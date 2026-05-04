@@ -96,6 +96,16 @@
 <li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
 </ul>
 </div>
+<div class="sidebar-group" data-group="Guides">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Guides</h4></button>
+<ul>
+<li><a href="../guides/enum.html">Enum</a></li>
+<li><a href="../guides/integer.html">Integer</a></li>
+<li><a href="../guides/io.html">Io</a></li>
+<li><a href="../guides/list.html">List</a></li>
+<li><a href="../guides/string.html">String</a></li>
+</ul>
+</div>
 </nav>
 <main class="content">
 <nav class="breadcrumb" aria-label="Breadcrumb">
@@ -166,7 +176,17 @@ cell.</td></tr>
 <tr><td class="summary-name"><a href="#first_sentence_walk-3">first_sentence_walk/3</a></td><td class="summary-doc"></td></tr>
 <tr><td class="summary-name"><a href="#struct_page-8">struct_page/8</a></td><td class="summary-doc"></td></tr>
 <tr><td class="summary-name"><a href="#layout-3">layout/3</a></td><td class="summary-doc"></td></tr>
-<tr><td class="summary-name"><a href="#sidebar-7">sidebar/7</a></td><td class="summary-doc"></td></tr>
+<tr><td class="summary-name"><a href="#sidebar-8">sidebar/8</a></td><td class="summary-doc"></td></tr>
+<tr><td class="summary-name"><a href="#guides_sidebar_group-3">guides_sidebar_group/3</a></td><td class="summary-doc">Render the sidebar `Guides` group — pinned to the bottom of the
+sidebar.</td></tr>
+<tr><td class="summary-name"><a href="#render_guide_sidebar_items-4">render_guide_sidebar_items/4</a></td><td class="summary-doc"></td></tr>
+<tr><td class="summary-name"><a href="#guide_sidebar_item-3">guide_sidebar_item/3</a></td><td class="summary-doc"></td></tr>
+<tr><td class="summary-name"><a href="#title_case-1">title_case/1</a></td><td class="summary-doc">Title-case a guide slug for sidebar display: `integer` → `Integer`,
+`getting_started` → `Getting Started`.</td></tr>
+<tr><td class="summary-name"><a href="#title_case_walk-5">title_case_walk/5</a></td><td class="summary-doc"></td></tr>
+<tr><td class="summary-name"><a href="#upcase_byte-1">upcase_byte/1</a></td><td class="summary-doc"></td></tr>
+<tr><td class="summary-name"><a href="#upcase_index-1">upcase_index/1</a></td><td class="summary-doc"></td></tr>
+<tr><td class="summary-name"><a href="#upcase_index_walk-2">upcase_index_walk/2</a></td><td class="summary-doc"></td></tr>
 <tr><td class="summary-name"><a href="#search_modal-0">search_modal/0</a></td><td class="summary-doc"></td></tr>
 <tr><td class="summary-name"><a href="#function_detail-5">function_detail/5</a></td><td class="summary-doc"></td></tr>
 <tr><td class="summary-name"><a href="#function_header-3">function_header/3</a></td><td class="summary-doc"></td></tr>
@@ -179,7 +199,7 @@ protocols.</td></tr>
 <tr><td class="summary-name"><a href="#escape_one_lt-1">escape_one_lt/1</a></td><td class="summary-doc"></td></tr>
 <tr><td class="summary-name"><a href="#escape_one_gt-1">escape_one_gt/1</a></td><td class="summary-doc"></td></tr>
 <tr><td class="summary-name"><a href="#escape_one_quote-1">escape_one_quote/1</a></td><td class="summary-doc"></td></tr>
-<tr><td class="summary-name"><a href="#render_summary_page-13">render_summary_page/13</a></td><td class="summary-doc">Compose a complete HTML page for a single module summary.</td></tr>
+<tr><td class="summary-name"><a href="#render_summary_page-14">render_summary_page/14</a></td><td class="summary-doc">Compose a complete HTML page for a single module summary.</td></tr>
 <tr><td class="summary-name"><a href="#render_right_rail-2">render_right_rail/2</a></td><td class="summary-doc">Render the right-rail &quot;On this page&quot; TOC from the sorted function
 and macro lists.</td></tr>
 <tr><td class="summary-name"><a href="#render_toc_items-2">render_toc_items/2</a></td><td class="summary-doc"></td></tr>
@@ -268,9 +288,17 @@ string by `*_search_entry`.</td></tr>
 field equals `module_name`.</td></tr>
 <tr><td class="summary-name"><a href="#member_row_for_module-2">member_row_for_module/2</a></td><td class="summary-doc">Render a single `summary_row` for `member` if `member[:module]`
 equals `module_name`, otherwise return the empty string.</td></tr>
-<tr><td class="summary-name"><a href="#write_pages_to-14">write_pages_to/14</a></td><td class="summary-doc">Render every summary list to disk under `out_dir` and return the
+<tr><td class="summary-name"><a href="#write_pages_to-15">write_pages_to/15</a></td><td class="summary-doc">Render every summary list to disk under `out_dir` and return the
 total number of pages written.</td></tr>
-<tr><td class="summary-name"><a href="#render_index_page-8">render_index_page/8</a></td><td class="summary-doc">Compose the docs landing page.</td></tr>
+<tr><td class="summary-name"><a href="#collect_guide_slugs-2">collect_guide_slugs/2</a></td><td class="summary-doc">Walk the guide manifest and pull each entry's slug out of the
+`:source_path` field.</td></tr>
+<tr><td class="summary-name"><a href="#guide_slug_from_source-1">guide_slug_from_source/1</a></td><td class="summary-doc">Strip the directory prefix and `.md` suffix from a guide source
+path: `guides/integer.md` -&gt; `integer`.</td></tr>
+<tr><td class="summary-name"><a href="#write_guide_pages-10">write_guide_pages/10</a></td><td class="summary-doc">Render every entry in the guide manifest to
+`&lt;out_dir&gt;/guides/&lt;slug&gt;.html`.</td></tr>
+<tr><td class="summary-name"><a href="#write_one_guide_page-11">write_one_guide_page/11</a></td><td class="summary-doc"></td></tr>
+<tr><td class="summary-name"><a href="#render_guide_page-9">render_guide_page/9</a></td><td class="summary-doc">Compose the full HTML for one guide page.</td></tr>
+<tr><td class="summary-name"><a href="#render_index_page-9">render_index_page/9</a></td><td class="summary-doc">Compose the docs landing page.</td></tr>
 <tr><td class="summary-name"><a href="#render_default_landing-4">render_default_landing/4</a></td><td class="summary-doc">Default landing-page body used when no `landing_md` is supplied.</td></tr>
 <tr><td class="summary-name"><a href="#render_struct_cards-2">render_struct_cards/2</a></td><td class="summary-doc"></td></tr>
 <tr><td class="summary-name"><a href="#render_struct_card-1">render_struct_card/1</a></td><td class="summary-doc"></td></tr>
@@ -284,7 +312,7 @@ list of strings.</td></tr>
 <tr><td class="summary-name"><a href="#insert_name_alpha-3">insert_name_alpha/3</a></td><td class="summary-doc"></td></tr>
 <tr><td class="summary-name"><a href="#list_concat_strings-2">list_concat_strings/2</a></td><td class="summary-doc"></td></tr>
 <tr><td class="summary-name"><a href="#manifest_names-2">manifest_names/2</a></td><td class="summary-doc"></td></tr>
-<tr><td class="summary-name"><a href="#write_summary_pages-15">write_summary_pages/15</a></td><td class="summary-doc">Iterate `summaries`, render each as a full HTML page, and write
+<tr><td class="summary-name"><a href="#write_summary_pages-16">write_summary_pages/16</a></td><td class="summary-doc">Iterate `summaries`, render each as a full HTML page, and write
 `&lt;out_dir&gt;/&lt;name&gt;.html`.</td></tr>
 </table>
 <h2>Function Details</h2>
@@ -705,15 +733,108 @@ matching the in-tree Zig <code>extractFirstSentence</code> heuristic.</p>
 <div class="signature"><code><span class="sig-name">layout</span><span class="sig-paren">(</span>sidebar_html<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>content_html<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>rail_html<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L417">Source</a>
 </div>
-<div class="function-detail" id="sidebar-7">
+<div class="function-detail" id="sidebar-8">
 <div class="function-header">
-<h3>sidebar<span class="arity">/7</span></h3>
+<h3>sidebar<span class="arity">/8</span></h3>
 <span class="badge">fn</span>
 <div style="flex:1"></div>
-<a href="#sidebar-7" class="anchor-link">#</a>
+<a href="#sidebar-8" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">sidebar</span><span class="sig-paren">(</span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>current<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>base<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">sidebar</span><span class="sig-paren">(</span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guides<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>current<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>base<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L428">Source</a>
+</div>
+<div class="function-detail" id="guides_sidebar_group-3">
+<div class="function-header">
+<h3>guides_sidebar_group<span class="arity">/3</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#guides_sidebar_group-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">guides_sidebar_group</span><span class="sig-paren">(</span>slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>current<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>base<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Render the sidebar <code>Guides</code> group — pinned to the bottom of the
+sidebar. Each entry links to <code>&lt;base&gt;guides/&lt;slug&gt;.html</code> and
+title-cases the slug for display so a <code>guides/integer.md</code> file
+surfaces as <code>Integer</code> in the panel. When <code>current</code> matches one of
+the slugs, that entry gets the <code>active</code> class.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L462">Source</a>
+</div>
+<div class="function-detail" id="render_guide_sidebar_items-4">
+<div class="function-header">
+<h3>render_guide_sidebar_items<span class="arity">/4</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#render_guide_sidebar_items-4" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">render_guide_sidebar_items</span><span class="sig-paren">(</span>slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>current<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>base<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L469">Source</a>
+</div>
+<div class="function-detail" id="guide_sidebar_item-3">
+<div class="function-header">
+<h3>guide_sidebar_item<span class="arity">/3</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#guide_sidebar_item-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">guide_sidebar_item</span><span class="sig-paren">(</span>slug<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>active?<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>base<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L479">Source</a>
+</div>
+<div class="function-detail" id="title_case-1">
+<div class="function-header">
+<h3>title_case<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#title_case-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">title_case</span><span class="sig-paren">(</span>slug<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Title-case a guide slug for sidebar display: <code>integer</code> → <code>Integer</code>,
+<code>getting_started</code> → <code>Getting Started</code>. Walks byte-by-byte so the
+first character of each word is uppercased and underscores collapse
+to spaces.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L490">Source</a>
+</div>
+<div class="function-detail" id="title_case_walk-5">
+<div class="function-header">
+<h3>title_case_walk<span class="arity">/5</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#title_case_walk-5" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">title_case_walk</span><span class="sig-paren">(</span>slug<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>capitalise_next<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L494">Source</a>
+</div>
+<div class="function-detail" id="upcase_byte-1">
+<div class="function-header">
+<h3>upcase_byte<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#upcase_byte-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">upcase_byte</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L508">Source</a>
+</div>
+<div class="function-detail" id="upcase_index-1">
+<div class="function-header">
+<h3>upcase_index<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#upcase_index-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">upcase_index</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L516">Source</a>
+</div>
+<div class="function-detail" id="upcase_index_walk-2">
+<div class="function-header">
+<h3>upcase_index_walk<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#upcase_index_walk-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">upcase_index_walk</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>idx<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L520">Source</a>
 </div>
 <div class="function-detail" id="search_modal-0">
 <div class="function-header">
@@ -723,7 +844,7 @@ matching the in-tree Zig <code>extractFirstSentence</code> heuristic.</p>
 <a href="#search_modal-0" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">search_modal</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L450">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L532">Source</a>
 </div>
 <div class="function-detail" id="function_detail-5">
 <div class="function-header">
@@ -733,7 +854,7 @@ matching the in-tree Zig <code>extractFirstSentence</code> heuristic.</p>
 <a href="#function_detail-5" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">function_detail</span><span class="sig-paren">(</span>name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>arity<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>is_macro<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>signatures<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>doc_html<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L459">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L541">Source</a>
 </div>
 <div class="function-detail" id="function_header-3">
 <div class="function-header">
@@ -743,7 +864,7 @@ matching the in-tree Zig <code>extractFirstSentence</code> heuristic.</p>
 <a href="#function_header-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">function_header</span><span class="sig-paren">(</span>name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>arity<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>is_macro<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L474">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L556">Source</a>
 </div>
 <div class="function-detail" id="implements_link-1">
 <div class="function-header">
@@ -753,7 +874,7 @@ matching the in-tree Zig <code>extractFirstSentence</code> heuristic.</p>
 <a href="#implements_link-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">implements_link</span><span class="sig-paren">(</span>name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L485">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L567">Source</a>
 </div>
 <div class="function-detail" id="implements_row-1">
 <div class="function-header">
@@ -775,7 +896,7 @@ single string. The recursive multi-clause form
 a closure-codegen issue elsewhere in the test suite — the
 comprehension path avoids it.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L503">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L585">Source</a>
 </div>
 <div class="function-detail" id="escape_html-1">
 <div class="function-header">
@@ -785,7 +906,7 @@ comprehension path avoids it.</p>
 <a href="#escape_html-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">escape_html</span><span class="sig-paren">(</span>text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L516">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L598">Source</a>
 </div>
 <div class="function-detail" id="escape_chars-4">
 <div class="function-header">
@@ -795,7 +916,7 @@ comprehension path avoids it.</p>
 <a href="#escape_chars-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">escape_chars</span><span class="sig-paren">(</span>text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L520">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L602">Source</a>
 </div>
 <div class="function-detail" id="escape_one-1">
 <div class="function-header">
@@ -805,7 +926,7 @@ comprehension path avoids it.</p>
 <a href="#escape_one-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">escape_one</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L528">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L610">Source</a>
 </div>
 <div class="function-detail" id="escape_one_lt-1">
 <div class="function-header">
@@ -815,7 +936,7 @@ comprehension path avoids it.</p>
 <a href="#escape_one_lt-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">escape_one_lt</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L536">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L618">Source</a>
 </div>
 <div class="function-detail" id="escape_one_gt-1">
 <div class="function-header">
@@ -825,7 +946,7 @@ comprehension path avoids it.</p>
 <a href="#escape_one_gt-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">escape_one_gt</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L544">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L626">Source</a>
 </div>
 <div class="function-detail" id="escape_one_quote-1">
 <div class="function-header">
@@ -835,16 +956,16 @@ comprehension path avoids it.</p>
 <a href="#escape_one_quote-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">escape_one_quote</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L552">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L634">Source</a>
 </div>
-<div class="function-detail" id="render_summary_page-13">
+<div class="function-detail" id="render_summary_page-14">
 <div class="function-header">
-<h3>render_summary_page<span class="arity">/13</span></h3>
+<h3>render_summary_page<span class="arity">/14</span></h3>
 <span class="badge">fn</span>
 <div style="flex:1"></div>
-<a href="#render_summary_page-13" class="anchor-link">#</a>
+<a href="#render_summary_page-14" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_summary_page</span><span class="sig-paren">(</span>summary<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>kind<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>all_functions<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_macros<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_impls<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_variants<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_required<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_summary_page</span><span class="sig-paren">(</span>summary<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>kind<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>all_functions<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_macros<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_impls<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_variants<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_required<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Compose a complete HTML page for a single module summary.</p>
 <p><code>summary</code> is a <code>%{Atom =&gt; Term}</code> map produced by
@@ -855,7 +976,7 @@ accessors). The returned HTML embeds the struct's name as the
 page heading and its <code>@doc</code> text as the lead paragraph; the
 sidebar highlights the current module.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L571">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L653">Source</a>
 </div>
 <div class="function-detail" id="render_right_rail-2">
 <div class="function-header">
@@ -873,7 +994,7 @@ member. Returns the empty string when both lists are empty so
 <code>layout</code> collapses to <code>layout-no-toc</code> and the content fills the
 freed column.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L598">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L680">Source</a>
 </div>
 <div class="function-detail" id="render_toc_items-2">
 <div class="function-header">
@@ -883,7 +1004,7 @@ freed column.</p>
 <a href="#render_toc_items-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_toc_items</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L604">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L686">Source</a>
 </div>
 <div class="function-detail" id="filter_members_by_module-2">
 <div class="function-header">
@@ -899,7 +1020,7 @@ whose <code>:module</code> field equals <code>module_name</code>. Used by
 <code>render_summary_page</code> so the per-module sort and render passes
 don't have to re-check the module name on every iteration.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L620">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L702">Source</a>
 </div>
 <div class="function-detail" id="filter_members_walk-3">
 <div class="function-header">
@@ -909,7 +1030,7 @@ don't have to re-check the module name on every iteration.</p>
 <a href="#filter_members_walk-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">filter_members_walk</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[?]</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L624">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L706">Source</a>
 </div>
 <div class="function-detail" id="sort_members_by_source_line-1">
 <div class="function-header">
@@ -928,7 +1049,7 @@ source-line order, so the output preserves the source-file
 layout the legacy generator emitted — the same order an
 <code>@doc</code>-driven reader expects when scanning a module's reference page.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L647">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L729">Source</a>
 </div>
 <div class="function-detail" id="sort_members_walk-2">
 <div class="function-header">
@@ -938,7 +1059,7 @@ layout the legacy generator emitted — the same order an
 <a href="#sort_members_walk-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">sort_members_walk</span><span class="sig-paren">(</span>remaining<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>sorted<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[?]</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L651">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L733">Source</a>
 </div>
 <div class="function-detail" id="insert_member_by_line-2">
 <div class="function-header">
@@ -948,7 +1069,7 @@ layout the legacy generator emitted — the same order an
 <a href="#insert_member_by_line-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">insert_member_by_line</span><span class="sig-paren">(</span>sorted<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>item<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[?]</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L661">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L743">Source</a>
 </div>
 <div class="function-detail" id="insert_member_walk-3">
 <div class="function-header">
@@ -958,7 +1079,7 @@ layout the legacy generator emitted — the same order an
 <a href="#insert_member_walk-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">insert_member_walk</span><span class="sig-paren">(</span>sorted<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>item<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>prefix<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[?]</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L665">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L747">Source</a>
 </div>
 <div class="function-detail" id="member_lt?-2">
 <div class="function-header">
@@ -976,7 +1097,7 @@ the legacy generator's source-driven layout. Falls back to <code>:name</code>
 when the location fields are identical (e.g. macro-generated
 siblings) so the order remains stable across runs.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L687">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L769">Source</a>
 </div>
 <div class="function-detail" id="file_lt_or_eq?-4">
 <div class="function-header">
@@ -986,7 +1107,7 @@ siblings) so the order remains stable across runs.</p>
 <a href="#file_lt_or_eq?-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">file_lt_or_eq?</span><span class="sig-paren">(</span>a_file<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>b_file<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>a<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>b<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L691">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L773">Source</a>
 </div>
 <div class="function-detail" id="file_eq_or_gt?-3">
 <div class="function-header">
@@ -996,7 +1117,7 @@ siblings) so the order remains stable across runs.</p>
 <a href="#file_eq_or_gt?-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">file_eq_or_gt?</span><span class="sig-paren">(</span>file_eq<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>a<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>b<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L699">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L781">Source</a>
 </div>
 <div class="function-detail" id="line_lt_or_eq?-4">
 <div class="function-header">
@@ -1006,7 +1127,7 @@ siblings) so the order remains stable across runs.</p>
 <a href="#line_lt_or_eq?-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">line_lt_or_eq?</span><span class="sig-paren">(</span>a_line<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>b_line<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>a<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>b<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L707">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L789">Source</a>
 </div>
 <div class="function-detail" id="line_eq_or_gt?-3">
 <div class="function-header">
@@ -1016,7 +1137,7 @@ siblings) so the order remains stable across runs.</p>
 <a href="#line_eq_or_gt?-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">line_eq_or_gt?</span><span class="sig-paren">(</span>line_eq<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>a<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>b<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L715">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L797">Source</a>
 </div>
 <div class="function-detail" id="string_lt?-2">
 <div class="function-header">
@@ -1032,7 +1153,7 @@ byte order. Implemented in Zap to keep the doc generator
 self-contained — <code>String</code> doesn't yet expose a public compare
 primitive.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L729">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L811">Source</a>
 </div>
 <div class="function-detail" id="string_lt_walk?-5">
 <div class="function-header">
@@ -1042,7 +1163,7 @@ primitive.</p>
 <a href="#string_lt_walk?-5" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">string_lt_walk?</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>left_len<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>right_len<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L733">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L815">Source</a>
 </div>
 <div class="function-detail" id="string_eq?-2">
 <div class="function-header">
@@ -1055,7 +1176,7 @@ primitive.</p>
 <div class="function-doc">
 <p>True when two strings are byte-equal.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L752">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L834">Source</a>
 </div>
 <div class="function-detail" id="string_eq_walk?-4">
 <div class="function-header">
@@ -1065,7 +1186,7 @@ primitive.</p>
 <a href="#string_eq_walk?-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">string_eq_walk?</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L760">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L842">Source</a>
 </div>
 <div class="function-detail" id="list_concat_two-2">
 <div class="function-header">
@@ -1075,7 +1196,7 @@ primitive.</p>
 <a href="#list_concat_two-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">list_concat_two</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[?]</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L772">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L854">Source</a>
 </div>
 <div class="function-detail" id="render_summary_rows_from_members-2">
 <div class="function-header">
@@ -1090,7 +1211,7 @@ primitive.</p>
 filtered to one module's entries. Each row uses the member's
 <code>:name</code>, <code>:arity</code>, and the first sentence of <code>:doc</code>.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L785">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L867">Source</a>
 </div>
 <div class="function-detail" id="render_member_details_sorted-5">
 <div class="function-header">
@@ -1106,7 +1227,7 @@ filtered+sorted to one module's entries. Mirrors
 <code>render_module_member_details</code> but skips the per-iteration module
 filter — the caller has done that work.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L802">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L884">Source</a>
 </div>
 <div class="function-detail" id="render_module_member_details-6">
 <div class="function-header">
@@ -1125,7 +1246,7 @@ concatenation of all matching detail blocks; the caller passes
 the result to <code>module_main_content</code>'s <code>functions_details</code> or
 <code>macros_details</code> slot.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L822">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L904">Source</a>
 </div>
 <div class="function-detail" id="member_detail_for_module-5">
 <div class="function-header">
@@ -1135,7 +1256,7 @@ the result to <code>module_main_content</code>'s <code>functions_details</code> 
 <a href="#member_detail_for_module-5" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">member_detail_for_module</span><span class="sig-paren">(</span>member<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>is_macro<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L830">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L912">Source</a>
 </div>
 <div class="function-detail" id="compose_member_detail-9">
 <div class="function-header">
@@ -1145,7 +1266,7 @@ the result to <code>module_main_content</code>'s <code>functions_details</code> 
 <a href="#compose_member_detail-9" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">compose_member_detail</span><span class="sig-paren">(</span>name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>arity<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>is_macro<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>doc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_file<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_line<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>signatures_joined<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L838">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L920">Source</a>
 </div>
 <div class="function-detail" id="render_signatures-1">
 <div class="function-header">
@@ -1162,7 +1283,7 @@ the result to <code>module_main_content</code>'s <code>functions_details</code> 
 renderer. Empty input returns the empty string so callers can
 splice unconditionally.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L859">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L941">Source</a>
 </div>
 <div class="function-detail" id="render_signatures_walk-2">
 <div class="function-header">
@@ -1172,7 +1293,7 @@ splice unconditionally.</p>
 <a href="#render_signatures_walk-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_signatures_walk</span><span class="sig-paren">(</span>sigs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L867">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L949">Source</a>
 </div>
 <div class="function-detail" id="rich_signature_block-1">
 <div class="function-header">
@@ -1190,7 +1311,7 @@ arrow <code>&lt;span class=&quot;sig-arrow&quot;&gt;→&lt;/span&gt;</code>, and
 Falls back to the plain <code>&lt;code&gt;</code> form when the signature shape
 can't be parsed.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L889">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L971">Source</a>
 </div>
 <div class="function-detail" id="rich_signature_with_open-2">
 <div class="function-header">
@@ -1200,7 +1321,7 @@ can't be parsed.</p>
 <a href="#rich_signature_with_open-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">rich_signature_with_open</span><span class="sig-paren">(</span>signature<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>paren_open<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L898">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L980">Source</a>
 </div>
 <div class="function-detail" id="rich_signature_assemble-3">
 <div class="function-header">
@@ -1210,7 +1331,7 @@ can't be parsed.</p>
 <a href="#rich_signature_assemble-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">rich_signature_assemble</span><span class="sig-paren">(</span>signature<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>paren_open<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>paren_close<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L907">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L989">Source</a>
 </div>
 <div class="function-detail" id="matching_close_paren-4">
 <div class="function-header">
@@ -1227,7 +1348,7 @@ nesting so function-typed parameters with their own parens
 (<code>(T) -&gt; R</code>) don't trip the scanner. Returns -1 if no match is
 found before <code>end_index</code>.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L924">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1006">Source</a>
 </div>
 <div class="function-detail" id="render_signature_params-1">
 <div class="function-header">
@@ -1244,7 +1365,7 @@ parens stays grouped), then renders each parameter as either
 <code>name&lt;sep&gt;::&lt;sep&gt;&lt;pill&gt;type&lt;/pill&gt;</code> or — if the parameter has no
 <code>::</code> — bare HTML-escaped text.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L952">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1034">Source</a>
 </div>
 <div class="function-detail" id="render_signature_params_walk-3">
 <div class="function-header">
@@ -1254,7 +1375,7 @@ parens stays grouped), then renders each parameter as either
 <a href="#render_signature_params_walk-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_signature_params_walk</span><span class="sig-paren">(</span>parts<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L960">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1042">Source</a>
 </div>
 <div class="function-detail" id="render_one_param-1">
 <div class="function-header">
@@ -1264,7 +1385,7 @@ parens stays grouped), then renders each parameter as either
 <a href="#render_one_param-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_one_param</span><span class="sig-paren">(</span>param<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L975">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1057">Source</a>
 </div>
 <div class="function-detail" id="render_typed_param-2">
 <div class="function-header">
@@ -1274,7 +1395,7 @@ parens stays grouped), then renders each parameter as either
 <a href="#render_typed_param-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_typed_param</span><span class="sig-paren">(</span>param<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>sep_idx<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L984">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1066">Source</a>
 </div>
 <div class="function-detail" id="render_signature_return-1">
 <div class="function-header">
@@ -1289,7 +1410,7 @@ parens stays grouped), then renders each parameter as either
 the <code>-&gt; ReturnType [if guard]</code> segment. Empty/missing portions
 return the empty string.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L995">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1077">Source</a>
 </div>
 <div class="function-detail" id="render_signature_return_trimmed-1">
 <div class="function-header">
@@ -1299,7 +1420,7 @@ return the empty string.</p>
 <a href="#render_signature_return_trimmed-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_signature_return_trimmed</span><span class="sig-paren">(</span>trimmed<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1004">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1086">Source</a>
 </div>
 <div class="function-detail" id="render_arrow_segment-1">
 <div class="function-header">
@@ -1309,7 +1430,7 @@ return the empty string.</p>
 <a href="#render_arrow_segment-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_arrow_segment</span><span class="sig-paren">(</span>after_arrow<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1016">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1098">Source</a>
 </div>
 <div class="function-detail" id="render_arrow_with_guard-2">
 <div class="function-header">
@@ -1319,7 +1440,7 @@ return the empty string.</p>
 <a href="#render_arrow_with_guard-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_arrow_with_guard</span><span class="sig-paren">(</span>after_arrow<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>guard_idx<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1025">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1107">Source</a>
 </div>
 <div class="function-detail" id="render_return_type-1">
 <div class="function-header">
@@ -1329,7 +1450,7 @@ return the empty string.</p>
 <a href="#render_return_type-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_return_type</span><span class="sig-paren">(</span>ret<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1031">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1113">Source</a>
 </div>
 <div class="function-detail" id="render_signature_guard-1">
 <div class="function-header">
@@ -1339,7 +1460,7 @@ return the empty string.</p>
 <a href="#render_signature_guard-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_signature_guard</span><span class="sig-paren">(</span>guard<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1039">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1121">Source</a>
 </div>
 <div class="function-detail" id="split_top_level_commas-1">
 <div class="function-header">
@@ -1355,7 +1476,7 @@ paren/bracket/brace depth. Parameters like <code>f :: (i64, i64) -&gt; i64</code
 stay grouped because the comma inside the function type sits at
 depth &gt; 0.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1053">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1135">Source</a>
 </div>
 <div class="function-detail" id="split_top_level_walk-6">
 <div class="function-header">
@@ -1365,7 +1486,7 @@ depth &gt; 0.</p>
 <a href="#split_top_level_walk-6" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">split_top_level_walk</span><span class="sig-paren">(</span>text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>start<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>depth<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[String]</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1057">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1139">Source</a>
 </div>
 <div class="function-detail" id="index_of_top_level_guard-1">
 <div class="function-header">
@@ -1381,7 +1502,7 @@ skipping nested-paren occurrences so a function-type parameter
 <code>(T) -&gt; R if pred</code> doesn't confuse the scanner. Returns -1 when no
 top-level <code> if </code> is present.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1084">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1166">Source</a>
 </div>
 <div class="function-detail" id="scan_top_level_if-4">
 <div class="function-header">
@@ -1391,7 +1512,7 @@ top-level <code> if </code> is present.</p>
 <a href="#scan_top_level_if-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">scan_top_level_if</span><span class="sig-paren">(</span>text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>depth<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1088">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1170">Source</a>
 </div>
 <div class="function-detail" id="is_if_at?-3">
 <div class="function-header">
@@ -1401,7 +1522,7 @@ top-level <code> if </code> is present.</p>
 <a href="#is_if_at?-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_if_at?</span><span class="sig-paren">(</span>text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1109">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1191">Source</a>
 </div>
 <div class="function-detail" id="source_link-4">
 <div class="function-header">
@@ -1419,7 +1540,7 @@ declared a repo URL), <code>source_file == &quot;&quot;</code> (reflection didn'
 capture a source location), or <code>source_line &lt;= 0</code>. Format
 matches the historical Zig generator: <code>&lt;url&gt;/blob/v&lt;version&gt;/&lt;file&gt;#L&lt;line&gt;</code>.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1125">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1207">Source</a>
 </div>
 <div class="function-detail" id="strip_dot_slash-1">
 <div class="function-header">
@@ -1434,7 +1555,7 @@ matches the historical Zig generator: <code>&lt;url&gt;/blob/v&lt;version&gt;/&l
 sometimes attaches to relative paths. The repo URLs the
 <code>[Source]</code> link points at don't tolerate the redundant segment.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1147">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1229">Source</a>
 </div>
 <div class="function-detail" id="json_escape-1">
 <div class="function-header">
@@ -1450,7 +1571,7 @@ Replaces backslash, double-quote, and newline with their JSON
 escape sequences. Other control characters are rare in stdlib
 <code>@doc</code> text.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1161">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1243">Source</a>
 </div>
 <div class="function-detail" id="struct_search_entry-2">
 <div class="function-header">
@@ -1463,7 +1584,7 @@ escape sequences. Other control characters are rare in stdlib
 <div class="function-doc">
 <p>Render one struct/protocol/union summary as a JSON entry.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1168">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1250">Source</a>
 </div>
 <div class="function-detail" id="render_struct_search_entries-3">
 <div class="function-header">
@@ -1476,7 +1597,7 @@ escape sequences. Other control characters are rare in stdlib
 <div class="function-doc">
 <p>Walk a list of struct/protocol/union summaries, accumulating JSON search entries.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1175">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1257">Source</a>
 </div>
 <div class="function-detail" id="compose_function_search_entry-5">
 <div class="function-header">
@@ -1495,7 +1616,7 @@ against the concrete types without going through Term unboxing inside
 the body. Mirrors the <code>compose_member_detail</code> pattern used elsewhere
 in this struct.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1195">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1277">Source</a>
 </div>
 <div class="function-detail" id="function_search_entry-2">
 <div class="function-header">
@@ -1508,7 +1629,7 @@ in this struct.</p>
 <div class="function-doc">
 <p>Render a <code>:module</code> + <code>:name</code> + <code>:arity</code> flat-summary entry as a JSON search entry. Used for functions and macros.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1201">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1283">Source</a>
 </div>
 <div class="function-detail" id="render_function_search_entries-3">
 <div class="function-header">
@@ -1521,7 +1642,7 @@ in this struct.</p>
 <div class="function-doc">
 <p>Walk a list of function/macro flat-summaries, accumulating JSON search entries.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1206">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1288">Source</a>
 </div>
 <div class="function-detail" id="strip_trailing_comma_newline-1">
 <div class="function-header">
@@ -1537,7 +1658,7 @@ string by <code>*_search_entry</code>. Recursive walkers keep their bodies
 branch-free (every entry adds the same suffix); the array
 closer here drops the last separator before the <code>]</code>.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1223">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1305">Source</a>
 </div>
 <div class="function-detail" id="render_search_index-5">
 <div class="function-header">
@@ -1553,7 +1674,7 @@ protocol, union, function, and macro becomes one JSON entry
 matching the legacy Zig-side search index shape so the bundled
 <code>app.js</code> can index and render results without changes.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1238">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1320">Source</a>
 </div>
 <div class="function-detail" id="render_kind_extras-4">
 <div class="function-header">
@@ -1572,7 +1693,7 @@ matching the legacy Zig-side search index shape so the bundled
 <code>summary_table</code> so an empty filter result collapses the whole
 block.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1258">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1340">Source</a>
 </div>
 <div class="function-detail" id="render_variant_rows-3">
 <div class="function-header">
@@ -1582,7 +1703,7 @@ block.</p>
 <a href="#render_variant_rows-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_variant_rows</span><span class="sig-paren">(</span>variants<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1270">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1352">Source</a>
 </div>
 <div class="function-detail" id="render_required_rows-3">
 <div class="function-header">
@@ -1592,7 +1713,7 @@ block.</p>
 <a href="#render_required_rows-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_required_rows</span><span class="sig-paren">(</span>required<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1285">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1367">Source</a>
 </div>
 <div class="function-detail" id="collect_implemented_protocols-3">
 <div class="function-header">
@@ -1608,7 +1729,7 @@ block.</p>
 <code>module_main_content</code> can populate the &quot;Implements&quot; row above the
 title without further filtering.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1306">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1388">Source</a>
 </div>
 <div class="function-detail" id="list_contains?-2">
 <div class="function-header">
@@ -1623,7 +1744,7 @@ title without further filtering.</p>
 <code>Implements</code> deduplication walk doesn't depend on a richer
 list-membership protocol.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1331">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1413">Source</a>
 </div>
 <div class="function-detail" id="render_module_member_rows-3">
 <div class="function-header">
@@ -1640,7 +1761,7 @@ function/macro list onto a single module's reference page.
 Returns the empty string when no member matches so
 <code>summary_table</code> collapses the whole section.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1351">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1433">Source</a>
 </div>
 <div class="function-detail" id="member_row_for_module-2">
 <div class="function-header">
@@ -1656,16 +1777,16 @@ equals <code>module_name</code>, otherwise return the empty string. Splits
 out of <code>render_module_member_rows</code> so the outer recursion stays a
 single tail call regardless of whether the member matches.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1365">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1447">Source</a>
 </div>
-<div class="function-detail" id="write_pages_to-14">
+<div class="function-detail" id="write_pages_to-15">
 <div class="function-header">
-<h3>write_pages_to<span class="arity">/14</span></h3>
+<h3>write_pages_to<span class="arity">/15</span></h3>
 <span class="badge">fn</span>
 <div style="flex:1"></div>
-<a href="#write_pages_to-14" class="anchor-link">#</a>
+<a href="#write_pages_to-15" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">write_pages_to</span><span class="sig-paren">(</span>out_dir<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>landing_md<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>struct_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>protocol_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>union_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>function_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>macro_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>impl_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>variant_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>required_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>js_content<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">write_pages_to</span><span class="sig-paren">(</span>out_dir<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>landing_md<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>struct_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>protocol_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>union_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>function_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>macro_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>impl_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>variant_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>required_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>guide_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>js_content<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Render every summary list to disk under <code>out_dir</code> and return the
 total number of pages written. Each summary becomes
@@ -1675,16 +1796,91 @@ every page.</p>
 <p>Typically called from a project's <code>main/1</code> after invoking
 <code>use Zap.Doc.Builder</code>.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1383">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1465">Source</a>
 </div>
-<div class="function-detail" id="render_index_page-8">
+<div class="function-detail" id="collect_guide_slugs-2">
 <div class="function-header">
-<h3>render_index_page<span class="arity">/8</span></h3>
+<h3>collect_guide_slugs<span class="arity">/2</span></h3>
 <span class="badge">fn</span>
 <div style="flex:1"></div>
-<a href="#render_index_page-8" class="anchor-link">#</a>
+<a href="#collect_guide_slugs-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_index_page</span><span class="sig-paren">(</span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>struct_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>landing_md<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">collect_guide_slugs</span><span class="sig-paren">(</span>guides<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[String]</span></code></div>
+<div class="function-doc">
+<p>Walk the guide manifest and pull each entry's slug out of the
+<code>:source_path</code> field. Slug = filename stem (basename minus the
+<code>.md</code> extension); <code>guides/integer.md</code> becomes <code>integer</code>.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1493">Source</a>
+</div>
+<div class="function-detail" id="guide_slug_from_source-1">
+<div class="function-header">
+<h3>guide_slug_from_source<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#guide_slug_from_source-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">guide_slug_from_source</span><span class="sig-paren">(</span>source_path<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Strip the directory prefix and <code>.md</code> suffix from a guide source
+path: <code>guides/integer.md</code> -&gt; <code>integer</code>. Empty input yields the
+empty string so the caller can filter out entries that lost their
+path during reflection.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1514">Source</a>
+</div>
+<div class="function-detail" id="write_guide_pages-10">
+<div class="function-header">
+<h3>write_guide_pages<span class="arity">/10</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#write_guide_pages-10" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">write_guide_pages</span><span class="sig-paren">(</span>out_dir<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>guides<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Render every entry in the guide manifest to
+<code>&lt;out_dir&gt;/guides/&lt;slug&gt;.html</code>. Each guide is loaded at runtime
+via <code>File.read/1</code>, rendered through <code>Markdown.to_html/1</code>, and
+framed by the same chrome (topbar / sidebar / structdoc body)
+used on per-struct pages so the look is consistent. Returns the
+number of pages successfully written.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1531">Source</a>
+</div>
+<div class="function-detail" id="write_one_guide_page-11">
+<div class="function-header">
+<h3>write_one_guide_page<span class="arity">/11</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#write_one_guide_page-11" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">write_one_guide_page</span><span class="sig-paren">(</span>out_dir<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>guide<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>slug<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1548">Source</a>
+</div>
+<div class="function-detail" id="render_guide_page-9">
+<div class="function-header">
+<h3>render_guide_page<span class="arity">/9</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#render_guide_page-9" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">render_guide_page</span><span class="sig-paren">(</span>slug<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>markdown_text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Compose the full HTML for one guide page. Mirrors the legacy
+<code>generateModuleGuidePage</code> shape: standard topbar/sidebar/footer
+chrome with the rendered markdown body wrapped in
+<code>&lt;article class=&quot;guide-article structdoc&quot;&gt;</code>.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1566">Source</a>
+</div>
+<div class="function-detail" id="render_index_page-9">
+<div class="function-header">
+<h3>render_index_page<span class="arity">/9</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#render_index_page-9" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">render_index_page</span><span class="sig-paren">(</span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>struct_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>landing_md<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Compose the docs landing page. When <code>landing_md</code> is non-empty it
 is rendered through <code>Markdown.to_html</code> and used as the main
@@ -1693,7 +1889,7 @@ column body — the legacy generator fed the project's
 back to a struct-card grid with the project name, version pill,
 and one card per declared struct (legacy <code>appendDefaultLanding</code>).</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1412">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1582">Source</a>
 </div>
 <div class="function-detail" id="render_default_landing-4">
 <div class="function-header">
@@ -1710,7 +1906,7 @@ a grid of struct cards — one per public struct, each with the
 first sentence of its <code>@doc</code> as the lead summary. Mirrors the
 legacy <code>appendDefaultLanding</code> Zig helper.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1429">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1599">Source</a>
 </div>
 <div class="function-detail" id="render_struct_cards-2">
 <div class="function-header">
@@ -1720,7 +1916,7 @@ legacy <code>appendDefaultLanding</code> Zig helper.</p>
 <a href="#render_struct_cards-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_struct_cards</span><span class="sig-paren">(</span>summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1441">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1611">Source</a>
 </div>
 <div class="function-detail" id="render_struct_card-1">
 <div class="function-header">
@@ -1730,7 +1926,7 @@ legacy <code>appendDefaultLanding</code> Zig helper.</p>
 <a href="#render_struct_card-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_struct_card</span><span class="sig-paren">(</span>entry<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1449">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1619">Source</a>
 </div>
 <div class="function-detail" id="render_struct_card_summary-1">
 <div class="function-header">
@@ -1740,7 +1936,7 @@ legacy <code>appendDefaultLanding</code> Zig helper.</p>
 <a href="#render_struct_card_summary-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_struct_card_summary</span><span class="sig-paren">(</span>summary<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1455">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1625">Source</a>
 </div>
 <div class="function-detail" id="render_index_section-3">
 <div class="function-header">
@@ -1756,7 +1952,7 @@ links, one per name. Returns the empty string when the name list
 is empty so the caller can emit all three section calls
 unconditionally and let the renderer drop empty kinds.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1469">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1639">Source</a>
 </div>
 <div class="function-detail" id="render_index_links-2">
 <div class="function-header">
@@ -1766,7 +1962,7 @@ unconditionally and let the renderer drop empty kinds.</p>
 <a href="#render_index_links-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_index_links</span><span class="sig-paren">(</span>names<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1477">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1647">Source</a>
 </div>
 <div class="function-detail" id="sort_names_alpha-1">
 <div class="function-header">
@@ -1782,7 +1978,7 @@ list of strings. Used to build the sidebar name lists from a
 single-pass walk so callers don't have to maintain three parallel
 arrays of names alongside their summaries.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1500">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1670">Source</a>
 </div>
 <div class="function-detail" id="sort_names_walk-2">
 <div class="function-header">
@@ -1792,7 +1988,7 @@ arrays of names alongside their summaries.</p>
 <a href="#sort_names_walk-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">sort_names_walk</span><span class="sig-paren">(</span>remaining<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>sorted<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[String]</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1504">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1674">Source</a>
 </div>
 <div class="function-detail" id="insert_name_alpha-3">
 <div class="function-header">
@@ -1802,7 +1998,7 @@ arrays of names alongside their summaries.</p>
 <a href="#insert_name_alpha-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">insert_name_alpha</span><span class="sig-paren">(</span>sorted<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>item<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>prefix<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[String]</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1514">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1684">Source</a>
 </div>
 <div class="function-detail" id="list_concat_strings-2">
 <div class="function-header">
@@ -1812,7 +2008,7 @@ arrays of names alongside their summaries.</p>
 <a href="#list_concat_strings-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">list_concat_strings</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[String]</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1528">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1698">Source</a>
 </div>
 <div class="function-detail" id="manifest_names-2">
 <div class="function-header">
@@ -1822,16 +2018,16 @@ arrays of names alongside their summaries.</p>
 <a href="#manifest_names-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">manifest_names</span><span class="sig-paren">(</span>summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[String]</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1536">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1706">Source</a>
 </div>
-<div class="function-detail" id="write_summary_pages-15">
+<div class="function-detail" id="write_summary_pages-16">
 <div class="function-header">
-<h3>write_summary_pages<span class="arity">/15</span></h3>
+<h3>write_summary_pages<span class="arity">/16</span></h3>
 <span class="badge">fn</span>
 <div style="flex:1"></div>
-<a href="#write_summary_pages-15" class="anchor-link">#</a>
+<a href="#write_summary_pages-16" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">write_summary_pages</span><span class="sig-paren">(</span>out_dir<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>kind<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>all_functions<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_macros<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_impls<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_variants<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_required<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">write_summary_pages</span><span class="sig-paren">(</span>out_dir<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>kind<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>all_functions<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_macros<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_impls<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_variants<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_required<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Iterate <code>summaries</code>, render each as a full HTML page, and write
 <code>&lt;out_dir&gt;/&lt;name&gt;.html</code>. Returns the number of pages written.
@@ -1839,7 +2035,7 @@ Files that fail to write are skipped without raising — <code>File.write</code>
 surfaces a Bool, which we count toward the total only when true so
 a partial failure doesn't lie about how much output landed.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1553">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1723">Source</a>
 </div>
 </main>
 <aside class="toc">
@@ -1875,7 +2071,15 @@ a partial failure doesn't lie about how much output landed.</p>
 <li><a href="#first_sentence_walk-3">first_sentence_walk/3</a></li>
 <li><a href="#struct_page-8">struct_page/8</a></li>
 <li><a href="#layout-3">layout/3</a></li>
-<li><a href="#sidebar-7">sidebar/7</a></li>
+<li><a href="#sidebar-8">sidebar/8</a></li>
+<li><a href="#guides_sidebar_group-3">guides_sidebar_group/3</a></li>
+<li><a href="#render_guide_sidebar_items-4">render_guide_sidebar_items/4</a></li>
+<li><a href="#guide_sidebar_item-3">guide_sidebar_item/3</a></li>
+<li><a href="#title_case-1">title_case/1</a></li>
+<li><a href="#title_case_walk-5">title_case_walk/5</a></li>
+<li><a href="#upcase_byte-1">upcase_byte/1</a></li>
+<li><a href="#upcase_index-1">upcase_index/1</a></li>
+<li><a href="#upcase_index_walk-2">upcase_index_walk/2</a></li>
 <li><a href="#search_modal-0">search_modal/0</a></li>
 <li><a href="#function_detail-5">function_detail/5</a></li>
 <li><a href="#function_header-3">function_header/3</a></li>
@@ -1887,7 +2091,7 @@ a partial failure doesn't lie about how much output landed.</p>
 <li><a href="#escape_one_lt-1">escape_one_lt/1</a></li>
 <li><a href="#escape_one_gt-1">escape_one_gt/1</a></li>
 <li><a href="#escape_one_quote-1">escape_one_quote/1</a></li>
-<li><a href="#render_summary_page-13">render_summary_page/13</a></li>
+<li><a href="#render_summary_page-14">render_summary_page/14</a></li>
 <li><a href="#render_right_rail-2">render_right_rail/2</a></li>
 <li><a href="#render_toc_items-2">render_toc_items/2</a></li>
 <li><a href="#filter_members_by_module-2">filter_members_by_module/2</a></li>
@@ -1949,8 +2153,13 @@ a partial failure doesn't lie about how much output landed.</p>
 <li><a href="#list_contains?-2">list_contains?/2</a></li>
 <li><a href="#render_module_member_rows-3">render_module_member_rows/3</a></li>
 <li><a href="#member_row_for_module-2">member_row_for_module/2</a></li>
-<li><a href="#write_pages_to-14">write_pages_to/14</a></li>
-<li><a href="#render_index_page-8">render_index_page/8</a></li>
+<li><a href="#write_pages_to-15">write_pages_to/15</a></li>
+<li><a href="#collect_guide_slugs-2">collect_guide_slugs/2</a></li>
+<li><a href="#guide_slug_from_source-1">guide_slug_from_source/1</a></li>
+<li><a href="#write_guide_pages-10">write_guide_pages/10</a></li>
+<li><a href="#write_one_guide_page-11">write_one_guide_page/11</a></li>
+<li><a href="#render_guide_page-9">render_guide_page/9</a></li>
+<li><a href="#render_index_page-9">render_index_page/9</a></li>
 <li><a href="#render_default_landing-4">render_default_landing/4</a></li>
 <li><a href="#render_struct_cards-2">render_struct_cards/2</a></li>
 <li><a href="#render_struct_card-1">render_struct_card/1</a></li>
@@ -1962,7 +2171,7 @@ a partial failure doesn't lie about how much output landed.</p>
 <li><a href="#insert_name_alpha-3">insert_name_alpha/3</a></li>
 <li><a href="#list_concat_strings-2">list_concat_strings/2</a></li>
 <li><a href="#manifest_names-2">manifest_names/2</a></li>
-<li><a href="#write_summary_pages-15">write_summary_pages/15</a></li>
+<li><a href="#write_summary_pages-16">write_summary_pages/16</a></li>
 </ul>
 </aside>
 </div>

@@ -232,7 +232,7 @@ pub struct Zap.DocTest {
 
   describe("Zap.Doc.sidebar") {
     test("renders one group per non-empty member list") {
-      result = Zap.Doc.sidebar(["Atom", "Bool"], ["Stringable"], empty_string_list(), "Bool", "../", "zap_stdlib", "0.1.0")
+      result = Zap.Doc.sidebar(["Atom", "Bool"], ["Stringable"], empty_string_list(), empty_string_list(), "Bool", "../", "zap_stdlib", "0.1.0")
       assert(String.starts_with?(result, "<nav class=\"sidebar\">"))
       assert(String.contains?(result, "<h4>Structs</h4>"))
       assert(String.contains?(result, "<h4>Protocols</h4>"))
@@ -244,7 +244,7 @@ pub struct Zap.DocTest {
 
     test("empty groups produce a sidebar with only the search header") {
       empty = empty_string_list()
-      result = Zap.Doc.sidebar(empty, empty, empty, "", "", "zap_stdlib", "0.1.0")
+      result = Zap.Doc.sidebar(empty, empty, empty, empty, "", "", "zap_stdlib", "0.1.0")
       assert(String.contains?(result, "<h4>") == false)
       assert(String.contains?(result, "<div class=\"sidebar-search\">"))
     }

@@ -425,7 +425,7 @@ pub struct Zap.Doc {
     open_div <> sidebar_html <> main_html <> rail_html <> "</div>\n"
   }
 
-  pub fn sidebar(structs :: [String], protocols :: [String], unions :: [String], current :: String, base :: String, project_name :: String, project_version :: String) -> String {
+  pub fn sidebar(structs :: [String], protocols :: [String], unions :: [String], guides :: [String], current :: String, base :: String, project_name :: String, project_version :: String) -> String {
     structs_group = if List.empty?(structs) {
       ""
     } else {
@@ -441,10 +441,92 @@ pub struct Zap.Doc {
     } else {
       sidebar_group("Unions", unions, current, base)
     }
+    guides_group = if List.empty?(guides) {
+      ""
+    } else {
+      guides_sidebar_group(guides, current, base)
+    }
     open_nav = "<nav class=\"sidebar\">\n"
     header = "<div class=\"sidebar-header\"><a href=\"" <> base <> "index.html\" class=\"sidebar-title\">" <> escape_html(project_name) <> "</a> <span class=\"sidebar-version\">v" <> escape_html(project_version) <> "</span></div>\n"
     search_input = "<div class=\"sidebar-search\"><input type=\"text\" id=\"search-input\" placeholder=\"Search (Cmd+K)\" aria-label=\"Search documentation\"></div>\n"
-    open_nav <> header <> search_input <> structs_group <> protocols_group <> unions_group <> "</nav>\n"
+    open_nav <> header <> search_input <> structs_group <> protocols_group <> unions_group <> guides_group <> "</nav>\n"
+  }
+
+  @doc = """
+    Render the sidebar `Guides` group — pinned to the bottom of the
+    sidebar. Each entry links to `<base>guides/<slug>.html` and
+    title-cases the slug for display so a `guides/integer.md` file
+    surfaces as `Integer` in the panel. When `current` matches one of
+    the slugs, that entry gets the `active` class.
+    """
+  pub fn guides_sidebar_group(slugs :: [String], current :: String, base :: String) -> String {
+    items = render_guide_sidebar_items(slugs, current, base, "")
+    open_div = "<div class=\"sidebar-group\" data-group=\"Guides\">\n"
+    button = "<button class=\"sidebar-group-header\" type=\"button\" aria-label=\"Toggle group\"><span class=\"chevron\" aria-hidden=\"true\">\u{25b8}</span><h4>Guides</h4></button>\n"
+    open_div <> button <> "<ul>\n" <> items <> "</ul>\n</div>\n"
+  }
+
+  pub fn render_guide_sidebar_items(slugs :: [String], current :: String, base :: String, acc :: String) -> String {
+    if List.empty?(slugs) {
+      acc
+    } else {
+      head = List.head(slugs)
+      tail = List.tail(slugs)
+      render_guide_sidebar_items(tail, current, base, acc <> guide_sidebar_item(head, head == current, base))
+    }
+  }
+
+  pub fn guide_sidebar_item(slug :: String, active? :: Bool, base :: String) -> String {
+    li_open = if active? { "<li class=\"active\">" } else { "<li>" }
+    li_open <> "<a href=\"" <> base <> "guides/" <> escape_html(slug) <> ".html\">" <> escape_html(title_case(slug)) <> "</a></li>\n"
+  }
+
+  @doc = """
+    Title-case a guide slug for sidebar display: `integer` → `Integer`,
+    `getting_started` → `Getting Started`. Walks byte-by-byte so the
+    first character of each word is uppercased and underscores collapse
+    to spaces.
+    """
+  pub fn title_case(slug :: String) -> String {
+    title_case_walk(slug, 0, String.length(slug), true, "")
+  }
+
+  pub fn title_case_walk(slug :: String, index :: i64, end_index :: i64, capitalise_next :: Bool, acc :: String) -> String {
+    if index >= end_index {
+      acc
+    } else {
+      ch = String.byte_at(slug, index)
+      if ch == "_" or ch == "-" {
+        title_case_walk(slug, index + 1, end_index, true, acc <> " ")
+      } else {
+        emitted = if capitalise_next { upcase_byte(ch) } else { ch }
+        title_case_walk(slug, index + 1, end_index, false, acc <> emitted)
+      }
+    }
+  }
+
+  pub fn upcase_byte(ch :: String) -> String {
+    if ch >= "a" and ch <= "z" {
+      String.byte_at("ABCDEFGHIJKLMNOPQRSTUVWXYZ", upcase_index(ch))
+    } else {
+      ch
+    }
+  }
+
+  pub fn upcase_index(ch :: String) -> i64 {
+    upcase_index_walk(ch, 0)
+  }
+
+  pub fn upcase_index_walk(ch :: String, idx :: i64) -> i64 {
+    if idx >= 26 {
+      0
+    } else {
+      if String.byte_at("abcdefghijklmnopqrstuvwxyz", idx) == ch {
+        idx
+      } else {
+        upcase_index_walk(ch, idx + 1)
+      }
+    }
   }
 
   pub fn search_modal() -> String {
@@ -568,7 +650,7 @@ pub struct Zap.Doc {
     page heading and its `@doc` text as the lead paragraph; the
     sidebar highlights the current module.
     """
-  pub fn render_summary_page(summary :: %{Atom => Term}, kind :: Atom, project_name :: String, project_version :: String, source_url :: String, structs :: [String], protocols :: [String], unions :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}], all_variants :: [%{Atom => Term}], all_required :: [%{Atom => Term}]) -> String {
+  pub fn render_summary_page(summary :: %{Atom => Term}, kind :: Atom, project_name :: String, project_version :: String, source_url :: String, structs :: [String], protocols :: [String], unions :: [String], guide_slugs :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}], all_variants :: [%{Atom => Term}], all_required :: [%{Atom => Term}]) -> String {
     name = Map.get(summary, :name, "")
     doc = Map.get(summary, :doc, "")
     structdoc_html = Markdown.to_html(doc)
@@ -582,7 +664,7 @@ pub struct Zap.Doc {
     body_html = module_main_content(kind, name, implements, first_sentence(doc), structdoc_html, functions_rows, macros_rows, functions_details, macros_details)
     extras = render_kind_extras(kind, name, all_variants, all_required)
     content = body_html <> extras
-    sidebar_html = sidebar(structs, protocols, unions, name, "../", project_name, project_version)
+    sidebar_html = sidebar(structs, protocols, unions, guide_slugs, name, "../", project_name, project_version)
     rail_html = render_right_rail(sorted_functions, sorted_macros)
     struct_page(project_name, project_version, name, "../", source_url, sidebar_html, content, rail_html)
   }
@@ -1380,15 +1462,17 @@ pub struct Zap.Doc {
     Typically called from a project's `main/1` after invoking
     `use Zap.Doc.Builder`.
     """
-  pub fn write_pages_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String, landing_md :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}], impl_summaries :: [%{Atom => Term}], variant_summaries :: [%{Atom => Term}], required_summaries :: [%{Atom => Term}], js_content :: String) -> i64 {
+  pub fn write_pages_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String, landing_md :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}], impl_summaries :: [%{Atom => Term}], variant_summaries :: [%{Atom => Term}], required_summaries :: [%{Atom => Term}], guide_summaries :: [%{Atom => Term}], js_content :: String) -> i64 {
     _ = File.mkdir(out_dir <> "/structs")
     structs = sort_names_alpha(manifest_names(struct_summaries, []))
     protocols = sort_names_alpha(manifest_names(protocol_summaries, []))
     unions = sort_names_alpha(manifest_names(union_summaries, []))
-    written_structs = write_summary_pages(out_dir, struct_summaries, :struct, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
-    written_protocols = write_summary_pages(out_dir, protocol_summaries, :protocol, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
-    written_unions = write_summary_pages(out_dir, union_summaries, :union, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
-    index_html = render_index_page(structs, protocols, unions, struct_summaries, project_name, project_version, source_url, landing_md)
+    guide_slugs = sort_names_alpha(collect_guide_slugs(guide_summaries, [] :: [String]))
+    written_structs = write_summary_pages(out_dir, struct_summaries, :struct, project_name, project_version, source_url, structs, protocols, unions, guide_slugs, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
+    written_protocols = write_summary_pages(out_dir, protocol_summaries, :protocol, project_name, project_version, source_url, structs, protocols, unions, guide_slugs, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
+    written_unions = write_summary_pages(out_dir, union_summaries, :union, project_name, project_version, source_url, structs, protocols, unions, guide_slugs, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
+    written_guides = write_guide_pages(out_dir, guide_summaries, project_name, project_version, source_url, structs, protocols, unions, guide_slugs, 0)
+    index_html = render_index_page(structs, protocols, unions, guide_slugs, struct_summaries, project_name, project_version, source_url, landing_md)
     _ = File.write(out_dir <> "/index.html", index_html)
     search_json = render_search_index(struct_summaries, protocol_summaries, union_summaries, function_summaries, macro_summaries)
     _ = File.write(out_dir <> "/search-index.json", search_json)
@@ -1398,7 +1482,93 @@ pub struct Zap.Doc {
     # works without a fetch — matching the legacy generator's
     # `generateScriptWithIndex` shape.
     _ = File.write(out_dir <> "/app.js", "var ZAP_SEARCH_DATA = " <> search_json <> ";\n" <> js_content)
-    written_structs + written_protocols + written_unions
+    written_structs + written_protocols + written_unions + written_guides
+  }
+
+  @doc = """
+    Walk the guide manifest and pull each entry's slug out of the
+    `:source_path` field. Slug = filename stem (basename minus the
+    `.md` extension); `guides/integer.md` becomes `integer`.
+    """
+  pub fn collect_guide_slugs(guides :: [%{Atom => Term}], acc :: [String]) -> [String] {
+    if List.empty?(guides) {
+      acc
+    } else {
+      head = List.head(guides)
+      tail = List.tail(guides)
+      slug = guide_slug_from_source(Map.get(head, :source_path, ""))
+      if String.length(slug) == 0 {
+        collect_guide_slugs(tail, acc)
+      } else {
+        collect_guide_slugs(tail, List.append(acc, slug))
+      }
+    }
+  }
+
+  @doc = """
+    Strip the directory prefix and `.md` suffix from a guide source
+    path: `guides/integer.md` -> `integer`. Empty input yields the
+    empty string so the caller can filter out entries that lost their
+    path during reflection.
+    """
+  pub fn guide_slug_from_source(source_path :: String) -> String {
+    base = Path.basename(source_path)
+    if String.ends_with?(base, ".md") {
+      String.slice(base, 0, String.length(base) - 3)
+    } else {
+      base
+    }
+  }
+
+  @doc = """
+    Render every entry in the guide manifest to
+    `<out_dir>/guides/<slug>.html`. Each guide is loaded at runtime
+    via `File.read/1`, rendered through `Markdown.to_html/1`, and
+    framed by the same chrome (topbar / sidebar / structdoc body)
+    used on per-struct pages so the look is consistent. Returns the
+    number of pages successfully written.
+    """
+  pub fn write_guide_pages(out_dir :: String, guides :: [%{Atom => Term}], project_name :: String, project_version :: String, source_url :: String, structs :: [String], protocols :: [String], unions :: [String], guide_slugs :: [String], acc :: i64) -> i64 {
+    if List.empty?(guides) {
+      acc
+    } else {
+      _ = File.mkdir(out_dir <> "/guides")
+      head = List.head(guides)
+      tail = List.tail(guides)
+      slug = guide_slug_from_source(Map.get(head, :source_path, ""))
+      next_acc = if String.length(slug) == 0 {
+        acc
+      } else {
+        write_one_guide_page(out_dir, head, slug, project_name, project_version, source_url, structs, protocols, unions, guide_slugs, acc)
+      }
+      write_guide_pages(out_dir, tail, project_name, project_version, source_url, structs, protocols, unions, guide_slugs, next_acc)
+    }
+  }
+
+  pub fn write_one_guide_page(out_dir :: String, guide :: %{Atom => Term}, slug :: String, project_name :: String, project_version :: String, source_url :: String, structs :: [String], protocols :: [String], unions :: [String], guide_slugs :: [String], acc :: i64) -> i64 {
+    source_path = Map.get(guide, :source_path, "")
+    markdown_text = File.read(source_path)
+    if String.length(markdown_text) == 0 {
+      acc
+    } else {
+      page_html = render_guide_page(slug, markdown_text, project_name, project_version, source_url, structs, protocols, unions, guide_slugs)
+      ok = File.write(out_dir <> "/guides/" <> slug <> ".html", page_html)
+      if ok { acc + 1 } else { acc }
+    }
+  }
+
+  @doc = """
+    Compose the full HTML for one guide page. Mirrors the legacy
+    `generateModuleGuidePage` shape: standard topbar/sidebar/footer
+    chrome with the rendered markdown body wrapped in
+    `<article class="guide-article structdoc">`.
+    """
+  pub fn render_guide_page(slug :: String, markdown_text :: String, project_name :: String, project_version :: String, source_url :: String, structs :: [String], protocols :: [String], unions :: [String], guide_slugs :: [String]) -> String {
+    title = title_case(slug)
+    body_html = Markdown.to_html(markdown_text)
+    article = "<article class=\"guide-article structdoc\">\n" <> body_html <> "</article>\n"
+    sidebar_html = sidebar(structs, protocols, unions, guide_slugs, slug, "../", project_name, project_version)
+    struct_page(project_name, project_version, title, "../", source_url, sidebar_html, article, "")
   }
 
   @doc = """
@@ -1409,13 +1579,13 @@ pub struct Zap.Doc {
     back to a struct-card grid with the project name, version pill,
     and one card per declared struct (legacy `appendDefaultLanding`).
     """
-  pub fn render_index_page(structs :: [String], protocols :: [String], unions :: [String], struct_summaries :: [%{Atom => Term}], project_name :: String, project_version :: String, source_url :: String, landing_md :: String) -> String {
+  pub fn render_index_page(structs :: [String], protocols :: [String], unions :: [String], guide_slugs :: [String], struct_summaries :: [%{Atom => Term}], project_name :: String, project_version :: String, source_url :: String, landing_md :: String) -> String {
     content = if String.length(landing_md) == 0 {
       render_default_landing(structs, struct_summaries, project_name, project_version)
     } else {
       "<div class=\"structdoc\">\n" <> Markdown.to_html(landing_md) <> "</div>\n"
     }
-    sidebar_html = sidebar(structs, protocols, unions, "", "", project_name, project_version)
+    sidebar_html = sidebar(structs, protocols, unions, guide_slugs, "", "", project_name, project_version)
     struct_page(project_name, project_version, project_name, "", source_url, sidebar_html, content, "")
   }
 
@@ -1550,20 +1720,20 @@ pub struct Zap.Doc {
     surfaces a Bool, which we count toward the total only when true so
     a partial failure doesn't lie about how much output landed.
     """
-  pub fn write_summary_pages(out_dir :: String, summaries :: [%{Atom => Term}], kind :: Atom, project_name :: String, project_version :: String, source_url :: String, structs :: [String], protocols :: [String], unions :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}], all_variants :: [%{Atom => Term}], all_required :: [%{Atom => Term}], acc :: i64) -> i64 {
+  pub fn write_summary_pages(out_dir :: String, summaries :: [%{Atom => Term}], kind :: Atom, project_name :: String, project_version :: String, source_url :: String, structs :: [String], protocols :: [String], unions :: [String], guide_slugs :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}], all_variants :: [%{Atom => Term}], all_required :: [%{Atom => Term}], acc :: i64) -> i64 {
     if List.empty?(summaries) {
       acc
     } else {
       head = List.head(summaries)
       tail = List.tail(summaries)
       name = Map.get(head, :name, "")
-      html = render_summary_page(head, kind, project_name, project_version, source_url, structs, protocols, unions, all_functions, all_macros, all_impls, all_variants, all_required)
+      html = render_summary_page(head, kind, project_name, project_version, source_url, structs, protocols, unions, guide_slugs, all_functions, all_macros, all_impls, all_variants, all_required)
       path = out_dir <> "/structs/" <> name <> ".html"
       ok = File.write(path, html)
       if ok {
-        write_summary_pages(out_dir, tail, kind, project_name, project_version, source_url, structs, protocols, unions, all_functions, all_macros, all_impls, all_variants, all_required, acc + 1)
+        write_summary_pages(out_dir, tail, kind, project_name, project_version, source_url, structs, protocols, unions, guide_slugs, all_functions, all_macros, all_impls, all_variants, all_required, acc + 1)
       } else {
-        write_summary_pages(out_dir, tail, kind, project_name, project_version, source_url, structs, protocols, unions, all_functions, all_macros, all_impls, all_variants, all_required, acc)
+        write_summary_pages(out_dir, tail, kind, project_name, project_version, source_url, structs, protocols, unions, guide_slugs, all_functions, all_macros, all_impls, all_variants, all_required, acc)
       }
     }
   }

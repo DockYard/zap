@@ -66,7 +66,7 @@ pub struct Zap.DocBuilderTest {
 
     test("render_summary_page composes name + doc into HTML") {
       summary = List.head(manifest_struct_summaries())
-      html = Zap.Doc.render_summary_page(summary, :struct, "Zap", "0.0.0", "https://github.com/DockYard/zap", manifest_structs(), manifest_protocols(), manifest_unions(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries())
+      html = Zap.Doc.render_summary_page(summary, :struct, "Zap", "0.0.0", "https://github.com/DockYard/zap", manifest_structs(), manifest_protocols(), manifest_unions(), [] :: [String], manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries())
       assert(String.contains?(html, "Atom"))
       assert(String.contains?(html, "Functions for working with atoms"))
     }

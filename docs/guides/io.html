@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Stringable — Zap</title>
+<title>Io — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -86,7 +86,7 @@
 <li><a href="../structs/Concatenable.html">Concatenable</a></li>
 <li><a href="../structs/Enumerable.html">Enumerable</a></li>
 <li><a href="../structs/Membership.html">Membership</a></li>
-<li class="active"><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
 <li><a href="../structs/Updatable.html">Updatable</a></li>
 </ul>
 </div>
@@ -101,41 +101,83 @@
 <ul>
 <li><a href="../guides/enum.html">Enum</a></li>
 <li><a href="../guides/integer.html">Integer</a></li>
-<li><a href="../guides/io.html">Io</a></li>
+<li class="active"><a href="../guides/io.html">Io</a></li>
 <li><a href="../guides/list.html">List</a></li>
 <li><a href="../guides/string.html">String</a></li>
 </ul>
 </div>
 </nav>
 <main class="content">
-<nav class="breadcrumb" aria-label="Breadcrumb">
-<span>Protocols</span>
-<span>/</span>
-<span class="breadcrumb-current">Stringable</span>
-</nav>
-<h1 class="page-title">Stringable</h1>
-<p class="tagline">Protocol for types that can be converted to a `String`.</p>
-<div class="structdoc">
-<p>Protocol for types that can be converted to a <code>String</code>.</p>
-<p>String interpolation <code>&quot;hello \#{x}&quot;</code> desugars to
-<code>&quot;hello &quot; &lt;&gt; Stringable.to_string(x)</code>, so any type with a
-<code>Stringable</code> impl can appear inside a <code>\#{}</code> interpolation. Built-in
-implementations cover <code>Atom</code>, <code>Bool</code>, <code>Float</code>, <code>Integer</code>, and
-<code>String</code> (the identity case). User types can opt in with
-<code>pub impl Stringable for MyType { pub fn to_string(...) }</code>.</p>
-<p>Compared to a single <code>Kernel.to_string(value :: any)</code> function with
-runtime type-dispatch, the protocol form lets the compiler pick the
-right implementation at HIR time based on the argument's static type
-— no any-tagging, no runtime branch.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-string">"n is \#{42}"</span>        <span class="hl-comment"># uses `Integer.to_string`</span>
-<span class="hl-string">"ok is \#{:ok}"</span>      <span class="hl-comment"># uses `Atom.to_string`</span>
-<span class="hl-string">"flag is \#{true}"</span>   <span class="hl-comment"># uses `Bool.to_string`</span></code></pre>
-</div>
-<h2 id="required-functions">Required Functions</h2>
-<table class="summary">
-<tr><td class="summary-name"><a href="#to_string-0">to_string/0</a></td><td class="summary-doc">to_string(value) -&gt; String</td></tr>
-</table>
+<article class="guide-article structdoc">
+<h1>IO</h1>
+<p><code>IO</code> is the bridge between your Zap program and the world outside it. It
+covers the three streams every program inherits — <code>stdout</code>, <code>stderr</code>,
+<code>stdin</code> — and the terminal modes that make interactive programs possible.</p>
+<p>There is intentionally no buffered, structured &quot;logger&quot; or &quot;file handle&quot;
+here. <code>File</code> covers files; <code>IO</code> covers the program's standard streams.</p>
+<h2>Writing to stdout</h2>
+<pre><code class="language-zap">IO.puts(<span class="hl-string">"hello"</span>)            <span class="hl-comment"># writes &quot;hello\n&quot;</span>
+IO.print_str(<span class="hl-string">"no newline"</span>)  <span class="hl-comment"># writes &quot;no newline&quot;</span></code></pre>
+<p><code>puts/1</code> is the right default for human-readable output. Use <code>print_str/1</code>
+when you're composing fragments that would otherwise produce stray newlines.</p>
+<p>For diagnostic output, prefer <code>warn/1</code>:</p>
+<pre><code class="language-zap">IO.warn(<span class="hl-string">"ignoring malformed line"</span>)   <span class="hl-comment"># writes to stderr with newline</span></code></pre>
+<p>Sending diagnostics to <code>stderr</code> keeps them out of any pipeline that consumes
+your program's <code>stdout</code>.</p>
+<h2>Reading from stdin</h2>
+<pre><code class="language-zap">line <span class="hl-op">=</span> IO.gets()    <span class="hl-comment"># blocks until a newline is read</span></code></pre>
+<p><code>gets/0</code> returns the line including the trailing newline. Use <code>String.trim/1</code>
+if you want it stripped:</p>
+<pre><code class="language-zap">IO.print_str(<span class="hl-string">"name: "</span>)
+name <span class="hl-op">=</span> <span class="hl-type">String</span>.trim(IO.gets())
+IO.puts(<span class="hl-string">"hello, \#{name}"</span>)</code></pre>
+<p>Single-character reads are explicit:</p>
+<pre><code class="language-zap">ch <span class="hl-op">=</span> IO.get_char()        <span class="hl-comment"># blocking, one byte</span>
+maybe <span class="hl-op">=</span> IO.try_get_char() <span class="hl-comment"># non-blocking; returns &quot;&quot; if no input is ready</span></code></pre>
+<p><code>try_get_char/0</code> is the building block for event loops that can't afford to
+block while waiting for a key.</p>
+<h2>Terminal modes</h2>
+<p>Standard &quot;cooked&quot; terminal mode buffers input until you press Enter and
+echoes characters back. Interactive programs usually need raw mode — every
+key arrives immediately, there is no echo, and signal characters like
+Ctrl+C don't get special treatment.</p>
+<p>The two-arity form is the safe way to use raw mode:</p>
+<pre><code class="language-zap">IO.mode(<span class="hl-atom">:raw</span>, <span class="hl-keyword">fn</span>() {
+  <span class="hl-keyword">case</span> IO.get_char() {
+    <span class="hl-string">"q"</span> <span class="hl-op">-&gt;</span> <span class="hl-atom">:quit</span>
+    other <span class="hl-op">-&gt;</span> other
+  }
+})</code></pre>
+<p><code>IO.mode/2</code> switches into the requested mode, runs your callback, and always
+restores the previous mode — even if the callback raises. You don't have to
+remember to flip the terminal back; if you forgot, your shell would be stuck
+in raw mode after the program exited.</p>
+<p>The single-arity form is escape hatch for cases where you genuinely want to
+manage the lifetime yourself:</p>
+<pre><code class="language-zap">IO.mode(<span class="hl-atom">:raw</span>)
+<span class="hl-comment"># ... do work ...</span>
+IO.mode(<span class="hl-atom">:cooked</span>)</code></pre>
+<h2>A small example: a key-driven menu</h2>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> run() {
+  IO.mode(<span class="hl-atom">:raw</span>, <span class="hl-keyword">fn</span>() {
+    IO.puts(<span class="hl-string">"Press: (q)uit, (r)eload, (h)elp"</span>)
+    <span class="hl-keyword">case</span> IO.get_char() {
+      <span class="hl-string">"q"</span> <span class="hl-op">-&gt;</span> <span class="hl-atom">:quit</span>
+      <span class="hl-string">"r"</span> <span class="hl-op">-&gt;</span> reload()
+      <span class="hl-string">"h"</span> <span class="hl-op">-&gt;</span> help()
+      _   <span class="hl-op">-&gt;</span> <span class="hl-atom">:unknown</span>
+    }
+  })
+}</code></pre>
+<p>The callback returns its value out of <code>IO.mode/2</code>, so the result of the
+menu propagates normally.</p>
+<h2>See also</h2>
+<ul>
+<li><code>File</code> — reading and writing files</li>
+<li><code>System</code> — environment variables, command-line arguments, process info</li>
+<li><code>IO.Mode</code> — the union of supported terminal modes</li>
+</ul>
+</article>
 </main>
 </div>
 <div id="search-modal" class="search-modal" hidden>

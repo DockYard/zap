@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>String — Zap</title>
+<link rel="stylesheet" href="../style.css">
+<meta name="zap-docs-base" content="../">
+</head>
+<body>
+<header class="topbar">
+<div class="topbar-left">
+<svg class="zap-mark" width="22" height="22" viewBox="0 0 22 22" fill="none">
+<rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
+<path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
+</svg>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
+<span class="docs-label">docs</span>
+</div>
+<div class="topbar-center">
+<button class="topbar-search-trigger" id="search-trigger">
+<svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+<circle cx="7" cy="7" r="5" stroke="var(--fg-muted)" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="var(--fg-muted)" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<span>Search structs, functions, guides...</span>
+<kbd>⌘</kbd><kbd>K</kbd>
+</button>
+</div>
+<div class="topbar-right">
+<button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+<span class="theme-icon-light">☀</span>
+<span class="theme-icon-dark">☾</span>
+</button>
+<div class="topbar-divider"></div>
+<a href="https://github.com/DockYard/zap" class="topbar-github" aria-label="GitHub repository" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+</svg>
+</a>
+</div>
+</header>
+<div class="layout layout-no-toc">
+<nav class="sidebar">
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
+<div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
+<div class="sidebar-group" data-group="Structs">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
+<ul>
+<li><a href="../structs/Atom.html">Atom</a></li>
+<li><a href="../structs/Bool.html">Bool</a></li>
+<li><a href="../structs/Enum.html">Enum</a></li>
+<li><a href="../structs/File.html">File</a></li>
+<li><a href="../structs/Float.html">Float</a></li>
+<li><a href="../structs/Function.html">Function</a></li>
+<li><a href="../structs/IO.html">IO</a></li>
+<li><a href="../structs/Integer.html">Integer</a></li>
+<li><a href="../structs/Kernel.html">Kernel</a></li>
+<li><a href="../structs/List.html">List</a></li>
+<li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
+<li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Path.html">Path</a></li>
+<li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
+<li><a href="../structs/String.html">String</a></li>
+<li><a href="../structs/Struct.html">Struct</a></li>
+<li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.Doc.Runner.html">Zap.Doc.Runner</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
+<li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Protocols">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Protocols</h4></button>
+<ul>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Unions">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Unions</h4></button>
+<ul>
+<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Guides">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Guides</h4></button>
+<ul>
+<li><a href="../guides/enum.html">Enum</a></li>
+<li><a href="../guides/integer.html">Integer</a></li>
+<li><a href="../guides/io.html">Io</a></li>
+<li><a href="../guides/list.html">List</a></li>
+<li class="active"><a href="../guides/string.html">String</a></li>
+</ul>
+</div>
+</nav>
+<main class="content">
+<article class="guide-article structdoc">
+<h1>String</h1>
+<p><code>String</code> in Zap is a UTF-8 byte sequence. There is no separate &quot;char&quot; type
+and no separate &quot;byte string&quot; type. A string is a string.</p>
+<p>Most of what you'll do with strings — compare, search, split, slice, format —
+goes through the <code>String</code> module. The <code>&lt;&gt;</code> operator concatenates via the
+<code>Concatenable</code> protocol, and <code>Enum</code> works against strings as a sequence of
+single-byte strings when you need to iterate.</p>
+<h2>Construction and interpolation</h2>
+<p>The <code>~s&quot;...&quot;</code> sigil (and the equivalent <code>&quot;...&quot;</code> literal in most positions)
+produce a <code>String</code>. Interpolation uses <code>\#{expr}</code>:</p>
+<pre><code class="language-zap">name <span class="hl-op">=</span> <span class="hl-string">"world"</span>
+greeting <span class="hl-op">=</span> <span class="hl-string">"hello, \#{name}!"</span>        <span class="hl-comment"># =&gt; &quot;hello, world!&quot;</span></code></pre>
+<p>For a raw string with no interpolation, use <code>~S&quot;...&quot;</code>. For a list of words,
+<code>~w[foo bar baz]</code> produces <code>[&quot;foo&quot;, &quot;bar&quot;, &quot;baz&quot;]</code>.</p>
+<h2>Comparing and searching</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.starts_with?(<span class="hl-string">"filename.zap"</span>, <span class="hl-string">"file"</span>)    <span class="hl-comment"># =&gt; true</span>
+<span class="hl-type">String</span>.ends_with?(<span class="hl-string">"filename.zap"</span>, <span class="hl-string">".zap"</span>)      <span class="hl-comment"># =&gt; true</span>
+<span class="hl-type">String</span>.contains?(<span class="hl-string">"a long sentence"</span>, <span class="hl-string">"long"</span>)    <span class="hl-comment"># =&gt; true</span>
+<span class="hl-type">String</span>.index_of(<span class="hl-string">"hello"</span>, <span class="hl-string">"ll"</span>)                 <span class="hl-comment"># =&gt; 2</span>
+<span class="hl-type">String</span>.index_of(<span class="hl-string">"hello"</span>, <span class="hl-string">"zz"</span>)                 <span class="hl-comment"># =&gt; -1</span></code></pre>
+<p><code>index_of/2</code> returns <code>-1</code> for &quot;not found&quot; rather than wrapping the result in
+an option. Same convention as <code>Enum.find/3</code> — Zap prefers a cheap sentinel
+over allocating a wrapper.</p>
+<h2>Slicing and trimming</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.slice(<span class="hl-string">"hello world"</span>, <span class="hl-number">0</span>, <span class="hl-number">5</span>)    <span class="hl-comment"># =&gt; &quot;hello&quot;</span>
+<span class="hl-type">String</span>.slice(<span class="hl-string">"hello world"</span>, <span class="hl-number">6</span>, <span class="hl-number">11</span>)   <span class="hl-comment"># =&gt; &quot;world&quot;</span>
+<span class="hl-type">String</span>.trim(<span class="hl-string">"  hi  "</span>)                <span class="hl-comment"># =&gt; &quot;hi&quot;</span></code></pre>
+<p>Indices are byte offsets. For ASCII text this is the same as character
+offsets; for multi-byte UTF-8 you need to think in bytes (or split before
+slicing).</p>
+<h2>Splitting and joining</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.split(<span class="hl-string">"a,b,c"</span>, <span class="hl-string">","</span>)           <span class="hl-comment"># =&gt; [&quot;a&quot;, &quot;b&quot;, &quot;c&quot;]</span>
+<span class="hl-type">String</span>.join([<span class="hl-string">"a"</span>, <span class="hl-string">"b"</span>, <span class="hl-string">"c"</span>], <span class="hl-string">", "</span>)   <span class="hl-comment"># =&gt; &quot;a, b, c&quot;</span></code></pre>
+<p><code>split/2</code> always returns a list. If you only want the first part, take it:</p>
+<pre><code class="language-zap"><span class="hl-string">"name: Alice"</span>
+<span class="hl-op">|&gt;</span> <span class="hl-type">String</span>.split(<span class="hl-string">": "</span>)
+<span class="hl-op">|&gt;</span> List.head()                        <span class="hl-comment"># =&gt; &quot;name&quot;</span></code></pre>
+<h2>Casing and padding</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.upcase(<span class="hl-string">"zap"</span>)                       <span class="hl-comment"># =&gt; &quot;ZAP&quot;</span>
+<span class="hl-type">String</span>.downcase(<span class="hl-string">"ZAP"</span>)                     <span class="hl-comment"># =&gt; &quot;zap&quot;</span>
+<span class="hl-type">String</span>.capitalize(<span class="hl-string">"hello world"</span>)           <span class="hl-comment"># =&gt; &quot;Hello world&quot;</span>
+<span class="hl-type">String</span>.pad_leading(<span class="hl-string">"42"</span>, <span class="hl-number">5</span>, <span class="hl-string">"0"</span>)           <span class="hl-comment"># =&gt; &quot;00042&quot;</span>
+<span class="hl-type">String</span>.pad_trailing(<span class="hl-string">"zap"</span>, <span class="hl-number">6</span>, <span class="hl-string">"."</span>)         <span class="hl-comment"># =&gt; &quot;zap...&quot;</span></code></pre>
+<h2>Converting to and from numbers</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.to_integer(<span class="hl-string">"42"</span>)    <span class="hl-comment"># =&gt; 42</span>
+<span class="hl-type">String</span>.to_float(<span class="hl-string">"3.14"</span>)    <span class="hl-comment"># =&gt; 3.14</span>
+
+Integer.to_string(<span class="hl-number">42</span>)      <span class="hl-comment"># =&gt; &quot;42&quot;</span>
+Float.to_string(<span class="hl-number">3.14</span>)      <span class="hl-comment"># =&gt; &quot;3.14&quot;</span></code></pre>
+<p>These functions raise on a malformed input. If you can't trust the source,
+validate before converting.</p>
+<h2>Strings as enumerables</h2>
+<p>Because <code>String</code> implements <code>Enumerable</code>, every <code>Enum</code> function works on it:</p>
+<pre><code class="language-zap">Enum.count(<span class="hl-string">"hello"</span>, <span class="hl-keyword">fn</span>(c) { c <span class="hl-op">==</span> <span class="hl-string">"l"</span> })          <span class="hl-comment"># =&gt; 2</span>
+Enum.map(<span class="hl-string">"abc"</span>, <span class="hl-keyword">fn</span>(c) { <span class="hl-type">String</span>.upcase(c) })      <span class="hl-comment"># =&gt; [&quot;A&quot;, &quot;B&quot;, &quot;C&quot;]</span></code></pre>
+<p>The element type is <code>String</code> (a single-byte string), not a code point. If
+you need code-point handling, work in the byte domain explicitly.</p>
+<h2>Concatenation via <code>&lt;&gt;</code></h2>
+<p>The <code>&lt;&gt;</code> operator is concatenation through the <code>Concatenable</code> protocol:</p>
+<pre><code class="language-zap"><span class="hl-string">"hello"</span> <span class="hl-op">&lt;&gt;</span> <span class="hl-string">", "</span> <span class="hl-op">&lt;&gt;</span> <span class="hl-string">"world"</span>   <span class="hl-comment"># =&gt; &quot;hello, world&quot;</span></code></pre>
+<p>For larger assemblies, prefer <code>String.join/2</code> — it allocates once instead of
+once per pair.</p>
+<h2>See also</h2>
+<ul>
+<li><code>Concatenable</code> protocol — <code>&lt;&gt;</code> operator behavior</li>
+<li><code>Enum</code> — generic operations that also work on strings</li>
+<li><code>Path</code> — string operations that understand path separators</li>
+</ul>
+</article>
+</main>
+</div>
+<div id="search-modal" class="search-modal" hidden>
+<div class="search-backdrop"></div>
+<div class="search-dialog">
+<div class="search-header">
+<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+<circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<input type="text" id="search-modal-input" placeholder="Search Zap docs…" aria-label="Search">
+<kbd>ESC</kbd>
+</div>
+<ul id="search-results" class="search-results"></ul>
+<div class="search-footer">
+<span class="search-footer-item"><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+<span class="search-footer-item"><kbd>↵</kbd> open</span>
+<span class="spacer"></span>
+<span class="search-footer-item"><kbd>ESC</kbd> close</span>
+</div>
+</div>
+</div>
+<script src="../app.js"></script>
+</body>
+</html>

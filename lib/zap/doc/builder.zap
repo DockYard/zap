@@ -148,6 +148,26 @@ pub struct Zap.Doc.Builder {
       }
     })
 
+    # Long-form guide markdown files. Convention is `<project>/guides/<slug>.md`
+    # — the legacy Zig generator looked up guides by per-module slug; the
+    # Zap-side runner globs the directory at compile time and bakes a
+    # summary per file. The runtime walker reads each file and emits a
+    # `docs/guides/<slug>.html` page; the sidebar Guides group lists each
+    # slug as a link. An empty `guides/` directory just produces an empty
+    # manifest, no Guides group, no guide pages.
+    guide_paths = Path.glob("guides/*.md")
+    # The `is_user_provided` Bool is here to force the map's value type
+    # to `Term` so it composes with the other Term-valued summary lists
+    # in `Zap.Doc`. Without it the inference picks `[%{Atom => String}]`
+    # from the single-string-field shape and downstream callers expecting
+    # `[%{Atom => Term}]` reject it.
+    guide_summaries = for guide_path <- guide_paths {
+      %{
+        source_path: guide_path,
+        is_user_provided: true,
+      }
+    }
+
     # Embed the static stylesheet and theme/search JS at compile time
     # so the runtime walker can drop them next to the generated HTML
     # without any filesystem awareness of the original asset locations.
@@ -206,8 +226,21 @@ pub struct Zap.Doc.Builder {
         unquote(if list_length(required_function_summaries) > 0 { required_function_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
+      @doc = """
+        Flat list of every long-form guide discovered under `guides/*.md`
+        in the project root at compile time. Each entry is a
+        `%{Atom => Term}` map with a `:source_path` key naming the
+        markdown file relative to the runtime working directory. The
+        runtime walker reads each file with `File.read/1` and renders it
+        through `Markdown.to_html/1`; the sidebar derives the Guides
+        group from the same manifest.
+        """
+      pub fn manifest_guide_summaries() -> [%{Atom => Term}] {
+        unquote(if list_length(guide_summaries) > 0 { guide_summaries } else { quote { [] :: [%{Atom => Term}] } })
+      }
+
       pub fn render_first_struct_html() -> String {
-        Zap.Doc.render_summary_page(List.head(manifest_struct_summaries()), :struct, "Zap", "0.0.0", "", manifest_structs(), manifest_protocols(), manifest_unions(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries())
+        Zap.Doc.render_summary_page(List.head(manifest_struct_summaries()), :struct, "Zap", "0.0.0", "", manifest_structs(), manifest_protocols(), manifest_unions(), [] :: [String], manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries())
       }
 
       @doc = """
@@ -236,7 +269,7 @@ pub struct Zap.Doc.Builder {
         # `app.js` is written inside `Zap.Doc.write_pages_to` after the
         # search index has been rendered, so the bundled JS lands with
         # its `ZAP_SEARCH_DATA` corpus already inlined at the top.
-        Zap.Doc.write_pages_to(out_dir, project_name, project_version, source_url, landing_md, manifest_struct_summaries(), manifest_protocol_summaries(), manifest_union_summaries(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries(), unquote(doc_js))
+        Zap.Doc.write_pages_to(out_dir, project_name, project_version, source_url, landing_md, manifest_struct_summaries(), manifest_protocol_summaries(), manifest_union_summaries(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries(), manifest_guide_summaries(), unquote(doc_js))
       }
     }
   }
