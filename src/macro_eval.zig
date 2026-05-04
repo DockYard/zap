@@ -2132,6 +2132,15 @@ fn structFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtV
         const family = &ctx.graph.families.items[entry.value_ptr.*];
         if (family.visibility != .public) continue;
         if (family.clauses.items.len == 0) continue;
+        // Skip impl-block functions that were reparented into the target
+        // struct's scope by `registerImplFunctionsInTargetScopes`. The
+        // family's primary `scope_id` still points at its declaring impl
+        // block, so a mismatch with the struct scope is the signal that
+        // this family belongs to a protocol-impl namespace, not to the
+        // struct itself. The legacy doc generator applied the same
+        // filter; without it `Integer` and similar structs end up
+        // listing every protocol operator alongside their own functions.
+        if (family.scope_id != struct_scope_id) continue;
         const name = ctx.interner.get(family.name);
         const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes) orelse "";
         const loc = declSourceLocation(ctx.graph, family.clauses.items[0].decl.meta);

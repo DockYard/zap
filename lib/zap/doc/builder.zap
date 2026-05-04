@@ -87,8 +87,8 @@ pub struct Zap.Doc.Builder {
           doc: map_get(_f, :doc, ""),
           source_file: map_get(_f, :source_file, ""),
           source_line: map_get(_f, :source_line, 0),
-          signatures_html: string_concat_list(for _sig <- map_get(_f, :signatures, []) {
-            "<div class=\"signature\"><code>" <> html_escape(_sig) <> "</code></div>\n"
+          signatures_joined: string_concat_list(for _sig <- map_get(_f, :signatures, []) {
+            _sig <> "\n"
           }),
         }
       }
@@ -103,8 +103,8 @@ pub struct Zap.Doc.Builder {
           doc: map_get(_m, :doc, ""),
           source_file: map_get(_m, :source_file, ""),
           source_line: map_get(_m, :source_line, 0),
-          signatures_html: string_concat_list(for _sig <- map_get(_m, :signatures, []) {
-            "<div class=\"signature\"><code>" <> html_escape(_sig) <> "</code></div>\n"
+          signatures_joined: string_concat_list(for _sig <- map_get(_m, :signatures, []) {
+            _sig <> "\n"
           }),
         }
       }

@@ -583,7 +583,32 @@ pub struct Zap.Doc {
     extras = render_kind_extras(kind, name, all_variants, all_required)
     content = body_html <> extras
     sidebar_html = sidebar(structs, protocols, unions, name, "../", project_name, project_version)
-    struct_page(project_name, project_version, name, "../", source_url, sidebar_html, content, "")
+    rail_html = render_right_rail(sorted_functions, sorted_macros)
+    struct_page(project_name, project_version, name, "../", source_url, sidebar_html, content, rail_html)
+  }
+
+  @doc = """
+    Render the right-rail "On this page" TOC from the sorted function
+    and macro lists. Each non-empty kind contributes a
+    `<li class="toc-section">` divider followed by one `toc_item` per
+    member. Returns the empty string when both lists are empty so
+    `layout` collapses to `layout-no-toc` and the content fills the
+    freed column.
+    """
+  pub fn render_right_rail(functions :: [%{Atom => Term}], macros :: [%{Atom => Term}]) -> String {
+    fn_section = if List.empty?(functions) { "" } else { toc_section_label("Functions") <> render_toc_items(functions, "") }
+    macro_section = if List.empty?(macros) { "" } else { toc_section_label("Macros") <> render_toc_items(macros, "") }
+    right_rail(fn_section <> macro_section)
+  }
+
+  pub fn render_toc_items(members :: [%{Atom => Term}], acc :: String) -> String {
+    if List.empty?(members) {
+      acc
+    } else {
+      head = List.head(members)
+      tail = List.tail(members)
+      render_toc_items(tail, acc <> toc_item(Map.get(head, :name, ""), Map.get(head, :arity, 0)))
+    }
   }
 
   @doc = """
@@ -780,7 +805,7 @@ pub struct Zap.Doc {
     } else {
       head = List.head(members)
       tail = List.tail(members)
-      block = compose_member_detail(Map.get(head, :name, ""), Map.get(head, :arity, 0), is_macro, Map.get(head, :doc, ""), Map.get(head, :source_file, ""), Map.get(head, :source_line, 0), Map.get(head, :signatures_html, ""), source_url, project_version)
+      block = compose_member_detail(Map.get(head, :name, ""), Map.get(head, :arity, 0), is_macro, Map.get(head, :doc, ""), Map.get(head, :source_file, ""), Map.get(head, :source_line, 0), Map.get(head, :signatures_joined, ""), source_url, project_version)
       render_member_details_sorted(tail, is_macro, source_url, project_version, acc <> block)
     }
   }
@@ -804,23 +829,289 @@ pub struct Zap.Doc {
 
   pub fn member_detail_for_module(member :: %{Atom => Term}, module_name :: String, is_macro :: Bool, source_url :: String, project_version :: String) -> String {
     if Map.get(member, :module, "") == module_name {
-      compose_member_detail(Map.get(member, :name, ""), Map.get(member, :arity, 0), is_macro, Map.get(member, :doc, ""), Map.get(member, :source_file, ""), Map.get(member, :source_line, 0), Map.get(member, :signatures_html, ""), source_url, project_version)
+      compose_member_detail(Map.get(member, :name, ""), Map.get(member, :arity, 0), is_macro, Map.get(member, :doc, ""), Map.get(member, :source_file, ""), Map.get(member, :source_line, 0), Map.get(member, :signatures_joined, ""), source_url, project_version)
     } else {
       ""
     }
   }
 
-  pub fn compose_member_detail(name :: String, arity :: i64, is_macro :: Bool, doc :: String, source_file :: String, source_line :: i64, signatures_html :: String, source_url :: String, project_version :: String) -> String {
+  pub fn compose_member_detail(name :: String, arity :: i64, is_macro :: Bool, doc :: String, source_file :: String, source_line :: i64, signatures_joined :: String, source_url :: String, project_version :: String) -> String {
     doc_html = Markdown.to_html(doc)
     open_div = "<div class=\"function-detail\" id=\"" <> anchor_id(name, arity) <> "\">\n"
     header = function_header(name, arity, is_macro)
+    sigs_html = render_signatures(signatures_joined)
     body = if String.length(doc_html) == 0 {
       ""
     } else {
       "<div class=\"function-doc\">\n" <> doc_html <> "</div>\n"
     }
     source = source_link(source_file, source_line, source_url, project_version)
-    open_div <> header <> signatures_html <> body <> source <> "</div>\n"
+    open_div <> header <> sigs_html <> body <> source <> "</div>\n"
+  }
+
+  @doc = """
+    Split a newline-joined block of bare signature strings (the
+    `:signatures_joined` value baked at compile time by
+    `Zap.Doc.Builder`) and render each one through the rich-signature
+    renderer. Empty input returns the empty string so callers can
+    splice unconditionally.
+    """
+  pub fn render_signatures(signatures_joined :: String) -> String {
+    if String.length(signatures_joined) == 0 {
+      ""
+    } else {
+      render_signatures_walk(String.split(signatures_joined, "\n"), "")
+    }
+  }
+
+  pub fn render_signatures_walk(sigs :: [String], acc :: String) -> String {
+    if List.empty?(sigs) {
+      acc
+    } else {
+      head = List.head(sigs)
+      tail = List.tail(sigs)
+      if String.length(head) == 0 {
+        render_signatures_walk(tail, acc)
+      } else {
+        render_signatures_walk(tail, acc <> rich_signature_block(head))
+      }
+    }
+  }
+
+  @doc = """
+    Render one signature string as the structured `<div class="signature">`
+    block the legacy generator emitted: `<span class="sig-name">`,
+    `<span class="sig-paren">(</span>`, typed-param pills, the
+    arrow `<span class="sig-arrow">→</span>`, and the return-type pill.
+    Falls back to the plain `<code>` form when the signature shape
+    can't be parsed.
+    """
+  pub fn rich_signature_block(signature :: String) -> String {
+    paren_open = String.index_of(signature, "(")
+    if paren_open < 0 {
+      "<div class=\"signature\"><code>" <> escape_html(signature) <> "</code></div>\n"
+    } else {
+      rich_signature_with_open(signature, paren_open)
+    }
+  }
+
+  pub fn rich_signature_with_open(signature :: String, paren_open :: i64) -> String {
+    paren_close = matching_close_paren(signature, paren_open + 1, 1, String.length(signature))
+    if paren_close < 0 {
+      "<div class=\"signature\"><code>" <> escape_html(signature) <> "</code></div>\n"
+    } else {
+      rich_signature_assemble(signature, paren_open, paren_close)
+    }
+  }
+
+  pub fn rich_signature_assemble(signature :: String, paren_open :: i64, paren_close :: i64) -> String {
+    sig_name = String.slice(signature, 0, paren_open)
+    params = String.slice(signature, paren_open + 1, paren_close)
+    rest = String.slice(signature, paren_close + 1, String.length(signature))
+    params_html = render_signature_params(params)
+    return_html = render_signature_return(rest)
+    body = "<span class=\"sig-name\">" <> escape_html(sig_name) <> "</span><span class=\"sig-paren\">(</span>" <> params_html <> "<span class=\"sig-paren\">)</span>" <> return_html
+    "<div class=\"signature\"><code>" <> body <> "</code></div>\n"
+  }
+
+  @doc = """
+    Walk a signature string from `index` looking for the close paren
+    that matches the open paren the caller already consumed. Tracks
+    nesting so function-typed parameters with their own parens
+    (`(T) -> R`) don't trip the scanner. Returns -1 if no match is
+    found before `end_index`.
+    """
+  pub fn matching_close_paren(text :: String, index :: i64, depth :: i64, end_index :: i64) -> i64 {
+    if index >= end_index {
+      -1
+    } else {
+      ch = String.byte_at(text, index)
+      if ch == "(" {
+        matching_close_paren(text, index + 1, depth + 1, end_index)
+      } else {
+        if ch == ")" {
+          if depth == 1 {
+            index
+          } else {
+            matching_close_paren(text, index + 1, depth - 1, end_index)
+          }
+        } else {
+          matching_close_paren(text, index + 1, depth, end_index)
+        }
+      }
+    }
+  }
+
+  @doc = """
+    Render the parameter list of a signature. Splits on top-level
+    commas (so a function-typed parameter with its own commas inside
+    parens stays grouped), then renders each parameter as either
+    `name<sep>::<sep><pill>type</pill>` or — if the parameter has no
+    `::` — bare HTML-escaped text.
+    """
+  pub fn render_signature_params(params :: String) -> String {
+    if String.length(String.trim(params)) == 0 {
+      ""
+    } else {
+      render_signature_params_walk(split_top_level_commas(params), 0, "")
+    }
+  }
+
+  pub fn render_signature_params_walk(parts :: [String], index :: i64, acc :: String) -> String {
+    if List.empty?(parts) {
+      acc
+    } else {
+      head = String.trim(List.head(parts))
+      tail = List.tail(parts)
+      if String.length(head) == 0 {
+        render_signature_params_walk(tail, index, acc)
+      } else {
+        sep = if index == 0 { "" } else { "<span class=\"sig-paren\">, </span>" }
+        render_signature_params_walk(tail, index + 1, acc <> sep <> render_one_param(head))
+      }
+    }
+  }
+
+  pub fn render_one_param(param :: String) -> String {
+    sep_idx = String.index_of(param, " :: ")
+    if sep_idx < 0 {
+      escape_html(param)
+    } else {
+      render_typed_param(param, sep_idx)
+    }
+  }
+
+  pub fn render_typed_param(param :: String, sep_idx :: i64) -> String {
+    param_name = String.slice(param, 0, sep_idx)
+    param_type = String.slice(param, sep_idx + 4, String.length(param))
+    escape_html(param_name) <> "<span class=\"sig-separator\">::</span><span class=\"sig-type-pill\">" <> escape_html(param_type) <> "</span>"
+  }
+
+  @doc = """
+    Render the trailing portion of a signature after the close paren:
+    the `-> ReturnType [if guard]` segment. Empty/missing portions
+    return the empty string.
+    """
+  pub fn render_signature_return(rest :: String) -> String {
+    trimmed = String.trim(rest)
+    if String.length(trimmed) == 0 {
+      ""
+    } else {
+      render_signature_return_trimmed(trimmed)
+    }
+  }
+
+  pub fn render_signature_return_trimmed(trimmed :: String) -> String {
+    if String.starts_with?(trimmed, "-> ") {
+      render_arrow_segment(String.trim(String.slice(trimmed, 3, String.length(trimmed))))
+    } else {
+      if String.starts_with?(trimmed, "if ") {
+        render_signature_guard(String.trim(String.slice(trimmed, 3, String.length(trimmed))))
+      } else {
+        ""
+      }
+    }
+  }
+
+  pub fn render_arrow_segment(after_arrow :: String) -> String {
+    guard_idx = index_of_top_level_guard(after_arrow)
+    if guard_idx < 0 {
+      render_return_type(after_arrow)
+    } else {
+      render_arrow_with_guard(after_arrow, guard_idx)
+    }
+  }
+
+  pub fn render_arrow_with_guard(after_arrow :: String, guard_idx :: i64) -> String {
+    ret_type = String.trim(String.slice(after_arrow, 0, guard_idx))
+    guard = String.trim(String.slice(after_arrow, guard_idx + 4, String.length(after_arrow)))
+    render_return_type(ret_type) <> render_signature_guard(guard)
+  }
+
+  pub fn render_return_type(ret :: String) -> String {
+    if String.length(ret) == 0 {
+      ""
+    } else {
+      "<span class=\"sig-arrow\">\u{2192}</span><span class=\"sig-ret-pill\">" <> escape_html(ret) <> "</span>"
+    }
+  }
+
+  pub fn render_signature_guard(guard :: String) -> String {
+    if String.length(guard) == 0 {
+      ""
+    } else {
+      "<span class=\"sig-guard-keyword\">if</span><span class=\"sig-guard\">" <> escape_html(guard) <> "</span>"
+    }
+  }
+
+  @doc = """
+    Split a comma-separated string at top-level commas, respecting
+    paren/bracket/brace depth. Parameters like `f :: (i64, i64) -> i64`
+    stay grouped because the comma inside the function type sits at
+    depth > 0.
+    """
+  pub fn split_top_level_commas(text :: String) -> [String] {
+    split_top_level_walk(text, 0, 0, 0, String.length(text), [] :: [String])
+  }
+
+  pub fn split_top_level_walk(text :: String, start :: i64, index :: i64, depth :: i64, end_index :: i64, acc :: [String]) -> [String] {
+    if index >= end_index {
+      List.append(acc, String.slice(text, start, end_index))
+    } else {
+      ch = String.byte_at(text, index)
+      if ch == "(" or ch == "[" or ch == "{" {
+        split_top_level_walk(text, start, index + 1, depth + 1, end_index, acc)
+      } else {
+        if ch == ")" or ch == "]" or ch == "}" {
+          split_top_level_walk(text, start, index + 1, depth - 1, end_index, acc)
+        } else {
+          if ch == "," and depth == 0 {
+            split_top_level_walk(text, index + 1, index + 1, depth, end_index, List.append(acc, String.slice(text, start, index)))
+          } else {
+            split_top_level_walk(text, start, index + 1, depth, end_index, acc)
+          }
+        }
+      }
+    }
+  }
+
+  @doc = """
+    Locate the top-level ` if ` token that introduces a clause guard,
+    skipping nested-paren occurrences so a function-type parameter
+    `(T) -> R if pred` doesn't confuse the scanner. Returns -1 when no
+    top-level ` if ` is present.
+    """
+  pub fn index_of_top_level_guard(text :: String) -> i64 {
+    scan_top_level_if(text, 0, 0, String.length(text))
+  }
+
+  pub fn scan_top_level_if(text :: String, index :: i64, depth :: i64, end_index :: i64) -> i64 {
+    if index + 4 > end_index {
+      -1
+    } else {
+      ch = String.byte_at(text, index)
+      if ch == "(" or ch == "[" or ch == "{" {
+        scan_top_level_if(text, index + 1, depth + 1, end_index)
+      } else {
+        if ch == ")" or ch == "]" or ch == "}" {
+          scan_top_level_if(text, index + 1, depth - 1, end_index)
+        } else {
+          if depth == 0 and is_if_at?(text, index, end_index) {
+            index
+          } else {
+            scan_top_level_if(text, index + 1, depth, end_index)
+          }
+        }
+      }
+    }
+  }
+
+  pub fn is_if_at?(text :: String, index :: i64, end_index :: i64) -> Bool {
+    if index + 4 > end_index {
+      false
+    } else {
+      String.byte_at(text, index) == " " and String.byte_at(text, index + 1) == "i" and String.byte_at(text, index + 2) == "f" and String.byte_at(text, index + 3) == " "
+    }
   }
 
   @doc = """
@@ -1091,9 +1382,9 @@ pub struct Zap.Doc {
     """
   pub fn write_pages_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}], impl_summaries :: [%{Atom => Term}], variant_summaries :: [%{Atom => Term}], required_summaries :: [%{Atom => Term}]) -> i64 {
     _ = File.mkdir(out_dir <> "/structs")
-    structs = manifest_names(struct_summaries, [])
-    protocols = manifest_names(protocol_summaries, [])
-    unions = manifest_names(union_summaries, [])
+    structs = sort_names_alpha(manifest_names(struct_summaries, []))
+    protocols = sort_names_alpha(manifest_names(protocol_summaries, []))
+    unions = sort_names_alpha(manifest_names(union_summaries, []))
     written_structs = write_summary_pages(out_dir, struct_summaries, :struct, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
     written_protocols = write_summary_pages(out_dir, protocol_summaries, :protocol, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
     written_unions = write_summary_pages(out_dir, union_summaries, :union, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
@@ -1151,6 +1442,48 @@ pub struct Zap.Doc {
     single-pass walk so callers don't have to maintain three parallel
     arrays of names alongside their summaries.
     """
+  @doc = """
+    Insertion-sort a list of qualified-name strings into ascending
+    alphabetical order. Used so the sidebar groups (`Structs`,
+    `Protocols`, `Unions`) and the index page list members in a
+    predictable order regardless of reflection iteration order.
+    """
+  pub fn sort_names_alpha(names :: [String]) -> [String] {
+    sort_names_walk(names, [] :: [String])
+  }
+
+  pub fn sort_names_walk(remaining :: [String], sorted :: [String]) -> [String] {
+    if List.empty?(remaining) {
+      sorted
+    } else {
+      head = List.head(remaining)
+      tail = List.tail(remaining)
+      sort_names_walk(tail, insert_name_alpha(sorted, head, [] :: [String]))
+    }
+  }
+
+  pub fn insert_name_alpha(sorted :: [String], item :: String, prefix :: [String]) -> [String] {
+    if List.empty?(sorted) {
+      List.append(prefix, item)
+    } else {
+      head = List.head(sorted)
+      tail = List.tail(sorted)
+      if string_lt?(item, head) {
+        list_concat_strings(List.append(prefix, item), sorted)
+      } else {
+        insert_name_alpha(tail, item, List.append(prefix, head))
+      }
+    }
+  }
+
+  pub fn list_concat_strings(left :: [String], right :: [String]) -> [String] {
+    if List.empty?(right) {
+      left
+    } else {
+      list_concat_strings(List.append(left, List.head(right)), List.tail(right))
+    }
+  }
+
   pub fn manifest_names(summaries :: [%{Atom => Term}], acc :: [String]) -> [String] {
     if List.empty?(summaries) {
       acc
