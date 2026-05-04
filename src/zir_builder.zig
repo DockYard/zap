@@ -4582,9 +4582,19 @@ pub const ZirDriver = struct {
                 }
 
                 if (self.findReusePairForDest(si.dest)) |pair| {
-                    // Use struct_init_typed for named structs to preserve type identity
+                    // Use struct_init_typed for named structs to preserve
+                    // type identity. The `current_function_is_closure` guard
+                    // stays — closures can't resolve struct-level decl_val
+                    // refs from inside their environment. The
+                    // `capture_depth == 0` band-aid was needed when
+                    // `addStructInitTyped` emitted `struct_init_field_type`
+                    // outside the captured body's instruction list; now
+                    // that the Zig fork's `addStructInitTyped` body-tracks
+                    // those instructions, captured contexts (multi-clause
+                    // dispatch arms, guard blocks) preserve nominal
+                    // identity through `struct_init_typed`.
                     const seed_ref = blk: {
-                        if (!self.current_function_is_closure and self.capture_depth == 0) {
+                        if (!self.current_function_is_closure) {
                             if (self.findStructDef(si.type_name) != null) {
                                 if (self.emitStructTypeRef(si.type_name) catch null) |type_ref| {
                                     const typed = zir_builder_emit_struct_init_typed(self.handle, type_ref, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
@@ -4622,9 +4632,12 @@ pub const ZirDriver = struct {
                     // does not escape the current function. Use ZIR alloc + store
                     // to place it on the stack instead of the arena.
                     _ = self.reuse_backed_struct_locals.remove(si.dest);
-                    // Use struct_init_typed for named structs to preserve type identity
+                    // See note above the reuse-pair branch — same fix:
+                    // the `capture_depth == 0` band-aid is no longer
+                    // necessary now that `struct_init_field_type` is
+                    // body-tracked in the Zig fork.
                     const seed_ref = blk: {
-                        if (!self.current_function_is_closure and self.capture_depth == 0) {
+                        if (!self.current_function_is_closure) {
                             if (self.findStructDef(si.type_name) != null) {
                                 if (self.emitStructTypeRef(si.type_name) catch null) |type_ref| {
                                     const typed = zir_builder_emit_struct_init_typed(self.handle, type_ref, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
@@ -4649,7 +4662,12 @@ pub const ZirDriver = struct {
                     // Use struct_init_typed with decl_val for nominal types
                     // in non-closure functions. Closures can't resolve struct-
                     // level decl_val refs, so fall back to struct_init_anon.
-                    if (!self.current_function_is_closure and self.capture_depth == 0) {
+                    // The `capture_depth == 0` guard from the historical
+                    // workaround is dropped: now that the Zig fork's
+                    // `addStructInitTyped` body-tracks each
+                    // `struct_init_field_type`, struct_init_typed is
+                    // safe inside captured guard-block bodies.
+                    if (!self.current_function_is_closure) {
                         if (self.findStructDef(si.type_name) != null) {
                             if (self.emitStructTypeRef(si.type_name) catch null) |type_ref| {
                                 const typed_result = zir_builder_emit_struct_init_typed(
