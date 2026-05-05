@@ -224,6 +224,7 @@ pub const Instruction = union(enum) {
     switch_return: SwitchReturn,
     union_switch_return: UnionSwitchReturn,
     union_switch: UnionSwitch,
+    optional_dispatch: OptionalDispatch,
     match_atom: MatchAtom,
     match_int: MatchInt,
     match_float: MatchFloat,
@@ -694,6 +695,28 @@ pub const UnionSwitch = struct {
     dest: LocalId,
     scrutinee: LocalId,
     cases: []const UnionCase,
+};
+
+/// Multi-clause `f(nil) / f(t :: T)` dispatch on an optional parameter.
+/// Generated when `canOptionalDispatch` succeeds at function-group
+/// lowering. The ZIR emitter expands this into:
+///
+///   if (param == null) { nil_instrs; ret nil_result }
+///   else { payload_local = param.?; struct_instrs; ret struct_result }
+///
+/// `payload_local` is a fresh `LocalId` allocated by the IR builder.
+/// References to the optional param inside the struct clause body still
+/// emit `param_get(scrutinee_param)`; the ZIR emitter redirects those
+/// reads to `payload_local` for the duration of the struct branch so
+/// the user-visible `n :: T` binding sees the unwrapped value, not the
+/// optional storage shape.
+pub const OptionalDispatch = struct {
+    scrutinee_param: u32,
+    payload_local: LocalId,
+    nil_instrs: []const Instruction,
+    nil_result: ?LocalId,
+    struct_instrs: []const Instruction,
+    struct_result: ?LocalId,
 };
 
 pub const UnionCase = struct {
@@ -1645,6 +1668,8 @@ pub const IrBuilder = struct {
         // Otherwise fall back to anytype.
         var params: std.ArrayList(Param) = .empty;
         var union_param_idx: ?u32 = null;
+        var optional_param_idx: ?u32 = null;
+        var optional_struct_name: ?[]const u8 = null;
         var captures: std.ArrayList(Capture) = .empty;
         for (group.captures, 0..) |capture, idx| {
             const cap_name = try std.fmt.allocPrint(self.allocator, "__cap_{d}", .{idx});
@@ -1672,6 +1697,15 @@ pub const IrBuilder = struct {
                             if (try self.canUnionDispatch(group, @intCast(i))) |union_type_name| {
                                 resolved_type = .{ .struct_ref = union_type_name };
                                 union_param_idx = @intCast(i);
+                            } else if (self.canOptionalDispatch(group, @intCast(i))) |sname| {
+                                // f(nil) / f(t :: T) shape — unify the
+                                // param to `?T` and route via
+                                // optional_dispatch IR.
+                                const inner_ptr = try self.allocator.create(ZigType);
+                                inner_ptr.* = .{ .struct_ref = sname };
+                                resolved_type = .{ .optional = inner_ptr };
+                                optional_param_idx = @intCast(i);
+                                optional_struct_name = sname;
                             } else {
                                 resolved_type = .any;
                             }
@@ -1799,6 +1833,67 @@ pub const IrBuilder = struct {
                 .union_switch_return = .{
                     .scrutinee_param = u_param_idx,
                     .cases = try union_cases.toOwnedSlice(self.allocator),
+                },
+            });
+        } else if (optional_param_idx) |o_param_idx| {
+            // f(nil) / f(t :: T) optional dispatch. Lower each clause's
+            // body separately. The struct clause's body must observe the
+            // param as `T`, not `?T` — track `payload_local` so the ZIR
+            // emitter can redirect `param_get(o_param_idx)` reads to it
+            // while emitting the struct branch.
+            const payload_local = self.next_local;
+            self.next_local += 1;
+            if (optional_struct_name) |sname| {
+                try self.known_local_types.put(payload_local, .{ .struct_ref = sname });
+            }
+
+            var nil_instrs_result: []const Instruction = &.{};
+            var nil_result: ?LocalId = null;
+            var struct_instrs_result: []const Instruction = &.{};
+            var struct_result: ?LocalId = null;
+
+            for (group.clauses) |clause| {
+                const param = clause.params[o_param_idx];
+                const is_nil_clause = blk: {
+                    if (param.pattern) |pat| {
+                        if (pat.* == .literal and pat.literal == .nil) break :blk true;
+                    }
+                    break :blk param.type_id == types_mod.TypeStore.NIL;
+                };
+
+                const saved = self.current_instrs;
+                self.current_instrs = .empty;
+                if (!is_nil_clause) {
+                    // The struct clause might destructure other params via
+                    // tuple/struct/binary/map patterns. Only emit those
+                    // bindings; the optional-param itself is handled by
+                    // the ZIR redirect rather than an explicit binding.
+                    try self.emitTupleBindings(&clause);
+                    try self.emitStructBindings(&clause);
+                    try self.emitBinaryBindings(&clause);
+                    try self.emitMapBindings(&clause);
+                }
+                const body_result = try self.lowerBlock(clause.body);
+                const body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved;
+
+                if (is_nil_clause) {
+                    nil_instrs_result = body_instrs;
+                    nil_result = body_result;
+                } else {
+                    struct_instrs_result = body_instrs;
+                    struct_result = body_result;
+                }
+            }
+
+            try self.current_instrs.append(self.allocator, .{
+                .optional_dispatch = .{
+                    .scrutinee_param = o_param_idx,
+                    .payload_local = payload_local,
+                    .nil_instrs = nil_instrs_result,
+                    .nil_result = nil_result,
+                    .struct_instrs = struct_instrs_result,
+                    .struct_result = struct_result,
                 },
             });
         } else {
@@ -2326,6 +2421,70 @@ pub const IrBuilder = struct {
 
     /// Check if all clauses have distinct named struct types for a given param position.
     /// Returns the synthesized union type name if eligible, null otherwise.
+    /// Detect the multi-clause `f(nil) / f(t :: T)` shape where every
+    /// clause for `param_idx` is either the `nil` literal pattern or a
+    /// non-nil pattern (typed bind / struct match) over the same nominal
+    /// struct. The unified parameter type is `?T` so the call site can
+    /// pass either `nil` or a `T` value, and the dispatcher routes on
+    /// is-null. Returns the single struct name on success — caller
+    /// promotes the param's `ZigType` to `optional(struct_ref T)` and
+    /// emits an `optional_dispatch` IR.
+    ///
+    /// Reasons to return null:
+    ///  - fewer than two clauses
+    ///  - no `TypeStore` (unit-test path with raw IR)
+    ///  - any clause has a non-nil / non-struct type for this param
+    ///  - more than one distinct struct type among the non-nil clauses
+    ///  - all clauses are nil (degenerate) or all struct (no optional)
+    fn canOptionalDispatch(self: *IrBuilder, group: *const hir_mod.FunctionGroup, param_idx: u32) ?[]const u8 {
+        if (group.clauses.len < 2) return null;
+        const ts = self.type_store orelse return null;
+
+        var struct_name: ?[]const u8 = null;
+        var saw_nil = false;
+        var saw_struct = false;
+
+        for (group.clauses) |clause| {
+            if (param_idx >= clause.params.len) return null;
+            const param = clause.params[param_idx];
+            const tid = param.type_id;
+
+            // Match nil either by type or by literal pattern. Source
+            // code like `pub fn count(nil)` parses with a `literal nil`
+            // pattern and a still-unresolved param type_id; the
+            // pattern is the authoritative signal.
+            const is_nil_pattern = blk: {
+                if (param.pattern) |pat| {
+                    if (pat.* == .literal and pat.literal == .nil) break :blk true;
+                }
+                break :blk false;
+            };
+
+            if (is_nil_pattern or tid == types_mod.TypeStore.NIL) {
+                saw_nil = true;
+                continue;
+            }
+
+            if (tid >= ts.types.items.len) return null;
+            const typ = ts.types.items[tid];
+            switch (typ) {
+                .struct_type => |st| {
+                    const sname = self.interner.get(st.name);
+                    if (struct_name) |existing| {
+                        if (!std.mem.eql(u8, existing, sname)) return null;
+                    } else {
+                        struct_name = sname;
+                    }
+                    saw_struct = true;
+                },
+                else => return null,
+            }
+        }
+
+        if (!saw_nil or !saw_struct) return null;
+        return struct_name;
+    }
+
     fn canUnionDispatch(self: *IrBuilder, group: *const hir_mod.FunctionGroup, param_idx: u32) !?[]const u8 {
         if (group.clauses.len < 2) return null;
         const ts = self.type_store orelse return null;
@@ -5034,6 +5193,13 @@ pub const IrBuilder = struct {
                             try self.current_instrs.append(self.allocator, .{
                                 .local_set = .{ .dest = ls.index, .value = val },
                             });
+                            // Propagate the source local's type so a
+                            // downstream `field_get` on this binding can
+                            // still resolve its struct nominal type and
+                            // run indirect-storage auto-deref.
+                            if (self.known_local_types.get(val)) |t| {
+                                try self.known_local_types.put(ls.index, t);
+                            }
                         },
                         .function_group => |group| {
                             // Anonymous functions and nested functions defined
@@ -5081,6 +5247,10 @@ pub const IrBuilder = struct {
                         .fields = try ir_fields.toOwnedSlice(self.allocator),
                     },
                 });
+                // Track the constructed value's nominal type so a later
+                // `field_get` on this local can resolve struct identity
+                // for indirect-storage auto-deref.
+                try self.known_local_types.put(dest, .{ .struct_ref = type_name });
             },
             .error_pipe => |ep| {
                 // Lower the error pipe so that a failure in any dispatched

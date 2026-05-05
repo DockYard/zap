@@ -700,6 +700,13 @@ pub const UseDefInfo = struct {
                     if (case.return_value) |rv| try info.recordUse(rv, block);
                 }
             },
+            .optional_dispatch => |od| {
+                try info.recordDef(od.payload_local, block);
+                try scanInstructionsForUseDef(info, block, od.nil_instrs);
+                if (od.nil_result) |nr| try info.recordUse(nr, block);
+                try scanInstructionsForUseDef(info, block, od.struct_instrs);
+                if (od.struct_result) |sr| try info.recordUse(sr, block);
+            },
 
             .ret => |ret_instr| {
                 if (ret_instr.value) |v| try info.recordUse(v, block);

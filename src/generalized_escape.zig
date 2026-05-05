@@ -551,6 +551,19 @@ pub const GeneralizedEscapeAnalyzer = struct {
                 }
             },
 
+            // Optional dispatch (`f(nil) / f(t :: T)`): both branches
+            // return their result, so the result locals escape globally.
+            .optional_dispatch => |od| {
+                try self.seedInstructions(func_id, od.nil_instrs);
+                if (od.nil_result) |nr| {
+                    try self.raiseEscape(func_id, nr, .global_escape);
+                }
+                try self.seedInstructions(func_id, od.struct_instrs);
+                if (od.struct_result) |sr| {
+                    try self.raiseEscape(func_id, sr, .global_escape);
+                }
+            },
+
             // Conditional return: value escapes globally.
             .cond_return => |cr| {
                 if (cr.value) |val| {

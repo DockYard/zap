@@ -1048,6 +1048,14 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
                 if (case.return_value) |rv| hasher.update(std.mem.asBytes(&rv));
             }
         },
+        .optional_dispatch => |v| {
+            hasher.update(std.mem.asBytes(&v.scrutinee_param));
+            hasher.update(std.mem.asBytes(&v.payload_local));
+            for (v.nil_instrs) |nested| hashInstruction(hasher, nested);
+            if (v.nil_result) |nr| hasher.update(std.mem.asBytes(&nr));
+            for (v.struct_instrs) |nested| hashInstruction(hasher, nested);
+            if (v.struct_result) |sr| hasher.update(std.mem.asBytes(&sr));
+        },
         .match_atom => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(std.mem.asBytes(&v.scrutinee));
@@ -1759,6 +1767,7 @@ pub const Interpreter = struct {
             .switch_return => |sr| return self.execSwitchReturn(sr, frame),
             .union_switch_return => |usr| return self.execUnionSwitchReturn(usr, frame),
             .union_switch => |us| return self.execUnionSwitch(us, frame),
+            .optional_dispatch => |od| return self.execOptionalDispatch(od, frame),
             .branch => |b| return .{ .jumped = b.target },
             .cond_branch => |cb| {
                 const cond = try self.readLocal(frame, cb.condition);
@@ -2557,6 +2566,40 @@ pub const Interpreter = struct {
             }
         }
         return .{ .returned = if (sr.default_result) |dr| try self.readLocal(frame, dr) else .void };
+    }
+
+    fn execOptionalDispatch(self: *Interpreter, od: ir.OptionalDispatch, frame: *Frame) CtfeInterpretError!ExecResult {
+        const scrutinee = try self.readParam(frame, od.scrutinee_param);
+        const is_nil = switch (scrutinee) {
+            .nil => true,
+            .optional => |opt| opt.value == null,
+            else => false,
+        };
+
+        const branch = if (is_nil) od.nil_instrs else od.struct_instrs;
+        const result_local = if (is_nil) od.nil_result else od.struct_result;
+
+        if (!is_nil) {
+            // Bind the unwrapped payload so any read of the optional
+            // param via `param_get` resolves to the underlying value.
+            const payload = switch (scrutinee) {
+                .optional => |opt| if (opt.value) |p| p.* else CtValue.nil,
+                else => scrutinee,
+            };
+            frame.setLocal(od.payload_local, payload);
+        }
+
+        for (branch, 0..) |instr, idx| {
+            self.setCurrentInstructionIndex(idx);
+            const r = try self.execOneInstruction(instr, frame);
+            switch (r) {
+                .returned => |v| return .{ .returned = v },
+                .continued => {},
+                .broke => {},
+                .jumped => |target| return .{ .jumped = target },
+            }
+        }
+        return .{ .returned = if (result_local) |rl| try self.readLocal(frame, rl) else .void };
     }
 
     fn execUnionSwitchReturn(self: *Interpreter, usr: ir.UnionSwitchReturn, frame: *Frame) CtfeInterpretError!ExecResult {

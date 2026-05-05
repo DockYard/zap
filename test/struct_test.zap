@@ -270,6 +270,40 @@ pub struct StructTest {
     origin.y
   }
 
+  describe("Optional dispatch f(nil) / f(t :: T)") {
+    test("nil clause selected for nil arg") {
+      assert(StructTest.classify(nil) == 0)
+    }
+
+    test("struct clause selected for non-nil arg") {
+      n = %LinkedNode{value: 7, next: nil}
+      assert(StructTest.classify_indirect(n) == 7)
+    }
+
+    test("indirect-storage field passes through optional dispatch") {
+      tail = %LinkedNode{value: 9, next: nil}
+      head = %LinkedNode{value: 5, next: tail}
+      assert(StructTest.classify_indirect(head.next) == 9)
+      assert(StructTest.classify_indirect(tail.next) == 0)
+    }
+  }
+
+  pub fn classify(nil) -> i64 {
+    0 :: i64
+  }
+
+  pub fn classify(_n :: LinkedNode) -> i64 {
+    1 :: i64
+  }
+
+  pub fn classify_indirect(nil) -> i64 {
+    0 :: i64
+  }
+
+  pub fn classify_indirect(n :: LinkedNode) -> i64 {
+    n.value
+  }
+
   describe("Recursive struct field auto-deref") {
     test("indirect-storage field reads as source-level optional") {
       head = build_two_node_list()

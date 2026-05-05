@@ -140,6 +140,8 @@ extern "c" fn zir_builder_begin_root_field_body(handle: ?*ZirBuilderHandle, name
 extern "c" fn zir_builder_end_root_field_body(handle: ?*ZirBuilderHandle, final_ref: u32) i32;
 extern "c" fn zir_builder_set_decl_val_return_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_emit_param_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
+extern "c" fn zir_builder_emit_param_optional_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
+extern "c" fn zir_builder_emit_param_optional_this_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32) u32;
 
 // Emit a parameter whose type is the root struct of an imported file:
 // `param_name: @import(import_name)` — file-IS-the-struct flavor with no
@@ -2192,6 +2194,102 @@ pub const ZirDriver = struct {
         }
     }
 
+    /// Emit a param with declared type `?Inner` via a fork helper that
+    /// emits decl_val/@This + optional_type + break_inline directly
+    /// inside the param's type body. This sidesteps the body-tracking
+    /// dance `emitImportedTypeRef` would otherwise force on us — the
+    /// fork's `addParamOptionalDeclValType` mirrors the pattern the
+    /// non-optional `addParamDeclValType` already uses for sibling
+    /// nominal types.
+    fn emitOptionalParam(self: *ZirDriver, param: ir.Param, inner_type: ir.ZigType) !u32 {
+        if (inner_type != .struct_ref) {
+            // Non-struct optional inner types are out of scope for the
+            // dispatch shape this helper exists for. Fall back to
+            // anytype rather than emit malformed ZIR.
+            const ref = zir_builder_emit_param(
+                self.handle,
+                param.name.ptr,
+                @intCast(param.name.len),
+                @intFromEnum(Zir.Inst.Ref.none),
+            );
+            if (ref == error_ref) return error.EmitFailed;
+            return ref;
+        }
+
+        const sname = inner_type.struct_ref;
+        const current_struct = self.current_emit_struct orelse {
+            // No emission context: emit as anytype (caller's burden).
+            const ref = zir_builder_emit_param(
+                self.handle,
+                param.name.ptr,
+                @intCast(param.name.len),
+                @intFromEnum(Zir.Inst.Ref.none),
+            );
+            if (ref == error_ref) return error.EmitFailed;
+            return ref;
+        };
+
+        var buf: [256]u8 = undefined;
+        const cls = classifyTypeDef(sname, current_struct, &buf);
+        const short_name = if (std.mem.lastIndexOf(u8, sname, ".")) |dot_idx|
+            sname[dot_idx + 1 ..]
+        else
+            sname;
+
+        switch (cls) {
+            .primary => {
+                const ref = zir_builder_emit_param_optional_this_type(
+                    self.handle,
+                    param.name.ptr,
+                    @intCast(param.name.len),
+                );
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            },
+            .nested => {
+                const ref = zir_builder_emit_param_optional_decl_val_type(
+                    self.handle,
+                    param.name.ptr,
+                    @intCast(param.name.len),
+                    short_name.ptr,
+                    @intCast(short_name.len),
+                );
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            },
+            .foreign => {
+                // Foreign optional struct: `?@import(struct_name).short`
+                // (or `?@import(name)` for foreign root structs).
+                // Fall through to the streaming `param_type_body` API
+                // since the fork doesn't have a one-shot helper for
+                // every shape — emit the body insts via the existing
+                // `emitImportedTypeRef` helper, which already handles
+                // foreign import + field_val and optional wrapping.
+                const optional_zig_type: ir.ZigType = blk: {
+                    const inner_ptr = try self.allocator.create(ir.ZigType);
+                    inner_ptr.* = inner_type;
+                    break :blk .{ .optional = inner_ptr };
+                };
+                var support_inst_indices: std.ArrayListUnmanaged(u32) = .empty;
+                defer support_inst_indices.deinit(self.allocator);
+                const before = zir_builder_get_body_inst_count(self.handle);
+                const opt_ref = try self.emitImportedTypeRef(optional_zig_type);
+                try self.captureBodyInsts(before, &support_inst_indices);
+
+                const ref = zir_builder_emit_param_type_body(
+                    self.handle,
+                    param.name.ptr,
+                    @intCast(param.name.len),
+                    support_inst_indices.items.ptr,
+                    @intCast(support_inst_indices.items.len),
+                    opt_ref,
+                );
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            },
+        }
+    }
+
     fn emitTupleParam(self: *ZirDriver, param: ir.Param, elements: []const ir.ZigType) !u32 {
         var support_inst_indices: std.ArrayListUnmanaged(u32) = .empty;
         defer support_inst_indices.deinit(self.allocator);
@@ -2498,6 +2596,14 @@ pub const ZirDriver = struct {
         }
         if (std.meta.activeTag(param.type_expr) == .tuple) {
             return try self.emitTupleParam(param, param.type_expr.tuple);
+        }
+        // Optional params (`?T`) need an explicit type body so the
+        // dispatcher (and any downstream null-check) sees the param as
+        // `?T`, not `anytype`. Emit
+        //   param body { inner_ref = T-type-ref ; opt_ref = optional_type(inner_ref) ; break opt_ref }
+        // and pass the body to `zir_builder_emit_param_type_body`.
+        if (std.meta.activeTag(param.type_expr) == .optional) {
+            return try self.emitOptionalParam(param, param.type_expr.optional.*);
         }
         // Map and list params use anytype — generic container types like
         // ListOf(T) and MapOf(K,V) can't be expressed as named imports.
@@ -4450,6 +4556,9 @@ pub const ZirDriver = struct {
                 // Non-return union switch: emit like union_switch_return
                 // but assign the result to dest instead of returning.
                 try self.emitUnionSwitch(us);
+            },
+            .optional_dispatch => |od| {
+                try self.emitOptionalDispatch(od);
             },
             .cond_return => |cr| {
                 const cond_ref = self.refForLocal(cr.condition) catch return;
@@ -6632,6 +6741,7 @@ pub const ZirDriver = struct {
             .switch_tag,
             .switch_return,
             .union_switch_return,
+            .optional_dispatch,
             .match_fail,
             .match_error_return,
             .cond_return,
@@ -7099,6 +7209,78 @@ pub const ZirDriver = struct {
         }
 
         self.allocator.free(current_else_insts);
+    }
+
+    /// Emit a `f(nil) / f(t :: T)` optional dispatcher as
+    /// `if (param == null) { nil_body; ret nil } else { unwrap; struct_body; ret struct }`.
+    /// While emitting the struct branch the param-ref slot for the
+    /// optional parameter is replaced with the unwrapped payload ref so
+    /// any `param_get(scrutinee_param)` inside the struct body reads the
+    /// `T` value, not the `?T` storage.
+    fn emitOptionalDispatch(self: *ZirDriver, od: ir.OptionalDispatch) BuildError!void {
+        if (od.scrutinee_param >= self.param_refs.items.len) return error.EmitFailed;
+        const scrutinee_ref = self.param_refs.items[od.scrutinee_param];
+        const is_non_null = zir_builder_emit_is_non_null(self.handle, scrutinee_ref);
+        if (is_non_null == error_ref) return error.EmitFailed;
+
+        // then-branch: unwrap, override param ref, emit struct body, ret.
+        self.beginCapture();
+        const payload_ref = zir_builder_emit_optional_payload_unsafe(self.handle, scrutinee_ref);
+        if (payload_ref == error_ref) {
+            var dropped_len: u32 = 0;
+            _ = self.endCapture(&dropped_len);
+            return error.EmitFailed;
+        }
+        try self.setLocal(od.payload_local, payload_ref);
+
+        const saved_param_ref = self.param_refs.items[od.scrutinee_param];
+        self.param_refs.items[od.scrutinee_param] = payload_ref;
+        for (od.struct_instrs) |bi| try self.emitInstruction(bi);
+        if (od.struct_result) |sr| {
+            const ret_ref = try self.refForLocal(sr);
+            if (zir_builder_emit_ret(self.handle, ret_ref) != 0) {
+                self.param_refs.items[od.scrutinee_param] = saved_param_ref;
+                var dropped_len: u32 = 0;
+                _ = self.endCapture(&dropped_len);
+                return error.EmitFailed;
+            }
+        }
+        self.param_refs.items[od.scrutinee_param] = saved_param_ref;
+        var then_len: u32 = 0;
+        const then_ptr = self.endCapture(&then_len);
+        const then_insts = try self.allocator.alloc(u32, then_len);
+        defer self.allocator.free(then_insts);
+        @memcpy(then_insts, then_ptr[0..then_len]);
+
+        // else-branch: emit nil body, ret.
+        self.beginCapture();
+        for (od.nil_instrs) |bi| try self.emitInstruction(bi);
+        if (od.nil_result) |nr| {
+            const ret_ref = try self.refForLocal(nr);
+            if (zir_builder_emit_ret(self.handle, ret_ref) != 0) {
+                var dropped_len: u32 = 0;
+                _ = self.endCapture(&dropped_len);
+                return error.EmitFailed;
+            }
+        }
+        var else_len: u32 = 0;
+        const else_ptr = self.endCapture(&else_len);
+        const else_insts = try self.allocator.alloc(u32, else_len);
+        defer self.allocator.free(else_insts);
+        @memcpy(else_insts, else_ptr[0..else_len]);
+
+        const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
+        const result = zir_builder_emit_if_else_bodies(
+            self.handle,
+            is_non_null,
+            then_insts.ptr,
+            @intCast(then_insts.len),
+            void_ref,
+            else_insts.ptr,
+            @intCast(else_insts.len),
+            void_ref,
+        );
+        if (result == error_ref) return error.EmitFailed;
     }
 
     fn emitUnionSwitch(self: *ZirDriver, us: ir.UnionSwitch) BuildError!void {

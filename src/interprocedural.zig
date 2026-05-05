@@ -177,6 +177,10 @@ pub const CallGraph = struct {
                         try self.scanInstructions(caller, c.body_instrs);
                     }
                 },
+                .optional_dispatch => |od| {
+                    try self.scanInstructions(caller, od.nil_instrs);
+                    try self.scanInstructions(caller, od.struct_instrs);
+                },
                 else => {},
             }
         }
@@ -547,7 +551,7 @@ pub const InterproceduralAnalyzer = struct {
                     }
                     if (hasRetInstruction(cb.default_instrs)) return true;
                 },
-                .switch_return, .union_switch_return, .union_switch => return true,
+                .switch_return, .union_switch_return, .union_switch, .optional_dispatch => return true,
                 else => {},
             }
         }
@@ -991,6 +995,17 @@ pub const InterproceduralAnalyzer = struct {
                         if (c.return_value) |rv| {
                             try self.recordReturnValue(rv, param_summaries, aliases, fresh_locals, return_sources);
                         }
+                    }
+                },
+
+                .optional_dispatch => |od| {
+                    try self.analyzeInstructions(od.nil_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                    if (od.nil_result) |nr| {
+                        try self.recordReturnValue(nr, param_summaries, aliases, fresh_locals, return_sources);
+                    }
+                    try self.analyzeInstructions(od.struct_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                    if (od.struct_result) |sr| {
+                        try self.recordReturnValue(sr, param_summaries, aliases, fresh_locals, return_sources);
                     }
                 },
 
