@@ -1778,6 +1778,59 @@ test "ZIR: tuple wildcard pattern" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR: tuple destructure param preserves element types for downstream dispatch" {
+    // Regression: a tuple-destructured parameter (`{m, k} :: {%{...}, String}`)
+    // must propagate each element's type into `known_local_types` so that
+    // downstream container dispatch (here `:zig.Map.get`) instantiates the
+    // correct `Map(K, V)` runtime variant. Without the propagation the
+    // dispatcher defaults to `Map(u32, ...)` and the ZIR backend rejects the
+    // call as a pointer-type mismatch.
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn make_map() -> %{String => i64} {
+        \\    Map.put(%{"" => 0 :: i64}, "answer", 42 :: i64)
+        \\  }
+        \\
+        \\  pub fn lookup({m, k} :: {%{String => i64}, String}) -> i64 {
+        \\    Map.get(m, k, 0 :: i64)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    m = make_map()
+        \\    Kernel.inspect(lookup({m, "answer"}))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: tuple destructure param preserves String type for protocol dispatch" {
+    // Regression for `tuple_protocol_dispatch.zap`: when a function destructures
+    // a `{String, i64}` parameter, the String binding must reach the protocol
+    // dispatcher (`<>` → `Concatenable.concat`) with its concrete element type
+    // intact. Without `known_local_types` propagation in `emitTupleBindings`
+    // the IR-level Concatenable dispatch loses the type and downstream codegen
+    // breaks.
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn greet({name, _} :: {String, i64}) -> String {
+        \\    name <> " world"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(greet({"hello", 1 :: i64}))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("hello world\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 // ============================================================
 // Variable assignment and reuse
 // ============================================================

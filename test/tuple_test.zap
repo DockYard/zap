@@ -83,4 +83,35 @@ pub struct TupleTest {
       {_, _} -> 0 - 1
     }
   }
+
+  describe("tuple-destructured parameters preserve element types") {
+    test("destructured String element flows into `<>` Concatenable dispatch") {
+      assert(greet({"hello", 42 :: i64}) == "hello world")
+    }
+
+    test("destructured String element flows into `<=` Comparable dispatch") {
+      assert(string_le({"abc", 1 :: i64}, "abd") == true)
+      assert(string_le({"abd", 1 :: i64}, "abc") == false)
+    }
+
+    test("destructured `i64` element preserves type for arithmetic") {
+      assert(double_count({"x", 21 :: i64}) == 42)
+    }
+  }
+
+  # Parameter-level tuple destructure: the `{name, _}` pattern lives on the
+  # function-clause boundary so the destructured locals must be registered
+  # in the IR's `known_local_types` map for downstream protocol dispatch
+  # (`<>`, `<=`) to resolve `String` correctly.
+  fn greet({name, _} :: {String, i64}) -> String {
+    name <> " world"
+  }
+
+  fn string_le({kmer, _} :: {String, i64}, other :: String) -> Bool {
+    kmer <= other
+  }
+
+  fn double_count({_, n} :: {String, i64}) -> i64 {
+    n + n
+  }
 }

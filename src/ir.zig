@@ -3119,6 +3119,17 @@ pub const IrBuilder = struct {
     }
 
     /// Emit index_get instructions to populate tuple binding locals.
+    ///
+    /// Each binding's `local_index` carries the runtime value of one slot of
+    /// the tuple-typed parameter. Downstream IR passes (container dispatch,
+    /// protocol dispatch, numeric widening, generic call-name encoding) read
+    /// per-local types from `known_local_types`, so both the parent tuple
+    /// local and each destructured element local must be registered with
+    /// their concrete types here. Without it, an in-body `Map.get(m, ...)`
+    /// where `m` came from `{m, k} :: {%{K=>V}, ...}` would default to the
+    /// generic `Map(u32, ...)` variant and fail to type-check at the ZIR
+    /// boundary; the parallel issue affects `<>` (Concatenable) on
+    /// destructured String elements.
     fn emitTupleBindings(self: *IrBuilder, clause: *const hir_mod.Clause) !void {
         for (clause.tuple_bindings) |binding| {
             // Get the param (the tuple)
@@ -3127,6 +3138,17 @@ pub const IrBuilder = struct {
             try self.current_instrs.append(self.allocator, .{
                 .param_get = .{ .dest = tuple_local, .index = binding.param_index },
             });
+            // Resolve the parent tuple's static type so we can hand the
+            // backend per-element types. The clause's declared parameter
+            // types are authoritative after monomorphization (mirrors the
+            // `param_get` lowering at `lowerExpr`).
+            const param_type: ZigType = if (binding.param_index < clause.params.len)
+                typeIdToZigTypeWithStore(clause.params[binding.param_index].type_id, self.type_store)
+            else
+                ZigType.any;
+            if (param_type != .any) {
+                try self.known_local_types.put(tuple_local, param_type);
+            }
             // Extract the element into the binding's local index
             try self.current_instrs.append(self.allocator, .{
                 .index_get = .{
@@ -3135,6 +3157,16 @@ pub const IrBuilder = struct {
                     .index = binding.element_index,
                 },
             });
+            // Propagate the static element type so downstream lookups (e.g.
+            // `Map.get`'s key/value resolution, `<>`'s Concatenable dispatch,
+            // numeric widening, generic call-name encoding) see the right
+            // type for the destructured local.
+            if (param_type == .tuple and binding.element_index < param_type.tuple.len) {
+                const elem_type = param_type.tuple[binding.element_index];
+                if (elem_type != .any) {
+                    try self.known_local_types.put(binding.local_index, elem_type);
+                }
+            }
         }
     }
 
