@@ -51,6 +51,28 @@ pub struct IO {
   }
 
   @doc = """
+    Writes a single raw byte to standard output through the buffered
+    writer.
+
+    Useful for streaming binary output (PBM bitmaps, bit-packed
+    payloads, byte-level protocols) without allocating a `String`
+    per byte. The byte is `i64 & 0xff`; the buffered writer flushes
+    automatically when the buffer fills, when the program reads
+    from stdin, when it writes to stderr, and at process exit.
+
+    Returns the byte unchanged so it composes in pipe chains.
+
+    ## Examples
+
+        # Write a P4 PBM bitmap row, eight pixels per byte
+        IO.write_byte(byte_acc)
+    """
+
+  pub fn write_byte(byte :: i64) -> i64 {
+    :zig.IO.write_byte(byte)
+  }
+
+  @doc = """
     Reads a line from standard input.
 
     Returns the line without the trailing newline.

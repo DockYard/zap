@@ -38,6 +38,99 @@ fn posixRead(fd: std.posix.fd_t, buf: []u8) usize {
     return std.posix.read(fd, buf) catch 0;
 }
 
+// ============================================================
+// Buffered stdout
+//
+// Every "write a single byte / small chunk to stdout" path used to
+// hit `std.c.write(1, …)` directly; for byte-streamed output (e.g.
+// the `mandelbrot` benchmark, which writes ~64 M bytes at N=8000)
+// that's one syscall per byte. Adding a 64 KiB user-space buffer
+// turns it into one syscall per ~64 KiB, matching the cost shape
+// of libc's FILE buffer for stdout in C / Rust / Go / OCaml.
+//
+// Single-threaded by design — the buffer is a process-global byte
+// array. Zap programs are single-threaded today; if that changes,
+// guarding `stdout_buf_pos` with a mutex is the only addition
+// needed (the buffer body has no aliasing concerns).
+//
+// `flushStdoutBuf()` is invoked:
+//   * automatically at process exit via `atexit` (registered
+//     lazily on first write);
+//   * before every `gets()` so prompts ship before the read blocks;
+//   * before every stderr write so error messages don't appear
+//     out of order with respect to in-flight stdout content.
+// All stderr writes still bypass the buffer — errors must be
+// observable even if the program crashes mid-buffer.
+const STDOUT_BUF_SIZE: usize = 64 * 1024;
+var stdout_buf: [STDOUT_BUF_SIZE]u8 = undefined;
+var stdout_buf_pos: usize = 0;
+var stdout_atexit_registered: bool = false;
+
+fn flushStdoutBuf() void {
+    if (stdout_buf_pos == 0) return;
+    var written: usize = 0;
+    while (written < stdout_buf_pos) {
+        const remaining = stdout_buf_pos - written;
+        const rc = std.c.write(STDOUT_FD, stdout_buf[written..].ptr, remaining);
+        if (rc <= 0) break;
+        written += @intCast(rc);
+    }
+    stdout_buf_pos = 0;
+}
+
+fn stdoutAtexitFlush() callconv(.c) void {
+    flushStdoutBuf();
+}
+
+// `std.c.atexit` isn't part of the public `std.c` surface in Zig
+// 0.16; declare the libc symbol directly. Zap binaries link libc
+// unconditionally (`main.zig` builds with `link_libc = true`).
+extern "c" fn atexit(handler: *const fn () callconv(.c) void) c_int;
+
+fn ensureStdoutAtexit() void {
+    if (stdout_atexit_registered) return;
+    stdout_atexit_registered = true;
+    _ = atexit(stdoutAtexitFlush);
+}
+
+/// Write a slice of bytes to the buffered stdout, flushing once when
+/// the slice is larger than the remaining buffer space. Slices
+/// larger than the whole buffer bypass the buffer entirely (one
+/// syscall) after flushing what was already pending — matches libc's
+/// behaviour for over-buffer writes and avoids splitting a single
+/// large user request across multiple syscalls when the buffer
+/// wouldn't add value.
+fn stdoutBufferedWrite(bytes: []const u8) void {
+    ensureStdoutAtexit();
+    if (bytes.len >= STDOUT_BUF_SIZE) {
+        flushStdoutBuf();
+        posixWrite(STDOUT_FD, bytes);
+        return;
+    }
+    if (bytes.len > STDOUT_BUF_SIZE - stdout_buf_pos) {
+        flushStdoutBuf();
+    }
+    @memcpy(stdout_buf[stdout_buf_pos..][0..bytes.len], bytes);
+    stdout_buf_pos += bytes.len;
+}
+
+fn stdoutBufferedWriteByte(byte: u8) void {
+    ensureStdoutAtexit();
+    if (stdout_buf_pos == STDOUT_BUF_SIZE) flushStdoutBuf();
+    stdout_buf[stdout_buf_pos] = byte;
+    stdout_buf_pos += 1;
+}
+
+/// Flush stdout, then write to stderr unbuffered. Use this for any
+/// runtime panic / halt / error path so an error message doesn't
+/// race ahead of buffered stdout output the user already produced —
+/// particularly important when the program is about to abort and
+/// `atexit` may not run.
+fn stderrWriteFlushed(bytes: []const u8) void {
+    flushStdoutBuf();
+    posixWrite(STDERR_FD, bytes);
+}
+
 /// Platform-portable access to process argv (replacement for removed getArgv() in 0.16).
 pub fn getArgv() []const [*:0]const u8 {
     if (comptime builtin.os.tag == .macos) {
@@ -61,16 +154,16 @@ pub fn getArgv() []const [*:0]const u8 {
     }
 }
 
-/// Write formatted output to stdout using POSIX write.
+/// Write formatted output to stdout through the buffered writer.
 fn stdoutPrint(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    posixWrite(STDOUT_FD, msg);
+    stdoutBufferedWrite(msg);
 }
 
-/// Write raw bytes to stdout.
+/// Write raw bytes to stdout through the buffered writer.
 fn stdoutWrite(bytes: []const u8) void {
-    posixWrite(STDOUT_FD, bytes);
+    stdoutBufferedWrite(bytes);
 }
 
 // ============================================================
@@ -957,7 +1050,7 @@ pub const String = struct {
 // ============================================================
 
 pub fn panic(message: []const u8) noreturn {
-    posixWrite(STDERR_FD, "** (NilError) ");
+    stderrWriteFlushed("** (NilError) ");
     posixWrite(STDERR_FD, message);
     posixWrite(STDERR_FD, "\n");
     std.process.exit(1);
@@ -1043,14 +1136,14 @@ pub const Kernel = struct {
     }
 
     pub fn panic(message: []const u8) noreturn {
-        posixWrite(STDERR_FD, "panic: ");
+        stderrWriteFlushed("panic: ");
         posixWrite(STDERR_FD, message);
         posixWrite(STDERR_FD, "\n");
         std.process.exit(1);
     }
 
     pub fn halt(message: []const u8) noreturn {
-        posixWrite(STDERR_FD, "halt: ");
+        stderrWriteFlushed("halt: ");
         posixWrite(STDERR_FD, message);
         posixWrite(STDERR_FD, "\n");
         std.process.exit(1);
@@ -1181,7 +1274,7 @@ pub const Kernel = struct {
     }
 
     pub fn raise(message: []const u8) noreturn {
-        posixWrite(STDERR_FD, "** (RuntimeError) ");
+        stderrWriteFlushed("** (RuntimeError) ");
         posixWrite(STDERR_FD, message);
         posixWrite(STDERR_FD, "\n");
         std.process.exit(1);
@@ -6325,7 +6418,7 @@ pub const IO = struct {
             var iw_buf: [4096]u8 = undefined;
             var iw = BufWriter{ .buf = &iw_buf, .pos = 0 };
             inspectWrite(&iw, value);
-            posixWrite(STDOUT_FD, iw_buf[0..iw.pos]);
+            stdoutBufferedWrite(iw_buf[0..iw.pos]);
             stdoutPrint("\n", .{});
         }
     }
@@ -6340,9 +6433,24 @@ pub const IO = struct {
         }
     }
 
+    /// Append a single byte to the buffered stdout. Used by streaming
+    /// output paths (e.g. the CLBG mandelbrot port) where building an
+    /// intermediate `String` per byte would dominate cost. Returns the
+    /// byte unchanged so it composes in pipe chains.
+    pub fn write_byte(byte: i64) i64 {
+        // Wrap to a u8 — Zap source-level i64 is the natural shape for
+        // single-byte arithmetic (`byte_acc <<= 1`, `bor`, …) but the
+        // wire shape is one byte.
+        const b: u8 = @truncate(@as(u64, @bitCast(byte)));
+        stdoutBufferedWriteByte(b);
+        return byte;
+    }
+
     /// Read a line from stdin. Returns the line without the trailing
     /// newline. Returns an empty string on EOF or error.
     pub fn gets() []const u8 {
+        // Flush pending stdout so prompts ship before the read blocks.
+        flushStdoutBuf();
         var buf: [4096]u8 = undefined;
         var len: usize = 0;
         // Read one byte at a time until newline or EOF
@@ -6426,8 +6534,10 @@ pub const IO = struct {
         return result;
     }
 
-    /// Write a string to stderr followed by a newline.
+    /// Write a string to stderr followed by a newline. Flushes pending
+    /// stdout first so error messages don't leapfrog buffered output.
     pub fn warn(message: []const u8) void {
+        flushStdoutBuf();
         posixWrite(STDERR_FD, message);
         posixWrite(STDERR_FD, "\n");
     }
@@ -6436,7 +6546,7 @@ pub const IO = struct {
         var iw_buf: [4096]u8 = undefined;
         var iw = BufWriter{ .buf = &iw_buf, .pos = 0 };
         inspectWrite(&iw, value);
-        posixWrite(STDOUT_FD, iw_buf[0..iw.pos]);
+        stdoutBufferedWrite(iw_buf[0..iw.pos]);
         stdoutPrint("\n", .{});
         const RT = InspectReturn(@TypeOf(value));
         if (RT == void) return;
