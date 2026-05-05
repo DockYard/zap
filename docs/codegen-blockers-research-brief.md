@@ -816,11 +816,29 @@ Three additional fixes landed after the original brief was written:
   - Multi-clause recursive functions returning a recursive type: `make(0)` / `make(d)` building trees of arbitrary depth.
   - Verified: `pub struct Tree { value :: i64, left :: Tree | nil, right :: Tree | nil }` plus a `make(d :: i64)` tree-builder compiles and runs end-to-end.
 
+  **Field-access auto-deref shipped** (Zap: `591a9ed`). `FieldGet` IR now
+  carries the receiver's struct nominal name (resolved via
+  `IrBuilder.structTypeForFieldReceiver`); the ZIR builder consults
+  `FieldStorage` and emits the inverse of `heapPromoteForIndirectField` —
+  `load` for `*const T`, or an `if (ptr) |p| @as(?T, p.*) else null`
+  branch for `?*const T`. Verified with `t.left == nil`, passing an
+  indirect field directly into a `?T` parameter, and `t.left != nil`
+  predicates. Three new tests in `test/struct_test.zap` lock in the
+  read shape.
+
   **Still open for full binary-trees benchmark**:
-  - Pattern matching on `?Tree` (the `case t { nil -> ...; _ -> ... }` shape) currently trips Zig's `comparison of 'Tree' with null` at call sites where the source value is `Tree` and the param is `Tree | nil` — auto-coercion from `Tree` to `?Tree` at the call boundary is the missing piece.
-  - Field-access auto-deref of indirect fields (`tree.left.value` to walk through the pointer) — currently produces `?*const Tree` at the source level rather than `?Tree`.
-  - Uninhabited-recursive-type diagnostics (a struct in a recursion cycle whose every constructor requires another instance).
-  - Mutual-recursion via SCC analysis (today's walker only detects self-recursion; documented inline in `zigTypeReachesStruct`).
+  - Pattern matching on `?Tree` for the `case t.left { nil -> A; l -> B }`
+    shape: bare bind `l ->` keeps source-level `?T` (Elixir semantics).
+    Either typed-bind narrowing (`l :: Tree -> ...`) or struct-destructure
+    (`%Tree{} = l ->`) needs to be wired through the pattern compiler so
+    `B` sees `l` as `Tree` and the recursive call type-checks.
+  - Multi-clause dispatch on `count(nil)` vs `count(t :: Tree)` —
+    dispatcher must unify the param type to `?Tree` (the union) and emit a
+    null check, not compare `Tree` to null.
+  - Uninhabited-recursive-type diagnostics (a struct in a recursion cycle
+    whose every constructor requires another instance).
+  - Mutual-recursion via SCC analysis (today's walker only detects
+    self-recursion; documented inline in `zigTypeReachesStruct`).
 
 - **Blocker 3 still open**. Loopification is the right primary path per the refined recommendations (§6.5). Implementation sketch: wrap function bodies in a ZIR `loop` block, allocate stack slots for each parameter, redirect `param_get` to slot loads, replace each `tail_call` IR instruction with slot-update + `repeat`. This bypasses LLVM `musttail` entirely so byref-shaped state runs bounded-stack. Estimated scope: 300-500 lines in `src/ir.zig` + `src/zir_builder.zig`. Not started.
 
