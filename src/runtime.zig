@@ -208,11 +208,48 @@ pub fn Arc(comptime T: type) type {
 // ============================================================
 
 pub const ArcRuntime = struct {
+    /// Per-type sized allocator pool. Each `Arc(T).Inner` size class gets
+    /// its own `std.heap.MemoryPool` so allocation becomes a free-list pop
+    /// and free becomes a free-list push — no malloc/free traffic in the
+    /// hot path. The pool grows in page-sized chunks from `page_allocator`
+    /// and never shrinks within process lifetime, so small-object
+    /// workloads (binarytrees ~600 M nodes) pay the cost of the OS page
+    /// commits exactly once instead of per-allocation.
+    ///
+    /// `threadlocal` because `MemoryPool` itself is single-threaded.
+    /// Multi-threaded Zap programs get one pool per thread, with no
+    /// shared free list and no contention. Functions that never
+    /// allocate values of `T` pay nothing — the pool starts in
+    /// `.empty` state (no allocation, no syscall).
+    fn ArcPool(comptime T: type) type {
+        return struct {
+            const Pool = std.heap.MemoryPool(Arc(T).Inner);
+            threadlocal var pool: Pool = .empty;
+
+            fn create() *Arc(T).Inner {
+                return pool.create(std.heap.page_allocator) catch
+                    @panic("ArcRuntime: ArcPool out of memory");
+            }
+
+            fn destroy(inner: *Arc(T).Inner) void {
+                pool.destroy(inner);
+            }
+        };
+    }
+
     /// Allocate and wrap a value in an Arc. Returns a pointer to the
     /// value field inside the Arc inner struct.
+    ///
+    /// The `allocator` parameter is preserved for ABI stability with
+    /// existing ZIR call sites (`allocAny(@TypeOf(value), allocator,
+    /// value)`) but is no longer the source of storage — `Arc(T).Inner`
+    /// allocations come from a per-type `MemoryPool`. Routing through
+    /// the pool removes one libc-allocator round-trip per Arc node, which
+    /// dominates Arc-heavy workloads (e.g., binarytrees `make`/`check`
+    /// at ~600 M nodes per N=21 run).
     pub fn allocAny(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
-        const Inner = Arc(T).Inner;
-        const inner = allocator.create(Inner) catch @panic("ArcRuntime.allocAny: out of memory");
+        _ = allocator;
+        const inner = ArcPool(T).create();
         inner.* = .{
             .header = ArcHeader.init(),
             .value = value,
@@ -236,12 +273,14 @@ pub const ArcRuntime = struct {
 
     /// Free an Arc-managed value given a pointer to the value field.
     /// Decrements the refcount and frees the inner allocation when it reaches zero.
+    /// The `allocator` argument is vestigial — the inner allocation is owned
+    /// by the per-type `ArcPool` and returns there on destruction.
     pub fn freeAny(allocator: std.mem.Allocator, ptr: anytype) void {
+        _ = allocator;
         const T = arcPtrChild(@TypeOf(ptr));
-        const Inner = Arc(T).Inner;
-        const inner: *Inner = @constCast(@fieldParentPtr("value", ptr));
+        const inner: *Arc(T).Inner = @constCast(@fieldParentPtr("value", ptr));
         if (inner.header.release()) {
-            allocator.destroy(inner);
+            ArcPool(T).destroy(inner);
         }
     }
 
@@ -278,11 +317,12 @@ pub const ArcRuntime = struct {
     /// Phase 2 of split-phase release: destroy an Arc-wrapped allocation
     /// whose refcount has already been brought to zero by
     /// `prepareReleaseAny`. The deep-release helper uses this between
-    /// the children walk and returning to the caller.
+    /// the children walk and returning to the caller. The `allocator`
+    /// argument is vestigial — see `allocAny` and `ArcPool`.
     pub fn destroyPreparedAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) void {
-        const Inner = Arc(T).Inner;
-        const inner: *Inner = @fieldParentPtr("value", ptr);
-        allocator.destroy(inner);
+        _ = allocator;
+        const inner: *Arc(T).Inner = @fieldParentPtr("value", ptr);
+        ArcPool(T).destroy(inner);
     }
 
     /// Deep-release an Arc-managed value. Walks the value's struct fields
