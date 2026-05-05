@@ -321,11 +321,30 @@ pub struct StructTest {
       assert(StructTest.next_is_present(head.next))
       assert(StructTest.next_is_present(nil) == false)
     }
+
+    test("recursive build outlives constructing frames") {
+      ## Builds a 4-node chain across 4 stack frames, then walks
+      ## the whole list. With stack-allocated heap-promote the
+      ## intermediate nodes' pointers would dangle as soon as the
+      ## constructing function returned and we'd segfault on the
+      ## first descent. The runtime allocator path keeps every
+      ## promoted node live for the life of the program.
+      list = build_chain_of_four()
+      assert(StructTest.chain_length(list) == 4)
+      assert(StructTest.chain_sum(list) == 10)
+    }
   }
 
   fn build_two_node_list() -> LinkedNode {
     tail = %LinkedNode{value: 2, next: nil}
     %LinkedNode{value: 1, next: tail}
+  }
+
+  fn build_chain_of_four() -> LinkedNode {
+    a = %LinkedNode{value: 4, next: nil}
+    b = %LinkedNode{value: 3, next: a}
+    c = %LinkedNode{value: 2, next: b}
+    %LinkedNode{value: 1, next: c}
   }
 
   fn head_next_is_set(node :: LinkedNode) -> Bool {
@@ -334,5 +353,22 @@ pub struct StructTest {
 
   pub fn next_is_present(maybe :: LinkedNode | nil) -> Bool {
     maybe != nil
+  }
+
+  pub fn chain_length(nil) -> i64 {
+    0 :: i64
+  }
+
+  pub fn chain_length(node :: LinkedNode) -> i64 {
+    one = 1 :: i64
+    one + StructTest.chain_length(node.next)
+  }
+
+  pub fn chain_sum(nil) -> i64 {
+    0 :: i64
+  }
+
+  pub fn chain_sum(node :: LinkedNode) -> i64 {
+    node.value + StructTest.chain_sum(node.next)
   }
 }

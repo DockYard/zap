@@ -6297,23 +6297,40 @@ pub const ZirDriver = struct {
     }
 
     /// Heap-promote a value Ref so it can occupy an indirect-storage
-    /// (`?*const T`) struct field. Emits `@TypeOf(value)` →
-    /// `alloc T` → `store ptr, value` → `make_ptr_const ptr`,
-    /// returning the resulting `*const T` Ref. Zig auto-coerces
-    /// `*const T` into `?*const T` at the assignment site, so the
-    /// caller never needs to wrap explicitly in optional.
+    /// (`?*const T`) struct field. Emits a runtime call to
+    /// `ArcRuntime.allocAny(@TypeOf(value), allocator, value)` which
+    /// heap-allocates an Arc-wrapped slot and returns `*T`. Zig
+    /// auto-coerces `*T` to `*const T` and then to `?*const T` at the
+    /// field assignment, so the caller never wraps explicitly.
+    ///
+    /// Why a runtime call instead of ZIR `alloc` + `store` + `make_ptr_const`:
+    /// `alloc` is a *stack* allocation. The pointer becomes invalid the
+    /// instant the constructing function returns, so any recursive
+    /// structure built across multiple frames (`make(d) = ... make(d-1) ...`)
+    /// would dereference dangling memory at depth >= 2. Routing through
+    /// the runtime allocator keeps the storage live as long as the Arc
+    /// header reaches it.
     ///
     /// Used by struct_init lowering for fields whose
-    /// `FieldStorage == .indirect`. Caller must ensure `value_ref`
-    /// is not `null_value` — passing null through this would alloc
-    /// and store a void value, which is wrong. The caller checks
-    /// upfront and short-circuits the null case.
+    /// `FieldStorage == .indirect`. Caller must ensure `value_ref` is
+    /// not `null_value` — `nil` short-circuits this path entirely.
     fn heapPromoteForIndirectField(self: *ZirDriver, value_ref: u32) BuildError!u32 {
         const type_ref = zir_builder_emit_typeof(self.handle, value_ref);
         if (type_ref == error_ref) return error.EmitFailed;
-        const alloc_ref = try self.emitAlloc(type_ref);
-        if (zir_builder_emit_store(self.handle, alloc_ref, value_ref) != 0) return error.EmitFailed;
-        return try self.emitMakePtrConst(alloc_ref);
+
+        const alloc_ref = try self.emitAllocatorRef();
+
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+        const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
+        if (arc_runtime == error_ref) return error.EmitFailed;
+        const alloc_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "allocAny", 8);
+        if (alloc_fn == error_ref) return error.EmitFailed;
+
+        const args = [_]u32{ type_ref, alloc_ref, value_ref };
+        const ptr = zir_builder_emit_call_ref(self.handle, alloc_fn, &args, 3);
+        if (ptr == error_ref) return error.EmitFailed;
+        return ptr;
     }
 
     /// Auto-deref the storage value of an indirect-storage field so the
