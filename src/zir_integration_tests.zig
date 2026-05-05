@@ -2864,3 +2864,29 @@ test "ZIR: MArrayI64 set returns the written value" {
     try std.testing.expectEqualStrings("42\n42\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
+
+test "ZIR: MArrayI64 mutate-then-read across both element kinds in one program" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn main() -> String {
+        \\    ints = MArrayI64.new(4, 0 :: i64)
+        \\    _ = MArrayI64.set(ints, 0, 5 :: i64)
+        \\    _ = MArrayI64.set(ints, 1, 6 :: i64)
+        \\    _ = MArrayI64.set(ints, 2, 7 :: i64)
+        \\    _ = MArrayI64.set(ints, 3, 8 :: i64)
+        \\    int_sum = MArrayI64.get(ints, 0) + MArrayI64.get(ints, 1) + MArrayI64.get(ints, 2) + MArrayI64.get(ints, 3)
+        \\    Kernel.inspect(int_sum)
+        \\    floats = MArrayF64.new(2, 1.0 :: f64)
+        \\    _ = MArrayF64.set(floats, 0, 0.5 :: f64)
+        \\    _ = MArrayF64.set(floats, 1, 1.5 :: f64)
+        \\    float_sum = MArrayF64.get(floats, 0) + MArrayF64.get(floats, 1)
+        \\    Kernel.inspect(float_sum)
+        \\    Kernel.inspect(MArrayI64.length(ints) + MArrayF64.length(floats))
+        \\    "ok"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("26\n2\n6\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}

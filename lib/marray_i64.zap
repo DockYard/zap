@@ -1,3 +1,5 @@
+@native_type = "marray_i64"
+
 @doc = """
   Mutable, contiguous-storage, ARC-managed array of `i64`.
 

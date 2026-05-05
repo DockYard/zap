@@ -5274,6 +5274,22 @@ pub const HirBuilder = struct {
                     }
                 }
 
+                // Native MArray instantiations resolve to their fixed
+                // well-known TypeIds. Mirrors the type checker's
+                // resolveTypeExpr branch — both the type checker and
+                // the HIR builder must agree on the canonical TypeId
+                // for `MArrayI64` / `MArrayF64` so monomorphization,
+                // call-site binding, and IR emission all see the
+                // same `.marray_type` slot. Without this branch the
+                // HIR builder falls through to the user-type lookup
+                // and stores `UNKNOWN` for the return type, which IR
+                // then widens to `.any` and ZIR emits a void-shaped
+                // function — the original failure mode.
+                if (n.args.len == 0) {
+                    if (self.isNativeTypeName(.marray_i64, n.name)) return types_mod.TypeStore.MARRAY_I64;
+                    if (self.isNativeTypeName(.marray_f64, n.name)) return types_mod.TypeStore.MARRAY_F64;
+                }
+
                 // First check builtins
                 if (self.type_store.resolveTypeName(name_str)) |id| return id;
                 // Then check user-defined types (struct/enum) from scope graph
