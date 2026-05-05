@@ -1,0 +1,17 @@
+# Build artefacts
+binary-trees/c/binary_trees
+binary-trees/zig/binary_trees
+binary-trees/zig/binary_trees.o
+binary-trees/zap/zap-out/
+binary-trees/zap/.zap-cache/
+binary-trees/zap/zap.lock
+binary-trees/rust/target/
+binary-trees/rust/Cargo.lock
+
+# Results: keep the rendered HTML out of git too — it's reproducible
+# from the JSON and the JSON is committed when the user wants to
+# share a published run. By default both stay local.
+results/*.html
+# Local timing data: stays out of git so each developer's runs
+# don't conflict; commit explicit JSON snapshots when publishing.
+results/*.json
