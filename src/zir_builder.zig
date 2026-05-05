@@ -650,11 +650,21 @@ pub const ZirDriver = struct {
     /// struct of the same name — the call site can pass `mod_name`
     /// straight through to `field_val`.
     fn emitAllocatorRef(self: *ZirDriver) BuildError!u32 {
+        // `std.heap.c_allocator` is malloc-backed: ~32 byte per-allocation
+        // overhead, vs. `std.heap.page_allocator`'s full OS-page rounding
+        // (16 KB on Apple Silicon, 4 KB on x86_64). Each Arc node is ~24
+        // bytes; routing through `page_allocator` made every recursive-
+        // struct allocation effectively cost a page, so `binarytrees N=21`
+        // (≈ 600 M transient nodes peak) couldn't fit in any reasonable
+        // RAM budget regardless of how perfectly the deep-release pass
+        // reclaimed memory. Zap binaries already link libc unconditionally
+        // (`main.zig` builds with `link_libc = true`), so `c_allocator` is
+        // always available.
         const std_import = zir_builder_emit_import(self.handle, "std", 3);
         if (std_import == error_ref) return error.EmitFailed;
         const heap_mod = zir_builder_emit_field_val(self.handle, std_import, "heap", 4);
         if (heap_mod == error_ref) return error.EmitFailed;
-        const alloc_ref = zir_builder_emit_field_val(self.handle, heap_mod, "page_allocator", 14);
+        const alloc_ref = zir_builder_emit_field_val(self.handle, heap_mod, "c_allocator", 11);
         if (alloc_ref == error_ref) return error.EmitFailed;
         return alloc_ref;
     }
