@@ -272,6 +272,151 @@ pub const ArcRuntime = struct {
 };
 
 // ============================================================
+// MArray — Mutable, ARC-managed, pool-backed contiguous arrays.
+//
+// `MArrayOf(T)` is the generic Zig template; user-visible Zap
+// types are concrete instantiations (`MArrayI64`, `MArrayF64`).
+// Each `MArrayOf(T)` carries:
+//
+//   * an `ArcHeader` — atomic refcount, identical to `Arc(T)`
+//     so retain/release lower through the same opaque helpers;
+//   * a `len` field — number of elements;
+//   * an `items` raw pointer — heap allocation of `len` `T`s.
+//
+// The `Inner` allocations come from a thread-local
+// `std.heap.MemoryPool(Inner)` (one pool per element type), and
+// the backing element storage comes from `std.heap.page_allocator`
+// directly. Two independent allocations are intentional: the
+// `Inner` is a small, cache-friendly fixed-size payload that
+// fits the pool's free-list shape; the `items` buffer is
+// variable-length and must round-trip through the page
+// allocator anyway.
+//
+// Mutation through `*const Self` mirrors `Arc(T).Inner` —
+// the source-Arc ABI exposes `?*const T` everywhere; the
+// runtime `@constCast`s once at the boundary to write through
+// the `items` pointer or the refcount header.
+// ============================================================
+
+pub fn MArrayOf(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        /// `Inner` carries the ARC header, the element count, and the
+        /// raw element-storage pointer. The Zap source representation
+        /// is `?*const Self`; recovering `Inner` from a `Self`
+        /// pointer is a single `@ptrCast`.
+        pub const Inner = struct {
+            header: ArcHeader,
+            len: usize,
+            items: [*]T,
+        };
+
+        const InnerPool = struct {
+            const PoolT = std.heap.MemoryPool(Inner);
+            threadlocal var pool: PoolT = .empty;
+
+            fn create() *Inner {
+                return pool.create(std.heap.page_allocator) catch
+                    @panic("MArray inner pool: out of memory");
+            }
+
+            fn destroy(inner: *Inner) void {
+                pool.destroy(inner);
+            }
+        };
+
+        /// Allocate an array of `requested_len` elements, each
+        /// initialised to `init_value`. Returns the
+        /// `?*const Self`-shaped pointer the Zap-side source
+        /// representation expects. Panics on OOM (consistent with
+        /// `ArcRuntime.allocAny` — Zap programs cannot recover from
+        /// allocation failure today).
+        pub fn new(requested_len: i64, init_value: T) ?*const Self {
+            if (requested_len < 0) @panic("MArray.new: negative length");
+            const slot_count: usize = @intCast(requested_len);
+            const items_slice = std.heap.page_allocator.alloc(T, slot_count) catch
+                @panic("MArray.new: items out of memory");
+            for (items_slice) |*element_slot| element_slot.* = init_value;
+
+            const inner = InnerPool.create();
+            inner.* = .{
+                .header = ArcHeader.init(),
+                .len = slot_count,
+                .items = items_slice.ptr,
+            };
+            return @ptrCast(inner);
+        }
+
+        /// Read the element at `index`. Panics on null array (matches
+        /// the ArcRuntime convention — null is a programmer error,
+        /// not a runtime-recoverable state).
+        pub fn get(array: ?*const Self, index: i64) T {
+            const inner = innerOf(array orelse @panic("MArray.get: null array"));
+            const slot: usize = @intCast(index);
+            if (slot >= inner.len) @panic("MArray.get: index out of bounds");
+            return inner.items[slot];
+        }
+
+        /// Write `value` to position `index` and return `value`. The
+        /// returned value matches `List.set`-style "value out" so
+        /// callers can chain (e.g. `total = total + MArray.set(arr, i, x)`).
+        pub fn set(array: ?*const Self, index: i64, value: T) T {
+            const inner: *Inner = @constCast(innerOf(array orelse @panic("MArray.set: null array")));
+            const slot: usize = @intCast(index);
+            if (slot >= inner.len) @panic("MArray.set: index out of bounds");
+            inner.items[slot] = value;
+            return value;
+        }
+
+        /// Number of elements. Panics on null array.
+        pub fn length(array: ?*const Self) i64 {
+            const inner = innerOf(array orelse @panic("MArray.length: null array"));
+            return @intCast(inner.len);
+        }
+
+        /// Increment the refcount and return the same handle. Mirrors
+        /// `ArcRuntime.retainAny`'s shape so the comptime field-walker
+        /// in `releaseChildrenAny` (or its successor) can pick up
+        /// `?*const MArrayOf(T)` fields automatically when an `MArray`
+        /// is stored inside a user struct.
+        pub fn retain(array: ?*const Self) ?*const Self {
+            const handle = array orelse return null;
+            const inner: *Inner = @constCast(innerOf(handle));
+            inner.header.retain();
+            return handle;
+        }
+
+        /// Decrement the refcount; on the zero-transition free both
+        /// the element-storage buffer and the `Inner` allocation.
+        /// Element types that need their own destruction (future
+        /// `MArrayString`, `MArrayList`) can extend the zero-branch
+        /// with a per-element walk; the present integer/float
+        /// instantiations leave `T` trivially destructible.
+        pub fn release(array: ?*const Self) void {
+            const handle = array orelse return;
+            const inner: *Inner = @constCast(innerOf(handle));
+            if (inner.header.release()) {
+                std.heap.page_allocator.free(inner.items[0..inner.len]);
+                InnerPool.destroy(inner);
+            }
+        }
+
+        fn innerOf(array: *const Self) *const Inner {
+            return @ptrCast(@alignCast(array));
+        }
+    };
+}
+
+/// Concrete instantiation backing `pub struct MArrayI64` in
+/// `lib/marray.zap`. Used by fannkuch-redux's permutation buffer.
+pub const MArrayI64 = MArrayOf(i64);
+
+/// Concrete instantiation backing `pub struct MArrayF64` in
+/// `lib/marray.zap`. Used by spectral-norm's `u`/`v` vectors.
+pub const MArrayF64 = MArrayOf(f64);
+
+// ============================================================
 // Atom — Interned atom values (spec §5.6)
 // ============================================================
 
@@ -6816,6 +6961,73 @@ test "Arc struct value" {
     try std.testing.expectEqual(@as(f64, 1.0), arc.getConst().x);
     try std.testing.expectEqual(@as(f64, 2.0), arc.getConst().y);
     arc.release(alloc);
+}
+
+test "MArrayOf(i64) new initializes every slot and length matches" {
+    const array = MArrayOf(i64).new(5, 7);
+    defer MArrayOf(i64).release(array);
+
+    try std.testing.expectEqual(@as(i64, 5), MArrayOf(i64).length(array));
+    var index: i64 = 0;
+    while (index < 5) : (index += 1) {
+        try std.testing.expectEqual(@as(i64, 7), MArrayOf(i64).get(array, index));
+    }
+}
+
+test "MArrayOf(i64) set returns the written value and persists it" {
+    const array = MArrayOf(i64).new(3, 0);
+    defer MArrayOf(i64).release(array);
+
+    try std.testing.expectEqual(@as(i64, 10), MArrayOf(i64).set(array, 0, 10));
+    try std.testing.expectEqual(@as(i64, 20), MArrayOf(i64).set(array, 1, 20));
+    try std.testing.expectEqual(@as(i64, 30), MArrayOf(i64).set(array, 2, 30));
+
+    try std.testing.expectEqual(@as(i64, 10), MArrayOf(i64).get(array, 0));
+    try std.testing.expectEqual(@as(i64, 20), MArrayOf(i64).get(array, 1));
+    try std.testing.expectEqual(@as(i64, 30), MArrayOf(i64).get(array, 2));
+}
+
+test "MArrayOf(f64) initialises slots and round-trips writes" {
+    const array = MArrayOf(f64).new(4, 1.5);
+    defer MArrayOf(f64).release(array);
+
+    try std.testing.expectEqual(@as(i64, 4), MArrayOf(f64).length(array));
+    try std.testing.expectEqual(@as(f64, 1.5), MArrayOf(f64).get(array, 2));
+
+    _ = MArrayOf(f64).set(array, 2, 2.75);
+    try std.testing.expectEqual(@as(f64, 2.75), MArrayOf(f64).get(array, 2));
+}
+
+test "MArrayOf retain/release roundtrips refcount" {
+    const array = MArrayOf(i64).new(2, 99);
+    const inner: *const MArrayOf(i64).Inner = @ptrCast(@alignCast(array.?));
+    try std.testing.expectEqual(@as(u32, 1), inner.header.count());
+
+    const second_handle = MArrayOf(i64).retain(array);
+    try std.testing.expectEqual(@as(u32, 2), inner.header.count());
+
+    // First release brings count to 1 — does not free.
+    MArrayOf(i64).release(second_handle);
+    try std.testing.expectEqual(@as(u32, 1), inner.header.count());
+
+    // Final release frees both the items buffer and the Inner.
+    MArrayOf(i64).release(array);
+}
+
+test "MArrayI64 / MArrayF64 specialised aliases are concrete instantiations" {
+    // The aliases must satisfy `==` with their generic instantiations
+    // — Zig deduplicates generic types by comptime parameter values,
+    // so this is a compile-time identity check.
+    try std.testing.expect(MArrayI64 == MArrayOf(i64));
+    try std.testing.expect(MArrayF64 == MArrayOf(f64));
+
+    const ints = MArrayI64.new(2, 5);
+    defer MArrayI64.release(ints);
+    try std.testing.expectEqual(@as(i64, 5), MArrayI64.get(ints, 0));
+
+    const floats = MArrayF64.new(2, 0.25);
+    defer MArrayF64.release(floats);
+    try std.testing.expectEqual(@as(f64, 0.25), MArrayF64.get(floats, 1));
 }
 
 test "Atom well-known values" {
