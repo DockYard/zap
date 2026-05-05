@@ -231,9 +231,90 @@ pub const ArcRuntime = struct {
     }
 
     /// Release (decrement refcount) an Arc-managed value given a pointer to the
-    /// value field. Frees the inner allocation when the refcount reaches zero.
+    /// value field. On the zero-transition, recursively releases any indirect-
+    /// storage Arc'd children before destroying the inner allocation; for types
+    /// without such fields the comptime walk degenerates to a shallow free.
     pub fn releaseAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) void {
-        freeAny(T, allocator, ptr);
+        releaseArcAny(T, allocator, ptr);
+    }
+
+    /// Phase 1 of split-phase release: atomically decrement the refcount and
+    /// report whether the caller is now the last owner.
+    ///
+    /// Returns `ptr` on the zero-transition (the caller is the final owner
+    /// and must finish destruction) and `null` otherwise (other owners still
+    /// hold the value live and must not be touched). Does NOT destroy the
+    /// inner allocation — `destroyPreparedAny` does that. The split exists
+    /// so a compiler-generated deep-release helper can read indirect-storage
+    /// child pointers from the parent struct *before* the parent's backing
+    /// allocation is destroyed.
+    ///
+    /// Companion to `destroyPreparedAny`. Mis-pairing — calling
+    /// `destroyPreparedAny` without a prior `prepareReleaseAny` returning
+    /// non-null, or shipping the returned pointer past the destroy without
+    /// reading the children first — is undefined.
+    pub fn prepareReleaseAny(comptime T: type, ptr: *T) ?*T {
+        const Inner = Arc(T).Inner;
+        const inner: *Inner = @fieldParentPtr("value", ptr);
+        if (inner.header.release()) return ptr;
+        return null;
+    }
+
+    /// Phase 2 of split-phase release: destroy an Arc-wrapped allocation
+    /// whose refcount has already been brought to zero by
+    /// `prepareReleaseAny`. The deep-release helper uses this between
+    /// the children walk and returning to the caller.
+    pub fn destroyPreparedAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) void {
+        const Inner = Arc(T).Inner;
+        const inner: *Inner = @fieldParentPtr("value", ptr);
+        allocator.destroy(inner);
+    }
+
+    /// Deep-release an Arc-managed value. Walks the value's struct fields
+    /// at comptime: every indirect-storage Arc'd field — encoded by the
+    /// Zap codegen as a single-item const pointer (`?*const ChildT`) — is
+    /// released recursively before the parent allocation is destroyed.
+    ///
+    /// For types without any indirect-storage fields, the comptime walk
+    /// expands to nothing and behavior is identical to `releaseAny`.
+    ///
+    /// Recursion at the type level (e.g. `Tree` → `?*const Tree` → `Tree`)
+    /// terminates because Zig memoizes generic instantiations by their
+    /// comptime parameter values; the recursive reference reuses the same
+    /// in-progress instance rather than expanding indefinitely.
+    pub fn releaseArcAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) void {
+        if (prepareReleaseAny(T, ptr)) |owned| {
+            releaseChildrenAny(T, allocator, owned.*);
+            destroyPreparedAny(T, allocator, owned);
+        }
+    }
+
+    /// Walk every field of an aggregate value at comptime and deep-release
+    /// any indirect-storage Arc'd children encountered. Non-aggregates are
+    /// a no-op; flat aggregates compile to nothing.
+    pub fn releaseChildrenAny(comptime T: type, allocator: std.mem.Allocator, value: T) void {
+        switch (@typeInfo(T)) {
+            .@"struct" => |s| {
+                inline for (s.fields) |field| {
+                    releaseFieldChildAny(field.type, allocator, @field(value, field.name));
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn releaseFieldChildAny(comptime FieldType: type, allocator: std.mem.Allocator, value: FieldType) void {
+        switch (@typeInfo(FieldType)) {
+            .optional => |opt| {
+                if (value) |inner| releaseFieldChildAny(opt.child, allocator, inner);
+            },
+            .pointer => |p| {
+                if (p.size == .one) {
+                    releaseArcAny(p.child, allocator, @constCast(value));
+                }
+            },
+            else => {},
+        }
     }
 
     /// Retain (increment refcount) an Arc-managed value given a pointer to the value field.
@@ -6819,6 +6900,26 @@ test "ArcRuntime.retainAny and refCountAny" {
 
     // Second free deallocates
     ArcRuntime.freeAny(i64, std.testing.allocator, val);
+}
+
+test "ArcRuntime.prepareReleaseAny returns ptr only on the zero-transition" {
+    const alloc = std.testing.allocator;
+    const val = ArcRuntime.allocAny(i64, alloc, 7);
+    // Second owner — refcount now 2.
+    ArcRuntime.retainAny(i64, val);
+
+    // First prepare: count goes 2 → 1. We're not the final owner.
+    try std.testing.expect(ArcRuntime.prepareReleaseAny(i64, val) == null);
+    try std.testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(i64, val));
+
+    // Second prepare: count goes 1 → 0. We ARE the final owner.
+    const owned = ArcRuntime.prepareReleaseAny(i64, val) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(@as(i64, 7), owned.*);
+    // Children would be walked here in a deep-release helper. Then:
+    ArcRuntime.destroyPreparedAny(i64, alloc, owned);
 }
 
 test "Arc struct value" {
