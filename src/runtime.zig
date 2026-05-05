@@ -753,6 +753,19 @@ test "ArcRuntime.resetAny releases shared value and yields null token" {
     ArcRuntime.releaseAny(allocator, ptr);
 }
 
+test "String.compare orders bytes lexicographically" {
+    try testing.expectEqual(@as(i64, 0), String.compare("abc", "abc"));
+    try testing.expectEqual(@as(i64, -1), String.compare("abc", "abd"));
+    try testing.expectEqual(@as(i64, 1), String.compare("abd", "abc"));
+    // shorter string compares less than its prefix-equal longer counterpart
+    try testing.expectEqual(@as(i64, -1), String.compare("ab", "abc"));
+    try testing.expectEqual(@as(i64, 1), String.compare("abc", "ab"));
+    // empty boundary
+    try testing.expectEqual(@as(i64, 0), String.compare("", ""));
+    try testing.expectEqual(@as(i64, -1), String.compare("", "x"));
+    try testing.expectEqual(@as(i64, 1), String.compare("x", ""));
+}
+
 // ============================================================
 // String — String utilities
 // ============================================================
@@ -837,6 +850,21 @@ pub const String = struct {
         if (result.len == 0) return "";
         result[0] = @intCast(@as(u64, @bitCast(byte)) & 0xFF);
         return result;
+    }
+
+    /// Lexicographic byte-wise comparison. Returns a negative integer
+    /// when `left` precedes `right`, zero when they are byte-identical,
+    /// and a positive integer when `left` follows `right`. Equivalent
+    /// in shape to C's `strcmp` and OCaml's `String.compare`. Useful
+    /// as a comparator for `Enum.sort` over `String` keys when the
+    /// protocol-based `<=` is too generic for the call-site to
+    /// resolve cleanly.
+    pub fn compare(left: []const u8, right: []const u8) i64 {
+        return switch (std.mem.order(u8, left, right)) {
+            .lt => -1,
+            .eq => 0,
+            .gt => 1,
+        };
     }
 
     /// Iterator protocol for strings. The slice itself is the iteration

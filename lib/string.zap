@@ -67,6 +67,29 @@ pub struct String {
   }
 
   @doc = """
+    Lexicographic byte-wise comparison of two strings. Returns a
+    negative integer when `left` precedes `right`, zero when they
+    are byte-identical, and a positive integer when `left` follows
+    `right`.
+
+    Useful as a comparator for `Enum.sort` over `String` keys
+    when the protocol-based `<=` is too generic for the call site
+    to resolve cleanly. Equivalent in shape to C's `strcmp` and
+    OCaml's `String.compare`.
+
+    ## Examples
+
+        String.compare("abc", "abc")   # => 0
+        String.compare("abc", "abd")   # => -1
+        String.compare("abd", "abc")   # => 1
+        String.compare("ab",  "abc")   # => -1
+    """
+
+  pub fn compare(left :: String, right :: String) -> i64 {
+    :zig.String.compare(left, right)
+  }
+
+  @doc = """
     Returns `true` if `haystack` contains `needle` as a substring.
 
     ## Examples
