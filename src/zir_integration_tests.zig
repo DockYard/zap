@@ -2750,3 +2750,64 @@ test "ZIR: pub fn with operator name parses and emits" {
     try std.testing.expectEqualStrings("ok\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
+
+// ============================================================
+// MArray operations — mutable, ARC-managed, pool-backed arrays
+// ============================================================
+
+test "ZIR: MArrayI64 new/get/set/length round-trips through the runtime" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn main() -> String {
+        \\    arr = MArrayI64.new(5, 0 :: i64)
+        \\    _ = MArrayI64.set(arr, 0, 10 :: i64)
+        \\    _ = MArrayI64.set(arr, 1, 20 :: i64)
+        \\    _ = MArrayI64.set(arr, 2, 30 :: i64)
+        \\    total = MArrayI64.get(arr, 0) + MArrayI64.get(arr, 1) + MArrayI64.get(arr, 2)
+        \\    Kernel.inspect(total)
+        \\    Kernel.inspect(MArrayI64.length(arr))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("60\n5\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: MArrayF64 new/get/set/length round-trips through the runtime" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn main() -> String {
+        \\    arr = MArrayF64.new(4, 0.0 :: f64)
+        \\    _ = MArrayF64.set(arr, 0, 1.5 :: f64)
+        \\    _ = MArrayF64.set(arr, 1, 2.5 :: f64)
+        \\    _ = MArrayF64.set(arr, 2, 3.0 :: f64)
+        \\    total = MArrayF64.get(arr, 0) + MArrayF64.get(arr, 1) + MArrayF64.get(arr, 2)
+        \\    Kernel.inspect(total)
+        \\    Kernel.inspect(MArrayF64.length(arr))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("7\n4\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: MArrayI64 set returns the written value" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn main() -> String {
+        \\    arr = MArrayI64.new(3, 0 :: i64)
+        \\    written = MArrayI64.set(arr, 1, 42 :: i64)
+        \\    Kernel.inspect(written)
+        \\    Kernel.inspect(MArrayI64.get(arr, 1))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
