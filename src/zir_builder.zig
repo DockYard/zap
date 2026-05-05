@@ -4862,8 +4862,22 @@ pub const ZirDriver = struct {
             },
             .field_get => |fg| {
                 const obj_ref = self.refForLocal(fg.object) catch return;
-                const ref = zir_builder_emit_field_val(self.handle, obj_ref, fg.field.ptr, @intCast(fg.field.len));
+                var ref = zir_builder_emit_field_val(self.handle, obj_ref, fg.field.ptr, @intCast(fg.field.len));
                 if (ref == error_ref) return error.EmitFailed;
+                // Indirect-storage fields (self-referential recursive types)
+                // are laid out as `*const T` or `?*const T`. Source-level the
+                // user observes `T` / `?T`. Auto-deref so downstream code
+                // operates on the source-level value and the storage shape
+                // remains an implementation detail.
+                if (fg.struct_type) |sname| {
+                    if (self.findStructDef(sname)) |sdef| {
+                        if (findFieldDef(sdef, fg.field)) |fdef| {
+                            if (fdef.storage == .indirect) {
+                                ref = try self.emitIndirectFieldDeref(ref, fdef.type_expr);
+                            }
+                        }
+                    }
+                }
                 try self.setLocal(fg.dest, ref);
             },
             .field_set => |fs| {
@@ -6191,6 +6205,80 @@ pub const ZirDriver = struct {
         const alloc_ref = try self.emitAlloc(type_ref);
         if (zir_builder_emit_store(self.handle, alloc_ref, value_ref) != 0) return error.EmitFailed;
         return try self.emitMakePtrConst(alloc_ref);
+    }
+
+    /// Auto-deref the storage value of an indirect-storage field so the
+    /// caller observes the field's source-level type. Inverse of
+    /// `heapPromoteForIndirectField`. Two cases:
+    ///
+    ///   * Source field type is non-optional `T`: the storage is
+    ///     `*const T`. Emit a `load` to recover `T`.
+    ///   * Source field type is `?T`: the storage is `?*const T`. Emit
+    ///     `if (storage) |p| @as(?T, p.*) else null`. Both branches are
+    ///     coerced to `?T` so peer-type resolution settles cleanly.
+    ///
+    /// `field_storage_ref` is the ZIR ref returned by `field_val` against
+    /// the underlying storage slot. `source_type` is the user-written
+    /// field type (the result of `indirectFieldType`'s inverse — i.e.,
+    /// the raw `StructFieldDef.type_expr`).
+    fn emitIndirectFieldDeref(
+        self: *ZirDriver,
+        field_storage_ref: u32,
+        source_type: ir.ZigType,
+    ) BuildError!u32 {
+        if (source_type != .optional) {
+            // Storage is `*const T`; load to recover `T`.
+            return try self.emitLoad(field_storage_ref);
+        }
+
+        // Storage is `?*const T`; conditionally unwrap and deref.
+        const inner_type = source_type.optional.*;
+        const optional_type_ref = blk: {
+            const inner_ref = try self.emitImportedTypeRef(inner_type);
+            const opt_ref = zir_builder_emit_optional_type(self.handle, inner_ref);
+            if (opt_ref == error_ref) return error.EmitFailed;
+            break :blk opt_ref;
+        };
+
+        const is_non_null = zir_builder_emit_is_non_null(self.handle, field_storage_ref);
+        if (is_non_null == error_ref) return error.EmitFailed;
+
+        // Then-branch: deref the pointer payload and coerce to `?T`.
+        self.beginCapture();
+        const ptr_ref = zir_builder_emit_optional_payload_unsafe(self.handle, field_storage_ref);
+        if (ptr_ref == error_ref) return error.EmitFailed;
+        const value_ref = try self.emitLoad(ptr_ref);
+        const then_value = zir_builder_emit_as(self.handle, optional_type_ref, value_ref);
+        if (then_value == error_ref) return error.EmitFailed;
+        var then_len: u32 = 0;
+        const then_ptr = self.endCapture(&then_len);
+        const then_insts = try self.allocator.alloc(u32, then_len);
+        defer self.allocator.free(then_insts);
+        @memcpy(then_insts, then_ptr[0..then_len]);
+
+        // Else-branch: coerce `null` to `?T`.
+        self.beginCapture();
+        const null_ref = @intFromEnum(Zir.Inst.Ref.null_value);
+        const else_value = zir_builder_emit_as(self.handle, optional_type_ref, null_ref);
+        if (else_value == error_ref) return error.EmitFailed;
+        var else_len: u32 = 0;
+        const else_ptr = self.endCapture(&else_len);
+        const else_insts = try self.allocator.alloc(u32, else_len);
+        defer self.allocator.free(else_insts);
+        @memcpy(else_insts, else_ptr[0..else_len]);
+
+        const result = zir_builder_emit_if_else_bodies(
+            self.handle,
+            is_non_null,
+            then_insts.ptr,
+            @intCast(then_insts.len),
+            then_value,
+            else_insts.ptr,
+            @intCast(else_insts.len),
+            else_value,
+        );
+        if (result == error_ref) return error.EmitFailed;
+        return result;
     }
 
     /// Emit a mutable stack allocation (ZIR alloc_mut instruction).

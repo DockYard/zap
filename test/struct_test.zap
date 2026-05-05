@@ -18,6 +18,11 @@ pub struct Rectangle extends Shape {
   height :: i64
 }
 
+pub struct LinkedNode {
+  value :: i64
+  next :: LinkedNode | nil
+}
+
 
 
 
@@ -263,5 +268,37 @@ pub struct StructTest {
     points = %{origin: %Point{x: 0, y: 0}, end: %Point{x: 10, y: 20}}
     origin = Map.get(points, :origin, %Point{x: -1, y: -1})
     origin.y
+  }
+
+  describe("Recursive struct field auto-deref") {
+    test("indirect-storage field reads as source-level optional") {
+      head = build_two_node_list()
+      assert(head.value == 1)
+      assert(head_next_is_set(head))
+    }
+
+    test("indirect-storage field nil compares cleanly") {
+      tail = %LinkedNode{value: 99, next: nil}
+      assert(tail.next == nil)
+    }
+
+    test("indirect field passes through to ?T parameter") {
+      head = build_two_node_list()
+      assert(StructTest.next_is_present(head.next))
+      assert(StructTest.next_is_present(nil) == false)
+    }
+  }
+
+  fn build_two_node_list() -> LinkedNode {
+    tail = %LinkedNode{value: 2, next: nil}
+    %LinkedNode{value: 1, next: tail}
+  }
+
+  fn head_next_is_set(node :: LinkedNode) -> Bool {
+    node.next != nil
+  }
+
+  pub fn next_is_present(maybe :: LinkedNode | nil) -> Bool {
+    maybe != nil
   }
 }

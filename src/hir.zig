@@ -102,6 +102,10 @@ pub const StructBinding = struct {
     param_index: u32,
     field_name: ast.StringId,
     local_index: u32,
+    /// Struct nominal type that owns the field. Plumbed through so the
+    /// IR builder can resolve the field's source-level type and storage
+    /// strategy (`FieldStorage.indirect` for self-referential fields).
+    struct_type: ast.StringId,
 };
 
 pub const MapBinding = struct {
@@ -3721,6 +3725,7 @@ pub const HirBuilder = struct {
                                 .param_index = @intCast(param_idx),
                                 .field_name = fb.field_name,
                                 .local_index = local_idx,
+                                .struct_type = pat.struct_match.type_name,
                             });
                         }
                     }

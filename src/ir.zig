@@ -370,6 +370,12 @@ pub const FieldGet = struct {
     dest: LocalId,
     object: LocalId,
     field: []const u8,
+    /// Struct type name owning the field, when known. Used by
+    /// the ZIR emitter to look up `FieldStorage` for indirect-
+    /// storage auto-deref. `null` when the receiver's struct
+    /// type isn't statically known (e.g. `term`/`any` or open
+    /// generics).
+    struct_type: ?[]const u8 = null,
 };
 
 pub const FieldSet = struct {
@@ -1190,6 +1196,47 @@ pub const IrBuilder = struct {
             .list => known.list.*,
             else => .i64,
         };
+    }
+
+    /// Resolve the nominal struct type name owning a `field_get`'s
+    /// receiver, when the local's static type is a struct (or an
+    /// optional/pointer to one). Returns the struct name string the
+    /// ZIR emitter can hand to `findStructDef`. `null` means the
+    /// receiver's struct identity isn't statically known — fall back
+    /// to the un-derefed `field_val` path.
+    fn structTypeForFieldReceiver(self: *const IrBuilder, local: LocalId) ?[]const u8 {
+        const known = self.known_local_types.get(local) orelse return null;
+        return zigTypeStructName(known);
+    }
+
+    /// Look up the source-level field type and storage strategy for a
+    /// field on a struct whose def already lives in the TypeStore.
+    /// Returns null when the struct or field can't be resolved (e.g.
+    /// generic shapes, missing TypeStore). The ZIR emitter uses the
+    /// returned `ZigType` to drive the source-level type the indirect
+    /// auto-deref must produce.
+    fn fieldZigTypeAndStorage(self: *const IrBuilder, struct_name: []const u8, field_name: []const u8) ?struct {
+        type_expr: ZigType,
+        storage: FieldStorage,
+    } {
+        const ts = self.type_store orelse return null;
+        for (ts.types.items) |typ| {
+            if (typ != .struct_type) continue;
+            const st = typ.struct_type;
+            const owner = self.interner.get(st.name);
+            if (!std.mem.eql(u8, owner, struct_name)) continue;
+            for (st.fields) |f| {
+                const fname = self.interner.get(f.name);
+                if (!std.mem.eql(u8, fname, field_name)) continue;
+                const field_zig_type = typeIdToZigTypeWithStore(f.type_id, self.type_store);
+                const storage: FieldStorage = if (zigTypeReachesStruct(field_zig_type, owner))
+                    .indirect
+                else
+                    .direct;
+                return .{ .type_expr = field_zig_type, .storage = storage };
+            }
+        }
+        return null;
     }
 
     /// True iff `name_id` (a struct's StringId) refers to the stdlib
@@ -2843,13 +2890,23 @@ pub const IrBuilder = struct {
             try self.current_instrs.append(self.allocator, .{
                 .param_get = .{ .dest = struct_local, .index = binding.param_index },
             });
+            // Track the param's struct type so the field_get lookup
+            // resolves the nominal type and can attach storage info.
+            const struct_name = self.interner.get(binding.struct_type);
+            try self.known_local_types.put(struct_local, .{ .struct_ref = struct_name });
+            const field_name = self.interner.get(binding.field_name);
+            const info = self.fieldZigTypeAndStorage(struct_name, field_name);
             try self.current_instrs.append(self.allocator, .{
                 .field_get = .{
                     .dest = binding.local_index,
                     .object = struct_local,
-                    .field = self.interner.get(binding.field_name),
+                    .field = field_name,
+                    .struct_type = struct_name,
                 },
             });
+            if (info) |i| {
+                try self.known_local_types.put(binding.local_index, i.type_expr);
+            }
         }
     }
 
@@ -3508,16 +3565,26 @@ pub const IrBuilder = struct {
             },
             .extract_struct => |es| {
                 const scrutinee_local = self.resolveScrutinee(es.scrutinee, scrutinee_map);
+                const struct_type = self.structTypeForFieldReceiver(scrutinee_local);
                 for (es.fields) |fe| {
                     const field_local = self.next_local;
                     self.next_local += 1;
+                    const field_name = self.interner.get(fe.field_name);
+                    const field_info = if (struct_type) |sname|
+                        self.fieldZigTypeAndStorage(sname, field_name)
+                    else
+                        null;
                     try self.current_instrs.append(self.allocator, .{
                         .field_get = .{
                             .dest = field_local,
                             .object = scrutinee_local,
-                            .field = self.interner.get(fe.field_name),
+                            .field = field_name,
+                            .struct_type = struct_type,
                         },
                     });
+                    if (field_info) |i| {
+                        try self.known_local_types.put(field_local, i.type_expr);
+                    }
                     try scrutinee_map.put(fe.scrutinee_id, field_local);
                 }
                 try self.lowerDecisionTreeForCase(es.success, case_arms, scrutinee_map, 0);
@@ -3923,16 +3990,26 @@ pub const IrBuilder = struct {
             },
             .extract_struct => |es| {
                 const scrutinee_local = self.resolveScrutinee(es.scrutinee, scrutinee_map);
+                const struct_type = self.structTypeForFieldReceiver(scrutinee_local);
                 for (es.fields) |fe| {
                     const field_local = self.next_local;
                     self.next_local += 1;
+                    const field_name = self.interner.get(fe.field_name);
+                    const field_info = if (struct_type) |sname|
+                        self.fieldZigTypeAndStorage(sname, field_name)
+                    else
+                        null;
                     try self.current_instrs.append(self.allocator, .{
                         .field_get = .{
                             .dest = field_local,
                             .object = scrutinee_local,
-                            .field = self.interner.get(fe.field_name),
+                            .field = field_name,
+                            .struct_type = struct_type,
                         },
                     });
+                    if (field_info) |i| {
+                        try self.known_local_types.put(field_local, i.type_expr);
+                    }
                     try scrutinee_map.put(fe.scrutinee_id, field_local);
                 }
                 try self.lowerDecisionTreeForDispatch(es.success, clauses, scrutinee_map);
@@ -5089,13 +5166,21 @@ pub const IrBuilder = struct {
                     }
                 }
                 const obj = try self.lowerExpr(fg.object);
+                const field_name = self.interner.get(fg.field);
+                const struct_type = self.structTypeForFieldReceiver(obj);
                 try self.current_instrs.append(self.allocator, .{
                     .field_get = .{
                         .dest = dest,
                         .object = obj,
-                        .field = self.interner.get(fg.field),
+                        .field = field_name,
+                        .struct_type = struct_type,
                     },
                 });
+                if (struct_type) |sname| {
+                    if (self.fieldZigTypeAndStorage(sname, field_name)) |info| {
+                        try self.known_local_types.put(dest, info.type_expr);
+                    }
+                }
             },
             .tuple_index_get => |tig| {
                 const obj = try self.lowerExpr(tig.object);
@@ -5678,6 +5763,19 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
 /// the next step. If a future change adds it, this function should
 /// be extended to walk a precomputed SCC map rather than the
 /// in-place name match.
+/// Peel `optional`/`ptr` wrappers and return the struct name when the
+/// underlying nominal type is a struct. Used by `field_get` lowering
+/// to look up the receiver's struct definition for indirect-storage
+/// auto-deref.
+fn zigTypeStructName(t: ZigType) ?[]const u8 {
+    return switch (t) {
+        .struct_ref => |name| name,
+        .optional => |inner| zigTypeStructName(inner.*),
+        .ptr => |inner| zigTypeStructName(inner.*),
+        else => null,
+    };
+}
+
 fn zigTypeReachesStruct(t: ZigType, owner_name: []const u8) bool {
     return switch (t) {
         .struct_ref => |name| std.mem.eql(u8, name, owner_name),
