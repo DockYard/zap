@@ -2989,7 +2989,18 @@ pub fn Map(comptime K: type, comptime V: type) type {
             bitmap: u32,
             children_entries: [*]const MapEntry, // leaf entries (parallel to children_nodes)
             children_nodes: [*]const ?*const HamtNode, // sub-nodes (null = leaf at this slot)
-            child_count: u5,
+            // u6 fits 0..63 — `child_count` may equal `BRANCHING_FACTOR`
+            // (32) when every bit is set, which doesn't fit u5.
+            child_count: u6,
+            // When set, the node is a collision bucket: hash bits have
+            // been exhausted at this depth (or beyond), so `bitmap`
+            // and `children_nodes` are unused, and `children_entries`
+            // is treated as a flat list of `child_count` entries
+            // looked up by linear scan over `keysEqual`. Without this
+            // flag the previous "max depth" code path silently
+            // replaced collisions, dropping data — surfaced by the
+            // CLBG `k-nucleotide` 18-mer query.
+            is_collision: bool = false,
         };
 
         /// Hash a key value for HAMT lookup. Supports u32 (atoms), i64, []const u8 (strings), bool, Term.
@@ -3087,8 +3098,26 @@ pub fn Map(comptime K: type, comptime V: type) type {
             return @intCast(@popCount(bitmap & (bit - 1)));
         }
 
-        fn hamtGet(node: *const HamtNode, key: K, hash: u32, depth: u5) ?V {
-            const shift: u5 = depth * BITS_PER_LEVEL;
+        fn hamtGet(node: *const HamtNode, key: K, hash: u32, depth: u8) ?V {
+            // Collision-bucket node: hash bits at this depth or
+            // beyond can no longer differentiate keys, so we walk
+            // the flat entry list and compare by `keysEqual`.
+            if (node.is_collision) {
+                const total: usize = @intCast(node.child_count);
+                for (0..total) |i| {
+                    const e = node.children_entries[i];
+                    if (keysEqual(e.key, key)) return e.value;
+                }
+                return null;
+            }
+            // `depth * BITS_PER_LEVEL` may exceed `u5`'s range during
+            // a transient recursive descent past the collision guard
+            // (the guard at `MAX_DEPTH - 1` only prevents creating
+            // *new* deeper sub-nodes; it does not prevent walking
+            // through a sub-node already created at the threshold
+            // depth). Promote `depth` to `u8` and narrow only at the
+            // shift site so the multiply fits.
+            const shift: u5 = @intCast(depth * BITS_PER_LEVEL);
             const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
 
             if (node.bitmap & bit == 0) return null;
@@ -3104,8 +3133,45 @@ pub fn Map(comptime K: type, comptime V: type) type {
             }
         }
 
-        fn hamtPut(node: *const HamtNode, key: K, value: V, hash: u32, depth: u5) ?*const HamtNode {
-            const shift: u5 = depth * BITS_PER_LEVEL;
+        fn hamtPut(node: *const HamtNode, key: K, value: V, hash: u32, depth: u8) ?*const HamtNode {
+            // Collision-bucket node: append or update via linear scan.
+            if (node.is_collision) {
+                const total: usize = @intCast(node.child_count);
+                // Update existing entry if present.
+                for (0..total) |i| {
+                    if (keysEqual(node.children_entries[i].key, key)) {
+                        const new_entries = allocEntries(total) orelse return null;
+                        @memcpy(new_entries[0..total], node.children_entries[0..total]);
+                        new_entries[i] = .{ .key = key, .value = value };
+                        const new_node = allocHamtNode() orelse return null;
+                        new_node.* = .{
+                            .bitmap = 0,
+                            .children_entries = new_entries,
+                            .children_nodes = node.children_nodes,
+                            .child_count = node.child_count,
+                            .is_collision = true,
+                        };
+                        return new_node;
+                    }
+                }
+                // Append new entry.
+                const new_count = total + 1;
+                const new_entries = allocEntries(new_count) orelse return null;
+                if (total > 0) {
+                    @memcpy(new_entries[0..total], node.children_entries[0..total]);
+                }
+                new_entries[total] = .{ .key = key, .value = value };
+                const new_node = allocHamtNode() orelse return null;
+                new_node.* = .{
+                    .bitmap = 0,
+                    .children_entries = new_entries,
+                    .children_nodes = node.children_nodes,
+                    .child_count = @intCast(new_count),
+                    .is_collision = true,
+                };
+                return new_node;
+            }
+            const shift: u5 = @intCast(depth * BITS_PER_LEVEL);
             const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
             const idx = sparseIndex(node.bitmap, bit);
 
@@ -3154,10 +3220,25 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 return copyNodeWithUpdatedEntry(node, idx, .{ .key = key, .value = value });
             }
 
-            // Hash collision at this depth — create sub-node
+            // Hash collision at this depth — create sub-node.
             if (depth >= MAX_DEPTH - 1) {
-                // At max depth, just replace (degenerate case)
-                return copyNodeWithUpdatedEntry(node, idx, .{ .key = key, .value = value });
+                // Hash bits exhausted: build a collision-bucket
+                // sub-node holding both entries as a flat list. The
+                // previous code replaced the existing entry here,
+                // silently dropping data when two keys shared every
+                // 5-bit chunk of their 32-bit hash.
+                const collision_entries = allocEntries(2) orelse return null;
+                collision_entries[0] = existing;
+                collision_entries[1] = .{ .key = key, .value = value };
+                const collision_sub = allocHamtNode() orelse return null;
+                collision_sub.* = .{
+                    .bitmap = 0,
+                    .children_entries = collision_entries,
+                    .children_nodes = undefined,
+                    .child_count = 2,
+                    .is_collision = true,
+                };
+                return copyNodeWithUpdatedChild(node, idx, null, collision_sub);
             }
 
             // Create a new sub-node containing both the existing and new entries
@@ -3169,8 +3250,39 @@ pub fn Map(comptime K: type, comptime V: type) type {
             return copyNodeWithUpdatedChild(node, idx, null, sub_with_both);
         }
 
-        fn hamtDelete(node: *const HamtNode, key: K, hash: u32, depth: u5) ?*const HamtNode {
-            const shift: u5 = depth * BITS_PER_LEVEL;
+        fn hamtDelete(node: *const HamtNode, key: K, hash: u32, depth: u8) ?*const HamtNode {
+            // Collision-bucket: drop the matching entry by linear scan.
+            if (node.is_collision) {
+                const total: usize = @intCast(node.child_count);
+                var hit: ?usize = null;
+                for (0..total) |i| {
+                    if (keysEqual(node.children_entries[i].key, key)) {
+                        hit = i;
+                        break;
+                    }
+                }
+                const drop = hit orelse return node;
+                if (total <= 1) {
+                    // Bucket emptied — caller will remove the whole sub-node.
+                    const empty_node = allocHamtNode() orelse return null;
+                    empty_node.* = .{ .bitmap = 0, .children_entries = undefined, .children_nodes = undefined, .child_count = 0, .is_collision = true };
+                    return empty_node;
+                }
+                const new_count = total - 1;
+                const new_entries = allocEntries(new_count) orelse return null;
+                if (drop > 0) @memcpy(new_entries[0..drop], node.children_entries[0..drop]);
+                if (drop < new_count) @memcpy(new_entries[drop..new_count], node.children_entries[drop + 1 .. total]);
+                const new_node = allocHamtNode() orelse return null;
+                new_node.* = .{
+                    .bitmap = 0,
+                    .children_entries = new_entries,
+                    .children_nodes = node.children_nodes,
+                    .child_count = @intCast(new_count),
+                    .is_collision = true,
+                };
+                return new_node;
+            }
+            const shift: u5 = @intCast(depth * BITS_PER_LEVEL);
             const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
 
             if (node.bitmap & bit == 0) return node; // not found
@@ -3263,6 +3375,14 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// Collect all entries from a HAMT trie into a flat list.
         fn hamtCollect(node: *const HamtNode, result: *std.ArrayListUnmanaged(MapEntry)) void {
             const count: usize = @intCast(node.child_count);
+            // Collision-bucket nodes hold every entry inline; no
+            // sub-nodes to recurse into.
+            if (node.is_collision) {
+                for (0..count) |i| {
+                    result.append(runtime_arena.allocator(), node.children_entries[i]) catch {};
+                }
+                return;
+            }
             for (0..count) |i| {
                 if (node.children_nodes[i]) |sub| {
                     hamtCollect(sub, result);
