@@ -23,7 +23,20 @@ pub struct LinkedNode {
   next :: LinkedNode | nil
 }
 
+## Two structs that reach each other through a non-self field —
+## the SCC-aware storage analyzer must give BOTH fields
+## `FieldStorage.indirect` so neither lays out inline. Without
+## SCC, only direct self-cycles get the indirection and these
+## land at infinite-size.
+pub struct CycleA {
+  tag :: i64
+  partner :: CycleB | nil
+}
 
+pub struct CycleB {
+  weight :: i64
+  back :: CycleA | nil
+}
 
 
 pub struct StructTest {
@@ -320,6 +333,20 @@ pub struct StructTest {
       head = build_two_node_list()
       assert(StructTest.next_is_present(head.next))
       assert(StructTest.next_is_present(nil) == false)
+    }
+
+    test("mutual recursion via SCC analysis") {
+      ## CycleA.partner -> CycleB -> CycleA closes a cycle through
+      ## a SECOND struct, not through self-reference. The SCC walker
+      ## must detect this and mark both indirect fields with hidden
+      ## pointers; without it, layout is infinite and either type-
+      ## checking or codegen errors out.
+      b = %CycleB{weight: 11, back: nil}
+      a = %CycleA{tag: 5, partner: b}
+      assert(a.tag == 5)
+      assert(a.partner != nil)
+      assert(b.weight == 11)
+      assert(b.back == nil)
     }
 
     test("recursive build outlives constructing frames") {

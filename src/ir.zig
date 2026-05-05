@@ -1261,10 +1261,12 @@ pub const IrBuilder = struct {
                 const fname = self.interner.get(f.name);
                 if (!std.mem.eql(u8, fname, field_name)) continue;
                 const field_zig_type = typeIdToZigTypeWithStore(f.type_id, self.type_store);
-                const storage: FieldStorage = if (zigTypeReachesStruct(field_zig_type, owner))
-                    .indirect
-                else
-                    .direct;
+                // Use the SCC-aware walker so mutual recursion (`A
+                // → B → A`) gets the same `.indirect` storage that
+                // self-recursion already does.
+                const reaches_cycle = zigTypeReachesStructInCycle(self.allocator, field_zig_type, owner, ts, self.interner) catch
+                    zigTypeReachesStruct(field_zig_type, owner);
+                const storage: FieldStorage = if (reaches_cycle) .indirect else .direct;
                 return .{ .type_expr = field_zig_type, .storage = storage };
             }
         }
@@ -1387,10 +1389,13 @@ pub const IrBuilder = struct {
                         for (st.fields) |field| {
                             const default_val: ?DefaultValue = if (field.default_expr) |expr| self.extractDefaultValue(expr) else null;
                             const field_zig_type = typeIdToZigTypeWithStore(field.type_id, self.type_store);
-                            const storage: FieldStorage = if (zigTypeReachesStruct(field_zig_type, owner_name))
-                                .indirect
-                            else
-                                .direct;
+                            // Use the SCC-aware walker so mutual recursion
+                            // (`A → B → A`) gets `.indirect` storage just
+                            // like self-recursion does. Falls back to the
+                            // shallow check on allocator failure.
+                            const reaches_cycle = zigTypeReachesStructInCycle(self.allocator, field_zig_type, owner_name, ts, self.interner) catch
+                                zigTypeReachesStruct(field_zig_type, owner_name);
+                            const storage: FieldStorage = if (reaches_cycle) .indirect else .direct;
                             try fields.append(self.allocator, .{
                                 .name = self.interner.get(field.name),
                                 .type_expr = field_zig_type,
@@ -6003,15 +6008,14 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
 }
 
 /// Walk a ZigType and return true if it transitively references a
-/// nominal struct type matching `owner_name`. Used to detect
-/// self-referential struct fields so the IR can mark them with
-/// `FieldStorage.indirect` and the codegen can break the layout
-/// cycle with a hidden pointer.
+/// nominal struct type matching `owner_name` via direct
+/// `struct_ref` traversal alone — does NOT follow into other
+/// structs' fields. Used as the inner step of the SCC-aware walker
+/// below, and as the storage-decision criterion when no `TypeStore`
+/// is attached (raw-IR unit tests).
 ///
-/// Self-recursion only — mutual recursion through SCC analysis is
-/// the next step. If a future change adds it, this function should
-/// be extended to walk a precomputed SCC map rather than the
-/// in-place name match.
+/// Self-recursion only at this layer; for mutual recursion (`A → B
+/// → A`) callers should use `zigTypeReachesStructInCycle`.
 /// Peel `optional`/`ptr` wrappers and return the struct name when the
 /// underlying nominal type is a struct. Used by `field_get` lowering
 /// to look up the receiver's struct definition for indirect-storage
@@ -6050,6 +6054,117 @@ fn zigTypeReachesStruct(t: ZigType, owner_name: []const u8) bool {
         // tagged_union variants currently lower as u32 enum tags
         // anyway; if/when payload variants land they'd need
         // separate recursion handling.
+        .void,
+        .bool_type,
+        .nil,
+        .never,
+        .term,
+        .any,
+        .string,
+        .atom,
+        .i8,
+        .i16,
+        .i32,
+        .i64,
+        .i128,
+        .u8,
+        .u16,
+        .u32,
+        .u64,
+        .u128,
+        .f16,
+        .f32,
+        .f64,
+        .f80,
+        .f128,
+        .usize,
+        .isize,
+        .tagged_union,
+        => false,
+    };
+}
+
+/// SCC-aware variant of `zigTypeReachesStruct`. Returns true iff
+/// `t` transitively references a struct that is in the same
+/// strongly-connected component as `owner_name` over the struct
+/// dependency graph. Catches both self-recursion (`A → A`, the
+/// degenerate 1-element SCC) and mutual recursion (`A → B → A`,
+/// where the cycle crosses one or more intermediate structs).
+///
+/// Without this, mutually-recursive struct families would lay out
+/// inline by value and explode at type-check or codegen time
+/// (Zig's "struct has infinite size" diagnostic, or worse, an LLVM
+/// crash). The check uses an iterative DFS keyed on struct name with
+/// a visited set, so the cost is bounded by the program's struct
+/// graph regardless of how the user wraps fields in containers.
+///
+/// `interner_lookup` translates a `StringId` to a string; the caller
+/// passes its own interner so this function stays free of any
+/// `IrBuilder` state and remains usable from raw-IR unit tests once
+/// they wire up a TypeStore.
+fn zigTypeReachesStructInCycle(
+    allocator: std.mem.Allocator,
+    t: ZigType,
+    owner_name: []const u8,
+    type_store: *const types_mod.TypeStore,
+    interner: *const ast.StringInterner,
+) !bool {
+    var visited = std.StringHashMapUnmanaged(void){};
+    defer visited.deinit(allocator);
+    return reachesStructInCycleImpl(allocator, t, owner_name, &visited, type_store, interner);
+}
+
+fn reachesStructInCycleImpl(
+    allocator: std.mem.Allocator,
+    t: ZigType,
+    owner_name: []const u8,
+    visited: *std.StringHashMapUnmanaged(void),
+    type_store: *const types_mod.TypeStore,
+    interner: *const ast.StringInterner,
+) !bool {
+    return switch (t) {
+        .struct_ref => |name| blk: {
+            if (std.mem.eql(u8, name, owner_name)) break :blk true;
+            // Avoid revisiting structs already on the DFS stack —
+            // bounds the walk to one pass over the struct graph.
+            if (visited.contains(name)) break :blk false;
+            try visited.put(allocator, name, {});
+            // Walk the named struct's field types, looking for a
+            // path back to `owner_name`. The TypeStore is the
+            // authoritative source of struct field shapes; the
+            // `IrBuilder.fields` representation is built only at IR
+            // finalization and isn't available here.
+            for (type_store.types.items) |typ| {
+                if (typ != .struct_type) continue;
+                const st = typ.struct_type;
+                const sname = interner.get(st.name);
+                if (!std.mem.eql(u8, sname, name)) continue;
+                for (st.fields) |f| {
+                    const f_zig_type = typeIdToZigTypeWithStore(f.type_id, type_store);
+                    if (try reachesStructInCycleImpl(allocator, f_zig_type, owner_name, visited, type_store, interner))
+                        break :blk true;
+                }
+                break;
+            }
+            break :blk false;
+        },
+        .optional => |inner| try reachesStructInCycleImpl(allocator, inner.*, owner_name, visited, type_store, interner),
+        .ptr => |pointee| try reachesStructInCycleImpl(allocator, pointee.*, owner_name, visited, type_store, interner),
+        .list => |elem| try reachesStructInCycleImpl(allocator, elem.*, owner_name, visited, type_store, interner),
+        .map => |mt| (try reachesStructInCycleImpl(allocator, mt.key.*, owner_name, visited, type_store, interner)) or
+            (try reachesStructInCycleImpl(allocator, mt.value.*, owner_name, visited, type_store, interner)),
+        .tuple => |elems| blk: {
+            for (elems) |elem| {
+                if (try reachesStructInCycleImpl(allocator, elem, owner_name, visited, type_store, interner)) break :blk true;
+            }
+            break :blk false;
+        },
+        .function => |ft| blk: {
+            for (ft.params) |p| {
+                if (try reachesStructInCycleImpl(allocator, p, owner_name, visited, type_store, interner)) break :blk true;
+            }
+            break :blk try reachesStructInCycleImpl(allocator, ft.return_type.*, owner_name, visited, type_store, interner);
+        },
         .void,
         .bool_type,
         .nil,
