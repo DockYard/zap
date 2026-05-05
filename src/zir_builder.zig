@@ -437,6 +437,13 @@ pub const ZirDriver = struct {
     current_block_label: ir.LabelId = 0,
     /// True when the current function is a closure (has captures).
     current_function_is_closure: bool = false,
+    /// When the function being emitted is a loopification candidate
+    /// (`Function.loopify == true`), this holds one mutable-stack-slot
+    /// pointer Ref per parameter. The function body is wrapped in a
+    /// `loop` block: `param_get(i)` loads from `loopify_slots[i]`, and
+    /// `tail_call` to self stores the new args back into the same
+    /// slots and emits `repeat`. `null` outside loopification.
+    loopify_slots: ?[]u32 = null,
     /// Nesting depth of capture contexts (case/switch/if-else bodies).
     /// When > 0, struct_init_typed can't be used because struct_init_field_type
     /// instructions (emitted via addInst) don't enter captured bodies.
@@ -3028,6 +3035,18 @@ pub const ZirDriver = struct {
             _ = try self.ensureListMethodRef(list_cell, "get", &self.cached_list_get_ref);
         }
 
+        // Loopification prologue: when the function has by-ref params
+        // and self-tail-calls, wrap the body in a `loop` block and
+        // route every `param_get(i)` through a per-param mutable
+        // stack slot. Tail calls store the new args back into the
+        // slots and `repeat` the loop instead of musttail-ing — see
+        // `Function.loopify` and the `tail_call` lowering for the
+        // dispatch.
+        if (func.loopify) {
+            try self.beginLoopification(func);
+            self.beginCapture();
+        }
+
         // Emit body blocks.
         for (func.body) |block| {
             self.current_block_label = block.label;
@@ -3041,9 +3060,75 @@ pub const ZirDriver = struct {
             }
         }
 
+        if (func.loopify) {
+            // The loop body must end on a noreturn instruction or
+            // Sema's `analyzeBodyInner` walks past the end. The
+            // dispatcher's value-producing `block` (from
+            // `if_else_bodies`) ISN'T noreturn — its branches break
+            // out with `void` — so we append an explicit `repeat`
+            // here. Iterations that ret-from-the-function (matched
+            // base cases) never reach it; iterations that committed
+            // new args into the slots fall through the dispatcher's
+            // block and hit this `repeat`, jumping back to the loop
+            // header.
+            try self.emitRepeat();
+            var body_len: u32 = 0;
+            const body_ptr = self.endCapture(&body_len);
+            const body_insts = try self.allocator.alloc(u32, body_len);
+            defer self.allocator.free(body_insts);
+            @memcpy(body_insts, body_ptr[0..body_len]);
+            _ = try self.emitLoop(body_insts);
+            self.endLoopification();
+        }
+
         if (zir_builder_end_func(self.handle) != 0) {
             return error.EndFuncFailed;
         }
+    }
+
+    /// Allocate one mutable stack slot per parameter and seed each
+    /// slot with the corresponding entry-param value. Stores the slot
+    /// pointer Refs in `loopify_slots` so the body's `param_get` and
+    /// `tail_call` lowerings can read/write them. Slot type comes from
+    /// `@TypeOf(param_ref)` rather than `func.params[i].type_expr` so
+    /// captures-prepended layouts (where `param_refs` is wider than
+    /// `func.params`) still get a slot per ZIR param.
+    fn beginLoopification(self: *ZirDriver, func: ir.Function) !void {
+        _ = func;
+        const num_params = self.param_refs.items.len;
+        if (num_params == 0) return;
+
+        var slots = try self.allocator.alloc(u32, num_params);
+        errdefer self.allocator.free(slots);
+
+        for (self.param_refs.items, 0..) |param_ref, i| {
+            const type_ref = zir_builder_emit_typeof(self.handle, param_ref);
+            if (type_ref == error_ref) return error.EmitFailed;
+            const slot_ref = try self.emitAllocMut(type_ref);
+            if (zir_builder_emit_store(self.handle, slot_ref, param_ref) != 0)
+                return error.EmitFailed;
+            slots[i] = slot_ref;
+        }
+        self.loopify_slots = slots;
+    }
+
+    fn endLoopification(self: *ZirDriver) void {
+        if (self.loopify_slots) |slots| self.allocator.free(slots);
+        self.loopify_slots = null;
+    }
+
+    /// Resolve the per-iteration value of param `index` when emitting
+    /// the body of a loopified function. Returns a fresh `load` from
+    /// the param's mutable stack slot — never the entry-scope param
+    /// ref. Used by IR forms that consult the param-INDEX slot
+    /// directly (e.g. `switch_return.scrutinee_param`,
+    /// `optional_dispatch.scrutinee_param`); without this, those
+    /// reads would observe the entry value and the loop would never
+    /// converge.
+    fn loopifyLoadParam(self: *ZirDriver, index: u32) BuildError!u32 {
+        const slots = self.loopify_slots orelse return error.EmitFailed;
+        if (index >= slots.len) return error.EmitFailed;
+        return try self.emitLoad(slots[index]);
     }
 
     // -- Instruction dispatch -------------------------------------------------
@@ -3712,6 +3797,18 @@ pub const ZirDriver = struct {
                 }
             },
             .param_get => |pg| {
+                // Loopification: load the param's per-iteration value
+                // from its stack slot. Each `param_get` emits a fresh
+                // `load`; LLVM's mem2reg merges them into a single
+                // phi at the loop header.
+                if (self.loopify_slots) |slots| {
+                    if (pg.index < slots.len) {
+                        const loaded = try self.emitLoad(slots[pg.index]);
+                        try self.setLocal(pg.dest, loaded);
+                        try self.markParamDerivedClosureLocal(pg.dest);
+                        return;
+                    }
+                }
                 // Look up param ref from the dedicated param_refs array,
                 // NOT from local_refs which may have been overwritten by
                 // earlier param_get dest assignments.
@@ -4397,8 +4494,44 @@ pub const ZirDriver = struct {
                 } // end if (!generic_handled)
             },
 
-            // Tail calls — call + ret
+            // Tail calls — two strategies, picked at function-emission time:
+            //
+            //   * Default (TCO-safe params/return): emit a `musttail
+            //     call + ret`. LLVM reuses the current stack frame.
+            //   * Loopification (`Function.loopify == true`): store
+            //     each new arg into the matching `loopify_slots` slot
+            //     and emit `repeat` to jump back to the wrapping loop
+            //     header. This sidesteps LLVM's `musttail` legality
+            //     check (which rejects byref signatures on fastcc-bound
+            //     argument shapes) and gives byref state bounded-stack
+            //     recursion.
             .tail_call => |tc| {
+                if (self.loopify_slots) |slots| {
+                    var arg_refs: std.ArrayListUnmanaged(u32) = .empty;
+                    defer arg_refs.deinit(self.allocator);
+                    for (tc.args) |arg| {
+                        const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        try arg_refs.append(self.allocator, ref);
+                    }
+                    // Commit the new arg values into their slots. The
+                    // wrapping `loop` block re-iterates implicitly when
+                    // its body falls through without breaking out, so
+                    // we don't emit an explicit `repeat` here — Sema's
+                    // ZIR `repeat` only resolves against the immediate
+                    // body of `loop`, and these stores live inside a
+                    // cond_br branch (case body of a switch_return /
+                    // optional_dispatch). Letting the if-else's normal
+                    // `break_inline` carry control back out of the
+                    // branch gives Sema an "unfinished" body, which it
+                    // turns into the loop back-edge.
+                    for (arg_refs.items, 0..) |arg_ref, i| {
+                        if (i >= slots.len) break;
+                        if (zir_builder_emit_store(self.handle, slots[i], arg_ref) != 0)
+                            return error.EmitFailed;
+                    }
+                    return;
+                }
+
                 // Guaranteed tail call: set always_tail modifier (4) so LLVM
                 // emits a tail call that reuses the current stack frame.
                 // Tail calls are always intra-struct (self-recursion).
@@ -6999,7 +7132,14 @@ pub const ZirDriver = struct {
     /// Each case compares the scrutinee parameter against the literal value
     /// and the body contains the return instruction.
     fn emitSwitchReturn(self: *ZirDriver, sr: ir.SwitchReturn) BuildError!void {
-        const scrutinee_ref = try self.refForLocal(sr.scrutinee_param);
+        // In loopified functions the dispatcher must scrutinise the
+        // per-iteration value loaded from the slot, not the entry-
+        // scope param ref `refForLocal(scrutinee_param)` would return.
+        const scrutinee_ref = if (self.loopify_slots != null and
+            sr.scrutinee_param < self.param_refs.items.len)
+            try self.loopifyLoadParam(sr.scrutinee_param)
+        else
+            try self.refForLocal(sr.scrutinee_param);
 
         if (sr.cases.len == 0) {
             // No cases — just emit the default body
@@ -7236,7 +7376,13 @@ pub const ZirDriver = struct {
     /// `T` value, not the `?T` storage.
     fn emitOptionalDispatch(self: *ZirDriver, od: ir.OptionalDispatch) BuildError!void {
         if (od.scrutinee_param >= self.param_refs.items.len) return error.EmitFailed;
-        const scrutinee_ref = self.param_refs.items[od.scrutinee_param];
+        // Loopification: scrutinise the per-iteration slot load, not
+        // the entry-scope param ref. See `emitSwitchReturn` for the
+        // same redirect.
+        const scrutinee_ref = if (self.loopify_slots != null)
+            try self.loopifyLoadParam(od.scrutinee_param)
+        else
+            self.param_refs.items[od.scrutinee_param];
         const is_non_null = zir_builder_emit_is_non_null(self.handle, scrutinee_ref);
         if (is_non_null == error_ref) return error.EmitFailed;
 

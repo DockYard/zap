@@ -39,6 +39,36 @@ pub struct RecursionTest {
     }
   }
 
+  pub struct LoopState {
+    a :: f64
+    b :: f64
+  }
+
+  describe("byref tail-call loopification") {
+    test("recurses 10000 deep without blowing the stack") {
+      ## Without IR-level loopification, by-ref state recursion
+      ## can't use LLVM `musttail` (rejected for fastcc-bound argument
+      ## shapes) and the call uses a real frame per iteration. At a
+      ## depth that overflows the 8 MB macOS thread stack the program
+      ## segfaults. With loopification the recursion compiles to a
+      ## stack-slot loop and runs in bounded stack regardless of
+      ## depth.
+      s0 = %LoopState{a: 0.0, b: 0.0}
+      sN = RecursionTest.byref_step(s0, 10000 :: i64)
+      assert(sN.a == 10000.0)
+      assert(sN.b == 20000.0)
+    }
+  }
+
+  pub fn byref_step(s :: LoopState, 0 :: i64) -> LoopState {
+    s
+  }
+
+  pub fn byref_step(s :: LoopState, n :: i64) -> LoopState {
+    next = %LoopState{a: s.a + 1.0, b: s.b + 2.0}
+    RecursionTest.byref_step(next, n - 1)
+  }
+
   fn factorial(0 :: i64) -> i64 {
     1
   }

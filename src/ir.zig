@@ -124,6 +124,15 @@ pub const Function = struct {
     /// Default parameter values. defaults[i] is the default for params[full_arity - defaults.len + i].
     /// Empty when no defaults exist.
     defaults: []const DefaultValue = &.{},
+    /// True when at least one self-tail-call survives in this function
+    /// AND the by-value parameter ABI would reject `musttail`. Set by
+    /// `rewriteTailCalls` after observing both. The ZIR backend reads
+    /// this flag and lowers tail-position self-calls as a `loop` +
+    /// stack-slot recurrence (loopification) instead of `musttail`.
+    /// Loopification has zero hot-path allocation and bypasses LLVM's
+    /// tail-call legality entirely, so byref-shaped state recurses
+    /// in bounded stack.
+    loopify: bool = false,
 };
 
 pub const DefaultValue = union(enum) {
@@ -1987,9 +1996,15 @@ pub const IrBuilder = struct {
             }
         }
 
-        // Rewrite tail-recursive calls: replace call_named + ret/break with tail_call.
-        // Skipped for byref-shaped signatures — see `rewriteTailCalls` doc.
+        // Rewrite tail-recursive self-calls into `tail_call` IR. The
+        // ZIR backend's tail_call lowering picks musttail (TCO-safe
+        // signatures) vs loopification (byref) — see `rewriteTailCalls`
+        // doc for the dispatch rationale.
         entry_instrs = try self.rewriteTailCalls(entry_instrs, name_str, params.items, return_type);
+
+        const has_tail_call = containsTailCall(entry_instrs);
+        const tco_safe = isTcoEligible(params.items, return_type);
+        const loopify = has_tail_call and !tco_safe;
 
         const entry_block = Block{
             .label = 0,
@@ -2034,6 +2049,7 @@ pub const IrBuilder = struct {
             .captures = try captures.toOwnedSlice(self.allocator),
             .local_count = self.next_local,
             .defaults = try defaults_list.toOwnedSlice(self.allocator),
+            .loopify = loopify,
         });
 
         // Generate a `__try` variant whenever the catch-basin pipeline asked
@@ -2244,6 +2260,50 @@ pub const IrBuilder = struct {
     /// here is correctness-preserving (the recursion just builds a
     /// real frame). Restoring TCO for byref-shaped state is a
     /// separate, larger ABI design effort.
+    /// Walk `instrs` (and any nested bodies the IR carries — switch
+    /// cases, optional-dispatch branches) and report whether a
+    /// `tail_call` instruction reaches the surface anywhere. Used to
+    /// decide if a function's signature needs the loopification
+    /// lowering path: `loopify = !isTcoEligible AND containsTailCall`.
+    fn containsTailCall(instrs: []const Instruction) bool {
+        for (instrs) |instr| {
+            switch (instr) {
+                .tail_call => return true,
+                .switch_return => |sr| {
+                    for (sr.cases) |c| if (containsTailCall(c.body_instrs)) return true;
+                    if (containsTailCall(sr.default_instrs)) return true;
+                },
+                .union_switch_return => |usr| {
+                    for (usr.cases) |c| if (containsTailCall(c.body_instrs)) return true;
+                },
+                .union_switch => |us| {
+                    for (us.cases) |c| if (containsTailCall(c.body_instrs)) return true;
+                },
+                .optional_dispatch => |od| {
+                    if (containsTailCall(od.nil_instrs)) return true;
+                    if (containsTailCall(od.struct_instrs)) return true;
+                },
+                .switch_literal => |sl| {
+                    for (sl.cases) |c| if (containsTailCall(c.body_instrs)) return true;
+                    if (containsTailCall(sl.default_instrs)) return true;
+                },
+                .case_block => |cb| {
+                    if (containsTailCall(cb.pre_instrs)) return true;
+                    for (cb.arms) |arm| {
+                        if (containsTailCall(arm.cond_instrs)) return true;
+                        if (containsTailCall(arm.body_instrs)) return true;
+                    }
+                    if (containsTailCall(cb.default_instrs)) return true;
+                },
+                .guard_block => |gb| {
+                    if (containsTailCall(gb.body)) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
     fn rewriteTailCalls(
         self: *IrBuilder,
         instrs: []const Instruction,
@@ -2251,7 +2311,26 @@ pub const IrBuilder = struct {
         params: []const Param,
         return_type: ZigType,
     ) ![]const Instruction {
-        if (!isTcoEligible(params, return_type)) return instrs;
+        // Self-tail-calls are always rewritten to `tail_call` IR. The
+        // ZIR backend chooses between two strategies at lowering time:
+        //
+        //   * `isTcoEligible(params, return_type)` true → emit
+        //     `musttail call + ret`, the existing fast path. LLVM
+        //     reuses the current frame.
+        //   * `isTcoEligible` false → emit a loopification body —
+        //     stack-slot stores plus `repeat` to the function-level
+        //     `loop` block — so by-ref state recurses without growing
+        //     the stack and without triggering LLVM's `musttail`
+        //     legality check (which rejects byref signatures on
+        //     fastcc-bound argument shapes).
+        //
+        // Earlier passes used to bail out here for byref signatures;
+        // that left the recursion as a regular `call_named + ret`,
+        // which compiled cleanly but blew the stack at scale. The
+        // ZIR-level loopification dispatch makes the byref case work
+        // correctly, so the IR rewrite always runs.
+        _ = params;
+        _ = return_type;
 
         var result: std.ArrayList(Instruction) = .empty;
         for (instrs) |instr| {
@@ -6438,12 +6517,14 @@ test "isTcoSafeType: byref aggregates are unsafe" {
     try std.testing.expect(!IrBuilder.isTcoSafeType(.any));
 }
 
-test "rewriteTailCalls skips functions with byref params" {
+test "rewriteTailCalls marks byref recursion for loopification" {
     // A multi-clause recursive function whose parameter list contains
-    // a struct must not be marked `tail_call` — LLVM's musttail
-    // requires no caller-frame escape and `State` is byref under
-    // fastcc. The IR builder must keep the recursion as
-    // `call_named + ret`, even though the call sits in tail position.
+    // a struct still gets the `tail_call` rewrite — but the function's
+    // `loopify` flag is set so the ZIR backend lowers to a loop +
+    // stack-slot recurrence instead of LLVM `musttail` (which rejects
+    // byref signatures under fastcc). Earlier passes silently kept the
+    // recursion as `call_named + ret` for byref shapes, which compiled
+    // cleanly but blew the stack at scale.
     const source =
         \\pub struct State {
         \\  a :: f64
@@ -6487,8 +6568,10 @@ test "rewriteTailCalls skips functions with byref params" {
     const ir_program = try ir_builder.buildProgram(&hir_program);
 
     var saw_tail_call = false;
+    var saw_loopify = false;
     for (ir_program.functions) |func| {
         if (!std.mem.startsWith(u8, func.name, "LoopHost__loop")) continue;
+        if (func.loopify) saw_loopify = true;
         for (func.body) |block| {
             for (block.instructions) |instr| {
                 if (instr == .tail_call) saw_tail_call = true;
@@ -6505,7 +6588,8 @@ test "rewriteTailCalls skips functions with byref params" {
             }
         }
     }
-    try std.testing.expect(!saw_tail_call);
+    try std.testing.expect(saw_tail_call);
+    try std.testing.expect(saw_loopify);
 }
 
 test "rewriteTailCalls still rewrites primitive-only recursion" {
