@@ -2547,6 +2547,12 @@ pub const TypeChecker = struct {
         // Register user-defined types (structs, enums) from scope graph into TypeStore
         try self.registerUserTypes();
 
+        // Diagnose recursive struct types that have no finite base case
+        // before any other check runs against them. Without this, the
+        // user gets Zig's late "struct has infinite size" message at
+        // codegen, which lands far from the actual mistake.
+        try self.checkUninhabitedRecursiveTypes();
+
         for (program.structs) |*mod| {
             try self.checkStruct(mod);
         }
@@ -3041,6 +3047,145 @@ pub const TypeChecker = struct {
                 try std.fmt.allocPrint(self.allocator, "if this is intentional, prefix with underscore: `_{s}`", .{name}),
             );
         }
+    }
+
+    /// Diagnose recursive struct types that have no finite base case.
+    /// A struct is "inhabitable" iff every required field can take a
+    /// finitely-sized value: primitives are always fine, optional /
+    /// list / map / atom / `any` / `term` are always fine (each has a
+    /// natural empty inhabitant), and a `struct_ref X` is fine iff
+    /// `X` is itself inhabitable. Fixpoint propagation closes over
+    /// any cycle: a struct stays uninhabitable iff every constructor
+    /// path forces another instance from its own SCC.
+    ///
+    /// Without this, programs like
+    ///
+    ///   pub struct Tree { left :: Tree, right :: Tree }
+    ///
+    /// reach Sema and trip Zig's `struct has infinite size`
+    /// diagnostic — accurate but not actionable. The friendly
+    /// message points at the structural problem (no nil escape, no
+    /// list, no tagged-union leaf) instead of the layout symptom.
+    fn checkUninhabitedRecursiveTypes(self: *TypeChecker) !void {
+        const ts = self.store;
+        // Collect every struct's TypeId so the fixpoint can be keyed
+        // on a small dense set rather than re-scanning `types.items`
+        // each pass.
+        var struct_ids: std.ArrayListUnmanaged(TypeId) = .empty;
+        defer struct_ids.deinit(self.allocator);
+        for (ts.types.items, 0..) |typ, i| {
+            if (typ != .struct_type) continue;
+            try struct_ids.append(self.allocator, @intCast(i));
+        }
+
+        // Fixpoint: start every struct as uninhabitable, mark those
+        // whose every field is inhabitable, repeat until stable.
+        var inhabitable: std.AutoHashMapUnmanaged(TypeId, void) = .empty;
+        defer inhabitable.deinit(self.allocator);
+
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (struct_ids.items) |sid| {
+                if (inhabitable.contains(sid)) continue;
+                const st = ts.types.items[sid].struct_type;
+                var all_ok = true;
+                for (st.fields) |f| {
+                    if (!self.typeIdInhabitable(f.type_id, &inhabitable)) {
+                        all_ok = false;
+                        break;
+                    }
+                }
+                if (all_ok) {
+                    try inhabitable.put(self.allocator, sid, {});
+                    changed = true;
+                }
+            }
+        }
+
+        // Anything still uninhabitable is a recursive structural
+        // dead end. Locate the source span via the scope graph and
+        // emit a friendly diagnostic.
+        for (struct_ids.items) |sid| {
+            if (inhabitable.contains(sid)) continue;
+            const st = ts.types.items[sid].struct_type;
+            const name_str = self.interner.get(st.name);
+            const span = self.findStructDeclSpan(st.name) orelse continue;
+            try self.addHardError(
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "recursive type `{s}` has no finite base case",
+                    .{name_str},
+                ),
+                span,
+                "every constructor of this type requires another instance of itself",
+                "make at least one cycle field optional (`T | nil`), a list (`[T]`), or a map; or split the type into a tagged union with a leaf variant",
+            );
+        }
+    }
+
+    /// True iff a value of `type_id` can be constructed in finite
+    /// space without dragging in an uninhabitable struct. Container
+    /// types (`?T`, `[T]`, `Map(K, V)`) are inhabited by their
+    /// natural empty values regardless of `T`'s inhabitability —
+    /// that's what breaks a recursive cycle. Tuples are inhabited
+    /// iff every element is. `struct_ref` is inhabited iff the
+    /// referenced struct's id is in `inhabitable`.
+    fn typeIdInhabitable(
+        self: *const TypeChecker,
+        type_id: TypeId,
+        inhabitable: *const std.AutoHashMapUnmanaged(TypeId, void),
+    ) bool {
+        if (type_id >= self.store.types.items.len) return true;
+        const typ = self.store.types.items[type_id];
+        return switch (typ) {
+            .struct_type => inhabitable.contains(type_id),
+            .union_type => |ut| blk: {
+                // A union is inhabitable iff at least one member is.
+                for (ut.members) |m| {
+                    if (self.typeIdInhabitable(m, inhabitable)) break :blk true;
+                }
+                break :blk false;
+            },
+            .tuple => |tt| blk: {
+                for (tt.elements) |elem| {
+                    if (!self.typeIdInhabitable(elem, inhabitable)) break :blk false;
+                }
+                break :blk true;
+            },
+            .applied => |at| self.typeIdInhabitable(at.base, inhabitable),
+            // Optional, list, and map all have natural empty values
+            // — they break recursion cycles regardless of payload.
+            // Tagged unions, opaque types, and protocol constraints
+            // are treated as inhabited from the structural-recursion
+            // perspective (they don't lay out by value here).
+            .list,
+            .map,
+            .tagged_union,
+            .opaque_type,
+            .protocol_constraint,
+            => true,
+            // Primitives, atoms, strings, function refs, type vars,
+            // unknown placeholder — all naturally inhabited.
+            else => true,
+        };
+    }
+
+    /// Look up a struct declaration's source span by `StringId`. The
+    /// scope graph keeps every struct decl with its `meta.span`;
+    /// matching by the leaf name is enough for top-level and nested
+    /// declarations because Zap requires unique struct names within
+    /// each scope.
+    fn findStructDeclSpan(self: *const TypeChecker, name: ast.StringId) ?ast.SourceSpan {
+        for (self.graph.types.items) |type_entry| {
+            switch (type_entry.kind) {
+                .struct_type => |sd| {
+                    if (type_entry.name == name) return sd.meta.span;
+                },
+                else => {},
+            }
+        }
+        return null;
     }
 
     fn checkStruct(self: *TypeChecker, mod: *const ast.StructDecl) !void {
@@ -5330,6 +5475,127 @@ test "type check simple function" {
     try checker.checkProgram(&program);
 
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "uninhabited recursive type emits friendly diagnostic" {
+    // Self-recursion with no nil-escape: every Tree requires two
+    // more Trees, infinite recursion at construction. The checker
+    // must surface a clear "no finite base case" error before any
+    // downstream pass reaches Zig's late "infinite size" message.
+    const source =
+        \\pub struct Bad {
+        \\  pub struct Tree {
+        \\    value :: i64
+        \\    left :: Tree
+        \\    right :: Tree
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var saw_uninhabited = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "no finite base case") != null) {
+            saw_uninhabited = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_uninhabited);
+}
+
+test "habitable recursive type compiles cleanly" {
+    // Same shape as the diagnostic test but with a `Tree | nil`
+    // escape on each cycle field. The checker must NOT flag this:
+    // `nil` is a finite base case.
+    const source =
+        \\pub struct Good {
+        \\  pub struct Tree {
+        \\    value :: i64
+        \\    left :: Tree | nil
+        \\    right :: Tree | nil
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |err| {
+        try std.testing.expect(std.mem.indexOf(u8, err.message, "no finite base case") == null);
+    }
+}
+
+test "mutual recursion with no escape diagnoses both structs" {
+    // A → B → A with both edges required. Every CycleA needs a
+    // CycleB and every CycleB needs a CycleA, so neither type has
+    // a finite constructor. Both should be flagged.
+    const source =
+        \\pub struct Bad {
+        \\  pub struct CycleA {
+        \\    tag :: i64
+        \\    partner :: CycleB
+        \\  }
+        \\
+        \\  pub struct CycleB {
+        \\    weight :: i64
+        \\    back :: CycleA
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var saw_a = false;
+    var saw_b = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "no finite base case") == null) continue;
+        if (std.mem.indexOf(u8, err.message, "CycleA") != null) saw_a = true;
+        if (std.mem.indexOf(u8, err.message, "CycleB") != null) saw_b = true;
+    }
+    try std.testing.expect(saw_a);
+    try std.testing.expect(saw_b);
 }
 
 test "type check literals" {
