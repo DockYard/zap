@@ -820,8 +820,24 @@ const MonomorphContext = struct {
                     }
                 },
                 .function_group => |fg| {
+                    // Nested function groups (anonymous closures, named
+                    // inner fns) have their own local index space — they
+                    // reset HIR's `next_local` counter on entry. Without
+                    // isolating the `local_types` map across that
+                    // boundary, a nested `local_set idx=N` overwrites the
+                    // outer scope's `local_types[N]`, corrupting type
+                    // information for the caller's locals (e.g., the
+                    // outer `pairs` at idx=0 gets clobbered by the
+                    // closure's destructure-assigned `value_local` also
+                    // at idx=0). Snapshot and restore around each clause
+                    // so each function's local-type tracking stays
+                    // isolated.
                     for (fg.clauses) |clause| {
+                        var snapshot = try self.cloneLocalTypes();
+                        defer snapshot.deinit();
+                        self.local_types.clearRetainingCapacity();
                         try self.scanBlock(clause.body);
+                        self.restoreLocalTypes(&snapshot);
                     }
                 },
             }
