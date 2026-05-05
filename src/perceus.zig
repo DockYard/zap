@@ -63,6 +63,12 @@ pub const DeconstructionSite = struct {
         case_block,
         switch_tag,
         if_expr,
+        /// Multi-clause `f(nil) / f(t :: T)` shape lowered to
+        /// `optional_dispatch`. The struct branch unwraps `?T` to the
+        /// boxed `*const T` payload and consumes it. Treated as a
+        /// deconstruction site so the payload is dropped at the end of
+        /// the struct branch.
+        optional_dispatch,
     };
 };
 
@@ -315,6 +321,38 @@ pub const PerceusAnalyzer = struct {
                         .match_kind = .if_expr,
                     });
                 }
+            },
+            .optional_dispatch => |od| {
+                // Multi-clause `f(nil) / f(t :: T)` lowering. The struct
+                // branch unwraps `?T` to a boxed `*const T` payload and
+                // consumes it. Recording this as a deconstruction site
+                // lets the drop-spec generator emit a release of the
+                // payload at the end of the struct branch — without
+                // this, recursive `Tree`-shaped functions like
+                // `Binarytrees.check` would never release the trees
+                // their callers transferred ownership of, which is the
+                // direct cause of the binarytrees-N=21 OOM.
+                //
+                // The scrutinee is the unwrapped payload local rather
+                // than the optional parameter itself: drop emission
+                // operates on the boxed pointer (`*const T`) inside
+                // the struct branch, where the value is live and the
+                // type is concrete.
+                const type_info = TypeInfo{
+                    .name = null,
+                    .kind = .struct_type,
+                    .num_fields = 0,
+                };
+                const match_id = self.nextMatchSiteId();
+                try self.current_decon_sites.append(self.allocator, .{
+                    .function = function_id,
+                    .block = block_label,
+                    .instr_index = instr_index,
+                    .scrutinee = od.payload_local,
+                    .scrutinee_type = type_info,
+                    .match_site_id = match_id,
+                    .match_kind = .optional_dispatch,
+                });
             },
             else => {},
         }
@@ -734,8 +772,85 @@ pub const PerceusAnalyzer = struct {
                     },
                 });
             },
+            .optional_dispatch => |od| {
+                // Optional-dispatch struct branch: emit a single drop
+                // specialization whose field_drop targets the boxed
+                // payload local. With the recursive-type boxing ABI,
+                // payload_local holds `*const T` — the source-Arc
+                // pointer — so `releaseAny(alloc, payload_local)`
+                // performs a real deep release of the entire
+                // substructure.
+                //
+                // No drop is generated when:
+                //   * The param's source type is not a recursive
+                //     struct optional. The boxing ABI only kicks in
+                //     for recursive struct types; for primitive or
+                //     non-recursive struct optionals the payload is
+                //     a value, not a `*const T` Arc pointer, and
+                //     `releaseAny` would reject it at comptime.
+                //   * The function returns the payload itself
+                //     (`struct_result == payload_local`): ownership
+                //     transfers to the caller, and a release here
+                //     would free what the caller still owns.
+                if (od.scrutinee_param >= func.params.len) return;
+                const param_type = func.params[od.scrutinee_param].type_expr;
+                if (!self.paramTypeRequiresArcDrop(param_type)) return;
+                if (od.struct_result) |sr| {
+                    if (sr == od.payload_local) return;
+                }
+                const drops = try self.allocator.alloc(FieldDrop, 1);
+                drops[0] = .{
+                    .field_name = "__optional_payload",
+                    .field_index = 0,
+                    .needs_recursive_drop = true,
+                    .local = od.payload_local,
+                };
+                try self.drop_specializations.append(self.allocator, .{
+                    .match_site = decon.match_site_id,
+                    .constructor_tag = 0,
+                    .field_drops = drops,
+                    .function = func.id,
+                    .insertion_point = .{
+                        .function = func.id,
+                        .block = decon.block,
+                        .instr_index = decon.instr_index,
+                        .position = .after,
+                    },
+                });
+            },
             else => {},
         }
+    }
+
+    /// Returns true when an optional-dispatch parameter's type matches
+    /// the boxing ABI — i.e. an optional of a struct that participates
+    /// in a layout cycle, marked by at least one `FieldStorage.indirect`
+    /// field on the named struct. Only those payloads are passed as
+    /// `*const T` Arc pointers; primitive or non-recursive optionals
+    /// stay value-shaped, and emitting `releaseAny` for them would feed
+    /// `arcPtrChild` a non-pointer and trip its `@compileError`.
+    fn paramTypeRequiresArcDrop(self: *const PerceusAnalyzer, t: ir.ZigType) bool {
+        const inner = switch (t) {
+            .optional => |opt| opt.*,
+            else => t,
+        };
+        const struct_name = switch (inner) {
+            .struct_ref => |name| name,
+            else => return false,
+        };
+        for (self.program.type_defs) |type_def| {
+            if (!std.mem.eql(u8, type_def.name, struct_name)) continue;
+            switch (type_def.kind) {
+                .struct_def => |def| {
+                    for (def.fields) |field| {
+                        if (field.storage == .indirect) return true;
+                    }
+                    return false;
+                },
+                else => return false,
+            }
+        }
+        return false;
     }
 
     fn extractFieldDropsFromArm(

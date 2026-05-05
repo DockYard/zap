@@ -1855,12 +1855,19 @@ pub const IrBuilder = struct {
             // param as `T`, not `?T` — track `payload_local` so the ZIR
             // emitter can redirect `param_get(o_param_idx)` reads to it
             // while emitting the struct branch.
-            const payload_local = self.next_local;
-            self.next_local += 1;
-            if (optional_struct_name) |sname| {
-                try self.known_local_types.put(payload_local, .{ .struct_ref = sname });
-            }
-
+            //
+            // `payload_local` is allocated AFTER the bodies are lowered.
+            // HIR resets its own `next_local` to 0 per clause, so any
+            // body bindings (`one = 1 :: i64`, etc.) get IDs starting at
+            // 0 and march upward. Allocating payload_local up front
+            // would collide with that range — `setLocal(payload_local,
+            // payload_ref)` and the body's `local_set dest=0 value=...`
+            // would write the same slot, and the ZIR drop emitted for
+            // the payload would read whichever value happened to land
+            // there last (a `comptime_int` from the body's literal,
+            // tripping `arcPtrChild`'s pointer assertion). Lowering
+            // first lets `next_local` advance past every body binding,
+            // so payload_local lands in a unique slot.
             var nil_instrs_result: []const Instruction = &.{};
             var nil_result: ?LocalId = null;
             var struct_instrs_result: []const Instruction = &.{};
@@ -1898,6 +1905,12 @@ pub const IrBuilder = struct {
                     struct_instrs_result = body_instrs;
                     struct_result = body_result;
                 }
+            }
+
+            const payload_local = self.next_local;
+            self.next_local += 1;
+            if (optional_struct_name) |sname| {
+                try self.known_local_types.put(payload_local, .{ .struct_ref = sname });
             }
 
             try self.current_instrs.append(self.allocator, .{

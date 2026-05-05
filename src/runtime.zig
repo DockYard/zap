@@ -220,11 +220,26 @@ pub const ArcRuntime = struct {
         return &inner.value;
     }
 
+    /// Element type of an Arc value pointer. The ZIR backend calls every
+    /// public release helper with `(allocator, ptr)` — Zig's call-site
+    /// inference cannot recover a `comptime T` slot from runtime arguments,
+    /// so each helper receives `ptr: anytype` and asks `@typeInfo` for the
+    /// element type instead. Centralised here so every helper agrees on
+    /// "argument is a single-item pointer to T".
+    fn arcPtrChild(comptime PtrT: type) type {
+        const info = @typeInfo(PtrT);
+        if (info != .pointer or info.pointer.size != .one) {
+            @compileError("ArcRuntime helper expects a single-item pointer; got " ++ @typeName(PtrT));
+        }
+        return info.pointer.child;
+    }
+
     /// Free an Arc-managed value given a pointer to the value field.
     /// Decrements the refcount and frees the inner allocation when it reaches zero.
-    pub fn freeAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) void {
+    pub fn freeAny(allocator: std.mem.Allocator, ptr: anytype) void {
+        const T = arcPtrChild(@TypeOf(ptr));
         const Inner = Arc(T).Inner;
-        const inner: *Inner = @fieldParentPtr("value", ptr);
+        const inner: *Inner = @constCast(@fieldParentPtr("value", ptr));
         if (inner.header.release()) {
             allocator.destroy(inner);
         }
@@ -234,29 +249,29 @@ pub const ArcRuntime = struct {
     /// value field. On the zero-transition, recursively releases any indirect-
     /// storage Arc'd children before destroying the inner allocation; for types
     /// without such fields the comptime walk degenerates to a shallow free.
-    pub fn releaseAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) void {
+    ///
+    /// Accepts the pointer as `anytype` so the ZIR backend's two-argument
+    /// call site (`releaseAny(allocator, ptr)`) compiles — Zig cannot infer
+    /// a leading `comptime T: type` parameter from the runtime ptr argument.
+    /// The element type is recovered via `@typeInfo`.
+    pub fn releaseAny(allocator: std.mem.Allocator, ptr: anytype) void {
+        const T = arcPtrChild(@TypeOf(ptr));
         releaseArcAny(T, allocator, ptr);
     }
 
     /// Phase 1 of split-phase release: atomically decrement the refcount and
     /// report whether the caller is now the last owner.
     ///
-    /// Returns `ptr` on the zero-transition (the caller is the final owner
-    /// and must finish destruction) and `null` otherwise (other owners still
-    /// hold the value live and must not be touched). Does NOT destroy the
-    /// inner allocation — `destroyPreparedAny` does that. The split exists
-    /// so a compiler-generated deep-release helper can read indirect-storage
-    /// child pointers from the parent struct *before* the parent's backing
-    /// allocation is destroyed.
-    ///
-    /// Companion to `destroyPreparedAny`. Mis-pairing — calling
-    /// `destroyPreparedAny` without a prior `prepareReleaseAny` returning
-    /// non-null, or shipping the returned pointer past the destroy without
-    /// reading the children first — is undefined.
-    pub fn prepareReleaseAny(comptime T: type, ptr: *T) ?*T {
+    /// Returns the mutable parent value pointer on the zero-transition (the
+    /// caller is the final owner and must finish destruction) and `null`
+    /// otherwise. Does NOT destroy the inner allocation — `destroyPreparedAny`
+    /// does that. The split exists so a compiler-generated deep-release helper
+    /// can read indirect-storage child pointers from the parent struct *before*
+    /// the parent's backing allocation is destroyed.
+    pub fn prepareReleaseAny(comptime T: type, ptr: *const T) ?*T {
         const Inner = Arc(T).Inner;
-        const inner: *Inner = @fieldParentPtr("value", ptr);
-        if (inner.header.release()) return ptr;
+        const inner: *Inner = @constCast(@fieldParentPtr("value", ptr));
+        if (inner.header.release()) return &inner.value;
         return null;
     }
 
@@ -282,7 +297,7 @@ pub const ArcRuntime = struct {
     /// terminates because Zig memoizes generic instantiations by their
     /// comptime parameter values; the recursive reference reuses the same
     /// in-progress instance rather than expanding indefinitely.
-    pub fn releaseArcAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) void {
+    pub fn releaseArcAny(comptime T: type, allocator: std.mem.Allocator, ptr: *const T) void {
         if (prepareReleaseAny(T, ptr)) |owned| {
             releaseChildrenAny(T, allocator, owned.*);
             destroyPreparedAny(T, allocator, owned);
@@ -318,27 +333,44 @@ pub const ArcRuntime = struct {
     }
 
     /// Retain (increment refcount) an Arc-managed value given a pointer to the value field.
-    pub fn retainAny(comptime T: type, ptr: *T) void {
+    pub fn retainAny(ptr: anytype) void {
+        const T = arcPtrChild(@TypeOf(ptr));
         const Inner = Arc(T).Inner;
-        const inner: *Inner = @fieldParentPtr("value", ptr);
+        const inner: *Inner = @constCast(@fieldParentPtr("value", ptr));
         inner.header.retain();
     }
 
+    /// Retain through an optional Arc pointer: `?*const T` becomes a no-op
+    /// when null, otherwise unwraps and increments the refcount. Field-get
+    /// on an indirect-storage recursive field (`?*const T`) emits this so
+    /// the extracted reference and the parent both own the child Arc — a
+    /// later deep release of either owner decrements once and only the
+    /// final decrement frees the allocation.
+    pub fn retainAnyOpt(ptr: anytype) void {
+        const PtrT = @TypeOf(ptr);
+        switch (@typeInfo(PtrT)) {
+            .optional => if (ptr) |p| retainAny(p),
+            .pointer => retainAny(ptr),
+            else => @compileError("retainAnyOpt expects pointer or optional pointer; got " ++ @typeName(PtrT)),
+        }
+    }
+
     /// Get the refcount of an Arc-managed value.
-    pub fn refCountAny(comptime T: type, ptr: *T) u32 {
+    pub fn refCountAny(ptr: anytype) u32 {
+        const T = arcPtrChild(@TypeOf(ptr));
         const Inner = Arc(T).Inner;
-        const inner: *Inner = @fieldParentPtr("value", ptr);
+        const inner: *Inner = @constCast(@fieldParentPtr("value", ptr));
         return inner.header.count();
     }
 
     /// Reset a value for Perceus-style reuse. If the reference count is 1,
     /// return an opaque reuse token for the existing allocation. Otherwise,
     /// release the current value and return null.
-    pub fn resetAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) ?*anyopaque {
-        if (refCountAny(T, ptr) == 1) {
-            return @ptrCast(ptr);
+    pub fn resetAny(allocator: std.mem.Allocator, ptr: anytype) ?*anyopaque {
+        if (refCountAny(ptr) == 1) {
+            return @ptrCast(@constCast(ptr));
         }
-        releaseAny(T, allocator, ptr);
+        releaseAny(allocator, ptr);
         return null;
     }
 
@@ -571,21 +603,21 @@ const testing = std.testing;
 test "ArcRuntime.resetAny returns token for unique value" {
     const allocator = testing.allocator;
     const ptr = ArcRuntime.allocAny(i64, allocator, 42);
-    const token = ArcRuntime.resetAny(i64, allocator, ptr);
+    const token = ArcRuntime.resetAny(allocator, ptr);
     try testing.expect(token != null);
     const reused = ArcRuntime.reuseAllocByType(i64, allocator, token);
     reused.* = 7;
     try testing.expectEqual(@as(i64, 7), reused.*);
-    ArcRuntime.releaseAny(i64, allocator, reused);
+    ArcRuntime.releaseAny(allocator, reused);
 }
 
 test "ArcRuntime.resetAny releases shared value and yields null token" {
     const allocator = testing.allocator;
     const ptr = ArcRuntime.allocAny(i64, allocator, 10);
-    ArcRuntime.retainAny(i64, ptr);
-    const token = ArcRuntime.resetAny(i64, allocator, ptr);
+    ArcRuntime.retainAny(ptr);
+    const token = ArcRuntime.resetAny(allocator, ptr);
     try testing.expect(token == null);
-    ArcRuntime.releaseAny(i64, allocator, ptr);
+    ArcRuntime.releaseAny(allocator, ptr);
 }
 
 // ============================================================
@@ -6883,34 +6915,34 @@ test "Arc basic reference counting" {
 
 test "ArcRuntime.allocAny creates arc-managed value" {
     const val = ArcRuntime.allocAny(i64, std.testing.allocator, 42);
-    defer ArcRuntime.freeAny(i64, std.testing.allocator, val);
+    defer ArcRuntime.freeAny(std.testing.allocator, val);
     try std.testing.expectEqual(@as(i64, 42), val.*);
 }
 
 test "ArcRuntime.retainAny and refCountAny" {
     const val = ArcRuntime.allocAny(i64, std.testing.allocator, 99);
-    try std.testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(i64, val));
+    try std.testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(val));
 
-    ArcRuntime.retainAny(i64, val);
-    try std.testing.expectEqual(@as(u32, 2), ArcRuntime.refCountAny(i64, val));
+    ArcRuntime.retainAny(val);
+    try std.testing.expectEqual(@as(u32, 2), ArcRuntime.refCountAny(val));
 
     // First free decrements but doesn't deallocate
-    ArcRuntime.freeAny(i64, std.testing.allocator, val);
-    try std.testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(i64, val));
+    ArcRuntime.freeAny(std.testing.allocator, val);
+    try std.testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(val));
 
     // Second free deallocates
-    ArcRuntime.freeAny(i64, std.testing.allocator, val);
+    ArcRuntime.freeAny(std.testing.allocator, val);
 }
 
 test "ArcRuntime.prepareReleaseAny returns ptr only on the zero-transition" {
     const alloc = std.testing.allocator;
     const val = ArcRuntime.allocAny(i64, alloc, 7);
     // Second owner — refcount now 2.
-    ArcRuntime.retainAny(i64, val);
+    ArcRuntime.retainAny(val);
 
     // First prepare: count goes 2 → 1. We're not the final owner.
     try std.testing.expect(ArcRuntime.prepareReleaseAny(i64, val) == null);
-    try std.testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(i64, val));
+    try std.testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(val));
 
     // Second prepare: count goes 1 → 0. We ARE the final owner.
     const owned = ArcRuntime.prepareReleaseAny(i64, val) orelse {

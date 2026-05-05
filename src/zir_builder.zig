@@ -1260,6 +1260,79 @@ pub const ZirDriver = struct {
         return null;
     }
 
+    /// A struct is "recursive" iff at least one of its fields was assigned
+    /// `FieldStorage.indirect` by the IR builder's SCC walk
+    /// (`analyzeStructFieldStorage` / `zigTypeReachesStructInCycle`). That's
+    /// the same condition that already breaks the layout cycle with a
+    /// pointer at the field level.
+    ///
+    /// The ZIR backend uses this predicate to decide whether to box
+    /// values of the struct uniformly: parameters lower to `?*const T` /
+    /// `*const T` instead of `?T` / `T`, returns lower to `*const T`,
+    /// and construction sites heap-promote the outer aggregate so the
+    /// dest local holds `*const T`. Indirect-storage field reads then
+    /// stop auto-dereffing, since the consumer's storage already matches
+    /// the field's `?*const T` representation. With the source Arc
+    /// preserved through every call, `releaseAny(T, alloc, ptr)` at the
+    /// end of an owning function deep-releases the entire substructure.
+    fn isRecursiveStruct(self: *const ZirDriver, type_name: []const u8) bool {
+        const def = self.findStructDef(type_name) orelse return false;
+        for (def.fields) |field| {
+            if (field.storage == .indirect) return true;
+        }
+        return false;
+    }
+
+    /// `isRecursiveStruct` accepting a `ZigType`: returns true when the
+    /// type names a recursive struct (directly or as an optional/pointer
+    /// over one), false for primitives, lists, maps, tuples, etc. Used
+    /// at parameter/return emission to decide whether to lower to a
+    /// boxed pointer representation.
+    fn zigTypeIsRecursiveStruct(self: *const ZirDriver, t: ir.ZigType) bool {
+        return switch (t) {
+            .struct_ref => |name| self.isRecursiveStruct(name),
+            .optional => |inner| self.zigTypeIsRecursiveStruct(inner.*),
+            else => false,
+        };
+    }
+
+    /// Box recursive struct types in a `ZigType`: `Tree` becomes `*const Tree`,
+    /// `?Tree` becomes `?*const Tree`. Non-recursive types pass through. The
+    /// transformation matches `indirectFieldType` (same `*const` indirection
+    /// already used to break the layout cycle at struct fields), but here it
+    /// is applied at parameter / return / construction-result positions so
+    /// recursive values are uniformly represented as pointers across the
+    /// whole call boundary, not just inside containing structs. The boxed
+    /// representation preserves the source-Arc pointer through every call,
+    /// which is what makes `releaseAny(T, alloc, ptr)` deep-release the
+    /// entire substructure correctly at end-of-life points (Perceus drops,
+    /// optional_dispatch struct-branch exits).
+    ///
+    /// Allocates child `ZigType` nodes from the page allocator to mirror
+    /// `indirectFieldType`'s strategy — node lifetimes outlive the synchronous
+    /// emission scope, and the leak is bounded by the program's struct count.
+    fn boxRecursiveZigType(self: *const ZirDriver, t: ir.ZigType) ir.ZigType {
+        return switch (t) {
+            .struct_ref => |name| blk: {
+                if (!self.isRecursiveStruct(name)) break :blk t;
+                const inner_box = std.heap.page_allocator.create(ir.ZigType) catch break :blk t;
+                inner_box.* = t;
+                break :blk .{ .ptr = inner_box };
+            },
+            .optional => |inner_ptr| blk: {
+                if (!self.zigTypeIsRecursiveStruct(inner_ptr.*)) break :blk t;
+                const ptr_inner = std.heap.page_allocator.create(ir.ZigType) catch break :blk t;
+                ptr_inner.* = inner_ptr.*;
+                const ptr_box = std.heap.page_allocator.create(ir.ZigType) catch break :blk t;
+                ptr_box.* = .{ .ptr = ptr_inner };
+                const opt_box = std.heap.page_allocator.create(ir.ZigType) catch break :blk t;
+                opt_box.* = .{ .optional = ptr_box };
+                break :blk opt_box.*;
+            },
+            else => t,
+        };
+    }
+
     fn findEnumDef(self: *const ZirDriver, type_name: []const u8) bool {
         const prog = self.program orelse return false;
         for (prog.type_defs) |type_def| {
@@ -2518,6 +2591,33 @@ pub const ZirDriver = struct {
     }
 
     fn emitTypedParam(self: *ZirDriver, param: ir.Param) !u32 {
+        // Recursive struct types are uniformly boxed at parameter
+        // boundaries: `Tree` becomes `*const Tree`, `?Tree` becomes
+        // `?*const Tree`. Routing through the streaming body API lets
+        // `emitImportedTypeRef` emit the `optional + single_const_ptr +
+        // struct_ref` chain inside the param's type body, so Sema sees
+        // every operand without falling out of the body slice. See
+        // `boxRecursiveZigType` for why this is correct (preserves the
+        // source-Arc pointer through every call so deep release
+        // observes a real allocation).
+        if (self.zigTypeIsRecursiveStruct(param.type_expr)) {
+            const boxed = self.boxRecursiveZigType(param.type_expr);
+            var support: std.ArrayListUnmanaged(u32) = .empty;
+            defer support.deinit(self.allocator);
+            const before = zir_builder_get_body_inst_count(self.handle);
+            const type_ref = try self.emitImportedTypeRef(boxed);
+            try self.captureBodyInsts(before, &support);
+            const ref = zir_builder_emit_param_type_body(
+                self.handle,
+                param.name.ptr,
+                @intCast(param.name.len),
+                support.items.ptr,
+                @intCast(support.items.len),
+                type_ref,
+            );
+            if (ref == error_ref) return error.EmitFailed;
+            return ref;
+        }
         // Struct params: dispatch to the right param-emission API
         // based on where the type lives. The CRITICAL constraint is
         // that any non-primitive operand the param's type body uses
@@ -2644,6 +2744,34 @@ pub const ZirDriver = struct {
     /// type, so the compiler must emit it exactly. If a new type is added
     /// to Zap without a case here, the build fails loudly.
     fn emitComplexReturnType(self: *ZirDriver, return_type: ir.ZigType) !void {
+        // Recursive struct return types are uniformly boxed: a function
+        // declared `-> Tree` returns `*const Tree`, `-> ?Tree` returns
+        // `?*const Tree`. The pointer carries the source-Arc identity
+        // through the return so callers can deep-release the
+        // substructure without aliasing concerns. See
+        // `boxRecursiveZigType` for the full rationale.
+        //
+        // `set_custom_return_type` takes the *instruction index* of the
+        // body's final result, not the ZIR Ref the emit helpers return,
+        // so convert via `ref_to_inst_index` after capturing the body.
+        if (self.zigTypeIsRecursiveStruct(return_type)) {
+            const boxed = self.boxRecursiveZigType(return_type);
+            var support: std.ArrayListUnmanaged(u32) = .empty;
+            defer support.deinit(self.allocator);
+            const before = zir_builder_get_body_inst_count(self.handle);
+            const type_ref = try self.emitImportedTypeRef(boxed);
+            try self.captureBodyInsts(before, &support);
+            const result_inst = zir_builder_ref_to_inst_index(self.handle, type_ref);
+            if (result_inst == 0xFFFFFFFF) return error.EmitFailed;
+            if (zir_builder_set_custom_return_type(
+                self.handle,
+                support.items.ptr,
+                @intCast(support.items.len),
+                result_inst,
+            ) != 0) return error.EmitFailed;
+            self.current_ret_type = 1;
+            return;
+        }
         switch (return_type) {
             .list => {
                 // emitContainerElementTypeRef may emit support instructions
@@ -4934,10 +5062,19 @@ pub const ZirDriver = struct {
                     // optional pointer slot. `null_value` passes
                     // through — Zig handles the nil-to-?*const T
                     // coercion natively.
+                    //
+                    // Skip the promote when the field's source type
+                    // is itself a recursive struct: under the boxing
+                    // ABI, recursive-typed expressions (param-get,
+                    // call-return, prior `%T{}` site) already produce
+                    // a `*const T` Ref. A second `allocAny` on top of
+                    // that pointer would store the pointer-to-pointer
+                    // into the field, breaking subsequent loads.
                     if (si_struct_def) |sdef| {
                         const def_field = findFieldDef(sdef, field.name);
                         if (def_field != null and def_field.?.storage == .indirect and
-                            ref != @intFromEnum(Zir.Inst.Ref.null_value))
+                            ref != @intFromEnum(Zir.Inst.Ref.null_value) and
+                            !self.zigTypeIsRecursiveStruct(def_field.?.type_expr))
                         {
                             ref = try self.heapPromoteForIndirectField(ref);
                         }
@@ -5032,10 +5169,14 @@ pub const ZirDriver = struct {
                     }
                     try self.markReuseBackedStructLocal(si.dest, si.type_name);
                     try self.setLocal(si.dest, ptr_ref);
-                } else if (self.shouldSkipArc(si.dest)) {
+                } else if (self.shouldSkipArc(si.dest) and !self.isRecursiveStruct(si.type_name)) {
                     // Stack allocation path: escape analysis determined this value
-                    // does not escape the current function. Use ZIR alloc + store
-                    // to place it on the stack instead of the arena.
+                    // does not escape the current function AND the type is not
+                    // recursive. Recursive struct values participate in the boxing
+                    // ABI (every parameter, return, and field expects `*const T`),
+                    // so even a non-escaping construction must be heap-promoted —
+                    // a stack-allocated struct can't be passed where the call
+                    // boundary needs an Arc-backed pointer with a refcount header.
                     _ = self.reuse_backed_struct_locals.remove(si.dest);
                     // See note above the reuse-pair branch — same fix:
                     // the `capture_depth == 0` band-aid is no longer
@@ -5072,6 +5213,7 @@ pub const ZirDriver = struct {
                     // `addStructInitTyped` body-tracks each
                     // `struct_init_field_type`, struct_init_typed is
                     // safe inside captured guard-block bodies.
+                    var struct_value: u32 = error_ref;
                     if (!self.current_function_is_closure) {
                         if (self.findStructDef(si.type_name) != null) {
                             if (self.emitStructTypeRef(si.type_name) catch null) |type_ref| {
@@ -5083,23 +5225,35 @@ pub const ZirDriver = struct {
                                     values.items.ptr,
                                     @intCast(values.items.len),
                                 );
-                                if (typed_result != error_ref) {
-                                    try self.setLocal(si.dest, typed_result);
-                                    return;
-                                }
+                                if (typed_result != error_ref) struct_value = typed_result;
                             }
                         }
                     }
+                    if (struct_value == error_ref) {
+                        struct_value = zir_builder_emit_struct_init_anon(
+                            self.handle,
+                            names_ptrs.items.ptr,
+                            names_lens.items.ptr,
+                            values.items.ptr,
+                            @intCast(values.items.len),
+                        );
+                        if (struct_value == error_ref) return error.EmitFailed;
+                    }
 
-                    const result = zir_builder_emit_struct_init_anon(
-                        self.handle,
-                        names_ptrs.items.ptr,
-                        names_lens.items.ptr,
-                        values.items.ptr,
-                        @intCast(values.items.len),
-                    );
-                    if (result == error_ref) return error.EmitFailed;
-                    try self.setLocal(si.dest, result);
+                    // Recursive structs are boxed at every cross-boundary
+                    // position (params, returns, field storage of the same
+                    // recursion class). The construction site must therefore
+                    // heap-promote the freshly built value so the dest local
+                    // holds `*const T`, not `T`. Without this promotion the
+                    // struct flows out as a value Ref and downstream coercions
+                    // to `*const T` (function calls, returns, field stores)
+                    // emit invalid ZIR.
+                    if (self.isRecursiveStruct(si.type_name)) {
+                        const ptr_ref = try self.heapPromoteForIndirectField(struct_value);
+                        try self.setLocal(si.dest, ptr_ref);
+                    } else {
+                        try self.setLocal(si.dest, struct_value);
+                    }
                 }
             },
             .field_get => |fg| {
@@ -5116,6 +5270,27 @@ pub const ZirDriver = struct {
                         if (findFieldDef(sdef, fg.field)) |fdef| {
                             if (fdef.storage == .indirect) {
                                 ref = try self.emitIndirectFieldDeref(ref, fdef.type_expr);
+                                if (self.zigTypeIsRecursiveStruct(fdef.type_expr)) {
+                                    // Boxed-recursive ABI: the parent owns
+                                    // this child's Arc, and the extracted
+                                    // value is a second handle to the same
+                                    // allocation. Retain so the parent's
+                                    // eventual deep release and the
+                                    // extracted value's release each
+                                    // decrement exactly once. Without this,
+                                    // the inner ownership graph aliases:
+                                    // the inner consumer frees the child
+                                    // first, then the outer drop walks the
+                                    // freed memory.
+                                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                                    if (rt_import == error_ref) return error.EmitFailed;
+                                    const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
+                                    if (arc_runtime == error_ref) return error.EmitFailed;
+                                    const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAnyOpt", 12);
+                                    if (retain_fn == error_ref) return error.EmitFailed;
+                                    const args = [_]u32{ref};
+                                    _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
+                                }
                             }
                         }
                     }
@@ -6485,6 +6660,18 @@ pub const ZirDriver = struct {
         field_storage_ref: u32,
         source_type: ir.ZigType,
     ) BuildError!u32 {
+        // Boxed-recursive ABI: when the source field type is itself a
+        // recursive struct, the consumer (param, return, sibling field,
+        // construction site) already expects `*const T` / `?*const T`.
+        // The storage shape and the consumer shape match, so the
+        // deref / null-check / re-coerce dance below would only undo
+        // and redo what's already correct — and in the deref+load
+        // case it would also strip the source-Arc identity that
+        // `releaseAny` needs at drop time. Pass the storage Ref
+        // through unchanged.
+        if (self.zigTypeIsRecursiveStruct(source_type)) {
+            return field_storage_ref;
+        }
         if (source_type != .optional) {
             // Storage is `*const T`; load to recover `T`.
             return try self.emitLoad(field_storage_ref);
@@ -7399,6 +7586,20 @@ pub const ZirDriver = struct {
         const saved_param_ref = self.param_refs.items[od.scrutinee_param];
         self.param_refs.items[od.scrutinee_param] = payload_ref;
         for (od.struct_instrs) |bi| try self.emitInstruction(bi);
+        // Perceus drop point for the boxed payload. Fired between the
+        // struct branch's body and the ret so:
+        //   * body has finished computing struct_result and any
+        //     children retains it needs;
+        //   * the release sees the source-Arc pointer (`*const T`)
+        //     and deep-releases the entire substructure;
+        //   * the ret then transfers the (possibly primitive,
+        //     possibly retained) result to the caller.
+        // `generateDropSpecialization` skips the drop when the
+        // function returns the payload itself, so this is always
+        // safe: either struct_result lives independent of the
+        // payload's allocation (e.g., an i64 sum) or the function
+        // is forwarding ownership and the spec opted out.
+        try self.emitDropSpecializationsForCurrentInstr(od.payload_local, null);
         if (od.struct_result) |sr| {
             const ret_ref = try self.refForLocal(sr);
             if (zir_builder_emit_ret(self.handle, ret_ref) != 0) {
