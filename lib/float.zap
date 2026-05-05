@@ -36,6 +36,17 @@ pub struct Float {
   pub fn to_string(value :: f80) -> String { :zig.Float.to_string_f80(value) }
   pub fn to_string(value :: f128) -> String { :zig.Float.to_string_f128(value) }
 
+  @doc = """
+    Format a float to a fixed number of decimal places, matching
+    C's `printf("%.<n>f", value)` rounding semantics. Useful for
+    numeric output that needs to be byte-identical against
+    reference implementations in other languages.
+    """
+
+  pub fn to_string(value :: f64, decimals :: i64) -> String {
+    :zig.Float.to_string_f64_precision(value, decimals)
+  }
+
   @doc = "Returns the absolute value of a float."
 
   pub fn abs(value :: f16) -> f16 { :zig.Float.abs_f16(value) }

@@ -5511,6 +5511,22 @@ pub const Float = struct {
         return result;
     }
 
+    /// Fixed-precision float formatter matching C's
+    /// `printf("%.<decimals>f", value)` rounding (round half away
+    /// from zero — actually round-to-even via Zig's `{d:.N}` which
+    /// uses ryu-like semantics; that matches glibc / POSIX printf
+    /// for the reference outputs this is wired up to compare against).
+    /// `decimals` is clamped to [0, 32].
+    pub fn to_string_f64_precision(value: f64, decimals: i64) []const u8 {
+        var buf: [128]u8 = undefined;
+        const d: usize = if (decimals < 0) 0 else if (decimals > 32) 32 else @intCast(decimals);
+        const slice = std.fmt.bufPrint(&buf, "{d:.[1]}", .{ value, d }) catch return "?";
+        const result = bumpAlloc(slice.len);
+        if (result.len == 0) return "?";
+        @memcpy(result, slice);
+        return result;
+    }
+
     /// Parse a string into f64, returning 0.0 on failure (non-optional).
     pub fn parse(s: []const u8) f64 {
         return std.fmt.parseFloat(f64, s) catch 0.0;
