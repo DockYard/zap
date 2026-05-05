@@ -472,6 +472,14 @@ pub const ZirDriver = struct {
     /// that resolve to `Map(K, Term).{get,...}` and other Term-
     /// returning runtime functions.
     term_typed_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
+    /// Locals known to alias the scrutinee parameter of a destructive
+    /// optional-dispatch (per `AnalysisContext.destructive_optional_dispatch`).
+    /// Tracked per-function: when `param_get`'s `index` matches the
+    /// destructive scrutinee param, its `dest` local goes into this
+    /// set. `field_get` reads of those locals on indirect-storage
+    /// recursive fields skip the `retainAnyOpt` retain — under the
+    /// destructive shape there's no second owner to balance against.
+    destructive_scrutinee_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
     type_store: ?*const @import("types.zig").TypeStore = null,
     /// Cached ZIR refs for List method functions, resolved once at function
     /// scope so they're available inside condbr bodies without re-importing.
@@ -535,6 +543,7 @@ pub const ZirDriver = struct {
         self.capture_param_derived_closure_map.deinit(self.allocator);
         self.reuse_backed_struct_locals.deinit(self.allocator);
         self.term_typed_locals.deinit(self.allocator);
+        self.destructive_scrutinee_locals.deinit(self.allocator);
         self.reuse_backed_union_locals.deinit(self.allocator);
         self.reuse_backed_tuple_locals.deinit(self.allocator);
         self.capture_param_refs.deinit(self.allocator);
@@ -545,6 +554,18 @@ pub const ZirDriver = struct {
     /// The IR builder already detects and marks tail-recursive calls as tail_call.
     /// Check if ARC operations should be skipped for a value.
     /// Only skips when the value was explicitly analyzed and found stack-eligible.
+    /// Tag `pg.dest` as a destructive-scrutinee local when the function
+    /// is in the destructive-optional-dispatch set and `pg.index` matches
+    /// its scrutinee param. The `field_get` retain emitter consults this
+    /// set to decide whether to skip `retainAnyOpt` on indirect-storage
+    /// recursive field reads of this local.
+    fn markDestructiveScrutineeIfApplicable(self: *ZirDriver, pg: ir.ParamGet) !void {
+        const actx = self.analysis_context orelse return;
+        const dscrut = actx.destructive_optional_dispatch.get(self.current_function_id) orelse return;
+        if (pg.index != dscrut) return;
+        try self.destructive_scrutinee_locals.put(self.allocator, pg.dest, {});
+    }
+
     fn shouldSkipArc(self: *const ZirDriver, local: ir.LocalId) bool {
         const lattice = @import("escape_lattice.zig");
         if (self.analysis_context) |actx| {
@@ -3039,6 +3060,7 @@ pub const ZirDriver = struct {
         self.closure_function_map.clearRetainingCapacity();
         self.param_derived_closure_locals.clearRetainingCapacity();
         self.capture_param_refs.clearRetainingCapacity();
+        self.destructive_scrutinee_locals.clearRetainingCapacity();
         self.cached_list_cell_ref = 0;
         self.cached_list_gethead_ref = 0;
         self.cached_list_gettail_ref = 0;
@@ -3709,7 +3731,20 @@ pub const ZirDriver = struct {
                     if (rt_import == error_ref) return error.EmitFailed;
                     const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                     if (arc_runtime == error_ref) return error.EmitFailed;
-                    const release_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "releaseAny", 10);
+                    // `.shallow` is the destructive-optional-dispatch
+                    // case: every recursive child of the parent has
+                    // already been extracted-and-consumed by an inner
+                    // call (which now owns the only handle to that
+                    // Arc), so reclaiming the parent must NOT walk the
+                    // children — those pointers were freed by the
+                    // consumers. `freeAny` decrements the parent's
+                    // refcount and frees the parent's allocation
+                    // without touching the children.
+                    const helper_name: []const u8 = switch (field_drop.kind) {
+                        .deep => "releaseAny",
+                        .shallow => "freeAny",
+                    };
+                    const release_fn = zir_builder_emit_field_val(self.handle, arc_runtime, helper_name.ptr, @intCast(helper_name.len));
                     if (release_fn == error_ref) return error.EmitFailed;
                     const args = [_]u32{ alloc_ref, val_ref };
                     _ = zir_builder_emit_call_ref(self.handle, release_fn, &args, 2);
@@ -3944,6 +3979,7 @@ pub const ZirDriver = struct {
                         const loaded = try self.emitLoad(slots[pg.index]);
                         try self.setLocal(pg.dest, loaded);
                         try self.markParamDerivedClosureLocal(pg.dest);
+                        try self.markDestructiveScrutineeIfApplicable(pg);
                         return;
                     }
                 }
@@ -3953,6 +3989,7 @@ pub const ZirDriver = struct {
                 if (pg.index < self.param_refs.items.len) {
                     try self.setLocal(pg.dest, self.param_refs.items[pg.index]);
                     try self.markParamDerivedClosureLocal(pg.dest);
+                    try self.markDestructiveScrutineeIfApplicable(pg);
                 } else if (self.local_refs.get(pg.index)) |value_ref| {
                     const materialized = try self.materializeValueRef(value_ref);
                     try self.setLocal(pg.dest, materialized);
@@ -5292,14 +5329,28 @@ pub const ZirDriver = struct {
                                     // the inner consumer frees the child
                                     // first, then the outer drop walks the
                                     // freed memory.
-                                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                                    if (rt_import == error_ref) return error.EmitFailed;
-                                    const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
-                                    if (arc_runtime == error_ref) return error.EmitFailed;
-                                    const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAnyOpt", 12);
-                                    if (retain_fn == error_ref) return error.EmitFailed;
-                                    const args = [_]u32{ref};
-                                    _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
+                                    //
+                                    // Skip the retain when the parent IS
+                                    // a destructive-scrutinee local. The
+                                    // Perceus analyzer proved that every
+                                    // such extraction is immediately
+                                    // consumed by a call (transferring
+                                    // ownership), and that the scrutinee's
+                                    // own drop will be shallow — so the
+                                    // inner consumer is the sole owner
+                                    // of the child Arc and the parent's
+                                    // teardown does not walk into it.
+                                    const skip_retain = self.destructive_scrutinee_locals.contains(fg.object);
+                                    if (!skip_retain) {
+                                        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                                        if (rt_import == error_ref) return error.EmitFailed;
+                                        const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
+                                        if (arc_runtime == error_ref) return error.EmitFailed;
+                                        const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAnyOpt", 12);
+                                        if (retain_fn == error_ref) return error.EmitFailed;
+                                        const args = [_]u32{ref};
+                                        _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
+                                    }
                                 }
                             }
                         }

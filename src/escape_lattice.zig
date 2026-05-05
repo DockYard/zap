@@ -831,6 +831,17 @@ pub const FieldDrop = struct {
     field_index: u32,
     needs_recursive_drop: bool,
     local: ?ir.LocalId = null,
+    /// `.deep` (default) emits a `releaseAny` that walks the value's
+    /// indirect-storage Arc'd fields and decrements every child's
+    /// refcount. `.shallow` emits `freeAny` and does no children
+    /// walk — used by the destructive-optional-dispatch path where
+    /// every indirect-storage child of the scrutinee was already
+    /// extracted-and-consumed (its ownership transferred to a
+    /// callee), so the parent must only reclaim its own allocation
+    /// without dereferencing the now-freed child pointers.
+    kind: Kind = .deep,
+
+    pub const Kind = enum { deep, shallow };
 };
 
 pub const DropSpecialization = struct {
@@ -992,6 +1003,24 @@ pub const AnalysisContext = struct {
     /// Per-call-site specialization decisions.
     call_specializations: std.AutoHashMap(CallSiteKey, CallSiteSpecialization),
 
+    /// Functions whose `optional_dispatch` struct branch destructively
+    /// reads every indirect-storage child of the scrutinee — every
+    /// recursive child is extracted and immediately consumed by a call
+    /// (transferring ownership), so the parent never observes those
+    /// child pointers again. Maps function id → scrutinee param index.
+    /// The ZIR backend uses this map to:
+    ///   * suppress the `retainAnyOpt` at indirect-storage `field_get`
+    ///     reads of the scrutinee — there is no second owner to balance
+    ///     against, the inner consumer takes the only handle;
+    ///   * emit a shallow `freeAny` at the optional-dispatch drop
+    ///     point instead of the deep `releaseAny`, because walking the
+    ///     children would dereference the now-freed pointers.
+    /// `Binarytrees.check` is the canonical case: t.left and t.right are
+    /// both extracted-and-passed; the extracted Trees are owned by the
+    /// recursive callee, so check itself only reclaims its own
+    /// allocation.
+    destructive_optional_dispatch: std.AutoHashMap(ir.FunctionId, u32),
+
     pub fn init(allocator: std.mem.Allocator) AnalysisContext {
         return .{
             .allocator = allocator,
@@ -1012,6 +1041,7 @@ pub const AnalysisContext = struct {
             .outlives_constraints = .empty,
             .closure_tiers = std.AutoHashMap(ir.FunctionId, ClosureEnvTier).init(allocator),
             .call_specializations = std.AutoHashMap(CallSiteKey, CallSiteSpecialization).init(allocator),
+            .destructive_optional_dispatch = std.AutoHashMap(ir.FunctionId, u32).init(allocator),
         };
     }
 
@@ -1074,6 +1104,7 @@ pub const AnalysisContext = struct {
             }
         }
         self.call_specializations.deinit();
+        self.destructive_optional_dispatch.deinit();
     }
 
     // --------------------------------------------------------

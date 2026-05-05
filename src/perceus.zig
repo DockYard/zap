@@ -98,12 +98,20 @@ pub const FunctionStats = struct {
     construction_sites: u32,
 };
 
+/// Function-id + scrutinee-param-index pair surfaced by the
+/// destructive-optional-dispatch detector.
+pub const DestructiveOptionalDispatch = struct {
+    function: ir.FunctionId,
+    scrutinee_param: u32,
+};
+
 /// Complete results from the Perceus analysis pass.
 pub const AnalysisResult = struct {
     reuse_pairs: []const lattice.ReusePair,
     arc_ops: []const lattice.ArcOperation,
     drop_specializations: []const DropSpecialization,
     function_stats: []const FunctionStats,
+    destructive_optional_dispatch: []const DestructiveOptionalDispatch,
 
     pub fn deinit(self: *const AnalysisResult, allocator: std.mem.Allocator) void {
         allocator.free(self.reuse_pairs);
@@ -113,6 +121,7 @@ pub const AnalysisResult = struct {
         }
         allocator.free(self.drop_specializations);
         allocator.free(self.function_stats);
+        allocator.free(self.destructive_optional_dispatch);
     }
 };
 
@@ -132,6 +141,13 @@ pub const PerceusAnalyzer = struct {
     arc_ops: std.ArrayList(lattice.ArcOperation),
     drop_specializations: std.ArrayList(DropSpecialization),
     function_stats: std.ArrayList(FunctionStats),
+    /// Function ids (with the scrutinee param index) whose optional-
+    /// dispatch struct branch is "destructive": every indirect-storage
+    /// child of the scrutinee is extracted-and-consumed by a call,
+    /// so the parent never observes those children again. Surfaces in
+    /// `AnalysisContext.destructive_optional_dispatch` for the ZIR
+    /// backend to act on.
+    destructive_funcs: std.AutoHashMapUnmanaged(ir.FunctionId, u32),
 
     // Working state for current function
     current_function_id: ir.FunctionId,
@@ -152,6 +168,7 @@ pub const PerceusAnalyzer = struct {
             .arc_ops = .empty,
             .drop_specializations = .empty,
             .function_stats = .empty,
+            .destructive_funcs = .empty,
             .current_function_id = 0,
             .current_decon_sites = .empty,
         };
@@ -165,6 +182,7 @@ pub const PerceusAnalyzer = struct {
         }
         self.drop_specializations.deinit(self.allocator);
         self.function_stats.deinit(self.allocator);
+        self.destructive_funcs.deinit(self.allocator);
         self.current_decon_sites.deinit(self.allocator);
     }
 
@@ -174,11 +192,21 @@ pub const PerceusAnalyzer = struct {
             try self.analyzeFunction(&func);
         }
 
+        var destructive_list: std.ArrayList(DestructiveOptionalDispatch) = .empty;
+        var destructive_iter = self.destructive_funcs.iterator();
+        while (destructive_iter.next()) |entry| {
+            try destructive_list.append(self.allocator, .{
+                .function = entry.key_ptr.*,
+                .scrutinee_param = entry.value_ptr.*,
+            });
+        }
+
         return .{
             .reuse_pairs = try self.reuse_pairs.toOwnedSlice(self.allocator),
             .arc_ops = try self.arc_ops.toOwnedSlice(self.allocator),
             .drop_specializations = try self.drop_specializations.toOwnedSlice(self.allocator),
             .function_stats = try self.function_stats.toOwnedSlice(self.allocator),
+            .destructive_optional_dispatch = try destructive_list.toOwnedSlice(self.allocator),
         };
     }
 
@@ -798,12 +826,17 @@ pub const PerceusAnalyzer = struct {
                 if (od.struct_result) |sr| {
                     if (sr == od.payload_local) return;
                 }
+                const destructive = self.isDestructiveOptionalDispatch(&od, func);
+                if (destructive) {
+                    self.destructive_funcs.put(self.allocator, func.id, od.scrutinee_param) catch return;
+                }
                 const drops = try self.allocator.alloc(FieldDrop, 1);
                 drops[0] = .{
                     .field_name = "__optional_payload",
                     .field_index = 0,
                     .needs_recursive_drop = true,
                     .local = od.payload_local,
+                    .kind = if (destructive) .shallow else .deep,
                 };
                 try self.drop_specializations.append(self.allocator, .{
                     .match_site = decon.match_site_id,
@@ -819,6 +852,212 @@ pub const PerceusAnalyzer = struct {
                 });
             },
             else => {},
+        }
+    }
+
+    /// Decide whether an optional-dispatch struct branch is "destructive"
+    /// — every indirect-storage Arc'd child of the scrutinee is
+    /// extracted by a `field_get` whose result is immediately consumed
+    /// by a function call (transferring ownership), and the scrutinee-
+    /// derived locals themselves are never used outside `field_get`
+    /// reads. When that pattern holds, the parent observes none of its
+    /// children after the body runs, so:
+    ///   * `field_get` of an indirect-storage recursive field on the
+    ///     scrutinee can skip its `retainAnyOpt` — the inner consumer
+    ///     takes the only handle, no second owner exists to balance;
+    ///   * the optional-dispatch drop emits a shallow `freeAny`
+    ///     instead of `releaseAny`, because deep-walking the parent
+    ///     would dereference child pointers the consumers already
+    ///     freed.
+    ///
+    /// Conservatively rejects unfamiliar instruction shapes: any
+    /// non-trivial use of a scrutinee-derived local outside a
+    /// recognised `field_get`/extraction pattern returns false, falling
+    /// back to the safe deep-release + retain path.
+    fn isDestructiveOptionalDispatch(
+        self: *const PerceusAnalyzer,
+        od: *const ir.OptionalDispatch,
+        func: *const ir.Function,
+    ) bool {
+        if (od.scrutinee_param >= func.params.len) return false;
+        const param_type = func.params[od.scrutinee_param].type_expr;
+        const inner = switch (param_type) {
+            .optional => |opt| opt.*,
+            else => return false,
+        };
+        const struct_name = switch (inner) {
+            .struct_ref => |n| n,
+            else => return false,
+        };
+
+        // Count indirect-storage fields on the scrutinee's struct so
+        // we can require the body to extract every one. If even one
+        // is left unextracted, that child still has the parent as its
+        // sole owner and dropping shallowly would leak it.
+        var indirect_count: u32 = 0;
+        var struct_fields: []const ir.StructFieldDef = &.{};
+        for (self.program.type_defs) |td| {
+            if (!std.mem.eql(u8, td.name, struct_name)) continue;
+            switch (td.kind) {
+                .struct_def => |def| {
+                    struct_fields = def.fields;
+                    for (def.fields) |f| {
+                        if (f.storage == .indirect) indirect_count += 1;
+                    }
+                },
+                else => return false,
+            }
+            break;
+        }
+        if (indirect_count == 0) return false;
+
+        // Pass 1: collect scrutinee-derived locals and indirect-extracted locals.
+        // A scrutinee-derived local is any `param_get(scrutinee_param)` dest.
+        // An indirect-extracted local is any `field_get` whose object is a
+        // scrutinee-derived local AND whose field is indirect-storage.
+        var scrutinee_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+        defer @constCast(&scrutinee_locals).deinit(self.allocator);
+        var extracted_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+        defer @constCast(&extracted_locals).deinit(self.allocator);
+        var fields_extracted: std.StringHashMapUnmanaged(void) = .empty;
+        defer @constCast(&fields_extracted).deinit(self.allocator);
+
+        for (od.struct_instrs) |instr| {
+            switch (instr) {
+                .param_get => |pg| {
+                    if (pg.index == od.scrutinee_param) {
+                        scrutinee_locals.put(self.allocator, pg.dest, {}) catch return false;
+                    }
+                },
+                .field_get => |fg| {
+                    if (!scrutinee_locals.contains(fg.object)) continue;
+                    for (struct_fields) |def_field| {
+                        if (!std.mem.eql(u8, def_field.name, fg.field)) continue;
+                        if (def_field.storage == .indirect) {
+                            extracted_locals.put(self.allocator, fg.dest, {}) catch return false;
+                            fields_extracted.put(self.allocator, def_field.name, {}) catch return false;
+                        }
+                        break;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Every indirect-storage field must have been extracted at least
+        // once. Otherwise some child still hangs off the parent and a
+        // shallow drop would leak it.
+        var missing_count: u32 = 0;
+        for (struct_fields) |def_field| {
+            if (def_field.storage != .indirect) continue;
+            if (!fields_extracted.contains(def_field.name)) missing_count += 1;
+        }
+        if (missing_count != 0) return false;
+
+        // Pass 2: validate every instruction's reads.
+        //   * scrutinee-derived locals may appear only as `field_get.object`.
+        //   * extracted locals may appear only as `call_named`/`call_direct`/
+        //     `call_dispatch`/`tail_call` arguments (consumed) or as the
+        //     value being passed through a transparent `local_get`/`move_value`/
+        //     `share_value` propagation that itself terminates in a call.
+        //
+        // Any other shape (return, store, binary op, etc. reading those
+        // locals) breaks the destructive assumption.
+        for (od.struct_instrs) |instr| {
+            if (!instructionUsesAreBorrowSafe(instr, &scrutinee_locals, &extracted_locals)) return false;
+        }
+        return true;
+    }
+
+    /// Walk the read operands of `instr` and verify that no scrutinee-
+    /// derived local escapes its borrow context. See
+    /// `isDestructiveOptionalDispatch` for the policy.
+    fn instructionUsesAreBorrowSafe(
+        instr: ir.Instruction,
+        scrutinee_locals: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
+        extracted_locals: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
+    ) bool {
+        const reads_scrutinee = struct {
+            fn check(s: *const std.AutoHashMapUnmanaged(ir.LocalId, void), id: ir.LocalId) bool {
+                return s.contains(id);
+            }
+        }.check;
+        const reads_extracted = reads_scrutinee;
+
+        switch (instr) {
+            .const_int, .const_float, .const_string, .const_bool, .const_atom, .const_nil => return true,
+            .param_get => return true,
+            .field_get => |fg| {
+                // `fg.object` is allowed to be a scrutinee_local — that's the
+                // borrow-extraction shape we explicitly want.
+                if (reads_extracted(extracted_locals, fg.object)) return false;
+                return true;
+            },
+            .local_get => |lg| {
+                // Reading a scrutinee-derived local through `local_get` would
+                // produce another live alias outside the borrow's `field_get`
+                // protocol. Reject conservatively. Same logic for extracted.
+                if (reads_scrutinee(scrutinee_locals, lg.source)) return false;
+                if (reads_extracted(extracted_locals, lg.source)) return false;
+                return true;
+            },
+            .local_set => |ls| {
+                if (reads_scrutinee(scrutinee_locals, ls.value)) return false;
+                if (reads_extracted(extracted_locals, ls.value)) return false;
+                return true;
+            },
+            .move_value => |mv| {
+                if (reads_scrutinee(scrutinee_locals, mv.source)) return false;
+                if (reads_extracted(extracted_locals, mv.source)) return false;
+                return true;
+            },
+            .share_value => |sv| {
+                if (reads_scrutinee(scrutinee_locals, sv.source)) return false;
+                if (reads_extracted(extracted_locals, sv.source)) return false;
+                return true;
+            },
+            .field_set => |fs| {
+                if (reads_scrutinee(scrutinee_locals, fs.object)) return false;
+                if (reads_scrutinee(scrutinee_locals, fs.value)) return false;
+                if (reads_extracted(extracted_locals, fs.object)) return false;
+                if (reads_extracted(extracted_locals, fs.value)) return false;
+                return true;
+            },
+            .call_named => |cn| {
+                for (cn.args) |a| if (reads_scrutinee(scrutinee_locals, a)) return false;
+                // Extracted locals are *expected* as call args — that is
+                // the consumption that justifies the destructive shape.
+                return true;
+            },
+            .call_direct => |cd| {
+                for (cd.args) |a| if (reads_scrutinee(scrutinee_locals, a)) return false;
+                return true;
+            },
+            .tail_call => |tc| {
+                for (tc.args) |a| if (reads_scrutinee(scrutinee_locals, a)) return false;
+                return true;
+            },
+            .binary_op => |bo| {
+                if (reads_scrutinee(scrutinee_locals, bo.lhs) or reads_scrutinee(scrutinee_locals, bo.rhs)) return false;
+                if (reads_extracted(extracted_locals, bo.lhs) or reads_extracted(extracted_locals, bo.rhs)) return false;
+                return true;
+            },
+            .unary_op => |uo| {
+                if (reads_scrutinee(scrutinee_locals, uo.operand)) return false;
+                if (reads_extracted(extracted_locals, uo.operand)) return false;
+                return true;
+            },
+            .ret => |r| {
+                if (r.value) |v| {
+                    if (reads_scrutinee(scrutinee_locals, v)) return false;
+                    if (reads_extracted(extracted_locals, v)) return false;
+                }
+                return true;
+            },
+            // Anything else: be conservative. Dispatches, allocations,
+            // and aggregate inits could all leak a scrutinee handle in
+            // ways this analyzer doesn't model.
+            else => return false,
         }
     }
 

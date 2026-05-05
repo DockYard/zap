@@ -297,6 +297,9 @@ pub fn runAnalysisPipelineWithIo(
             .insertion_point = spec.insertion_point,
         });
     }
+    for (perceus_result.destructive_optional_dispatch) |entry| {
+        try ctx.destructive_optional_dispatch.put(entry.function, entry.scrutinee_param);
+    }
 
     // Back-propagate used_in_reset from Perceus to interprocedural summaries.
     // For each reuse pair, find which function parameters flow to the
