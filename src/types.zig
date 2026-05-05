@@ -69,6 +69,14 @@ pub const Type = union(enum) {
     /// disagree. Construction sites lower to `Term.from(value)`;
     /// consumers unwrap via `Term.to(T, default)`.
     term_type,
+    /// Mutable, ARC-managed, pool-backed contiguous array of one
+    /// concrete element type. Backed by `runtime.MArrayOf(T)`. The
+    /// element kind disambiguates `MArrayI64` from `MArrayF64`. Each
+    /// MArray kind is a distinct nominal Zig type — element kind
+    /// participates in equality. Like `string_type`, the kind is
+    /// stand-alone (no parameterisation across arbitrary `T`); only
+    /// the explicit element variants enumerated here are supported.
+    marray_type: MArrayElementKind,
 
     // Compound types
     tuple: TupleType,
@@ -103,6 +111,18 @@ pub const Type = union(enum) {
     pub const FloatType = struct {
         bits: u16,
     };
+
+    /// The concrete element type of an `MArrayOf(T)` instantiation.
+    /// Each variant maps to a distinct runtime type — the compiler
+    /// must keep `MArrayI64` and `MArrayF64` ABI-distinct because
+    /// the underlying generic instantiation is a different Zig type
+    /// per element type. New variants here demand:
+    ///   * a matching well-known TypeId in `TypeStore`,
+    ///   * a matching `NativeTypeKind` in `scope.zig`,
+    ///   * a matching `ZigType` variant in `ir.zig`,
+    ///   * mapping rules in `zir_builder.zig` for parameter/return
+    ///     emission and `:zig.MArray<X>.method` dispatch.
+    pub const MArrayElementKind = enum { i64, f64 };
 
     pub const TupleType = struct {
         elements: []const TypeId,
@@ -218,6 +238,8 @@ pub const TypeStore = struct {
     pub const U128: TypeId = 22;
     pub const F80: TypeId = 23;
     pub const F128: TypeId = 24;
+    pub const MARRAY_I64: TypeId = 25;
+    pub const MARRAY_F64: TypeId = 26;
     pub const VOID: TypeId = NIL;
 
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner) TypeStore {
@@ -266,6 +288,8 @@ pub const TypeStore = struct {
         try self.types.append(self.allocator, .{ .int = .{ .signedness = .unsigned, .bits = 128 } }); // 22 - u128
         try self.types.append(self.allocator, .{ .float = .{ .bits = 80 } }); // 23 - f80
         try self.types.append(self.allocator, .{ .float = .{ .bits = 128 } }); // 24 - f128
+        try self.types.append(self.allocator, .{ .marray_type = .i64 }); // 25 - MArrayI64
+        try self.types.append(self.allocator, .{ .marray_type = .f64 }); // 26 - MArrayF64
     }
 
     pub fn addType(self: *TypeStore, typ: Type) !TypeId {
@@ -291,6 +315,7 @@ pub const TypeStore = struct {
             .int => |i| i.signedness == b.int.signedness and i.bits == b.int.bits,
             .float => |f| f.bits == b.float.bits,
             .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => true,
+            .marray_type => |element_kind| element_kind == b.marray_type,
             .type_var => false,
             .list => |l| l.element == b.list.element,
             .tuple => |t| std.mem.eql(TypeId, t.elements, b.tuple.elements),
@@ -412,6 +437,10 @@ pub const TypeStore = struct {
             .atom_type => "Atom",
             .tuple => "Tuple",
             .function => "Function",
+            .marray_type => |element_kind| switch (element_kind) {
+                .i64 => "MArrayI64",
+                .f64 => "MArrayF64",
+            },
             else => null,
         };
     }
@@ -602,7 +631,7 @@ pub const TypeStore = struct {
                 return false;
             },
             // Primitives and non-compound types cannot contain type variables
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => false,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .marray_type => false,
             .struct_type, .union_type, .tagged_union, .opaque_type => false,
         };
     }
@@ -651,7 +680,7 @@ pub const TypeStore = struct {
                 return false;
             },
             // Primitives and non-compound types cannot contain type variables
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => false,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .marray_type => false,
             .struct_type, .union_type, .tagged_union, .opaque_type => false,
         };
     }
@@ -922,7 +951,7 @@ pub const SubstitutionMap = struct {
                 } }) catch type_id;
             },
             // Primitives and other types pass through unchanged
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => type_id,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .marray_type => type_id,
             .struct_type, .union_type, .tagged_union, .opaque_type, .applied => type_id,
         };
     }
@@ -1025,7 +1054,7 @@ pub const SubstitutionMap = struct {
                     .type_params = new_params,
                 } }) catch type_id;
             },
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => type_id,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .marray_type => type_id,
             .struct_type, .union_type, .tagged_union, .opaque_type, .applied => type_id,
         };
     }
@@ -2497,6 +2526,8 @@ pub const TypeChecker = struct {
         if (type_id == TypeStore.F16) return "f16";
         if (type_id == TypeStore.USIZE) return "usize";
         if (type_id == TypeStore.ISIZE) return "isize";
+        if (type_id == TypeStore.MARRAY_I64) return "MArrayI64";
+        if (type_id == TypeStore.MARRAY_F64) return "MArrayF64";
         if (type_id == TypeStore.UNKNOWN) return "{unknown}";
         if (type_id == TypeStore.ERROR) return "{error}";
         if (type_id == TypeStore.TERM) return "Term";
@@ -5009,6 +5040,19 @@ pub const TypeChecker = struct {
                         const elem_t = try self.resolveTypeExpr(tn.args[0]);
                         return try self.store.addType(.{ .list = .{ .element = elem_t } });
                     }
+                }
+
+                // Native MArray instantiations resolve to their fixed
+                // well-known TypeIds. The `@native_type` registry on
+                // `ScopeGraph` answers "is this Zap struct the
+                // user-visible alias for `runtime.MArrayI64`?". When
+                // the answer is yes, the type system collapses the
+                // type to the precomputed `MARRAY_I64` /
+                // `MARRAY_F64` slot so downstream IR/ZIR consumers
+                // see one canonical TypeId per element kind.
+                if (tn.args.len == 0) {
+                    if (self.isNativeTypeName(.marray_i64, tn.name)) return TypeStore.MARRAY_I64;
+                    if (self.isNativeTypeName(.marray_f64, tn.name)) return TypeStore.MARRAY_F64;
                 }
 
                 if (self.store.resolveTypeName(name)) |tid| {

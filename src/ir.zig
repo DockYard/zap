@@ -949,6 +949,16 @@ pub const ZigType = union(enum) {
     /// sites wrap via `Term.from(value)` and consumption sites unwrap
     /// via `Term.to(T, term, default)`.
     term,
+    /// `?*const zap_runtime.MArrayOf(i64)` — concrete instantiation of
+    /// the mutable, ARC-managed, pool-backed contiguous array. The
+    /// runtime owns the cell layout (`Inner = { header, len, items }`);
+    /// the source-Arc ABI sees `?*const Inner` everywhere and
+    /// `@constCast`s once at write boundaries. Distinct from
+    /// `marray_f64` because `MArrayOf(i64)` and `MArrayOf(f64)` are
+    /// different Zig generic instantiations.
+    marray_i64,
+    /// `?*const zap_runtime.MArrayOf(f64)` — see `marray_i64`.
+    marray_f64,
     tuple: []const ZigType,
     list: *const ZigType,
     map: MapType,
@@ -2237,6 +2247,11 @@ pub const IrBuilder = struct {
             .atom,
             .never,
             .ptr,
+            // `?*const MArrayOf(T)` is a single pointer-size optional —
+            // Zig passes it in registers like any other `?*T`, so it
+            // satisfies the by-value requirement for `musttail`.
+            .marray_i64,
+            .marray_f64,
             => true,
             // Anything routed through Zig's by-ref ABI is unsafe for
             // `musttail`. Strings (slices), structs, tuples, lists,
@@ -5982,12 +5997,18 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
         types_mod.TypeStore.F16 => .f16,
         types_mod.TypeStore.USIZE => .usize,
         types_mod.TypeStore.ISIZE => .isize,
+        types_mod.TypeStore.MARRAY_I64 => .marray_i64,
+        types_mod.TypeStore.MARRAY_F64 => .marray_f64,
         else => {
             // Try to resolve user-defined struct/enum/union types
             if (type_store) |ts| {
                 if (type_id < ts.types.items.len) {
                     const typ = ts.types.items[type_id];
                     switch (typ) {
+                        .marray_type => |element_kind| return switch (element_kind) {
+                            .i64 => .marray_i64,
+                            .f64 => .marray_f64,
+                        },
                         .struct_type => |st| {
                             return .{ .struct_ref = ts.interner.get(st.name) };
                         },
@@ -6125,6 +6146,11 @@ fn zigTypeReachesStruct(t: ZigType, owner_name: []const u8) bool {
         .usize,
         .isize,
         .tagged_union,
+        // MArray cells are heap-managed runtime values whose `Inner`
+        // never embeds a Zap user struct, so they cannot reach
+        // `owner_name`.
+        .marray_i64,
+        .marray_f64,
         => false,
     };
 }
@@ -6236,6 +6262,11 @@ fn reachesStructInCycleImpl(
         .usize,
         .isize,
         .tagged_union,
+        // MArray cells are heap-managed runtime types whose `Inner`
+        // never embeds a Zap user struct, so they can't carry a back-
+        // reference to `owner_name`.
+        .marray_i64,
+        .marray_f64,
         => false,
     };
 }
@@ -6266,6 +6297,8 @@ fn zigTypeToStr(zig_type: ZigType) []const u8 {
         .string => "[]const u8",
         .atom => "[]const u8",
         .nil => "?void",
+        .marray_i64 => "?*const zap_runtime.MArrayOf(i64)",
+        .marray_f64 => "?*const zap_runtime.MArrayOf(f64)",
         .struct_ref => |name| name,
         .tagged_union => |name| name,
         .function => "zap_runtime.DynClosure",

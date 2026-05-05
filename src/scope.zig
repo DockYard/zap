@@ -456,26 +456,41 @@ pub const ImplEntry = struct {
 /// runtime container the compiler must lower or dispatch specially
 /// (e.g. List for cons-cell IR, Map for k/v-aware ZIR encoding,
 /// Range for `in_range` literal switching, String for the byte-string
-/// primitive). The Zap stdlib structs that back these kinds opt in
-/// by writing a `@native_type = "list"|"map"|"range"|"string"`
-/// attribute on the struct declaration; the collector scans those
-/// attributes and populates `ScopeGraph.native_type_names`. Compiler
-/// passes that previously string-compared struct names against
-/// hardcoded literals consult the registry instead — that way the
-/// "is this struct the runtime List type?" question is answered by
-/// the user-visible declaration in `lib/list.zap`, not by a string
-/// literal embedded in the compiler.
+/// primitive, `marray_i64` / `marray_f64` for the mutable
+/// pool-backed contiguous arrays used by the CLBG numeric inner
+/// loops). The Zap stdlib structs that back these kinds opt in by
+/// writing a `@native_type = "<kind>"` attribute on the struct
+/// declaration; the collector scans those attributes and populates
+/// `ScopeGraph.native_type_names`. Compiler passes that previously
+/// string-compared struct names against hardcoded literals consult
+/// the registry instead — that way the "is this struct the runtime
+/// List type?" question is answered by the user-visible declaration
+/// in `lib/list.zap`, not by a string literal embedded in the
+/// compiler.
+///
+/// `marray_i64` and `marray_f64` are concrete element-typed runtime
+/// instantiations of `MArrayOf(T)`; they appear here as separate
+/// kinds (rather than a single parameterised `marray` kind with an
+/// element-type field) so the existing zero-parameter
+/// `NativeTypeKind` shape stays intact. The shape is acceptable
+/// because each `?*const MArrayOf(T)` is a distinct ABI-visible
+/// runtime type and the user-visible Zap structs (`MArrayI64`,
+/// `MArrayF64`) are similarly distinct.
 pub const NativeTypeKind = enum {
     list,
     map,
     range,
     string,
+    marray_i64,
+    marray_f64,
 
     pub fn fromName(name: []const u8) ?NativeTypeKind {
         if (std.mem.eql(u8, name, "list")) return .list;
         if (std.mem.eql(u8, name, "map")) return .map;
         if (std.mem.eql(u8, name, "range")) return .range;
         if (std.mem.eql(u8, name, "string")) return .string;
+        if (std.mem.eql(u8, name, "marray_i64")) return .marray_i64;
+        if (std.mem.eql(u8, name, "marray_f64")) return .marray_f64;
         return null;
     }
 };
@@ -1288,9 +1303,13 @@ test "native type kind name parsing" {
     try std.testing.expectEqual(@as(?NativeTypeKind, .map), NativeTypeKind.fromName("map"));
     try std.testing.expectEqual(@as(?NativeTypeKind, .range), NativeTypeKind.fromName("range"));
     try std.testing.expectEqual(@as(?NativeTypeKind, .string), NativeTypeKind.fromName("string"));
+    try std.testing.expectEqual(@as(?NativeTypeKind, .marray_i64), NativeTypeKind.fromName("marray_i64"));
+    try std.testing.expectEqual(@as(?NativeTypeKind, .marray_f64), NativeTypeKind.fromName("marray_f64"));
     try std.testing.expectEqual(@as(?NativeTypeKind, null), NativeTypeKind.fromName("List"));
     try std.testing.expectEqual(@as(?NativeTypeKind, null), NativeTypeKind.fromName(""));
     try std.testing.expectEqual(@as(?NativeTypeKind, null), NativeTypeKind.fromName("nope"));
+    try std.testing.expectEqual(@as(?NativeTypeKind, null), NativeTypeKind.fromName("MArrayI64"));
+    try std.testing.expectEqual(@as(?NativeTypeKind, null), NativeTypeKind.fromName("marray"));
 }
 
 test "ScopeSet add/contains/remove preserves sorted invariant" {
@@ -1424,21 +1443,32 @@ test "scope graph native type registry" {
     const list_name: ast.StringId = 11;
     const map_name: ast.StringId = 12;
     const other_name: ast.StringId = 13;
+    const marray_i64_name: ast.StringId = 14;
+    const marray_f64_name: ast.StringId = 15;
 
     // Lookup before registration returns null.
     try std.testing.expectEqual(@as(?ast.StringId, null), graph.nativeTypeStructName(.list));
     try std.testing.expect(!graph.isNativeTypeName(.list, list_name));
+    try std.testing.expectEqual(@as(?ast.StringId, null), graph.nativeTypeStructName(.marray_i64));
+    try std.testing.expectEqual(@as(?ast.StringId, null), graph.nativeTypeStructName(.marray_f64));
 
     graph.registerNativeType(.list, list_name);
     graph.registerNativeType(.map, map_name);
+    graph.registerNativeType(.marray_i64, marray_i64_name);
+    graph.registerNativeType(.marray_f64, marray_f64_name);
 
     try std.testing.expectEqual(list_name, graph.nativeTypeStructName(.list).?);
     try std.testing.expectEqual(map_name, graph.nativeTypeStructName(.map).?);
+    try std.testing.expectEqual(marray_i64_name, graph.nativeTypeStructName(.marray_i64).?);
+    try std.testing.expectEqual(marray_f64_name, graph.nativeTypeStructName(.marray_f64).?);
 
     try std.testing.expect(graph.isNativeTypeName(.list, list_name));
     try std.testing.expect(graph.isNativeTypeName(.map, map_name));
+    try std.testing.expect(graph.isNativeTypeName(.marray_i64, marray_i64_name));
+    try std.testing.expect(graph.isNativeTypeName(.marray_f64, marray_f64_name));
     try std.testing.expect(!graph.isNativeTypeName(.list, map_name));
     try std.testing.expect(!graph.isNativeTypeName(.list, other_name));
+    try std.testing.expect(!graph.isNativeTypeName(.marray_i64, marray_f64_name));
 
     // Registration is first-wins so callers get a stable answer.
     graph.registerNativeType(.list, other_name);
@@ -1448,6 +1478,8 @@ test "scope graph native type registry" {
     // classifyNativeType reverse-lookup.
     try std.testing.expectEqual(NativeTypeKind.list, graph.classifyNativeType(list_name).?);
     try std.testing.expectEqual(NativeTypeKind.map, graph.classifyNativeType(map_name).?);
+    try std.testing.expectEqual(NativeTypeKind.marray_i64, graph.classifyNativeType(marray_i64_name).?);
+    try std.testing.expectEqual(NativeTypeKind.marray_f64, graph.classifyNativeType(marray_f64_name).?);
     try std.testing.expectEqual(@as(?NativeTypeKind, null), graph.classifyNativeType(other_name));
 }
 
