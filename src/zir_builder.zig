@@ -4679,8 +4679,27 @@ pub const ZirDriver = struct {
                 var values: std.ArrayListUnmanaged(u32) = .empty;
                 defer values.deinit(self.allocator);
 
+                // Look up the struct def once so we can wrap values
+                // for indirect-storage fields (recursive types).
+                const si_struct_def = self.findStructDef(si.type_name);
+
                 for (si.fields) |field| {
-                    const ref = self.refForValueLocal(field.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    var ref = self.refForValueLocal(field.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    // Indirect-storage fields (self-referential
+                    // recursive types) are laid out as `?*const T`.
+                    // Promote a non-null `T` value to a heap-
+                    // allocated `*const T` so Zig coerces it into the
+                    // optional pointer slot. `null_value` passes
+                    // through — Zig handles the nil-to-?*const T
+                    // coercion natively.
+                    if (si_struct_def) |sdef| {
+                        const def_field = findFieldDef(sdef, field.name);
+                        if (def_field != null and def_field.?.storage == .indirect and
+                            ref != @intFromEnum(Zir.Inst.Ref.null_value))
+                        {
+                            ref = try self.heapPromoteForIndirectField(ref);
+                        }
+                    }
                     try names_ptrs.append(self.allocator, field.name.ptr);
                     try names_lens.append(self.allocator, @intCast(field.name.len));
                     try values.append(self.allocator, ref);
@@ -6154,6 +6173,26 @@ pub const ZirDriver = struct {
         return ref;
     }
 
+    /// Heap-promote a value Ref so it can occupy an indirect-storage
+    /// (`?*const T`) struct field. Emits `@TypeOf(value)` →
+    /// `alloc T` → `store ptr, value` → `make_ptr_const ptr`,
+    /// returning the resulting `*const T` Ref. Zig auto-coerces
+    /// `*const T` into `?*const T` at the assignment site, so the
+    /// caller never needs to wrap explicitly in optional.
+    ///
+    /// Used by struct_init lowering for fields whose
+    /// `FieldStorage == .indirect`. Caller must ensure `value_ref`
+    /// is not `null_value` — passing null through this would alloc
+    /// and store a void value, which is wrong. The caller checks
+    /// upfront and short-circuits the null case.
+    fn heapPromoteForIndirectField(self: *ZirDriver, value_ref: u32) BuildError!u32 {
+        const type_ref = zir_builder_emit_typeof(self.handle, value_ref);
+        if (type_ref == error_ref) return error.EmitFailed;
+        const alloc_ref = try self.emitAlloc(type_ref);
+        if (zir_builder_emit_store(self.handle, alloc_ref, value_ref) != 0) return error.EmitFailed;
+        return try self.emitMakePtrConst(alloc_ref);
+    }
+
     /// Emit a mutable stack allocation (ZIR alloc_mut instruction).
     fn emitAllocMut(self: *ZirDriver, type_ref: u32) BuildError!u32 {
         const ref = zir_builder_emit_alloc_mut(self.handle, type_ref);
@@ -7367,3 +7406,14 @@ test "findClosureTargetInInstrs follows local aliases" {
 // in Zap library files (lib/*.zap). The compiler's HIR builder lowers those
 // calls to `call_builtin` instructions, which the ZIR builder emits as
 // `@import("zap_runtime").Struct.function(args)`.
+
+/// Lookup a field by name in a struct definition. Used by struct-init
+/// lowering to consult the field's storage strategy (`.direct` vs
+/// `.indirect`) so recursive-type fields get heap-promoted at the
+/// construction site.
+fn findFieldDef(struct_def: ir.StructDef, name: []const u8) ?ir.StructFieldDef {
+    for (struct_def.fields) |f| {
+        if (std.mem.eql(u8, f.name, name)) return f;
+    }
+    return null;
+}
