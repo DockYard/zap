@@ -807,12 +807,20 @@ Three additional fixes landed after the original brief was written:
 
 - **Blocker 1 fully resolved** (fork: `8352916bdb`, Zap: `3b3eec9`). Streaming per-field-body API in the fork; Zap migrated to `ZigType` field types and routes non-primitive field types through `emitImportedTypeRef` in body context. The `Body { x :: f64, ... }` + `Bodies { sun :: Body, jupiter :: Body }` hierarchy now compiles and runs end-to-end. Verified with a `pair_dist(bs.sun, bs.jupiter) -> f64` function that crosses struct boundaries and returns a primitive.
 
-- **Blocker 2 foundation landed** (fork: `7c5d77c5e8`, Zap: `f175a43`). Adds `FieldStorage` enum on `StructFieldDef`, `zigTypeReachesStruct` walker for self-recursion detection, `indirectFieldType` rewrite (`?T` → `?*const T`, `T` → `*const T`), `emit_optional_type` and `emit_single_const_ptr_type` ZIR primitives + Zap-side `.optional` / `.ptr` cases in `emitImportedTypeRef`. The lowering machinery is correct end-to-end but **does not yet light up on real recursive types** because of a *separate* type-checker bug:
-  > When `pub struct Tree { left :: Tree | nil }` is type-checked, Tree's own name is not yet registered in the `TypeStore` when its fields are processed, so `Tree | nil` resolves as `union(unknown, nil_type)` instead of `union(struct_type Tree, nil_type)`. The storage-detection walker doesn't see a struct_ref to match against, the field stays `.direct`, and the indirect-lowering code is never invoked.
+- **Blocker 2 substantial progress** — five commits across the fork (`7c5d77c5e8`) and Zap (`f175a43`, `714554d`, `d629878`). What's working end-to-end as of this session:
+  - Storage-strategy detection (self-recursion via `zigTypeReachesStruct`).
+  - Indirect-field type lowering (`?T` → `?*const T`, `T` → `*const T`) via the streaming root-field-body API.
+  - Two-pass type-checker registration so `pub struct Tree { left :: Tree | nil }` resolves the recursive `Tree` correctly.
+  - Construction codegen: `%Tree{left: subtree}` heap-promotes the subtree value (`alloc + store + make_ptr_const`) and Zig coerces `*const Tree` to the `?*const Tree` field. `nil` short-circuits the promotion.
+  - Reading non-recursive fields of a recursive struct: `t.value` works (Zig auto-derefs through pointers transparently for direct-storage fields).
+  - Multi-clause recursive functions returning a recursive type: `make(0)` / `make(d)` building trees of arbitrary depth.
+  - Verified: `pub struct Tree { value :: i64, left :: Tree | nil, right :: Tree | nil }` plus a `make(d :: i64)` tree-builder compiles and runs end-to-end.
 
-  **The prerequisite fix** (next step for Blocker 2): two-pass struct type registration in `src/types.zig`. First pass registers every `pub struct` name with a placeholder `TypeId`; second pass resolves field types with all names visible. Once that lands, the storage-strategy machinery activates automatically.
-
-  Construction codegen, field-access auto-deref, pattern-match auto-deref, and uninhabited-recursive-type diagnostics are also still pending — each requires the type-checker fix to be testable.
+  **Still open for full binary-trees benchmark**:
+  - Pattern matching on `?Tree` (the `case t { nil -> ...; _ -> ... }` shape) currently trips Zig's `comparison of 'Tree' with null` at call sites where the source value is `Tree` and the param is `Tree | nil` — auto-coercion from `Tree` to `?Tree` at the call boundary is the missing piece.
+  - Field-access auto-deref of indirect fields (`tree.left.value` to walk through the pointer) — currently produces `?*const Tree` at the source level rather than `?Tree`.
+  - Uninhabited-recursive-type diagnostics (a struct in a recursion cycle whose every constructor requires another instance).
+  - Mutual-recursion via SCC analysis (today's walker only detects self-recursion; documented inline in `zigTypeReachesStruct`).
 
 - **Blocker 3 still open**. Loopification is the right primary path per the refined recommendations (§6.5). Implementation sketch: wrap function bodies in a ZIR `loop` block, allocate stack slots for each parameter, redirect `param_get` to slot loads, replace each `tail_call` IR instruction with slot-update + `repeat`. This bypasses LLVM `musttail` entirely so byref-shaped state runs bounded-stack. Estimated scope: 300-500 lines in `src/ir.zig` + `src/zir_builder.zig`. Not started.
 
