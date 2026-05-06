@@ -2625,7 +2625,6 @@ test "arc_liveness: Phase 5 — release filter suppresses return-source releases
     };
     defer {
         driver.arc_share_skipped.deinit(driver.allocator);
-        driver.arc_consumed_locals.deinit(driver.allocator);
         driver.arc_returned_locals.deinit(driver.allocator);
     }
 

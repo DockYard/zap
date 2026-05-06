@@ -955,8 +955,8 @@ const Pipeline = struct {
         // terminator, using the per-terminator live-before-ret sets
         // recorded by the ownership analyzer. The existing
         // `isReleaseSuppressed` filter in `ZirDriver` (consulting
-        // `arc_consumed_locals`, `arc_returned_locals`,
-        // `arc_share_skipped`) handles elision automatically at ZIR
+        // `arc_returned_locals` and `arc_share_skipped`) handles
+        // elision automatically at ZIR
         // emission time. Today's stdlib has no `.map`-flagged ARC
         // type that fires, so the pass is silent in production
         // codepaths; the infrastructure must still be correct so

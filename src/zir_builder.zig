@@ -510,13 +510,6 @@ pub const ZirDriver = struct {
     /// must skip its decrement too — emitting an unpaired release would
     /// destroy a refcount that was never bumped, causing double-free.
     arc_share_skipped: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
-    /// Locals whose `share_value` retain was skipped because the source
-    /// was at its last use (Perceus-style ownership transfer to the
-    /// callee). Their scope-exit release is also suppressed because
-    /// the callee now owns the value. Populated by `.consume`-mode
-    /// `share_value` lowering; the upstream pass that decides which
-    /// sites become `.consume` is wired in phase 4.
-    arc_consumed_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
     /// Locals that are the source of a `ret` instruction; ownership
     /// flows to the caller's return slot, so the callee's scope-exit
     /// release is suppressed. Populated by phase 5.
@@ -565,7 +558,6 @@ pub const ZirDriver = struct {
         self.param_refs.deinit(self.allocator);
         self.closure_function_map.deinit(self.allocator);
         self.arc_share_skipped.deinit(self.allocator);
-        self.arc_consumed_locals.deinit(self.allocator);
         self.arc_returned_locals.deinit(self.allocator);
         self.param_derived_closure_locals.deinit(self.allocator);
         self.capture_closure_function_map.deinit(self.allocator);
@@ -579,15 +571,6 @@ pub const ZirDriver = struct {
         self.pending_ret_ty_untracked.deinit(self.allocator);
     }
 
-    /// Mark a local whose ownership was transferred to a callee via
-    /// a `share_value(.consume)` lowering. The matching scope-exit
-    /// release for this local must be suppressed because the callee
-    /// now owns the value. Centralizing the write here keeps the
-    /// consume-mode lowering and the release-filter in lockstep.
-    pub fn markConsumed(self: *ZirDriver, local: ir.LocalId) !void {
-        try self.arc_consumed_locals.put(self.allocator, local, {});
-    }
-
     /// Mark a local whose ownership was transferred into the function's
     /// return slot. The matching scope-exit release for this local
     /// must be suppressed because the caller now owns the value.
@@ -599,18 +582,25 @@ pub const ZirDriver = struct {
     }
 
     /// True when a `.release` IR instruction targeting `local` should
-    /// be suppressed by the lowering. Three causes, all of which leave
+    /// be suppressed by the lowering. Two causes, both of which leave
     /// the value's refcount unchanged from the caller's perspective:
     ///   1. Escape analysis decided the matching `share_value` retain
     ///      was unnecessary — `arc_share_skipped`.
-    ///   2. The matching share was lowered as `.consume` because the
-    ///      source was at its last use — `arc_consumed_locals`.
-    ///   3. The local is the source of the function's `ret`, so
+    ///   2. The local is the source of the function's `ret`, so
     ///      ownership flows to the caller — `arc_returned_locals`.
-    /// Each cause is distinct; the function returns true if any apply.
+    ///
+    /// Note: `share_value(.consume)` is NOT a release-suppression
+    /// cause. Consume mode is purely an "elide the retain" optimization
+    /// for the caller-side share — it relies on the source local being
+    /// at its last use so no extra refcount bump is needed. The
+    /// post-call `.release` IR instruction targeting the per-call
+    /// shared dest local must still fire so that the cell's refcount
+    /// is decremented; the callee borrows the value but does not
+    /// consume it. Suppressing the post-call release here would leak
+    /// the cell on every consume-mode share. (See the consume-mode
+    /// branch in the share_value lowering for the full reasoning.)
     pub fn isReleaseSuppressed(self: *const ZirDriver, local: ir.LocalId) bool {
         return self.arc_share_skipped.contains(local) or
-            self.arc_consumed_locals.contains(local) or
             self.arc_returned_locals.contains(local);
     }
 
@@ -3234,7 +3224,6 @@ pub const ZirDriver = struct {
         // them here so a previous function's local id can never alias
         // into this function's release-emission filter.
         self.arc_share_skipped.clearRetainingCapacity();
-        self.arc_consumed_locals.clearRetainingCapacity();
         self.arc_returned_locals.clearRetainingCapacity();
         // Phase 4 of the k-nucleotide RSS gap implementation plan:
         // when the IR-lowering phase produced an ARC ownership table
@@ -4149,33 +4138,47 @@ pub const ZirDriver = struct {
 
                     switch (sv.mode) {
                         .consume => {
-                            // Perceus-style ownership transfer: the source
-                            // local is at its last use, so the caller has
-                            // no further need for a refcount on this value.
-                            // Emit the value-assignment (already done above
-                            // via `local_refs.put`) but skip the retain.
+                            // Perceus-style ownership-transfer optimization:
+                            // the source local is at its last use, so the
+                            // caller has no further need to bump the refcount
+                            // before passing the value into the callee. The
+                            // assign has already happened above (via
+                            // `local_refs.put`); skip the retain.
                             //
-                            // The post-call `.release` IR (emitted from
-                            // `src/ir.zig`'s call lowering) targets the
-                            // share's `dest` local (the per-call shared
-                            // slot accumulated into `shared_release_locals`),
-                            // not its `source`. The release-suppression
-                            // filter `isReleaseSuppressed(rel.value)` looks
-                            // up `rel.value`, which equals `sv.dest`. Mark
-                            // the `dest` here so the existing post-call
-                            // release is correctly elided. Source-marking
-                            // for the not-yet-emitted scope-exit drop is
-                            // added in a follow-up commit alongside the
-                            // scope-exit drop emission itself; doing both
-                            // at once would mark a local whose drop site
-                            // does not yet exist, which is a no-op today
-                            // but obscures intent.
-                            try self.markConsumed(sv.dest);
+                            // CRITICAL: consume mode does NOT suppress the
+                            // post-call `.release{value=sv.dest}`. The
+                            // callee BORROWS its argument — it does not
+                            // decrement the cell on its own. Suppressing
+                            // the post-call release would leak the cell on
+                            // every consume-mode share (this was the
+                            // root-cause bug discovered in the first
+                            // Phase 6.3 attempt: borrowing callees + the
+                            // old "skip retain AND release" semantics =
+                            // unbounded leak). The release-suppression
+                            // path is now reserved for retain-elision
+                            // causes that are symmetric: escape analysis
+                            // (no retain emitted here either) and return-
+                            // source elision (the retain-on-ret pass
+                            // skips the bump because ownership flows to
+                            // the caller's slot).
+                            //
+                            // Net effect of consume mode in the steady
+                            // state: -1 retain. Net refcount delta of
+                            // the (consume share + post-call release)
+                            // pair is -1, which exactly cancels the +1
+                            // imbalance the source local would otherwise
+                            // accumulate from the still-emitted scope-
+                            // exit release inserted by the drop-insertion
+                            // pass on its source. (Without consume, the
+                            // share-emitted retain would have produced
+                            // +1; with consume, no retain is emitted and
+                            // ownership transfers naturally.)
+                            //
                             // Emit a ZIR call to bump the runtime
-                            // `arc_consumes_total` counter. The counter
-                            // is observed at runtime via `ZAP_ARC_STATS=1`
-                            // and is the load-bearing signal that proves
-                            // consume sites fired during program execution.
+                            // `arc_consumes_total` counter. Observed at
+                            // runtime via `ZAP_ARC_STATS=1`; this is the
+                            // load-bearing signal that proves consume
+                            // sites fired during program execution.
                             const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                             if (rt_import == error_ref) return error.EmitFailed;
                             const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
@@ -8393,13 +8396,16 @@ fn findFieldDef(struct_def: ir.StructDef, name: []const u8) ?ir.StructFieldDef {
 }
 
 // ============================================================
-// Phase 3 bookkeeping tests
+// Release-suppression bookkeeping tests
 //
-// These tests pin the lifecycle and contract of the three release-
-// suppression sets (`arc_share_skipped`, `arc_consumed_locals`,
-// `arc_returned_locals`) without depending on the C-ABI ZIR-emit
-// path. Lowering-level integration is verified end-to-end once
-// phase 4 wires consume sites into the IR.
+// These tests pin the lifecycle and contract of the two release-
+// suppression sets (`arc_share_skipped`, `arc_returned_locals`)
+// without depending on the C-ABI ZIR-emit path. Consume mode is
+// NOT a release-suppression cause — see the consume-mode branch in
+// `share_value` lowering for the design rationale (callees borrow,
+// they don't consume; suppressing the post-call release would leak
+// the cell). Consume's only effect on lowering is "skip the retain
+// at the share site"; the post-call release fires normally.
 // ============================================================
 
 test "ZirDriver: release-suppression sets default to empty" {
@@ -8412,34 +8418,13 @@ test "ZirDriver: release-suppression sets default to empty" {
     };
     defer {
         driver.arc_share_skipped.deinit(driver.allocator);
-        driver.arc_consumed_locals.deinit(driver.allocator);
         driver.arc_returned_locals.deinit(driver.allocator);
     }
 
     try std.testing.expectEqual(@as(u32, 0), driver.arc_share_skipped.size);
-    try std.testing.expectEqual(@as(u32, 0), driver.arc_consumed_locals.size);
     try std.testing.expectEqual(@as(u32, 0), driver.arc_returned_locals.size);
     try std.testing.expect(!driver.isReleaseSuppressed(0));
     try std.testing.expect(!driver.isReleaseSuppressed(1234));
-}
-
-test "ZirDriver.markConsumed populates arc_consumed_locals" {
-    var driver = ZirDriver{
-        .handle = undefined,
-        .local_refs = .empty,
-        .param_refs = .empty,
-        .allocator = std.testing.allocator,
-        .program = null,
-    };
-    defer {
-        driver.arc_share_skipped.deinit(driver.allocator);
-        driver.arc_consumed_locals.deinit(driver.allocator);
-        driver.arc_returned_locals.deinit(driver.allocator);
-    }
-
-    try driver.markConsumed(42);
-    try std.testing.expect(driver.arc_consumed_locals.contains(42));
-    try std.testing.expect(!driver.arc_consumed_locals.contains(43));
 }
 
 test "ZirDriver.markReturned populates arc_returned_locals" {
@@ -8452,7 +8437,6 @@ test "ZirDriver.markReturned populates arc_returned_locals" {
     };
     defer {
         driver.arc_share_skipped.deinit(driver.allocator);
-        driver.arc_consumed_locals.deinit(driver.allocator);
         driver.arc_returned_locals.deinit(driver.allocator);
     }
 
@@ -8461,7 +8445,7 @@ test "ZirDriver.markReturned populates arc_returned_locals" {
     try std.testing.expect(!driver.arc_returned_locals.contains(8));
 }
 
-test "ZirDriver.isReleaseSuppressed reports any of the three causes" {
+test "ZirDriver.isReleaseSuppressed reports either of the two causes" {
     var driver = ZirDriver{
         .handle = undefined,
         .local_refs = .empty,
@@ -8471,17 +8455,12 @@ test "ZirDriver.isReleaseSuppressed reports any of the three causes" {
     };
     defer {
         driver.arc_share_skipped.deinit(driver.allocator);
-        driver.arc_consumed_locals.deinit(driver.allocator);
         driver.arc_returned_locals.deinit(driver.allocator);
     }
 
     // Escape-analysis cause.
     try driver.arc_share_skipped.put(driver.allocator, 100, {});
     try std.testing.expect(driver.isReleaseSuppressed(100));
-
-    // Consume cause.
-    try driver.markConsumed(101);
-    try std.testing.expect(driver.isReleaseSuppressed(101));
 
     // Return-source cause.
     try driver.markReturned(102);
@@ -8492,11 +8471,13 @@ test "ZirDriver.isReleaseSuppressed reports any of the three causes" {
 }
 
 test "ZirDriver.isReleaseSuppressed: causes are independent" {
-    // Pinning the contract that the three causes are distinct sets:
-    // a local marked as consumed must NOT trip the share-skipped
-    // check, and vice versa. The lowering must distinguish escape
-    // elision (low-level physical optimization) from semantic
-    // ownership transfer (consume / return-source).
+    // Pinning the contract that the two causes are distinct sets:
+    // a local marked as a return source must NOT trip the share-
+    // skipped check, and vice versa. Escape elision (low-level
+    // physical optimization on the dest) and return-source ownership
+    // transfer (semantic, on the source) target different IR locals
+    // in normal code; encoding them as disjoint sets keeps the
+    // diagnostic trail clean.
     var driver = ZirDriver{
         .handle = undefined,
         .local_refs = .empty,
@@ -8506,17 +8487,14 @@ test "ZirDriver.isReleaseSuppressed: causes are independent" {
     };
     defer {
         driver.arc_share_skipped.deinit(driver.allocator);
-        driver.arc_consumed_locals.deinit(driver.allocator);
         driver.arc_returned_locals.deinit(driver.allocator);
     }
 
-    try driver.markConsumed(50);
-    try std.testing.expect(driver.arc_consumed_locals.contains(50));
-    try std.testing.expect(!driver.arc_share_skipped.contains(50));
+    try driver.arc_share_skipped.put(driver.allocator, 50, {});
+    try std.testing.expect(driver.arc_share_skipped.contains(50));
     try std.testing.expect(!driver.arc_returned_locals.contains(50));
 
     try driver.markReturned(51);
     try std.testing.expect(driver.arc_returned_locals.contains(51));
-    try std.testing.expect(!driver.arc_consumed_locals.contains(51));
     try std.testing.expect(!driver.arc_share_skipped.contains(51));
 }

@@ -330,10 +330,17 @@ pub const ShareMode = enum {
     /// Pairs with a release at scope exit (unless suppressed by
     /// `arc_share_skipped` from the escape lattice).
     retain,
-    /// Caller transfers ownership. Emits assign only — no retain.
-    /// The source local is marked in `arc_consumed_locals` so its
-    /// scope-exit release is also suppressed. Net effect: zero
-    /// refcount operations, ownership moves from source to dest.
+    /// Caller relinquishes the retain bump at the share site because
+    /// the source local is at its last use. Emits assign only — no
+    /// retain. The post-call `.release{value=dest}` IR instruction
+    /// still fires: callees BORROW their arguments, they do not
+    /// internally decrement the cell. The scope-exit release on the
+    /// source local (emitted by the drop-insertion pass) is also still
+    /// emitted; it balances the original allocation rather than the
+    /// share. Net effect of consume vs retain: -1 retain on the call
+    /// path. Ownership transfers naturally because the source's last
+    /// use means no further reads accumulate retains the post-call
+    /// release would otherwise need to pair with.
     consume,
 };
 
