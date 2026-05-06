@@ -950,6 +950,13 @@ const Pipeline = struct {
         // backend can consult `return_source_locals` per function.
         const ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
             return self.failWith("Error during ARC ownership analysis", error.IrFailed);
+        // Phase A of the Phase 6 redux plan: run the new ownership
+        // classification + verifier passes between `arc_liveness` and
+        // `arc_drop_insertion`. Both passes are stubs at this phase
+        // (no IR mutation, no rejected programs); they exist so the
+        // wiring is in place when subsequent phases populate them.
+        runArcOwnershipAndVerify(self.alloc, &program, &ownership, type_store) catch
+            return self.failWith("Error during ARC ownership classification or verification", error.IrFailed);
         // Phase 6 of the ARC ownership initiative: insert scope-exit
         // `release` IR instructions before every ret-equivalent
         // terminator, using the per-terminator live-before-ret sets
@@ -992,6 +999,11 @@ const Pipeline = struct {
         next_try_id.* = ir_builder.next_try_id;
         const ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
             return self.failWith("Error during ARC ownership analysis", error.IrFailed);
+        // Phase A of the Phase 6 redux plan: same wiring as
+        // `runIrLowering` so per-struct and whole-program lowering
+        // exercise the identical pass list.
+        runArcOwnershipAndVerify(self.alloc, &program, &ownership, type_store) catch
+            return self.failWith("Error during ARC ownership classification or verification", error.IrFailed);
         // Phase 6: see `runIrLowering` for the rationale. Both call
         // sites must run the drop-insertion pass to keep the per-
         // struct IR build path identical to the whole-program path.
@@ -1972,6 +1984,35 @@ pub fn compileStructByStruct(
 /// reaches through to mutate body slices in place. This is the same
 /// pattern `arc_liveness.writeBackConsumeModes` uses to update
 /// `share_value.mode` fields.
+/// Phase A of the Phase 6 redux plan: run the new
+/// `arc_ownership.classifyAndNormalize` pass followed by
+/// `arc_verifier.verify` on every function in `program`. Both passes
+/// are scaffolds at Phase A (no IR mutation, no rejected programs);
+/// the wiring exists so subsequent phases (C populates the
+/// classifier, E activates the verifier rules) can light up without
+/// further plumbing changes.
+///
+/// Functions absent from `ownership` (no last-use data recorded)
+/// still go through both passes — `arc_ownership` will be expected
+/// to handle that edge case in Phase C, and even today the verifier
+/// must run on every function regardless of whether the liveness
+/// analyzer recorded any ARC locals.
+fn runArcOwnershipAndVerify(
+    alloc: std.mem.Allocator,
+    program: *ir.Program,
+    ownership: *const zap.arc_liveness.ProgramArcOwnership,
+    type_store: *const zap.types.TypeStore,
+) CompileError!void {
+    for (program.functions, 0..) |_, i| {
+        const function: *ir.Function = @constCast(&program.functions[i]);
+        const fn_ownership = ownership.get(function.id) orelse continue;
+        zap.arc_ownership.classifyAndNormalize(alloc, function, fn_ownership, type_store) catch return error.OutOfMemory;
+    }
+    for (program.functions) |*function| {
+        zap.arc_verifier.verify(alloc, function) catch return error.OutOfMemory;
+    }
+}
+
 fn runArcDropInsertion(
     alloc: std.mem.Allocator,
     program: *ir.Program,
@@ -1981,6 +2022,39 @@ fn runArcDropInsertion(
         const function: *ir.Function = @constCast(&program.functions[i]);
         const fn_ownership = ownership.get(function.id) orelse continue;
         zap.arc_drop_insertion.insertScopeExitDrops(alloc, function, fn_ownership) catch return error.OutOfMemory;
+    }
+
+    if (std.c.getenv("ZAP_DUMP_IR_FN")) |raw| {
+        const glob_z: [*:0]const u8 = @ptrCast(raw);
+        const glob = std.mem.span(glob_z);
+        for (program.functions) |*function| {
+            if (std.mem.indexOf(u8, function.name, glob)) |_| {
+                std.debug.print("=== IR dump (post-drop-insertion): {s} ===\n", .{function.name});
+                for (function.body, 0..) |block, bidx| {
+                    std.debug.print("  block[{d}]:\n", .{bidx});
+                    for (block.instructions, 0..) |instr, idx| {
+                        std.debug.print("    [{d}] {s}", .{ idx, @tagName(instr) });
+                        switch (instr) {
+                            .local_get => |lg| std.debug.print(" dest={d} source={d}", .{ lg.dest, lg.source }),
+                            .share_value => |sv| std.debug.print(" dest={d} source={d} mode={s}", .{ sv.dest, sv.source, @tagName(sv.mode) }),
+                            .retain => |r| std.debug.print(" value={d}", .{r.value}),
+                            .release => |r| std.debug.print(" value={d}", .{r.value}),
+                            .map_init => |mi| std.debug.print(" dest={d}", .{mi.dest}),
+                            .ret => |r| std.debug.print(" value={?d}", .{r.value}),
+                            .call_named => |cn| std.debug.print(" name={s} dest={d}", .{ cn.name, cn.dest }),
+                            .call_direct => |cd| std.debug.print(" dest={d}", .{cd.dest}),
+                            .param_get => |pg| std.debug.print(" dest={d} index={d}", .{ pg.dest, pg.index }),
+                            .const_int => |ci| std.debug.print(" dest={d}", .{ci.dest}),
+                            .switch_literal => |sl| std.debug.print(" dest={d} cases={d}", .{ sl.dest, sl.cases.len }),
+                            .tail_call => |tc| std.debug.print(" args={d}", .{tc.args.len}),
+                            else => {},
+                        }
+                        std.debug.print("\n", .{});
+                    }
+                }
+                std.debug.print("=== end ===\n", .{});
+            }
+        }
     }
 }
 

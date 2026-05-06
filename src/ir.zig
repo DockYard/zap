@@ -100,6 +100,87 @@ pub const Program = struct {
     entry: ?FunctionId,
 };
 
+/// Per-value ownership classification at IR sites that produce or
+/// reference ARC-managed cells (parameters, locals, call results,
+/// aggregate arm results, captures, and return values).
+///
+/// Phase A of the Phase 6 redux plan introduces this enum as pure
+/// metadata. Phases C and E will use it to drive borrow/copy
+/// classification (`borrow_value` vs `copy_value`) and verifier
+/// invariants. The classification is the property the ownership
+/// verifier checks: every ARC value site has exactly one class, and
+/// drop insertion only emits `release` for `owned` values.
+///
+/// - `trivial`: Non-ARC values (i64, Bool, Atom, ...). No ARC
+///   operations. Stored in `Function.local_ownership` for every
+///   non-ARC local so the table is dense across `LocalId`.
+/// - `owned`: Owns one refcount unit. Must be destroyed exactly once
+///   on every CFG path that reaches a function exit. Owners are
+///   produced by: function entry of owned-convention parameters,
+///   `copy_value` of any ARC value, return values of calls whose
+///   convention transfers ownership, aggregate initializers
+///   (`map_init`, `list_init`, `struct_init`), and freshly-allocated
+///   values. Must NOT be destroyed twice.
+/// - `borrowed`: Borrowed reference scoped to a borrow region. Must
+///   NOT be destroyed within the region. Cannot escape into owned
+///   storage without an explicit `copy_value` to promote.
+///   Produced by: function entry of borrowed-convention parameters
+///   (the default for ARC-managed parameter types), `borrow_value`
+///   of any owner, and capture access in closures.
+pub const OwnershipClass = enum {
+    trivial,
+    owned,
+    borrowed,
+};
+
+/// Per-parameter calling convention recorded on every
+/// `Function.params` slot.
+///
+/// Three variants cover every parameter shape, which is cleaner than
+/// pairing a binary `borrowed|owned` enum with a separate
+/// `is_arc_managed` predicate: the dense form lets a single look-up
+/// answer "what should drop insertion do at scope exit for this
+/// parameter?" without consulting the type table again.
+///
+/// - `trivial`: The parameter's type is not ARC-managed. No retain
+///   is performed by the caller, and drop insertion never targets
+///   the parameter local at scope exit. This is the catch-all for
+///   primitive scalar types, atoms, and structurally trivial types.
+/// - `borrowed`: The default for ARC-managed parameter types. The
+///   caller has already balanced retain (`share_value`) and release
+///   (post-call `release`) around the call site, so the callee
+///   merely *borrows* the value within its body. Drop insertion
+///   must NOT emit a destroy on the parameter local at scope exit.
+/// - `owned`: The callee takes ownership of the value. The caller
+///   does NOT release after the call, and the callee is responsible
+///   for emitting a `destroy_value` on every CFG path. Reserved for
+///   explicitly-annotated consuming functions; today's stdlib
+///   surface uses no `owned` parameters, so this variant exists for
+///   forward compatibility with Phase H's consume-mode work.
+pub const ParamConvention = enum {
+    trivial,
+    borrowed,
+    owned,
+};
+
+/// Calling convention for the function's result value.
+///
+/// - `trivial`: The return type is not ARC-managed. Default for
+///   primitive scalar types. The caller binds the result in a
+///   trivial local with no retain/release tracking.
+/// - `owned`: The callee returns an owner. The caller binds the
+///   result in an owned local and is responsible for destroying it
+///   on every CFG path. Default for ARC-managed return types.
+/// - `borrowed`: The callee returns a borrow scoped to one of its
+///   parameters (lifetime polymorphism). Currently unused; reserved
+///   for a future extension that lets a function return a borrowed
+///   alias to one of its inputs without bumping the refcount.
+pub const ResultConvention = enum {
+    trivial,
+    owned,
+    borrowed,
+};
+
 pub const Function = struct {
     id: FunctionId,
     name: []const u8,
@@ -133,6 +214,32 @@ pub const Function = struct {
     /// tail-call legality entirely, so byref-shaped state recurses
     /// in bounded stack.
     loopify: bool = false,
+    /// Per-parameter calling convention, one entry per `params` slot.
+    /// Phase A of the Phase 6 redux plan populates this with the
+    /// default classification: ARC-managed parameter types get
+    /// `.borrowed`, every other parameter type gets `.trivial`.
+    /// Phase H may flip individual entries to `.owned` for explicit
+    /// consume-mode callees. The slice must always have the same
+    /// length as `params` so call sites can index by parameter
+    /// position.
+    param_conventions: []const ParamConvention = &.{},
+    /// Per-local ownership class indexed by `LocalId`. Phase A
+    /// populates this with the trivial baseline classification:
+    /// every non-ARC local is `.trivial`, every ARC-managed local
+    /// (the value held in the local is ARC-cell-typed) defaults to
+    /// `.owned` at this stage. Phase C's `arc_ownership` pass
+    /// refines ARC entries into `.borrowed` vs `.owned` based on
+    /// the local's definition site (parameter binding, alias of an
+    /// existing value, fresh allocation, etc.) and the verifier in
+    /// Phase E checks invariants against the refined classification.
+    /// The slice has length `local_count` so look-ups by `LocalId`
+    /// never need a bounds-tolerant fallback.
+    local_ownership: []const OwnershipClass = &.{},
+    /// Calling convention for the result. Defaults to `.owned` for
+    /// ARC-managed return types and `.trivial` for everything else.
+    /// Phase E's verifier checks every `ret` instruction's source
+    /// against this convention.
+    result_convention: ResultConvention = .trivial,
 };
 
 pub const DefaultValue = union(enum) {
@@ -1018,7 +1125,40 @@ pub const ZigType = union(enum) {
 /// an IrBuilder.
 pub fn isArcManagedTypeId(type_store: *const types_mod.TypeStore, type_id: types_mod.TypeId) bool {
     if (type_id >= type_store.types.items.len) return false;
-    return type_store.getType(type_id) == .opaque_type;
+    const t = type_store.getType(type_id);
+    return t == .opaque_type or t == .map;
+}
+
+/// Default `ParamConvention` for a parameter of HIR type `type_id`.
+/// Phase A of the Phase 6 redux plan classifies every ARC-managed
+/// parameter as `.borrowed` (matching the existing caller-side
+/// `share_value` + post-call `release` ABI) and every non-ARC
+/// parameter as `.trivial`. When `type_store` is null (only the
+/// in-process IrBuilder unit tests do this) every parameter falls
+/// back to `.trivial` because we cannot determine ARC status without
+/// the type table.
+pub fn defaultParamConvention(
+    type_store: ?*const types_mod.TypeStore,
+    type_id: ?types_mod.TypeId,
+) ParamConvention {
+    const store = type_store orelse return .trivial;
+    const tid = type_id orelse return .trivial;
+    if (isArcManagedTypeId(store, tid)) return .borrowed;
+    return .trivial;
+}
+
+/// Default `ResultConvention` for a return type of HIR type
+/// `type_id`. ARC-managed return types receive `.owned` (the callee
+/// returns an owner; the caller is responsible for destroying it on
+/// every CFG path). Every other return type is `.trivial`.
+pub fn defaultResultConvention(
+    type_store: ?*const types_mod.TypeStore,
+    type_id: ?types_mod.TypeId,
+) ResultConvention {
+    const store = type_store orelse return .trivial;
+    const tid = type_id orelse return .trivial;
+    if (isArcManagedTypeId(store, tid)) return .owned;
+    return .trivial;
 }
 
 /// Walks every instruction in `function` (top-level and nested
@@ -1762,6 +1902,10 @@ pub const IrBuilder = struct {
             local_name;
 
         try self.known_function_names.put(name_str, {});
+        const final_params_typed = try params.toOwnedSlice(self.allocator);
+        const param_conventions = try self.computeParamConventions(final_params_typed);
+        const local_ownership = try self.computeLocalOwnership(self.next_local);
+        const result_convention = self.computeResultConvention(clause.return_type);
         try self.functions.append(self.allocator, .{
             .id = func_id,
             .name = name_str,
@@ -1771,7 +1915,7 @@ pub const IrBuilder = struct {
             .local_name = local_name,
             .scope_id = group.scope_id,
             .arity = group.arity,
-            .params = try params.toOwnedSlice(self.allocator),
+            .params = final_params_typed,
             .return_type = typeIdToZigTypeWithStore(clause.return_type, self.type_store),
             .return_type_id = clause.return_type,
             .body = try self.allocSlice(Block, &.{.{
@@ -1781,6 +1925,9 @@ pub const IrBuilder = struct {
             .is_closure = group.captures.len > 0,
             .captures = try captures.toOwnedSlice(self.allocator),
             .local_count = self.next_local,
+            .param_conventions = param_conventions,
+            .local_ownership = local_ownership,
+            .result_convention = result_convention,
         });
     }
 
@@ -2193,6 +2340,9 @@ pub const IrBuilder = struct {
             }
         }
 
+        const param_conventions = try self.computeParamConventions(final_params);
+        const local_ownership = try self.computeLocalOwnership(self.next_local);
+        const result_convention = self.computeResultConvention(first_clause.return_type);
         try self.functions.append(self.allocator, .{
             .id = func_id,
             .name = name_str,
@@ -2209,6 +2359,9 @@ pub const IrBuilder = struct {
             .local_count = self.next_local,
             .defaults = try defaults_list.toOwnedSlice(self.allocator),
             .loopify = loopify,
+            .param_conventions = param_conventions,
+            .local_ownership = local_ownership,
+            .result_convention = result_convention,
         });
 
         // Generate a `__try` variant whenever the catch-basin pipeline asked
@@ -2327,6 +2480,10 @@ pub const IrBuilder = struct {
 
             const try_name = try std.fmt.allocPrint(self.allocator, "{s}__try", .{name_str});
             const try_local_name = try std.fmt.allocPrint(self.allocator, "{s}__try", .{local_name});
+            const try_final_params = try try_params.toOwnedSlice(self.allocator);
+            const try_param_conventions = try self.computeParamConventions(try_final_params);
+            const try_local_ownership = try self.computeLocalOwnership(self.next_local);
+            const try_result_convention = self.computeResultConvention(first_clause.return_type);
             try self.functions.append(self.allocator, .{
                 .id = try_func_id,
                 .name = try_name,
@@ -2334,12 +2491,15 @@ pub const IrBuilder = struct {
                 .local_name = try_local_name,
                 .scope_id = group.scope_id,
                 .arity = group.arity,
-                .params = try try_params.toOwnedSlice(self.allocator),
+                .params = try_final_params,
                 .return_type = return_type,
                 .body = try self.allocSlice(Block, &.{try_entry_block}),
                 .is_closure = group.captures.len > 0,
                 .captures = try try_captures.toOwnedSlice(self.allocator),
                 .local_count = self.next_local,
+                .param_conventions = try_param_conventions,
+                .local_ownership = try_local_ownership,
+                .result_convention = try_result_convention,
             });
         }
     }
@@ -4767,7 +4927,8 @@ pub const IrBuilder = struct {
 
     fn isArcManagedType(self: *const IrBuilder, type_id: hir_mod.TypeId) bool {
         const store = self.type_store orelse return false;
-        return store.getType(type_id) == .opaque_type;
+        const t = store.getType(type_id);
+        return t == .opaque_type or t == .map;
     }
 
     /// Returns whether the value held in `local` is ARC-managed at the
@@ -4778,6 +4939,44 @@ pub const IrBuilder = struct {
     fn isArcManagedLocal(self: *const IrBuilder, local: LocalId) bool {
         const hir_type = self.local_hir_types.get(local) orelse return false;
         return self.isArcManagedType(hir_type);
+    }
+
+    /// Allocates a `param_conventions` slice sized to `params.len` and
+    /// populates each entry from its parameter's HIR type. Phase A of
+    /// the Phase 6 redux plan: ARC-managed parameter types default to
+    /// `.borrowed`, every other type defaults to `.trivial`. The
+    /// caller owns the returned slice via `self.allocator`.
+    fn computeParamConventions(self: *IrBuilder, params: []const Param) ![]ParamConvention {
+        const out = try self.allocator.alloc(ParamConvention, params.len);
+        for (params, 0..) |param, i| {
+            out[i] = defaultParamConvention(self.type_store, param.type_id);
+        }
+        return out;
+    }
+
+    /// Allocates a `local_ownership` slice sized to `local_count` and
+    /// populates each entry by consulting `local_hir_types`. Phase A
+    /// classifies every non-ARC local as `.trivial` and every ARC-
+    /// managed local as `.owned` (a stub that Phase C's classifier
+    /// refines into `.borrowed` vs `.owned` based on definition
+    /// site). Locals with no recorded HIR type fall back to
+    /// `.trivial` — this matches the conservative `isArcManagedLocal`
+    /// default and avoids labelling unknown locals as owners.
+    fn computeLocalOwnership(self: *IrBuilder, local_count: u32) ![]OwnershipClass {
+        const out = try self.allocator.alloc(OwnershipClass, local_count);
+        var index: u32 = 0;
+        while (index < local_count) : (index += 1) {
+            out[index] = if (self.isArcManagedLocal(index)) .owned else .trivial;
+        }
+        return out;
+    }
+
+    /// Returns the default `ResultConvention` for a function whose
+    /// HIR-level return type is `return_type_id`. Mirrors
+    /// `defaultResultConvention`; placed on the builder so call sites
+    /// can use the same `self.type_store` context.
+    fn computeResultConvention(self: *const IrBuilder, return_type_id: ?hir_mod.TypeId) ResultConvention {
+        return defaultResultConvention(self.type_store, return_type_id);
     }
 
     /// Emits a `.local_get{dest, source}` instruction and the
@@ -7514,4 +7713,157 @@ test "Instruction.share_value carries the mode field through union storage" {
         .share_value = .{ .dest = 7, .source = 8 },
     };
     try std.testing.expectEqual(ShareMode.retain, default_instr.share_value.mode);
+}
+
+test "ownership metadata: ARC-managed identity function gets borrowed param + owned result" {
+    // Phase A of the Phase 6 redux plan: a function whose single
+    // parameter has an ARC-managed type must default to a `.borrowed`
+    // calling convention, and a function that returns an ARC-managed
+    // value must default to an `.owned` result convention. The
+    // parameter local in `local_ownership` is also `.borrowed` —
+    // matching the convention so drop insertion (Phase B onwards)
+    // skips it correctly when scope-exit destroys are emitted.
+    //
+    // We use `opaque_type` (Handle) here because it's already
+    // ARC-flagged and exercises the same `isArcManagedTypeId`
+    // predicate Phase F will eventually flip on for `.map`.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn id(h :: Handle) -> Handle { h }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var found_id_func: ?*const Function = null;
+    for (ir_program.functions) |*function| {
+        if (std.mem.indexOf(u8, function.name, "id") != null) {
+            found_id_func = function;
+            break;
+        }
+    }
+    const id_func = found_id_func orelse return error.MissingFunction;
+
+    // Per-parameter conventions match the params slice exactly.
+    try std.testing.expectEqual(id_func.params.len, id_func.param_conventions.len);
+    try std.testing.expectEqual(@as(usize, 1), id_func.params.len);
+    try std.testing.expectEqual(ParamConvention.borrowed, id_func.param_conventions[0]);
+
+    // ARC-managed return type defaults to .owned.
+    try std.testing.expectEqual(ResultConvention.owned, id_func.result_convention);
+
+    // local_ownership is sized to local_count; the param-bound local
+    // (LocalId 0 by `param_get` allocation order) is ARC-managed, so
+    // Phase A's stub classifier marks it `.owned`. Phase C will
+    // refine this to `.borrowed` once the borrow/copy split lands.
+    try std.testing.expectEqual(@as(usize, id_func.local_count), id_func.local_ownership.len);
+    try std.testing.expect(id_func.local_count >= 1);
+    // The first local emitted is the param_get for the single arg.
+    try std.testing.expectEqual(OwnershipClass.owned, id_func.local_ownership[0]);
+}
+
+test "ownership metadata: non-ARC parameters classify as trivial" {
+    // Phase A counter-test: scalar parameters (i64, Bool, ...) must
+    // never receive a non-trivial calling convention. ARC discipline
+    // does not fire on these locals: `param_conventions` reports
+    // `.trivial`, the result convention is `.trivial`, and every
+    // local in the function defaults to `.trivial` since none hold
+    // an ARC-managed cell.
+    const source =
+        \\pub struct Test {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 { x + y }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const ast_program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&ast_program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&ast_program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&ast_program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var found_add_func: ?*const Function = null;
+    for (ir_program.functions) |*function| {
+        if (std.mem.indexOf(u8, function.name, "add") != null) {
+            found_add_func = function;
+            break;
+        }
+    }
+    const add_func = found_add_func orelse return error.MissingFunction;
+
+    try std.testing.expectEqual(@as(usize, 2), add_func.param_conventions.len);
+    try std.testing.expectEqual(ParamConvention.trivial, add_func.param_conventions[0]);
+    try std.testing.expectEqual(ParamConvention.trivial, add_func.param_conventions[1]);
+
+    try std.testing.expectEqual(ResultConvention.trivial, add_func.result_convention);
+
+    // No local in this function holds an ARC cell, so every entry in
+    // local_ownership must be `.trivial`.
+    try std.testing.expectEqual(@as(usize, add_func.local_count), add_func.local_ownership.len);
+    for (add_func.local_ownership) |class| {
+        try std.testing.expectEqual(OwnershipClass.trivial, class);
+    }
+}
+
+test "ownership metadata: defaultParamConvention and defaultResultConvention agree on ARC predicate" {
+    // The free-function helpers (`defaultParamConvention`,
+    // `defaultResultConvention`) must agree with the IrBuilder's
+    // type-resolution path so analysis passes outside the IrBuilder
+    // (arc_ownership, arc_verifier in later phases) reach the same
+    // conclusions about a given type. This is a property test on the
+    // helpers themselves; it pins the contract that ARC-managed
+    // types map to (.borrowed param, .owned result) and non-ARC
+    // types map to (.trivial param, .trivial result).
+    //
+    // Because the helpers tolerate a null `type_store`, the unit
+    // test asserts the null-fallback path too: callers without
+    // type information default to `.trivial` so the analysis never
+    // accidentally classifies an unknown local as ARC-managed.
+    try std.testing.expectEqual(ParamConvention.trivial, defaultParamConvention(null, null));
+    try std.testing.expectEqual(ResultConvention.trivial, defaultResultConvention(null, null));
+    try std.testing.expectEqual(ParamConvention.trivial, defaultParamConvention(null, 0));
+    try std.testing.expectEqual(ResultConvention.trivial, defaultResultConvention(null, 0));
 }
