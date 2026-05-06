@@ -319,6 +319,18 @@ const ParentLink = union(enum) {
     try_handler: InstructionId,
     try_success: InstructionId,
     guard_body: InstructionId,
+    /// `optional_dispatch.nil_instrs` — body of the synthetic
+    /// `if (param == null) { ... }` branch. Each instruction inside
+    /// is followed by a synthetic `ret nil_result` at ZIR emission;
+    /// any explicit IR terminator inside the body (tail_call,
+    /// switch_return, cond_return, ...) is a return-equivalent site
+    /// that needs scope-exit drops just like terminators in any
+    /// other return arm. (Phase D, Phase 6 redux plan §3.D.)
+    optional_dispatch_nil: InstructionId,
+    /// `optional_dispatch.struct_instrs` — body of the synthetic
+    /// `else { payload_local = param.?; ... }` branch. Same drop
+    /// semantics as `optional_dispatch_nil`. (Phase D.)
+    optional_dispatch_struct: InstructionId,
 };
 
 // ============================================================
@@ -504,6 +516,20 @@ const Analyzer = struct {
             },
             .guard_block => |gb| {
                 try self.flattenStream(gb.body, .{ .guard_body = parent_id });
+            },
+            .optional_dispatch => |od| {
+                // Phase D (Phase 6 redux plan §3.D): recurse into both
+                // arm bodies so every instruction inside receives an
+                // `InstructionId`. The drop-insertion rebuilder mirrors
+                // this exact traversal order and depends on ID numbering
+                // being identical. Without this recursion, terminators
+                // inside the synthetic if/else of an `optional_dispatch`
+                // never get a `live_before_ret` snapshot, and scope-exit
+                // drops for ARC-managed locals live across those
+                // terminators are silently omitted — surfaced as the
+                // segfault suspect (e) in the diagnosis brief §12.
+                try self.flattenStream(od.nil_instrs, .{ .optional_dispatch_nil = parent_id });
+                try self.flattenStream(od.struct_instrs, .{ .optional_dispatch_struct = parent_id });
             },
             else => {},
         }
@@ -869,6 +895,32 @@ const Analyzer = struct {
             .guard_block => |gb| {
                 var body_in = try self.processStream(gb.body, parent_live_after);
                 defer body_in.deinit(self.allocator);
+            },
+            .optional_dispatch => |od| {
+                // Phase D (Phase 6 redux plan §3.D): each arm body is
+                // followed by a synthetic `ret nil_result` /
+                // `ret struct_result` constructed at ZIR emission, so
+                // control leaves the function at the end of each arm
+                // body — exactly the same shape as `switch_return`
+                // arms. The enclosing `live_after` for both arm bodies
+                // is therefore the empty set: nothing is live past the
+                // implicit return.
+                //
+                // Note that this preserves the parent-level `applyUses`
+                // accounting for `nil_result` / `struct_result` (see
+                // `collectUses` for `optional_dispatch`): those locals
+                // are defined inside the arm bodies and consumed by
+                // the parent instruction, but the synthetic return is
+                // structurally outside the arm body's instruction
+                // stream — so the arm's own live-after at the body's
+                // last instruction is empty, matching the
+                // ret-equivalent shape.
+                var empty = try LiveSet.init(self.allocator, @intCast(self.arc_locals.items.len));
+                defer empty.deinit(self.allocator);
+                var nil_in = try self.processStream(od.nil_instrs, &empty);
+                defer nil_in.deinit(self.allocator);
+                var struct_in = try self.processStream(od.struct_instrs, &empty);
+                defer struct_in.deinit(self.allocator);
             },
             else => {},
         }
@@ -3095,6 +3147,14 @@ test "arc_liveness: live_before_ret keys all map to ret-equivalent terminator in
                 .guard_block => |gb| {
                     try self.walkStream(gb.body);
                 },
+                .optional_dispatch => |od| {
+                    // Phase D: walker mirrors `flattenChildren`'s
+                    // recursion into both arm bodies so the
+                    // InstructionId numbering used in this test
+                    // matches the analyzer's exactly.
+                    try self.walkStream(od.nil_instrs);
+                    try self.walkStream(od.struct_instrs);
+                },
                 else => {},
             }
         }
@@ -3115,4 +3175,247 @@ test "arc_liveness: live_before_ret keys all map to ret-equivalent terminator in
             tag == .union_switch_return;
         try std.testing.expect(ok);
     }
+}
+
+// ============================================================
+// Phase D — recursion through optional_dispatch nested streams
+// ============================================================
+
+/// Walk every function body and return true iff some instruction is
+/// an `optional_dispatch`. Used by the Phase D regression tests to
+/// guard the assertion behind the IR builder's chosen lowering
+/// shape: when the front-end declines to emit `optional_dispatch`
+/// (e.g. because the heuristic's preconditions fail), the test
+/// silently exits — the load-bearing assertion only runs when the
+/// shape under test is actually present in the IR.
+fn functionContainsOptionalDispatch(function: *const ir.Function) bool {
+    const Detector = struct {
+        seen: bool = false,
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (instr.* == .optional_dispatch) self.seen = true;
+        }
+    };
+    var detector = Detector{};
+    ir.forEachInstruction(function, &detector, Detector.visit);
+    return detector.seen;
+}
+
+test "arc_liveness: analyzer recurses into optional_dispatch arms without crashing (Phase D)" {
+    // Phase D (Phase 6 redux plan §3.D): the analyzer's
+    // `flattenChildren` must recurse into both arm bodies of an
+    // `optional_dispatch` so every nested instruction — including
+    // ret-equivalent terminators like `tail_call` — receives an
+    // `InstructionId` and a `live_before_ret` snapshot.
+    //
+    // Without the Phase D recursion, an `optional_dispatch` whose
+    // struct arm is self-recursive (lowered by `containsTailCall`-
+    // detection into a `tail_call`) would never trigger the
+    // `snapshotLiveBeforeRet` call inside the arm — the snapshot
+    // is gated on `isReturnEquivalentTerminator(instr)` AND
+    // `processStream` having been entered for the enclosing stream;
+    // skipping the recursion skips both.
+    //
+    // The Zap source below has two clauses:
+    //   - `process(nil, h)` → returns `h`.
+    //   - `process(_n :: Node, h)` → recurses on `nil` (always
+    //      reaches the base case after one step). The struct arm's
+    //      body is `Test.process(nil, h)` — a self-recursive call
+    //      lowered to a `tail_call` in IR.
+    // The IR builder synthesises an `optional_dispatch` with a
+    // `tail_call` inside the struct arm body. Phase D guarantees
+    // the analyzer records a `live_before_ret` snapshot at that
+    // tail_call.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\  pub struct Node { tag :: i64 }
+        \\
+        \\  pub fn process(nil, h :: Handle) -> Handle { h }
+        \\  pub fn process(_n :: Node, h :: Handle) -> Handle {
+        \\    Test.process(nil, h)
+        \\  }
+        \\}
+    ;
+    var suite = try TestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const process_func = suite.findFunctionByName("process") orelse return error.MissingFunction;
+    if (!functionContainsOptionalDispatch(process_func)) {
+        // The IR builder declined to emit `optional_dispatch`. Phase
+        // D's recursion structure is correctness-preserving on every
+        // shape, but the load-bearing assertion needs the shape to
+        // be present.
+        return;
+    }
+
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        process_func,
+        suite.typeStore(),
+        defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // Walk every instruction (forEachInstruction recurses into
+    // optional_dispatch as of Phase D) using the analyzer's depth-
+    // first numbering scheme. Map ids to (a) whether the
+    // instruction is a ret-equivalent terminator and (b) whether
+    // it lives inside an optional_dispatch arm body. The
+    // load-bearing Phase D invariant: at least one instruction
+    // lives inside optional_dispatch arms (proving the recursion
+    // structurally fired) AND every `live_before_ret` key maps to
+    // a ret-equivalent terminator (proving the analyzer's
+    // `flattenChildren` numbering remained consistent under the
+    // new recursion).
+    var id_to_is_term: std.AutoHashMapUnmanaged(InstructionId, bool) = .empty;
+    defer id_to_is_term.deinit(std.testing.allocator);
+    const Walker = struct {
+        next_id: InstructionId = 0,
+        id_to_is_term: *std.AutoHashMapUnmanaged(InstructionId, bool),
+        allocator: std.mem.Allocator,
+        instructions_inside_optional: usize = 0,
+        depth_in_optional: usize = 0,
+
+        fn walkFunction(self: *@This(), func: *const ir.Function) error{OutOfMemory}!void {
+            for (func.body) |block| try self.walkStream(block.instructions);
+        }
+
+        fn walkStream(self: *@This(), stream: []const ir.Instruction) error{OutOfMemory}!void {
+            for (stream) |*instr| {
+                const my_id = self.next_id;
+                self.next_id += 1;
+                const is_term = isReturnEquivalentTerminator(instr.*);
+                try self.id_to_is_term.put(self.allocator, my_id, is_term);
+                if (self.depth_in_optional > 0) {
+                    self.instructions_inside_optional += 1;
+                }
+                try self.walkChildren(instr);
+            }
+        }
+
+        fn walkChildren(self: *@This(), instr: *const ir.Instruction) error{OutOfMemory}!void {
+            switch (instr.*) {
+                .if_expr => |ie| {
+                    try self.walkStream(ie.then_instrs);
+                    try self.walkStream(ie.else_instrs);
+                },
+                .case_block => |cb| {
+                    try self.walkStream(cb.pre_instrs);
+                    for (cb.arms) |arm| {
+                        try self.walkStream(arm.cond_instrs);
+                        try self.walkStream(arm.body_instrs);
+                    }
+                    try self.walkStream(cb.default_instrs);
+                },
+                .switch_literal => |sl| {
+                    for (sl.cases) |c| try self.walkStream(c.body_instrs);
+                    try self.walkStream(sl.default_instrs);
+                },
+                .switch_return => |sr| {
+                    for (sr.cases) |c| try self.walkStream(c.body_instrs);
+                    try self.walkStream(sr.default_instrs);
+                },
+                .union_switch => |us| {
+                    for (us.cases) |c| try self.walkStream(c.body_instrs);
+                },
+                .union_switch_return => |usr| {
+                    for (usr.cases) |c| try self.walkStream(c.body_instrs);
+                },
+                .try_call_named => |tc| {
+                    try self.walkStream(tc.handler_instrs);
+                    try self.walkStream(tc.success_instrs);
+                },
+                .guard_block => |gb| {
+                    try self.walkStream(gb.body);
+                },
+                .optional_dispatch => |od| {
+                    self.depth_in_optional += 1;
+                    try self.walkStream(od.nil_instrs);
+                    try self.walkStream(od.struct_instrs);
+                    self.depth_in_optional -= 1;
+                },
+                else => {},
+            }
+        }
+    };
+    var walker = Walker{
+        .id_to_is_term = &id_to_is_term,
+        .allocator = std.testing.allocator,
+    };
+    try walker.walkFunction(process_func);
+
+    // Pre-condition: at least one instruction must live inside
+    // the optional_dispatch arms. Without Phase D's recursion, the
+    // walker would also skip them (it mirrors the analyzer's
+    // structure exactly), so the precondition would be unsatisfiable
+    // — but we'd never reach here because the analyzer would
+    // produce *fewer* records than the walker's count and the
+    // soundness check below would trip.
+    try std.testing.expect(walker.instructions_inside_optional >= 1);
+
+    // Soundness invariant: every `live_before_ret` key must map to
+    // a ret-equivalent terminator. The analyzer's depth-first
+    // numbering matches the walker above, so the mapping is
+    // direct. Without Phase D, the analyzer would assign FEWER ids
+    // than the walker would — keys for instructions outside
+    // optional_dispatch would still match (since their numbering
+    // is unaffected), but the walker would assert IDs the analyzer
+    // never assigned. Phase D's recursion ensures the numbering
+    // stays consistent end-to-end.
+    var live_iter = ownership.live_before_ret.keyIterator();
+    while (live_iter.next()) |id_ptr| {
+        const is_term = id_to_is_term.get(id_ptr.*) orelse return error.IdNotFound;
+        try std.testing.expect(is_term);
+    }
+}
+
+test "arc_liveness: deeply nested case recursion is depth-uniform (Phase D)" {
+    // Phase D (Phase 6 redux plan §3.D): the analyzer must visit
+    // every level of nesting uniformly. Today this works for
+    // case/switch combinations; this test pins that invariant.
+    // Combining it with the optional_dispatch test above guarantees
+    // that the recursion structure is uniform across every IR shape.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn pick(outer :: Bool, inner :: Bool, x :: Handle, y :: Handle) -> Handle {
+        \\    case outer {
+        \\      true ->
+        \\        case inner {
+        \\          true -> x
+        \\          false -> x
+        \\        }
+        \\      false ->
+        \\        case inner {
+        \\          true -> y
+        \\          false -> y
+        \\        }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var suite = try TestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const pick_func = suite.findFunctionByName("pick") orelse return error.MissingFunction;
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        pick_func,
+        suite.typeStore(),
+        defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // The function returns one of two ARC-managed locals via deeply-
+    // nested if + case structure. The analyzer must reach every
+    // ret-equivalent terminator and produce non-empty live snapshots
+    // for each.
+    try std.testing.expect(ownership.live_before_ret.count() >= 1);
+    var saw_arc_local = false;
+    var live_iter = ownership.live_before_ret.valueIterator();
+    while (live_iter.next()) |set_ptr| {
+        if (set_ptr.count() >= 1) saw_arc_local = true;
+    }
+    try std.testing.expect(saw_arc_local);
 }

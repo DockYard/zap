@@ -1270,6 +1270,19 @@ fn forEachInstructionChildren(
         .guard_block => |gb| {
             forEachInstructionInStream(gb.body, context, visitFn);
         },
+        .optional_dispatch => |od| {
+            // Phase D (Phase 6 redux plan §3.D): recurse into both
+            // arm bodies so any visitor — use-summary walker, drop
+            // counter, verifier, IR dumper — sees every instruction
+            // regardless of nesting. The arc-liveness analyzer and
+            // arc-drop-insertion rebuilder use a separate region-tree
+            // walk with their own InstructionId assignment, so this
+            // helper's traversal order is orthogonal to theirs; it
+            // is only required to be consistent (which it is — nil
+            // first, then struct, mirroring the structural shape).
+            forEachInstructionInStream(od.nil_instrs, context, visitFn);
+            forEachInstructionInStream(od.struct_instrs, context, visitFn);
+        },
         else => {},
     }
 }

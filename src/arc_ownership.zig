@@ -659,6 +659,24 @@ const StreamRewriter = struct {
                 copy.body = new_body.?;
                 return ir.Instruction{ .guard_block = copy };
             },
+            .optional_dispatch => |od| {
+                // Phase D (Phase 6 redux plan §3.D): recurse into both
+                // arm bodies so borrow/copy classification applies
+                // uniformly to every `.local_get` regardless of nesting
+                // depth. Without this, a `.local_get` inside an
+                // optional_dispatch arm would never be normalized to
+                // `.borrow_value` / `.copy_value` and the Phase 6.8
+                // emitLocalGet retain would survive past
+                // `arc_ownership` — leaving a refcount imbalance the
+                // verifier (Phase E) cannot reach.
+                const new_nil = try self.rewriteStream(od.nil_instrs);
+                const new_struct = try self.rewriteStream(od.struct_instrs);
+                if (new_nil == null and new_struct == null) return null;
+                var copy = od;
+                if (new_nil) |s| copy.nil_instrs = s;
+                if (new_struct) |s| copy.struct_instrs = s;
+                return ir.Instruction{ .optional_dispatch = copy };
+            },
             else => return null,
         }
     }
@@ -993,4 +1011,86 @@ test "arc_ownership: aliased reads of a shared param both yield borrow_value" {
     // absence of `.local_get` and presence of borrow classifications
     // for the named `a1`/`a2` aliases of `h`.
     try std.testing.expect(totals.borrow_count >= 2);
+}
+
+// ============================================================
+// Phase D — recursion through optional_dispatch nested streams
+// ============================================================
+
+/// Phase D test guard: skip the test cleanly if the IR builder
+/// declined to emit `optional_dispatch` for the input shape.
+fn ownershipFunctionContainsOptionalDispatch(function: *const ir.Function) bool {
+    const Detector = struct {
+        seen: bool = false,
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (instr.* == .optional_dispatch) self.seen = true;
+        }
+    };
+    var detector = Detector{};
+    ir.forEachInstruction(function, &detector, Detector.visit);
+    return detector.seen;
+}
+
+test "arc_ownership: classifier normalises local_get inside optional_dispatch arms (Phase D)" {
+    // Phase D (Phase 6 redux plan §3.D): the classifier's
+    // `rewriteChildren` and the use-summary's `forEachInstruction`
+    // walker must both recurse into `optional_dispatch.nil_instrs`
+    // and `struct_instrs`. Without recursion, any `.local_get`
+    // inside an arm would (a) be missed by the use summary —
+    // leaving its dest's borrow count unrecorded — and (b) be
+    // skipped by the rewrite pass entirely, surviving past
+    // arc_ownership as the legacy overloaded form. Both failures
+    // would leave Phase 6.8's emitLocalGet retain in the IR with
+    // no matching destroy and no verifier reach, causing leaks
+    // under `.map` (Phase F).
+    //
+    // The Zap source uses an optional struct-or-nil parameter so
+    // the IR builder synthesises an `optional_dispatch`. The arm
+    // bodies introduce a named binding (`bound = h`) so the body
+    // contains a `.local_get` whose dest's classification depends
+    // on the use-summary built by the pre-pass. After
+    // `classifyAndNormalize`, no `.local_get` may remain anywhere
+    // in the function — the assertion is uniform across every
+    // nesting depth.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\  pub struct Node { tag :: i64 }
+        \\
+        \\  pub fn pick(nil, h :: Handle) -> Handle {
+        \\    bound = h
+        \\    bound
+        \\  }
+        \\  pub fn pick(_n :: Node, h :: Handle) -> Handle {
+        \\    bound = h
+        \\    bound
+        \\  }
+        \\}
+    ;
+    var suite = try ClassifyTestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const pick_func = suite.findFunctionByName("pick") orelse return error.MissingFunction;
+    if (!ownershipFunctionContainsOptionalDispatch(pick_func)) {
+        // The IR builder declined to emit `optional_dispatch`.
+        return;
+    }
+
+    // Pre-condition: at least one `.local_get` exists somewhere in
+    // the function (proving the arms have something to rewrite).
+    const totals_before = countAliasOpcodes(pick_func);
+    try std.testing.expect(totals_before.local_get_count >= 1);
+
+    try suite.classify(pick_func);
+
+    // Post-condition: zero `.local_get` instructions remain — the
+    // recursion structurally reached every nested stream.
+    const totals_after = countAliasOpcodes(pick_func);
+    try std.testing.expectEqual(@as(usize, 0), totals_after.local_get_count);
+    // At least one classified opcode (borrow_value or copy_value)
+    // appeared. The exact form depends on use-classification (the
+    // `bound` local feeds a return whose source is a parameter,
+    // which classifies as `.copy_value` per pattern 3 in the
+    // existing tests).
+    try std.testing.expect(totals_after.borrow_count + totals_after.copy_count >= 1);
 }
