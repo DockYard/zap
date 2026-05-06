@@ -222,6 +222,145 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
     };
 }
 
+const EnvEntry = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// Compile a Zap source string and run the resulting binary with extra
+/// environment variables layered on top of the parent's environment.
+/// Used by Phase 4 ARC ownership tests that observe `ZAP_ARC_STATS=1`
+/// counter dumps emitted on stderr by the runtime atexit hook.
+fn compileAndRunWithEnv(source: []const u8, extra_env: []const EnvEntry) TestError!TestResult {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
+
+    const build_source =
+        \\pub struct TestProg.Builder {
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
+        \\    case env.target {
+        \\      :test_prog ->
+        \\        %Zap.Manifest{
+        \\          name: "test_prog",
+        \\          version: "0.1.0",
+        \\          kind: :bin,
+        \\          root: "TestProg.main/0",
+        \\          paths: ["lib/**/*.zap"]
+        \\        }
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch
+        return error.Unexpected;
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/test_prog.zap", .data = source }) catch
+        return error.Unexpected;
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const zap_binary_raw: []const u8 = getenvSlice("ZAP_BINARY") orelse "zig-out/bin/zap";
+
+    const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
+        allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
+    else
+        std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
+    defer allocator.free(zap_binary);
+
+    const compile_argv: []const []const u8 = &.{ zap_binary, "build", "test_prog" };
+    var compile_child = std.process.spawn(getTestIo(), .{
+        .argv = compile_argv,
+        .cwd = .{ .path = tmp_dir_path },
+        .stderr = .inherit,
+        .stdout = .inherit,
+    }) catch return error.CompilationFailed;
+    const compile_term = compile_child.wait(getTestIo()) catch return error.CompilationFailed;
+
+    const compile_exit = switch (compile_term) {
+        .exited => |code| code,
+        else => return error.CompilationFailed,
+    };
+
+    if (compile_exit != 0) {
+        std.debug.print("\n=== COMPILATION FAILED (exit {d}) ===\n", .{compile_exit});
+        return error.CompilationFailed;
+    }
+
+    const compiled_binary = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out/bin/test_prog", allocator) catch {
+        std.debug.print("\n=== COMPILED BINARY NOT FOUND ===\n", .{});
+        return error.CompilationFailed;
+    };
+    defer allocator.free(compiled_binary);
+
+    // Build a child environment by cloning the parent's and overlaying
+    // every extra entry. The clone is necessary because std.process.run
+    // accepts `?*const Environ.Map`, and each test owns its own env map
+    // so concurrent tests don't race on a shared mutation. The
+    // testing harness exposes `std.testing.environ` as the parent's
+    // process environment view; `createMap` materialises it into a
+    // mutable map that the test owns.
+    var env_map = std.testing.environ.createMap(allocator) catch return error.Unexpected;
+    defer env_map.deinit();
+    for (extra_env) |entry| {
+        env_map.put(entry.name, entry.value) catch return error.OutOfMemory;
+    }
+
+    const run_result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{compiled_binary},
+        .environ_map = &env_map,
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch return error.RunFailed;
+
+    const run_exit = switch (run_result.term) {
+        .exited => |code| code,
+        else => {
+            allocator.free(run_result.stdout);
+            allocator.free(run_result.stderr);
+            return error.RunFailed;
+        },
+    };
+
+    const output_dir = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out", allocator) catch null;
+
+    return .{
+        .stdout = run_result.stdout,
+        .stderr = run_result.stderr,
+        .exit_code = run_exit,
+        .allocator = allocator,
+        .output_dir = output_dir,
+    };
+}
+
+/// Parse a single `[zap-arc-stats] ... key=value ...` line emitted by
+/// `runtime.dumpArcStats`, returning the integer value associated with
+/// `key`. Returns null when the key is not present in `stderr_dump`.
+fn parseArcStatCounter(stderr_dump: []const u8, key: []const u8) ?u64 {
+    // The dump format is documented in `src/runtime.zig:dumpArcStats`.
+    // Each counter line begins with `[zap-arc-stats] ` and lists global
+    // counters as space-separated `name=number` pairs.
+    var line_iter = std.mem.splitScalar(u8, stderr_dump, '\n');
+    while (line_iter.next()) |line| {
+        if (std.mem.indexOf(u8, line, "[zap-arc-stats]") == null) continue;
+        var token_iter = std.mem.splitScalar(u8, line, ' ');
+        while (token_iter.next()) |token| {
+            const eq_idx = std.mem.indexOfScalar(u8, token, '=') orelse continue;
+            if (!std.mem.eql(u8, token[0..eq_idx], key)) continue;
+            const value_str = token[eq_idx + 1 ..];
+            return std.fmt.parseInt(u64, value_str, 10) catch return null;
+        }
+    }
+    return null;
+}
+
 const ExtraFile = struct {
     path: []const u8,
     data: []const u8,
@@ -2925,3 +3064,88 @@ test "ZIR: persistent-map tail loop microbench (Phase 1 RSS reproducer)" {
     try std.testing.expectEqualStrings("500\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
+
+// ----------------------------------------------------------------
+// Phase 4: ARC ownership pass wired to share_value mode write-back.
+// ----------------------------------------------------------------
+
+// Phase 4 baseline: the Phase 1 persistent-Map microbench must still
+// produce the same lookup result and exit code after the ARC ownership
+// write-back wire-up. `.map` is not yet flagged as ARC-managed (Phase 6
+// flips the flag), so the analysis records no ARC locals on this
+// program and the ZIR backend emits identical instructions to before
+// Phase 4. The byte-exact regression test catches accidental write-back
+// reaching Map locals before Phase 6 is intentionally enabled.
+test "ZIR: Phase 4 Map microbench regression baseline" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn loop(m :: %{i64 => i64}, i :: i64, n :: i64) -> %{i64 => i64} {
+        \\    if i >= n {
+        \\      m
+        \\    } else {
+        \\      next = Map.put(m, i, i)
+        \\      TestProg.loop(next, i + (1 :: i64), n)
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    seed = %{-1 :: i64 => 0 :: i64}
+        \\    cleared = Map.delete(seed, -1 :: i64)
+        \\    result = TestProg.loop(cleared, 0 :: i64, 1000 :: i64)
+        \\    Kernel.inspect(Map.get(result, 500 :: i64, -1 :: i64))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("500\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// Phase 4 byte-exact regression: a Map-based tail-recursive workload
+// must produce the same output after the ownership pass upgrades
+// `share_value` instructions to `.consume`. The pass is currently a
+// no-op for `.map` (Phase 6 flips that flag), but the regression
+// guards against the pass mistakenly mutating Map locals or otherwise
+// breaking any code path the existing benchmarks exercise. Pairs the
+// counter dump with `ZAP_ARC_STATS=1` so a future regression that
+// silently inflates retain/release traffic is observable through the
+// stderr dump.
+test "ZIR: Phase 4 Map workload byte-exact with retain/release balance check" {
+    var result = try compileAndRunWithEnv(
+        \\pub struct TestProg {
+        \\  pub fn loop(m :: %{i64 => i64}, i :: i64, n :: i64) -> %{i64 => i64} {
+        \\    if i >= n {
+        \\      m
+        \\    } else {
+        \\      next = Map.put(m, i, i)
+        \\      TestProg.loop(next, i + (1 :: i64), n)
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    seed = %{-1 :: i64 => 0 :: i64}
+        \\    cleared = Map.delete(seed, -1 :: i64)
+        \\    result = TestProg.loop(cleared, 0 :: i64, 100 :: i64)
+        \\    Kernel.inspect(Map.get(result, 50 :: i64, -1 :: i64))
+        \\    "done"
+        \\  }
+        \\}
+    ,
+        &.{.{ .name = "ZAP_ARC_STATS", .value = "1" }},
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("50\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    // `.map` is not yet ARC-managed, so consumes_total stays at 0.
+    // The consume-side wire-up is exercised by `arc_liveness.zig`'s
+    // unit tests; this integration test guards the byte-exact
+    // contract Phase 4 must preserve.
+    const consumes_total = parseArcStatCounter(result.stderr, "consumes_total") orelse return error.RunFailed;
+    try std.testing.expectEqual(@as(u64, 0), consumes_total);
+    // Soundness: the runtime never releases more than it retains.
+    const retains = parseArcStatCounter(result.stderr, "retains_total") orelse return error.RunFailed;
+    const releases = parseArcStatCounter(result.stderr, "releases_total") orelse return error.RunFailed;
+    try std.testing.expect(retains >= releases);
+}
+

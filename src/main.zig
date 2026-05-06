@@ -1162,6 +1162,7 @@ fn buildTarget(
         .optimize_mode = optimize_mode,
         .target = compile_target,
         .analysis_context = if (result.analysis_context) |*ctx| ctx else null,
+        .arc_ownership = if (result.arc_ownership) |*ownership| ownership else null,
         // Zig 0.16 error formatting options from manifest
         .error_style = config.error_style,
         .multiline_errors = config.multiline_errors,
@@ -1658,6 +1659,7 @@ const IncrementalWatchState = struct {
             .optimize_mode = self.optimize_mode,
             .link_libc = self.link_libc,
             .analysis_context = if (result.analysis_context) |*ctx| ctx else null,
+            .arc_ownership = if (result.arc_ownership) |*ownership| ownership else null,
         }) catch return error.BackendError;
 
         self.baseline_established = true;

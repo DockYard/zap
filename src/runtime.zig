@@ -439,7 +439,15 @@ pub const ArcRuntime = struct {
     /// extern function call per consume; consume mode still saves the
     /// far more expensive retain/release pair, so net effect is a
     /// reduction in ARC traffic.
+    ///
+    /// Also ensures the `ZAP_ARC_STATS=1` atexit hook is registered so
+    /// programs whose ARC-managed types use bump allocation (e.g.
+    /// `List`) — and therefore never run the per-pool atexit-registration
+    /// path — still emit the counter dump on exit when the env var is
+    /// set. The `ensureArcStatsAtexit` guard is idempotent so the cost
+    /// is one boolean compare-branch on every consume after the first.
     pub fn noteConsume() void {
+        ensureArcStatsAtexit();
         arc_consumes_total += 1;
     }
 

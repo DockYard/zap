@@ -68,6 +68,13 @@ fn profilingEnabled() bool {
 pub const CompileResult = struct {
     ir_program: ir.Program,
     analysis_context: ?zap.escape_lattice.AnalysisContext = null,
+    /// Per-function ARC ownership tables computed during IR lowering
+    /// (Phase 4 of the k-nucleotide RSS gap implementation plan). The
+    /// table is consumed by the ZIR backend so per-function lowering
+    /// can populate `arc_returned_locals` from each function's
+    /// `return_source_locals` set without re-running the analysis.
+    /// Empty when the IR program contains no ARC-managed locals.
+    arc_ownership: ?zap.arc_liveness.ProgramArcOwnership = null,
 };
 
 pub const CompileError = error{
@@ -631,7 +638,8 @@ pub fn compileForCtfe(
     const hir_result = try pipeline.runHirBuild(&desugared, type_checker.store, 0);
     var mono_next = hir_result.next_group_id;
     const mono_program = try pipeline.runMonomorphize(&hir_result.program, type_checker.store, &mono_next);
-    var ir_program = try pipeline.runIrLowering(&mono_program, type_checker.store);
+    const ir_lowering_result = try pipeline.runIrLowering(&mono_program, type_checker.store);
+    var ir_program = ir_lowering_result.program;
 
     pipeline.runCtfeAttributes(&ir_program, options.struct_order);
 
@@ -659,7 +667,11 @@ pub fn compileForCtfe(
 
     pipeline.clearProgress();
 
-    return .{ .ir_program = ir_program, .analysis_context = analysis_result.context };
+    return .{
+        .ir_program = ir_program,
+        .analysis_context = analysis_result.context,
+        .arc_ownership = ir_lowering_result.arc_ownership,
+    };
 }
 
 // ============================================================
@@ -911,11 +923,19 @@ const Pipeline = struct {
         return result.program;
     }
 
+    /// Result of an IR-lowering phase: the lowered IR program plus the
+    /// ARC-ownership side table that Phase 4 of the k-nucleotide RSS
+    /// gap implementation plan computes during the same phase.
+    pub const IrLoweringResult = struct {
+        program: ir.Program,
+        arc_ownership: zap.arc_liveness.ProgramArcOwnership,
+    };
+
     fn runIrLowering(
         self: *Pipeline,
         hir_program: *const zap.hir.Program,
         type_store: *zap.types.TypeStore,
-    ) CompileError!ir.Program {
+    ) CompileError!IrLoweringResult {
         self.progress("IR");
         var ir_builder = zap.ir.IrBuilder.init(self.alloc, &self.ctx.interner);
         ir_builder.type_store = type_store;
@@ -923,13 +943,14 @@ const Pipeline = struct {
         defer ir_builder.deinit();
         const program = ir_builder.buildProgram(hir_program) catch
             return self.failWith("Error during IR lowering", error.IrFailed);
-        // Phase 2 of the ARC ownership initiative: run the
-        // last-use analysis on every function so it gets exercised
-        // during normal compilation. Output is observed (deinit'd
-        // immediately) — Phase 4 wires the consume side-table.
-        zap.arc_liveness.runProgramArcLiveness(self.alloc, &program, type_store) catch
+        // Phase 4 of the ARC ownership initiative: compute the
+        // last-use ownership pass and write back consume modes onto
+        // every share_value instruction whose ID is a consume site.
+        // The returned table is threaded downstream so the ZIR
+        // backend can consult `return_source_locals` per function.
+        const ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
             return self.failWith("Error during ARC ownership analysis", error.IrFailed);
-        return program;
+        return .{ .program = program, .arc_ownership = ownership };
     }
 
     /// Per-struct IR build variant that threads a globally-unique
@@ -945,7 +966,7 @@ const Pipeline = struct {
         type_store: *zap.types.TypeStore,
         next_try_id: *u32,
         known_name_program: ?*const zap.hir.Program,
-    ) CompileError!ir.Program {
+    ) CompileError!IrLoweringResult {
         self.progress("IR");
         var ir_builder = zap.ir.IrBuilder.init(self.alloc, &self.ctx.interner);
         ir_builder.type_store = type_store;
@@ -956,9 +977,9 @@ const Pipeline = struct {
         const program = ir_builder.buildProgram(hir_program) catch
             return self.failWith("Error during IR lowering", error.IrFailed);
         next_try_id.* = ir_builder.next_try_id;
-        zap.arc_liveness.runProgramArcLiveness(self.alloc, &program, type_store) catch
+        const ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
             return self.failWith("Error during ARC ownership analysis", error.IrFailed);
-        return program;
+        return .{ .program = program, .arc_ownership = ownership };
     }
 
     /// CTFE attribute evaluation across the whole IR program. When a
@@ -1067,7 +1088,11 @@ fn compileSingleStructHir(
 /// Lower a monomorphized HIR program to IR, then evaluate computed
 /// attributes for the struct so downstream structs can read the
 /// resolved values. Per-struct half of the IR-lowering loop in
-/// `compileStructByStruct`.
+/// `compileStructByStruct`. Returns both the lowered IR and the
+/// per-function ARC ownership table the IR-lowering phase produced
+/// (Phase 4 of the k-nucleotide RSS gap implementation plan); the
+/// caller merges the per-struct ownership tables into a program-wide
+/// table that downstream phases consume.
 fn compileHirToIr(
     alloc: std.mem.Allocator,
     ctx: *CompilationContext,
@@ -1077,12 +1102,12 @@ fn compileHirToIr(
     options: CompileOptions,
     next_try_id: *u32,
     known_name_program: ?*const zap.hir.Program,
-) CompileError!ir.Program {
+) CompileError!Pipeline.IrLoweringResult {
     var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
     pipeline.defer_render = true;
-    var mod_ir = try pipeline.runIrLoweringWithTryIdSeed(hir_program, type_store, next_try_id, known_name_program);
-    pipeline.runCtfeAttributesForStruct(mod_name, &mod_ir);
-    return mod_ir;
+    var mod_ir_result = try pipeline.runIrLoweringWithTryIdSeed(hir_program, type_store, next_try_id, known_name_program);
+    pipeline.runCtfeAttributesForStruct(mod_name, &mod_ir_result.program);
+    return mod_ir_result;
 }
 
 fn legacyMacroExpandAndDesugar(
@@ -1830,6 +1855,13 @@ pub fn compileStructByStruct(
     // synthesized `__try` variants get globally unique IDs that don't
     // collide with another struct's regular HIR groups.
     var next_try_id: u32 = mono_next;
+    // Merged ARC ownership table aggregated across every per-struct
+    // IR-lowering call. Each per-struct call returns its own
+    // `ProgramArcOwnership`; we move the entries into this combined
+    // map so downstream phases can look up any function by id without
+    // tracking which struct it came from.
+    var combined_arc_ownership = zap.arc_liveness.ProgramArcOwnership.init(alloc);
+    errdefer combined_arc_ownership.deinit();
     for (combined_hir.structs) |mod| {
         const single_mod_hir = zap.hir.Program{
             .structs = try alloc.dupe(zap.hir.Struct, &.{mod}),
@@ -1837,9 +1869,11 @@ pub fn compileStructByStruct(
         };
         const mod_name_str = if (mod.name.parts.len > 0) ctx.interner.get(mod.name.parts[mod.name.parts.len - 1]) else "unknown";
         per_struct_timer.reset();
-        const mod_ir = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options, &next_try_id, &combined_hir) catch {
+        const mod_lower = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options, &next_try_id, &combined_hir) catch {
             continue;
         };
+        const mod_ir = mod_lower.program;
+        try mergeArcOwnership(alloc, &combined_arc_ownership, mod_lower.arc_ownership);
         const ir_elapsed_ms = per_struct_timer.readMs();
         if (profilingEnabled() and ir_elapsed_ms >= 100) {
             std.debug.print("\n[stage IR struct={s}] ms={d}\n", .{ mod_name_str, ir_elapsed_ms });
@@ -1858,7 +1892,9 @@ pub fn compileStructByStruct(
             .top_functions = combined_hir.top_functions,
             .impls = combined_hir.impls,
         };
-        const mod_ir = compileHirToIr(alloc, ctx, "top", &top_hir, shared_store, options, &next_try_id, &combined_hir) catch return error.IrFailed;
+        const mod_lower = compileHirToIr(alloc, ctx, "top", &top_hir, shared_store, options, &next_try_id, &combined_hir) catch return error.IrFailed;
+        const mod_ir = mod_lower.program;
+        try mergeArcOwnership(alloc, &combined_arc_ownership, mod_lower.arc_ownership);
         for (mod_ir.functions) |func| {
             all_functions.append(alloc, func) catch return error.OutOfMemory;
         }
@@ -1896,7 +1932,32 @@ pub fn compileStructByStruct(
         emitContextDiagnostics(ctx, alloc);
     }
 
-    return .{ .ir_program = merged_ir, .analysis_context = analysis_result.context };
+    return .{
+        .ir_program = merged_ir,
+        .analysis_context = analysis_result.context,
+        .arc_ownership = combined_arc_ownership,
+    };
+}
+
+/// Move every per-function entry from `source` into `target` so the
+/// per-struct ARC ownership tables coalesce into one program-wide
+/// table. `source` is consumed: its hash-map storage is freed once
+/// every entry has been transferred. The inner `ArcOwnership` values
+/// keep their original allocator-owned hash-map allocations; only the
+/// outer `by_function` map's storage is dropped.
+fn mergeArcOwnership(
+    alloc: std.mem.Allocator,
+    target: *zap.arc_liveness.ProgramArcOwnership,
+    source: zap.arc_liveness.ProgramArcOwnership,
+) CompileError!void {
+    var src = source;
+    var it = src.by_function.iterator();
+    while (it.next()) |entry| {
+        target.by_function.put(alloc, entry.key_ptr.*, entry.value_ptr.*) catch return error.OutOfMemory;
+    }
+    target.consumes_marked += src.consumes_marked;
+    target.return_sources_recorded += src.return_sources_recorded;
+    src.by_function.deinit(src.allocator);
 }
 
 /// Extract a single-struct ast.Program from the merged program.

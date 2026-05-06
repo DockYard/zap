@@ -462,6 +462,15 @@ pub const ZirDriver = struct {
     skip_next_ret_local: ?ir.LocalId = null,
     /// Analysis results from the escape/region/ARC pipeline.
     analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext = null,
+    /// Per-function ARC ownership tables produced by Phase 4 of the
+    /// k-nucleotide RSS gap implementation plan. Each entry maps a
+    /// `FunctionId` to the function's `ArcOwnership` table; lookup
+    /// happens during `begin_function` so that the function's
+    /// `return_source_locals` can be replayed into
+    /// `arc_returned_locals`. The table itself is owned by the caller
+    /// of `buildAndInject` (the compiler pipeline) — the driver only
+    /// borrows it.
+    arc_ownership: ?*const @import("arc_liveness.zig").ProgramArcOwnership = null,
     reuse_backed_struct_locals: std.AutoHashMapUnmanaged(ir.LocalId, []const u8) = .empty,
     reuse_backed_union_locals: std.AutoHashMapUnmanaged(ir.LocalId, ir.UnionInit) = .empty,
     reuse_backed_tuple_locals: std.AutoHashMapUnmanaged(ir.LocalId, usize) = .empty,
@@ -3227,6 +3236,23 @@ pub const ZirDriver = struct {
         self.arc_share_skipped.clearRetainingCapacity();
         self.arc_consumed_locals.clearRetainingCapacity();
         self.arc_returned_locals.clearRetainingCapacity();
+        // Phase 4 of the k-nucleotide RSS gap implementation plan:
+        // when the IR-lowering phase produced an ARC ownership table
+        // for this function, replay its `return_source_locals` into
+        // `arc_returned_locals` here so the existing
+        // `isReleaseSuppressed` filter elides the scope-exit release
+        // for any local whose ownership flowed into the function's
+        // return slot. The set is part of the per-function arc
+        // bookkeeping cleared immediately above, so there is no
+        // chance of cross-function bleed.
+        if (self.arc_ownership) |ownership| {
+            if (ownership.get(func.id)) |fn_ownership| {
+                var ret_it = fn_ownership.return_source_locals.keyIterator();
+                while (ret_it.next()) |local_id_ptr| {
+                    try self.markReturned(local_id_ptr.*);
+                }
+            }
+        }
         self.cached_list_cell_ref = 0;
         self.cached_list_gethead_ref = 0;
         self.cached_list_gettail_ref = 0;
@@ -8138,6 +8164,7 @@ pub fn buildAndInject(
     lib_mode: bool,
     builder_entry: ?[]const u8,
     analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext,
+    arc_ownership: ?*const @import("arc_liveness.zig").ProgramArcOwnership,
 ) BuildError!void {
     // Register the runtime struct if a path was provided.
     if (runtime_path) |rpath| {
@@ -8150,6 +8177,7 @@ pub fn buildAndInject(
     driver.lib_mode = lib_mode;
     driver.builder_entry = builder_entry;
     driver.analysis_context = analysis_context;
+    driver.arc_ownership = arc_ownership;
     driver.compilation_ctx = compilation_ctx;
 
     driver.buildProgram(program) catch |err| {

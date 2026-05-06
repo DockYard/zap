@@ -116,6 +116,13 @@ pub const CompileOptions = struct {
     target: ?[]const u8 = null,
     /// Analysis results from the escape/region/ARC pipeline.
     analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext = null,
+    /// Per-function ARC ownership tables produced by Phase 4 of the
+    /// k-nucleotide RSS gap implementation plan. The ZIR backend
+    /// reads each function's `return_source_locals` so it can mark
+    /// those locals in `arc_returned_locals` when lowering the
+    /// matching `share_value`/`ret` pair, suppressing the function's
+    /// scope-exit release on the returned local.
+    arc_ownership: ?*const @import("arc_liveness.zig").ProgramArcOwnership = null,
 };
 
 /// Create a ZirContext compilation context from the given options.
@@ -176,7 +183,7 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
 pub fn injectAndUpdate(allocator: std.mem.Allocator, program: ir.Program, ctx: *ZirContext, options: CompileOptions) CompileError!void {
     // Build ZIR via C-ABI calls and inject into compilation.
     const lib_mode = options.output_mode == 1;
-    try zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode, options.builder_entry, options.analysis_context);
+    try zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode, options.builder_entry, options.analysis_context, options.arc_ownership);
 
     // Run Sema + codegen + link.
     if (zir_compilation_update(ctx) != 0) {

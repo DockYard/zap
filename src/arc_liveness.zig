@@ -954,6 +954,302 @@ pub fn runProgramArcLiveness(
 }
 
 // ============================================================
+// Phase 4: per-program ownership orchestration + IR write-back.
+// ============================================================
+
+/// Side table keyed by `FunctionId` carrying the `ArcOwnership` that
+/// `computeArcOwnership` produced for every function. Phase 4 populates
+/// this map immediately after monomorphization; the same map is then
+/// threaded through to `ZirDriver` so per-function lowering can read
+/// `return_source_locals` (Phase 5) without re-running the analysis.
+///
+/// The map owns the inner `ArcOwnership` value and is responsible for
+/// freeing every entry's nested `AutoHashMapUnmanaged` storage.
+pub const ProgramArcOwnership = struct {
+    allocator: std.mem.Allocator,
+    by_function: std.AutoHashMapUnmanaged(ir.FunctionId, ArcOwnership) = .empty,
+
+    /// Cumulative number of `share_value` instructions whose mode was
+    /// upgraded from `.retain` to `.consume` during write-back.
+    /// Diagnostic only; consumed by tests that want to confirm the
+    /// write-back fired without observing the runtime counter.
+    consumes_marked: u64 = 0,
+
+    /// Cumulative number of locals classified as the immediate source
+    /// of a `ret` instruction across the whole program. Diagnostic
+    /// only; mirrors `consumes_marked` for the return-elision side.
+    return_sources_recorded: u64 = 0,
+
+    pub fn init(allocator: std.mem.Allocator) ProgramArcOwnership {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *ProgramArcOwnership) void {
+        var it = self.by_function.valueIterator();
+        while (it.next()) |entry| {
+            entry.deinit(self.allocator);
+        }
+        self.by_function.deinit(self.allocator);
+    }
+
+    /// Lookup the per-function ownership table. Returns `null` for
+    /// functions that had no ARC-managed locals (the analysis emits
+    /// no entry in that case).
+    pub fn get(self: *const ProgramArcOwnership, function_id: ir.FunctionId) ?*const ArcOwnership {
+        return self.by_function.getPtr(function_id);
+    }
+};
+
+/// Compute ARC ownership for every function in `program`, mutate every
+/// `share_value` instruction whose ID is a consume site so that its
+/// `mode` becomes `.consume`, and return the populated
+/// `ProgramArcOwnership` map for downstream consumers (Phase 5+).
+///
+/// The IR mutation is in-place. `program.functions` is declared
+/// `[]const Function` (via `toOwnedSlice` from the IR builder), but
+/// the underlying memory is mutable; we reach through `@constCast`
+/// only at the precise `share_value` payload we are upgrading. No
+/// other instruction is touched and no slice header is rewritten.
+///
+/// The walk that performs the write-back uses the identical depth-first
+/// region-tree traversal as `flattenInstructions`, so the implicit
+/// `InstructionId` numbering matches one-to-one with the IDs the
+/// analyzer used when it populated `consume_share_sites`.
+pub fn runProgramArcOwnership(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    type_store: *const types_mod.TypeStore,
+) !ProgramArcOwnership {
+    var table = ProgramArcOwnership.init(allocator);
+    errdefer table.deinit();
+
+    for (program.functions) |*function| {
+        var ownership = try computeArcOwnership(
+            allocator,
+            function,
+            type_store,
+            defaultArcManagedTypeId,
+        );
+
+        // Soundness contract from §2.3 of the implementation plan:
+        // a local must never appear in *both* `consume_share_sites`
+        // (via some site) and `return_source_locals`. The analyzer
+        // already asserts the per-local invariant inside
+        // `checkSoundness`; we re-assert at the orchestration seam
+        // so a future refactor that silently relaxes the analyzer
+        // assertion still trips here in debug builds.
+        if (std.debug.runtime_safety) {
+            assertConsumeReturnDisjoint(function, &ownership);
+        }
+
+        const consumes_marked = writeBackConsumeModes(function, &ownership);
+        table.consumes_marked += consumes_marked;
+        table.return_sources_recorded += ownership.return_source_locals.size;
+
+        // Only stash an entry for functions that have something
+        // observable. Phase 5 reads `return_source_locals`; functions
+        // with no ARC-managed locals contribute neither consume sites
+        // nor return sources and don't need an entry.
+        if (ownership.consume_share_sites.size != 0 or
+            ownership.return_source_locals.size != 0 or
+            ownership.last_use_map.size != 0)
+        {
+            try table.by_function.put(allocator, function.id, ownership);
+        } else {
+            ownership.deinit(allocator);
+        }
+    }
+
+    return table;
+}
+
+/// Walk every `share_value` instruction in `function` in the same
+/// depth-first order `flattenInstructions` used, and upgrade the mode
+/// to `.consume` for any instruction whose synthesised `InstructionId`
+/// appears in `ownership.consume_share_sites`. Returns the number of
+/// instructions whose mode was changed.
+///
+/// Exposed (not just used internally by `runProgramArcOwnership`) so
+/// targeted tests can construct an `ArcOwnership`, hand-roll a function,
+/// and verify the write-back without going through the orchestration
+/// wrapper. Phase 5+ tests benefit from the same surface.
+pub fn writeBackConsumeModes(
+    function: *const ir.Function,
+    ownership: *const ArcOwnership,
+) u64 {
+    var walker = WriteBackWalker{
+        .next_id = 0,
+        .consumes_marked = 0,
+        .ownership = ownership,
+    };
+    walker.walkFunction(function);
+    return walker.consumes_marked;
+}
+
+const WriteBackWalker = struct {
+    next_id: InstructionId,
+    consumes_marked: u64,
+    ownership: *const ArcOwnership,
+
+    fn walkFunction(self: *WriteBackWalker, function: *const ir.Function) void {
+        for (function.body) |block| {
+            self.walkStream(block.instructions);
+        }
+    }
+
+    fn walkStream(self: *WriteBackWalker, stream: []const ir.Instruction) void {
+        for (stream) |*instr| {
+            const my_id = self.next_id;
+            self.next_id += 1;
+            self.maybeUpgradeShareValue(instr, my_id);
+            self.walkChildren(instr);
+        }
+    }
+
+    fn maybeUpgradeShareValue(self: *WriteBackWalker, instr: *const ir.Instruction, id: InstructionId) void {
+        if (instr.* != .share_value) return;
+        if (!self.ownership.consume_share_sites.contains(id)) return;
+        // The IR slice was allocated mutably by `IrBuilder.buildProgram`
+        // (via `toOwnedSlice`) but exposed through a `[]const`-typed
+        // field for general callers. Phase 4 is the one site that
+        // legitimately needs to mutate a single `share_value` payload
+        // in place, so the cast is confined here. We do not reorder
+        // instructions, do not reallocate, and only touch the `mode`
+        // field of the matched `ShareValue` payload.
+        const mutable_instr: *ir.Instruction = @constCast(instr);
+        if (mutable_instr.share_value.mode == .consume) {
+            // Already consume: idempotent. Don't double-count.
+            return;
+        }
+        mutable_instr.share_value.mode = .consume;
+        self.consumes_marked += 1;
+    }
+
+    fn walkChildren(self: *WriteBackWalker, instr: *const ir.Instruction) void {
+        switch (instr.*) {
+            .if_expr => |ie| {
+                self.walkStream(ie.then_instrs);
+                self.walkStream(ie.else_instrs);
+            },
+            .case_block => |cb| {
+                self.walkStream(cb.pre_instrs);
+                for (cb.arms) |arm| {
+                    self.walkStream(arm.cond_instrs);
+                    self.walkStream(arm.body_instrs);
+                }
+                self.walkStream(cb.default_instrs);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| self.walkStream(c.body_instrs);
+                self.walkStream(sl.default_instrs);
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| self.walkStream(c.body_instrs);
+                self.walkStream(sr.default_instrs);
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| self.walkStream(c.body_instrs);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| self.walkStream(c.body_instrs);
+            },
+            .try_call_named => |tc| {
+                self.walkStream(tc.handler_instrs);
+                self.walkStream(tc.success_instrs);
+            },
+            .guard_block => |gb| {
+                self.walkStream(gb.body);
+            },
+            else => {},
+        }
+    }
+};
+
+/// Soundness check executed at the orchestration seam (debug builds
+/// only). Walks the function's instructions, and for every consume
+/// site, asserts that the source local of the matching `share_value`
+/// is *not* also recorded in `return_source_locals`. The analyzer's
+/// own `checkSoundness` already enforces this inside the pass; this
+/// duplicate check guards against future refactors that might relax
+/// the analyzer-side check or skip it.
+fn assertConsumeReturnDisjoint(
+    function: *const ir.Function,
+    ownership: *const ArcOwnership,
+) void {
+    var checker = DisjointChecker{
+        .next_id = 0,
+        .ownership = ownership,
+    };
+    checker.walkFunction(function);
+}
+
+const DisjointChecker = struct {
+    next_id: InstructionId,
+    ownership: *const ArcOwnership,
+
+    fn walkFunction(self: *DisjointChecker, function: *const ir.Function) void {
+        for (function.body) |block| {
+            self.walkStream(block.instructions);
+        }
+    }
+
+    fn walkStream(self: *DisjointChecker, stream: []const ir.Instruction) void {
+        for (stream) |*instr| {
+            const my_id = self.next_id;
+            self.next_id += 1;
+            self.checkInstr(instr, my_id);
+            self.walkChildren(instr);
+        }
+    }
+
+    fn checkInstr(self: *DisjointChecker, instr: *const ir.Instruction, id: InstructionId) void {
+        if (instr.* != .share_value) return;
+        if (!self.ownership.consume_share_sites.contains(id)) return;
+        const sv = instr.share_value;
+        std.debug.assert(!self.ownership.return_source_locals.contains(sv.source));
+    }
+
+    fn walkChildren(self: *DisjointChecker, instr: *const ir.Instruction) void {
+        switch (instr.*) {
+            .if_expr => |ie| {
+                self.walkStream(ie.then_instrs);
+                self.walkStream(ie.else_instrs);
+            },
+            .case_block => |cb| {
+                self.walkStream(cb.pre_instrs);
+                for (cb.arms) |arm| {
+                    self.walkStream(arm.cond_instrs);
+                    self.walkStream(arm.body_instrs);
+                }
+                self.walkStream(cb.default_instrs);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| self.walkStream(c.body_instrs);
+                self.walkStream(sl.default_instrs);
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| self.walkStream(c.body_instrs);
+                self.walkStream(sr.default_instrs);
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| self.walkStream(c.body_instrs);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| self.walkStream(c.body_instrs);
+            },
+            .try_call_named => |tc| {
+                self.walkStream(tc.handler_instrs);
+                self.walkStream(tc.success_instrs);
+            },
+            .guard_block => |gb| {
+                self.walkStream(gb.body);
+            },
+            else => {},
+        }
+    }
+};
+
+// ============================================================
 // Helpers: terminators, def/use lists, type predicates.
 // ============================================================
 
@@ -1777,4 +2073,152 @@ test "arc_liveness: empty when no ARC-managed locals" {
 
     try std.testing.expectEqual(@as(usize, 0), ownership.consume_share_sites.count());
     try std.testing.expectEqual(@as(usize, 0), ownership.return_source_locals.count());
+}
+
+// ============================================================
+// Phase 4 unit tests: write-back of consume modes onto share_value.
+// ============================================================
+
+test "arc_liveness: writeBackConsumeModes upgrades every consume site" {
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn use_one(h :: Handle) -> Handle { h }
+        \\
+        \\  pub fn run(h :: Handle) -> Handle {
+        \\    Test.use_one(h)
+        \\  }
+        \\}
+    ;
+    var suite = try TestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const run_func = suite.findFunctionByName("run") orelse return error.MissingFunction;
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        run_func,
+        suite.typeStore(),
+        defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // Pre-condition: every share_value defaults to .retain.
+    var share_value_pre_count: usize = 0;
+    {
+        var walker = WriteBackWalker{
+            .next_id = 0,
+            .consumes_marked = 0,
+            .ownership = &ownership,
+        };
+        walker.walkFunction(run_func);
+        // After the walker runs once, every share_value in
+        // consume_share_sites is now .consume; second invocation
+        // should report zero new upgrades (idempotent).
+        const second = writeBackConsumeModes(run_func, &ownership);
+        try std.testing.expectEqual(@as(u64, 0), second);
+        share_value_pre_count = walker.consumes_marked;
+    }
+    try std.testing.expect(share_value_pre_count > 0);
+    try std.testing.expectEqual(@as(usize, share_value_pre_count), ownership.consume_share_sites.count());
+
+    // Top-level invariant: every share_value across the function
+    // body is now `.consume` whenever it appears in the consume-site
+    // table. The full structural traversal that built the IDs lives
+    // in `WriteBackWalker`; the program-level integration test
+    // re-validates the same invariant end-to-end.
+    for (run_func.body) |block| {
+        for (block.instructions) |instr| {
+            if (instr == .share_value) {
+                // After write-back, the only valid mode for any
+                // share_value in this body is `.consume` (the helper
+                // function only ever lowers a single ARC argument).
+                try std.testing.expectEqual(ir.ShareMode.consume, instr.share_value.mode);
+            }
+        }
+    }
+}
+
+test "arc_liveness: runProgramArcOwnership populates per-function table" {
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn id(h :: Handle) -> Handle { h }
+        \\
+        \\  pub fn use(h :: Handle) -> Handle {
+        \\    Test.id(h)
+        \\  }
+        \\}
+    ;
+    var suite = try TestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    var table = try runProgramArcOwnership(
+        std.testing.allocator,
+        &suite.ir_program,
+        suite.typeStore(),
+    );
+    defer table.deinit();
+
+    // At least one function (`use`) must have a consume site, and at
+    // least one function (`id`) must have a return-source local.
+    var saw_consume = false;
+    var saw_return_source = false;
+    var it = table.by_function.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.consume_share_sites.size > 0) saw_consume = true;
+        if (entry.value_ptr.return_source_locals.size > 0) saw_return_source = true;
+    }
+    try std.testing.expect(saw_consume);
+    try std.testing.expect(saw_return_source);
+    try std.testing.expect(table.consumes_marked > 0);
+    try std.testing.expect(table.return_sources_recorded > 0);
+}
+
+test "arc_liveness: runProgramArcOwnership flips share_value mode on the IR" {
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn use_one(h :: Handle) -> Handle { h }
+        \\
+        \\  pub fn run(h :: Handle) -> Handle {
+        \\    Test.use_one(h)
+        \\  }
+        \\}
+    ;
+    var suite = try TestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    // Pre-condition: every share_value starts at .retain.
+    for (suite.ir_program.functions) |func| {
+        for (func.body) |block| {
+            for (block.instructions) |instr| {
+                if (instr == .share_value) {
+                    try std.testing.expectEqual(ir.ShareMode.retain, instr.share_value.mode);
+                }
+            }
+        }
+    }
+
+    var table = try runProgramArcOwnership(
+        std.testing.allocator,
+        &suite.ir_program,
+        suite.typeStore(),
+    );
+    defer table.deinit();
+
+    // Post-condition: at least one share_value is now .consume.
+    var saw_consume_in_ir = false;
+    for (suite.ir_program.functions) |func| {
+        for (func.body) |block| {
+            for (block.instructions) |instr| {
+                if (instr == .share_value and instr.share_value.mode == .consume) {
+                    saw_consume_in_ir = true;
+                }
+            }
+        }
+    }
+    try std.testing.expect(saw_consume_in_ir);
 }
