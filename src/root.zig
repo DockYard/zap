@@ -29,6 +29,7 @@ pub const analysis_pipeline = @import("analysis_pipeline.zig");
 pub const contification_rewrite = @import("contification_rewrite.zig");
 pub const arc_optimizer = @import("arc_optimizer.zig");
 pub const arc_liveness = @import("arc_liveness.zig");
+pub const arc_drop_insertion = @import("arc_drop_insertion.zig");
 pub const runtime = @import("runtime.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const DiagnosticEngine = diagnostics.DiagnosticEngine;
@@ -70,6 +71,7 @@ test {
     _ = @import("analysis_pipeline.zig");
     _ = @import("arc_optimizer.zig");
     _ = @import("arc_liveness.zig");
+    _ = @import("arc_drop_insertion.zig");
     _ = @import("ast_data.zig");
     _ = @import("macro_eval.zig");
     _ = @import("zir_builder.zig");

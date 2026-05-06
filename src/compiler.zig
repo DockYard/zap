@@ -941,7 +941,7 @@ const Pipeline = struct {
         ir_builder.type_store = type_store;
         ir_builder.scope_graph = &self.ctx.collector.graph;
         defer ir_builder.deinit();
-        const program = ir_builder.buildProgram(hir_program) catch
+        var program = ir_builder.buildProgram(hir_program) catch
             return self.failWith("Error during IR lowering", error.IrFailed);
         // Phase 4 of the ARC ownership initiative: compute the
         // last-use ownership pass and write back consume modes onto
@@ -950,6 +950,19 @@ const Pipeline = struct {
         // backend can consult `return_source_locals` per function.
         const ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
             return self.failWith("Error during ARC ownership analysis", error.IrFailed);
+        // Phase 6 of the ARC ownership initiative: insert scope-exit
+        // `release` IR instructions before every ret-equivalent
+        // terminator, using the per-terminator live-before-ret sets
+        // recorded by the ownership analyzer. The existing
+        // `isReleaseSuppressed` filter in `ZirDriver` (consulting
+        // `arc_consumed_locals`, `arc_returned_locals`,
+        // `arc_share_skipped`) handles elision automatically at ZIR
+        // emission time. Today's stdlib has no `.map`-flagged ARC
+        // type that fires, so the pass is silent in production
+        // codepaths; the infrastructure must still be correct so
+        // future commits can flip the flag without leaks.
+        runArcDropInsertion(self.alloc, &program, &ownership) catch
+            return self.failWith("Error during ARC drop insertion", error.IrFailed);
         return .{ .program = program, .arc_ownership = ownership };
     }
 
@@ -974,11 +987,16 @@ const Pipeline = struct {
         ir_builder.next_try_id = next_try_id.*;
         ir_builder.known_name_program = known_name_program;
         defer ir_builder.deinit();
-        const program = ir_builder.buildProgram(hir_program) catch
+        var program = ir_builder.buildProgram(hir_program) catch
             return self.failWith("Error during IR lowering", error.IrFailed);
         next_try_id.* = ir_builder.next_try_id;
         const ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
             return self.failWith("Error during ARC ownership analysis", error.IrFailed);
+        // Phase 6: see `runIrLowering` for the rationale. Both call
+        // sites must run the drop-insertion pass to keep the per-
+        // struct IR build path identical to the whole-program path.
+        runArcDropInsertion(self.alloc, &program, &ownership) catch
+            return self.failWith("Error during ARC drop insertion", error.IrFailed);
         return .{ .program = program, .arc_ownership = ownership };
     }
 
@@ -1937,6 +1955,33 @@ pub fn compileStructByStruct(
         .analysis_context = analysis_result.context,
         .arc_ownership = combined_arc_ownership,
     };
+}
+
+/// Phase 6 of the ARC ownership initiative: walk every function in
+/// `program` and, for each function that has a per-function entry in
+/// `ownership`, insert scope-exit `release` IR instructions before
+/// every ret-equivalent terminator (sourced from
+/// `ArcOwnership.live_before_ret`). The pass is generic, type-blind,
+/// and runs uniformly on every function regardless of whether any
+/// ARC-managed locals are present — but the actual mutation only
+/// fires when the analyzer recorded a non-empty live-before-ret set
+/// for at least one terminator in the function.
+///
+/// `program.functions` is exposed as `[]const Function` so the
+/// `@constCast` here is the seam where the drop-insertion pass
+/// reaches through to mutate body slices in place. This is the same
+/// pattern `arc_liveness.writeBackConsumeModes` uses to update
+/// `share_value.mode` fields.
+fn runArcDropInsertion(
+    alloc: std.mem.Allocator,
+    program: *ir.Program,
+    ownership: *const zap.arc_liveness.ProgramArcOwnership,
+) CompileError!void {
+    for (program.functions, 0..) |_, i| {
+        const function: *ir.Function = @constCast(&program.functions[i]);
+        const fn_ownership = ownership.get(function.id) orelse continue;
+        zap.arc_drop_insertion.insertScopeExitDrops(alloc, function, fn_ownership) catch return error.OutOfMemory;
+    }
 }
 
 /// Move every per-function entry from `source` into `target` so the
