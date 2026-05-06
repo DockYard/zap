@@ -1189,6 +1189,15 @@ fn collectUses(instr: ir.Instruction, buf: *UseList) void {
         },
         .int_widen, .float_widen => |x| buf.append(allocator, x.source) catch {},
         .phi => |x| for (x.sources) |src| buf.append(allocator, src.value) catch {},
+        .optional_dispatch => |x| {
+            // scrutinee_param is a param index (not a local); payload_local
+            // is a def; nested nil_instrs / struct_instrs are visited
+            // separately by the dataflow. The arm results flow into the
+            // function via terminators in each arm (the nested streams),
+            // not via this opcode directly.
+            if (x.nil_result) |l| buf.append(allocator, l) catch {};
+            if (x.struct_result) |l| buf.append(allocator, l) catch {};
+        },
     }
 }
 
