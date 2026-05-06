@@ -141,6 +141,7 @@ pub fn insertScopeExitDrops(
     var rebuilder = StreamRebuilder{
         .allocator = allocator,
         .ownership = ownership,
+        .function = function,
         .next_id = 0,
     };
 
@@ -157,6 +158,13 @@ pub fn insertScopeExitDrops(
 const StreamRebuilder = struct {
     allocator: std.mem.Allocator,
     ownership: *const arc_liveness.ArcOwnership,
+
+    /// The function being rewritten. Carried so per-terminator drop
+    /// computation can read `param_conventions` and skip LocalIds
+    /// bound to borrowed parameters (Phase B of the Phase 6 redux
+    /// plan — borrowed parameters are owned by the caller, the
+    /// callee must not destroy them on scope exit).
+    function: *const ir.Function,
 
     /// Monotonically increasing instruction-id counter shared across
     /// the entire walk so the IDs assigned here line up exactly with
@@ -476,6 +484,15 @@ const StreamRebuilder = struct {
         while (iter.next()) |local_ptr| {
             const local_id = local_ptr.*;
             if (args_view.containsLocal(local_id)) continue;
+            // Phase B (Phase 6 redux plan §3.B): skip LocalIds bound
+            // to a `borrowed` formal parameter. The caller owns the
+            // value across the entire call (caller-side `share_value`
+            // retain + post-call `release` ABI), so the callee must
+            // not emit a scope-exit destroy on the parameter local.
+            // Emitting one would double-free at Phase F when the
+            // .map flag is flipped: the caller's post-call release
+            // would decrement an already-destroyed cell.
+            if (isBorrowedParameterLocal(self.function, local_id)) continue;
             try releases.append(self.allocator, ir.Instruction{
                 .release = .{ .value = local_id },
             });
@@ -621,6 +638,31 @@ fn isReturnEquivalentTerminator(instr: ir.Instruction) bool {
         => true,
         else => false,
     };
+}
+
+/// Returns true when `local_id` names a formal parameter local of
+/// `function` whose declared calling convention is `.borrowed`.
+///
+/// Phase B (Phase 6 redux plan §3.B): drop insertion uses this gate
+/// to skip emitting `.release` instructions on parameter locals at
+/// scope exit. The caller-side ABI (`share_value` retain + post-call
+/// `release`) owns the parameter value; the callee borrows it across
+/// its body. Emitting a callee-side scope-exit destroy on a borrowed
+/// parameter would double-free at Phase F (when the .map flag is
+/// flipped) — the caller's post-call release would decrement an
+/// already-destroyed cell.
+///
+/// Parameter LocalIds occupy the first `function.param_conventions.len`
+/// slots in the function's local-id space — the IR builder allocates
+/// them in order via `param_get` instructions before any other locals.
+/// A LocalId `i` therefore names a parameter local iff
+/// `i < function.param_conventions.len`.
+fn isBorrowedParameterLocal(
+    function: *const ir.Function,
+    local_id: ir.LocalId,
+) bool {
+    if (local_id >= function.param_conventions.len) return false;
+    return function.param_conventions[local_id] == .borrowed;
 }
 
 // ============================================================
@@ -783,13 +825,16 @@ test "arc_drop_insertion: function with no ARC locals is unchanged" {
     try std.testing.expectEqual(original_first_block_len, run_func.body[0].instructions.len);
 }
 
-test "arc_drop_insertion: simple ret(local) gets a release inserted before it" {
+test "arc_drop_insertion: simple ret(param) does NOT release the param (Phase B)" {
     // The identity function on an ARC-managed type. The single `ret`
     // terminator's live-before-ret entry contains the parameter
-    // local; the pass must insert exactly one `.release` before that
-    // ret. The pass does NOT consult `isReleaseSuppressed` — that
-    // happens later in the ZIR lowering, so the IR-level effect is
-    // visible regardless of whether the release is later elided.
+    // local. Phase B (Phase 6 redux) makes drop insertion SKIP
+    // borrowed parameter locals — the caller's post-call release
+    // owns the value, so the callee must not emit a scope-exit
+    // destroy. The expected number of releases inserted is therefore
+    // the live-before-ret count MINUS the parameter locals in those
+    // sets — for the identity function, that's 0 (the only live
+    // local IS the parameter).
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -826,14 +871,19 @@ test "arc_drop_insertion: simple ret(local) gets a release inserted before it" {
     try insertScopeExitDrops(suite.irAllocator(), id_func, &ownership);
 
     const releases_after = countReleases(id_func);
-    // Expect at least one new release. Sum of all live-before-ret
-    // counts is an upper bound (tail-call arg subtraction may shave
-    // some); for an identity function with no tail call, every
-    // live-before-ret local becomes a release.
+    // Phase B: parameter locals are skipped. For the identity
+    // function, every live-before-ret local IS a parameter, so
+    // no releases are inserted. Count parameters in the live sets
+    // and subtract.
     var expected_releases: usize = 0;
     var live_iter = ownership.live_before_ret.valueIterator();
     while (live_iter.next()) |set_ptr| {
-        expected_releases += set_ptr.count();
+        var set_iter = set_ptr.keyIterator();
+        while (set_iter.next()) |local_ptr| {
+            if (!isBorrowedParameterLocal(id_func, local_ptr.*)) {
+                expected_releases += 1;
+            }
+        }
     }
     try std.testing.expectEqual(releases_before + expected_releases, releases_after);
 }
@@ -971,16 +1021,24 @@ test "arc_drop_insertion: tail-call site does NOT drop its argument locals" {
     if (seen_tail_call) {} else {}
 }
 
-test "arc_drop_insertion: return-source local still gets a release inserted at IR level" {
+test "arc_drop_insertion: identity-function parameter is skipped (Phase B + Phase 5 compose)" {
     // For an identity function, the ARC parameter is BOTH:
-    //   * present in `live_before_ret` at the ret (so the pass
-    //     inserts a `.release` instruction in the IR), AND
-    //   * recorded in `return_source_locals` (so phase 5's
-    //     `isReleaseSuppressed` filter elides the release at ZIR
-    //     emission time).
-    // This test pins the IR-level invariant: the release IS inserted
-    // — both behaviors compose correctly. The ZIR-level suppression
-    // is verified separately in arc_liveness.zig's Phase 5 tests.
+    //   * present in `live_before_ret` at the ret AND
+    //   * recorded in `return_source_locals`.
+    // Phase B (Phase 6 redux) makes drop insertion skip parameters
+    // at IR-insertion time, which is strictly earlier than Phase 5's
+    // ZIR-emission-time `isReleaseSuppressed` filter. Both target the
+    // same correctness goal — the parameter must not be destroyed by
+    // the callee since the caller's post-call release owns the
+    // value. Phase B catches it earlier; Phase 5's filter is
+    // redundant for parameter return-sources but still load-bearing
+    // for non-parameter return-source locals (e.g., a binding that
+    // sources `ret`).
+    //
+    // This test pins Phase B's IR-level invariant: NO release is
+    // inserted on the parameter local, so `releases_after ==
+    // releases_before` even though the parameter is in
+    // `live_before_ret`.
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -1000,31 +1058,26 @@ test "arc_drop_insertion: return-source local still gets a release inserted at I
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // Pre-condition: the parameter is recorded as a return source.
+    // Pre-condition: the parameter is recorded as a return source AND
+    // is in live_before_ret.
     try std.testing.expect(ownership.return_source_locals.count() >= 1);
 
     const releases_before = countReleases(id_func);
     try insertScopeExitDrops(suite.irAllocator(), id_func, &ownership);
     const releases_after = countReleases(id_func);
 
-    // The IR DOES gain a release. Suppression happens at ZIR
-    // emission time via `isReleaseSuppressed(local)` — which is
-    // tested in arc_liveness.zig.
-    try std.testing.expect(releases_after > releases_before);
+    // Phase B: NO releases inserted on parameter locals. For the
+    // identity function, every live-before-ret local IS the
+    // parameter, so the count is unchanged.
+    try std.testing.expectEqual(releases_before, releases_after);
 
-    // Specifically: at least one of the new releases targets a local
-    // that is also recorded in `return_source_locals`. This is the
-    // load-bearing invariant — the ZIR backend will see this release
-    // and ask `isReleaseSuppressed`, which returns true because the
-    // local is in `arc_returned_locals` (Phase 5).
+    // Specifically: no release targets a parameter local.
     var release_locals = try collectReleaseLocals(std.testing.allocator, id_func);
     defer release_locals.deinit(std.testing.allocator);
-    var saw_return_source_release = false;
-    var ret_iter = ownership.return_source_locals.keyIterator();
-    while (ret_iter.next()) |local_ptr| {
-        if (release_locals.contains(local_ptr.*)) saw_return_source_release = true;
+    var iter = release_locals.keyIterator();
+    while (iter.next()) |local_ptr| {
+        try std.testing.expect(!isBorrowedParameterLocal(id_func, local_ptr.*));
     }
-    try std.testing.expect(saw_return_source_release);
 }
 
 test "arc_drop_insertion: idempotent — second run inserts nothing" {
