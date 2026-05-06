@@ -495,6 +495,12 @@ pub const ZirDriver = struct {
     /// Populated by make_closure, propagated by local_set/local_get/move/share.
     /// Used by call_closure to resolve 0-capture closures to direct named calls.
     closure_function_map: std.AutoHashMapUnmanaged(ir.LocalId, ir.FunctionId) = .empty,
+    /// Locals whose `share_value` retain was skipped (because the source
+    /// was stack-eligible per escape analysis or otherwise didn't need
+    /// reference-count tracking). The matching `.release` IR instruction
+    /// must skip its decrement too — emitting an unpaired release would
+    /// destroy a refcount that was never bumped, causing double-free.
+    arc_share_skipped: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
     /// Forward-propagating set of locals whose value originated from a
     /// function parameter. When such a local is used as a call_closure callee,
     /// the runtime value may be either a bare function pointer or a closure
@@ -538,6 +544,7 @@ pub const ZirDriver = struct {
         self.local_refs.deinit(self.allocator);
         self.param_refs.deinit(self.allocator);
         self.closure_function_map.deinit(self.allocator);
+        self.arc_share_skipped.deinit(self.allocator);
         self.param_derived_closure_locals.deinit(self.allocator);
         self.capture_closure_function_map.deinit(self.allocator);
         self.capture_param_derived_closure_map.deinit(self.allocator);
@@ -4071,6 +4078,16 @@ pub const ZirDriver = struct {
 
                         const args = [_]u32{materialized_ref};
                         _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
+                    } else {
+                        // Pair the suppression with the eventual `.release`
+                        // IR instruction so we don't emit a release that
+                        // never had a matching retain. Without this, an
+                        // arg whose source local was deemed stack-eligible
+                        // (e.g. a Map literal that doesn't escape) ends
+                        // up double-released: the post-call release fires
+                        // even though no retain was emitted, decrementing
+                        // a refcount that the caller still owns.
+                        try self.arc_share_skipped.put(self.allocator, sv.dest, {});
                     }
                 }
             },
@@ -6439,6 +6456,11 @@ pub const ZirDriver = struct {
                 }
             },
             .release => |rel| {
+                if (self.arc_share_skipped.contains(rel.value)) {
+                    // Matching share_value retain was skipped; suppress
+                    // the release to keep the pair balanced.
+                    return;
+                }
                 if (!self.shouldSkipArc(rel.value)) {
                     // Emit: @import("zap_runtime").ArcRuntime.releaseAny(allocator, value)
                     const val_ref = self.refForLocal(rel.value) catch return;

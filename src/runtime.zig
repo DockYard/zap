@@ -358,10 +358,36 @@ pub const ArcRuntime = struct {
     /// "argument is a single-item pointer to T".
     fn arcPtrChild(comptime PtrT: type) type {
         const info = @typeInfo(PtrT);
+        if (info == .optional) {
+            const inner = @typeInfo(info.optional.child);
+            if (inner == .pointer and inner.pointer.size == .one) {
+                return inner.pointer.child;
+            }
+        }
         if (info != .pointer or info.pointer.size != .one) {
             @compileError("ArcRuntime helper expects a single-item pointer; got " ++ @typeName(PtrT));
         }
         return info.pointer.child;
+    }
+
+    fn arcPtrIsOptional(comptime PtrT: type) bool {
+        return @typeInfo(PtrT) == .optional;
+    }
+
+    /// Returns true when `T` carries its own ARC header inline as the first
+    /// field rather than relying on the generic `Arc(T).Inner` wrapper.
+    /// Such types are responsible for their own allocation pool and
+    /// destruction (via a `release` or `arcReleaseDeep` method) — typically
+    /// because they own variable-length payload buffers (`Map(K, V)`,
+    /// `MArrayOf(T)`).
+    fn hasInlineArcHeader(comptime T: type) bool {
+        const info = @typeInfo(T);
+        if (info != .@"struct") return false;
+        if (info.@"struct".fields.len == 0) return false;
+        const first = info.@"struct".fields[0];
+        if (first.type != ArcHeader) return false;
+        if (!std.mem.eql(u8, first.name, "header")) return false;
+        return true;
     }
 
     /// Free an Arc-managed value given a pointer to the value field.
@@ -369,8 +395,27 @@ pub const ArcRuntime = struct {
     /// The `allocator` argument is vestigial — the inner allocation is owned
     /// by the per-type `ArcPool` and returns there on destruction.
     pub fn freeAny(allocator: std.mem.Allocator, ptr: anytype) void {
-        _ = allocator;
+        if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
+            const unwrapped = ptr orelse return;
+            return freeAny(allocator, unwrapped);
+        }
+        @setEvalBranchQuota(2000);
+        // `allocator` retained for ABI; pool-owned allocations don't use it.
+        _ = &allocator;
         const T = arcPtrChild(@TypeOf(ptr));
+        if (comptime hasInlineArcHeader(T)) {
+            // Self-managed: T owns its own pool. Release routes through
+            // T's release method, which performs deep teardown including
+            // any heap-allocated payload arrays.
+            if (@hasDecl(T, "release")) {
+                T.release(@as(?*const T, ptr));
+            } else if (@hasDecl(T, "arcReleaseDeep")) {
+                T.arcReleaseDeep(std.heap.page_allocator, ptr);
+            } else {
+                @compileError("inline-header Arc type missing release/arcReleaseDeep: " ++ @typeName(T));
+            }
+            return;
+        }
         const inner: *Arc(T).Inner = @constCast(@fieldParentPtr("value", ptr));
         if (inner.header.release()) {
             ArcPool(T).destroy(inner);
@@ -387,6 +432,10 @@ pub const ArcRuntime = struct {
     /// a leading `comptime T: type` parameter from the runtime ptr argument.
     /// The element type is recovered via `@typeInfo`.
     pub fn releaseAny(allocator: std.mem.Allocator, ptr: anytype) void {
+        if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
+            const unwrapped = ptr orelse return;
+            return releaseAny(allocator, unwrapped);
+        }
         const T = arcPtrChild(@TypeOf(ptr));
         releaseArcAny(T, allocator, ptr);
     }
@@ -431,6 +480,16 @@ pub const ArcRuntime = struct {
     /// comptime parameter values; the recursive reference reuses the same
     /// in-progress instance rather than expanding indefinitely.
     pub fn releaseArcAny(comptime T: type, allocator: std.mem.Allocator, ptr: *const T) void {
+        if (comptime hasInlineArcHeader(T)) {
+            if (@hasDecl(T, "release")) {
+                T.release(@as(?*const T, ptr));
+            } else if (@hasDecl(T, "arcReleaseDeep")) {
+                T.arcReleaseDeep(allocator, ptr);
+            } else {
+                @compileError("inline-header Arc type missing release/arcReleaseDeep: " ++ @typeName(T));
+            }
+            return;
+        }
         if (prepareReleaseAny(T, ptr)) |owned| {
             releaseChildrenAny(T, allocator, owned.*);
             destroyPreparedAny(T, allocator, owned);
@@ -467,7 +526,16 @@ pub const ArcRuntime = struct {
 
     /// Retain (increment refcount) an Arc-managed value given a pointer to the value field.
     pub fn retainAny(ptr: anytype) void {
+        if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
+            const unwrapped = ptr orelse return;
+            return retainAny(unwrapped);
+        }
         const T = arcPtrChild(@TypeOf(ptr));
+        if (comptime hasInlineArcHeader(T)) {
+            const mut: *T = @constCast(ptr);
+            mut.header.retain();
+            return;
+        }
         const Inner = Arc(T).Inner;
         const inner: *Inner = @constCast(@fieldParentPtr("value", ptr));
         inner.header.retain();
@@ -490,7 +558,14 @@ pub const ArcRuntime = struct {
 
     /// Get the refcount of an Arc-managed value.
     pub fn refCountAny(ptr: anytype) u32 {
+        if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
+            const unwrapped = ptr orelse return 0;
+            return refCountAny(unwrapped);
+        }
         const T = arcPtrChild(@TypeOf(ptr));
+        if (comptime hasInlineArcHeader(T)) {
+            return ptr.header.count();
+        }
         const Inner = Arc(T).Inner;
         const inner: *Inner = @constCast(@fieldParentPtr("value", ptr));
         return inner.header.count();
@@ -2961,8 +3036,22 @@ pub fn Map(comptime K: type, comptime V: type) type {
         // Hybrid representation: flat array for small maps, HAMT trie for larger maps.
         // The HAMT (Hash Array Mapped Trie) provides O(log32 n) lookup, insert, and
         // delete for large maps while the flat array remains optimal for <= 8 entries.
-        // All nodes are bump-allocated (persistent/immutable).
+        //
+        // Memory model: Self and HamtNode are ARC-managed. Each carries an
+        // `ArcHeader` as its first field so retain/release is a refcount bump
+        // on the cell pointer. Path-copy `put`/`delete` produce a new spine
+        // whose nodes carry refcount=1; every shared subtree pointer carried
+        // forward into the new spine is `retain`'d. When a Map cell or
+        // HamtNode reaches refcount zero it deep-releases its trie children
+        // before its Inner allocation returns to the per-(K,V) MemoryPool;
+        // the variable-length entries / node-ptrs buffers are freed back to
+        // page_allocator. This keeps persistent semantics while ensuring
+        // O(active set) memory rather than O(total mutations).
 
+        // First field: ArcHeader. Layout-stable across Map(K,V) instantiations
+        // so codegen-side release helpers see a uniform "header at offset 0"
+        // shape and can release any Map pointer through `Self.release`.
+        header: ArcHeader,
         total_count: u32,
         repr_tag: u8, // 0 = flat, 1 = trie
         // Payload is one of:
@@ -2985,7 +3074,14 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
         /// HAMT trie node: bitmap-indexed with packed children array.
         /// Each child is either a leaf entry or a pointer to a sub-node.
+        ///
+        /// First field is ArcHeader so the node participates in the same
+        /// retain/release dance as the parent Map cell. `children_entries`
+        /// and `children_nodes` are heap-allocated through page_allocator
+        /// (sized by `child_count`) and freed when this node's refcount
+        /// reaches zero.
         const HamtNode = struct {
+            header: ArcHeader,
             bitmap: u32,
             children_entries: [*]const MapEntry, // leaf entries (parallel to children_nodes)
             children_nodes: [*]const ?*const HamtNode, // sub-nodes (null = leaf at this slot)
@@ -3001,6 +3097,40 @@ pub fn Map(comptime K: type, comptime V: type) type {
             // replaced collisions, dropping data — surfaced by the
             // CLBG `k-nucleotide` 18-mer query.
             is_collision: bool = false,
+        };
+
+        // Per-(K,V) thread-local MemoryPool for Self cells. Mirrors
+        // ArcRuntime.ArcPool / MArrayOf.InnerPool: hot-path allocation
+        // becomes a free-list pop, reclamation becomes a free-list push,
+        // OS page commit happens once per pool growth instead of per
+        // allocation. Single-threaded Zap programs share the pool across
+        // all Map(K,V) operations.
+        const SelfPool = struct {
+            const PoolT = std.heap.MemoryPool(Self);
+            threadlocal var pool: PoolT = .empty;
+
+            fn create() *Self {
+                return pool.create(std.heap.page_allocator) catch
+                    @panic("Map cell pool: out of memory");
+            }
+
+            fn destroy(cell: *Self) void {
+                pool.destroy(cell);
+            }
+        };
+
+        const NodePool = struct {
+            const PoolT = std.heap.MemoryPool(HamtNode);
+            threadlocal var pool: PoolT = .empty;
+
+            fn create() *HamtNode {
+                return pool.create(std.heap.page_allocator) catch
+                    @panic("Map node pool: out of memory");
+            }
+
+            fn destroy(node: *HamtNode) void {
+                pool.destroy(node);
+            }
         };
 
         /// Hash a key value for HAMT lookup. Supports u32 (atoms), i64, []const u8 (strings), bool, Term.
@@ -3039,37 +3169,126 @@ pub fn Map(comptime K: type, comptime V: type) type {
         }
 
         fn allocMap() ?*Self {
-            const slice = bumpAllocSlice(Self, 1);
-            if (slice.len == 0) return null;
-            return &slice[0];
+            return SelfPool.create();
+        }
+
+        // Variable-length children arrays (entries + node ptrs) range
+        // from a few bytes to a few hundred. Routing those allocations
+        // through `page_allocator` would mmap one page per allocation
+        // (16 KiB on macOS aarch64), turning a 32-byte HAMT node array
+        // into a 16 KiB syscall and ~500x amplification at the OS layer.
+        // `c_allocator` (libc malloc) has proper small-object size
+        // classes and free-list reuse, which is what these allocations
+        // need. Single-threaded Zap programs share libc malloc state
+        // safely; the small-object hot path doesn't contend.
+        fn entriesAllocator() std.mem.Allocator {
+            return std.heap.c_allocator;
         }
 
         fn allocEntries(count: usize) ?[*]MapEntry {
             if (count == 0) return @as([*]MapEntry, undefined);
-            const slice = bumpAllocSlice(MapEntry, count);
-            if (slice.len == 0) return null;
+            const slice = entriesAllocator().alloc(MapEntry, count) catch return null;
             return slice.ptr;
         }
 
         fn allocHamtNode() ?*HamtNode {
-            const slice = bumpAllocSlice(HamtNode, 1);
-            if (slice.len == 0) return null;
-            return &slice[0];
+            return NodePool.create();
         }
 
         fn allocNodePtrs(count: usize) ?[*]?*const HamtNode {
             if (count == 0) return @as([*]?*const HamtNode, undefined);
-            const slice = bumpAllocSlice(?*const HamtNode, count);
-            if (slice.len == 0) return null;
+            const slice = entriesAllocator().alloc(?*const HamtNode, count) catch return null;
             for (0..count) |i| {
                 slice[i] = null;
             }
             return slice.ptr;
         }
 
+        fn freeEntries(buf: [*]const MapEntry, count: usize) void {
+            if (count == 0) return;
+            entriesAllocator().free(@constCast(buf[0..count]));
+        }
+
+        fn freeNodePtrs(buf: [*]const ?*const HamtNode, count: usize) void {
+            if (count == 0) return;
+            entriesAllocator().free(@constCast(buf[0..count]));
+        }
+
+        // ----- ARC retain/release for Map cells and HamtNodes -----
+
+        /// Increment the refcount of a Map cell and return the same handle.
+        /// Null maps (the empty-map sentinel) are a no-op.
+        pub fn retain(map: ?*const Self) ?*const Self {
+            if (map) |m| {
+                const mut: *Self = @constCast(m);
+                mut.header.retain();
+            }
+            return map;
+        }
+
+        /// Decrement the refcount of a Map cell. On the zero-transition,
+        /// deep-release the trie root and free the variable-length flat
+        /// entries buffer before returning the cell to the SelfPool.
+        pub fn release(map: ?*const Self) void {
+            if (map == null) return;
+            const m = map.?;
+            const mut: *Self = @constCast(m);
+            if (!mut.header.release()) return;
+            // Final owner — tear down owned children before destroying the cell.
+            if (m.repr_tag == 0) {
+                if (m.flat_count > 0) {
+                    freeEntries(m.flat_entries, @intCast(m.flat_count));
+                }
+            } else if (m.trie_root) |root| {
+                releaseNode(root);
+            }
+            SelfPool.destroy(mut);
+        }
+
+        /// Increment a HamtNode's refcount. Used at every spot where a
+        /// path-copy operation carries a sibling subtree forward into a
+        /// new node — both the old node and the new node will eventually
+        /// release that pointer, and the refcount must absorb both.
+        fn retainNode(node: *const HamtNode) void {
+            const mut: *HamtNode = @constCast(node);
+            mut.header.retain();
+        }
+
+        /// Decrement a HamtNode's refcount. On zero, recursively release
+        /// each child sub-node, free the entries / node-ptrs buffers, and
+        /// return the node to the NodePool.
+        fn releaseNode(node: *const HamtNode) void {
+            const mut: *HamtNode = @constCast(node);
+            if (!mut.header.release()) return;
+            const count: usize = @intCast(node.child_count);
+            if (node.is_collision) {
+                // Collision-bucket: only `children_entries` is owned;
+                // `children_nodes` is unused (`undefined` placeholder).
+                if (count > 0) freeEntries(node.children_entries, count);
+            } else if (count > 0) {
+                // Walk children_nodes and release each non-null sub-tree.
+                for (0..count) |i| {
+                    if (node.children_nodes[i]) |sub| releaseNode(sub);
+                }
+                freeEntries(node.children_entries, count);
+                freeNodePtrs(node.children_nodes, count);
+            }
+            NodePool.destroy(mut);
+        }
+
+        /// Codegen-side deep-release entry point. Invoked by
+        /// `ArcRuntime.releaseArcAny` when the Zap-emitted release path
+        /// dispatches on a `Map(K, V)` value pointer. Mirrors `release`
+        /// but takes the value-pointer shape that codegen produces.
+        pub fn arcReleaseDeep(allocator: std.mem.Allocator, ptr: *const Self) void {
+            _ = allocator;
+            release(@as(?*const Self, ptr));
+        }
+
         fn makeFlatMap(entries: [*]const MapEntry, count: u32) ?*const Self {
             const cell = allocMap() orelse return null;
             cell.* = .{
+                .header = ArcHeader.init(),
                 .total_count = count,
                 .repr_tag = 0,
                 .flat_entries = entries,
@@ -3082,6 +3301,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
         fn makeTrieMap(root: *const HamtNode, total: u32) ?*const Self {
             const cell = allocMap() orelse return null;
             cell.* = .{
+                .header = ArcHeader.init(),
                 .total_count = total,
                 .repr_tag = 1,
                 .flat_entries = undefined,
@@ -3145,9 +3365,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
                         new_entries[i] = .{ .key = key, .value = value };
                         const new_node = allocHamtNode() orelse return null;
                         new_node.* = .{
+                            .header = ArcHeader.init(),
                             .bitmap = 0,
                             .children_entries = new_entries,
-                            .children_nodes = node.children_nodes,
+                            .children_nodes = undefined,
                             .child_count = node.child_count,
                             .is_collision = true,
                         };
@@ -3163,9 +3384,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 new_entries[total] = .{ .key = key, .value = value };
                 const new_node = allocHamtNode() orelse return null;
                 new_node.* = .{
+                    .header = ArcHeader.init(),
                     .bitmap = 0,
                     .children_entries = new_entries,
-                    .children_nodes = node.children_nodes,
+                    .children_nodes = undefined,
                     .child_count = @intCast(new_count),
                     .is_collision = true,
                 };
@@ -3176,7 +3398,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
             const idx = sparseIndex(node.bitmap, bit);
 
             if (node.bitmap & bit == 0) {
-                // Empty slot — insert new leaf
+                // Empty slot — insert new leaf. Sibling sub-nodes copied
+                // from the old node are aliased into the new spine, so
+                // each must be retain'd; the old node will release them
+                // when it eventually drops.
                 const old_count: usize = @intCast(node.child_count);
                 const new_count = old_count + 1;
                 const new_entries = allocEntries(new_count) orelse return null;
@@ -3187,6 +3412,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 if (idx > 0) {
                     @memcpy(new_entries[0..idx], node.children_entries[0..idx]);
                     @memcpy(new_nodes[0..idx], node.children_nodes[0..idx]);
+                    for (0..idx) |i| {
+                        if (new_nodes[i]) |sub| retainNode(sub);
+                    }
                 }
                 // Insert new leaf at idx
                 new_entries[idx] = .{ .key = key, .value = value };
@@ -3196,9 +3424,13 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 if (after > 0) {
                     @memcpy(new_entries[idx + 1 ..][0..after], node.children_entries[idx..][0..after]);
                     @memcpy(new_nodes[idx + 1 ..][0..after], node.children_nodes[idx..][0..after]);
+                    for (0..after) |i| {
+                        if (new_nodes[idx + 1 + i]) |sub| retainNode(sub);
+                    }
                 }
 
                 new_node.* = .{
+                    .header = ArcHeader.init(),
                     .bitmap = node.bitmap | bit,
                     .children_entries = new_entries,
                     .children_nodes = new_nodes,
@@ -3208,7 +3440,11 @@ pub fn Map(comptime K: type, comptime V: type) type {
             }
 
             if (node.children_nodes[idx]) |sub| {
-                // Recurse into existing sub-node
+                // Recurse into existing sub-node. `updated_sub` is a
+                // brand-new node owned by us with refcount=1; it
+                // replaces `sub` at index `idx` of the new spine, so
+                // `copyNodeWithUpdatedChild` must NOT retain it (the
+                // returned ownership is already fresh).
                 const updated_sub = hamtPut(sub, key, value, hash, depth + 1) orelse return null;
                 return copyNodeWithUpdatedChild(node, idx, null, updated_sub);
             }
@@ -3232,6 +3468,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 collision_entries[1] = .{ .key = key, .value = value };
                 const collision_sub = allocHamtNode() orelse return null;
                 collision_sub.* = .{
+                    .header = ArcHeader.init(),
                     .bitmap = 0,
                     .children_entries = collision_entries,
                     .children_nodes = undefined,
@@ -3241,12 +3478,39 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 return copyNodeWithUpdatedChild(node, idx, null, collision_sub);
             }
 
-            // Create a new sub-node containing both the existing and new entries
+            // Create a new sub-node containing both the existing and new entries.
+            // `initial_sub` is a fresh refcount=1 node consumed by the first
+            // hamtPut, which releases its input on the recursive copy path
+            // (because we own the only reference). We must mirror that
+            // ownership — the intermediate `sub_with_existing` is consumed
+            // by the second hamtPut. To avoid double-release, we explicitly
+            // release the intermediate nodes that hamtPut leaves behind.
             const existing_hash = hashKey(existing.key);
             const initial_sub = allocHamtNode() orelse return null;
-            initial_sub.* = .{ .bitmap = 0, .children_entries = undefined, .children_nodes = undefined, .child_count = 0 };
-            const sub_with_existing = hamtPut(initial_sub, existing.key, existing.value, existing_hash, depth + 1) orelse return null;
-            const sub_with_both = hamtPut(sub_with_existing, key, value, hash, depth + 1) orelse return null;
+            initial_sub.* = .{
+                .header = ArcHeader.init(),
+                .bitmap = 0,
+                .children_entries = undefined,
+                .children_nodes = undefined,
+                .child_count = 0,
+            };
+            const sub_with_existing = hamtPut(initial_sub, existing.key, existing.value, existing_hash, depth + 1) orelse {
+                releaseNode(initial_sub);
+                return null;
+            };
+            // The first hamtPut produced a new node referencing 0 children
+            // (initial_sub had child_count=0); initial_sub itself is no
+            // longer referenced by anyone except us. Release it.
+            releaseNode(initial_sub);
+            const sub_with_both = hamtPut(sub_with_existing, key, value, hash, depth + 1) orelse {
+                releaseNode(sub_with_existing);
+                return null;
+            };
+            // sub_with_existing was the input to the second put; that put
+            // built a new node carrying retain'd references to whatever
+            // children sub_with_existing held. sub_with_existing is now
+            // dropped from our hand.
+            releaseNode(sub_with_existing);
             return copyNodeWithUpdatedChild(node, idx, null, sub_with_both);
         }
 
@@ -3261,11 +3525,26 @@ pub fn Map(comptime K: type, comptime V: type) type {
                         break;
                     }
                 }
-                const drop = hit orelse return node;
+                const drop = hit orelse {
+                    // Not found — return the existing node with its
+                    // refcount unchanged from the caller's perspective.
+                    // The caller treats the result the same whether it's
+                    // a fresh node or a re-used pointer; downstream
+                    // copyNodeWithUpdatedChild retains it as appropriate.
+                    retainNode(node);
+                    return node;
+                };
                 if (total <= 1) {
                     // Bucket emptied — caller will remove the whole sub-node.
                     const empty_node = allocHamtNode() orelse return null;
-                    empty_node.* = .{ .bitmap = 0, .children_entries = undefined, .children_nodes = undefined, .child_count = 0, .is_collision = true };
+                    empty_node.* = .{
+                        .header = ArcHeader.init(),
+                        .bitmap = 0,
+                        .children_entries = undefined,
+                        .children_nodes = undefined,
+                        .child_count = 0,
+                        .is_collision = true,
+                    };
                     return empty_node;
                 }
                 const new_count = total - 1;
@@ -3274,9 +3553,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 if (drop < new_count) @memcpy(new_entries[drop..new_count], node.children_entries[drop + 1 .. total]);
                 const new_node = allocHamtNode() orelse return null;
                 new_node.* = .{
+                    .header = ArcHeader.init(),
                     .bitmap = 0,
                     .children_entries = new_entries,
-                    .children_nodes = node.children_nodes,
+                    .children_nodes = undefined,
                     .child_count = @intCast(new_count),
                     .is_collision = true,
                 };
@@ -3285,13 +3565,19 @@ pub fn Map(comptime K: type, comptime V: type) type {
             const shift: u5 = @intCast(depth * BITS_PER_LEVEL);
             const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
 
-            if (node.bitmap & bit == 0) return node; // not found
+            if (node.bitmap & bit == 0) {
+                retainNode(node);
+                return node; // not found
+            }
 
             const idx = sparseIndex(node.bitmap, bit);
 
             if (node.children_nodes[idx]) |sub| {
                 const updated = hamtDelete(sub, key, hash, depth + 1) orelse return null;
                 if (updated.child_count == 0) {
+                    // Drop the empty sub-node we just produced; the
+                    // returned node won't reference it.
+                    releaseNode(updated);
                     return removeChildFromNode(node, idx, bit);
                 }
                 return copyNodeWithUpdatedChild(node, idx, null, updated);
@@ -3299,7 +3585,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
             // Leaf
             const existing = node.children_entries[idx];
-            if (!keysEqual(existing.key, key)) return node; // not found
+            if (!keysEqual(existing.key, key)) {
+                retainNode(node);
+                return node; // not found
+            }
             return removeChildFromNode(node, idx, bit);
         }
 
@@ -3312,8 +3601,16 @@ pub fn Map(comptime K: type, comptime V: type) type {
             @memcpy(new_entries[0..count], node.children_entries[0..count]);
             @memcpy(new_nodes[0..count], node.children_nodes[0..count]);
             new_entries[idx] = entry;
+            // All sibling sub-nodes (every slot of new_nodes) are now
+            // aliased between the old and new spine. Bump their refcount
+            // so the eventual release of the old spine doesn't free them
+            // while the new spine is still alive.
+            for (0..count) |i| {
+                if (new_nodes[i]) |sub| retainNode(sub);
+            }
 
             new_node.* = .{
+                .header = ArcHeader.init(),
                 .bitmap = node.bitmap,
                 .children_entries = new_entries,
                 .children_nodes = new_nodes,
@@ -3322,6 +3619,11 @@ pub fn Map(comptime K: type, comptime V: type) type {
             return new_node;
         }
 
+        /// Build a path-copied node where slot `idx` is replaced by
+        /// `sub`. Caller owns `sub` (one fresh reference) and that
+        /// reference transfers into the new node — sub is NOT retained
+        /// here. Sibling sub-nodes at every other slot are retained
+        /// because they are aliased into the new spine.
         fn copyNodeWithUpdatedChild(node: *const HamtNode, idx: usize, entry: ?MapEntry, sub: *const HamtNode) ?*const HamtNode {
             const count: usize = @intCast(node.child_count);
             const new_entries = allocEntries(count) orelse return null;
@@ -3330,10 +3632,19 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
             @memcpy(new_entries[0..count], node.children_entries[0..count]);
             @memcpy(new_nodes[0..count], node.children_nodes[0..count]);
+            // Retain all aliased siblings (every slot except idx, which
+            // is about to be overwritten with our owned `sub`). This
+            // must happen BEFORE we overwrite slot idx — otherwise the
+            // pointer at idx could be retained then leaked.
+            for (0..count) |i| {
+                if (i == idx) continue;
+                if (new_nodes[i]) |sibling_sub| retainNode(sibling_sub);
+            }
             if (entry) |e| new_entries[idx] = e;
             new_nodes[idx] = sub;
 
             new_node.* = .{
+                .header = ArcHeader.init(),
                 .bitmap = node.bitmap,
                 .children_entries = new_entries,
                 .children_nodes = new_nodes,
@@ -3346,7 +3657,13 @@ pub fn Map(comptime K: type, comptime V: type) type {
             const old_count: usize = @intCast(node.child_count);
             if (old_count <= 1) {
                 const empty_node = allocHamtNode() orelse return null;
-                empty_node.* = .{ .bitmap = 0, .children_entries = undefined, .children_nodes = undefined, .child_count = 0 };
+                empty_node.* = .{
+                    .header = ArcHeader.init(),
+                    .bitmap = 0,
+                    .children_entries = undefined,
+                    .children_nodes = undefined,
+                    .child_count = 0,
+                };
                 return empty_node;
             }
             const new_count = old_count - 1;
@@ -3359,11 +3676,13 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 if (i != idx) {
                     new_entries[dst] = node.children_entries[i];
                     new_nodes[dst] = node.children_nodes[i];
+                    if (new_nodes[dst]) |sub| retainNode(sub);
                     dst += 1;
                 }
             }
 
             new_node.* = .{
+                .header = ArcHeader.init(),
                 .bitmap = node.bitmap & ~bit,
                 .children_entries = new_entries,
                 .children_nodes = new_nodes,
@@ -3373,13 +3692,17 @@ pub fn Map(comptime K: type, comptime V: type) type {
         }
 
         /// Collect all entries from a HAMT trie into a flat list.
+        /// Caller is responsible for freeing the result via the same
+        /// allocator passed in (`entriesAllocator()` for the canonical
+        /// path). Using `c_allocator` here mirrors the entries / nodes
+        /// buffers — small allocations with proper free semantics.
         fn hamtCollect(node: *const HamtNode, result: *std.ArrayListUnmanaged(MapEntry)) void {
             const count: usize = @intCast(node.child_count);
             // Collision-bucket nodes hold every entry inline; no
             // sub-nodes to recurse into.
             if (node.is_collision) {
                 for (0..count) |i| {
-                    result.append(runtime_arena.allocator(), node.children_entries[i]) catch {};
+                    result.append(entriesAllocator(), node.children_entries[i]) catch {};
                 }
                 return;
             }
@@ -3388,21 +3711,34 @@ pub fn Map(comptime K: type, comptime V: type) type {
                     hamtCollect(sub, result);
                 } else {
                     // Use a fixed-size buffer approach since we can't return errors
-                    result.append(runtime_arena.allocator(), node.children_entries[i]) catch {};
+                    result.append(entriesAllocator(), node.children_entries[i]) catch {};
                 }
             }
         }
 
-        /// Convert flat entries to a HAMT trie.
+        /// Convert flat entries to a HAMT trie. Each iteration creates a
+        /// fresh root referenced once by `root`; the previous root must
+        /// be released so it doesn't leak.
         fn flatToTrie(entries: [*]const MapEntry, count: u32) ?*const HamtNode {
             const initial = allocHamtNode() orelse return null;
-            initial.* = .{ .bitmap = 0, .children_entries = undefined, .children_nodes = undefined, .child_count = 0 };
+            initial.* = .{
+                .header = ArcHeader.init(),
+                .bitmap = 0,
+                .children_entries = undefined,
+                .children_nodes = undefined,
+                .child_count = 0,
+            };
 
             var root: *const HamtNode = initial;
             for (0..count) |i| {
                 const entry = entries[i];
                 const hash = hashKey(entry.key);
-                root = hamtPut(root, entry.key, entry.value, hash, 0) orelse return null;
+                const next_root = hamtPut(root, entry.key, entry.value, hash, 0) orelse {
+                    releaseNode(root);
+                    return null;
+                };
+                releaseNode(root);
+                root = next_root;
             }
             return root;
         }
@@ -3478,6 +3814,16 @@ pub fn Map(comptime K: type, comptime V: type) type {
             return map == null;
         }
 
+        /// `put` and `delete` are non-consuming on the input map. The
+        /// caller's reference remains live with refcount unchanged; the
+        /// returned map (a fresh cell when allocated) carries refcount 1
+        /// and any shared trie subtrees are retain'd along the path-copy
+        /// spine inside hamtPut / copyNodeWithUpdatedChild. When the
+        /// returned `?*const Self` is the same pointer as the input
+        /// (no-change cases like updating absent keys), the caller's
+        /// existing reference IS retained — codegen treats the return
+        /// value as a fresh ownership and would double-release without
+        /// the bump.
         pub fn put(map: ?*const Self, key: K, value: V) ?*const Self {
             if (map == null) {
                 // Create new single-entry flat map
@@ -3496,21 +3842,34 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 for (0..old_count) |i| {
                     if (keysEqual(m.flat_entries[i].key, key)) {
                         // Update existing key — copy and replace
-                        const new_entries = allocEntries(old_count) orelse return map;
+                        const new_entries = allocEntries(old_count) orelse {
+                            retainNode_or_self_for_unchanged_return(map);
+                            return map;
+                        };
                         for (0..old_count) |j| {
                             new_entries[j] = if (j == i) MapEntry{ .key = key, .value = value } else m.flat_entries[j];
                         }
                         if (old_count <= FLAT_THRESHOLD) {
                             return makeFlatMap(new_entries, m.flat_count);
                         }
-                        const root = flatToTrie(new_entries, m.flat_count) orelse return makeFlatMap(new_entries, m.flat_count);
+                        const root = flatToTrie(new_entries, m.flat_count) orelse {
+                            // flatToTrie failed; fall back to flat. Reuse
+                            // the entries buffer.
+                            return makeFlatMap(new_entries, m.flat_count);
+                        };
+                        // Trie now owns the entry data via leaf nodes;
+                        // free the transient flat buffer.
+                        freeEntries(new_entries, m.flat_count);
                         return makeTrieMap(root, m.flat_count);
                     }
                 }
 
                 // New key — append
                 const new_count: u32 = m.flat_count + 1;
-                const new_entries = allocEntries(old_count + 1) orelse return map;
+                const new_entries = allocEntries(old_count + 1) orelse {
+                    retainNode_or_self_for_unchanged_return(map);
+                    return map;
+                };
                 for (0..old_count) |i| {
                     new_entries[i] = m.flat_entries[i];
                 }
@@ -3520,7 +3879,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
                     return makeFlatMap(new_entries, new_count);
                 }
                 // Promote to trie
-                const root = flatToTrie(new_entries, new_count) orelse return makeFlatMap(new_entries, new_count);
+                const root = flatToTrie(new_entries, new_count) orelse {
+                    return makeFlatMap(new_entries, new_count);
+                };
+                freeEntries(new_entries, new_count);
                 return makeTrieMap(root, new_count);
             }
 
@@ -3528,10 +3890,14 @@ pub fn Map(comptime K: type, comptime V: type) type {
             if (m.trie_root) |root| {
                 const hash = hashKey(key);
                 const was_present = hamtGet(root, key, hash, 0) != null;
-                const new_root = hamtPut(root, key, value, hash, 0) orelse return map;
+                const new_root = hamtPut(root, key, value, hash, 0) orelse {
+                    retainNode_or_self_for_unchanged_return(map);
+                    return map;
+                };
                 const new_total = if (was_present) m.total_count else m.total_count + 1;
                 return makeTrieMap(new_root, new_total);
             }
+            retainNode_or_self_for_unchanged_return(map);
             return map;
         }
 
@@ -3548,12 +3914,18 @@ pub fn Map(comptime K: type, comptime V: type) type {
                         break;
                     }
                 }
-                if (!found) return map;
+                if (!found) {
+                    retainNode_or_self_for_unchanged_return(map);
+                    return map;
+                }
 
                 const new_count = m.flat_count - 1;
                 if (new_count == 0) return null;
 
-                const new_entries = allocEntries(new_count) orelse return map;
+                const new_entries = allocEntries(new_count) orelse {
+                    retainNode_or_self_for_unchanged_return(map);
+                    return map;
+                };
                 var dst: usize = 0;
                 for (m.flat_entries[0..m.flat_count]) |entry| {
                     if (!keysEqual(entry.key, key)) {
@@ -3567,25 +3939,50 @@ pub fn Map(comptime K: type, comptime V: type) type {
             // Trie mode
             if (m.trie_root) |root| {
                 const hash = hashKey(key);
-                if (hamtGet(root, key, hash, 0) == null) return map; // not found
-                const new_root = hamtDelete(root, key, hash, 0) orelse return map;
+                if (hamtGet(root, key, hash, 0) == null) {
+                    retainNode_or_self_for_unchanged_return(map);
+                    return map; // not found
+                }
+                const new_root = hamtDelete(root, key, hash, 0) orelse {
+                    retainNode_or_self_for_unchanged_return(map);
+                    return map;
+                };
                 const new_total = m.total_count - 1;
-                if (new_total == 0) return null;
+                if (new_total == 0) {
+                    releaseNode(new_root);
+                    return null;
+                }
                 // Demote to flat if below threshold
                 if (new_total <= FLAT_THRESHOLD) {
                     var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
+                    defer collected.deinit(entriesAllocator());
                     hamtCollect(new_root, &collected);
                     if (collected.items.len > 0) {
-                        const entries = allocEntries(collected.items.len) orelse return makeTrieMap(new_root, new_total);
+                        const entries = allocEntries(collected.items.len) orelse {
+                            return makeTrieMap(new_root, new_total);
+                        };
                         for (collected.items, 0..) |entry, i| {
                             entries[i] = entry;
                         }
+                        // Discard the trie now that entries live in the
+                        // flat representation.
+                        releaseNode(new_root);
                         return makeFlatMap(entries, new_total);
                     }
                 }
                 return makeTrieMap(new_root, new_total);
             }
+            retainNode_or_self_for_unchanged_return(map);
             return map;
+        }
+
+        /// Bump the refcount of a Map cell on a no-change return path.
+        /// `put` and `delete` callers treat the return value as a fresh
+        /// owned reference, so when we hand back the same pointer we
+        /// must increment so the eventual matched release decrements
+        /// against the bumped count, not the caller's original.
+        fn retainNode_or_self_for_unchanged_return(map: ?*const Self) void {
+            _ = retain(map);
         }
 
         /// Iterator protocol for maps.
@@ -3642,6 +4039,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
             } else {
                 // Collect trie entries and apply
                 var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
+                defer collected.deinit(entriesAllocator());
                 if (b.trie_root) |root| hamtCollect(root, &collected);
                 for (collected.items) |entry| {
                     result = put(result, entry.key, entry.value);
@@ -3666,6 +4064,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
             // Trie: collect and build list
             var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
+            defer collected.deinit(entriesAllocator());
             if (m.trie_root) |root| hamtCollect(root, &collected);
             var result: ?*const List(K) = null;
             var i: usize = collected.items.len;
@@ -3692,6 +4091,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
             // Trie: collect and build list
             var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
+            defer collected.deinit(entriesAllocator());
             if (m.trie_root) |root| hamtCollect(root, &collected);
             var result: ?*const List(V) = null;
             var i: usize = collected.items.len;
@@ -3717,6 +4117,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
             } else if (m.trie_root) |root| {
                 // Trie: collect entries then iterate
                 var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
+                defer collected.deinit(entriesAllocator());
                 hamtCollect(root, &collected);
                 for (collected.items) |entry| {
                     acc = callback(acc, @as(i64, @intCast(entry.key)), entry.value);
@@ -3738,6 +4139,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 }
             } else if (m.trie_root) |root| {
                 var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
+                defer collected.deinit(entriesAllocator());
                 hamtCollect(root, &collected);
                 for (collected.items) |entry| {
                     acc = callback(acc, entry.value);

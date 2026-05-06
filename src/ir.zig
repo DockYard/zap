@@ -4932,6 +4932,19 @@ pub const IrBuilder = struct {
                                 if (self.known_local_types.get(arg_local)) |src_type| {
                                     try self.known_local_types.put(shared_local, src_type);
                                 }
+                                // Propagate param-backed marker so dispatch
+                                // encoders that fall back to runtime type-
+                                // derived helpers for `param: anytype`
+                                // bridge calls still see the share'd local
+                                // as param-backed. Otherwise the encoder
+                                // would burn the post-monomorph nominal
+                                // type into the call name, but the runtime
+                                // value may carry a different instantiation
+                                // (e.g. Map(K, Term)) and trip a type
+                                // mismatch in the generated Zig.
+                                if (self.param_backed_locals.contains(arg_local)) {
+                                    try self.param_backed_locals.put(shared_local, {});
+                                }
                                 try shared_release_locals.append(self.allocator, shared_local);
                                 break :blk shared_local;
                             }
