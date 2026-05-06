@@ -514,6 +514,15 @@ pub const ZirDriver = struct {
     /// flows to the caller's return slot, so the callee's scope-exit
     /// release is suppressed. Populated by phase 5.
     arc_returned_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
+    /// Set of every ARC-managed local in the currently-emitting
+    /// function. Mirrored from `ArcOwnership.arc_managed_locals` at
+    /// `emitFunction` start. Consulted by `shouldSkipArc` to enforce
+    /// the invariant "ARC-managed locals are never stack-eligible
+    /// regardless of escape state" — their cells are heap-pool
+    /// allocated, so suppressing retain/release on the basis of
+    /// `.no_escape` / `.function_local` would leak (or, with
+    /// path-copy structures whose cells get recycled, cause UAF).
+    arc_managed_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
     /// Forward-propagating set of locals whose value originated from a
     /// function parameter. When such a local is used as a call_closure callee,
     /// the runtime value may be either a bare function pointer or a closure
@@ -559,6 +568,7 @@ pub const ZirDriver = struct {
         self.closure_function_map.deinit(self.allocator);
         self.arc_share_skipped.deinit(self.allocator);
         self.arc_returned_locals.deinit(self.allocator);
+        self.arc_managed_locals.deinit(self.allocator);
         self.param_derived_closure_locals.deinit(self.allocator);
         self.capture_closure_function_map.deinit(self.allocator);
         self.capture_param_derived_closure_map.deinit(self.allocator);
@@ -621,6 +631,18 @@ pub const ZirDriver = struct {
     }
 
     fn shouldSkipArc(self: *const ZirDriver, local: ir.LocalId) bool {
+        // ARC-managed types live on heap pools and must always
+        // participate in retain/release. The escape lattice's
+        // `.no_escape` / `.function_local` classifications describe
+        // pointer flow, not allocation-site placement — for these
+        // types, the cell is heap-allocated regardless. Skipping
+        // ARC operations here would (a) leak the pool cell when the
+        // function exits, and (b) for path-copy mutable structures
+        // whose pool cells get recycled, cause use-after-free when a
+        // reused cell is observed by another spine that still holds
+        // a stale alias. Refuse the skip at the source.
+        if (self.arc_managed_locals.contains(local)) return false;
+
         const lattice = @import("escape_lattice.zig");
         if (self.analysis_context) |actx| {
             const vkey = lattice.ValueKey{
@@ -3225,6 +3247,7 @@ pub const ZirDriver = struct {
         // into this function's release-emission filter.
         self.arc_share_skipped.clearRetainingCapacity();
         self.arc_returned_locals.clearRetainingCapacity();
+        self.arc_managed_locals.clearRetainingCapacity();
         // Phase 4 of the k-nucleotide RSS gap implementation plan:
         // when the IR-lowering phase produced an ARC ownership table
         // for this function, replay its `return_source_locals` into
@@ -3234,11 +3257,21 @@ pub const ZirDriver = struct {
         // return slot. The set is part of the per-function arc
         // bookkeeping cleared immediately above, so there is no
         // chance of cross-function bleed.
+        //
+        // The same fan-out also seeds `arc_managed_locals` from the
+        // ownership table's `arc_managed_locals` field so
+        // `shouldSkipArc` can enforce the soundness invariant that
+        // ARC-managed locals are never stack-eligible — see the
+        // field doc on `arc_managed_locals` for the full reasoning.
         if (self.arc_ownership) |ownership| {
             if (ownership.get(func.id)) |fn_ownership| {
                 var ret_it = fn_ownership.return_source_locals.keyIterator();
                 while (ret_it.next()) |local_id_ptr| {
                     try self.markReturned(local_id_ptr.*);
+                }
+                var arc_it = fn_ownership.arc_managed_locals.keyIterator();
+                while (arc_it.next()) |local_id_ptr| {
+                    try self.arc_managed_locals.put(self.allocator, local_id_ptr.*, {});
                 }
             }
         }

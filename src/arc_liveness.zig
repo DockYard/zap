@@ -190,6 +190,25 @@ pub const ArcOwnership = struct {
     /// excluded from the drop list (Phase 5 wires this).
     return_source_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
 
+    /// Set of every ARC-managed local in the function — every local
+    /// whose runtime value is a heap-allocated, refcount-tracked
+    /// cell. Populated from the analyzer's internal `arc_locals`
+    /// dense array and mirrored here so downstream consumers (most
+    /// notably `ZirDriver.shouldSkipArc`) can decide whether a local
+    /// participates in ARC operations.
+    ///
+    /// Why this matters: the escape lattice classifies pointer flow
+    /// (`.no_escape`, `.function_local`, ...). For non-ARC types
+    /// "doesn't escape" implies "stack-eligible", so retain/release
+    /// can be skipped. For ARC-managed types the cell is heap-pool
+    /// allocated regardless — even when escape says the value never
+    /// leaves the function, the refcount must still be tracked or
+    /// the pool cell leaks (or worse, gets recycled while another
+    /// path-copy spine still holds a reference). Treating ARC-managed
+    /// locals as never stack-eligible is a soundness invariant that
+    /// has to be enforced everywhere `shouldSkipArc` is consulted.
+    arc_managed_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
+
     /// Diagnostic: per-ARC-local last-use instruction id. Useful
     /// for pretty printers, debug counters, and soundness checks.
     last_use_map: std.AutoHashMapUnmanaged(ir.LocalId, InstructionId) = .empty,
@@ -223,6 +242,7 @@ pub const ArcOwnership = struct {
     pub fn deinit(self: *ArcOwnership, allocator: std.mem.Allocator) void {
         self.consume_share_sites.deinit(allocator);
         self.return_source_locals.deinit(allocator);
+        self.arc_managed_locals.deinit(allocator);
         self.last_use_map.deinit(allocator);
         var live_iter = self.live_before_ret.valueIterator();
         while (live_iter.next()) |set_ptr| {
@@ -329,6 +349,18 @@ pub fn computeArcOwnership(
 
     var ownership: ArcOwnership = .{};
     errdefer ownership.deinit(allocator);
+
+    // Mirror the analyzer's dense `arc_locals` list into the public
+    // `arc_managed_locals` set so downstream consumers (notably
+    // `ZirDriver.shouldSkipArc`) can answer "is this local ARC-managed?"
+    // without re-running the analysis. Populated even when no consume
+    // or return-source classifications fire, because the soundness
+    // invariant — ARC-managed locals are never stack-eligible — must
+    // hold for every ARC local in the function regardless of whether
+    // ownership analysis found any optimization opportunities.
+    for (analyzer.arc_locals.items) |arc_local| {
+        try ownership.arc_managed_locals.put(allocator, arc_local, {});
+    }
 
     if (analyzer.arc_locals.items.len == 0) {
         // No ARC-managed locals — nothing to do. Return empty maps.
@@ -1137,11 +1169,15 @@ pub fn runProgramArcOwnership(
         table.consumes_marked += consumes_marked;
         table.return_sources_recorded += ownership.return_source_locals.size;
 
-        // Only stash an entry for functions that have something
-        // observable. Phase 5 reads `return_source_locals`; functions
-        // with no ARC-managed locals contribute neither consume sites
-        // nor return sources and don't need an entry.
-        if (ownership.consume_share_sites.size != 0 or
+        // Stash an entry for any function with ARC-managed locals.
+        // The `arc_managed_locals` set is the soundness anchor: even
+        // when no consume site or return source fires, a downstream
+        // pass (e.g. `ZirDriver.shouldSkipArc`) needs to know which
+        // locals are ARC-managed so it can refuse to mark them as
+        // stack-eligible regardless of escape state. Functions with
+        // no ARC-managed locals at all genuinely don't need an entry.
+        if (ownership.arc_managed_locals.size != 0 or
+            ownership.consume_share_sites.size != 0 or
             ownership.return_source_locals.size != 0 or
             ownership.last_use_map.size != 0)
         {
@@ -2194,6 +2230,61 @@ test "arc_liveness: empty when no ARC-managed locals" {
 
     try std.testing.expectEqual(@as(usize, 0), ownership.consume_share_sites.count());
     try std.testing.expectEqual(@as(usize, 0), ownership.return_source_locals.count());
+    try std.testing.expectEqual(@as(usize, 0), ownership.arc_managed_locals.count());
+}
+
+test "arc_liveness: arc_managed_locals records every ARC local in the function" {
+    // Soundness anchor: the analyzer must surface every ARC-managed
+    // local in the public ownership table so `ZirDriver.shouldSkipArc`
+    // can refuse to mark them as stack-eligible regardless of the
+    // escape lattice's verdict. Their cells live on heap pools and
+    // suppressing retain/release would leak (or, with path-copy
+    // structures, cause UAF on recycled cells).
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn id(h :: Handle) -> Handle { h }
+        \\
+        \\  pub fn run(h :: Handle) -> Handle {
+        \\    Test.id(h)
+        \\  }
+        \\}
+    ;
+    var suite = try TestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const run_func = suite.findFunctionByName("run") orelse return error.MissingFunction;
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        run_func,
+        suite.typeStore(),
+        defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // The function has at least the parameter `h` plus the call's
+    // dest (return) flowing through ARC. arc_managed_locals must
+    // include every such local.
+    try std.testing.expect(ownership.arc_managed_locals.count() > 0);
+
+    // Cross-check: every local that appears in retain/release/share
+    // must be recorded as ARC-managed. The analyzer's identifyArcLocals
+    // is the canonical seed; arc_managed_locals must be a superset of
+    // every share_value source/dest reachable in the body.
+    for (run_func.body) |block| {
+        for (block.instructions) |instr| {
+            switch (instr) {
+                .share_value => |sv| {
+                    try std.testing.expect(ownership.arc_managed_locals.contains(sv.source));
+                    try std.testing.expect(ownership.arc_managed_locals.contains(sv.dest));
+                },
+                .retain => |r| try std.testing.expect(ownership.arc_managed_locals.contains(r.value)),
+                .release => |r| try std.testing.expect(ownership.arc_managed_locals.contains(r.value)),
+                else => {},
+            }
+        }
+    }
 }
 
 // ============================================================
