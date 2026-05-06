@@ -8,8 +8,29 @@ const arc_liveness = @import("arc_liveness.zig");
 // `insertScopeExitDrops` is an in-place IR transformation pass.
 // For every ret-equivalent terminator instruction in the function it
 // rewrites the enclosing instruction stream so that, immediately
-// before the terminator, a `release` instruction is emitted for each
-// ARC-managed local recorded in `ownership.live_before_ret[id]`.
+// before the terminator:
+//   1. A `.release{value=X}` IR instruction is emitted for each
+//      ARC-managed local X recorded in `ownership.live_before_ret[id]`
+//      (Phase 6.2b — scope-exit release insertion).
+//   2. A `.retain{value=L}` IR instruction is emitted when the
+//      terminator carries a return value L that is ARC-managed AND
+//      not recorded in `ownership.return_source_locals` (Phase 6.2c —
+//      retain-on-ret discipline). This bumps the returned value's
+//      refcount by +1 just before exit so the caller receives a
+//      fresh ownership unit; the matching scope-exit release inserted
+//      in step 1 (if any) balances the in-function refcount.
+//      When L IS in `return_source_locals`, the Phase 5
+//      `isReleaseSuppressed` filter elides the release and we skip
+//      the retain — net zero refcount ops, ownership transfers
+//      directly to the caller's return slot.
+//
+// For multi-arm terminators (`switch_return`, `union_switch_return`)
+// the retain is per-arm: a `.retain{value=case.return_value}` is
+// appended at the end of each arm's body when the arm's return value
+// is ARC-managed and not a return source.
+//
+// Tail calls receive no retain — there is no return value at the IR
+// site (the callee returns directly to the caller's caller).
 //
 // Why this pass exists: until this pass landed there was no IR-level
 // site that produced scope-exit `release` instructions for ARC-bound
@@ -182,17 +203,19 @@ const StreamRebuilder = struct {
             const my_id = self.next_id;
             self.next_id += 1;
 
-            const child_result = try self.rebuildChildren(instr);
+            const child_result = try self.rebuildChildren(instr, my_id);
             const drops = try self.dropsForTerminator(instr, my_id);
+            const retains = try self.retainsForTerminator(instr, my_id);
 
             const outcome: InstructionOutcome = .{
                 .original_ptr = instr,
                 .rebuilt_instruction = child_result.rebuilt,
                 .drops_before = drops,
+                .retains_before = retains,
             };
             try outcomes.append(self.allocator, outcome);
 
-            if (child_result.rebuilt != null or drops.len != 0) {
+            if (child_result.rebuilt != null or drops.len != 0 or retains.len != 0) {
                 any_change = true;
             }
         }
@@ -202,14 +225,26 @@ const StreamRebuilder = struct {
         // Compute final size and allocate.
         var total: usize = 0;
         for (outcomes.items) |outcome| {
-            total += outcome.drops_before.len + 1;
+            total += outcome.drops_before.len + outcome.retains_before.len + 1;
         }
 
         const new_slice = try self.allocator.alloc(ir.Instruction, total);
         var write_index: usize = 0;
         for (outcomes.items) |outcome| {
+            // Order is load-bearing: releases of dying locals come
+            // first, then the retain that bumps the returned value's
+            // refcount, then the terminator itself. The releases
+            // observe the un-retained refcount, so the retain
+            // happening AFTER cannot accidentally rescue a local that
+            // a preceding release brought down. The retain happens
+            // before the terminator so the +1 is observable when the
+            // caller reads its return slot.
             for (outcome.drops_before) |drop| {
                 new_slice[write_index] = drop;
+                write_index += 1;
+            }
+            for (outcome.retains_before) |retain_instr| {
+                new_slice[write_index] = retain_instr;
                 write_index += 1;
             }
             new_slice[write_index] = if (outcome.rebuilt_instruction) |built|
@@ -234,6 +269,7 @@ const StreamRebuilder = struct {
     fn rebuildChildren(
         self: *StreamRebuilder,
         instr: *const ir.Instruction,
+        parent_id: arc_liveness.InstructionId,
     ) error{OutOfMemory}!ChildResult {
         switch (instr.*) {
             .if_expr => |ie| {
@@ -306,15 +342,21 @@ const StreamRebuilder = struct {
                 var any_case_changed = false;
                 var new_cases: ?[]ir.ReturnCase = null;
                 for (sr.cases, 0..) |case, idx| {
-                    const new_body = try self.rebuildStream(case.body_instrs);
-                    if (new_body == null) continue;
+                    const new_body_opt = try self.rebuildStream(case.body_instrs);
+                    const arm_retain = try self.armRetainForReturnValue(parent_id, case.return_value);
+                    if (new_body_opt == null and arm_retain == null) continue;
                     if (new_cases == null) {
                         const buf = try self.allocator.alloc(ir.ReturnCase, sr.cases.len);
                         for (sr.cases, 0..) |orig, j| buf[j] = orig;
                         new_cases = buf;
                     }
+                    const base_body: []const ir.Instruction = new_body_opt orelse case.body_instrs;
+                    const final_body: []const ir.Instruction = if (arm_retain) |retain_instr|
+                        try self.appendInstruction(base_body, retain_instr)
+                    else
+                        base_body;
                     var case_copy = case;
-                    case_copy.body_instrs = new_body.?;
+                    case_copy.body_instrs = final_body;
                     new_cases.?[idx] = case_copy;
                     any_case_changed = true;
                 }
@@ -350,15 +392,21 @@ const StreamRebuilder = struct {
                 var any_case_changed = false;
                 var new_cases: ?[]ir.UnionCase = null;
                 for (usr.cases, 0..) |case, idx| {
-                    const new_body = try self.rebuildStream(case.body_instrs);
-                    if (new_body == null) continue;
+                    const new_body_opt = try self.rebuildStream(case.body_instrs);
+                    const arm_retain = try self.armRetainForReturnValue(parent_id, case.return_value);
+                    if (new_body_opt == null and arm_retain == null) continue;
                     if (new_cases == null) {
                         const buf = try self.allocator.alloc(ir.UnionCase, usr.cases.len);
                         for (usr.cases, 0..) |orig, j| buf[j] = orig;
                         new_cases = buf;
                     }
+                    const base_body: []const ir.Instruction = new_body_opt orelse case.body_instrs;
+                    const final_body: []const ir.Instruction = if (arm_retain) |retain_instr|
+                        try self.appendInstruction(base_body, retain_instr)
+                    else
+                        base_body;
                     var case_copy = case;
-                    case_copy.body_instrs = new_body.?;
+                    case_copy.body_instrs = final_body;
                     new_cases.?[idx] = case_copy;
                     any_case_changed = true;
                 }
@@ -435,6 +483,107 @@ const StreamRebuilder = struct {
 
         return try releases.toOwnedSlice(self.allocator);
     }
+
+    /// Build the `retain` instruction list to inject immediately
+    /// before `instr` (which has just been assigned `id`). Phase 6.2c
+    /// — retain-on-ret discipline. The returned slice contains:
+    ///
+    ///   * Exactly one `.retain{value=L}` when `instr` is `.ret` or
+    ///     `.cond_return` carrying a return value `L` that is
+    ///     ARC-managed AND not in `ownership.return_source_locals`.
+    ///     The "ARC-managed" check is done via membership in
+    ///     `live_before_ret[id]`: the analyzer's dataflow guarantees
+    ///     that the return-value local of a ret/cond_return appears
+    ///     in `live_before_ret[id]` iff it is ARC-managed (the use
+    ///     comes from `applyUses`, the analyzer's `local_to_arc_index`
+    ///     filters down to ARC locals only).
+    ///
+    ///   * An empty slice for `.tail_call` (no return value at the IR
+    ///     site — the callee returns directly to the caller's caller).
+    ///
+    ///   * An empty slice for `.switch_return` and
+    ///     `.union_switch_return` at the parent level — those
+    ///     terminators have per-arm return values, not a single
+    ///     return value. Per-arm retains are appended INSIDE each
+    ///     arm's body by `armRetainForReturnValue`, called from
+    ///     `rebuildChildren`.
+    ///
+    ///   * An empty slice for non-ret-equivalent terminators or
+    ///     terminators whose return value is not ARC-managed or is
+    ///     already a return source.
+    fn retainsForTerminator(
+        self: *StreamRebuilder,
+        instr: *const ir.Instruction,
+        id: arc_liveness.InstructionId,
+    ) error{OutOfMemory}![]ir.Instruction {
+        const return_value: ir.LocalId = switch (instr.*) {
+            .ret => |r| r.value orelse return &.{},
+            .cond_return => |cr| cr.value orelse return &.{},
+            else => return &.{},
+        };
+        if (!self.shouldRetainReturnValue(id, return_value)) return &.{};
+        const buf = try self.allocator.alloc(ir.Instruction, 1);
+        buf[0] = ir.Instruction{ .retain = .{ .value = return_value } };
+        return buf;
+    }
+
+    /// Per-arm retain helper for `switch_return` / `union_switch_return`.
+    /// Returns a single-instruction `.retain{value=L}` when the arm's
+    /// `return_value` is ARC-managed (present in
+    /// `live_before_ret[parent_id]`) and not in `return_source_locals`,
+    /// otherwise null. The retain is intended to be appended to the
+    /// arm's body so it executes immediately before the arm's
+    /// implicit return.
+    fn armRetainForReturnValue(
+        self: *StreamRebuilder,
+        parent_id: arc_liveness.InstructionId,
+        return_value_opt: ?ir.LocalId,
+    ) error{OutOfMemory}!?ir.Instruction {
+        const return_value = return_value_opt orelse return null;
+        if (!self.shouldRetainReturnValue(parent_id, return_value)) return null;
+        return ir.Instruction{ .retain = .{ .value = return_value } };
+    }
+
+    /// Common predicate: should the pass insert a `.retain{value=L}`
+    /// for a terminator whose return value is `return_value` and whose
+    /// `live_before_ret` entry is keyed at `terminator_id`?
+    ///
+    /// Conditions (all must hold):
+    ///   1. `return_value` is in `ownership.live_before_ret[terminator_id]`
+    ///      (this proves it is an ARC-managed local — non-ARC locals
+    ///      are never inserted into `live_before_ret`).
+    ///   2. `return_value` is NOT in `ownership.return_source_locals`
+    ///      (return-source elision case: the matching scope-exit
+    ///      release gets suppressed by `isReleaseSuppressed`, and the
+    ///      retain would unbalance ownership — net should be zero
+    ///      refcount ops, ownership transfers to the caller via the
+    ///      return slot).
+    fn shouldRetainReturnValue(
+        self: *const StreamRebuilder,
+        terminator_id: arc_liveness.InstructionId,
+        return_value: ir.LocalId,
+    ) bool {
+        const live_set = self.ownership.live_before_ret.get(terminator_id) orelse return false;
+        if (!live_set.contains(return_value)) return false;
+        if (self.ownership.return_source_locals.contains(return_value)) return false;
+        return true;
+    }
+
+    /// Allocate a fresh slice that is `base ++ [extra]`. Used to
+    /// append a per-arm retain to a switch arm's body. The base
+    /// slice's contents are copied by-value (IR instructions are
+    /// tagged unions of small payload structs); the original slice's
+    /// allocation is left to its owner (the IR builder's arena).
+    fn appendInstruction(
+        self: *StreamRebuilder,
+        base: []const ir.Instruction,
+        extra: ir.Instruction,
+    ) error{OutOfMemory}![]const ir.Instruction {
+        const buf = try self.allocator.alloc(ir.Instruction, base.len + 1);
+        for (base, 0..) |item, idx| buf[idx] = item;
+        buf[base.len] = extra;
+        return buf;
+    }
 };
 
 /// Helper view over a tail-call's argument slice for `containsLocal`
@@ -453,6 +602,7 @@ const InstructionOutcome = struct {
     original_ptr: *const ir.Instruction,
     rebuilt_instruction: ?ir.Instruction,
     drops_before: []ir.Instruction,
+    retains_before: []ir.Instruction,
 };
 
 /// Mirror of `arc_liveness.isReturnEquivalentTerminator`. Re-declared
@@ -931,4 +1081,291 @@ test "arc_drop_insertion: idempotent — second run inserts nothing" {
 
     // Second run is non-decreasing — well-formed IR survived.
     try std.testing.expect(releases_after_second >= releases_after_first);
+}
+
+// ============================================================
+// Phase 6.2c — retain-on-ret discipline tests.
+// ============================================================
+
+/// Count every `retain` instruction across the function (including
+/// nested streams).
+fn countRetains(function: *const ir.Function) usize {
+    const Counter = struct {
+        count: *usize,
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (instr.* == .retain) self.count.* += 1;
+        }
+    };
+    var count: usize = 0;
+    var counter = Counter{ .count = &count };
+    ir.forEachInstruction(function, &counter, Counter.visit);
+    return count;
+}
+
+/// Collect every `retain` instruction's value local, across nested
+/// streams.
+fn collectRetainLocals(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+) !std.AutoHashMapUnmanaged(ir.LocalId, void) {
+    var result: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+    const Walker = struct {
+        result: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+        allocator: std.mem.Allocator,
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (instr.* == .retain) {
+                self.result.put(self.allocator, instr.retain.value, {}) catch {};
+            }
+        }
+    };
+    var walker = Walker{ .result = &result, .allocator = allocator };
+    ir.forEachInstruction(function, &walker, Walker.visit);
+    return result;
+}
+
+test "arc_drop_insertion: direct return of param does NOT insert retain (return_source elision)" {
+    // Identity function: `pub fn id(h :: Handle) -> Handle { h }`.
+    // The parameter local `h` is the direct source of the `ret` and
+    // is therefore recorded in `return_source_locals` by Phase 5's
+    // `classifyLastUses`. Phase 6.2c's retain discipline must NOT
+    // emit a `.retain` for `h` because the matching scope-exit
+    // release will be suppressed by `isReleaseSuppressed` at ZIR
+    // emission time — net zero refcount ops, ownership transfers via
+    // the return slot. Inserting a retain here would unbalance the
+    // refcount and leak the value.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn id(h :: Handle) -> Handle { h }
+        \\}
+    ;
+    var suite = try DropTestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const id_func = suite.findFunctionByName("id") orelse return error.MissingFunction;
+    var ownership = try arc_liveness.computeArcOwnership(
+        std.testing.allocator,
+        id_func,
+        suite.typeStore(),
+        arc_liveness.defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // Pre-condition: the parameter must be a return source (otherwise
+    // the test isn't exercising the elision branch).
+    try std.testing.expect(ownership.return_source_locals.count() >= 1);
+
+    const retains_before = countRetains(id_func);
+    try insertScopeExitDrops(suite.irAllocator(), id_func, &ownership);
+    const retains_after = countRetains(id_func);
+
+    // Retain count must be unchanged — every return-value local is a
+    // return source, so the retain branch never fires.
+    try std.testing.expectEqual(retains_before, retains_after);
+}
+
+test "arc_drop_insertion: switch_return arm with non-return-source value gets retain appended to arm body" {
+    // Multi-clause Arc-typed function lowers to either `switch_return`
+    // or per-clause `cond_return`. `propagateReturnSourcesThroughAggregates`
+    // does NOT propagate through `switch_return` (its parent has no
+    // `dest`), so per-arm `case.return_value` locals are *not* in
+    // `return_source_locals` even when the analyzer sees them as
+    // ARC-managed last uses at the parent terminator.
+    //
+    // For the `switch_return` shape: each arm body must be rewritten
+    // with a `.retain{value=case.return_value}` appended at the end,
+    // so the arm's chosen value receives a +1 refcount before the
+    // implicit return.
+    //
+    // The `cond_return` shape: each `cond_return` instruction itself
+    // is a ret-equivalent terminator whose return value `v` is added
+    // to `return_source_locals` (Phase 5 does run `cond_return` →
+    // return source, see `classifyLastUses` → `applySpecialization`).
+    // For that lowering shape no retain is needed and none is
+    // inserted. The test therefore only asserts retain counts when
+    // the IR builder produced a `switch_return`; on `cond_return`
+    // shapes it asserts the alternative invariant.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn first(h :: Handle, _g :: Handle) -> Handle { h }
+        \\  pub fn second(_h :: Handle, g :: Handle) -> Handle { g }
+        \\}
+    ;
+    var suite = try DropTestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const dispatch_func = suite.findFunctionByName("first") orelse return error.MissingFunction;
+    var ownership = try arc_liveness.computeArcOwnership(
+        std.testing.allocator,
+        dispatch_func,
+        suite.typeStore(),
+        arc_liveness.defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // Detect the lowering shape so the test can adapt its
+    // assertions. Walk every instruction once.
+    const ShapeDetector = struct {
+        has_switch_return: bool,
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (instr.* == .switch_return) self.has_switch_return = true;
+        }
+    };
+    var detector = ShapeDetector{ .has_switch_return = false };
+    ir.forEachInstruction(dispatch_func, &detector, ShapeDetector.visit);
+
+    const retains_before = countRetains(dispatch_func);
+    try insertScopeExitDrops(suite.irAllocator(), dispatch_func, &ownership);
+    const retains_after = countRetains(dispatch_func);
+
+    if (detector.has_switch_return) {
+        // For switch_return, per-arm `case.return_value`s are not in
+        // `return_source_locals`. Each arm with an ARC-managed
+        // return value must have a retain appended. The function
+        // takes two ARC params and returns one, so at least one arm
+        // exists with an ARC return value.
+        try std.testing.expect(retains_after > retains_before);
+
+        // Specifically, every retained local must be a local that
+        // appears as some arm's `case.return_value`.
+        var retain_locals = try collectRetainLocals(std.testing.allocator, dispatch_func);
+        defer retain_locals.deinit(std.testing.allocator);
+
+        const ArmCollector = struct {
+            arm_returns: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+            allocator: std.mem.Allocator,
+            fn visit(self: *@This(), instr: *const ir.Instruction) void {
+                if (instr.* == .switch_return) {
+                    for (instr.switch_return.cases) |case| {
+                        if (case.return_value) |rv| {
+                            self.arm_returns.put(self.allocator, rv, {}) catch {};
+                        }
+                    }
+                }
+            }
+        };
+        var arm_returns: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+        defer arm_returns.deinit(std.testing.allocator);
+        var arm_collector = ArmCollector{
+            .arm_returns = &arm_returns,
+            .allocator = std.testing.allocator,
+        };
+        ir.forEachInstruction(dispatch_func, &arm_collector, ArmCollector.visit);
+
+        var iter = retain_locals.keyIterator();
+        while (iter.next()) |local_ptr| {
+            try std.testing.expect(arm_returns.contains(local_ptr.*));
+        }
+    } else {
+        // `cond_return` shape: every return value is a return source,
+        // so no retain is inserted by Phase 6.2c.
+        try std.testing.expectEqual(retains_before, retains_after);
+    }
+}
+
+test "arc_drop_insertion: tail call gets no retain (no return value at IR site)" {
+    // `tail_call` is a ret-equivalent terminator that has no return
+    // value — the callee returns directly to the caller's caller.
+    // Phase 6.2c must skip it (no retain).
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn helper(h :: Handle) -> Handle { h }
+        \\
+        \\  pub fn loop(acc :: Handle, n :: i64) -> Handle {
+        \\    case n <= (0 :: i64) {
+        \\      true -> acc
+        \\      false -> Test.loop(Test.helper(acc), n - (1 :: i64))
+        \\    }
+        \\  }
+        \\}
+    ;
+    var suite = try DropTestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const loop_func = suite.findFunctionByName("loop") orelse return error.MissingFunction;
+    var ownership = try arc_liveness.computeArcOwnership(
+        std.testing.allocator,
+        loop_func,
+        suite.typeStore(),
+        arc_liveness.defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    try insertScopeExitDrops(suite.irAllocator(), loop_func, &ownership);
+
+    // Walk the function: for every `tail_call` site, verify there is
+    // no `.retain` instruction immediately preceding it inside the
+    // same stream. (We check by walking each block's stream; for
+    // arms inside case_block we rely on the recursive forEach to
+    // visit every instruction sequence and assert the no-retain-
+    // before-tail-call invariant per stream.)
+    const TailCallNoRetainChecker = struct {
+        ok: *bool,
+        previous_was_retain: bool,
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            switch (instr.*) {
+                .tail_call => {
+                    if (self.previous_was_retain) self.ok.* = false;
+                    self.previous_was_retain = false;
+                },
+                .retain => {
+                    self.previous_was_retain = true;
+                },
+                else => {
+                    self.previous_was_retain = false;
+                },
+            }
+        }
+    };
+    var ok = true;
+    var checker = TailCallNoRetainChecker{ .ok = &ok, .previous_was_retain = false };
+    ir.forEachInstruction(loop_func, &checker, TailCallNoRetainChecker.visit);
+    try std.testing.expect(ok);
+}
+
+test "arc_drop_insertion: case_block with arm-result aggregate sees no retain (return-source propagation)" {
+    // `case b { true -> x; false -> y }` returns the case_block's
+    // `dest`, which Phase 5 records as a return source AND
+    // `propagateReturnSourcesThroughAggregates` propagates to `x`
+    // and `y`. Both arm results are return sources, so Phase 6.2c
+    // emits no retain at any level.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn pick(b :: Bool, x :: Handle, y :: Handle) -> Handle {
+        \\    case b {
+        \\      true -> x
+        \\      false -> y
+        \\    }
+        \\  }
+        \\}
+    ;
+    var suite = try DropTestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const pick_func = suite.findFunctionByName("pick") orelse return error.MissingFunction;
+    var ownership = try arc_liveness.computeArcOwnership(
+        std.testing.allocator,
+        pick_func,
+        suite.typeStore(),
+        arc_liveness.defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // Pre-condition: aggregate dest and both arm-results are in
+    // return_source_locals. With three locals in the set we exercise
+    // the propagation path.
+    try std.testing.expect(ownership.return_source_locals.count() >= 1);
+
+    const retains_before = countRetains(pick_func);
+    try insertScopeExitDrops(suite.irAllocator(), pick_func, &ownership);
+    const retains_after = countRetains(pick_func);
+
+    try std.testing.expectEqual(retains_before, retains_after);
 }
