@@ -950,59 +950,87 @@ const Analyzer = struct {
         last_use_local: ir.LocalId,
         ownership: *ArcOwnership,
     ) !void {
+        // `id` was the share_value's instruction id, used to populate
+        // `consume_share_sites` when consume mode was active. The
+        // borrow-by-default ABI never inserts into that table, so the
+        // parameter is unused here. Discard it explicitly to keep the
+        // signature stable for future per-callee borrow / consume
+        // metadata work.
+        _ = id;
         switch (instr) {
             .share_value => |sv| {
                 if (sv.source == last_use_local) {
-                    // Consume mode is sound only when the source local
-                    // owns its own +1 ownership unit on the cell. The
-                    // IR's aliasing instructions (local_get / local_set
-                    // / move_value, and a chained share_value whose
-                    // dest was itself shared again — rare but possible)
-                    // produce dests that *alias* the source's
-                    // ownership unit; they do not retain. Marking a
-                    // share_value(.consume) on such an alias dest
-                    // would (a) skip the retain at this site and
-                    // (b) keep the post-call release on the per-call
-                    // shared dest, netting -1 refcount on the cell
-                    // even though no caller-side ownership unit was
-                    // actually transferred. With multiple aliased
-                    // shares of the same named binding, the cell's
-                    // refcount goes negative and the cell gets recycled
-                    // out from under a still-live use.
+                    // ============================================
+                    // Consume mode is currently disabled at every
+                    // call site. See the borrow / consume audit
+                    // below for the design reasoning.
+                    // ============================================
                     //
-                    // This was the root cause of the post-flag-flip
-                    // segfault on `m = %{...}; Map.get(m, ...);
-                    // Map.get(m, ...)`: each `Map.get(m, ...)` lowers
-                    // through a fresh `local_get(d_i, source=m) ;
-                    // share_value(d'_i, source=d_i)`. The analyzer
-                    // sees each d_i as live for exactly one share —
-                    // its consume bit fires correctly under
-                    // per-local liveness but the underlying owned
-                    // local `m` is shared multiple times, so the
-                    // accumulated -1 net releases free `m`'s cell
-                    // before the second share even reads it.
+                    // Consume mode (Phase 4) was designed to skip the
+                    // share_value's retain when a local is at its
+                    // last use, transferring ownership of the cell
+                    // into the callee's argument slot. That mode is
+                    // sound only when the *callee* either releases
+                    // the input internally or transfers the
+                    // ownership unit into its return value — i.e.
+                    // the callee participates in a "consuming"
+                    // calling convention.
                     //
-                    // The conservative fix: only fire consume when
-                    // the share's source is an "owner-producing"
-                    // local — i.e. one whose definition is a fresh
-                    // ownership unit (map_init, list_init, struct_init,
-                    // union_init, call_*, param_get, capture_get,
-                    // field_get, list_*/map_get/index_get extractions,
-                    // and similar). Aliases produced by local_get,
-                    // local_set, move_value, or share_value (the per-
-                    // call dest chain) are excluded.
+                    // An audit of every runtime builtin in
+                    // `src/runtime.zig` (Map.put, Map.delete,
+                    // Map.get, Map.merge, Map.has_key, Map.size,
+                    // Map.iter, List.append, List.cons, List.head,
+                    // String.*, MArrayI64/F64.*, etc.) shows that
+                    // *no* current runtime function consumes its
+                    // input. Every runtime builtin borrows: the
+                    // caller's ownership unit is observed but never
+                    // released, and the function's return value is
+                    // a freshly-allocated cell with refcount 1.
                     //
-                    // Trade-off: aliased shares fall back to retain
-                    // mode (net 0 refcount delta per share). The lost
-                    // optimization is one retain+release pair per
-                    // aliased share. This is negligible compared to
-                    // the cell allocation cost and is the correct
-                    // semantic regardless — alias-aware liveness is
-                    // the only sound way to fire consume on aliased
-                    // sources, and that is a deeper analyzer change
-                    // tracked separately.
-                    if (self.isAliasLocal(sv.source)) return;
-                    try ownership.consume_share_sites.put(self.allocator, id, {});
+                    // User-defined Zap functions are also borrowing
+                    // by default: the IR's `param_get` retains the
+                    // parameter cell at function entry, and the
+                    // matching scope-exit release fires on the
+                    // parameter local. Without an annotation that
+                    // says "this callee consumes", marking the
+                    // caller's share as `.consume` skips the retain
+                    // but leaves the caller's (now-stale) post-call
+                    // release in place, netting -1 on the cell's
+                    // refcount and either leaking (when the cell is
+                    // still reachable through other paths) or
+                    // double-freeing (when pool reuse kicks in at
+                    // scale).
+                    //
+                    // The proper fix is per-callee borrow / consume
+                    // calling-convention metadata: each runtime
+                    // function and each user-defined Zap function
+                    // declares whether each ARC-managed argument is
+                    // borrowed or consumed, and `arc_liveness`
+                    // consults that metadata when deciding whether
+                    // to upgrade a last-use share to consume mode.
+                    // That work is the next phase of the ARC
+                    // ownership project; until it lands, the safe
+                    // ABI is "every share retains, every scope-exit
+                    // release fires", which exactly matches the
+                    // pre-Phase-4 design.
+                    //
+                    // Disabling `consume_share_sites` here is the
+                    // correct semantic regardless of whether the
+                    // share's source is fresh or aliased: even a
+                    // share of a freshly-defined owner local is
+                    // unsafe to consume into a borrowing callee,
+                    // because the borrowing callee never balances
+                    // the missing retain. The earlier alias-only
+                    // gate was therefore necessary but insufficient.
+                    //
+                    // Note: `return_source_locals` (Phase 5) and
+                    // `live_before_ret` (Phase 6 prep) remain fully
+                    // populated below. Those tables describe
+                    // dataflow at function-exit terminators, not
+                    // ownership transfer at calls, and are sound
+                    // independently of any per-callee calling
+                    // convention.
+                    return;
                 }
             },
             .ret => |r| {
@@ -1021,28 +1049,6 @@ const Analyzer = struct {
             },
             else => {},
         }
-    }
-
-    /// True when `local` is the dest of an aliasing instruction
-    /// (`local_get`, `local_set`, `move_value`, or `share_value`).
-    /// These produce dests that *alias* an existing ownership unit
-    /// rather than allocating a fresh one; consume mode at a
-    /// share_value whose source is such an alias would net -1 on
-    /// the underlying cell's refcount with no compensating
-    /// ownership transfer, breaking the consume invariant. The
-    /// caller (`applySpecialization`) uses this predicate to refuse
-    /// consume marking on alias sources.
-    fn isAliasLocal(self: *const Analyzer, local: ir.LocalId) bool {
-        for (self.records.items) |rec| {
-            switch (rec.instr.*) {
-                .local_get => |lg| if (lg.dest == local) return true,
-                .local_set => |ls| if (ls.dest == local) return true,
-                .move_value => |mv| if (mv.dest == local) return true,
-                .share_value => |sv| if (sv.dest == local) return true,
-                else => {},
-            }
-        }
-        return false;
     }
 
     /// Phase-5 prep: when a `ret v` returns a local that is itself
@@ -2064,7 +2070,7 @@ const TestSuite = struct {
 // Tests use the testing allocator. Each test owns its own TestSuite
 // and ArcOwnership.
 
-test "arc_liveness: linear last-use is consume at share_value" {
+test "arc_liveness: linear last-use share_value is not promoted to consume (borrow ABI)" {
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -2090,10 +2096,14 @@ test "arc_liveness: linear last-use is consume at share_value" {
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // Expect: at least one consume site (the share_value of `h` into
-    // the call) AND `h` recorded as a return-source local on the
-    // identity helper `use_one`.
-    try std.testing.expect(ownership.consume_share_sites.count() >= 1);
+    // Borrow-by-default ABI: every callee borrows its ARC arguments,
+    // so no last-use share_value is upgraded to consume mode. The
+    // analyzer keeps `consume_share_sites` empty regardless of the
+    // last-use shape until per-callee borrow / consume metadata
+    // exists. Return-source semantics are unaffected and still pin
+    // the identity helper's parameter as a return source on its own
+    // body — that table is exercised by the dedicated test below.
+    try std.testing.expectEqual(@as(usize, 0), ownership.consume_share_sites.count());
 }
 
 test "arc_liveness: identity function returns its parameter (return_source)" {
@@ -2151,9 +2161,11 @@ test "arc_liveness: branching case last-uses param in both arms" {
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // Each arm has a share_value of `h` to f/g; both should be
-    // consume sites.
-    try std.testing.expect(ownership.consume_share_sites.count() >= 2);
+    // Each arm has a share_value of `h` to f/g, but with the borrow-
+    // by-default ABI no share is promoted to consume. The branching
+    // shape itself is exercised by `live_before_ret` and
+    // `return_source_locals`; consume sites stay empty.
+    try std.testing.expectEqual(@as(usize, 0), ownership.consume_share_sites.count());
 }
 
 test "arc_liveness: function returning a call's result has no extra elision" {
@@ -2180,13 +2192,11 @@ test "arc_liveness: function returning a call's result has no extra elision" {
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // `h` consumed at the call; `h` is NOT a return source (the
-    // call's result is what's returned).
-    try std.testing.expect(ownership.consume_share_sites.count() >= 1);
-    // `h`'s last use is the share_value, not the ret. The ret's
-    // value is the call's dest, which is *also* an ARC local; that
-    // dest IS a return_source. So return_source_locals should
-    // contain the call's dest, not h itself.
+    // Borrow-by-default ABI: `h`'s share into the call stays as
+    // retain (not consume). The dest local of the call still flows
+    // into `ret` and is a return source — that table is the one this
+    // test pins.
+    try std.testing.expectEqual(@as(usize, 0), ownership.consume_share_sites.count());
     try std.testing.expect(ownership.return_source_locals.count() <= 1);
 }
 
@@ -2221,29 +2231,26 @@ test "arc_liveness: tail-recursion k-nucleotide shape (return + recursive call)"
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // The recursive arm consumes `m` via share_value into helper(m),
-    // and the base-case arm has `m` as the return source. Both
-    // categories must be populated.
-    try std.testing.expect(ownership.consume_share_sites.count() >= 1);
+    // Borrow-by-default ABI: the recursive-arm share of `m` stays as
+    // retain. The base-case arm still records `m` as a return source.
+    // Until per-callee borrow / consume metadata exists, the consume
+    // table is intentionally empty for every call site.
+    try std.testing.expectEqual(@as(usize, 0), ownership.consume_share_sites.count());
     try std.testing.expect(ownership.return_source_locals.count() >= 1);
 }
 
-test "arc_liveness: duplicate-arg call — every share_value of a fresh-loaded local is a consume" {
-    // Surface-language expectation from the plan:
+test "arc_liveness: duplicate-arg call leaves every share_value at retain (borrow ABI)" {
+    // Surface-language expectation from the plan was:
     //   "f(x, x) → first x retains, last x consumes".
     //
-    // Zap IR's actual lowering issues a *fresh* `param_get` (or
-    // `local_get`) for each occurrence of `x`, so every
-    // `share_value`'s source is a distinct SSA local. Each share is
-    // therefore the unique last use of its source, and every share
-    // becomes a consume site. The "first share retains, last share
-    // consumes" semantics is materialised at the IR level not by
-    // marking some shares as retain but by issuing a fresh load
-    // (which inherently retains via param_get/local_get) before
-    // each share_value. This test pins the IR-level invariant: a
-    // consume site is recorded for every share_value, because each
-    // such share_value is genuinely the last use of its source
-    // local.
+    // The borrow-by-default ABI supersedes this: until per-callee
+    // borrow / consume metadata exists, no last-use share_value is
+    // promoted to consume mode regardless of the source shape. This
+    // test pins the post-ABI-revision invariant — every share_value
+    // stays at retain — and continues to exercise that the IR builder
+    // emits one share_value per ARC argument occurrence (so a
+    // duplicate-arg call has multiple shares, each of which the
+    // analyzer leaves at retain).
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -2267,8 +2274,9 @@ test "arc_liveness: duplicate-arg call — every share_value of a fresh-loaded l
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // Count share_value instructions in the function and assert
-    // *every* one is a consume site.
+    // Count share_value instructions in the function. The borrow-
+    // by-default ABI leaves every one at retain; consume_share_sites
+    // is empty.
     var share_count: usize = 0;
     for (run_func.body) |block| {
         for (block.instructions) |instr| {
@@ -2276,7 +2284,7 @@ test "arc_liveness: duplicate-arg call — every share_value of a fresh-loaded l
         }
     }
     try std.testing.expect(share_count >= 2);
-    try std.testing.expectEqual(share_count, ownership.consume_share_sites.count());
+    try std.testing.expectEqual(@as(usize, 0), ownership.consume_share_sites.count());
 }
 
 test "arc_liveness: empty when no ARC-managed locals" {
@@ -2362,7 +2370,14 @@ test "arc_liveness: arc_managed_locals records every ARC local in the function" 
 // Phase 4 unit tests: write-back of consume modes onto share_value.
 // ============================================================
 
-test "arc_liveness: writeBackConsumeModes upgrades every consume site" {
+test "arc_liveness: writeBackConsumeModes is a no-op under borrow ABI" {
+    // Under the borrow-by-default ABI, `consume_share_sites` is empty
+    // for every function — the analyzer refuses to promote any
+    // last-use share_value to consume mode without per-callee
+    // borrow / consume metadata. The write-back walker therefore
+    // upgrades zero share_values, runs idempotently, and leaves every
+    // share_value at the default `.retain` mode. This test pins both
+    // the empty-table invariant and the lowering's resulting state.
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -2386,37 +2401,25 @@ test "arc_liveness: writeBackConsumeModes upgrades every consume site" {
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // Pre-condition: every share_value defaults to .retain.
-    var share_value_pre_count: usize = 0;
-    {
-        var walker = WriteBackWalker{
-            .next_id = 0,
-            .consumes_marked = 0,
-            .ownership = &ownership,
-        };
-        walker.walkFunction(run_func);
-        // After the walker runs once, every share_value in
-        // consume_share_sites is now .consume; second invocation
-        // should report zero new upgrades (idempotent).
-        const second = writeBackConsumeModes(run_func, &ownership);
-        try std.testing.expectEqual(@as(u64, 0), second);
-        share_value_pre_count = walker.consumes_marked;
-    }
-    try std.testing.expect(share_value_pre_count > 0);
-    try std.testing.expectEqual(@as(usize, share_value_pre_count), ownership.consume_share_sites.count());
+    try std.testing.expectEqual(@as(usize, 0), ownership.consume_share_sites.count());
 
-    // Top-level invariant: every share_value across the function
-    // body is now `.consume` whenever it appears in the consume-site
-    // table. The full structural traversal that built the IDs lives
-    // in `WriteBackWalker`; the program-level integration test
-    // re-validates the same invariant end-to-end.
+    var walker = WriteBackWalker{
+        .next_id = 0,
+        .consumes_marked = 0,
+        .ownership = &ownership,
+    };
+    walker.walkFunction(run_func);
+    try std.testing.expectEqual(@as(u64, 0), walker.consumes_marked);
+
+    // Idempotent: a second invocation reports zero upgrades.
+    const second = writeBackConsumeModes(run_func, &ownership);
+    try std.testing.expectEqual(@as(u64, 0), second);
+
+    // Every share_value remains at the default `.retain` mode.
     for (run_func.body) |block| {
         for (block.instructions) |instr| {
             if (instr == .share_value) {
-                // After write-back, the only valid mode for any
-                // share_value in this body is `.consume` (the helper
-                // function only ever lowers a single ARC argument).
-                try std.testing.expectEqual(ir.ShareMode.consume, instr.share_value.mode);
+                try std.testing.expectEqual(ir.ShareMode.retain, instr.share_value.mode);
             }
         }
     }
@@ -2444,8 +2447,10 @@ test "arc_liveness: runProgramArcOwnership populates per-function table" {
     );
     defer table.deinit();
 
-    // At least one function (`use`) must have a consume site, and at
-    // least one function (`id`) must have a return-source local.
+    // Borrow-by-default ABI: no function records any consume site.
+    // Return-source locals are unaffected by the ABI change — the
+    // identity helper `id` still records its parameter as a return
+    // source, exercising the per-function table's population.
     var saw_consume = false;
     var saw_return_source = false;
     var it = table.by_function.iterator();
@@ -2453,13 +2458,19 @@ test "arc_liveness: runProgramArcOwnership populates per-function table" {
         if (entry.value_ptr.consume_share_sites.size > 0) saw_consume = true;
         if (entry.value_ptr.return_source_locals.size > 0) saw_return_source = true;
     }
-    try std.testing.expect(saw_consume);
+    try std.testing.expect(!saw_consume);
     try std.testing.expect(saw_return_source);
-    try std.testing.expect(table.consumes_marked > 0);
+    try std.testing.expectEqual(@as(u64, 0), table.consumes_marked);
     try std.testing.expect(table.return_sources_recorded > 0);
 }
 
-test "arc_liveness: runProgramArcOwnership flips share_value mode on the IR" {
+test "arc_liveness: runProgramArcOwnership leaves every share_value at retain (borrow ABI)" {
+    // Under the borrow-by-default ABI, the program-level driver
+    // populates `return_source_locals` and `live_before_ret` for
+    // every function but leaves `consume_share_sites` empty for all.
+    // Consequently the write-back step over the IR does not promote
+    // any share_value to `.consume`; every share retains its default
+    // mode. This test pins the post-ABI-revision invariant.
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -2492,18 +2503,18 @@ test "arc_liveness: runProgramArcOwnership flips share_value mode on the IR" {
     );
     defer table.deinit();
 
-    // Post-condition: at least one share_value is now .consume.
-    var saw_consume_in_ir = false;
+    // Post-condition: every share_value is still `.retain`. No
+    // promotion occurred because `consume_share_sites` was empty.
     for (suite.ir_program.functions) |func| {
         for (func.body) |block| {
             for (block.instructions) |instr| {
-                if (instr == .share_value and instr.share_value.mode == .consume) {
-                    saw_consume_in_ir = true;
+                if (instr == .share_value) {
+                    try std.testing.expectEqual(ir.ShareMode.retain, instr.share_value.mode);
                 }
             }
         }
     }
-    try std.testing.expect(saw_consume_in_ir);
+    try std.testing.expectEqual(@as(u64, 0), table.consumes_marked);
 }
 
 // ============================================================
@@ -2663,7 +2674,9 @@ test "arc_liveness: Phase 5 — k-nucleotide-shaped tail loop populates both cat
     );
     defer ownership.deinit(std.testing.allocator);
 
-    try std.testing.expect(ownership.consume_share_sites.count() >= 1);
+    // Borrow ABI: the recursive-arm share of `m` stays at retain.
+    // The base-case arm still records `m` as a return source.
+    try std.testing.expectEqual(@as(usize, 0), ownership.consume_share_sites.count());
     try std.testing.expect(ownership.return_source_locals.count() >= 1);
 }
 
@@ -2697,45 +2710,17 @@ test "arc_liveness: Phase 5 — function returning helper(x) does not list param
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // Find the param-local for `x` so we can prove it is NOT a
-    // return source. The IR allocates parameter locals starting at
-    // 0 in source order; for `run(x :: Handle)` the param-get's dest
-    // is the function's first ARC-managed local.
-    try std.testing.expect(ownership.consume_share_sites.count() >= 1);
-    // Parameter `x` is consumed at the call, so it must not be a
-    // return source. The analyzer's soundness check (`checkSoundness`)
-    // already asserts disjointness in debug builds, but pinning the
-    // expectation here makes Phase 5's contract explicit.
-    var consumed_sources: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
-    defer consumed_sources.deinit(std.testing.allocator);
-    var iter = ownership.consume_share_sites.keyIterator();
-    while (iter.next()) |id_ptr| {
-        // For each consume site, walk the function to find the share's source.
-        const Walker = struct {
-            target_id: u32,
-            count: u32 = 0,
-            sources: *std.AutoHashMapUnmanaged(ir.LocalId, void),
-            allocator: std.mem.Allocator,
-            fn visit(self: *@This(), instr: *const ir.Instruction) void {
-                if (instr.* == .share_value) {
-                    if (self.count == self.target_id) {
-                        self.sources.put(self.allocator, instr.share_value.source, {}) catch {};
-                    }
-                    self.count += 1;
-                }
-            }
-        };
-        var walker = Walker{
-            .target_id = id_ptr.*,
-            .sources = &consumed_sources,
-            .allocator = std.testing.allocator,
-        };
-        ir.forEachInstruction(run_func, &walker, Walker.visit);
-    }
+    // Borrow ABI: parameter `x` is *not* promoted to consume mode at
+    // the helper call — every share stays at retain. The disjointness
+    // invariant therefore holds trivially because `consume_share_sites`
+    // is empty. We still pin that the test exercises the data-flow
+    // analyzer for an Arc parameter passed into a call without
+    // promoting the share, and that no return source aliases an
+    // (empty) consume source set.
+    try std.testing.expectEqual(@as(usize, 0), ownership.consume_share_sites.count());
     var ret_iter = ownership.return_source_locals.keyIterator();
-    while (ret_iter.next()) |ret_local_ptr| {
-        try std.testing.expect(!consumed_sources.contains(ret_local_ptr.*));
-    }
+    _ = &ret_iter; // The set may be empty or contain the call's dest;
+    // the disjointness invariant is trivially satisfied either way.
 }
 
 test "arc_liveness: Phase 5 — release filter suppresses return-source releases" {
