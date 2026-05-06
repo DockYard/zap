@@ -319,9 +319,28 @@ pub const MoveValue = struct {
     source: LocalId,
 };
 
+/// Ownership semantics of a `share_value` instruction. Distinguishes
+/// retain-style sharing (two live references after the share) from
+/// consume-style transfer (caller relinquishes ownership). The default
+/// is `.retain` so existing IR sites stay byte-identical until the ARC
+/// liveness pass (phase 4) explicitly upgrades selected sites.
+pub const ShareMode = enum {
+    /// Default. Emits assign + retain. Caller's local stays live;
+    /// callee's slot gets an independent ownership reference.
+    /// Pairs with a release at scope exit (unless suppressed by
+    /// `arc_share_skipped` from the escape lattice).
+    retain,
+    /// Caller transfers ownership. Emits assign only — no retain.
+    /// The source local is marked in `arc_consumed_locals` so its
+    /// scope-exit release is also suppressed. Net effect: zero
+    /// refcount operations, ownership moves from source to dest.
+    consume,
+};
+
 pub const ShareValue = struct {
     dest: LocalId,
     source: LocalId,
+    mode: ShareMode = .retain,
 };
 
 pub const ParamGet = struct {
@@ -6944,4 +6963,46 @@ test "rewriteTailCalls still rewrites primitive-only recursion" {
         }
     }
     try std.testing.expect(saw_tail_call);
+}
+
+test "ShareValue defaults to retain mode" {
+    // Phase 3: every existing IR construction site that does not
+    // explicitly set `mode` must carry `.retain`, so default behavior
+    // is preserved bit-for-bit until the ARC liveness pass starts
+    // upgrading sites in phase 4. This test pins the default and
+    // makes any accidental change to it (e.g. flipping the default
+    // to `.consume`) surface as an immediate test failure.
+    const default_share = ShareValue{ .dest = 1, .source = 2 };
+    try std.testing.expectEqual(ShareMode.retain, default_share.mode);
+
+    const explicit_consume = ShareValue{ .dest = 3, .source = 4, .mode = .consume };
+    try std.testing.expectEqual(ShareMode.consume, explicit_consume.mode);
+}
+
+test "ShareMode enum has exactly retain and consume" {
+    // Phase 3: the lowering switch in `zir_builder.zig` is exhaustive
+    // over `ShareMode`. Anyone adding a new variant must update the
+    // lowering and break the build at the switch site, but we also
+    // pin the variant set here so a renaming or accidental addition
+    // surfaces as a test diff rather than a silent semantic change.
+    const fields = std.meta.fields(ShareMode);
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+    try std.testing.expectEqualStrings("retain", fields[0].name);
+    try std.testing.expectEqualStrings("consume", fields[1].name);
+}
+
+test "Instruction.share_value carries the mode field through union storage" {
+    // Phase 3: confirm an Instruction value built with a `.consume`-
+    // mode `ShareValue` round-trips through the tagged-union storage
+    // without losing the mode. Catches any future flattening of
+    // ShareValue that accidentally drops the new field.
+    const instr: Instruction = .{
+        .share_value = .{ .dest = 5, .source = 6, .mode = .consume },
+    };
+    try std.testing.expectEqual(ShareMode.consume, instr.share_value.mode);
+
+    const default_instr: Instruction = .{
+        .share_value = .{ .dest = 7, .source = 8 },
+    };
+    try std.testing.expectEqual(ShareMode.retain, default_instr.share_value.mode);
 }

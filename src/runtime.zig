@@ -431,6 +431,28 @@ fn ensureArcStatsAtexit() void {
 // ============================================================
 
 pub const ArcRuntime = struct {
+    /// Increment the runtime `arc_consumes_total` counter. Emitted as a
+    /// ZIR call from each `share_value(.consume)` lowering so the
+    /// observable counter reflects every consume site that fired during
+    /// program execution, mirroring how `retainAny` / `releaseAny` bump
+    /// their respective counters from the hot path. The cost is one
+    /// extern function call per consume; consume mode still saves the
+    /// far more expensive retain/release pair, so net effect is a
+    /// reduction in ARC traffic.
+    pub fn noteConsume() void {
+        arc_consumes_total += 1;
+    }
+
+    /// Increment the runtime `arc_return_elisions_total` counter.
+    /// Emitted from the function-epilogue drop emission when a local's
+    /// release is suppressed because it is the source of the function's
+    /// `ret` instruction (Phase 5 wires the emission). Defined here in
+    /// Phase 3 alongside `noteConsume` so phase 5 only has to emit the
+    /// call site, not introduce the runtime symbol.
+    pub fn noteReturnElision() void {
+        arc_return_elisions_total += 1;
+    }
+
     /// Per-type sized allocator pool. Each `Arc(T).Inner` size class gets
     /// its own `std.heap.MemoryPool` so allocation becomes a free-list pop
     /// and free becomes a free-list push — no malloc/free traffic in the
