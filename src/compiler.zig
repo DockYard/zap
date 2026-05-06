@@ -2009,7 +2009,17 @@ fn runArcOwnershipAndVerify(
         zap.arc_ownership.classifyAndNormalize(alloc, function, fn_ownership, type_store) catch return error.OutOfMemory;
     }
     for (program.functions) |*function| {
-        zap.arc_verifier.verify(alloc, function) catch return error.OutOfMemory;
+        zap.arc_verifier.verify(alloc, function) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // Phase E (Phase 6 redux plan §3.E): the verifier rejects
+            // IR that violates an ARC ownership invariant. The plan
+            // is emphatic that any rejection points at an upstream
+            // pass bug, not a verifier bug — we surface it as a hard
+            // build error so the offending pass gets fixed at its
+            // source. The diagnostic was already emitted via
+            // `std.log.err` inside `verify`.
+            error.ArcInvariantViolation => return error.IrFailed,
+        };
     }
 }
 
