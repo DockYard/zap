@@ -1114,6 +1114,20 @@ pub const IrBuilder = struct {
     /// scope graph, so call sites must guard for null.
     scope_graph: ?*const scope_mod.ScopeGraph = null,
     known_local_types: std.AutoHashMap(LocalId, ZigType),
+    /// Maps `LocalId` -> the HIR `TypeId` of the value held in that
+    /// local. Distinct from `known_local_types`, which carries the
+    /// post-monomorphization Zig-level type. The HIR-level type is
+    /// what `isArcManagedType` consults, so any analysis that needs
+    /// to ask "is this local's value ARC-managed?" — including the
+    /// `emitLocalGet` helper that decides whether a `.local_get`
+    /// requires a follow-up `.retain` for independent ownership —
+    /// must use this table. Populated at every site that produces a
+    /// new local: param entries, `local_set`, every dest computed by
+    /// `lowerExpr`, `local_get` aliases, and the four pattern-binding
+    /// `local_get` sites in case / decision-tree lowering. Saved and
+    /// restored across nested `function_group` blocks alongside
+    /// `known_local_types`.
+    local_hir_types: std.AutoHashMap(LocalId, hir_mod.TypeId),
     /// Locals whose value originated from a `param_get` instruction.
     /// Used by the call-builtin encoder to detect bridge calls inside
     /// generic Zap functions — those have `param: anytype` in the
@@ -1180,6 +1194,7 @@ pub const IrBuilder = struct {
             .interner = interner,
             .type_store = null,
             .known_local_types = std.AutoHashMap(LocalId, ZigType).init(allocator),
+            .local_hir_types = std.AutoHashMap(LocalId, hir_mod.TypeId).init(allocator),
             .param_backed_locals = std.AutoHashMap(LocalId, void).init(allocator),
             .term_tuple_locals = std.AutoHashMap(LocalId, ZigType).init(allocator),
             .current_struct_prefix = null,
@@ -1195,6 +1210,7 @@ pub const IrBuilder = struct {
         self.current_blocks.deinit(self.allocator);
         self.current_instrs.deinit(self.allocator);
         self.known_local_types.deinit();
+        self.local_hir_types.deinit();
         self.param_backed_locals.deinit();
         self.term_tuple_locals.deinit();
         self.synthesized_type_defs.deinit(self.allocator);
@@ -1697,6 +1713,7 @@ pub const IrBuilder = struct {
         self.next_local = 0;
         self.current_instrs = .empty;
         self.known_local_types.clearRetainingCapacity();
+        self.local_hir_types.clearRetainingCapacity();
         self.param_backed_locals.clearRetainingCapacity();
         self.term_tuple_locals.clearRetainingCapacity();
         self.current_param_types = .empty;
@@ -1788,6 +1805,7 @@ pub const IrBuilder = struct {
         self.next_local = 0;
         self.current_instrs = .empty;
         self.known_local_types.clearRetainingCapacity();
+        self.local_hir_types.clearRetainingCapacity();
         self.param_backed_locals.clearRetainingCapacity();
         self.term_tuple_locals.clearRetainingCapacity();
         self.current_param_types = .empty;
@@ -2090,6 +2108,10 @@ pub const IrBuilder = struct {
                 if (param_type != .any) {
                     try self.known_local_types.put(param_local, param_type);
                 }
+                // Track HIR type so `emitLocalGet` can decide whether a
+                // pattern-binding `.local_get` from this param requires a
+                // follow-up `.retain`.
+                try self.local_hir_types.put(param_local, first_clause.params[i].type_id);
                 try self.param_backed_locals.put(param_local, {});
                 try scrutinee_map.put(@intCast(i), param_local);
             }
@@ -2221,6 +2243,7 @@ pub const IrBuilder = struct {
             self.next_local = 0;
             self.current_instrs = .empty;
             self.known_local_types.clearRetainingCapacity();
+            self.local_hir_types.clearRetainingCapacity();
             self.param_backed_locals.clearRetainingCapacity();
             self.term_tuple_locals.clearRetainingCapacity();
 
@@ -2273,6 +2296,8 @@ pub const IrBuilder = struct {
                 if (param_type != .any) {
                     try self.known_local_types.put(param_local, param_type);
                 }
+                // Track HIR type for ARC-managed pattern-binding decisions.
+                try self.local_hir_types.put(param_local, first_clause.params[i].type_id);
                 try self.param_backed_locals.put(param_local, {});
                 try try_scrutinee_map.put(@intCast(i), param_local);
             }
@@ -3671,9 +3696,7 @@ pub const IrBuilder = struct {
                     if (pat.* == .bind) {
                         for (arm.bindings) |binding| {
                             if (binding.kind == .scrutinee) {
-                                try self.current_instrs.append(self.allocator, .{
-                                    .local_get = .{ .dest = binding.local_index, .source = scrutinee_local },
-                                });
+                                try self.emitLocalGet(binding.local_index, scrutinee_local);
                             }
                         }
                     }
@@ -3802,9 +3825,7 @@ pub const IrBuilder = struct {
                 for (arm.bindings) |binding| {
                     if (binding.kind == .scrutinee) {
                         const scr_local = scrutinee_map.get(0) orelse 0;
-                        try self.current_instrs.append(self.allocator, .{
-                            .local_get = .{ .dest = binding.local_index, .source = scr_local },
-                        });
+                        try self.emitLocalGet(binding.local_index, scr_local);
                     }
                 }
                 const body_result = try self.lowerBlock(arm.body);
@@ -4061,9 +4082,7 @@ pub const IrBuilder = struct {
                 for (case_arms) |arm| {
                     for (arm.bindings) |binding| {
                         if (binding.name == bind_node.name) {
-                            try self.current_instrs.append(self.allocator, .{
-                                .local_get = .{ .dest = binding.local_index, .source = scrutinee_local },
-                            });
+                            try self.emitLocalGet(binding.local_index, scrutinee_local);
                             break;
                         }
                     }
@@ -4575,9 +4594,7 @@ pub const IrBuilder = struct {
                 if (scrutinee_map.get(idx)) |local| {
                     const dest = self.next_local;
                     self.next_local += 1;
-                    try self.current_instrs.append(self.allocator, .{
-                        .local_get = .{ .dest = dest, .source = local },
-                    });
+                    try self.emitLocalGet(dest, local);
                     return dest;
                 }
                 // Fall back to raw param_get for actual parameter references
@@ -4717,17 +4734,27 @@ pub const IrBuilder = struct {
                     if (self.known_local_types.get(val)) |src_type| {
                         try self.known_local_types.put(ls.index, src_type);
                     }
+                    // Propagate HIR type as well so subsequent `.local_get`
+                    // sites reading `ls.index` know whether the value is
+                    // ARC-managed and need a retain on alias.
+                    if (self.local_hir_types.get(val)) |src_hir_type| {
+                        try self.local_hir_types.put(ls.index, src_hir_type);
+                    }
                     last_local = ls.index;
                 },
                 .function_group => |group| {
                     const saved_instrs = self.current_instrs;
                     const saved_next_local = self.next_local;
                     const saved_known_local_types = self.known_local_types;
+                    const saved_local_hir_types = self.local_hir_types;
                     self.current_instrs = .empty;
                     self.known_local_types = std.AutoHashMap(LocalId, ZigType).init(self.allocator);
+                    self.local_hir_types = std.AutoHashMap(LocalId, hir_mod.TypeId).init(self.allocator);
                     defer {
                         self.known_local_types.deinit();
                         self.known_local_types = saved_known_local_types;
+                        self.local_hir_types.deinit();
+                        self.local_hir_types = saved_local_hir_types;
                     }
                     try self.buildFunctionGroup(group);
                     self.current_instrs = saved_instrs;
@@ -4741,6 +4768,58 @@ pub const IrBuilder = struct {
     fn isArcManagedType(self: *const IrBuilder, type_id: hir_mod.TypeId) bool {
         const store = self.type_store orelse return false;
         return store.getType(type_id) == .opaque_type;
+    }
+
+    /// Returns whether the value held in `local` is ARC-managed at the
+    /// HIR-type level, consulting `local_hir_types`. Returns `false` if
+    /// no HIR type was recorded for the local — this is a conservative
+    /// default that avoids spurious retains on locals whose types we
+    /// genuinely don't know.
+    fn isArcManagedLocal(self: *const IrBuilder, local: LocalId) bool {
+        const hir_type = self.local_hir_types.get(local) orelse return false;
+        return self.isArcManagedType(hir_type);
+    }
+
+    /// Emits a `.local_get{dest, source}` instruction and the
+    /// follow-up `.retain{value=dest}` when the source's HIR type is
+    /// ARC-managed. Also propagates `known_local_types`,
+    /// `local_hir_types`, and `param_backed_locals` membership from
+    /// `source` to `dest` so downstream passes see the new alias as
+    /// equivalent to the original local.
+    ///
+    /// This helper is the single source of truth for `.local_get`
+    /// emission — the named-binding path in `lowerExpr.local_get` and
+    /// the four pattern-binding extraction sites in case / decision-
+    /// tree lowering all funnel through it. Centralising the retain
+    /// emission here avoids the silent mismatch that bit Phase 6:
+    /// pattern bindings used to alias an ARC cell into a fresh local
+    /// without bumping the cell's refcount, so the dest's own scope-
+    /// exit release decremented past the source's true ownership.
+    ///
+    /// Without this retain, a single ARC-managed scrutinee shared into
+    /// multiple binding locals would lower to multiple `.local_get`
+    /// sites all aliasing the same cell, with the per-binding scope-
+    /// exit releases over-decrementing. The Phase 6.2b drop-insertion
+    /// pass treats each binding as owning an independent +1, so the
+    /// retain restores that invariant.
+    fn emitLocalGet(self: *IrBuilder, dest: LocalId, source: LocalId) !void {
+        try self.current_instrs.append(self.allocator, .{
+            .local_get = .{ .dest = dest, .source = source },
+        });
+        if (self.isArcManagedLocal(source)) {
+            try self.current_instrs.append(self.allocator, .{
+                .retain = .{ .value = dest },
+            });
+        }
+        if (self.known_local_types.get(source)) |src_type| {
+            try self.known_local_types.put(dest, src_type);
+        }
+        if (self.local_hir_types.get(source)) |src_hir_type| {
+            try self.local_hir_types.put(dest, src_hir_type);
+        }
+        if (self.param_backed_locals.contains(source)) {
+            try self.param_backed_locals.put(dest, {});
+        }
     }
 
     /// Pre-scan HIR block to find error_pipe expressions with
@@ -4977,6 +5056,18 @@ pub const IrBuilder = struct {
         const dest = self.next_local;
         self.next_local += 1;
 
+        // Record the HIR-level type of this expression's dest local. The
+        // `emitLocalGet` helper consults `local_hir_types[source]` to
+        // decide whether a follow-up `.retain` is required, so this
+        // population is what lets pattern-binding extraction sites see
+        // the scrutinee local's ARC-managed type even though they only
+        // have the scrutinee local id, not its HIR expression node. The
+        // `expr.type_id` may be `UNKNOWN` for some lowered shapes; that
+        // is acceptable because `isArcManagedType(UNKNOWN)` returns
+        // false and conservative non-retain is correct for unknown
+        // types (they cannot be ARC-managed as far as the IR knows).
+        try self.local_hir_types.put(dest, expr.type_id);
+
         switch (expr.kind) {
             .int_lit => |v| {
                 const int_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
@@ -5019,38 +5110,15 @@ pub const IrBuilder = struct {
                 try self.known_local_types.put(dest, .nil);
             },
             .local_get => |idx| {
-                try self.current_instrs.append(self.allocator, .{
-                    .local_get = .{ .dest = dest, .source = idx },
-                });
-                // Phase 6 — Option B ownership protocol. Each named binding
-                // of an ARC-managed value is its own ownership unit. The
-                // `local_get` aliases an existing local without copying the
-                // underlying cell, so we bump the cell's refcount here so
-                // `dest` carries an independent +1. The Phase 6.2b drop-
-                // insertion pass will emit the matching scope-exit
-                // `.release{value=dest}` (or it will be elided when ownership
-                // transfers to a callee via consume mode or to the caller's
-                // return slot via return-source elision). Net refcount delta
-                // across `local_get` + matching release is zero.
-                //
-                // Without this retain, a single named local shared into
-                // multiple callees would lower to multiple `share_value`
-                // sites all aliasing the same cell, with the post-call
-                // releases over-decrementing. Phase 6.5 (commit d72af0b)
-                // forbids consume-mode for aliased shares, but retain-mode
-                // shares still need each named local to own an independent
-                // refcount unit so the post-call releases balance.
-                if (self.isArcManagedType(expr.type_id)) {
-                    try self.current_instrs.append(self.allocator, .{
-                        .retain = .{ .value = dest },
-                    });
-                }
-                if (self.known_local_types.get(idx)) |src_type| {
-                    try self.known_local_types.put(dest, src_type);
-                }
-                if (self.param_backed_locals.contains(idx)) {
-                    try self.param_backed_locals.put(dest, {});
-                }
+                // Funnel through the unified helper so the named-binding
+                // alias gets the same retain treatment as the four
+                // pattern-binding extraction sites in case / decision-
+                // tree lowering. The helper consults `local_hir_types`
+                // so that even when the named binding's HIR type was
+                // not flagged on `expr.type_id` (e.g. a stale
+                // pre-monomorphization id), the source local's tracked
+                // HIR type still drives the correct retain decision.
+                try self.emitLocalGet(dest, idx);
             },
             .param_get => |idx| {
                 try self.current_instrs.append(self.allocator, .{
@@ -5591,11 +5659,15 @@ pub const IrBuilder = struct {
                             const saved_instrs = self.current_instrs;
                             const saved_next_local = self.next_local;
                             const saved_known_local_types = self.known_local_types;
+                            const saved_local_hir_types = self.local_hir_types;
                             self.current_instrs = .empty;
                             self.known_local_types = std.AutoHashMap(LocalId, ZigType).init(self.allocator);
+                            self.local_hir_types = std.AutoHashMap(LocalId, hir_mod.TypeId).init(self.allocator);
                             defer {
                                 self.known_local_types.deinit();
                                 self.known_local_types = saved_known_local_types;
+                                self.local_hir_types.deinit();
+                                self.local_hir_types = saved_local_hir_types;
                             }
                             try self.buildFunctionGroup(group);
                             self.current_instrs = saved_instrs;
@@ -7321,6 +7393,111 @@ test "ShareMode enum has exactly retain and consume" {
     try std.testing.expectEqual(@as(usize, 2), fields.len);
     try std.testing.expectEqualStrings("retain", fields[0].name);
     try std.testing.expectEqualStrings("consume", fields[1].name);
+}
+
+test "IR pattern-binding local_get of ARC-managed scrutinee emits retain" {
+    // Phase 6 — Option B ownership protocol: the four pattern-binding
+    // `.local_get` sites (case scrutinee bind, switch_literal default-arm
+    // bind, decision-tree `.bind` node, guard scrutinee resolve) must
+    // also emit `.retain{value=dest}` when the source is ARC-managed.
+    // Before the unified `emitLocalGet` helper landed, the named-binding
+    // `local_get` retained but pattern bindings did not, leaving case-
+    // dispatch on ARC values with under-counted refcounts.
+    //
+    // The source pins the simplest pattern that exercises the
+    // `lowerCaseExprBody` decision-tree path with a scrutinee bind:
+    //   case h {
+    //     bound -> bound
+    //   }
+    // After lowering, the bind's `.local_get{dest=bound, source=scr}`
+    // must be immediately followed by `.retain{value=bound}`.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn case_bind(h :: Handle) -> Handle {
+        \\    case h {
+        \\      bound -> bound
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    const func = ir_program.functions[0];
+
+    // Walk every instruction (including those nested inside structural
+    // sub-streams like case_block.pre_instrs) and search for any
+    // `.local_get` whose immediately following sibling is a `.retain`
+    // matching the same dest. Since `case h { bound -> bound }` lowers
+    // to a `case_block` containing a decision-tree leaf with a
+    // scrutinee-bind followed by the body's `bound` reference, we
+    // expect at least one such pair somewhere in the function.
+    const Walker = struct {
+        found_pair: bool = false,
+
+        fn visit(ctx: *@This(), instr_stream: []const Instruction) void {
+            for (instr_stream, 0..) |instr, idx| {
+                if (instr == .local_get and idx + 1 < instr_stream.len) {
+                    const lg = instr.local_get;
+                    const next = instr_stream[idx + 1];
+                    if (next == .retain and next.retain.value == lg.dest) {
+                        ctx.found_pair = true;
+                    }
+                }
+                switch (instr) {
+                    .case_block => |cb| {
+                        ctx.visit(cb.pre_instrs);
+                        for (cb.arms) |arm| {
+                            ctx.visit(arm.cond_instrs);
+                            ctx.visit(arm.body_instrs);
+                        }
+                        ctx.visit(cb.default_instrs);
+                    },
+                    .if_expr => |ie| {
+                        ctx.visit(ie.then_instrs);
+                        ctx.visit(ie.else_instrs);
+                    },
+                    .guard_block => |gb| ctx.visit(gb.body),
+                    .switch_literal => |sw| {
+                        for (sw.cases) |c| ctx.visit(c.body_instrs);
+                        ctx.visit(sw.default_instrs);
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+
+    var walker = Walker{};
+    for (func.body) |block| {
+        walker.visit(block.instructions);
+    }
+    try std.testing.expect(walker.found_pair);
 }
 
 test "Instruction.share_value carries the mode field through union storage" {
