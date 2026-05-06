@@ -982,6 +982,89 @@ pub const ZigType = union(enum) {
 };
 
 // ============================================================
+// Public IR helpers — used by analysis passes (e.g. arc_liveness).
+// ============================================================
+
+/// Recognises the "default" ARC-managed-type set, mirroring
+/// `IrBuilder.isArcManagedType`. Phase 6 of the k-nucleotide RSS gap
+/// plan extends this to include `.map`. Exposed here so analysis
+/// passes can share a single source of truth without instantiating
+/// an IrBuilder.
+pub fn isArcManagedTypeId(type_store: *const types_mod.TypeStore, type_id: types_mod.TypeId) bool {
+    if (type_id >= type_store.types.items.len) return false;
+    return type_store.getType(type_id) == .opaque_type;
+}
+
+/// Walks every instruction in `function` (top-level and nested
+/// inside structural sub-streams) in depth-first order, invoking
+/// `visitor.visit(instruction_pointer)` for each. Used by analysis
+/// passes that need to enumerate every instruction without
+/// re-implementing the structural recursion.
+pub fn forEachInstruction(
+    function: *const Function,
+    context: anytype,
+    comptime visitFn: fn (ctx: @TypeOf(context), instr: *const Instruction) void,
+) void {
+    for (function.body) |block| {
+        forEachInstructionInStream(block.instructions, context, visitFn);
+    }
+}
+
+fn forEachInstructionInStream(
+    stream: []const Instruction,
+    context: anytype,
+    comptime visitFn: fn (ctx: @TypeOf(context), instr: *const Instruction) void,
+) void {
+    for (stream) |*instr| {
+        visitFn(context, instr);
+        forEachInstructionChildren(instr, context, visitFn);
+    }
+}
+
+fn forEachInstructionChildren(
+    instr: *const Instruction,
+    context: anytype,
+    comptime visitFn: fn (ctx: @TypeOf(context), instr: *const Instruction) void,
+) void {
+    switch (instr.*) {
+        .if_expr => |ie| {
+            forEachInstructionInStream(ie.then_instrs, context, visitFn);
+            forEachInstructionInStream(ie.else_instrs, context, visitFn);
+        },
+        .case_block => |cb| {
+            forEachInstructionInStream(cb.pre_instrs, context, visitFn);
+            for (cb.arms) |arm| {
+                forEachInstructionInStream(arm.cond_instrs, context, visitFn);
+                forEachInstructionInStream(arm.body_instrs, context, visitFn);
+            }
+            forEachInstructionInStream(cb.default_instrs, context, visitFn);
+        },
+        .switch_literal => |sl| {
+            for (sl.cases) |c| forEachInstructionInStream(c.body_instrs, context, visitFn);
+            forEachInstructionInStream(sl.default_instrs, context, visitFn);
+        },
+        .switch_return => |sr| {
+            for (sr.cases) |c| forEachInstructionInStream(c.body_instrs, context, visitFn);
+            forEachInstructionInStream(sr.default_instrs, context, visitFn);
+        },
+        .union_switch => |us| {
+            for (us.cases) |c| forEachInstructionInStream(c.body_instrs, context, visitFn);
+        },
+        .union_switch_return => |usr| {
+            for (usr.cases) |c| forEachInstructionInStream(c.body_instrs, context, visitFn);
+        },
+        .try_call_named => |tc| {
+            forEachInstructionInStream(tc.handler_instrs, context, visitFn);
+            forEachInstructionInStream(tc.success_instrs, context, visitFn);
+        },
+        .guard_block => |gb| {
+            forEachInstructionInStream(gb.body, context, visitFn);
+        },
+        else => {},
+    }
+}
+
+// ============================================================
 // IR Builder — lowers HIR to IR
 // ============================================================
 

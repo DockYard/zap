@@ -921,8 +921,15 @@ const Pipeline = struct {
         ir_builder.type_store = type_store;
         ir_builder.scope_graph = &self.ctx.collector.graph;
         defer ir_builder.deinit();
-        return ir_builder.buildProgram(hir_program) catch
-            self.failWith("Error during IR lowering", error.IrFailed);
+        const program = ir_builder.buildProgram(hir_program) catch
+            return self.failWith("Error during IR lowering", error.IrFailed);
+        // Phase 2 of the ARC ownership initiative: run the
+        // last-use analysis on every function so it gets exercised
+        // during normal compilation. Output is observed (deinit'd
+        // immediately) — Phase 4 wires the consume side-table.
+        zap.arc_liveness.runProgramArcLiveness(self.alloc, &program, type_store) catch
+            return self.failWith("Error during ARC ownership analysis", error.IrFailed);
+        return program;
     }
 
     /// Per-struct IR build variant that threads a globally-unique
@@ -949,6 +956,8 @@ const Pipeline = struct {
         const program = ir_builder.buildProgram(hir_program) catch
             return self.failWith("Error during IR lowering", error.IrFailed);
         next_try_id.* = ir_builder.next_try_id;
+        zap.arc_liveness.runProgramArcLiveness(self.alloc, &program, type_store) catch
+            return self.failWith("Error during ARC ownership analysis", error.IrFailed);
         return program;
     }
 
@@ -1655,7 +1664,9 @@ fn rebuildStagedIr(
     ir_builder.type_store = shared_store;
     ir_builder.scope_graph = &collector.graph;
     defer ir_builder.deinit();
-    return ir_builder.buildProgram(&combined_hir) catch return error.IrFailed;
+    const program = ir_builder.buildProgram(&combined_hir) catch return error.IrFailed;
+    zap.arc_liveness.runProgramArcLiveness(alloc, &program, shared_store) catch return error.IrFailed;
+    return program;
 }
 
 fn lookupStructProgramInSlice(struct_programs: []const StructProgram, struct_name: []const u8) ?*const StructProgram {
