@@ -493,6 +493,17 @@ const StreamRebuilder = struct {
             // .map flag is flipped: the caller's post-call release
             // would decrement an already-destroyed cell.
             if (isBorrowedParameterLocal(self.function, local_id)) continue;
+            // Phase C (Phase 6 redux plan §3.C): skip LocalIds whose
+            // ownership class was refined to `.borrowed` by
+            // `arc_ownership.classifyAndNormalize` — these are
+            // produced by `.borrow_value` instructions, which alias
+            // an existing owner without bumping its refcount. A
+            // scope-exit destroy on a borrow would decrement the
+            // source's cell without a matching retain, leading to
+            // premature free. Mirrors the parameter filter above:
+            // both are borrows whose underlying owner outlives the
+            // borrow's scope.
+            if (isBorrowedLocal(self.function, local_id)) continue;
             try releases.append(self.allocator, ir.Instruction{
                 .release = .{ .value = local_id },
             });
@@ -663,6 +674,28 @@ fn isBorrowedParameterLocal(
 ) bool {
     if (local_id >= function.param_conventions.len) return false;
     return function.param_conventions[local_id] == .borrowed;
+}
+
+/// Returns true when `local_id`'s refined ownership class in
+/// `function.local_ownership` is `.borrowed`.
+///
+/// Phase C (Phase 6 redux plan §3.C): the `arc_ownership` pass
+/// classifies each `.local_get` as either `.borrow_value` or
+/// `.copy_value` and, for borrow classifications, sets
+/// `local_ownership[dest] = .borrowed`. Drop insertion uses this
+/// gate to skip the dest at scope exit — a `.borrow_value` does
+/// NOT bump the source cell's refcount, so a matching destroy
+/// would underflow the source's owner reference.
+///
+/// This complements `isBorrowedParameterLocal` (Phase B): both
+/// guard the drop set against locals whose memory ownership lives
+/// outside the function-local scope.
+fn isBorrowedLocal(
+    function: *const ir.Function,
+    local_id: ir.LocalId,
+) bool {
+    if (local_id >= function.local_ownership.len) return false;
+    return function.local_ownership[local_id] == .borrowed;
 }
 
 // ============================================================

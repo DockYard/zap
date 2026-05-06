@@ -234,7 +234,7 @@ pub const Function = struct {
     /// Phase E checks invariants against the refined classification.
     /// The slice has length `local_count` so look-ups by `LocalId`
     /// never need a bounds-tolerant fallback.
-    local_ownership: []const OwnershipClass = &.{},
+    local_ownership: []OwnershipClass = &.{},
     /// Calling convention for the result. Defaults to `.owned` for
     /// ARC-managed return types and `.trivial` for everything else.
     /// Phase E's verifier checks every `ret` instruction's source
@@ -287,6 +287,22 @@ pub const Instruction = union(enum) {
     move_value: MoveValue,
     share_value: ShareValue,
     param_get: ParamGet,
+    /// Phase C of the Phase 6 redux plan: produce a borrow alias of an
+    /// ARC-managed source. Result is `.borrowed`. No retain on `dest`,
+    /// no scope-exit destroy on `dest`. The arc_ownership pass produces
+    /// this opcode by classifying a `.local_get` whose dest's only use
+    /// is a borrowing-convention call argument or a borrow-only alias.
+    /// Phase D's verifier ensures `dest` is not destroyed within its
+    /// borrow scope and does not escape into owned storage.
+    borrow_value: BorrowValue,
+    /// Phase C of the Phase 6 redux plan: produce an independent owner
+    /// from an ARC-managed source. Lowering emits a runtime retain on
+    /// the source's cell. Result is `.owned`. Pairs with a scope-exit
+    /// destroy (modeled as `.release` until Phase E renames). Produced
+    /// by the arc_ownership pass when a `.local_get` flows into owned
+    /// storage (struct/list/map/tuple init), is captured by a closure,
+    /// or returns a borrowed parameter (return-source borrow promotion).
+    copy_value: CopyValue,
 
     // Aggregates
     tuple_init: AggregateInit,
@@ -412,6 +428,30 @@ pub const ConstAtom = struct {
 };
 
 pub const LocalGet = struct {
+    dest: LocalId,
+    source: LocalId,
+};
+
+/// Payload for the `.borrow_value` instruction. Produced by the
+/// arc_ownership pass when classifying a `.local_get` whose
+/// destination is used only as a borrow alias (e.g., a borrowing
+/// call argument). Lowers to a plain assignment in ZIR with no
+/// retain on `dest`. The borrow is valid until the enclosing
+/// borrow scope ends; Phase D's verifier checks no destroy fires
+/// on `dest` within the scope.
+pub const BorrowValue = struct {
+    dest: LocalId,
+    source: LocalId,
+};
+
+/// Payload for the `.copy_value` instruction. Produced by the
+/// arc_ownership pass when classifying a `.local_get` whose
+/// destination flows into owned storage, escapes via a closure
+/// capture, or promotes a borrowed parameter to ownership at a
+/// `ret` site. Lowers to assignment + `retainAny` in ZIR. The
+/// caller is responsible for matching this with a scope-exit
+/// destroy on `dest` (drop insertion handles this today).
+pub const CopyValue = struct {
     dest: LocalId,
     source: LocalId,
 };
@@ -5005,6 +5045,20 @@ pub const IrBuilder = struct {
     /// exit releases over-decrementing. The Phase 6.2b drop-insertion
     /// pass treats each binding as owning an independent +1, so the
     /// retain restores that invariant.
+    ///
+    /// Phase C of the Phase 6 redux plan: this helper is now a
+    /// transitional shim. The IR builder still produces `.local_get +
+    /// .retain` here so that existing IR-level tests and pre-
+    /// arc_ownership consumers (CTFE attribute eval is post-
+    /// arc_ownership; HIR / monomorphize / arc_liveness are pre-
+    /// arc_ownership and consume `.local_get`) keep their current
+    /// shape. The new `arc_ownership.classifyAndNormalize` pass walks
+    /// each function's body after `arc_liveness` and replaces every
+    /// `.local_get` with an explicit `.borrow_value` (no retain) or
+    /// `.copy_value` (lowering emits the retain at ZIR time). When
+    /// the conversion is total — i.e., no consumer below
+    /// `arc_ownership` reads `.local_get` anymore — this helper can
+    /// be retired and the explicit forms emitted directly.
     fn emitLocalGet(self: *IrBuilder, dest: LocalId, source: LocalId) !void {
         try self.current_instrs.append(self.allocator, .{
             .local_get = .{ .dest = dest, .source = source },

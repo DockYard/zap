@@ -626,6 +626,23 @@ pub const InterproceduralAnalyzer = struct {
                     }
                 },
 
+                // Phase C: borrow_value / copy_value share the same
+                // alias-tracking semantics as local_get for the
+                // interprocedural escape lattice — both produce a
+                // dest local that aliases the same parameter slot
+                // memberships as the source.
+                .borrow_value => |bv| {
+                    if (aliases.get(bv.source)) |param_set| {
+                        try aliases.put(bv.dest, param_set);
+                    }
+                },
+
+                .copy_value => |cv| {
+                    if (aliases.get(cv.source)) |param_set| {
+                        try aliases.put(cv.dest, param_set);
+                    }
+                },
+
                 .local_set => |ls| {
                     if (aliases.get(ls.value)) |param_set| {
                         try aliases.put(ls.dest, param_set);

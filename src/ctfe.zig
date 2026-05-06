@@ -811,6 +811,14 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(std.mem.asBytes(&v.source));
         },
+        .borrow_value => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.source));
+        },
+        .copy_value => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.source));
+        },
         .local_set => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(std.mem.asBytes(&v.value));
@@ -1498,6 +1506,22 @@ pub const Interpreter = struct {
             // === Locals ===
             .local_get => |lg| {
                 frame.setLocal(lg.dest, try self.readLocal(frame, lg.source));
+                return .continued;
+            },
+            .borrow_value => |bv| {
+                // Phase C: a borrow-alias has the same value semantics
+                // as `.local_get` at compile time — no runtime retain
+                // is observable inside the CTFE interpreter, so the
+                // alias simply copies the source's value handle.
+                frame.setLocal(bv.dest, try self.readLocal(frame, bv.source));
+                return .continued;
+            },
+            .copy_value => |cv| {
+                // Phase C: a copy of an ARC owner also has plain
+                // value-aliasing semantics inside CTFE — refcount
+                // bookkeeping is a runtime concept that the
+                // interpreter does not model.
+                frame.setLocal(cv.dest, try self.readLocal(frame, cv.source));
                 return .continued;
             },
             .local_set => |ls| {

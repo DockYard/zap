@@ -307,6 +307,27 @@ pub const GeneralizedEscapeAnalyzer = struct {
                 const src_ownership = self.ctx.getOwnership(.{ .function = func_id, .local = lg.source });
                 try self.ctx.setOwnership(.{ .function = func_id, .local = lg.dest }, src_ownership);
             },
+            // Phase C: borrow_value and copy_value mirror local_get for
+            // escape analysis purposes — both create an alias whose
+            // escape and ownership state derive from the source. The
+            // distinction (retain vs no retain) is a refcount-bookkeeping
+            // concern handled at ZIR lowering, not an escape concern.
+            .borrow_value => |bv| {
+                try self.addAlias(func_id, bv.dest, bv.source);
+                const src_escape = self.ctx.getEscape(.{ .function = func_id, .local = bv.source });
+                try self.setEscapeAndEnqueue(func_id, bv.dest, src_escape);
+                try self.propagateAllocSite(func_id, bv.source, bv.dest);
+                const src_ownership = self.ctx.getOwnership(.{ .function = func_id, .local = bv.source });
+                try self.ctx.setOwnership(.{ .function = func_id, .local = bv.dest }, src_ownership);
+            },
+            .copy_value => |cv| {
+                try self.addAlias(func_id, cv.dest, cv.source);
+                const src_escape = self.ctx.getEscape(.{ .function = func_id, .local = cv.source });
+                try self.setEscapeAndEnqueue(func_id, cv.dest, src_escape);
+                try self.propagateAllocSite(func_id, cv.source, cv.dest);
+                const src_ownership = self.ctx.getOwnership(.{ .function = func_id, .local = cv.source });
+                try self.ctx.setOwnership(.{ .function = func_id, .local = cv.dest }, src_ownership);
+            },
             .move_value => |mv| {
                 try self.addAlias(func_id, mv.dest, mv.source);
                 const src_escape = self.ctx.getEscape(.{ .function = func_id, .local = mv.source });

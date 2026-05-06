@@ -488,6 +488,18 @@ pub const UseDefInfo = struct {
                 try info.recordDef(lg.dest, block);
                 try info.recordUse(lg.source, block);
             },
+            // Phase C: borrow_value / copy_value have the same
+            // use/def shape as local_get for region-solver use-def
+            // analysis. The runtime distinction (no retain vs retain)
+            // is invisible to dataflow.
+            .borrow_value => |bv| {
+                try info.recordDef(bv.dest, block);
+                try info.recordUse(bv.source, block);
+            },
+            .copy_value => |cv| {
+                try info.recordDef(cv.dest, block);
+                try info.recordUse(cv.source, block);
+            },
             .local_set => |ls| {
                 try info.recordDef(ls.dest, block);
                 try info.recordUse(ls.value, block);

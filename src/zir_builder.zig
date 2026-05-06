@@ -3664,6 +3664,8 @@ pub const ZirDriver = struct {
             const source_local: ?ir.LocalId = switch (instr) {
                 .local_set => |ls| if (ls.dest == local) ls.value else null,
                 .local_get => |lg| if (lg.dest == local) lg.source else null,
+                .borrow_value => |bv| if (bv.dest == local) bv.source else null,
+                .copy_value => |cv| if (cv.dest == local) cv.source else null,
                 .move_value => |mv| if (mv.dest == local) mv.source else null,
                 .share_value => |sv| if (sv.dest == local) sv.source else null,
                 else => null,
@@ -3705,6 +3707,12 @@ pub const ZirDriver = struct {
                 .make_closure => |mc| if (mc.dest == local) return .{ .function_id = mc.function, .captures = mc.captures },
                 .local_get => |lg| if (lg.dest == local) {
                     if (findClosureTargetInInstrsRec(instrs, lg.source, visited, visited_alloc)) |target| return target;
+                },
+                .borrow_value => |bv| if (bv.dest == local) {
+                    if (findClosureTargetInInstrsRec(instrs, bv.source, visited, visited_alloc)) |target| return target;
+                },
+                .copy_value => |cv| if (cv.dest == local) {
+                    if (findClosureTargetInInstrsRec(instrs, cv.source, visited, visited_alloc)) |target| return target;
                 },
                 .local_set => |ls| if (ls.dest == local) {
                     if (findClosureTargetInInstrsRec(instrs, ls.value, visited, visited_alloc)) |target| return target;
@@ -4135,6 +4143,62 @@ pub const ZirDriver = struct {
                     try self.closure_function_map.put(self.allocator, lg.dest, func_id);
                 if (self.local_refs.get(lg.source)) |value_ref| {
                     try self.local_refs.put(self.allocator, lg.dest, value_ref);
+                }
+            },
+            // Phase C: borrow_value lowers to a plain value-alias —
+            // identical propagation to local_get, with NO runtime
+            // retain. The borrow scope owner (the source) keeps its
+            // refcount; dest is never destroyed at scope exit (drop
+            // insertion skips borrowed locals; verifier will enforce
+            // this in Phase E).
+            .borrow_value => |bv| {
+                try self.propagateReuseBackedStructLocal(bv.dest, bv.source);
+                try self.propagateReuseBackedUnionLocal(bv.dest, bv.source);
+                try self.propagateReuseBackedTupleLocal(bv.dest, bv.source);
+                try self.propagateParamDerivedClosureLocal(bv.dest, bv.source);
+                if (self.closure_function_map.get(bv.source)) |func_id|
+                    try self.closure_function_map.put(self.allocator, bv.dest, func_id);
+                if (self.local_refs.get(bv.source)) |value_ref| {
+                    try self.local_refs.put(self.allocator, bv.dest, value_ref);
+                }
+            },
+            // Phase C: copy_value lowers to value-alias plus a runtime
+            // retain on the source's cell, producing an independent
+            // owner. The matching scope-exit destroy is emitted by the
+            // arc_drop_insertion pass (today: a `.release` IR
+            // instruction lowered to a `releaseAny` runtime call).
+            // Follows the post-Phase-6.8 lowering for `.local_get` of
+            // ARC sources, but is now produced explicitly by the
+            // arc_ownership classifier rather than emitted at every
+            // `.local_get` site.
+            .copy_value => |cv| {
+                try self.propagateReuseBackedStructLocal(cv.dest, cv.source);
+                try self.propagateReuseBackedUnionLocal(cv.dest, cv.source);
+                try self.propagateReuseBackedTupleLocal(cv.dest, cv.source);
+                try self.propagateParamDerivedClosureLocal(cv.dest, cv.source);
+                if (self.closure_function_map.get(cv.source)) |func_id|
+                    try self.closure_function_map.put(self.allocator, cv.dest, func_id);
+                if (self.local_refs.get(cv.source)) |value_ref| {
+                    try self.local_refs.put(self.allocator, cv.dest, value_ref);
+
+                    if (!self.shouldSkipArc(cv.source)) {
+                        const materialized_ref = try self.materializeValueRef(value_ref);
+                        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                        if (rt_import == error_ref) return error.EmitFailed;
+                        const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
+                        if (arc_runtime == error_ref) return error.EmitFailed;
+                        const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
+                        if (retain_fn == error_ref) return error.EmitFailed;
+                        const args = [_]u32{materialized_ref};
+                        _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
+                    } else {
+                        // Pair the suppression with the eventual
+                        // scope-exit `.release` so we don't release a
+                        // cell that was never retained — same
+                        // bookkeeping the share_value retain branch
+                        // uses for stack-eligible sources.
+                        try self.arc_share_skipped.put(self.allocator, cv.dest, {});
+                    }
                 }
             },
             .local_set => |ls| {
@@ -7439,6 +7503,8 @@ pub const ZirDriver = struct {
             .reset => |value| value.dest,
             .reuse_alloc => |value| value.dest,
             .local_get => |value| value.dest,
+            .borrow_value => |value| value.dest,
+            .copy_value => |value| value.dest,
             .local_set => |value| value.dest,
             .move_value => |value| value.dest,
             .share_value => |value| value.dest,
