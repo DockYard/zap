@@ -1125,8 +1125,12 @@ pub const ZigType = union(enum) {
 /// an IrBuilder.
 pub fn isArcManagedTypeId(type_store: *const types_mod.TypeStore, type_id: types_mod.TypeId) bool {
     if (type_id >= type_store.types.items.len) return false;
-    const t = type_store.getType(type_id);
-    return t == .opaque_type or t == .map;
+    // The `.map` flip is reserved for Phase F (the milestone). Phase A
+    // populates ParamConvention metadata for `.map` parameters in
+    // anticipation, but the metadata is consulted only when the flag is
+    // flipped. Until then, the predicate stays at `.opaque_type` only —
+    // matching pre-Phase-6-redux behavior so Phase A is pure plumbing.
+    return type_store.getType(type_id) == .opaque_type;
 }
 
 /// Default `ParamConvention` for a parameter of HIR type `type_id`.
@@ -4927,8 +4931,8 @@ pub const IrBuilder = struct {
 
     fn isArcManagedType(self: *const IrBuilder, type_id: hir_mod.TypeId) bool {
         const store = self.type_store orelse return false;
-        const t = store.getType(type_id);
-        return t == .opaque_type or t == .map;
+        // See `isArcManagedTypeId` above — flag flip is Phase F.
+        return store.getType(type_id) == .opaque_type;
     }
 
     /// Returns whether the value held in `local` is ARC-managed at the
