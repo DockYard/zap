@@ -6573,6 +6573,31 @@ pub const ZirDriver = struct {
                     // because ownership flowed into the function's
                     // return slot (return-source elision — phase 5).
                     // Suppress the release to keep the pair balanced.
+                    //
+                    // Phase 5: when the elision is specifically due to
+                    // return-source ownership transfer, emit a ZIR call
+                    // to `ArcRuntime.noteReturnElision` so the runtime
+                    // `arc_return_elisions_total` counter is bumped at
+                    // the program point where the release would have
+                    // been emitted. Mirrors how `noteConsume` is wired
+                    // from the share_value(.consume) lowering: one call
+                    // per elided release. The three suppression causes
+                    // are disjoint by construction (escape analysis
+                    // operates over `dest` locals while consume/return
+                    // operate over `source`/`ret-value` locals; the
+                    // analyzer's `checkSoundness` further asserts
+                    // consume and return are disjoint), so no double-
+                    // counting is possible.
+                    if (self.arc_returned_locals.contains(rel.value)) {
+                        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                        if (rt_import == error_ref) return error.EmitFailed;
+                        const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
+                        if (arc_runtime == error_ref) return error.EmitFailed;
+                        const note_return_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "noteReturnElision", 17);
+                        if (note_return_fn == error_ref) return error.EmitFailed;
+                        const args = [_]u32{};
+                        _ = zir_builder_emit_call_ref(self.handle, note_return_fn, &args, 0);
+                    }
                     return;
                 }
                 if (!self.shouldSkipArc(rel.value)) {

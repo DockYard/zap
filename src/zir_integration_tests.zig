@@ -3149,3 +3149,94 @@ test "ZIR: Phase 4 Map workload byte-exact with retain/release balance check" {
     try std.testing.expect(retains >= releases);
 }
 
+// ----------------------------------------------------------------
+// Phase 5: return-source drop elision counter regression baseline.
+// ----------------------------------------------------------------
+
+// Phase 5 wires `arc_returned_locals` into the release filter and
+// emits a `noteReturnElision` ZIR call at every elision point. The
+// runtime counter `arc_return_elisions_total` must remain at zero
+// for any program whose only ARC-managed types are *not* yet flagged
+// (i.e., `.map`, `.list`, `.string_type`, `.marray_type`). Phase 6
+// flips the flag, at which point this test's counter expectation
+// will need to update — but until then, an unexpected non-zero
+// reading here would mean Phase 5's emission accidentally fired on
+// a non-`.opaque_type` local, surfacing a regression in either
+// `isArcManagedTypeId` or the analyzer's filter.
+test "ZIR: Phase 5 return-elision counter stays zero for Map workload (pre-Phase-6)" {
+    var result = try compileAndRunWithEnv(
+        \\pub struct TestProg {
+        \\  pub fn loop(m :: %{i64 => i64}, i :: i64, n :: i64) -> %{i64 => i64} {
+        \\    if i >= n {
+        \\      m
+        \\    } else {
+        \\      next = Map.put(m, i, i)
+        \\      TestProg.loop(next, i + (1 :: i64), n)
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    seed = %{-1 :: i64 => 0 :: i64}
+        \\    cleared = Map.delete(seed, -1 :: i64)
+        \\    result = TestProg.loop(cleared, 0 :: i64, 100 :: i64)
+        \\    Kernel.inspect(Map.get(result, 50 :: i64, -1 :: i64))
+        \\    "done"
+        \\  }
+        \\}
+    ,
+        &.{.{ .name = "ZAP_ARC_STATS", .value = "1" }},
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("50\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    // `.map` is not yet ARC-managed, so neither consumes_total nor
+    // return_elisions_total has anything to bump. Phase 6 flips the
+    // flag and tightens this assertion.
+    const return_elisions_total = parseArcStatCounter(result.stderr, "return_elisions_total") orelse
+        return error.RunFailed;
+    try std.testing.expectEqual(@as(u64, 0), return_elisions_total);
+    const consumes_total = parseArcStatCounter(result.stderr, "consumes_total") orelse
+        return error.RunFailed;
+    try std.testing.expectEqual(@as(u64, 0), consumes_total);
+}
+
+// Phase 5 byte-exact regression: a non-ARC integer-arithmetic
+// workload must produce zero return-elision counter activity. The
+// Phase 5 emission lives entirely inside the `release`-instruction
+// lowering, so a program with no `release` instructions in its IR
+// must never bump the counter. Pins that the lowering's
+// `arc_returned_locals.contains(...)` guard does not accidentally
+// fire on unrelated programs.
+//
+// Note: a program with zero ARC traffic also never registers the
+// `ZAP_ARC_STATS=1` atexit hook — `ensureArcStatsAtexit` is gated
+// on the first ARC counter bump, so a stats-line absence in stderr
+// is itself the proof that no ARC operation (including return-source
+// elisions) fired. We accept either an absent dump line or an
+// explicit `return_elisions_total=0` reading; both are equivalent
+// observations of the load-bearing invariant.
+test "ZIR: Phase 5 return-elision counter stays zero for non-ARC workload" {
+    var result = try compileAndRunWithEnv(
+        \\pub struct TestProg {
+        \\  pub fn add(a :: i64, b :: i64) -> i64 {
+        \\    a + b
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(TestProg.add(20 :: i64, 22 :: i64))
+        \\    "done"
+        \\  }
+        \\}
+    ,
+        &.{.{ .name = "ZAP_ARC_STATS", .value = "1" }},
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    if (parseArcStatCounter(result.stderr, "return_elisions_total")) |return_elisions_total| {
+        try std.testing.expectEqual(@as(u64, 0), return_elisions_total);
+    }
+    // Else: no stats dumped because no ARC traffic fired — also a
+    // valid observation that the counter stayed at zero.
+}
+

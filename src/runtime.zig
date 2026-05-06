@@ -457,7 +457,17 @@ pub const ArcRuntime = struct {
     /// `ret` instruction (Phase 5 wires the emission). Defined here in
     /// Phase 3 alongside `noteConsume` so phase 5 only has to emit the
     /// call site, not introduce the runtime symbol.
+    ///
+    /// Also ensures the `ZAP_ARC_STATS=1` atexit hook is registered so
+    /// programs whose ARC-managed types use bump allocation — and
+    /// therefore never run the per-pool atexit-registration path — still
+    /// emit the counter dump on exit when the env var is set. The
+    /// `ensureArcStatsAtexit` guard is idempotent so the cost is one
+    /// boolean compare-branch on every elision after the first; mirrors
+    /// the `noteConsume` symmetry so a return-elision-only workload
+    /// (one that never fires a consume site) still dumps stats.
     pub fn noteReturnElision() void {
+        ensureArcStatsAtexit();
         arc_return_elisions_total += 1;
     }
 
