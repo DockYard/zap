@@ -293,6 +293,136 @@ pub fn Arc(comptime T: type) type {
 }
 
 // ============================================================
+// ARC instrumentation counters (Phase 1 of the k-nucleotide RSS
+// roadmap — see `docs/k-nucleotide-rss-gap-implementation-plan.md`).
+//
+// Pure measurement infrastructure: every ARC retain / release path
+// in the runtime increments one of these counters, and every pool
+// tracks its own per-thread high-water-mark of simultaneously-live
+// cells. The Phase 4-5 ownership pass will later populate
+// `arc_consumes_total` and `arc_return_elisions_total`; for now they
+// stay zero so callers (tests, stat dumps, future passes) have stable
+// hooks to drop into.
+//
+// Setting `ZAP_ARC_STATS=1` in the environment causes the program to
+// dump these counters on exit through an `atexit` hook. The dump
+// reports global counters, then per-pool registered stats — pool name
+// (Zig type name) and per-pool live high-water-mark. Pool HWM is the
+// load-bearing signal for the RSS gap: peak resident set ≈ Σ pool HWM,
+// regardless of total alloc count, so a bounded HWM under tail
+// recursion proves the leak has been closed.
+//
+// Threading: counters are plain `u64` — Zap is single-threaded today.
+// If concurrency lands, swap each `u64` for `std.atomic.Value(u64)`.
+// ============================================================
+
+pub var arc_retains_total: u64 = 0;
+pub var arc_releases_total: u64 = 0;
+pub var arc_consumes_total: u64 = 0;
+pub var arc_return_elisions_total: u64 = 0;
+
+/// Per-pool live-cell statistics. Each pool wrapper (e.g.
+/// `ArcRuntime.ArcPool(T)`, `MArrayOf(T).InnerPool`, `Map(K,V).SelfPool`)
+/// owns one of these and registers it with `pool_stats_head` on first
+/// allocation. The registration is idempotent: a `registered` flag
+/// guarantees a pool is linked exactly once even though `note*`
+/// helpers run on every allocation/deallocation.
+pub const PoolStats = struct {
+    name: []const u8,
+    live: u64 = 0,
+    high_water: u64 = 0,
+    registered: bool = false,
+    next: ?*PoolStats = null,
+
+    pub fn noteAllocation(self: *PoolStats) void {
+        registerIfNeeded(self);
+        self.live += 1;
+        if (self.live > self.high_water) self.high_water = self.live;
+    }
+
+    pub fn noteDeallocation(self: *PoolStats) void {
+        // The decrement is unconditional; pool destroy is invoked
+        // exactly once per cell by the runtime, mirroring `create`.
+        if (self.live > 0) self.live -= 1;
+    }
+};
+
+var pool_stats_head: ?*PoolStats = null;
+
+fn registerIfNeeded(stats: *PoolStats) void {
+    if (stats.registered) return;
+    stats.registered = true;
+    stats.next = pool_stats_head;
+    pool_stats_head = stats;
+}
+
+/// Snapshot a single pool's stats line. Tests / external callers can
+/// walk `pool_stats_head` directly to assert HWM bounds without
+/// stringifying the whole dump. The accessor is deliberately a free
+/// function so future locking can be added in one place.
+pub fn iteratePoolStats() ?*PoolStats {
+    return pool_stats_head;
+}
+
+/// Print the global ARC counters and every registered pool's
+/// high-water-mark through `write_line`. The callback indirection lets
+/// the same dump routine target stderr (the atexit hook) and arbitrary
+/// future sinks (test capture buffers, log files) without depending on
+/// the std.Io writer interface — this file is shared between the
+/// compiler-host process and the Zap-binary runtime, and the latter
+/// must avoid pulling in any std.Io infrastructure that the embedded
+/// build doesn't link.
+pub fn dumpArcStats(write_line: *const fn ([]const u8) void) void {
+    var line_buf: [256]u8 = undefined;
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] retains_total={d} releases_total={d} consumes_total={d} return_elisions_total={d}\n", .{
+        arc_retains_total,
+        arc_releases_total,
+        arc_consumes_total,
+        arc_return_elisions_total,
+    })) |line| {
+        write_line(line);
+    } else |_| {}
+    var cursor = pool_stats_head;
+    while (cursor) |stats| : (cursor = stats.next) {
+        if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] pool={s} live={d} high_water={d}\n", .{
+            stats.name, stats.live, stats.high_water,
+        })) |line| {
+            write_line(line);
+        } else |_| {}
+    }
+}
+
+fn writeLineToStderr(bytes: []const u8) void {
+    posixWrite(STDERR_FD, bytes);
+}
+
+/// Convenience wrapper that writes the dump to stderr. Used by the
+/// `atexit` hook so stats survive even if stdout was redirected to a
+/// pipe that closed early.
+pub fn dumpArcStatsToStderr() void {
+    flushStdoutBuf();
+    dumpArcStats(writeLineToStderr);
+}
+
+fn arcStatsAtexit() callconv(.c) void {
+    dumpArcStatsToStderr();
+}
+
+var arc_stats_atexit_registered: bool = false;
+
+/// Register the `ZAP_ARC_STATS=1` exit hook on first pool registration.
+/// Cheap to call repeatedly — the boolean guard short-circuits after
+/// the first invocation. The env-var check is done once and cached
+/// implicitly through the registered flag.
+fn ensureArcStatsAtexit() void {
+    if (arc_stats_atexit_registered) return;
+    arc_stats_atexit_registered = true;
+    const value = envGetRuntime("ZAP_ARC_STATS") orelse return;
+    if (value.len == 0 or value[0] == '0') return;
+    _ = atexit(arcStatsAtexit);
+}
+
+// ============================================================
 // ArcRuntime — Non-generic ARC helpers for ZIR (spec §31.4)
 //
 // ZIR cannot express generic instantiation, so ArcRuntime
@@ -318,13 +448,17 @@ pub const ArcRuntime = struct {
         return struct {
             const Pool = std.heap.MemoryPool(Arc(T).Inner);
             threadlocal var pool: Pool = .empty;
+            threadlocal var stats: PoolStats = .{ .name = "Arc(" ++ @typeName(T) ++ ")" };
 
             fn create() *Arc(T).Inner {
+                ensureArcStatsAtexit();
+                stats.noteAllocation();
                 return pool.create(std.heap.page_allocator) catch
                     @panic("ArcRuntime: ArcPool out of memory");
             }
 
             fn destroy(inner: *Arc(T).Inner) void {
+                stats.noteDeallocation();
                 pool.destroy(inner);
             }
         };
@@ -437,6 +571,7 @@ pub const ArcRuntime = struct {
             return releaseAny(allocator, unwrapped);
         }
         const T = arcPtrChild(@TypeOf(ptr));
+        arc_releases_total += 1;
         releaseArcAny(T, allocator, ptr);
     }
 
@@ -534,11 +669,13 @@ pub const ArcRuntime = struct {
         if (comptime hasInlineArcHeader(T)) {
             const mut: *T = @constCast(ptr);
             mut.header.retain();
+            arc_retains_total += 1;
             return;
         }
         const Inner = Arc(T).Inner;
         const inner: *Inner = @constCast(@fieldParentPtr("value", ptr));
         inner.header.retain();
+        arc_retains_total += 1;
     }
 
     /// Retain through an optional Arc pointer: `?*const T` becomes a no-op
@@ -636,13 +773,17 @@ pub fn MArrayOf(comptime T: type) type {
         const InnerPool = struct {
             const PoolT = std.heap.MemoryPool(Inner);
             threadlocal var pool: PoolT = .empty;
+            threadlocal var stats: PoolStats = .{ .name = "MArrayOf(" ++ @typeName(T) ++ ").Inner" };
 
             fn create() *Inner {
+                ensureArcStatsAtexit();
+                stats.noteAllocation();
                 return pool.create(std.heap.page_allocator) catch
                     @panic("MArray inner pool: out of memory");
             }
 
             fn destroy(inner: *Inner) void {
+                stats.noteDeallocation();
                 pool.destroy(inner);
             }
         };
@@ -705,6 +846,7 @@ pub fn MArrayOf(comptime T: type) type {
             const handle = array orelse return null;
             const inner: *Inner = @constCast(innerOf(handle));
             inner.header.retain();
+            arc_retains_total += 1;
             return handle;
         }
 
@@ -717,6 +859,7 @@ pub fn MArrayOf(comptime T: type) type {
         pub fn release(array: ?*const Self) void {
             const handle = array orelse return;
             const inner: *Inner = @constCast(innerOf(handle));
+            arc_releases_total += 1;
             if (inner.header.release()) {
                 std.heap.page_allocator.free(inner.items[0..inner.len]);
                 InnerPool.destroy(inner);
@@ -3108,13 +3251,17 @@ pub fn Map(comptime K: type, comptime V: type) type {
         const SelfPool = struct {
             const PoolT = std.heap.MemoryPool(Self);
             threadlocal var pool: PoolT = .empty;
+            threadlocal var stats: PoolStats = .{ .name = "Map(" ++ @typeName(K) ++ "," ++ @typeName(V) ++ ").Self" };
 
             fn create() *Self {
+                ensureArcStatsAtexit();
+                stats.noteAllocation();
                 return pool.create(std.heap.page_allocator) catch
                     @panic("Map cell pool: out of memory");
             }
 
             fn destroy(cell: *Self) void {
+                stats.noteDeallocation();
                 pool.destroy(cell);
             }
         };
@@ -3122,13 +3269,17 @@ pub fn Map(comptime K: type, comptime V: type) type {
         const NodePool = struct {
             const PoolT = std.heap.MemoryPool(HamtNode);
             threadlocal var pool: PoolT = .empty;
+            threadlocal var stats: PoolStats = .{ .name = "Map(" ++ @typeName(K) ++ "," ++ @typeName(V) ++ ").HamtNode" };
 
             fn create() *HamtNode {
+                ensureArcStatsAtexit();
+                stats.noteAllocation();
                 return pool.create(std.heap.page_allocator) catch
                     @panic("Map node pool: out of memory");
             }
 
             fn destroy(node: *HamtNode) void {
+                stats.noteDeallocation();
                 pool.destroy(node);
             }
         };
@@ -3222,6 +3373,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
             if (map) |m| {
                 const mut: *Self = @constCast(m);
                 mut.header.retain();
+                arc_retains_total += 1;
             }
             return map;
         }
@@ -3233,6 +3385,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
             if (map == null) return;
             const m = map.?;
             const mut: *Self = @constCast(m);
+            arc_releases_total += 1;
             if (!mut.header.release()) return;
             // Final owner — tear down owned children before destroying the cell.
             if (m.repr_tag == 0) {

@@ -2890,3 +2890,38 @@ test "ZIR: MArrayI64 mutate-then-read across both element kinds in one program" 
     try std.testing.expectEqualStrings("26\n2\n6\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
+
+// Phase-1 microbench for the k-nucleotide RSS roadmap. Mirrors
+// `src/test_reductions/persistent_map_tail_loop.zap`: a tail-recursive
+// `Map.put` accumulator threaded over a small but non-trivial bound.
+// The microbench's job is to make the persistent-Map RSS leak observable
+// at fast iteration speed; later phases tighten counter / RSS assertions
+// once the ARC ownership pass populates the consume / return-elision
+// hooks. For now the test only asserts the program runs to completion
+// and emits the expected lookup result, which proves the runtime
+// substrate handles the workload end-to-end.
+test "ZIR: persistent-map tail loop microbench (Phase 1 RSS reproducer)" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn loop(m :: %{i64 => i64}, i :: i64, n :: i64) -> %{i64 => i64} {
+        \\    if i >= n {
+        \\      m
+        \\    } else {
+        \\      next = Map.put(m, i, i)
+        \\      TestProg.loop(next, i + (1 :: i64), n)
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    seed = %{-1 :: i64 => 0 :: i64}
+        \\    cleared = Map.delete(seed, -1 :: i64)
+        \\    result = TestProg.loop(cleared, 0 :: i64, 1000 :: i64)
+        \\    Kernel.inspect(Map.get(result, 500 :: i64, -1 :: i64))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("500\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
