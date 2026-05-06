@@ -746,32 +746,63 @@ When a feature is locally complete and ready for a commit candidate:
    Should complete in seconds. If it hangs or crashes, that's a
    regression in CTFE/doc-gen ownership handling.
 
-### 4.3 Outer loop: per-phase-commit gate (~10-15 minutes)
+### 4.3 Outer loop: per-phase-commit gate (~30-60 seconds)
 
-Run only at the phase-commit boundary:
+Run only at the phase-commit boundary. **The full `zig build
+zir-test` is NOT in this loop.** It runs only at major-milestone
+gates (§4.3.5).
 
-1. `zig build test --summary all` — full unit test suite.
-2. `zig build zir-test --summary all -Dzap-compiler-lib=...` —
-   full integration suite.
-3. All 3 CLBG benchmark byte-exact verifications.
-4. Microbench under `ZAP_ARC_STATS=1` for HWM assertion.
-5. k-nucleotide RSS measurement (via `/usr/bin/time -l`) — only
-   meaningful at Phase F+ (until then, `.map` is off and RSS is
-   unchanged from baseline).
-6. Doc-gen full sweep.
+1. `zig build test --summary all` — full unit test suite (~10s).
+2. **Filtered zir-test for the phase's feature** (~30-60s):
+   ```sh
+   zig build zir-test -Dzap-compiler-lib=$HOME/projects/zig/zig-out/lib/libzap_compiler.a -- "ARC"
+   ```
+   (or "ownership", "borrow", "Map", etc. — whichever filter
+   captures the phase's feature). NOT the full suite.
+3. Microbench under `ZAP_ARC_STATS=1` for HWM assertion (~5s).
+4. Doc-runner spot check on a small file (~10s).
 
-**Hard rule: only commit when the outer-loop matrix is green.** No
-WIP commits. No "I'll fix it in the next commit" deferrals.
+**Hard rule: only commit when this matrix is green.** No WIP
+commits. No "I'll fix it in the next commit" deferrals.
+
+### 4.3.5 Major-milestone gate: per-phase-F-and-G commit (~10-15 min)
+
+The full `zig build zir-test --summary all` and full benchmark
+sweep run **only at Phase F (the flag flip) and Phase G (CI
+hardening)** commits — and ONCE per commit, at the very end.
+
+For Phases A-E, the outer-loop gate above is sufficient. If a
+Phase A-E change accidentally breaks a non-ARC zir-test, that
+breakage is caught at the Phase F gate (where the full sweep
+finally runs) and fixed there. This is acceptable because:
+
+- Phase A-E changes are scoped to ARC infrastructure (new files,
+  new metadata, new instructions). They don't touch the broader
+  IR semantics that non-ARC tests exercise.
+- The unit test suite (729+ tests) covers the IR layer's other
+  semantics extensively.
+- Filtered zir-test for the phase's feature catches regressions
+  in the area being changed.
+- The cost of running full zir-test 6 times (once per phase A-F
+  commit) is ~36-42 minutes. The cost of running it ONCE at the
+  Phase F gate is ~6-7 minutes. The difference compounds across
+  attempts.
+
+If a non-ARC zir-test breaks during Phase A-E, that's diagnosed
+at Phase F as a single regression. This trades a small risk of
+late-discovered breakage for a large savings in iteration time.
 
 ### 4.4 Practical agent-prompt conventions
 
 When launching subagents for individual phases:
 
-- **Specify the inner loop in the prompt.** Tell the agent:
+- **Specify the iteration discipline in the prompt.** Tell the agent:
   > "Inner loop: `zig build test` + reproducer probe + verifier
-  > output. Mid loop: filtered zir-test for the phase's feature.
-  > Full zir-test ONLY at commit. DO NOT run full zir-test on every
-  > iteration — that's a 6-7 minute waste."
+  > output. Outer-loop commit gate: unit tests + FILTERED zir-test
+  > for the phase's feature only. **DO NOT run `zig build zir-test`
+  > without a filter argument** — full zir-test runs ONLY at the
+  > Phase F flag-flip milestone and the Phase G CI commit. Until
+  > then, filtered zir-test (`-- "ARC"` or similar) is the gate."
 
 - **Pre-build zap once per phase.** The prompt should include:
   > "Build the zap binary at the start of the phase. Iterate against
@@ -803,19 +834,20 @@ Following these conventions cuts per-attempt time from ~3 hours to
 A consolidated table of "what must be true at each phase-commit gate"
 (outer loop, §4.3):
 
-| Phase | Unit tests | zir-test (full) | Microbench RSS | k-nuc RSS | k-nuc runtime | byte-exact | doc gen | verifier active |
-|-------|-----------:|---------:|---------------:|----------:|--------------:|------------|---------|-----------------|
-| A | 724+ | 104+ | unchanged | 7.57 GiB | unchanged | yes | yes | scaffolded |
-| B | 724+ | 104+ | unchanged (`.map` off) | 7.57 GiB | unchanged | yes | yes | scaffolded |
-| C | 724+ | 104+ | unchanged | 7.57 GiB | unchanged | yes | yes | scaffolded |
-| D | 724+ | 104+ | unchanged | 7.57 GiB | unchanged | yes | yes (recursing nested) | scaffolded |
-| E | 724+ | 104+ | unchanged | 7.57 GiB | unchanged | yes | yes | **active** |
-| F | 724+ | 104+ | **bounded** | **< 500 MiB** | **≤ 1.5s (target)** | **yes** | yes | active |
-| G | 724+ | 104+ | bounded | < 500 MiB | ≤ 1.5s | yes | yes | active + ASan/LSan + fuzz |
+| Phase | Unit tests | zir-test | Microbench | k-nuc RSS | byte-exact | verifier |
+|-------|-----------:|----------|------------|----------:|------------|----------|
+| A | 729+ | filtered (~30s) | unchanged | 7.57 GiB | yes | scaffolded |
+| B | 729+ | filtered (~30s) | unchanged (`.map` off) | 7.57 GiB | yes | scaffolded |
+| C | 729+ | filtered (~30s) | unchanged | 7.57 GiB | yes | scaffolded |
+| D | 729+ | filtered (~30s) | unchanged | 7.57 GiB | yes | scaffolded |
+| E | 729+ | filtered (~30s) | unchanged | 7.57 GiB | yes | **active** |
+| F | 729+ | **full (~6 min, ONCE)** | **bounded** | **< 500 MiB** | **yes** | active |
+| G | 729+ | full (~6 min, ONCE) | bounded | < 500 MiB | yes | active + ASan/LSan + fuzz |
 
-The full zir-test column is the **outer-loop** gate only. Inner-loop
-iteration relies on unit tests and verifier output (§4.1). Mid-loop
-iteration uses filtered zir-test (§4.2).
+"Filtered" = `zig build zir-test -- "ARC"` or similar — runs only
+the tests matching the phase's feature. "Full" = the entire
+zir-test suite. Full zir-test runs ONLY at Phase F and Phase G
+commit gates.
 
 Phase F is the milestone for the project's primary goal; phase G is
 hardening so this stays correct under expansion.
