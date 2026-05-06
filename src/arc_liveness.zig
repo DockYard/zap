@@ -953,6 +953,55 @@ const Analyzer = struct {
         switch (instr) {
             .share_value => |sv| {
                 if (sv.source == last_use_local) {
+                    // Consume mode is sound only when the source local
+                    // owns its own +1 ownership unit on the cell. The
+                    // IR's aliasing instructions (local_get / local_set
+                    // / move_value, and a chained share_value whose
+                    // dest was itself shared again — rare but possible)
+                    // produce dests that *alias* the source's
+                    // ownership unit; they do not retain. Marking a
+                    // share_value(.consume) on such an alias dest
+                    // would (a) skip the retain at this site and
+                    // (b) keep the post-call release on the per-call
+                    // shared dest, netting -1 refcount on the cell
+                    // even though no caller-side ownership unit was
+                    // actually transferred. With multiple aliased
+                    // shares of the same named binding, the cell's
+                    // refcount goes negative and the cell gets recycled
+                    // out from under a still-live use.
+                    //
+                    // This was the root cause of the post-flag-flip
+                    // segfault on `m = %{...}; Map.get(m, ...);
+                    // Map.get(m, ...)`: each `Map.get(m, ...)` lowers
+                    // through a fresh `local_get(d_i, source=m) ;
+                    // share_value(d'_i, source=d_i)`. The analyzer
+                    // sees each d_i as live for exactly one share —
+                    // its consume bit fires correctly under
+                    // per-local liveness but the underlying owned
+                    // local `m` is shared multiple times, so the
+                    // accumulated -1 net releases free `m`'s cell
+                    // before the second share even reads it.
+                    //
+                    // The conservative fix: only fire consume when
+                    // the share's source is an "owner-producing"
+                    // local — i.e. one whose definition is a fresh
+                    // ownership unit (map_init, list_init, struct_init,
+                    // union_init, call_*, param_get, capture_get,
+                    // field_get, list_*/map_get/index_get extractions,
+                    // and similar). Aliases produced by local_get,
+                    // local_set, move_value, or share_value (the per-
+                    // call dest chain) are excluded.
+                    //
+                    // Trade-off: aliased shares fall back to retain
+                    // mode (net 0 refcount delta per share). The lost
+                    // optimization is one retain+release pair per
+                    // aliased share. This is negligible compared to
+                    // the cell allocation cost and is the correct
+                    // semantic regardless — alias-aware liveness is
+                    // the only sound way to fire consume on aliased
+                    // sources, and that is a deeper analyzer change
+                    // tracked separately.
+                    if (self.isAliasLocal(sv.source)) return;
                     try ownership.consume_share_sites.put(self.allocator, id, {});
                 }
             },
@@ -972,6 +1021,28 @@ const Analyzer = struct {
             },
             else => {},
         }
+    }
+
+    /// True when `local` is the dest of an aliasing instruction
+    /// (`local_get`, `local_set`, `move_value`, or `share_value`).
+    /// These produce dests that *alias* an existing ownership unit
+    /// rather than allocating a fresh one; consume mode at a
+    /// share_value whose source is such an alias would net -1 on
+    /// the underlying cell's refcount with no compensating
+    /// ownership transfer, breaking the consume invariant. The
+    /// caller (`applySpecialization`) uses this predicate to refuse
+    /// consume marking on alias sources.
+    fn isAliasLocal(self: *const Analyzer, local: ir.LocalId) bool {
+        for (self.records.items) |rec| {
+            switch (rec.instr.*) {
+                .local_get => |lg| if (lg.dest == local) return true,
+                .local_set => |ls| if (ls.dest == local) return true,
+                .move_value => |mv| if (mv.dest == local) return true,
+                .share_value => |sv| if (sv.dest == local) return true,
+                else => {},
+            }
+        }
+        return false;
     }
 
     /// Phase-5 prep: when a `ret v` returns a local that is itself
