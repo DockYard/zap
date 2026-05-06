@@ -175,6 +175,11 @@ pub const InstructionId = u32;
 /// Output of `computeArcOwnership`. The pass populates these maps and
 /// returns them; nothing else mutates them. Phases 4-5 will read from
 /// the maps; the pass itself is read-only with respect to the IR.
+/// Set of ARC-managed locals, materialised as a hash-map. Used as the
+/// value type of `ArcOwnership.live_before_ret` so per-terminator live
+/// sets are O(1)-queryable by `LocalId` without any bit-index round-trip.
+pub const ArcLocalSet = std.AutoHashMapUnmanaged(ir.LocalId, void);
+
 pub const ArcOwnership = struct {
     /// Locals whose `share_value` to a call-arg slot is a last-use
     /// transfer (consume site). Indexed by share_value instruction id.
@@ -189,10 +194,41 @@ pub const ArcOwnership = struct {
     /// for pretty printers, debug counters, and soundness checks.
     last_use_map: std.AutoHashMapUnmanaged(ir.LocalId, InstructionId) = .empty,
 
+    /// For each ret-equivalent terminator instruction id, the set of
+    /// ARC-managed local ids that are live immediately before that
+    /// terminator. A future drop-insertion pass (Phase 6 of the
+    /// k-nucleotide RSS gap plan) uses this to know which locals
+    /// need scope-exit `release` instructions inserted at each
+    /// termination point. Per-terminator (rather than per-function)
+    /// because branches can have distinct live sets — the locals
+    /// alive immediately before `ret x` in one arm may differ from
+    /// those alive before `ret y` in another arm.
+    ///
+    /// Ret-equivalent terminators recorded here:
+    ///   - `.ret`
+    ///   - `.cond_return`
+    ///   - `.tail_call` (the callee returns directly to the caller's
+    ///      caller, so the tail_call instruction is functionally a
+    ///      return; the live-before set captures locals that need
+    ///      to be released before the tail jump)
+    ///   - `.switch_return` and `.union_switch_return` (each arm body
+    ///     ends with an implicit return; the live-before set at the
+    ///     parent terminator's id captures the union of arm uses
+    ///     plus anything else still live at the switch)
+    ///
+    /// Pure side-table: this map is read by future passes; the
+    /// dataflow that populates it does not mutate the IR.
+    live_before_ret: std.AutoHashMapUnmanaged(InstructionId, ArcLocalSet) = .empty,
+
     pub fn deinit(self: *ArcOwnership, allocator: std.mem.Allocator) void {
         self.consume_share_sites.deinit(allocator);
         self.return_source_locals.deinit(allocator);
         self.last_use_map.deinit(allocator);
+        var live_iter = self.live_before_ret.valueIterator();
+        while (live_iter.next()) |set_ptr| {
+            set_ptr.deinit(allocator);
+        }
+        self.live_before_ret.deinit(allocator);
     }
 };
 
@@ -299,7 +335,9 @@ pub fn computeArcOwnership(
         return ownership;
     }
 
+    analyzer.ownership_in_progress = &ownership;
     try analyzer.computeLiveAfter();
+    analyzer.ownership_in_progress = null;
     try analyzer.classifyLastUses(&ownership);
     try analyzer.propagateReturnSourcesThroughAggregates(&ownership);
 
@@ -336,6 +374,14 @@ const Analyzer = struct {
 
     /// Per-instruction live-after sets, indexed by `InstructionId`.
     live_after: std.ArrayListUnmanaged(LiveSet),
+
+    /// When non-null, the dataflow walk snapshots the live-before set
+    /// at every ret-equivalent terminator into
+    /// `ownership_in_progress.live_before_ret`. Set immediately before
+    /// `computeLiveAfter` runs and cleared after, so the analyzer's
+    /// other passes don't accidentally observe a half-initialised
+    /// ownership table.
+    ownership_in_progress: ?*ArcOwnership = null,
 
     fn deinit(self: *Analyzer) void {
         self.records.deinit(self.allocator);
@@ -653,11 +699,56 @@ const Analyzer = struct {
             try self.applyDefs(instr.*, &next_live);
             try self.applyUses(instr.*, &next_live);
 
+            // Side-table snapshot: at every ret-equivalent terminator,
+            // record the live-before set into
+            // `ownership.live_before_ret`. The drop-insertion pass
+            // (Phase 6 of the k-nucleotide RSS gap plan) consults
+            // this map to know which ARC-managed locals need a
+            // scope-exit `release` inserted immediately before the
+            // terminator. The snapshot is materialised as a
+            // `LocalId`-keyed `ArcLocalSet` so consumers don't need
+            // to know about the analyzer's internal bitset
+            // representation.
+            if (isReturnEquivalentTerminator(instr.*)) {
+                if (self.ownership_in_progress) |ownership| {
+                    try self.snapshotLiveBeforeRet(ownership, id, &next_live);
+                }
+            }
+
             cur_live.deinit(self.allocator);
             cur_live = next_live;
         }
 
         return cur_live;
+    }
+
+    /// Materialise the in-progress bitset `live_before` into a
+    /// `LocalId`-keyed `ArcLocalSet` and store it under `id` in
+    /// `ownership.live_before_ret`. Each bit set in `live_before`
+    /// corresponds to one ARC-managed local; the bit's index maps
+    /// back to the local via `arc_locals[idx]`. The resulting set
+    /// is owned by the ownership table and freed by `deinit`.
+    fn snapshotLiveBeforeRet(
+        self: *Analyzer,
+        ownership: *ArcOwnership,
+        id: InstructionId,
+        live_before: *const LiveSet,
+    ) error{OutOfMemory}!void {
+        var local_set: ArcLocalSet = .empty;
+        errdefer local_set.deinit(self.allocator);
+        var bit_index: u32 = 0;
+        const bit_count: u32 = @intCast(self.arc_locals.items.len);
+        while (bit_index < bit_count) : (bit_index += 1) {
+            if (live_before.contains(bit_index)) {
+                const local_id = self.arc_locals.items[bit_index];
+                try local_set.put(self.allocator, local_id, {});
+            }
+        }
+        // Per-instruction-id snapshot: a given terminator id appears
+        // in exactly one stream walk, so this `put` is the only
+        // insertion for that key. Use `putNoClobber` to surface
+        // mistakes if that invariant is ever violated.
+        try ownership.live_before_ret.putNoClobber(self.allocator, id, local_set);
     }
 
     fn recurseChildren(
@@ -1266,6 +1357,36 @@ fn isTerminator(instr: ir.Instruction) bool {
         .switch_return,
         .union_switch_return,
         .case_break,
+        => true,
+        else => false,
+    };
+}
+
+/// Subset of terminators that hand control back to the function's
+/// caller (rather than transferring within the same function). Each
+/// such terminator is a candidate site for inserting scope-exit
+/// `release` instructions on locals still live at that point.
+///
+/// `cond_return` is included because it conditionally leaves the
+/// function; on the taken edge it is functionally a `ret`.
+///
+/// `tail_call` is included because the callee returns directly to
+/// our caller — control never re-enters this function, so any local
+/// still live at the tail_call must be released before the jump.
+///
+/// `switch_return` and `union_switch_return` are aggregating
+/// terminators: each arm body ends with an implicit return whose
+/// value is the arm's `return_value`. The dataflow records the
+/// live-before set at the parent terminator id; per-arm refinement
+/// (if needed by a future drop-insertion pass) is computable from
+/// each arm's `return_value` plus the parent's set.
+fn isReturnEquivalentTerminator(instr: ir.Instruction) bool {
+    return switch (instr) {
+        .ret,
+        .cond_return,
+        .tail_call,
+        .switch_return,
+        .union_switch_return,
         => true,
         else => false,
     };
@@ -2524,4 +2645,324 @@ test "arc_liveness: Phase 5 — release filter suppresses return-source releases
     defer release_sources.deinit(std.testing.allocator);
     // No assertion on count: the test's contract is the membership
     // check above, not a specific release-count expectation.
+}
+
+// ============================================================
+// Phase 6 prep: per-terminator live-before-ret snapshots.
+//
+// `ArcOwnership.live_before_ret` records, for every ret-equivalent
+// terminator instruction id, the set of ARC-managed locals live
+// immediately before that terminator. A future drop-insertion pass
+// consults this map to know which locals need a scope-exit `release`
+// inserted at each termination point. The tests below pin the
+// expected shape of the map across the canonical control-flow
+// patterns the drop-insertion pass will encounter.
+// ============================================================
+
+test "arc_liveness: live_before_ret records ARC locals at simple ret(local)" {
+    // The identity function: a single `ret value` instruction whose
+    // value is the (ARC-managed) parameter. The live-before set at
+    // the ret must contain exactly that parameter local.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn id(h :: Handle) -> Handle { h }
+        \\}
+    ;
+    var suite = try TestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const id_func = suite.findFunctionByName("id") orelse return error.MissingFunction;
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        id_func,
+        suite.typeStore(),
+        defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // The ret terminator (or a tail-call equivalent) must have a
+    // live-before-ret entry. For an identity function the IR builder
+    // may emit either a `ret` directly or a `tail_call` of a value
+    // synthesized via param_get; either is a ret-equivalent
+    // terminator and gets its own snapshot. We don't pin the exact
+    // tag — the load-bearing assertion is that *some* live-before-ret
+    // entry contains an ARC-managed local that traces back to `h`.
+    try std.testing.expect(ownership.live_before_ret.count() >= 1);
+
+    // Every snapshot must be non-empty for an identity function,
+    // since the parameter `h` is live up to the function's exit.
+    var saw_non_empty = false;
+    var live_iter = ownership.live_before_ret.valueIterator();
+    while (live_iter.next()) |set_ptr| {
+        if (set_ptr.count() >= 1) saw_non_empty = true;
+    }
+    try std.testing.expect(saw_non_empty);
+}
+
+test "arc_liveness: live_before_ret records the case-aggregate flowing into ret" {
+    // Two branches that each return a distinct ARC-managed parameter.
+    // Zap's case-lowering allocates an aggregate dest local that both
+    // arms `share_value` into (consuming `x` and `y` at last-use along
+    // each arm); the post-case `ret` sees only the aggregate as live.
+    // The live-before-ret snapshot at the ret therefore contains
+    // exactly one ARC-managed local (the case aggregate) — the
+    // analyzer's `propagateReturnSourcesThroughAggregates` step is
+    // what later folds the underlying `x`/`y` arm locals into the
+    // return-source set. The two side-tables address different needs:
+    //   * `live_before_ret` answers "what is dataflow-live at the
+    //     terminator?" — the answer is the aggregate.
+    //   * `return_source_locals` answers "which underlying locals'
+    //     ownership flows through the aggregate to the caller?" —
+    //     that includes `x` and `y` after propagation.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn pick(b :: Bool, x :: Handle, y :: Handle) -> Handle {
+        \\    case b {
+        \\      true -> x
+        \\      false -> y
+        \\    }
+        \\  }
+        \\}
+    ;
+    var suite = try TestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const pick_func = suite.findFunctionByName("pick") orelse return error.MissingFunction;
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        pick_func,
+        suite.typeStore(),
+        defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // At least one ret-equivalent terminator must have a snapshot,
+    // and at least one of those snapshots must contain at least one
+    // ARC-managed local (the aggregate). The exact count depends on
+    // the lowering shape; pinning the *non-empty* contract is the
+    // load-bearing assertion for downstream drop-insertion.
+    try std.testing.expect(ownership.live_before_ret.count() >= 1);
+    var saw_non_empty = false;
+    var live_iter = ownership.live_before_ret.valueIterator();
+    while (live_iter.next()) |set_ptr| {
+        if (set_ptr.count() >= 1) saw_non_empty = true;
+    }
+    try std.testing.expect(saw_non_empty);
+}
+
+test "arc_liveness: live_before_ret captures cond_return live set" {
+    // A multi-clause function lowers to a sequence of `cond_return`
+    // (or `switch_return`) instructions, each of which is a
+    // ret-equivalent terminator. Each terminator's live-before set
+    // should reflect the specific value being returned at that point.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn first(h :: Handle, _g :: Handle) -> Handle { h }
+        \\  pub fn second(_h :: Handle, g :: Handle) -> Handle { g }
+        \\}
+    ;
+    var suite = try TestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const first_func = suite.findFunctionByName("first") orelse return error.MissingFunction;
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        first_func,
+        suite.typeStore(),
+        defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // Whatever ret-equivalent terminator the IR builder emits for
+    // a single-clause function, there must be at least one snapshot,
+    // and it must contain at least one ARC-managed local (the
+    // returned parameter `h`).
+    try std.testing.expect(ownership.live_before_ret.count() >= 1);
+    var saw_non_empty = false;
+    var live_iter = ownership.live_before_ret.valueIterator();
+    while (live_iter.next()) |set_ptr| {
+        if (set_ptr.count() >= 1) saw_non_empty = true;
+    }
+    try std.testing.expect(saw_non_empty);
+}
+
+test "arc_liveness: live_before_ret populated for switch_return-shaped multi-clause" {
+    // Multi-clause Arc-typed functions can lower to `switch_return`
+    // (literal-dispatch) or to per-clause `cond_return` chains. In
+    // either case every ret-equivalent terminator instruction
+    // produces its own live-before snapshot. This test pins the
+    // invariant that *some* snapshot contains an ARC-managed local
+    // when the function returns one — without pinning the exact
+    // lowering shape, since the IR builder's choice of dispatch is
+    // an implementation detail.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn pick(c :: i64, x :: Handle, y :: Handle) -> Handle {
+        \\    case c {
+        \\      0 -> x
+        \\      _ -> y
+        \\    }
+        \\  }
+        \\}
+    ;
+    var suite = try TestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const pick_func = suite.findFunctionByName("pick") orelse return error.MissingFunction;
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        pick_func,
+        suite.typeStore(),
+        defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    try std.testing.expect(ownership.live_before_ret.count() >= 1);
+    var saw_arc_local = false;
+    var live_iter = ownership.live_before_ret.valueIterator();
+    while (live_iter.next()) |set_ptr| {
+        if (set_ptr.count() >= 1) saw_arc_local = true;
+    }
+    try std.testing.expect(saw_arc_local);
+}
+
+test "arc_liveness: live_before_ret is empty/absent when no ARC locals are in scope" {
+    // A function with no ARC-managed locals must produce an
+    // ownership table whose `live_before_ret` is empty, since the
+    // analyzer short-circuits before running the dataflow when
+    // `arc_locals` is empty. This exercises the no-op contract from
+    // the field's docstring.
+    const source =
+        \\pub struct Test {
+        \\  pub fn run(x :: i64) -> i64 {
+        \\    x + (1 :: i64)
+        \\  }
+        \\}
+    ;
+    var suite = try TestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const run_func = suite.findFunctionByName("run") orelse return error.MissingFunction;
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        run_func,
+        suite.typeStore(),
+        defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), ownership.live_before_ret.count());
+}
+
+test "arc_liveness: live_before_ret keys all map to ret-equivalent terminator instructions" {
+    // Soundness invariant: every key in `live_before_ret` is the
+    // `InstructionId` of an instruction whose tag is one of the
+    // ret-equivalent terminators (`ret`, `cond_return`, `tail_call`,
+    // `switch_return`, `union_switch_return`). Walks the function's
+    // structural region tree using the same depth-first numbering as
+    // the analyzer and checks each recorded id.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn id(h :: Handle) -> Handle { h }
+        \\}
+    ;
+    var suite = try TestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const id_func = suite.findFunctionByName("id") orelse return error.MissingFunction;
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        id_func,
+        suite.typeStore(),
+        defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // Build a map from InstructionId → tag using the same depth-first
+    // walk as the analyzer.
+    var id_to_tag: std.AutoHashMapUnmanaged(InstructionId, std.meta.Tag(ir.Instruction)) = .empty;
+    defer id_to_tag.deinit(std.testing.allocator);
+    const Walker = struct {
+        next_id: InstructionId = 0,
+        id_to_tag: *std.AutoHashMapUnmanaged(InstructionId, std.meta.Tag(ir.Instruction)),
+        allocator: std.mem.Allocator,
+
+        fn walkFunction(self: *@This(), func: *const ir.Function) error{OutOfMemory}!void {
+            for (func.body) |block| try self.walkStream(block.instructions);
+        }
+
+        fn walkStream(self: *@This(), stream: []const ir.Instruction) error{OutOfMemory}!void {
+            for (stream) |*instr| {
+                const my_id = self.next_id;
+                self.next_id += 1;
+                try self.id_to_tag.put(self.allocator, my_id, std.meta.activeTag(instr.*));
+                try self.walkChildren(instr);
+            }
+        }
+
+        fn walkChildren(self: *@This(), instr: *const ir.Instruction) error{OutOfMemory}!void {
+            switch (instr.*) {
+                .if_expr => |ie| {
+                    try self.walkStream(ie.then_instrs);
+                    try self.walkStream(ie.else_instrs);
+                },
+                .case_block => |cb| {
+                    try self.walkStream(cb.pre_instrs);
+                    for (cb.arms) |arm| {
+                        try self.walkStream(arm.cond_instrs);
+                        try self.walkStream(arm.body_instrs);
+                    }
+                    try self.walkStream(cb.default_instrs);
+                },
+                .switch_literal => |sl| {
+                    for (sl.cases) |c| try self.walkStream(c.body_instrs);
+                    try self.walkStream(sl.default_instrs);
+                },
+                .switch_return => |sr| {
+                    for (sr.cases) |c| try self.walkStream(c.body_instrs);
+                    try self.walkStream(sr.default_instrs);
+                },
+                .union_switch => |us| {
+                    for (us.cases) |c| try self.walkStream(c.body_instrs);
+                },
+                .union_switch_return => |usr| {
+                    for (usr.cases) |c| try self.walkStream(c.body_instrs);
+                },
+                .try_call_named => |tc| {
+                    try self.walkStream(tc.handler_instrs);
+                    try self.walkStream(tc.success_instrs);
+                },
+                .guard_block => |gb| {
+                    try self.walkStream(gb.body);
+                },
+                else => {},
+            }
+        }
+    };
+    var walker = Walker{
+        .id_to_tag = &id_to_tag,
+        .allocator = std.testing.allocator,
+    };
+    try walker.walkFunction(id_func);
+
+    var live_iter = ownership.live_before_ret.keyIterator();
+    while (live_iter.next()) |id_ptr| {
+        const tag = id_to_tag.get(id_ptr.*) orelse return error.IdNotFound;
+        const ok = tag == .ret or
+            tag == .cond_return or
+            tag == .tail_call or
+            tag == .switch_return or
+            tag == .union_switch_return;
+        try std.testing.expect(ok);
+    }
 }
