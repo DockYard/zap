@@ -4154,12 +4154,23 @@ pub const ZirDriver = struct {
                             // no further need for a refcount on this value.
                             // Emit the value-assignment (already done above
                             // via `local_refs.put`) but skip the retain.
-                            // Marking the source local in
-                            // `arc_consumed_locals` ensures the matching
-                            // scope-exit release is also suppressed; net
-                            // effect is zero refcount operations, with
-                            // ownership flowing from source to dest.
-                            try self.markConsumed(sv.source);
+                            //
+                            // The post-call `.release` IR (emitted from
+                            // `src/ir.zig`'s call lowering) targets the
+                            // share's `dest` local (the per-call shared
+                            // slot accumulated into `shared_release_locals`),
+                            // not its `source`. The release-suppression
+                            // filter `isReleaseSuppressed(rel.value)` looks
+                            // up `rel.value`, which equals `sv.dest`. Mark
+                            // the `dest` here so the existing post-call
+                            // release is correctly elided. Source-marking
+                            // for the not-yet-emitted scope-exit drop is
+                            // added in a follow-up commit alongside the
+                            // scope-exit drop emission itself; doing both
+                            // at once would mark a local whose drop site
+                            // does not yet exist, which is a no-op today
+                            // but obscures intent.
+                            try self.markConsumed(sv.dest);
                             // Emit a ZIR call to bump the runtime
                             // `arc_consumes_total` counter. The counter
                             // is observed at runtime via `ZAP_ARC_STATS=1`
