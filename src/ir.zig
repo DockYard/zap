@@ -5022,6 +5022,29 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{
                     .local_get = .{ .dest = dest, .source = idx },
                 });
+                // Phase 6 — Option B ownership protocol. Each named binding
+                // of an ARC-managed value is its own ownership unit. The
+                // `local_get` aliases an existing local without copying the
+                // underlying cell, so we bump the cell's refcount here so
+                // `dest` carries an independent +1. The Phase 6.2b drop-
+                // insertion pass will emit the matching scope-exit
+                // `.release{value=dest}` (or it will be elided when ownership
+                // transfers to a callee via consume mode or to the caller's
+                // return slot via return-source elision). Net refcount delta
+                // across `local_get` + matching release is zero.
+                //
+                // Without this retain, a single named local shared into
+                // multiple callees would lower to multiple `share_value`
+                // sites all aliasing the same cell, with the post-call
+                // releases over-decrementing. Phase 6.5 (commit d72af0b)
+                // forbids consume-mode for aliased shares, but retain-mode
+                // shares still need each named local to own an independent
+                // refcount unit so the post-call releases balance.
+                if (self.isArcManagedType(expr.type_id)) {
+                    try self.current_instrs.append(self.allocator, .{
+                        .retain = .{ .value = dest },
+                    });
+                }
                 if (self.known_local_types.get(idx)) |src_type| {
                     try self.known_local_types.put(dest, src_type);
                 }
@@ -7149,6 +7172,129 @@ test "rewriteTailCalls walks past intervening releases for ARC tail recursion" {
     try std.testing.expect(saw_tail_call);
     try std.testing.expect(!saw_call_named_to_self);
     try std.testing.expect(!saw_orphan_release);
+}
+
+test "IR local_get of ARC-managed source emits retain on dest" {
+    // Phase 6 — Option B ownership protocol: every named binding of an
+    // ARC-managed value owns an independent +1 refcount on the underlying
+    // cell. The IR builder honors this by emitting a `.retain{value=dest}`
+    // immediately after every `.local_get` whose source is ARC-managed,
+    // making the alias a stand-alone ownership unit. This test pins the
+    // invariant for `opaque_type` (the only currently-flagged ARC type).
+    //
+    // Source pattern:
+    //   pub fn alias_use(h :: Handle) {
+    //     aliased = h
+    //     aliased
+    //   }
+    // - `h` is a parameter. `aliased = h` lowers to a local_set that records
+    //   `h` (a param_get's dest) into the binding's local. The trailing
+    //   `aliased` expression lowers to a `.local_get{dest=N, source=binding}`.
+    // - With the Phase 6 retain rule, that local_get is followed by
+    //   `.retain{value=N}` because Handle is ARC-managed (opaque_type).
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn alias_use(h :: Handle) {
+        \\    aliased = h
+        \\    aliased
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    const func = ir_program.functions[0];
+
+    // Walk the body and find every `.local_get`. For each, the *immediately
+    // following* instruction must be a `.retain` whose `value` equals the
+    // local_get's `dest`. There must be at least one such pair (the body's
+    // tail expression `aliased`).
+    var found_pair: bool = false;
+    const instrs = func.body[0].instructions;
+    for (instrs, 0..) |instr, idx| {
+        if (instr != .local_get) continue;
+        const lg = instr.local_get;
+        try std.testing.expect(idx + 1 < instrs.len);
+        const next = instrs[idx + 1];
+        try std.testing.expect(next == .retain);
+        try std.testing.expectEqual(lg.dest, next.retain.value);
+        found_pair = true;
+    }
+    try std.testing.expect(found_pair);
+}
+
+test "IR local_get of non-ARC source does NOT emit retain" {
+    // Counter-test: scalar locals (e.g. i64) must not generate an extra
+    // retain after `.local_get`. Phase 6 retain emission is gated on
+    // `IrBuilder.isArcManagedType(expr.type_id)`. This pins the gate.
+    const source =
+        \\pub struct Test {
+        \\  pub fn alias_use(n :: i64) -> i64 {
+        \\    aliased = n
+        \\    aliased
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    const func = ir_program.functions[0];
+    var retain_count: usize = 0;
+    for (func.body[0].instructions) |instr| {
+        switch (instr) {
+            .retain => retain_count += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), retain_count);
 }
 
 test "ShareValue defaults to retain mode" {
