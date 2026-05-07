@@ -149,6 +149,22 @@ pub fn classifyAndNormalize(
 const LocalUseCounts = struct {
     borrow_use_count: u32 = 0,
     tail_call_arg_use_count: u32 = 0,
+    /// Phase E.10: count of uses that occur as operands of a non-
+    /// ARC aggregate-init instruction (`list_cons.head` /
+    /// `list_cons.tail`, `list_init.elements[]`,
+    /// `tuple_init.elements[]`, `struct_init.field.value`,
+    /// `union_init.value`). When a `.local_get` whose dest's ONLY
+    /// use is one of these positions is being classified, the
+    /// classifier emits `.move_value` instead of `.copy_value` so
+    /// the source's owns bit is transferred to dest. Combined with
+    /// the parallel liveness rule (aggregate-init operands clear
+    /// the operand's owns bit, mirroring `tail_call`), this makes
+    /// the aggregate the durable owner of the stored cell — the
+    /// scope-exit destroy that today's `.copy_value` + scope-exit
+    /// release combination fires (and which freed the underlying
+    /// cell while the bump-allocated aggregate retained the now-
+    /// dangling pointer) is suppressed.
+    aggregate_store_use_count: u32 = 0,
     total_use_count: u32 = 0,
 };
 
@@ -188,6 +204,26 @@ const UseSummary = struct {
         if (!gop.found_existing) gop.value_ptr.* = .{};
         gop.value_ptr.total_use_count += 1;
         gop.value_ptr.tail_call_arg_use_count += 1;
+    }
+
+    /// Phase E.10: record a use of `local` that occurs as an
+    /// operand of a non-ARC aggregate-init instruction. Aggregate-
+    /// init sites are "consume" positions for ARC values: list,
+    /// tuple, struct, and union cells are bump-allocated and never
+    /// call retain on their stored elements, so the storage acts
+    /// as a durable +1 holder. When a `.local_get`'s dest is used
+    /// only here, the classifier emits `.move_value` so the
+    /// source's owns bit transfers cleanly into the aggregate's
+    /// implicit ownership without an extra retain.
+    fn recordAggregateStoreUse(
+        self: *UseSummary,
+        allocator: std.mem.Allocator,
+        local: ir.LocalId,
+    ) !void {
+        const gop = try self.counts.getOrPut(allocator, local);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.total_use_count += 1;
+        gop.value_ptr.aggregate_store_use_count += 1;
     }
 
     fn get(self: *const UseSummary, local: ir.LocalId) LocalUseCounts {
@@ -268,15 +304,23 @@ fn recordInstructionUses(
             try summary.recordUse(allocator, cr.condition, false);
             if (cr.value) |v| try summary.recordUse(allocator, v, false);
         },
+        // Phase E.10 — aggregate-store positions are special "consume"
+        // positions, NOT ordinary non-borrow uses. The classifier needs
+        // to recognise these so it can emit `.move_value` (instead of
+        // the conservative `.copy_value`) when a `.local_get`'s dest's
+        // only use lands in one of these slots. Map IS ARC-managed and
+        // its `Map.put` substrate retains stored children correctly,
+        // so `.map_init` is excluded from this consume-position set —
+        // its operands continue to be ordinary non-borrow uses.
         .tuple_init => |ti| {
-            for (ti.elements) |elem| try summary.recordUse(allocator, elem, false);
+            for (ti.elements) |elem| try summary.recordAggregateStoreUse(allocator, elem);
         },
         .list_init => |li| {
-            for (li.elements) |elem| try summary.recordUse(allocator, elem, false);
+            for (li.elements) |elem| try summary.recordAggregateStoreUse(allocator, elem);
         },
         .list_cons => |lc| {
-            try summary.recordUse(allocator, lc.head, false);
-            try summary.recordUse(allocator, lc.tail, false);
+            try summary.recordAggregateStoreUse(allocator, lc.head);
+            try summary.recordAggregateStoreUse(allocator, lc.tail);
         },
         .map_init => |mi| {
             for (mi.entries) |entry| {
@@ -285,10 +329,10 @@ fn recordInstructionUses(
             }
         },
         .struct_init => |si| {
-            for (si.fields) |field| try summary.recordUse(allocator, field.value, false);
+            for (si.fields) |field| try summary.recordAggregateStoreUse(allocator, field.value);
         },
         .union_init => |ui| {
-            try summary.recordUse(allocator, ui.value, false);
+            try summary.recordAggregateStoreUse(allocator, ui.value);
         },
         .field_get => |fg| try summary.recordUse(allocator, fg.object, false),
         .field_set => |fs| {
@@ -495,6 +539,60 @@ fn shouldMove(
     return true;
 }
 
+/// Phase E.10: decide whether a `.local_get{dest, source}` should
+/// be lowered as `.move_value` instead of `.copy_value` because
+/// dest's only use is an aggregate-store operand position. Returns
+/// `true` when ALL of these hold:
+///
+///   * dest is ARC-managed (`.owned` in `local_ownership`).
+///   * dest's only use is an aggregate-init operand
+///     (`aggregate_store_use_count == total_use_count == 1`).
+///   * source is ARC-managed and its only use is this `.local_get`
+///     (`source.total_use_count == 1`). With more than one use, the
+///     source's other use sites still need the cell alive, so the
+///     classifier must fall back to `.copy_value` to keep both
+///     owner aliases viable.
+///
+/// Aggregate-init slots (`list_cons.head/tail`, `list_init.elements`,
+/// `tuple_init.elements`, `struct_init.field.value`, `union_init.value`)
+/// are non-ARC bump-allocated cells. They never retain stored elements
+/// and they are never freed via the ARC runtime, so the only way to
+/// keep the stored cell alive is to suppress the scope-exit destroy on
+/// the alias that fed the operand. `.move_value` (paired with the
+/// matching liveness rule in `arc_liveness.applyOwnsEffect`) achieves
+/// this: source's owns bit clears at the move, dest's owns bit clears
+/// at the aggregate-init, and the cell's existing `+1` from its
+/// producer (the `.map_init` / call-result that originally created the
+/// owner) becomes the durable refcount the aggregate's stored pointer
+/// rides on.
+///
+/// Note on Map: `.map_init` is intentionally NOT in this consume-
+/// position set. Map cells are themselves ARC-managed and `Map.put`
+/// retains its inserted value (Phase 6 substrate). A `.local_get`
+/// flowing into `.map_init.entry.value` therefore continues to
+/// classify as `.copy_value` — the Map runtime's retain handles the
+/// stored cell's lifetime, so the conservative copy is correct.
+fn shouldMoveIntoAggregate(
+    function: *const ir.Function,
+    summary: *const UseSummary,
+    dest: ir.LocalId,
+    source: ir.LocalId,
+) bool {
+    if (dest >= function.local_ownership.len) return false;
+    if (function.local_ownership[dest] != .owned) return false;
+    if (source >= function.local_ownership.len) return false;
+    if (function.local_ownership[source] != .owned) return false;
+
+    const dest_counts = summary.get(dest);
+    if (dest_counts.total_use_count != 1) return false;
+    if (dest_counts.aggregate_store_use_count != 1) return false;
+
+    const source_counts = summary.get(source);
+    if (source_counts.total_use_count != 1) return false;
+
+    return true;
+}
+
 const StreamRewriter = struct {
     allocator: std.mem.Allocator,
     function: *ir.Function,
@@ -563,6 +661,23 @@ const StreamRewriter = struct {
                         // exit release fires for source; the
                         // tail_call arg-set handling already
                         // suppresses the destroy on dest.
+                        try new_instrs.append(self.allocator, .{
+                            .move_value = .{ .dest = lg.dest, .source = lg.source },
+                        });
+                    } else if (shouldMoveIntoAggregate(self.function, self.use_summary, lg.dest, lg.source)) {
+                        // Phase E.10: dest's only use is an aggregate-
+                        // init operand AND source's only use is this
+                        // read. Aggregate-init operand positions are
+                        // consume sites (mirroring `tail_call`): the
+                        // bump-allocated cell takes implicit ownership
+                        // of the stored value. Emit `.move_value` so
+                        // the source's owns bit transfers cleanly to
+                        // dest, and rely on the matching liveness
+                        // rule in `arc_liveness.applyOwnsEffect` to
+                        // clear dest's owns bit at the aggregate-init
+                        // (so neither owner alias's scope-exit destroy
+                        // fires on the cell whose live pointer the
+                        // aggregate now holds).
                         try new_instrs.append(self.allocator, .{
                             .move_value = .{ .dest = lg.dest, .source = lg.source },
                         });
@@ -2023,5 +2138,254 @@ test "arc_ownership: still emits copy_value when source has additional uses (Pha
     // No move — source has another use (the retain).
     try std.testing.expectEqual(@as(usize, 0), totals.move_count);
     // copy_value is the conservative fallback.
+    try std.testing.expectEqual(@as(usize, 1), totals.copy_count);
+}
+
+// ============================================================
+// Phase E.10 — move_value emission for aggregate-store operands
+// ============================================================
+
+test "arc_ownership: emits move_value for local_get whose dest's only use is a list_cons.head and source is at last use (Phase E.10)" {
+    // Phase E.10 of the Phase 6 redux plan — aggregate-store consume.
+    //
+    // The doc-runner reproducer's UAF traces back to a `.local_get`
+    // whose dest flows directly into `list_cons.head`. The classifier
+    // conservatively emitted `.copy_value` (lowering to `retainAny`
+    // at ZIR time), bumping the cell's refcount to +2; the bump-
+    // allocated list cell stored the pointer without retaining; both
+    // owner aliases' scope-exit `release` fired at function exit,
+    // dropping the refcount to 0 — the cell freed while the list's
+    // stored pointer dangled. Subsequent reads of the list (the
+    // canonical reproducer is `Map.size(List.head(s))`) read the
+    // freed-memory pattern `0xAAAAAAAA...` instead of a real value.
+    //
+    // The fix: detect this exact shape (`.local_get{dest, source}`
+    // where dest's only use is a non-`.map_init` aggregate-init
+    // operand AND source's only use is this read) and emit
+    // `.move_value` instead. Move semantics transfer ownership
+    // without retaining; the matching liveness rule in
+    // `arc_liveness.applyOwnsEffect` clears the operand's owns bit
+    // at the aggregate-init, so neither owner alias's scope-exit
+    // destroy fires on the cell whose live pointer the aggregate
+    // now holds.
+    //
+    // Hand-constructed IR mirroring the reproducer shape:
+    //   %0 = const_int 0                  // dummy producer
+    //   %1 = const_nil                    // tail of the list
+    //   %2 = local_get <- %0              // alias for list_cons.head
+    //   %3 = list_cons head=%2 tail=%1
+    //   ret null
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        .{ .const_nil = 1 },
+        .{ .local_get = .{ .dest = 2, .source = 0 } },
+        .{ .list_cons = .{ .dest = 3, .head = 2, .tail = 1 } },
+        .{ .ret = .{ .value = null } },
+    };
+    // %0 owned (the producer), %1 trivial (nil), %2 owned (the alias),
+    // %3 owned (the list).
+    const ownership = [_]ir.OwnershipClass{ .owned, .trivial, .owned, .owned };
+
+    var function = try buildMoveValueTestFunction(arena, "list_cons_consume", &instrs, &ownership, 0);
+
+    var dummy_ownership: arc_liveness.ArcOwnership = .{};
+    defer dummy_ownership.deinit(arena);
+    var dummy_store: types_mod.TypeStore = undefined;
+    try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
+
+    const totals = countAliasOpcodes(&function);
+    try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
+    try std.testing.expectEqual(@as(usize, 1), totals.move_count);
+    try std.testing.expectEqual(@as(usize, 0), totals.copy_count);
+    try std.testing.expectEqual(@as(usize, 0), totals.borrow_count);
+}
+
+test "arc_ownership: emits move_value for local_get whose dest's only use is a struct_init field value (Phase E.10)" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const fields = try arena.alloc(ir.StructFieldInit, 1);
+    fields[0] = .{ .name = "f", .value = 1 };
+    const instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        .{ .local_get = .{ .dest = 1, .source = 0 } },
+        .{ .struct_init = .{ .dest = 2, .type_name = "Box", .fields = fields } },
+        .{ .ret = .{ .value = null } },
+    };
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned };
+
+    var function = try buildMoveValueTestFunction(arena, "struct_consume", &instrs, &ownership, 0);
+
+    var dummy_ownership: arc_liveness.ArcOwnership = .{};
+    defer dummy_ownership.deinit(arena);
+    var dummy_store: types_mod.TypeStore = undefined;
+    try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
+
+    const totals = countAliasOpcodes(&function);
+    try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
+    try std.testing.expectEqual(@as(usize, 1), totals.move_count);
+    try std.testing.expectEqual(@as(usize, 0), totals.copy_count);
+}
+
+test "arc_ownership: emits move_value for local_get whose dest's only use is a tuple_init element (Phase E.10)" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const elems = try arena.alloc(ir.LocalId, 1);
+    elems[0] = 1;
+    const instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        .{ .local_get = .{ .dest = 1, .source = 0 } },
+        .{ .tuple_init = .{ .dest = 2, .elements = elems } },
+        .{ .ret = .{ .value = null } },
+    };
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned };
+
+    var function = try buildMoveValueTestFunction(arena, "tuple_consume", &instrs, &ownership, 0);
+
+    var dummy_ownership: arc_liveness.ArcOwnership = .{};
+    defer dummy_ownership.deinit(arena);
+    var dummy_store: types_mod.TypeStore = undefined;
+    try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
+
+    const totals = countAliasOpcodes(&function);
+    try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
+    try std.testing.expectEqual(@as(usize, 1), totals.move_count);
+    try std.testing.expectEqual(@as(usize, 0), totals.copy_count);
+}
+
+test "arc_ownership: emits move_value for local_get whose dest's only use is a list_init element (Phase E.10)" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const elems = try arena.alloc(ir.LocalId, 1);
+    elems[0] = 1;
+    const instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        .{ .local_get = .{ .dest = 1, .source = 0 } },
+        .{ .list_init = .{ .dest = 2, .elements = elems } },
+        .{ .ret = .{ .value = null } },
+    };
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned };
+
+    var function = try buildMoveValueTestFunction(arena, "list_init_consume", &instrs, &ownership, 0);
+
+    var dummy_ownership: arc_liveness.ArcOwnership = .{};
+    defer dummy_ownership.deinit(arena);
+    var dummy_store: types_mod.TypeStore = undefined;
+    try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
+
+    const totals = countAliasOpcodes(&function);
+    try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
+    try std.testing.expectEqual(@as(usize, 1), totals.move_count);
+    try std.testing.expectEqual(@as(usize, 0), totals.copy_count);
+}
+
+test "arc_ownership: emits move_value for local_get whose dest's only use is a union_init value (Phase E.10)" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        .{ .local_get = .{ .dest = 1, .source = 0 } },
+        .{ .union_init = .{ .dest = 2, .union_type = "U", .variant_name = "V", .value = 1 } },
+        .{ .ret = .{ .value = null } },
+    };
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned };
+
+    var function = try buildMoveValueTestFunction(arena, "union_consume", &instrs, &ownership, 0);
+
+    var dummy_ownership: arc_liveness.ArcOwnership = .{};
+    defer dummy_ownership.deinit(arena);
+    var dummy_store: types_mod.TypeStore = undefined;
+    try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
+
+    const totals = countAliasOpcodes(&function);
+    try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
+    try std.testing.expectEqual(@as(usize, 1), totals.move_count);
+    try std.testing.expectEqual(@as(usize, 0), totals.copy_count);
+}
+
+test "arc_ownership: still emits copy_value for map_init operands — Map retains its inserted children (Phase E.10)" {
+    // Phase E.10 negative: `.map_init` is intentionally NOT in the
+    // consume-position set. Map cells are themselves ARC-managed and
+    // `Map.put` retains its inserted value via the Phase 6 substrate.
+    // A `.local_get` flowing into `.map_init.entry.value` therefore
+    // continues to classify as `.copy_value` — the runtime's retain
+    // handles the stored cell's lifetime, so the conservative copy is
+    // correct (and a `.move_value` would double-decrement at scope
+    // exit).
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const entries = try arena.alloc(ir.MapEntry, 1);
+    entries[0] = .{ .key = 0, .value = 2 };
+    const instrs = [_]ir.Instruction{
+        .{ .const_atom = .{ .dest = 0, .value = "k" } },
+        .{ .const_int = .{ .dest = 1, .value = 0, .type_hint = null } },
+        .{ .local_get = .{ .dest = 2, .source = 1 } },
+        .{ .map_init = .{ .dest = 3, .entries = entries } },
+        .{ .ret = .{ .value = null } },
+    };
+    const ownership = [_]ir.OwnershipClass{ .trivial, .owned, .owned, .owned };
+
+    var function = try buildMoveValueTestFunction(arena, "map_consume", &instrs, &ownership, 0);
+
+    var dummy_ownership: arc_liveness.ArcOwnership = .{};
+    defer dummy_ownership.deinit(arena);
+    var dummy_store: types_mod.TypeStore = undefined;
+    try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
+
+    const totals = countAliasOpcodes(&function);
+    try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
+    // copy_value is correct here — Map.put's substrate retains the
+    // inserted child, and a move would clear source's +1 leaving the
+    // Map's runtime retain unbalanced.
+    try std.testing.expectEqual(@as(usize, 0), totals.move_count);
+    try std.testing.expectEqual(@as(usize, 1), totals.copy_count);
+}
+
+test "arc_ownership: still emits copy_value when source has additional uses outside the aggregate-init (Phase E.10 negative)" {
+    // Phase E.10 negative: even when dest's only use is an aggregate-
+    // init operand, if source has any non-`local_get` use the move
+    // would steal ownership from the other use site. The classifier
+    // must fall back to `.copy_value` to keep both owner aliases
+    // viable.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const elems = try arena.alloc(ir.LocalId, 1);
+    elems[0] = 2;
+    const instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        // Extra non-borrow use of source 0 (a local_set carrying it
+        // as its value). This forces the classifier away from move.
+        .{ .local_set = .{ .dest = 1, .value = 0 } },
+        .{ .local_get = .{ .dest = 2, .source = 0 } },
+        .{ .list_init = .{ .dest = 3, .elements = elems } },
+        .{ .ret = .{ .value = null } },
+    };
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned, .owned };
+
+    var function = try buildMoveValueTestFunction(arena, "no_consume_extra_use", &instrs, &ownership, 0);
+
+    var dummy_ownership: arc_liveness.ArcOwnership = .{};
+    defer dummy_ownership.deinit(arena);
+    var dummy_store: types_mod.TypeStore = undefined;
+    try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
+
+    const totals = countAliasOpcodes(&function);
+    try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
+    try std.testing.expectEqual(@as(usize, 0), totals.move_count);
     try std.testing.expectEqual(@as(usize, 1), totals.copy_count);
 }

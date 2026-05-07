@@ -39,6 +39,31 @@ const ir = @import("ir.zig");
 //       operand local's `local_ownership` MUST NOT be `.borrowed`.
 //       Storing a borrow into owned aggregate data would dangle
 //       once the borrow scope ends.
+//
+//       Phase E.10 sharpens the rationale for the non-`.map_init`
+//       aggregates: list, tuple, struct, and union cells are bump-
+//       allocated and never call retain on their stored elements.
+//       The classifier therefore upgrades `.local_get` whose dest's
+//       only use is one of these slots from `.copy_value` to
+//       `.move_value`, transferring the source's `+1` into the
+//       aggregate's implicit ownership; the matching liveness rule
+//       in `arc_liveness.applyOwnsEffect` clears the operand's
+//       owns bit at the aggregate-init so no scope-exit destroy
+//       fires on the cell whose live pointer the aggregate now
+//       holds. V3's borrowed-rejection is the static counterpart of
+//       that liveness contract: a `.borrowed` operand has no `+1`
+//       to transfer in the first place.
+//
+//       Limitation: the contract is correct for comptime-baked or
+//       single-owner aggregates (every macro-emitted manifest
+//       function in the standard library; the canonical doc-runner
+//       reproducer). For runtime-built aggregates that hold ARC
+//       values across many transformations (e.g. `List.append`
+//       chains), the consumed cell stays alive forever via the
+//       bump-allocated aggregate even after the user-visible
+//       aggregate goes out of scope. That is an acceptable leak
+//       compared to the previous use-after-free, and the long-term
+//       remedy is making `List(T)` ARC-managed (Phase H+).
 //   V4. Function parameters of `.borrowed` convention MUST NOT
 //       be released within the function body. Subsumed by V1
 //       when Phase C correctly classifies the param-bound local

@@ -1527,6 +1527,65 @@ const Analyzer = struct {
                     if (self.local_to_arc_index.get(arg_local)) |idx| owns.unset(idx);
                 }
             },
+            // Phase E.10: aggregate-init instructions consume their
+            // operands. List, tuple, struct, and union cells are bump-
+            // allocated and never call retain on stored elements; the
+            // stored pointer itself rides on the producer's existing
+            // +1, and the alias that fed the operand must NOT also
+            // emit a scope-exit release — that release would decrement
+            // the cell while the bump-allocated aggregate still holds
+            // the pointer, producing a use-after-free on every
+            // subsequent read of the aggregate.
+            //
+            // Mirror `tail_call`: clear every operand's owns bit, then
+            // set the dest's owns bit (the aggregate itself becomes
+            // the new owner alias for downstream destroys; e.g. the
+            // returned list is a fresh owner whose own scope-exit
+            // destroy is already accounted for at its consumer).
+            //
+            // `.map_init` is excluded from this rule. Map cells are
+            // ARC-managed and `Map.put` (which underpins `.map_init`)
+            // retains its inserted value via the Phase 6 substrate.
+            // Treating `.map_init` operands as consumed would clear
+            // owns bits the runtime's retain has already accounted
+            // for, double-decrementing the cell at scope exit.
+            .tuple_init => |ti| {
+                for (ti.elements) |elem| {
+                    if (self.local_to_arc_index.get(elem)) |idx| owns.unset(idx);
+                }
+                if (ti.dest < local_ownership.len and local_ownership[ti.dest] == .owned) {
+                    if (self.local_to_arc_index.get(ti.dest)) |idx| owns.set(idx);
+                }
+            },
+            .list_init => |li| {
+                for (li.elements) |elem| {
+                    if (self.local_to_arc_index.get(elem)) |idx| owns.unset(idx);
+                }
+                if (li.dest < local_ownership.len and local_ownership[li.dest] == .owned) {
+                    if (self.local_to_arc_index.get(li.dest)) |idx| owns.set(idx);
+                }
+            },
+            .list_cons => |lc| {
+                if (self.local_to_arc_index.get(lc.head)) |idx| owns.unset(idx);
+                if (self.local_to_arc_index.get(lc.tail)) |idx| owns.unset(idx);
+                if (lc.dest < local_ownership.len and local_ownership[lc.dest] == .owned) {
+                    if (self.local_to_arc_index.get(lc.dest)) |idx| owns.set(idx);
+                }
+            },
+            .struct_init => |si| {
+                for (si.fields) |field| {
+                    if (self.local_to_arc_index.get(field.value)) |idx| owns.unset(idx);
+                }
+                if (si.dest < local_ownership.len and local_ownership[si.dest] == .owned) {
+                    if (self.local_to_arc_index.get(si.dest)) |idx| owns.set(idx);
+                }
+            },
+            .union_init => |ui| {
+                if (self.local_to_arc_index.get(ui.value)) |idx| owns.unset(idx);
+                if (ui.dest < local_ownership.len and local_ownership[ui.dest] == .owned) {
+                    if (self.local_to_arc_index.get(ui.dest)) |idx| owns.set(idx);
+                }
+            },
             else => {
                 // Generic case: every dest local that's classified as
                 // .owned in `local_ownership` gains a +1 at this
