@@ -709,6 +709,38 @@ pub const ArcRuntime = struct {
         }
     }
 
+    /// Walk every field of an aggregate value at comptime and deep-retain
+    /// any indirect-storage Arc'd children encountered. Mirrors
+    /// `releaseChildrenAny` exactly — every field shape that the release
+    /// walker would decrement, this walker increments. Used at sites
+    /// that hand a borrowed-by-pointer aggregate to a caller that will
+    /// later own and release it (e.g. `List.next` returning `cell.head`
+    /// when the cell still owns the same value).
+    pub fn retainChildrenAny(comptime T: type, value: T) void {
+        switch (@typeInfo(T)) {
+            .@"struct" => |s| {
+                inline for (s.fields) |field| {
+                    retainFieldChildAny(field.type, @field(value, field.name));
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn retainFieldChildAny(comptime FieldType: type, value: FieldType) void {
+        switch (@typeInfo(FieldType)) {
+            .optional => |opt| {
+                if (value) |inner| retainFieldChildAny(opt.child, inner);
+            },
+            .pointer => |p| {
+                if (p.size == .one) {
+                    retainAny(@as(*const p.child, value));
+                }
+            },
+            else => {},
+        }
+    }
+
     /// Retain (increment refcount) an Arc-managed value given a pointer to the value field.
     pub fn retainAny(ptr: anytype) void {
         if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
@@ -4588,13 +4620,80 @@ pub fn List(comptime T: type) type {
             }
         }
 
+        /// Inverse of `releaseHeadChildren`: deep-retain every
+        /// ARC-managed child carried inside the head value. Used by
+        /// `next` (and any other site that hands a cell-owned head out
+        /// as a fresh owner without removing it from the cell). The
+        /// switch arms exactly mirror `releaseHeadChildren` so retain
+        /// and release stay in lockstep — drift between the two would
+        /// produce one-sided refcount adjustments that leak or
+        /// double-free.
+        fn retainHeadChildren(head_value: T) void {
+            switch (@typeInfo(T)) {
+                .optional => |opt| {
+                    if (head_value) |inner| {
+                        retainFieldShape(opt.child, inner);
+                    }
+                },
+                .pointer => |p| {
+                    if (p.size == .one) {
+                        ArcRuntime.retainAny(@as(*const p.child, @constCast(head_value)));
+                    }
+                },
+                .@"struct" => {
+                    ArcRuntime.retainChildrenAny(T, head_value);
+                },
+                else => {},
+            }
+        }
+
+        /// Helper for `retainHeadChildren`'s optional branch — mirror
+        /// of `releaseFieldShape`, walks one level deeper into an
+        /// unwrapped optional payload and bumps refcounts at the
+        /// pointer / struct cases.
+        fn retainFieldShape(comptime FieldType: type, value: FieldType) void {
+            switch (@typeInfo(FieldType)) {
+                .optional => |opt| {
+                    if (value) |inner| retainFieldShape(opt.child, inner);
+                },
+                .pointer => |p| {
+                    if (p.size == .one) {
+                        ArcRuntime.retainAny(@as(*const p.child, @constCast(value)));
+                    }
+                },
+                .@"struct" => {
+                    ArcRuntime.retainChildrenAny(FieldType, value);
+                },
+                else => {},
+            }
+        }
+
+        /// Returns a fresh owner of the cell's head value. The cell
+        /// continues to own its copy too — `releaseHeadChildren` runs
+        /// on the cell's zero-transition. To keep the two owners in
+        /// balance, deep-retain the head's ARC children before handing
+        /// the value out. This matches the IR's "list_head produces an
+        /// owner" model used by `arc_drop_insertion`. Without the
+        /// retain, the cell's deep-release and the caller's release
+        /// race on the same children and produce double-frees once
+        /// `.list` joins the ARC-managed set.
         pub fn getHead(list: ?*const Self) T {
-            if (list) |cell| return cell.head;
+            if (list) |cell| {
+                retainHeadChildren(cell.head);
+                return cell.head;
+            }
             return defaultElement();
         }
 
+        /// Returns a fresh owner of the cell's tail spine. Bumps the
+        /// head cell of `cell.tail` (the spine's first cell) so the
+        /// cell's own owner-side deep-release stays balanced with the
+        /// caller's eventual release. Mirrors `getHead`.
         pub fn getTail(list: ?*const Self) ?*const Self {
-            if (list) |cell| return cell.tail;
+            if (list) |cell| {
+                _ = retain(cell.tail);
+                return cell.tail;
+            }
             return null;
         }
 
@@ -4645,8 +4744,31 @@ pub fn List(comptime T: type) type {
 
         /// Iterator protocol: returns {atom, value, next_state}.
         /// :cont (5) with head and tail for non-empty, :done (7) for empty.
+        ///
+        /// Ownership semantics for ARC-managed `T`: the returned tuple's
+        /// `head` and `next_state` are fresh **owners** — the caller's
+        /// `result_convention` for this protocol-dispatched call sees
+        /// every ARC-managed return slot as `.owned`. Because `cell.head`
+        /// and `cell.tail` are still owned by `cell` after we read them,
+        /// `next` must deep-retain `head` (recursively bumping the
+        /// refcount of every ARC-managed child carried inside `T`) and
+        /// retain `tail` (bumping the head cell of the tail spine, since
+        /// the original list still references it). Without this, the
+        /// caller's eventual release of the returned values would race
+        /// with the cell's own deep-release on its zero-transition,
+        /// producing double-frees for ARC-typed elements (the corruption
+        /// surfaced by k-nucleotide once `.list` joins `.opaque_type`,
+        /// `.map` in `isArcManagedTypeId`).
+        /// See module-level note on Phase H ARC ABI: `next` returns
+        /// fresh owners of `head` and `tail`, so we must deep-retain
+        /// the head's ARC children and bump the tail spine's head-cell
+        /// refcount before handing the values out. The cell itself
+        /// still owns its copies — the symmetric deep-release fires on
+        /// the cell's eventual zero-transition in `release`.
         pub fn next(list: ?*const Self) std.meta.Tuple(&.{ u32, T, ?*const Self }) {
             if (list) |cell| {
+                retainHeadChildren(cell.head);
+                _ = retain(cell.tail);
                 return .{ ATOM_CONT, cell.head, cell.tail };
             }
             return .{ ATOM_DONE, defaultElement(), null };
