@@ -210,6 +210,120 @@ fn verifyTailCallRewritability(
             if (terminatesStream(next)) break;
         }
     }
+
+    // Phase E.7: structural V6 — catch self-recursive `call_named`
+    // sites buried inside an `if_expr` / `switch_literal` arm whose
+    // arm-result is the call's dest, with the enclosing branch's
+    // dest feeding the function's `ret`. This is the structural
+    // analogue of the linear case above; the IrBuilder's
+    // `tryRewriteTailThroughBranch` exists specifically to catch
+    // this shape and rewrite it to per-arm `tail_call`. If V6 sees
+    // a non-rewritten residue (because some pass introduced a non-
+    // tail-mappable instruction in the arm body, blocking the
+    // rewriter, or because the rewriter's gate did not fire for
+    // some reason), the runtime would execute it as unbounded
+    // stack-growing recursion. Surface that at compile time.
+    //
+    // The walk pattern: for each `(if_expr | switch_literal)`
+    // followed by `ret`, where the construct's dest matches the
+    // ret's value, descend into each arm and check whether any arm
+    // body has the call+arm-result-feed shape that the rewriter
+    // would have transformed.
+    var struct_index: usize = 0;
+    while (struct_index < stream.len) : (struct_index += 1) {
+        const branch = stream[struct_index];
+        const branch_dest: ir.LocalId = switch (branch) {
+            .if_expr => |ie| ie.dest,
+            .switch_literal => |sl| sl.dest,
+            else => continue,
+        };
+        // Must be immediately followed by a matching ret. The
+        // rewriter's strict gate checks the same; a non-strict
+        // gap (an intervening tail-mappable instruction) is V6's
+        // job for the linear path above, not the structural one.
+        if (struct_index + 1 >= stream.len) continue;
+        const successor = stream[struct_index + 1];
+        if (successor != .ret) continue;
+        const ret_value = successor.ret.value orelse continue;
+        if (ret_value != branch_dest) continue;
+
+        // Each arm is in tail position. Check each arm's body for
+        // an unrewritten self-recursive tail-position call.
+        switch (branch) {
+            .if_expr => |ie| {
+                try verifyArmTailCallRewritten(function, struct_index, ie.then_instrs, ie.then_result);
+                try verifyArmTailCallRewritten(function, struct_index, ie.else_instrs, ie.else_result);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |case| {
+                    try verifyArmTailCallRewritten(function, struct_index, case.body_instrs, case.result);
+                }
+                try verifyArmTailCallRewritten(function, struct_index, sl.default_instrs, sl.default_result);
+            },
+            else => unreachable,
+        }
+    }
+}
+
+/// Phase E.7 helper: assert that an arm in tail position does NOT
+/// contain an unrewritten self-recursive call_named at its tail.
+/// The arm is in tail position when the enclosing if_expr /
+/// switch_literal's `dest` feeds the function's `ret`. The arm
+/// itself is "the tail" when its `arm_result` is the local consumed
+/// by the merge — which is precisely the IR shape the rewriter's
+/// `rewriteTailCallsInBody` recognises.
+///
+/// The check walks backward from the arm body's tail, skipping past
+/// tail-mappable trailing instructions, and verifies the resulting
+/// position is NOT a self-recursive `call_named` whose dest equals
+/// `arm_result`. Such a residue means the rewriter could not (or
+/// did not) fire on this arm; deep recursion through this code path
+/// will blow the stack at runtime.
+fn verifyArmTailCallRewritten(
+    function: *const ir.Function,
+    enclosing_branch_index: usize,
+    body: []const ir.Instruction,
+    arm_result: ?ir.LocalId,
+) VerifyError!void {
+    const expected_dest = arm_result orelse return;
+    if (body.len == 0) return;
+    var probe: usize = body.len;
+    while (probe > 0 and isTailMappableTrailingInstr(body[probe - 1])) : (probe -= 1) {}
+    if (probe == 0) return;
+    const candidate = body[probe - 1];
+    switch (candidate) {
+        .call_named => |cn| {
+            if (cn.dest != expected_dest) return;
+            if (!std.mem.eql(u8, cn.name, function.name)) return;
+            // V6 structural violation: the arm's tail is a self-
+            // recursive call_named whose result is the arm's merge
+            // value, but the rewriter did not collapse it into a
+            // tail_call. Diagnose with enough context to localise.
+            emitStructuralTailCallDiagnostic(function, enclosing_branch_index, probe - 1);
+            return error.ArcInvariantViolation;
+        },
+        else => return,
+    }
+}
+
+/// Emit a V6 diagnostic for the structural shape — a self-recursive
+/// `call_named` at the tail of an `if_expr` / `switch_literal` arm
+/// that the IrBuilder's `tryRewriteTailThroughBranch` did not lower
+/// to a `tail_call`.
+fn emitStructuralTailCallDiagnostic(
+    function: *const ir.Function,
+    branch_index: usize,
+    arm_call_index: usize,
+) void {
+    if (suppress_diagnostics) return;
+    std.debug.print(
+        "arc_verifier: function '{s}' violates V6 (structural):\n" ++
+            "  self-recursive call at arm-internal index {d}, inside if_expr/switch_literal at stream index {d}\n" ++
+            "  the construct's dest feeds the function's ret, so the arm is in tail position;\n" ++
+            "  the IrBuilder's tryRewriteTailThroughBranch should have collapsed it into `tail_call`.\n" ++
+            "  Deep recursion through this code path will blow the stack.\n",
+        .{ function.name, arm_call_index, branch_index },
+    );
 }
 
 /// Phase E.6: classify whether `instr` is a tail-mappable trailing
@@ -1069,6 +1183,134 @@ test "arc_verifier: V6 walks into nested switch_return arms" {
 
     const result = verify(allocator, &function);
     try testing.expectError(error.ArcInvariantViolation, result);
+}
+
+test "arc_verifier: rejects unrewritten structural tail-call inside switch_literal arm (V6 Phase E.7)" {
+    var guard = SuppressDiagnostics.init();
+    defer guard.deinit();
+    // Phase E.7 structural V6: a self-recursive `.call_named` whose
+    // dest is its arm's `result`, sitting inside an `if_expr` /
+    // `switch_literal` whose own `dest` feeds the function's `ret`,
+    // is in tail position even though the call is one structural
+    // level deep. The IrBuilder's `tryRewriteTailThroughBranch`
+    // collapses this shape into `tail_call`. If V6 sees a
+    // residue, the rewriter missed it — flag at compile time.
+    const allocator = testing.allocator;
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned };
+    const conventions = [_]ir.ParamConvention{};
+    const true_arm_instrs = [_]ir.Instruction{
+        .{ .call_named = .{ .dest = 1, .name = "test_v6_struct", .args = &.{}, .arg_modes = &.{} } },
+    };
+    const cases = [_]ir.LitCase{
+        .{ .value = .{ .bool_val = true }, .body_instrs = &true_arm_instrs, .result = 1 },
+    };
+    const false_arm_instrs = [_]ir.Instruction{};
+    const instrs = [_]ir.Instruction{
+        .{ .switch_literal = .{
+            .dest = 2,
+            .scrutinee = 0,
+            .cases = &cases,
+            .default_instrs = &false_arm_instrs,
+            .default_result = 0,
+        } },
+        .{ .ret = .{ .value = 2 } },
+    };
+    var function = try buildTestFunction(
+        allocator,
+        "test_v6_struct",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(allocator, &function);
+
+    const result = verify(allocator, &function);
+    try testing.expectError(error.ArcInvariantViolation, result);
+}
+
+test "arc_verifier: structural V6 silent when branch dest does not feed ret" {
+    // Negative control: when the if/switch's dest is NOT the operand
+    // of the immediately-following `ret`, the arms are NOT in tail
+    // position. Even a self-recursive call inside an arm whose
+    // result is the arm's merge value is genuinely non-tail (the
+    // construct's value flows somewhere else first), so V6 must
+    // remain silent.
+    const allocator = testing.allocator;
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned, .owned };
+    const conventions = [_]ir.ParamConvention{};
+    const true_arm_instrs = [_]ir.Instruction{
+        .{ .call_named = .{ .dest = 1, .name = "test_v6_nontail", .args = &.{}, .arg_modes = &.{} } },
+    };
+    const cases = [_]ir.LitCase{
+        .{ .value = .{ .bool_val = true }, .body_instrs = &true_arm_instrs, .result = 1 },
+    };
+    const false_arm_instrs = [_]ir.Instruction{};
+    const instrs = [_]ir.Instruction{
+        .{ .switch_literal = .{
+            .dest = 2,
+            .scrutinee = 0,
+            .cases = &cases,
+            .default_instrs = &false_arm_instrs,
+            .default_result = 0,
+        } },
+        // The construct's dest %2 is not consumed by the ret; the
+        // ret returns %3 instead. The arm's call is therefore not
+        // in tail position.
+        .{ .ret = .{ .value = 3 } },
+    };
+    var function = try buildTestFunction(
+        allocator,
+        "test_v6_nontail",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(allocator, &function);
+
+    try verify(allocator, &function);
+}
+
+test "arc_verifier: structural V6 silent when arm tail call already rewritten to tail_call" {
+    // Positive control: after `tryRewriteTailThroughBranch` runs,
+    // the arm body ends in `tail_call` (not `call_named`), the arm
+    // result is `null`, and the outer `ret` has been dropped. V6
+    // must accept this shape — it is exactly what the rewriter
+    // produces.
+    const allocator = testing.allocator;
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned };
+    const conventions = [_]ir.ParamConvention{};
+    const true_arm_instrs = [_]ir.Instruction{
+        .{ .tail_call = .{ .name = "test_v6_rewritten", .args = &.{} } },
+    };
+    const cases = [_]ir.LitCase{
+        .{ .value = .{ .bool_val = true }, .body_instrs = &true_arm_instrs, .result = null },
+    };
+    const false_arm_instrs = [_]ir.Instruction{
+        .{ .ret = .{ .value = 0 } },
+    };
+    // No outer ret — the rewriter dropped it.
+    const instrs = [_]ir.Instruction{
+        .{ .switch_literal = .{
+            .dest = 2,
+            .scrutinee = 0,
+            .cases = &cases,
+            .default_instrs = &false_arm_instrs,
+            .default_result = null,
+        } },
+    };
+    var function = try buildTestFunction(
+        allocator,
+        "test_v6_rewritten",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(allocator, &function);
+
+    try verify(allocator, &function);
 }
 
 test "arc_verifier: stub function signature compiles" {
