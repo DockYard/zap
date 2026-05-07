@@ -2893,6 +2893,76 @@ pub const IrBuilder = struct {
                                 continue; // skip the ret
                             }
                         }
+
+                        // Phase E.7: structural tail-call through `if_expr`
+                        // / `switch_literal` arms.
+                        //
+                        // Zap's `if-else` surface lowers to `switch_literal`
+                        // (literal arms on a Bool scrutinee) or `if_expr`,
+                        // and the value flowing out of the construct (the
+                        // arms' merged result) is what feeds the function's
+                        // `ret`. When each arm's last instruction is a
+                        // self-recursive `call_named` whose `dest` is the
+                        // arm's `result`, the recursion is genuinely in
+                        // tail position — every CFG path from the construct
+                        // to the function exit is `arm body -> recursive
+                        // call -> arm result -> if/switch dest -> ret`. The
+                        // top-level rewriter above only handles the case
+                        // where the `call_named + ret` pair is already
+                        // adjacent in the same stream; the structural case
+                        // requires recursing INTO each arm and rewriting
+                        // its tail position.
+                        //
+                        // Match the construct walking past trailing tail-
+                        // mappable instructions exactly like the linear
+                        // case. When the construct's `dest` matches the
+                        // outer `ret`'s value, rewrite each arm via the
+                        // existing `rewriteTailCallsInBody` helper. Arms
+                        // whose body does NOT end in a self-recursive call
+                        // (e.g., a base case returning a constant) are left
+                        // alone — `rewriteTailCallsInBody` returns `null`
+                        // for the rewritten flag and the original arm is
+                        // preserved verbatim. This is correct: only the
+                        // recursive arm needs the tail-call rewrite; the
+                        // base case completes its arm body, joins at the
+                        // construct's `dest`, and flows into the outer
+                        // `ret` normally. The outer `ret` itself stays in
+                        // place — it remains the terminator for non-
+                        // rewritten arms; for rewritten arms the `tail_call`
+                        // inside the arm jumps out of the function before
+                        // control would have rejoined the merge.
+                        // Only fire the structural rewrite when the
+                        // branch is IMMEDIATELY followed by the outer
+                        // `ret` (no intervening tail-mappable
+                        // instructions). Tail-mappable instructions in
+                        // the gap would be ARC bookkeeping on the
+                        // merge value (e.g., a post-merge retain
+                        // before ret); after the rewrite no merge
+                        // value exists, so those instructions would
+                        // have nothing to operate on. Keeping the
+                        // gate strict avoids that ambiguity. The k-
+                        // nucleotide hot loop falls in this strict
+                        // window.
+                        if (probe == result.items.len and probe > 0) {
+                            const branch_instr = result.items[probe - 1];
+                            const rewritten_branch = try self.tryRewriteTailThroughBranch(branch_instr, r.value.?, func_name);
+                            if (rewritten_branch) |new_branch| {
+                                // The rewritten branch subsumes the
+                                // outer `ret`: every arm now terminates
+                                // itself (either via `tail_call` or via
+                                // the `ret arm_result` pushed by
+                                // `tryRewriteTailThroughBranch`). Drop
+                                // the outer `ret` — control never
+                                // reaches a merge. The shape mirrors
+                                // `switch_return`'s self-terminating
+                                // arms, which the ZIR backend already
+                                // handles correctly under both musttail
+                                // and loopify lowering.
+                                result.items.len = probe - 1;
+                                try result.append(self.allocator, new_branch);
+                                continue;
+                            }
+                        }
                     }
                     try result.append(self.allocator, instr);
                 },
@@ -2979,6 +3049,159 @@ pub const IrBuilder = struct {
             .tail_call = .{ .name = sh.tail_name, .args = sh.args },
         });
         return .{ .instrs = try new_body.toOwnedSlice(self.allocator), .rewritten = true };
+    }
+
+    /// Phase E.7: rewrite an `if_expr` / `switch_literal` whose `dest`
+    /// flows into a function-level tail-position `ret`, descending into
+    /// each arm and rewriting per-arm `call_named + arm_result == call.dest`
+    /// shapes into `tail_call`. Returns the rewritten branch instruction
+    /// when at least one arm was rewritten, otherwise `null` (so the
+    /// caller leaves the original branch in place).
+    ///
+    /// `dest_local` is the LocalId that the outer `ret` consumes; the
+    /// rewrite is gated on the branch's `dest` matching it. A mismatch
+    /// (the branch's value flows somewhere else before reaching `ret`)
+    /// means the arms are NOT in tail position and the rewrite would
+    /// be unsound.
+    ///
+    /// Branch lowering: a `switch_literal` / `if_expr` is a value-
+    /// producing expression. The ZIR backend lowers it to nested
+    /// `if_else_bodies` whose merge produces `dest`. Without further
+    /// changes, a single arm being rewritten to `tail_call` would
+    /// leave the OTHER arm producing a typed value into the merge —
+    /// in loopify mode (the ARC-managed/byref shape) the merge would
+    /// be Map vs void, which Sema rejects. To make the construct
+    /// type-uniform we push the outer `ret` INTO each non-recursive
+    /// arm: append `ret arm_result` to the arm body and clear the
+    /// arm's `result` field. The arm becomes noreturn (matching
+    /// `switch_return`'s shape). The outer `ret` is left in place by
+    /// the caller — it becomes dead code that Zig's ZIR/Sema accept
+    /// without complaint, and it remains the explicit terminator if
+    /// any arm bodies happen not to be rewritten or pushed (e.g., an
+    /// empty arm, which today is an unreachable IR shape).
+    ///
+    /// In musttail mode every rewritten arm ends in `tail_call` →
+    /// `musttail call + ret` (noreturn at ZIR level). Pushed-ret arms
+    /// also end in `ret` (noreturn). The merge is never reached.
+    ///
+    /// In loopify mode the rewritten arm ends in `tail_call` → stores
+    /// + fall-through to the wrapping `loop`'s trailing `repeat`.
+    /// Pushed-ret arms end in `ret` (noreturn → exits the function,
+    /// bypassing the loop). Both shapes are valid block-body
+    /// terminators inside `if_else_bodies` because Sema treats
+    /// fall-through-and-repeat the same as any normal break_inline.
+    fn tryRewriteTailThroughBranch(
+        self: *IrBuilder,
+        branch_instr: Instruction,
+        dest_local: LocalId,
+        func_name: []const u8,
+    ) !?Instruction {
+        switch (branch_instr) {
+            .if_expr => |ie| {
+                if (ie.dest != dest_local) return null;
+                const new_then = try self.rewriteTailCallsInBody(ie.then_instrs, ie.then_result, func_name);
+                const new_else = try self.rewriteTailCallsInBody(ie.else_instrs, ie.else_result, func_name);
+                if (!new_then.rewritten and !new_else.rewritten) return null;
+
+                const final_then_instrs = if (new_then.rewritten)
+                    new_then.instrs
+                else
+                    try self.appendRetToBody(ie.then_instrs, ie.then_result);
+                const final_else_instrs = if (new_else.rewritten)
+                    new_else.instrs
+                else
+                    try self.appendRetToBody(ie.else_instrs, ie.else_result);
+
+                return Instruction{ .if_expr = .{
+                    .dest = ie.dest,
+                    .condition = ie.condition,
+                    .then_instrs = final_then_instrs,
+                    .then_result = null,
+                    .else_instrs = final_else_instrs,
+                    .else_result = null,
+                } };
+            },
+            .switch_literal => |sl| {
+                if (sl.dest != dest_local) return null;
+                var any_rewritten = false;
+                // First pass: discover whether any arm gets rewritten.
+                // The pushed-ret transformation is gated on this
+                // (arms only need to push the outer ret if at least
+                // one sibling arm is taking the tail-call path).
+                var rewrite_results: std.ArrayList(TailCallRewrite) = .empty;
+                defer rewrite_results.deinit(self.allocator);
+                for (sl.cases) |case| {
+                    const r = try self.rewriteTailCallsInBody(case.body_instrs, case.result, func_name);
+                    if (r.rewritten) any_rewritten = true;
+                    try rewrite_results.append(self.allocator, r);
+                }
+                const new_default = try self.rewriteTailCallsInBody(sl.default_instrs, sl.default_result, func_name);
+                if (new_default.rewritten) any_rewritten = true;
+                if (!any_rewritten) return null;
+
+                // Second pass: emit each arm in its final shape —
+                // either the rewritten body (tail_call terminated) or
+                // the original body with `ret arm_result` appended.
+                var new_cases: std.ArrayList(LitCase) = .empty;
+                for (sl.cases, 0..) |case, idx| {
+                    const r = rewrite_results.items[idx];
+                    const final_body = if (r.rewritten)
+                        r.instrs
+                    else
+                        try self.appendRetToBody(case.body_instrs, case.result);
+                    try new_cases.append(self.allocator, .{
+                        .value = case.value,
+                        .body_instrs = final_body,
+                        .result = null,
+                    });
+                }
+                const final_default = if (new_default.rewritten)
+                    new_default.instrs
+                else
+                    try self.appendRetToBody(sl.default_instrs, sl.default_result);
+                return Instruction{ .switch_literal = .{
+                    .dest = sl.dest,
+                    .scrutinee = sl.scrutinee,
+                    .cases = try new_cases.toOwnedSlice(self.allocator),
+                    .default_instrs = final_default,
+                    .default_result = null,
+                } };
+            },
+            else => return null,
+        }
+    }
+
+    /// Phase E.7 helper: append a `ret arm_result` instruction to
+    /// `body`, returning a freshly-allocated slice. Used by
+    /// `tryRewriteTailThroughBranch` to push the outer `ret` into
+    /// arms that did NOT get the tail-call rewrite, so every arm
+    /// becomes noreturn and the if/switch construct type-merges
+    /// uniformly under both musttail and loopify lowering.
+    ///
+    /// If `result` is `null`, the body is returned unchanged — the
+    /// arm is already noreturn (e.g., it ends in `match_fail`) and
+    /// adding a `ret` would emit an unreachable instruction after a
+    /// noreturn terminator.
+    fn appendRetToBody(
+        self: *IrBuilder,
+        body: []const Instruction,
+        result: ?LocalId,
+    ) ![]const Instruction {
+        const ret_value = result orelse return body;
+        // Detect bodies that already end in a noreturn terminator
+        // (e.g., `match_fail`, `match_error_return`, `ret`, or a
+        // tail_call). Such bodies should not have an extra `ret`
+        // appended — the appended instruction would be unreachable.
+        if (body.len > 0) {
+            switch (body[body.len - 1]) {
+                .ret, .match_fail, .match_error_return, .tail_call, .switch_return, .union_switch_return => return body,
+                else => {},
+            }
+        }
+        var new_body: std.ArrayList(Instruction) = .empty;
+        for (body) |bi| try new_body.append(self.allocator, bi);
+        try new_body.append(self.allocator, .{ .ret = .{ .value = ret_value } });
+        return try new_body.toOwnedSlice(self.allocator);
     }
 
     /// Check if multi-clause function can emit switch_return for integer literals.

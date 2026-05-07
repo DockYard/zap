@@ -2700,9 +2700,29 @@ test "arc_liveness: function returning a call's result has no extra elision" {
 
 test "arc_liveness: tail-recursion k-nucleotide shape (return + recursive call)" {
     // Mimics the `Probe.loop` pattern: a recursive function whose
-    // base-case arm returns the ARC param directly (return source)
-    // and whose recursive arm passes the ARC param into a helper
-    // call (consume site).
+    // base-case arm returns the ARC param directly and whose
+    // recursive arm passes the ARC param into a helper call.
+    //
+    // Phase E.7 changed the structural shape of this function. The
+    // tail-call rewriter now recognises `if`/`switch_literal` whose
+    // dest feeds an outer `ret` and pushes per-arm terminators
+    // (the recursive arm becomes `tail_call`, the base arm gets the
+    // outer `ret arm_result` pushed in). This eliminates the outer
+    // `ret D` over the case-block dest entirely — every arm is
+    // self-terminating, exactly as `switch_return` already was. The
+    // construct's dest `D` is therefore no longer the operand of any
+    // `ret`, so `return_source_locals` does not pick it up.
+    //
+    // The borrow ABI invariant the test pins is unchanged: every
+    // share stays at retain (consume_share_sites is empty). The
+    // return-source bookkeeping table is now empty for this shape
+    // because the structural elision target has moved into per-arm
+    // self-termination — neither the base arm's `ret m` (m is a
+    // borrowed param, blocked by `canElideReturnSource`) nor the
+    // recursive arm's `tail_call` (no operand-as-ret-value) populates
+    // the table. The drop-list filter does not need an entry here:
+    // the borrowed param is excluded from drops by Phase B's
+    // parameter-skip logic, not by return-source elision.
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -2729,12 +2749,8 @@ test "arc_liveness: tail-recursion k-nucleotide shape (return + recursive call)"
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // Borrow-by-default ABI: the recursive-arm share of `m` stays as
-    // retain. The base-case arm still records `m` as a return source.
-    // Until per-callee borrow / consume metadata exists, the consume
-    // table is intentionally empty for every call site.
     try std.testing.expectEqual(@as(usize, 0), ownership.consume_share_sites.count());
-    try std.testing.expect(ownership.return_source_locals.count() >= 1);
+    try std.testing.expectEqual(@as(usize, 0), ownership.return_source_locals.count());
 }
 
 test "arc_liveness: duplicate-arg call leaves every share_value at retain (borrow ABI)" {
@@ -3185,13 +3201,22 @@ test "arc_liveness: Phase 5 — owned-binding ret IS in return_source (Phase E.5
 
 test "arc_liveness: Phase 5 — k-nucleotide-shaped tail loop populates both categories" {
     // The plan's prototype shape: a recursive function whose then-arm
-    // returns the ARC parameter directly (return-source elision) and
-    // whose else-arm tail-recurses with a helper-produced value
-    // (consume site at the helper call). Phase 5's filter must
-    // suppress the release on `m` in the base-case arm; Phase 4's
-    // consume infrastructure must suppress the share-retain at the
-    // helper call site. Both fire on the same function, on disjoint
-    // locals.
+    // returns the ARC parameter directly and whose else-arm tail-
+    // recurses with a helper-produced value.
+    //
+    // Phase E.7 changed the structural shape of this function. The
+    // tail-call rewriter now folds the outer `ret D` (over the case-
+    // block dest) into per-arm self-terminators — the recursive arm
+    // ends in `tail_call`, the base arm has `ret m` pushed into it.
+    // The construct's dest D is no longer consumed by any
+    // instruction, so `return_source_locals` does not record it. The
+    // base arm's `ret m` does not propagate to `return_source_locals`
+    // either: `m` is a borrowed param and `canElideReturnSource`
+    // refuses to elide for borrowed params (per Phase E.5 Gap 4 — a
+    // borrowed param's retain-on-ret discipline must fire). The
+    // borrow ABI invariant the test pins (consume_share_sites empty)
+    // remains; the return-source bookkeeping migrates to a different
+    // representation under the new structural shape.
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -3218,10 +3243,8 @@ test "arc_liveness: Phase 5 — k-nucleotide-shaped tail loop populates both cat
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // Borrow ABI: the recursive-arm share of `m` stays at retain.
-    // The base-case arm still records `m` as a return source.
     try std.testing.expectEqual(@as(usize, 0), ownership.consume_share_sites.count());
-    try std.testing.expect(ownership.return_source_locals.count() >= 1);
+    try std.testing.expectEqual(@as(usize, 0), ownership.return_source_locals.count());
 }
 
 test "arc_liveness: Phase 5 — function returning helper(x) does not list parameter as return source" {

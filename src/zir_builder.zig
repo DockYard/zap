@@ -398,6 +398,16 @@ fn mapParamType(zig_type: ir.ZigType) u32 {
 // ZirDriver
 // ---------------------------------------------------------------------------
 
+/// True when the IR `instructions` slice's last instruction lowers to
+/// a ZIR-level noreturn terminator unconditionally. The ZIR backend
+/// uses this to decide whether to mark a captured branch body's
+/// result ref as `unreachable_value` (the body never produces a value
+/// the merge can consume) instead of `void_value`.
+///
+/// `tail_call` is intentionally NOT in this list — its noreturn-ness
+/// is loopify-state-dependent and must be checked through
+/// `instructionsEndNoReturnFor` (a method on ZirDriver) which has
+/// access to `loopify_slots`.
 fn instructionsEndNoReturn(instructions: []const ir.Instruction) bool {
     if (instructions.len == 0) return false;
     return switch (instructions[instructions.len - 1]) {
@@ -740,6 +750,35 @@ pub const ZirDriver = struct {
         const result = zir_builder_end_capture(self.handle, out_len);
         if (self.capture_depth > 0) self.capture_depth -= 1;
         return result;
+    }
+
+    /// Phase E.7: classify whether `instructions` ends in a ZIR-level
+    /// noreturn terminator, accounting for loopify state.
+    ///
+    /// In addition to the unconditional noreturn shapes captured by
+    /// `instructionsEndNoReturn` (`.match_fail`, `.match_error_return`,
+    /// `.ret`), a trailing `.tail_call` is noreturn ONLY when the
+    /// musttail lowering path is in effect — that path emits `musttail
+    /// call + ret` for the tail call, so the captured ZIR body ends
+    /// with a `ret`. In the loopify path the same `.tail_call` IR
+    /// emits stores to mutable parameter slots and falls through; the
+    /// captured body is NOT noreturn at the ZIR level (the wrapping
+    /// `loop` block's trailing `repeat` carries control back).
+    ///
+    /// Used by `emitIfExpr` and `emitSwitchLiteral` to pick the
+    /// correct branch-result ref when the IR sets `result = null` for
+    /// a tail-call-rewritten arm. Sema accepts `unreachable_value`
+    /// from a body that genuinely never produces a value, but
+    /// disagrees with `void_value` when the body actually ends in
+    /// `ret` (it sees the `ret` as a hard exit and the void claim as
+    /// dead code).
+    fn instructionsEndNoReturnFor(self: *const ZirDriver, instructions: []const ir.Instruction) bool {
+        if (instructions.len == 0) return false;
+        return switch (instructions[instructions.len - 1]) {
+            .match_fail, .match_error_return, .ret => true,
+            .tail_call => self.loopify_slots == null,
+            else => false,
+        };
     }
 
     /// Map Zap-facing struct names to runtime struct names. Each Zap
@@ -6799,8 +6838,18 @@ pub const ZirDriver = struct {
         var then_len: u32 = 0;
         const then_insts_ptr = self.endCapture(&then_len);
 
+        // Phase E.7: when the rewriter has collapsed the arm's
+        // recursive call into a `tail_call`, `ie.then_result` is
+        // `null` and the captured ZIR ends in a `ret` (musttail) or
+        // falls through to the wrapping `loop`'s `repeat` (loopify).
+        // The musttail case is noreturn at the ZIR level and must
+        // emit `unreachable_value` so Sema does not treat the merge
+        // as reachable. The loopify case is fall-through; `void_value`
+        // is correct.
         const then_ref: u32 = if (ie.then_result) |tr|
             try self.refForLocal(tr)
+        else if (self.instructionsEndNoReturnFor(ie.then_instrs))
+            @intFromEnum(Zir.Inst.Ref.unreachable_value)
         else
             @intFromEnum(Zir.Inst.Ref.void_value);
 
@@ -6819,6 +6868,8 @@ pub const ZirDriver = struct {
 
         const else_ref: u32 = if (ie.else_result) |er|
             try self.refForLocal(er)
+        else if (self.instructionsEndNoReturnFor(ie.else_instrs))
+            @intFromEnum(Zir.Inst.Ref.unreachable_value)
         else
             @intFromEnum(Zir.Inst.Ref.void_value);
 
@@ -6884,7 +6935,7 @@ pub const ZirDriver = struct {
         const default_ptr = self.endCapture(&default_len);
         const default_result: u32 = if (dest_opt) |d|
             if (self.local_refs.get(d)) |vr| self.materializeValueRef(vr) catch void_ref else void_ref
-        else if (instructionsEndNoReturn(default_instrs))
+        else if (self.instructionsEndNoReturnFor(default_instrs))
             @intFromEnum(Zir.Inst.Ref.unreachable_value)
         else
             void_ref;
@@ -7226,9 +7277,13 @@ pub const ZirDriver = struct {
         }
         var default_len: u32 = 0;
         const default_ptr = self.endCapture(&default_len);
+        // Phase E.7: also recognise `tail_call` as noreturn in non-
+        // loopify mode (see `instructionsEndNoReturnFor`). Without
+        // this, a tail-call-rewritten default arm would be treated as
+        // void-typed and Sema would reject the if/else merge.
         const default_result: u32 = if (sl.default_result) |dr|
             self.refForLocal(dr) catch @intFromEnum(Zir.Inst.Ref.void_value)
-        else if (instructionsEndNoReturn(sl.default_instrs))
+        else if (self.instructionsEndNoReturnFor(sl.default_instrs))
             @intFromEnum(Zir.Inst.Ref.unreachable_value)
         else
             @intFromEnum(Zir.Inst.Ref.void_value);
@@ -7278,8 +7333,17 @@ pub const ZirDriver = struct {
             var case_len: u32 = 0;
             const case_ptr = self.endCapture(&case_len);
 
+            // Phase E.7: a tail-call-rewritten case (`case.result == null`
+            // because `tail_call` produces no merge value) is noreturn
+            // at the ZIR level when the function is musttail-lowered;
+            // emit `unreachable_value` so Sema does not consider the
+            // merge reachable from this arm. In loopify mode the same
+            // arm falls through to the wrapping `loop`'s `repeat` and
+            // `void_value` remains correct.
             const case_result: u32 = if (case.result) |r|
                 self.refForLocal(r) catch @intFromEnum(Zir.Inst.Ref.void_value)
+            else if (self.instructionsEndNoReturnFor(case.body_instrs))
+                @intFromEnum(Zir.Inst.Ref.unreachable_value)
             else
                 @intFromEnum(Zir.Inst.Ref.void_value);
 
@@ -7355,7 +7419,7 @@ pub const ZirDriver = struct {
         const default_ptr = self.endCapture(&default_len);
         const default_result: u32 = if (cb.default_result) |dr|
             self.refForLocal(dr) catch @intFromEnum(Zir.Inst.Ref.void_value)
-        else if (instructionsEndNoReturn(cb.default_instrs))
+        else if (self.instructionsEndNoReturnFor(cb.default_instrs))
             @intFromEnum(Zir.Inst.Ref.unreachable_value)
         else
             @intFromEnum(Zir.Inst.Ref.void_value);
@@ -7385,8 +7449,14 @@ pub const ZirDriver = struct {
             var arm_len: u32 = 0;
             const arm_ptr = self.endCapture(&arm_len);
 
+            // Phase E.7: tail-call-rewritten arms have `result == null`
+            // and the captured ZIR ends in a noreturn `ret` (musttail
+            // mode). Use `unreachable_value` so Sema does not try to
+            // type-merge the arm into the enclosing block.
             const arm_result: u32 = if (arm.result) |r|
                 self.refForLocal(r) catch @intFromEnum(Zir.Inst.Ref.void_value)
+            else if (self.instructionsEndNoReturnFor(arm.body_instrs))
+                @intFromEnum(Zir.Inst.Ref.unreachable_value)
             else
                 @intFromEnum(Zir.Inst.Ref.void_value);
 
@@ -7605,7 +7675,7 @@ pub const ZirDriver = struct {
         const default_ptr = self.endCapture(&default_len);
         var default_result: u32 = if (cb.default_result) |dr|
             self.refForLocal(dr) catch void_ref
-        else if (instructionsEndNoReturn(default_pre_instrs) or instructionsEndNoReturn(cb.default_instrs))
+        else if (self.instructionsEndNoReturnFor(default_pre_instrs) or self.instructionsEndNoReturnFor(cb.default_instrs))
             @intFromEnum(Zir.Inst.Ref.unreachable_value)
         else
             void_ref;
