@@ -4382,8 +4382,57 @@ fn defaultElementOf(comptime T: type) T {
 pub fn List(comptime T: type) type {
     return struct {
         const Self = @This();
+
+        // Phase H.1 — `List(T)` cells are now Arc-headered + pool-
+        // allocated, mirroring `Map(K, V)` and `MArrayOf(T)`. The
+        // first field is `ArcHeader` so retain/release lower through
+        // the same opaque helpers and the inline-header detection in
+        // `ArcRuntime.hasInlineArcHeader` recognises the type.
+        //
+        // Memory model: every `cons` allocates a fresh cell with
+        // `refcount = 1` from a thread-local `MemoryPool(Self)`. The
+        // caller-side share/release ABI keeps refcounts honest:
+        //   * `cons(head, tail)` consumes its arguments — the cell
+        //     stores `head`/`tail` as durable owners. Sharing is the
+        //     caller's responsibility (Phase E.10's aggregate-store
+        //     consume classification handles this in IR).
+        //   * `retain(list)` bumps the refcount on the head cell only
+        //     (the spine is not touched — every cell already has its
+        //     own count).
+        //   * `release(list)` decrements; on the zero-transition the
+        //     cell's `head` is deep-released (if `T` carries Arc-
+        //     managed children) and the `tail` pointer is released
+        //     recursively before the cell returns to its pool.
+        //
+        // Persistent semantics are preserved: `cons` never mutates an
+        // existing cell, and shared tails carry their own refcounts.
+        header: ArcHeader,
         head: T,
         tail: ?*const Self,
+
+        /// Per-(T) thread-local MemoryPool for List cells. Mirrors
+        /// `Map(K, V).SelfPool` and `MArrayOf(T).InnerPool`: hot-path
+        /// allocation becomes a free-list pop, reclamation becomes a
+        /// free-list push. OS page commit happens once per pool growth
+        /// instead of per-allocation. Single-threaded Zap programs
+        /// share the pool across all `List(T)` operations.
+        const SelfPool = struct {
+            const PoolT = std.heap.MemoryPool(Self);
+            threadlocal var pool: PoolT = .empty;
+            threadlocal var stats: PoolStats = .{ .name = "List(" ++ @typeName(T) ++ ").Self" };
+
+            fn create() *Self {
+                ensureArcStatsAtexit();
+                stats.noteAllocation();
+                return pool.create(std.heap.page_allocator) catch
+                    @panic("List cell pool: out of memory");
+            }
+
+            fn destroy(cell: *Self) void {
+                stats.noteDeallocation();
+                pool.destroy(cell);
+            }
+        };
 
         /// Default-initialised value of `T` for empty-list returns.
         /// Tagged unions (notably `Term`) cannot use `std.mem.zeroes`.
@@ -4399,12 +4448,144 @@ pub fn List(comptime T: type) type {
             return null;
         }
 
+        /// Construct a new list cell with `head` and `tail`. The cell's
+        /// refcount starts at 1; the caller becomes the sole owner.
+        ///
+        /// Ownership semantics for ARC-managed `T`: `head` and `tail`
+        /// are **consumed** — the cell stores them as durable owners,
+        /// and the caller must NOT release them after `cons` returns.
+        /// Phase E.10's classifier emits `move_value` for `local_get`
+        /// uses whose only consumption is a `list_cons.head/tail`
+        /// position, so the caller-side IR transfers ownership cleanly.
+        ///
+        /// When the cell's refcount later hits zero, `release` will
+        /// deep-release the stored `head` (if `T` carries ARC children)
+        /// and recurse into `tail`.
         pub fn cons(head: T, tail: ?*const Self) ?*const Self {
-            const bytes = bumpAlloc(@sizeOf(Self));
-            if (bytes.len == 0) return null;
-            const cell: *Self = @ptrCast(@alignCast(bytes.ptr));
-            cell.* = .{ .head = head, .tail = tail };
+            const cell = SelfPool.create();
+            cell.* = .{
+                .header = ArcHeader.init(),
+                .head = head,
+                .tail = tail,
+            };
             return cell;
+        }
+
+        /// Increment the refcount of a list cell and return the same
+        /// handle. Null lists (the empty-list sentinel) are a no-op.
+        /// Mirrors `Map.retain` / `MArrayOf.retain`. Only the head
+        /// cell's refcount is bumped; the spine is shared by-pointer
+        /// and each tail cell has its own count.
+        pub fn retain(list: ?*const Self) ?*const Self {
+            if (list) |cell| {
+                const mut: *Self = @constCast(cell);
+                mut.header.retain();
+                arc_retains_total += 1;
+            }
+            return list;
+        }
+
+        /// Decrement the refcount of a list cell. On the zero-
+        /// transition, deep-release the head (if `T` carries ARC
+        /// children), iteratively walk the tail spine releasing each
+        /// cell whose refcount also hits zero, and return reclaimed
+        /// cells to the SelfPool.
+        ///
+        /// The walk is bounded by the actual ownership graph: every
+        /// shared tail has its own refcount > 1, so the loop stops at
+        /// the first cell whose decrement leaves a survivor count,
+        /// leaving the rest of the spine alive for any other owner.
+        ///
+        /// Iteration (vs. recursion) is required because long lists
+        /// would otherwise blow the call stack on teardown — the spine
+        /// can be arbitrarily deep, but the work per cell is fixed, so
+        /// a tight loop replaces the recursive call cleanly.
+        pub fn release(list: ?*const Self) void {
+            var current = list;
+            while (current) |cell| {
+                const mut: *Self = @constCast(cell);
+                arc_releases_total += 1;
+                if (!mut.header.release()) {
+                    // Refcount survived — another owner still holds the
+                    // remaining spine. Stop here.
+                    return;
+                }
+                // Final owner of this cell — tear down owned children.
+                // The walk dispatches on `T`'s shape:
+                //   * If `T` is itself an ARC-managed pointer (e.g.
+                //     `?*const Map(K, V)`), release the pointer
+                //     directly via `releaseFieldChildAny`.
+                //   * If `T` is a struct/tuple, walk its fields via
+                //     `releaseChildrenAny` to deep-release any
+                //     ARC-managed children inside.
+                //   * Otherwise (i64, bool, ...), this compiles to
+                //     nothing.
+                releaseHeadChildren(cell.head);
+                const next_tail = cell.tail;
+                SelfPool.destroy(mut);
+                current = next_tail;
+            }
+        }
+
+        /// Codegen-side deep-release entry point. Invoked by
+        /// `ArcRuntime.releaseArcAny` when the Zap-emitted release path
+        /// dispatches on a `List(T)` value pointer. Mirrors `release`
+        /// but takes the value-pointer shape that codegen produces.
+        pub fn arcReleaseDeep(allocator: std.mem.Allocator, ptr: *const Self) void {
+            _ = allocator;
+            release(@as(?*const Self, ptr));
+        }
+
+        /// Deep-release the head value of a list cell. Dispatches on
+        /// `T`'s shape: optional/pointer heads are released directly
+        /// (mirroring how struct fields of the same shape are walked
+        /// in `ArcRuntime.releaseFieldChildAny`); aggregate heads
+        /// (structs, tuples) recurse through their fields; primitive
+        /// heads (i64, bool, ...) compile to nothing.
+        ///
+        /// Inlined into `release` so the comptime dispatch happens at
+        /// the list-monomorphization site, not inside an opaque
+        /// helper.
+        fn releaseHeadChildren(head_value: T) void {
+            const allocator = std.heap.c_allocator;
+            switch (@typeInfo(T)) {
+                .optional => |opt| {
+                    if (head_value) |inner| {
+                        releaseFieldShape(opt.child, allocator, inner);
+                    }
+                },
+                .pointer => |p| {
+                    if (p.size == .one) {
+                        ArcRuntime.releaseArcAny(p.child, allocator, @constCast(head_value));
+                    }
+                },
+                .@"struct" => {
+                    ArcRuntime.releaseChildrenAny(T, allocator, head_value);
+                },
+                else => {},
+            }
+        }
+
+        /// Helper for `releaseHeadChildren`'s optional branch — walks
+        /// one level deeper into an unwrapped optional payload. Mirrors
+        /// `ArcRuntime.releaseFieldChildAny`'s semantics but stays in
+        /// this file so the recursion bottoms out cleanly at the
+        /// pointer / struct cases.
+        fn releaseFieldShape(comptime FieldType: type, allocator: std.mem.Allocator, value: FieldType) void {
+            switch (@typeInfo(FieldType)) {
+                .optional => |opt| {
+                    if (value) |inner| releaseFieldShape(opt.child, allocator, inner);
+                },
+                .pointer => |p| {
+                    if (p.size == .one) {
+                        ArcRuntime.releaseArcAny(p.child, allocator, @constCast(value));
+                    }
+                },
+                .@"struct" => {
+                    ArcRuntime.releaseChildrenAny(FieldType, allocator, value);
+                },
+                else => {},
+            }
         }
 
         pub fn getHead(list: ?*const Self) T {
@@ -8135,6 +8316,128 @@ test "releaseChildrenAny releases ?*const Map(K, V) field" {
     // hits the zero-transition. The generic wrapper short-circuits the
     // bump for inline-header types, so we expect exactly one release tick.
     try std.testing.expectEqual(before_releases + 1, arc_releases_total);
+}
+
+test "List(i64) cons + retain + release with refcount semantics" {
+    // Phase H.1: every `cons` allocates a fresh Arc-headered cell from
+    // the per-(T) MemoryPool. Refcount starts at 1; `retain` bumps,
+    // `release` decrements. The cell is returned to the pool only on
+    // the zero-transition.
+    const ListI64 = List(i64);
+    const before_retains = arc_retains_total;
+    const before_releases = arc_releases_total;
+
+    const cell_a = ListI64.cons(1, null) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const cell_b = ListI64.cons(2, cell_a) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(@as(i64, 2), ListI64.getHead(cell_b));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.length(cell_b));
+
+    // Retain bumps the head cell only.
+    _ = ListI64.retain(cell_b);
+    try std.testing.expectEqual(before_retains + 1, arc_retains_total);
+
+    // Release once — refcount drops to 1, cell stays alive.
+    ListI64.release(cell_b);
+    try std.testing.expectEqual(before_releases + 1, arc_releases_total);
+
+    // Final release — cell_b's refcount hits zero, head is shallow
+    // (i64), tail recurse into cell_a which also drops to zero.
+    // Two cells freed, two release ticks.
+    ListI64.release(cell_b);
+    try std.testing.expectEqual(before_releases + 3, arc_releases_total);
+}
+
+test "releaseChildrenAny releases ?*const List(T) field" {
+    // Phase H.1 regression test mirroring the Phase F Map-field test:
+    // when a struct holds a `?*const List(T)` child field,
+    // `releaseChildrenAny` must walk the field via
+    // `releaseFieldChildAny` -> `releaseArcAny` and dispatch into the
+    // List's inline-header `release` method (via `arcReleaseDeep`).
+    // Now that List carries an inline `ArcHeader`, the runtime helper
+    // must recognize the inline-header path and avoid the `Arc(T)`-
+    // wrapper double-counting that would arise from
+    // `prepareReleaseAny`.
+    const ListI64 = List(i64);
+
+    const before_releases = arc_releases_total;
+
+    const cell_a = ListI64.cons(10, null) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const cell_b = ListI64.cons(20, cell_a) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    // Wrap the list pointer inside a struct, mimicking the codegen-
+    // emitted shape for an aggregate that owns a List child via an
+    // indirect-storage optional pointer field.
+    const Holder = struct {
+        list_field: ?*const ListI64,
+        scalar: i64,
+    };
+    const holder = Holder{ .list_field = cell_b, .scalar = 7 };
+
+    // releaseChildrenAny must traverse `list_field` and invoke the
+    // List's inline-header `release` (not the generic Arc(T) path).
+    // The non-arc `scalar` field must be skipped without compile error.
+    ArcRuntime.releaseChildrenAny(Holder, std.testing.allocator, holder);
+
+    // The List's `release` bumps `arc_releases_total` once per cell
+    // freed (two cells in this spine), and the generic wrapper short-
+    // circuits its own bump for inline-header types.
+    try std.testing.expectEqual(before_releases + 2, arc_releases_total);
+}
+
+test "List(?*const Map) deep-releases Map heads on cell teardown" {
+    // Phase H.1 keystone: a list of ARC-managed values (here, Map
+    // pointers) must release each head when the cell is reclaimed.
+    // Without this, the doc-runner fails — `compose_member_detail`
+    // builds a list whose heads are Maps, the comptime store consumes
+    // the +1, then the cell drops with a stale Map pointer that gets
+    // reused.
+    const MapI64 = Map(i64, i64);
+    const ListMap = List(?*const MapI64);
+
+    const before_releases = arc_releases_total;
+
+    const keys_one = [_]i64{ 1, 2 };
+    const vals_one = [_]i64{ 10, 20 };
+    const map_one = MapI64.fromPairs(&keys_one, &vals_one, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const keys_two = [_]i64{ 3, 4 };
+    const vals_two = [_]i64{ 30, 40 };
+    const map_two = MapI64.fromPairs(&keys_two, &vals_two, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    // Build [map_one, map_two] — `cons` consumes its arguments, so
+    // the list now owns the +1 on each Map.
+    const cell_a = ListMap.cons(map_two, null) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const cell_b = ListMap.cons(map_one, cell_a) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    // Releasing the list's head cell tears down the entire spine and
+    // each cell deep-releases its head Map. Expect:
+    //   * 2 List cells freed (2 release ticks from List.release).
+    //   * 2 Map cells freed (2 release ticks from Map.release).
+    ListMap.release(cell_b);
+    try std.testing.expectEqual(before_releases + 4, arc_releases_total);
 }
 
 test "Atom well-known values" {
