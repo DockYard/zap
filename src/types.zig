@@ -77,6 +77,12 @@ pub const Type = union(enum) {
     /// stand-alone (no parameterisation across arbitrary `T`); only
     /// the explicit element variants enumerated here are supported.
     marray_type: MArrayElementKind,
+    /// Phase 2: flat-buffer mutable Vector(T) with COW semantics.
+    /// Mirrors `marray_type`'s shape — concrete element variants are
+    /// enumerated rather than parameterised, so each `VectorI64`,
+    /// `VectorF64` is a distinct nominal type at the Zig ABI level.
+    /// Phase 6 retires `marray_type` in favour of this.
+    vector_type: VectorElementKind,
 
     // Compound types
     tuple: TupleType,
@@ -123,6 +129,13 @@ pub const Type = union(enum) {
     ///   * mapping rules in `zir_builder.zig` for parameter/return
     ///     emission and `:zig.MArray<X>.method` dispatch.
     pub const MArrayElementKind = enum { i64, f64 };
+
+    /// Phase 2: the concrete element type of a `Vector(T)`
+    /// instantiation. Each variant maps to a distinct runtime alias
+    /// (`VectorI64` for `i64`, `VectorF64` for `f64`). New variants
+    /// here demand the same MArray-side wiring chain — well-known
+    /// TypeId, NativeTypeKind, ZigType, ZIR builder rules.
+    pub const VectorElementKind = enum { i64, f64 };
 
     pub const TupleType = struct {
         elements: []const TypeId,
@@ -240,6 +253,8 @@ pub const TypeStore = struct {
     pub const F128: TypeId = 24;
     pub const MARRAY_I64: TypeId = 25;
     pub const MARRAY_F64: TypeId = 26;
+    pub const VECTOR_I64: TypeId = 27;
+    pub const VECTOR_F64: TypeId = 28;
     pub const VOID: TypeId = NIL;
 
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner) TypeStore {
@@ -290,6 +305,8 @@ pub const TypeStore = struct {
         try self.types.append(self.allocator, .{ .float = .{ .bits = 128 } }); // 24 - f128
         try self.types.append(self.allocator, .{ .marray_type = .i64 }); // 25 - MArrayI64
         try self.types.append(self.allocator, .{ .marray_type = .f64 }); // 26 - MArrayF64
+        try self.types.append(self.allocator, .{ .vector_type = .i64 }); // 27 - VectorI64
+        try self.types.append(self.allocator, .{ .vector_type = .f64 }); // 28 - VectorF64
     }
 
     pub fn addType(self: *TypeStore, typ: Type) !TypeId {
@@ -316,6 +333,7 @@ pub const TypeStore = struct {
             .float => |f| f.bits == b.float.bits,
             .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => true,
             .marray_type => |element_kind| element_kind == b.marray_type,
+            .vector_type => |element_kind| element_kind == b.vector_type,
             .type_var => false,
             .list => |l| l.element == b.list.element,
             .tuple => |t| std.mem.eql(TypeId, t.elements, b.tuple.elements),
@@ -440,6 +458,10 @@ pub const TypeStore = struct {
             .marray_type => |element_kind| switch (element_kind) {
                 .i64 => "MArrayI64",
                 .f64 => "MArrayF64",
+            },
+            .vector_type => |element_kind| switch (element_kind) {
+                .i64 => "VectorI64",
+                .f64 => "VectorF64",
             },
             else => null,
         };
@@ -631,7 +653,7 @@ pub const TypeStore = struct {
                 return false;
             },
             // Primitives and non-compound types cannot contain type variables
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .marray_type => false,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .marray_type, .vector_type => false,
             .struct_type, .union_type, .tagged_union, .opaque_type => false,
         };
     }
@@ -680,7 +702,7 @@ pub const TypeStore = struct {
                 return false;
             },
             // Primitives and non-compound types cannot contain type variables
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .marray_type => false,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .marray_type, .vector_type => false,
             .struct_type, .union_type, .tagged_union, .opaque_type => false,
         };
     }
@@ -951,7 +973,7 @@ pub const SubstitutionMap = struct {
                 } }) catch type_id;
             },
             // Primitives and other types pass through unchanged
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .marray_type => type_id,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .marray_type, .vector_type => type_id,
             .struct_type, .union_type, .tagged_union, .opaque_type, .applied => type_id,
         };
     }
@@ -1054,7 +1076,7 @@ pub const SubstitutionMap = struct {
                     .type_params = new_params,
                 } }) catch type_id;
             },
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .marray_type => type_id,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .marray_type, .vector_type => type_id,
             .struct_type, .union_type, .tagged_union, .opaque_type, .applied => type_id,
         };
     }
@@ -2528,6 +2550,8 @@ pub const TypeChecker = struct {
         if (type_id == TypeStore.ISIZE) return "isize";
         if (type_id == TypeStore.MARRAY_I64) return "MArrayI64";
         if (type_id == TypeStore.MARRAY_F64) return "MArrayF64";
+        if (type_id == TypeStore.VECTOR_I64) return "VectorI64";
+        if (type_id == TypeStore.VECTOR_F64) return "VectorF64";
         if (type_id == TypeStore.UNKNOWN) return "{unknown}";
         if (type_id == TypeStore.ERROR) return "{error}";
         if (type_id == TypeStore.TERM) return "Term";
@@ -5042,17 +5066,19 @@ pub const TypeChecker = struct {
                     }
                 }
 
-                // Native MArray instantiations resolve to their fixed
-                // well-known TypeIds. The `@native_type` registry on
-                // `ScopeGraph` answers "is this Zap struct the
-                // user-visible alias for `runtime.MArrayI64`?". When
-                // the answer is yes, the type system collapses the
-                // type to the precomputed `MARRAY_I64` /
-                // `MARRAY_F64` slot so downstream IR/ZIR consumers
-                // see one canonical TypeId per element kind.
+                // Native MArray and Vector instantiations resolve to
+                // their fixed well-known TypeIds. The `@native_type`
+                // registry on `ScopeGraph` answers "is this Zap struct
+                // the user-visible alias for `runtime.MArrayI64`/
+                // `runtime.VectorI64`?". When the answer is yes, the
+                // type system collapses the type to the precomputed
+                // slot so downstream IR/ZIR consumers see one
+                // canonical TypeId per element kind.
                 if (tn.args.len == 0) {
                     if (self.isNativeTypeName(.marray_i64, tn.name)) return TypeStore.MARRAY_I64;
                     if (self.isNativeTypeName(.marray_f64, tn.name)) return TypeStore.MARRAY_F64;
+                    if (self.isNativeTypeName(.vector_i64, tn.name)) return TypeStore.VECTOR_I64;
+                    if (self.isNativeTypeName(.vector_f64, tn.name)) return TypeStore.VECTOR_F64;
                 }
 
                 if (self.store.resolveTypeName(name)) |tid| {

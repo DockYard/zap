@@ -1132,6 +1132,13 @@ pub const ZigType = union(enum) {
     marray_i64,
     /// `?*const zap_runtime.MArrayOf(f64)` — see `marray_i64`.
     marray_f64,
+    /// Phase 2: `?*const zap_runtime.Vector(i64)` — flat-buffer
+    /// mutable array with COW. Replaces `marray_i64` in Phase 6.
+    /// Distinct from `vector_f64` for the same nominal-type reason
+    /// MArray's variants are split.
+    vector_i64,
+    /// Phase 2: `?*const zap_runtime.Vector(f64)` — see `vector_i64`.
+    vector_f64,
     tuple: []const ZigType,
     list: *const ZigType,
     map: MapType,
@@ -2631,11 +2638,14 @@ pub const IrBuilder = struct {
             .atom,
             .never,
             .ptr,
-            // `?*const MArrayOf(T)` is a single pointer-size optional —
-            // Zig passes it in registers like any other `?*T`, so it
-            // satisfies the by-value requirement for `musttail`.
+            // `?*const MArrayOf(T)` and `?*const Vector(T)` are
+            // single pointer-size optionals — Zig passes them in
+            // registers like any other `?*T`, so they satisfy the
+            // by-value requirement for `musttail`.
             .marray_i64,
             .marray_f64,
+            .vector_i64,
+            .vector_f64,
             => true,
             // Anything routed through Zig's by-ref ABI is unsafe for
             // `musttail`. Strings (slices), structs, tuples, lists,
@@ -7324,6 +7334,8 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
         types_mod.TypeStore.ISIZE => .isize,
         types_mod.TypeStore.MARRAY_I64 => .marray_i64,
         types_mod.TypeStore.MARRAY_F64 => .marray_f64,
+        types_mod.TypeStore.VECTOR_I64 => .vector_i64,
+        types_mod.TypeStore.VECTOR_F64 => .vector_f64,
         else => {
             // Try to resolve user-defined struct/enum/union types
             if (type_store) |ts| {
@@ -7333,6 +7345,10 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                         .marray_type => |element_kind| return switch (element_kind) {
                             .i64 => .marray_i64,
                             .f64 => .marray_f64,
+                        },
+                        .vector_type => |element_kind| return switch (element_kind) {
+                            .i64 => .vector_i64,
+                            .f64 => .vector_f64,
                         },
                         .struct_type => |st| {
                             return .{ .struct_ref = ts.interner.get(st.name) };
@@ -7471,11 +7487,13 @@ fn zigTypeReachesStruct(t: ZigType, owner_name: []const u8) bool {
         .usize,
         .isize,
         .tagged_union,
-        // MArray cells are heap-managed runtime values whose `Inner`
-        // never embeds a Zap user struct, so they cannot reach
-        // `owner_name`.
+        // MArray and Vector cells are heap-managed runtime values
+        // whose buffers never embed a Zap user struct, so they
+        // cannot reach `owner_name`.
         .marray_i64,
         .marray_f64,
+        .vector_i64,
+        .vector_f64,
         => false,
     };
 }
@@ -7587,11 +7605,13 @@ fn reachesStructInCycleImpl(
         .usize,
         .isize,
         .tagged_union,
-        // MArray cells are heap-managed runtime types whose `Inner`
-        // never embeds a Zap user struct, so they can't carry a back-
-        // reference to `owner_name`.
+        // MArray and Vector cells are heap-managed runtime types
+        // whose buffers never embed a Zap user struct, so they
+        // can't carry a back-reference to `owner_name`.
         .marray_i64,
         .marray_f64,
+        .vector_i64,
+        .vector_f64,
         => false,
     };
 }
@@ -7624,6 +7644,8 @@ fn zigTypeToStr(zig_type: ZigType) []const u8 {
         .nil => "?void",
         .marray_i64 => "?*const zap_runtime.MArrayOf(i64)",
         .marray_f64 => "?*const zap_runtime.MArrayOf(f64)",
+        .vector_i64 => "?*const zap_runtime.Vector(i64)",
+        .vector_f64 => "?*const zap_runtime.Vector(f64)",
         .struct_ref => |name| name,
         .tagged_union => |name| name,
         .function => "zap_runtime.DynClosure",

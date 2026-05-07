@@ -1791,6 +1791,18 @@ pub const MArrayF64 = MArrayOf(f64);
 // allocations efficiently — same choice the dense Map made.
 // ============================================================
 
+/// Concrete Vector(i64) alias used by the `lib/vector_i64.zap`
+/// `@native_type = "vector_i64"` surface. Mirrors `MArrayI64`'s
+/// pattern so the parser/scope/types/IR/codegen wiring is a direct
+/// copy of the MArray-side layout. Phase 6 ports fannkuch-redux to
+/// `VectorI64`, then deletes `MArrayI64`.
+pub const VectorI64 = Vector(i64);
+
+/// Concrete Vector(f64) alias used by the `lib/vector_f64.zap`
+/// `@native_type = "vector_f64"` surface. Companion to `VectorI64`;
+/// targets spectral-norm's `u`/`v` flat-buffer kernel.
+pub const VectorF64 = Vector(f64);
+
 pub fn Vector(comptime T: type) type {
     return struct {
         const Self = @This();

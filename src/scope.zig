@@ -476,6 +476,12 @@ pub const ImplEntry = struct {
 /// because each `?*const MArrayOf(T)` is a distinct ABI-visible
 /// runtime type and the user-visible Zap structs (`MArrayI64`,
 /// `MArrayF64`) are similarly distinct.
+///
+/// `vector_i64` and `vector_f64` mirror the same shape for Phase 2's
+/// flat-buffer `Vector(T)`. The two kinds are wire-distinct because
+/// `?*const Vector(i64)` and `?*const Vector(f64)` are different
+/// types at the Zig ABI level. Phase 6 retires the MArray kinds in
+/// favour of these.
 pub const NativeTypeKind = enum {
     list,
     map,
@@ -483,6 +489,8 @@ pub const NativeTypeKind = enum {
     string,
     marray_i64,
     marray_f64,
+    vector_i64,
+    vector_f64,
 
     pub fn fromName(name: []const u8) ?NativeTypeKind {
         if (std.mem.eql(u8, name, "list")) return .list;
@@ -491,6 +499,8 @@ pub const NativeTypeKind = enum {
         if (std.mem.eql(u8, name, "string")) return .string;
         if (std.mem.eql(u8, name, "marray_i64")) return .marray_i64;
         if (std.mem.eql(u8, name, "marray_f64")) return .marray_f64;
+        if (std.mem.eql(u8, name, "vector_i64")) return .vector_i64;
+        if (std.mem.eql(u8, name, "vector_f64")) return .vector_f64;
         return null;
     }
 };
@@ -1305,6 +1315,8 @@ test "native type kind name parsing" {
     try std.testing.expectEqual(@as(?NativeTypeKind, .string), NativeTypeKind.fromName("string"));
     try std.testing.expectEqual(@as(?NativeTypeKind, .marray_i64), NativeTypeKind.fromName("marray_i64"));
     try std.testing.expectEqual(@as(?NativeTypeKind, .marray_f64), NativeTypeKind.fromName("marray_f64"));
+    try std.testing.expectEqual(@as(?NativeTypeKind, .vector_i64), NativeTypeKind.fromName("vector_i64"));
+    try std.testing.expectEqual(@as(?NativeTypeKind, .vector_f64), NativeTypeKind.fromName("vector_f64"));
     try std.testing.expectEqual(@as(?NativeTypeKind, null), NativeTypeKind.fromName("List"));
     try std.testing.expectEqual(@as(?NativeTypeKind, null), NativeTypeKind.fromName(""));
     try std.testing.expectEqual(@as(?NativeTypeKind, null), NativeTypeKind.fromName("nope"));

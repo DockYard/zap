@@ -496,7 +496,7 @@ const MonomorphContext = struct {
                 }
                 return true;
             },
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .term_type, .marray_type => true,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .term_type, .marray_type, .vector_type => true,
             .struct_type, .union_type, .tagged_union, .opaque_type => true,
         };
     }

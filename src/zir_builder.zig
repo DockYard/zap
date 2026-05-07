@@ -890,6 +890,8 @@ pub const ZirDriver = struct {
             .term => return try self.emitTermTypeRef(),
             .marray_i64 => return try self.emitMArrayTypeRef(.i64),
             .marray_f64 => return try self.emitMArrayTypeRef(.f64),
+            .vector_i64 => return try self.emitVectorTypeRef(.i64),
+            .vector_f64 => return try self.emitVectorTypeRef(.f64),
             .optional => |inner| {
                 // `?T` — emit T's ref, then wrap in optional. Used by
                 // the recursive-struct storage strategy to lower a
@@ -2338,6 +2340,40 @@ pub const ZirDriver = struct {
         return opt_ref;
     }
 
+    /// Phase 2 mirror of `mArrayAliasName`. Each `VectorElementKind`
+    /// maps to a runtime alias (`VectorI64` / `VectorF64`) defined in
+    /// `runtime.zig`. New variants here demand the corresponding
+    /// `pub const Vector<X> = Vector(<X>)` alias and a matching
+    /// `NativeTypeKind` registration.
+    const VectorElementKind = enum { i64, f64 };
+
+    fn vectorAliasName(kind: VectorElementKind) []const u8 {
+        return switch (kind) {
+            .i64 => "VectorI64",
+            .f64 => "VectorF64",
+        };
+    }
+
+    /// Emit a ZIR ref for `?*const zap_runtime.Vector<X>`. Phase 2
+    /// counterpart to `emitMArrayTypeRef`. The runtime's
+    /// `Vector<X>` alias names the underlying `Vector(<X>)` struct
+    /// (the cell's `Inner`-equivalent self type), so every Zap-
+    /// visible signature wraps that with `?*const ...` to match the
+    /// source-Arc ABI shape that every runtime Vector helper expects
+    /// (`pub fn new_filled() ?*const Self`, ...).
+    fn emitVectorTypeRef(self: *ZirDriver, kind: VectorElementKind) BuildError!u32 {
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+        const alias = vectorAliasName(kind);
+        const alias_ref = zir_builder_emit_field_val(self.handle, rt_import, alias.ptr, @intCast(alias.len));
+        if (alias_ref == error_ref) return error.EmitFailed;
+        const ptr_ref = zir_builder_emit_single_const_ptr_type(self.handle, alias_ref);
+        if (ptr_ref == error_ref) return error.EmitFailed;
+        const opt_ref = zir_builder_emit_optional_type(self.handle, ptr_ref);
+        if (opt_ref == error_ref) return error.EmitFailed;
+        return opt_ref;
+    }
+
     /// Emit `runtime.Term.from(value_ref)` — wraps a concrete value as
     /// a `Term`. Used by collection construction sites whose element
     /// type was promoted to `Term` because the static element types
@@ -2948,6 +2984,34 @@ pub const ZirDriver = struct {
             if (ref == error_ref) return error.EmitFailed;
             return ref;
         }
+        // Phase 2: Vector params take their declared concrete runtime
+        // type `?*const zap_runtime.Vector(<X>)`. Same emission shape
+        // as MArray params — see the comment above. The two branches
+        // exist because the runtime aliases are different Zig generic
+        // instantiations.
+        if (param.type_expr == .vector_i64 or param.type_expr == .vector_f64) {
+            const kind: VectorElementKind = switch (param.type_expr) {
+                .vector_i64 => .i64,
+                .vector_f64 => .f64,
+                else => unreachable,
+            };
+            var support_inst_indices: std.ArrayListUnmanaged(u32) = .empty;
+            defer support_inst_indices.deinit(self.allocator);
+            const before = zir_builder_get_body_inst_count(self.handle);
+            const opt_ref = try self.emitVectorTypeRef(kind);
+            try self.captureBodyInsts(before, &support_inst_indices);
+
+            const ref = zir_builder_emit_param_type_body(
+                self.handle,
+                param.name.ptr,
+                @intCast(param.name.len),
+                support_inst_indices.items.ptr,
+                @intCast(support_inst_indices.items.len),
+                opt_ref,
+            );
+            if (ref == error_ref) return error.EmitFailed;
+            return ref;
+        }
         const effective_type = mapParamType(param.type_expr);
         const ref = zir_builder_emit_param(
             self.handle,
@@ -3221,6 +3285,32 @@ pub const ZirDriver = struct {
                 defer support.deinit(self.allocator);
                 const before = zir_builder_get_body_inst_count(self.handle);
                 const opt_ref = try self.emitMArrayTypeRef(kind);
+                try self.captureBodyInsts(before, &support);
+                const result_inst = zir_builder_ref_to_inst_index(self.handle, opt_ref);
+                if (result_inst == 0xFFFFFFFF) return error.EmitFailed;
+                if (zir_builder_set_custom_return_type(
+                    self.handle,
+                    support.items.ptr,
+                    @intCast(support.items.len),
+                    result_inst,
+                ) != 0) return error.EmitFailed;
+                self.current_ret_type = 1;
+            },
+            // Phase 2: Vector return types resolve to `?*const
+            // zap_runtime.Vector(<X>)`. Same shape as MArray's branch —
+            // wrap the imported alias in `single_const_ptr + optional`
+            // and route the resulting type ref through
+            // `set_custom_return_type`.
+            .vector_i64, .vector_f64 => {
+                const kind: VectorElementKind = switch (return_type) {
+                    .vector_i64 => .i64,
+                    .vector_f64 => .f64,
+                    else => unreachable,
+                };
+                var support: std.ArrayListUnmanaged(u32) = .empty;
+                defer support.deinit(self.allocator);
+                const before = zir_builder_get_body_inst_count(self.handle);
+                const opt_ref = try self.emitVectorTypeRef(kind);
                 try self.captureBodyInsts(before, &support);
                 const result_inst = zir_builder_ref_to_inst_index(self.handle, opt_ref);
                 if (result_inst == 0xFFFFFFFF) return error.EmitFailed;
