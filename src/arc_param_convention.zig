@@ -271,34 +271,34 @@ const SiteWalker = struct {
     caller: *const ir.Function,
     name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
     sites: *SitesByTarget,
-    /// Per-stream: most recently observed `share_value{dest=X, source=Y}`
-    /// table. Maps args[i]'s shared local back to its source. Reset on
-    /// every stream entry because share_values do not cross structural
-    /// boundaries (the IR builder emits share/call/release as a single
-    /// stream-local sequence).
-    share_dest_to_source: std.AutoHashMap(ir.LocalId, ir.LocalId) = undefined,
-    share_dest_to_id: std.AutoHashMap(ir.LocalId, arc_liveness.InstructionId) = undefined,
     /// Running instruction id, mirrored from `arc_liveness`'s
     /// depth-first traversal order. Both walkers must agree on the id
     /// assignment so cross-pass comparisons against `last_use_map` are
     /// meaningful.
     next_id: arc_liveness.InstructionId = 0,
 
+    /// Per-stream: most recently observed `share_value{dest=X, source=Y}`
+    /// table. Maps args[i]'s shared local back to its source. Tracked
+    /// per-stream because share_values do not cross structural
+    /// boundaries (the IR builder emits share/call/release as a single
+    /// stream-local sequence). The maps are stack-local on each
+    /// `walkStream` invocation so nested recursion does not clobber
+    /// outer-scope tables.
     fn walkStream(self: *SiteWalker, stream: []const ir.Instruction) error{OutOfMemory}!void {
-        // Per-stream share-value bookkeeping. The IrBuilder emits the
-        // sequence `share_value{X<-Y}; call args=[..., X, ...];
-        // release{X}` linearly within one stream; tracking the
-        // bookkeeping per-stream keeps the lookup O(1) without a
-        // function-wide CFG walk.
-        self.share_dest_to_source = std.AutoHashMap(ir.LocalId, ir.LocalId).init(self.allocator);
-        defer self.share_dest_to_source.deinit();
-        self.share_dest_to_id = std.AutoHashMap(ir.LocalId, arc_liveness.InstructionId).init(self.allocator);
-        defer self.share_dest_to_id.deinit();
+        var share_dest_to_source = std.AutoHashMap(ir.LocalId, ir.LocalId).init(self.allocator);
+        defer share_dest_to_source.deinit();
+        var share_dest_to_id = std.AutoHashMap(ir.LocalId, arc_liveness.InstructionId).init(self.allocator);
+        defer share_dest_to_id.deinit();
 
         for (stream) |*instr| {
             const id = self.next_id;
             self.next_id += 1;
-            try self.processInstruction(instr, id);
+            try self.processInstruction(
+                instr,
+                id,
+                &share_dest_to_source,
+                &share_dest_to_id,
+            );
             try self.recurseChildren(instr);
         }
     }
@@ -350,11 +350,13 @@ const SiteWalker = struct {
         self: *SiteWalker,
         instr: *const ir.Instruction,
         id: arc_liveness.InstructionId,
+        share_dest_to_source: *std.AutoHashMap(ir.LocalId, ir.LocalId),
+        share_dest_to_id: *std.AutoHashMap(ir.LocalId, arc_liveness.InstructionId),
     ) !void {
         switch (instr.*) {
             .share_value => |sv| {
-                try self.share_dest_to_source.put(sv.dest, sv.source);
-                try self.share_dest_to_id.put(sv.dest, id);
+                try share_dest_to_source.put(sv.dest, sv.source);
+                try share_dest_to_id.put(sv.dest, id);
             },
             .tail_call => |tc| {
                 // Self-recursive tail call. By Phase E.8 invariants
@@ -372,14 +374,29 @@ const SiteWalker = struct {
             },
             .call_named => |cn| {
                 const target_id = self.name_to_id.get(cn.name) orelse return;
-                try self.recordRegularCall(target_id, cn.args);
+                try self.recordRegularCall(
+                    target_id,
+                    cn.args,
+                    share_dest_to_source,
+                    share_dest_to_id,
+                );
             },
             .call_direct => |cd| {
-                try self.recordRegularCall(cd.function, cd.args);
+                try self.recordRegularCall(
+                    cd.function,
+                    cd.args,
+                    share_dest_to_source,
+                    share_dest_to_id,
+                );
             },
             .try_call_named => |tcn| {
                 const target_id = self.name_to_id.get(tcn.name) orelse return;
-                try self.recordRegularCall(target_id, tcn.args);
+                try self.recordRegularCall(
+                    target_id,
+                    tcn.args,
+                    share_dest_to_source,
+                    share_dest_to_id,
+                );
             },
             // call_dispatch resolves to a group of clauses; without
             // a single concrete callee we cannot bind the convention
@@ -397,13 +414,15 @@ const SiteWalker = struct {
         self: *SiteWalker,
         target_id: ir.FunctionId,
         args: []const ir.LocalId,
+        share_dest_to_source: *const std.AutoHashMap(ir.LocalId, ir.LocalId),
+        share_dest_to_id: *const std.AutoHashMap(ir.LocalId, arc_liveness.InstructionId),
     ) !void {
         const share_sources = try self.allocator.alloc(?ir.LocalId, args.len);
         const share_ids = try self.allocator.alloc(?arc_liveness.InstructionId, args.len);
         for (args, 0..) |arg_local, idx| {
-            if (self.share_dest_to_source.get(arg_local)) |src| {
+            if (share_dest_to_source.get(arg_local)) |src| {
                 share_sources[idx] = src;
-                share_ids[idx] = self.share_dest_to_id.get(arg_local).?;
+                share_ids[idx] = share_dest_to_id.get(arg_local).?;
             } else {
                 share_sources[idx] = null;
                 share_ids[idx] = null;

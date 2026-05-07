@@ -948,7 +948,7 @@ const Pipeline = struct {
         // every share_value instruction whose ID is a consume site.
         // The returned table is threaded downstream so the ZIR
         // backend can consult `return_source_locals` per function.
-        const ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
+        var ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
             return self.failWith("Error during ARC ownership analysis", error.IrFailed);
         // Phase E.9 of the Phase 6 redux plan: per-callee parameter
         // convention inference. Promotes `.borrowed` to `.owned` for
@@ -966,6 +966,18 @@ const Pipeline = struct {
         // wiring is in place when subsequent phases populate them.
         runArcOwnershipAndVerify(self.alloc, &program, &ownership, type_store) catch
             return self.failWith("Error during ARC ownership classification or verification", error.IrFailed);
+        // Phase E.9: `runArcOwnershipAndVerify` rewrote share/release
+        // pairs into move/(no-release) for owned-convention call
+        // sites, which mutates the per-stream liveness shape that
+        // `arc_drop_insertion` consumes. Recompute the ownership
+        // analysis on the post-rewrite IR so `live_before_ret`,
+        // `last_use_map`, and `owned_at_ret` reflect the actual
+        // shape drop insertion sees. Without the recompute the drop
+        // pass would emit destroys for sources that are now moved
+        // through a call (double-free).
+        ownership.deinit();
+        ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
+            return self.failWith("Error during ARC ownership analysis (recompute)", error.IrFailed);
         // Phase 6 of the ARC ownership initiative: insert scope-exit
         // `release` IR instructions before every ret-equivalent
         // terminator, using the per-terminator live-before-ret sets
@@ -1006,7 +1018,7 @@ const Pipeline = struct {
         var program = ir_builder.buildProgram(hir_program) catch
             return self.failWith("Error during IR lowering", error.IrFailed);
         next_try_id.* = ir_builder.next_try_id;
-        const ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
+        var ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
             return self.failWith("Error during ARC ownership analysis", error.IrFailed);
         // Phase E.9: same per-callee inference as `runIrLowering`.
         // Both pipelines must run the inference before
@@ -1020,6 +1032,13 @@ const Pipeline = struct {
         // exercise the identical pass list.
         runArcOwnershipAndVerify(self.alloc, &program, &ownership, type_store) catch
             return self.failWith("Error during ARC ownership classification or verification", error.IrFailed);
+        // Phase E.9: recompute the ARC liveness analysis after the
+        // share→move rewrite so drop insertion's `live_before_ret`
+        // / `last_use_map` reflect the post-rewrite IR shape. Same
+        // rationale as the `runIrLowering` path above.
+        ownership.deinit();
+        ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
+            return self.failWith("Error during ARC ownership analysis (recompute)", error.IrFailed);
         // Phase 6: see `runIrLowering` for the rationale. Both call
         // sites must run the drop-insertion pass to keep the per-
         // struct IR build path identical to the whole-program path.
