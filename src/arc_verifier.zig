@@ -89,24 +89,31 @@ pub const VerifyError = error{
 /// reported via the diagnostic emission inside the check itself
 /// but the function exits at the first failure to keep the
 /// compile path predictable.
+///
+/// `program` is the IR program in scope. Phase E.9 V7 reads each
+/// callee's `param_conventions` through this pointer to confirm
+/// caller and callee agree on the consume/borrow convention at
+/// every ARC-managed call argument.
 pub fn verify(
     allocator: std.mem.Allocator,
     function: *const ir.Function,
+    program: *const ir.Program,
 ) VerifyError!void {
     _ = allocator;
-    var ctx = VerifyContext{ .function = function };
+    var ctx = VerifyContext{ .function = function, .program = program };
     for (function.body) |block| {
         try verifyStream(&ctx, block.instructions);
     }
 }
 
-/// Per-verification context. Phase E carries only the function
-/// pointer; all invariants are local to a single instruction. A
-/// future tightening (per-CFG-path bitset dataflow for the
-/// "destroyed exactly once" invariant) would extend this struct
-/// with `live_owned` / `live_borrowed` bitsets.
+/// Per-verification context. Phase E.9 V7 added the `program`
+/// pointer so call-site invariants can resolve the callee's
+/// `param_conventions`. A future tightening (per-CFG-path bitset
+/// dataflow for the "destroyed exactly once" invariant) would
+/// extend this struct with `live_owned` / `live_borrowed` bitsets.
 const VerifyContext = struct {
     function: *const ir.Function,
+    program: *const ir.Program,
 };
 
 /// Visit every instruction in `stream` (and recursively in every
@@ -125,6 +132,15 @@ fn verifyStream(
     // sequence of instructions, not just one) so it runs before the
     // per-instruction checks.
     try verifyTailCallRewritability(ctx, stream);
+
+    // Phase E.9 V7: every call site's argument convention agrees
+    // with the callee's parameter convention. V7 is also a stream-
+    // level invariant — the caller's preparation for a call (a
+    // share_value retain or a move_value transfer) lives earlier in
+    // the same stream. The check resolves each call's args back to
+    // the producing instruction and confirms the caller emitted the
+    // right shape for the callee's declared convention.
+    try verifyCallSiteConventions(ctx, stream);
 
     for (stream) |*instr| {
         try verifyInstruction(ctx, instr);
@@ -263,6 +279,175 @@ fn verifyTailCallRewritability(
             else => unreachable,
         }
     }
+}
+
+/// Phase E.9 V7: caller-callee convention agreement at every call
+/// site. For each `.call_named` / `.call_direct` / `.try_call_named`
+/// in the stream, look up the callee's `param_conventions` and walk
+/// the caller's prelude to confirm:
+///
+///   * For each `.owned` parameter slot: the matching arg must
+///     have been produced by `.move_value` (the only caller-side
+///     shape that transfers ownership without a retain). A
+///     `.share_value` would imply the caller still holds the
+///     refcount unit and Step 2's rewrite did not fire — the
+///     callee's scope-exit drop would underflow.
+///
+///   * For each `.borrowed` parameter slot: the matching arg must
+///     NOT have been produced by `.move_value` for a non-tail call.
+///     `share_value`, `borrow_value`, `copy_value`, or a direct
+///     local pass are all valid. A `move_value` here would have
+///     consumed the source without a callee-side release — leaking
+///     the cell.
+///
+///   * `.trivial` slots are not checked: their args are non-ARC
+///     values; convention does not apply.
+///
+/// Tail calls (`.tail_call`) and call-shape variants without a
+/// fixed concrete callee (`.call_dispatch`, `.call_closure`,
+/// `.call_builtin`) are not subject to V7. Tail calls are a
+/// special-case consume convention enforced by Phase E.8's
+/// rewriter; the other variants resolve their convention only at
+/// trampoline / runtime / builtin lowering time.
+fn verifyCallSiteConventions(
+    ctx: *VerifyContext,
+    stream: []const ir.Instruction,
+) VerifyError!void {
+    const program = ctx.program;
+    var index: usize = 0;
+    while (index < stream.len) : (index += 1) {
+        const instr = stream[index];
+        const callee_conv: []const ir.ParamConvention = switch (instr) {
+            .call_named => |cn| lookupConventionByName(program, cn.name) orelse continue,
+            .call_direct => |cd| lookupConventionById(program, cd.function) orelse continue,
+            .try_call_named => |tcn| lookupConventionByName(program, tcn.name) orelse continue,
+            else => continue,
+        };
+        const args: []const ir.LocalId = switch (instr) {
+            .call_named => |cn| cn.args,
+            .call_direct => |cd| cd.args,
+            .try_call_named => |tcn| tcn.args,
+            else => unreachable,
+        };
+        // Iterate slot-by-slot. Argument counts can in principle
+        // differ from `param_conventions.len` for default-arg or
+        // synthesised-prelude shapes; bound the iteration by the
+        // smaller of the two so we never read past either slice.
+        const slot_count = @min(callee_conv.len, args.len);
+        var slot: usize = 0;
+        while (slot < slot_count) : (slot += 1) {
+            const conv = callee_conv[slot];
+            if (conv == .trivial) continue;
+            const arg_local = args[slot];
+            const producer_kind = findArgProducerKind(stream, index, arg_local);
+            switch (conv) {
+                .owned => {
+                    if (producer_kind != .move) {
+                        emitV7Diagnostic(ctx.function, index, slot, conv, producer_kind);
+                        return error.ArcInvariantViolation;
+                    }
+                },
+                .borrowed => {
+                    if (producer_kind == .move) {
+                        emitV7Diagnostic(ctx.function, index, slot, conv, producer_kind);
+                        return error.ArcInvariantViolation;
+                    }
+                },
+                .trivial => unreachable,
+            }
+        }
+    }
+}
+
+/// Categorisation of the instruction that defines a call-arg local
+/// in the same stream. The verifier does not need a full mapping;
+/// the four cases below are sufficient to enforce V7.
+const ArgProducerKind = enum {
+    /// `.move_value{dest=arg, ...}` — caller transferred ownership.
+    move,
+    /// `.share_value{dest=arg, ...}` — caller retained.
+    share,
+    /// Anything else — `.copy_value`, `.borrow_value`, a direct
+    /// `param_get`, a `local_set`, or no producing instruction at
+    /// all (the local was passed without preparation, e.g. a
+    /// non-ARC arg or a fresh call result reused inline).
+    other,
+    /// The arg local was not produced earlier in the same stream.
+    /// Rare — generally happens for non-share-shaped passes (the
+    /// IR builder elides preparation for `.borrow` and `.move`
+    /// modes when the source is already a usable local). V7 treats
+    /// this as `.other` for invariant purposes.
+    none,
+};
+
+fn findArgProducerKind(
+    stream: []const ir.Instruction,
+    call_index: usize,
+    arg_local: ir.LocalId,
+) ArgProducerKind {
+    var probe: usize = call_index;
+    while (probe > 0) {
+        probe -= 1;
+        const candidate = stream[probe];
+        switch (candidate) {
+            .move_value => |mv| if (mv.dest == arg_local) return .move,
+            .share_value => |sv| if (sv.dest == arg_local) return .share,
+            .copy_value => |cv| if (cv.dest == arg_local) return .other,
+            .borrow_value => |bv| if (bv.dest == arg_local) return .other,
+            .local_get => |lg| if (lg.dest == arg_local) return .other,
+            .local_set => |ls| if (ls.dest == arg_local) return .other,
+            .param_get => |pg| if (pg.dest == arg_local) return .other,
+            else => {},
+        }
+    }
+    return .none;
+}
+
+fn lookupConventionByName(
+    program: *const ir.Program,
+    name: []const u8,
+) ?[]const ir.ParamConvention {
+    for (program.functions) |func| {
+        if (std.mem.eql(u8, func.name, name)) return func.param_conventions;
+        if (func.local_name.len != 0 and std.mem.eql(u8, func.local_name, name)) {
+            return func.param_conventions;
+        }
+    }
+    return null;
+}
+
+fn lookupConventionById(
+    program: *const ir.Program,
+    function_id: ir.FunctionId,
+) ?[]const ir.ParamConvention {
+    for (program.functions) |func| {
+        if (func.id == function_id) return func.param_conventions;
+    }
+    return null;
+}
+
+fn emitV7Diagnostic(
+    function: *const ir.Function,
+    call_index: usize,
+    slot: usize,
+    callee_conv: ir.ParamConvention,
+    producer_kind: ArgProducerKind,
+) void {
+    if (suppress_diagnostics) return;
+    std.debug.print(
+        "arc_verifier: function '{s}' violates V7:\n" ++
+            "  call site at instruction {d}\n" ++
+            "  arg slot {d}: callee convention is .{s}, caller's producer is {s}\n" ++
+            "  V7 requires .owned slots to be filled by .move_value (no retain)\n" ++
+            "  and .borrowed slots to be filled by anything BUT .move_value\n",
+        .{
+            function.name,
+            call_index,
+            slot,
+            @tagName(callee_conv),
+            @tagName(producer_kind),
+        },
+    );
 }
 
 /// Phase E.7 helper: assert that an arm in tail position does NOT
@@ -699,6 +884,24 @@ fn freeTestFunction(allocator: std.mem.Allocator, function: *ir.Function) void {
     allocator.free(function.params);
 }
 
+/// Test-only adapter that wraps a single hand-rolled `function` in a
+/// minimal `Program` and invokes the public `verify`. Existing tests
+/// (V1-V6) construct an isolated function and have no need for a
+/// program-wide call-site survey; V7 tests build their own multi-
+/// function programs and call `verify` directly.
+fn verifyFunctionStandalone(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+) VerifyError!void {
+    const functions = [_]ir.Function{function.*};
+    const program = ir.Program{
+        .functions = &functions,
+        .type_defs = &.{},
+        .entry = null,
+    };
+    return verify(allocator, function, &program);
+}
+
 /// RAII guard that suppresses verifier diagnostics for the
 /// duration of a negative test, then restores the previous
 /// setting on scope exit. Each negative test instantiates one
@@ -740,7 +943,7 @@ test "arc_verifier: rejects release of borrowed local (V1)" {
     );
     defer freeTestFunction(allocator, &function);
 
-    const result = verify(allocator, &function);
+    const result = verifyFunctionStandalone(allocator, &function);
     try testing.expectError(error.ArcInvariantViolation, result);
 }
 
@@ -766,7 +969,7 @@ test "arc_verifier: rejects release of trivial local (V2)" {
     );
     defer freeTestFunction(allocator, &function);
 
-    const result = verify(allocator, &function);
+    const result = verifyFunctionStandalone(allocator, &function);
     try testing.expectError(error.ArcInvariantViolation, result);
 }
 
@@ -796,7 +999,7 @@ test "arc_verifier: rejects release of borrowed-convention parameter (V4)" {
     );
     defer freeTestFunction(allocator, &function);
 
-    const result = verify(allocator, &function);
+    const result = verifyFunctionStandalone(allocator, &function);
     try testing.expectError(error.ArcInvariantViolation, result);
 }
 
@@ -826,7 +1029,7 @@ test "arc_verifier: rejects borrowed local stored into struct_init (V3)" {
     );
     defer freeTestFunction(allocator, &function);
 
-    const result = verify(allocator, &function);
+    const result = verifyFunctionStandalone(allocator, &function);
     try testing.expectError(error.ArcInvariantViolation, result);
 }
 
@@ -850,7 +1053,7 @@ test "arc_verifier: rejects borrowed local stored into list_init (V3)" {
     );
     defer freeTestFunction(allocator, &function);
 
-    const result = verify(allocator, &function);
+    const result = verifyFunctionStandalone(allocator, &function);
     try testing.expectError(error.ArcInvariantViolation, result);
 }
 
@@ -877,7 +1080,7 @@ test "arc_verifier: rejects borrowed return when result_convention is owned (V5)
     );
     defer freeTestFunction(allocator, &function);
 
-    const result = verify(allocator, &function);
+    const result = verifyFunctionStandalone(allocator, &function);
     try testing.expectError(error.ArcInvariantViolation, result);
 }
 
@@ -900,7 +1103,7 @@ test "arc_verifier: accepts release of owned local" {
     );
     defer freeTestFunction(allocator, &function);
 
-    try verify(allocator, &function);
+    try verifyFunctionStandalone(allocator, &function);
 }
 
 test "arc_verifier: accepts owned local stored into struct_init" {
@@ -925,7 +1128,7 @@ test "arc_verifier: accepts owned local stored into struct_init" {
     );
     defer freeTestFunction(allocator, &function);
 
-    try verify(allocator, &function);
+    try verifyFunctionStandalone(allocator, &function);
 }
 
 test "arc_verifier: accepts owned return with owned result_convention" {
@@ -947,7 +1150,7 @@ test "arc_verifier: accepts owned return with owned result_convention" {
     );
     defer freeTestFunction(allocator, &function);
 
-    try verify(allocator, &function);
+    try verifyFunctionStandalone(allocator, &function);
 }
 
 test "arc_verifier: trivial result_convention skips V5 entirely" {
@@ -971,7 +1174,7 @@ test "arc_verifier: trivial result_convention skips V5 entirely" {
     );
     defer freeTestFunction(allocator, &function);
 
-    try verify(allocator, &function);
+    try verifyFunctionStandalone(allocator, &function);
 }
 
 test "arc_verifier: recurses into optional_dispatch arms" {
@@ -1007,7 +1210,7 @@ test "arc_verifier: recurses into optional_dispatch arms" {
     );
     defer freeTestFunction(allocator, &function);
 
-    const result = verify(allocator, &function);
+    const result = verifyFunctionStandalone(allocator, &function);
     try testing.expectError(error.ArcInvariantViolation, result);
 }
 
@@ -1043,7 +1246,7 @@ test "arc_verifier: rejects self-recursive call followed by non-tail-mappable in
     );
     defer freeTestFunction(allocator, &function);
 
-    const result = verify(allocator, &function);
+    const result = verifyFunctionStandalone(allocator, &function);
     try testing.expectError(error.ArcInvariantViolation, result);
 }
 
@@ -1078,7 +1281,7 @@ test "arc_verifier: accepts self-recursive call followed only by tail-mappable i
     );
     defer freeTestFunction(allocator, &function);
 
-    try verify(allocator, &function);
+    try verifyFunctionStandalone(allocator, &function);
 }
 
 test "arc_verifier: V6 silent on non-self-recursive call_named" {
@@ -1106,7 +1309,7 @@ test "arc_verifier: V6 silent on non-self-recursive call_named" {
     );
     defer freeTestFunction(allocator, &function);
 
-    try verify(allocator, &function);
+    try verifyFunctionStandalone(allocator, &function);
 }
 
 test "arc_verifier: V6 silent when self-recursive call is not in tail position" {
@@ -1139,7 +1342,7 @@ test "arc_verifier: V6 silent when self-recursive call is not in tail position" 
     );
     defer freeTestFunction(allocator, &function);
 
-    try verify(allocator, &function);
+    try verifyFunctionStandalone(allocator, &function);
 }
 
 test "arc_verifier: V6 walks into nested switch_return arms" {
@@ -1181,7 +1384,7 @@ test "arc_verifier: V6 walks into nested switch_return arms" {
     );
     defer freeTestFunction(allocator, &function);
 
-    const result = verify(allocator, &function);
+    const result = verifyFunctionStandalone(allocator, &function);
     try testing.expectError(error.ArcInvariantViolation, result);
 }
 
@@ -1225,7 +1428,7 @@ test "arc_verifier: rejects unrewritten structural tail-call inside switch_liter
     );
     defer freeTestFunction(allocator, &function);
 
-    const result = verify(allocator, &function);
+    const result = verifyFunctionStandalone(allocator, &function);
     try testing.expectError(error.ArcInvariantViolation, result);
 }
 
@@ -1269,7 +1472,7 @@ test "arc_verifier: structural V6 silent when branch dest does not feed ret" {
     );
     defer freeTestFunction(allocator, &function);
 
-    try verify(allocator, &function);
+    try verifyFunctionStandalone(allocator, &function);
 }
 
 test "arc_verifier: structural V6 silent when arm tail call already rewritten to tail_call" {
@@ -1310,7 +1513,7 @@ test "arc_verifier: structural V6 silent when arm tail call already rewritten to
     );
     defer freeTestFunction(allocator, &function);
 
-    try verify(allocator, &function);
+    try verifyFunctionStandalone(allocator, &function);
 }
 
 test "arc_verifier: stub function signature compiles" {
@@ -1318,4 +1521,256 @@ test "arc_verifier: stub function signature compiles" {
     // at compile time instead of as a downstream wiring failure.
     const fn_ptr: *const @TypeOf(verify) = &verify;
     _ = fn_ptr;
+}
+
+// ============================================================
+// Phase E.9 V7 — caller-callee convention agreement
+// ============================================================
+
+/// Build a 2-function `Program` for V7 tests: a target with one
+/// parameter declared at convention `target_conv`, and a caller
+/// whose body is `caller_instrs`.
+fn buildV7Program(
+    allocator: std.mem.Allocator,
+    target_conv: ir.ParamConvention,
+    caller_instrs: []const ir.Instruction,
+) !struct { program: ir.Program, functions: []ir.Function } {
+    const target_param_conv = try allocator.alloc(ir.ParamConvention, 1);
+    target_param_conv[0] = target_conv;
+    const target_params = try allocator.alloc(ir.Param, 1);
+    target_params[0] = .{ .name = "x", .type_expr = .void, .type_id = null };
+    const target_blocks = try allocator.alloc(ir.Block, 1);
+    target_blocks[0] = .{
+        .label = 0,
+        .instructions = try allocator.dupe(ir.Instruction, &[_]ir.Instruction{
+            .{ .ret = .{ .value = null } },
+        }),
+    };
+    const target_local_ownership = try allocator.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        switch (target_conv) {
+            .owned, .borrowed => .owned,
+            .trivial => .trivial,
+        },
+    });
+    const target = ir.Function{
+        .id = 100,
+        .name = "Mod__target__1",
+        .scope_id = 0,
+        .arity = 1,
+        .params = target_params,
+        .return_type = .void,
+        .body = target_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+        .param_conventions = target_param_conv,
+        .local_ownership = target_local_ownership,
+        .result_convention = .trivial,
+    };
+
+    const caller_blocks = try allocator.alloc(ir.Block, 1);
+    caller_blocks[0] = .{ .label = 0, .instructions = try allocator.dupe(ir.Instruction, caller_instrs) };
+    const caller_param_conv = try allocator.alloc(ir.ParamConvention, 0);
+    const caller_local_ownership = try allocator.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .trivial,
+    });
+    const caller = ir.Function{
+        .id = 200,
+        .name = "Mod__caller__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = caller_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+        .param_conventions = caller_param_conv,
+        .local_ownership = caller_local_ownership,
+        .result_convention = .trivial,
+    };
+
+    const functions = try allocator.alloc(ir.Function, 2);
+    functions[0] = target;
+    functions[1] = caller;
+    const program = ir.Program{
+        .functions = functions,
+        .type_defs = &.{},
+        .entry = null,
+    };
+    return .{ .program = program, .functions = functions };
+}
+
+test "arc_verifier: V7 rejects share_value into owned-convention slot" {
+    var guard = SuppressDiagnostics.init();
+    defer guard.deinit();
+    const allocator = testing.allocator;
+
+    const args = try allocator.alloc(ir.LocalId, 1);
+    defer allocator.free(args);
+    args[0] = 1;
+    const arg_modes = try allocator.alloc(ir.ValueMode, 1);
+    defer allocator.free(arg_modes);
+    arg_modes[0] = .share;
+
+    const caller_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        // share_value into a slot the callee declares .owned —
+        // V7 rejects this. Step 2's rewrite is supposed to have
+        // converted this into a move_value; if a share_value
+        // survives, an upstream pass missed the rewrite.
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "Mod__target__1",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .ret = .{ .value = null } },
+    };
+
+    var built = try buildV7Program(allocator, .owned, &caller_instrs);
+    defer {
+        allocator.free(built.functions[0].param_conventions);
+        allocator.free(built.functions[0].params);
+        allocator.free(built.functions[0].body[0].instructions);
+        allocator.free(built.functions[0].body);
+        allocator.free(built.functions[0].local_ownership);
+        allocator.free(built.functions[1].param_conventions);
+        allocator.free(built.functions[1].body[0].instructions);
+        allocator.free(built.functions[1].body);
+        allocator.free(built.functions[1].local_ownership);
+        allocator.free(built.functions);
+    }
+
+    const result = verify(allocator, &built.functions[1], &built.program);
+    try testing.expectError(error.ArcInvariantViolation, result);
+}
+
+test "arc_verifier: V7 accepts move_value into owned-convention slot" {
+    const allocator = testing.allocator;
+
+    const args = try allocator.alloc(ir.LocalId, 1);
+    defer allocator.free(args);
+    args[0] = 1;
+    const arg_modes = try allocator.alloc(ir.ValueMode, 1);
+    defer allocator.free(arg_modes);
+    arg_modes[0] = .share;
+
+    const caller_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        // move_value into an owned slot — V7's positive shape.
+        .{ .move_value = .{ .dest = 1, .source = 0 } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "Mod__target__1",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+        .{ .ret = .{ .value = null } },
+    };
+
+    var built = try buildV7Program(allocator, .owned, &caller_instrs);
+    defer {
+        allocator.free(built.functions[0].param_conventions);
+        allocator.free(built.functions[0].params);
+        allocator.free(built.functions[0].body[0].instructions);
+        allocator.free(built.functions[0].body);
+        allocator.free(built.functions[0].local_ownership);
+        allocator.free(built.functions[1].param_conventions);
+        allocator.free(built.functions[1].body[0].instructions);
+        allocator.free(built.functions[1].body);
+        allocator.free(built.functions[1].local_ownership);
+        allocator.free(built.functions);
+    }
+
+    try verify(allocator, &built.functions[1], &built.program);
+}
+
+test "arc_verifier: V7 rejects move_value into borrowed-convention slot" {
+    var guard = SuppressDiagnostics.init();
+    defer guard.deinit();
+    const allocator = testing.allocator;
+
+    const args = try allocator.alloc(ir.LocalId, 1);
+    defer allocator.free(args);
+    args[0] = 1;
+    const arg_modes = try allocator.alloc(ir.ValueMode, 1);
+    defer allocator.free(arg_modes);
+    arg_modes[0] = .share;
+
+    const caller_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        // move_value into a borrowed slot — V7 rejects: the callee
+        // borrows under the caller's retain, but a move_value
+        // emitted no retain. Without the matching retain, the
+        // post-call release the caller still emits would underflow.
+        .{ .move_value = .{ .dest = 1, .source = 0 } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "Mod__target__1",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .ret = .{ .value = null } },
+    };
+
+    var built = try buildV7Program(allocator, .borrowed, &caller_instrs);
+    defer {
+        allocator.free(built.functions[0].param_conventions);
+        allocator.free(built.functions[0].params);
+        allocator.free(built.functions[0].body[0].instructions);
+        allocator.free(built.functions[0].body);
+        allocator.free(built.functions[0].local_ownership);
+        allocator.free(built.functions[1].param_conventions);
+        allocator.free(built.functions[1].body[0].instructions);
+        allocator.free(built.functions[1].body);
+        allocator.free(built.functions[1].local_ownership);
+        allocator.free(built.functions);
+    }
+
+    const result = verify(allocator, &built.functions[1], &built.program);
+    try testing.expectError(error.ArcInvariantViolation, result);
+}
+
+test "arc_verifier: V7 accepts share_value into borrowed-convention slot" {
+    const allocator = testing.allocator;
+
+    const args = try allocator.alloc(ir.LocalId, 1);
+    defer allocator.free(args);
+    args[0] = 1;
+    const arg_modes = try allocator.alloc(ir.ValueMode, 1);
+    defer allocator.free(arg_modes);
+    arg_modes[0] = .share;
+
+    const caller_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "Mod__target__1",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .ret = .{ .value = null } },
+    };
+
+    var built = try buildV7Program(allocator, .borrowed, &caller_instrs);
+    defer {
+        allocator.free(built.functions[0].param_conventions);
+        allocator.free(built.functions[0].params);
+        allocator.free(built.functions[0].body[0].instructions);
+        allocator.free(built.functions[0].body);
+        allocator.free(built.functions[0].local_ownership);
+        allocator.free(built.functions[1].param_conventions);
+        allocator.free(built.functions[1].body[0].instructions);
+        allocator.free(built.functions[1].body);
+        allocator.free(built.functions[1].local_ownership);
+        allocator.free(built.functions);
+    }
+
+    try verify(allocator, &built.functions[1], &built.program);
 }

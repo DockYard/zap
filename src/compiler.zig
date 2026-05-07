@@ -2055,7 +2055,7 @@ fn runArcOwnershipAndVerify(
         zap.arc_ownership.rewriteOwnedConsumeSites(alloc, function, program) catch return error.OutOfMemory;
     }
     for (program.functions) |*function| {
-        zap.arc_verifier.verify(alloc, function) catch |err| switch (err) {
+        zap.arc_verifier.verify(alloc, function, program) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // Phase E (Phase 6 redux plan §3.E): the verifier rejects
             // IR that violates an ARC ownership invariant. The plan
