@@ -137,8 +137,18 @@ pub fn classifyAndNormalize(
 /// reference). A `.local_get` whose dest's `borrow_use_count`
 /// equals `total_use_count` is a borrow candidate; otherwise it
 /// promotes to `.copy_value`.
+///
+/// Phase E.8 adds `tail_call_arg_use_count` so the classifier can
+/// recognise the move-into-tail-call shape: a `.local_get` whose
+/// dest's only use is as a tail_call argument, AND whose source's
+/// only use is this `.local_get`, can be lowered as `.move_value`
+/// (no caller-side retain). Without this discrimination the
+/// classifier conservatively emits `.copy_value`, leaking +1 retain
+/// per iteration on deep tail-recursive workloads (the exact
+/// signature observed in Phase F retry-3 — 8.75M Map cells/run).
 const LocalUseCounts = struct {
     borrow_use_count: u32 = 0,
+    tail_call_arg_use_count: u32 = 0,
     total_use_count: u32 = 0,
 };
 
@@ -159,6 +169,25 @@ const UseSummary = struct {
         if (!gop.found_existing) gop.value_ptr.* = .{};
         gop.value_ptr.total_use_count += 1;
         if (is_borrow_position) gop.value_ptr.borrow_use_count += 1;
+    }
+
+    /// Phase E.8: record a use of `local` that occurs as a
+    /// `tail_call` argument. The tail-call site is a special
+    /// "consume" position: the callee inherits ownership through
+    /// the tail jump and the caller's frame goes away. When a
+    /// local's ONLY use is in this position, classifying its
+    /// producing `.local_get` as `.move_value` (no retain) is
+    /// strictly cheaper than `.copy_value` (retain + paired
+    /// release) without losing correctness.
+    fn recordTailCallArgUse(
+        self: *UseSummary,
+        allocator: std.mem.Allocator,
+        local: ir.LocalId,
+    ) !void {
+        const gop = try self.counts.getOrPut(allocator, local);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.total_use_count += 1;
+        gop.value_ptr.tail_call_arg_use_count += 1;
     }
 
     fn get(self: *const UseSummary, local: ir.LocalId) LocalUseCounts {
@@ -302,7 +331,11 @@ fn recordInstructionUses(
             for (cb.args) |arg| try summary.recordUse(allocator, arg, false);
         },
         .tail_call => |tc| {
-            for (tc.args) |arg| try summary.recordUse(allocator, arg, false);
+            // Phase E.8: tail-call args are recorded specially so
+            // the classifier can detect dests whose ONLY use is
+            // here and emit `.move_value` (no retain) for the
+            // matching `.local_get`.
+            for (tc.args) |arg| try summary.recordTailCallArgUse(allocator, arg);
         },
         .try_call_named => |tcn| {
             for (tcn.args) |arg| try summary.recordUse(allocator, arg, false);
@@ -406,6 +439,62 @@ fn shouldBorrow(
     return counts.borrow_use_count == counts.total_use_count;
 }
 
+/// Phase E.8: decide whether a `.local_get{dest, source}` should
+/// be lowered as `.move_value` instead of `.copy_value`. Returns
+/// `true` when ALL of these hold:
+///
+///   * dest is ARC-managed (`.owned` in `local_ownership`).
+///   * dest's only use is a `tail_call` argument
+///     (`tail_call_arg_use_count == total_use_count == 1`).
+///   * source's only use is this `.local_get`
+///     (`source.total_use_count == 1`).
+///
+/// Under these preconditions the move is safe:
+///   * Source owns +1; the move transfers that ownership to dest
+///     without bumping the refcount. Source becomes dead at the
+///     move site (arc_liveness's forward dataflow already clears
+///     source's bit on `.move_value`, so no scope-exit drop fires).
+///   * Dest's owned +1 enters the tail_call arg slot. The
+///     tail_call's existing arg-handling already excludes arg
+///     locals from scope-exit drops (the callee inherits
+///     ownership through the tail jump).
+///   * The callee's borrowing parameter convention does not
+///     decrement the cell. Net per-iteration retain delta is 0.
+///
+/// Without this discrimination, the conservative `.copy_value`
+/// emits a retain on source's cell that has no matching release
+/// (the post-call release was elided as a tail-call arg cleanup
+/// by the rewriter — see Phase E.6 / E.8 orphan-share fix). The
+/// missing release accumulates +1 per iteration, producing the
+/// exact pool-leak signature observed in Phase F's retry-3.
+fn shouldMove(
+    function: *const ir.Function,
+    summary: *const UseSummary,
+    dest: ir.LocalId,
+    source: ir.LocalId,
+) bool {
+    // Dest must be ARC-managed; trivial dests get no ARC ops at all
+    // and the move/copy distinction is moot.
+    if (dest >= function.local_ownership.len) return false;
+    if (function.local_ownership[dest] != .owned) return false;
+    // Source must be ARC-managed too (a trivial source can't
+    // transfer +1 ownership; nothing to move).
+    if (source >= function.local_ownership.len) return false;
+    if (function.local_ownership[source] != .owned) return false;
+
+    const dest_counts = summary.get(dest);
+    if (dest_counts.total_use_count != 1) return false;
+    if (dest_counts.tail_call_arg_use_count != 1) return false;
+
+    const source_counts = summary.get(source);
+    // Source's only use must be this `.local_get`. Any other use
+    // means the cell needs to live past the move site, requiring
+    // a `.copy_value` to retain across uses.
+    if (source_counts.total_use_count != 1) return false;
+
+    return true;
+}
+
 const StreamRewriter = struct {
     allocator: std.mem.Allocator,
     function: *ir.Function,
@@ -464,6 +553,19 @@ const StreamRewriter = struct {
                         {
                             self.function.local_ownership[lg.dest] = .borrowed;
                         }
+                    } else if (shouldMove(self.function, self.use_summary, lg.dest, lg.source)) {
+                        // Phase E.8: dest's only use is a tail_call
+                        // arg AND source's only use is this read.
+                        // Emit `.move_value` to transfer ownership
+                        // without a retain. The arc_liveness forward
+                        // dataflow on `.move_value` clears source's
+                        // owned bit and sets dest's, so no scope-
+                        // exit release fires for source; the
+                        // tail_call arg-set handling already
+                        // suppresses the destroy on dest.
+                        try new_instrs.append(self.allocator, .{
+                            .move_value = .{ .dest = lg.dest, .source = lg.source },
+                        });
                     } else {
                         try new_instrs.append(self.allocator, .{
                             .copy_value = .{ .dest = lg.dest, .source = lg.source },
@@ -796,11 +898,12 @@ const ClassifyTestSuite = struct {
 };
 
 /// Walk every instruction (top-level and nested) and tally the count
-/// of `.borrow_value` and `.copy_value` instructions whose source
-/// equals `source_local`.
+/// of `.borrow_value`, `.copy_value`, and `.move_value` instructions
+/// whose source equals `source_local`.
 const ClassifyCounts = struct {
     borrow_count: usize = 0,
     copy_count: usize = 0,
+    move_count: usize = 0,
     local_get_count: usize = 0,
 };
 
@@ -818,6 +921,9 @@ fn countClassificationsFromSource(
                 },
                 .copy_value => |cv| {
                     if (cv.source == self.source_local) self.counts.copy_count += 1;
+                },
+                .move_value => |mv| {
+                    if (mv.source == self.source_local) self.counts.move_count += 1;
                 },
                 .local_get => |lg| {
                     if (lg.source == self.source_local) self.counts.local_get_count += 1;
@@ -841,6 +947,7 @@ fn countAliasOpcodes(function: *const ir.Function) ClassifyCounts {
             switch (instr.*) {
                 .borrow_value => self.counts.borrow_count += 1,
                 .copy_value => self.counts.copy_count += 1,
+                .move_value => self.counts.move_count += 1,
                 .local_get => self.counts.local_get_count += 1,
                 else => {},
             }
@@ -1093,4 +1200,157 @@ test "arc_ownership: classifier normalises local_get inside optional_dispatch ar
     // which classifies as `.copy_value` per pattern 3 in the
     // existing tests).
     try std.testing.expect(totals_after.borrow_count + totals_after.copy_count >= 1);
+}
+
+// ============================================================
+// Phase E.8 — move_value emission for tail-call args at last use
+// ============================================================
+
+/// Hand-constructed IR fixture for the move_value emission tests.
+/// The classifier's `ownership` and `type_store` parameters are
+/// unused by `classifyAndNormalize` itself (they exist for future
+/// phases); we pass dummies and free everything via the test arena.
+fn buildMoveValueTestFunction(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    instructions: []const ir.Instruction,
+    local_ownership: []const ir.OwnershipClass,
+    arity: u32,
+) !ir.Function {
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{
+        .label = 0,
+        .instructions = try arena.dupe(ir.Instruction, instructions),
+    };
+    const ownership_copy = try arena.dupe(ir.OwnershipClass, local_ownership);
+    const params = try arena.alloc(ir.Param, arity);
+    for (params) |*p| p.* = .{ .name = "p", .type_expr = .void, .type_id = null };
+    const param_conventions = try arena.alloc(ir.ParamConvention, arity);
+    for (param_conventions) |*c| c.* = .borrowed;
+    return ir.Function{
+        .id = 0,
+        .name = name,
+        .scope_id = 0,
+        .arity = arity,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = @intCast(local_ownership.len),
+        .param_conventions = param_conventions,
+        .local_ownership = ownership_copy,
+        .result_convention = .owned,
+    };
+}
+
+test "arc_ownership: emits move_value for local_get whose dest's only use is a tail_call arg and source is at last use (Phase E.8)" {
+    // Phase E.8 of the Phase 6 redux plan — tail-call arg consume.
+    //
+    // The k-nucleotide hot loop's leak signature traces back to a
+    // `.local_get` whose dest flows directly into a self-recursive
+    // tail_call argument. The classifier conservatively emits
+    // `.copy_value` (which lowers to `retainAny` at ZIR time),
+    // bumping the source cell's refcount by +1 per iteration.
+    // Because the post-call arg-cleanup release was already elided
+    // by the tail-call rewriter (callee inherits ownership through
+    // the tail jump), the orphan retain accumulates linearly with
+    // iteration count — 8.75M cells/run at the production scale
+    // observed in Phase F retry-3.
+    //
+    // The fix: detect this exact shape (`.local_get{dest, source}`
+    // where dest's only use is a tail_call arg AND source's only
+    // use is this read) and emit `.move_value` instead. Move
+    // semantics transfer ownership without retaining; downstream
+    // arc_liveness already clears source's owned bit on
+    // `.move_value`, so no scope-exit release fires for source,
+    // and tail_call's existing arg-set handling already excludes
+    // dest from scope-exit drops.
+    //
+    // Hand-constructed IR mirroring the leak shape:
+    //   %0 = const_int 0                  // dummy producer (any owned source works)
+    //   local_get %1 <- %0                // alias for tail_call arg
+    //   tail_call self args=[%1]
+    //   ret null
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const args = try arena.alloc(ir.LocalId, 1);
+    args[0] = 1;
+    const instrs = [_]ir.Instruction{
+        // %0: an owned ARC value (the producer's identity is
+        // immaterial to the classifier — only the ownership class
+        // and use pattern matter).
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        // %1: a `.local_get` whose dest's only use is the tail_call
+        // arg, and whose source's only use is this read.
+        .{ .local_get = .{ .dest = 1, .source = 0 } },
+        // self-recursive tail_call consuming %1.
+        .{ .tail_call = .{ .name = "self_loop", .args = args } },
+    };
+    // Mark both locals as `.owned` so the move_value precondition
+    // (dest is ARC-managed, source is ARC-managed) is met.
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned };
+
+    var function = try buildMoveValueTestFunction(arena, "self_loop", &instrs, &ownership, 0);
+
+    // The classifier's ownership / type_store args are unused;
+    // pass dummies via undefined since `classifyAndNormalize`
+    // explicitly discards them.
+    var dummy_ownership: arc_liveness.ArcOwnership = .{};
+    defer dummy_ownership.deinit(arena);
+    var dummy_store: types_mod.TypeStore = undefined;
+    try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
+
+    const totals = countAliasOpcodes(&function);
+    // No .local_get must remain after classification.
+    try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
+    // The move_value path must fire — exactly one .move_value
+    // (the classified `.local_get` from the test fixture).
+    try std.testing.expectEqual(@as(usize, 1), totals.move_count);
+    // No .copy_value should be emitted: the leak comes from the
+    // copy_value's retainAny.
+    try std.testing.expectEqual(@as(usize, 0), totals.copy_count);
+    // No .borrow_value either: the dest's only use (a tail_call
+    // arg) is not a borrow-position use.
+    try std.testing.expectEqual(@as(usize, 0), totals.borrow_count);
+}
+
+test "arc_ownership: still emits copy_value when source has additional uses (Phase E.8 negative)" {
+    // Phase E.8 negative: when source has any non-`local_get` use,
+    // the move would steal ownership from the other use site. The
+    // classifier must fall back to `.copy_value` to preserve the
+    // source's living cell across uses.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const args = try arena.alloc(ir.LocalId, 1);
+    args[0] = 1;
+    const instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        .{ .local_get = .{ .dest = 1, .source = 0 } },
+        // Extra use of source 0 (a local_set carrying it as its
+        // value) — defeats the move precondition. The use-summary
+        // counts this as a non-borrow use of source 0 so its
+        // total_use_count rises to 2.
+        .{ .local_set = .{ .dest = 2, .value = 0 } },
+        .{ .tail_call = .{ .name = "self_loop", .args = args } },
+    };
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned };
+
+    var function = try buildMoveValueTestFunction(arena, "self_loop", &instrs, &ownership, 0);
+
+    var dummy_ownership: arc_liveness.ArcOwnership = .{};
+    defer dummy_ownership.deinit(arena);
+    var dummy_store: types_mod.TypeStore = undefined;
+    try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
+
+    const totals = countAliasOpcodes(&function);
+    try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
+    // No move — source has another use (the retain).
+    try std.testing.expectEqual(@as(usize, 0), totals.move_count);
+    // copy_value is the conservative fallback.
+    try std.testing.expectEqual(@as(usize, 1), totals.copy_count);
 }
