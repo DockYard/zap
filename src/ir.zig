@@ -1172,21 +1172,21 @@ pub fn isArcManagedTypeId(type_store: *const types_mod.TypeStore, type_id: types
     // every `.map` value flows through the same retain/release ABI as
     // opaque types.
     //
-    // Phase H.1 lays the substrate for adding `.list` to this set —
-    // `List(T)` cells now carry an inline `ArcHeader`, are pool-
-    // allocated, and implement deep retain/release. The flag itself
-    // is NOT flipped here yet: the IR-level chain still has gaps
-    // that produce unanalyzable ZIR for runtime-built lists (Zig's
-    // Air/Liveness asserts `post-live-set should be a subset of
-    // pre-live-set` on the generated code). The supporting fixes
-    // landed in this phase — list-binding HIR-type propagation
-    // (`recordListChildHirType`), share_value HIR-type fallback for
-    // call-result locals tagged `UNKNOWN`, and the verifier's
-    // `paramConventionOf` walking `param_get` instructions — make
-    // the flip cleanly possible once the Air/Liveness gap is
-    // closed in Phase H.2.
+    // Phase H.1 laid the runtime substrate (`List(T)` Arc-headered +
+    // pool-allocated + deep retain/release). Phase H.2 closed the
+    // Air/Liveness gap by scoping `guard_block` body ownership to
+    // its own execution path so out-of-scope locals no longer leak
+    // into the parent's `owns` set. Phase H.3 closed the runtime
+    // ARC ABI gap in `List.next`, `List.getHead`, and `List.getTail`
+    // (those ops returned `cell.head`/`cell.tail` without bumping
+    // refcounts, which the IR's `.owned` result convention required;
+    // the cell's owner-side deep-release on its zero-transition
+    // raced with the caller's release of the same children and
+    // produced double-frees). Phase H.4 — this flip — adds `.list`
+    // to the ARC-managed-type set so List(T) values flow through
+    // the same retain/release ABI as `.map` and `.opaque_type`.
     return switch (type_store.getType(type_id)) {
-        .opaque_type, .map => true,
+        .opaque_type, .map, .list => true,
         else => false,
     };
 }
@@ -5557,15 +5557,15 @@ pub const IrBuilder = struct {
     fn isArcManagedType(self: *const IrBuilder, type_id: hir_mod.TypeId) bool {
         const store = self.type_store orelse return false;
         // Phase F flip: `.map` joined `.opaque_type` as ARC-managed.
-        // Phase H.1 substrate landed (`List(T)` Arc-header + pool
-        // refactor in `runtime.zig`); the `.list` flip itself is
-        // deferred to Phase H.2 because the IR-level chain still
-        // produces ZIR that Zig's Air/Liveness rejects with the
-        // `post-live-set should be a subset of pre-live-set`
-        // assertion. Keep `isArcManagedTypeId` and this method in
-        // lockstep — both must agree on every type.
+        // Phase H.4 flip: `.list` joins them, completing the chain
+        // started by H.1's runtime substrate (Arc-headered pool-
+        // allocated cells), continued by H.2's `guard_block`
+        // ownership scoping fix in `arc_liveness.zig`, and closed
+        // by H.3's `next`/`getHead`/`getTail` retain symmetry in
+        // `runtime.zig`. Keep `isArcManagedTypeId` and this method
+        // in lockstep — both must agree on every type.
         return switch (store.getType(type_id)) {
-            .opaque_type, .map => true,
+            .opaque_type, .map, .list => true,
             else => false,
         };
     }
