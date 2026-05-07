@@ -56,6 +56,7 @@ pub const lockfile = @import("lockfile.zig");
 pub const monomorphize = @import("monomorphize.zig");
 pub const env = @import("env.zig");
 pub const signature = @import("signature.zig");
+pub const wyhash = @import("wyhash.zig");
 
 test {
     _ = @import("token.zig");
@@ -100,4 +101,5 @@ test {
     _ = @import("capability_inference.zig");
     _ = @import("monomorphize.zig");
     _ = @import("env.zig");
+    _ = @import("wyhash.zig");
 }
