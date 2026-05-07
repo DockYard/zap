@@ -239,6 +239,38 @@ pub const ArcOwnership = struct {
     /// dataflow that populates it does not mutate the IR.
     live_before_ret: std.AutoHashMapUnmanaged(InstructionId, ArcLocalSet) = .empty,
 
+    /// Phase E.5 Gap 7 — the forward "defined-and-still-owns-+1"
+    /// snapshot at every ret-equivalent terminator. Complements
+    /// `live_before_ret`: liveness answers "which locals are read
+    /// after this point" while ownership answers "which locals own
+    /// +1 at this point". The two diverge for owned-by-construction
+    /// bindings whose last use is a `share_value` — the share
+    /// retains rather than consumes, so the source is dead per
+    /// liveness yet still owns its +1. Without this table,
+    /// `arc_drop_insertion` never sees those locals and they leak.
+    ///
+    /// Forward dataflow:
+    ///   - Define an ARC-managed-owned local D (any defining
+    ///     instruction whose `function.local_ownership[D]` is
+    ///     `.owned`): set bit D.
+    ///   - `release{value=L}`: clear bit L (cell now released; any
+    ///     subsequent use is undefined behavior).
+    ///   - `move_value{dest, source}`: clear `source`, set `dest`
+    ///     (ownership transfers; source dead after this point).
+    ///   - `tail_call` arg local L: clear bit L (callee inherits
+    ///     ownership through the tail jump). Other tail_call locals
+    ///     are unchanged.
+    ///   - At nested-region boundaries (`if_expr`, `case_block`,
+    ///     `switch_*`, `optional_dispatch`, `try_call_named`,
+    ///     `guard_block`): each sub-stream sees the parent's `owns`
+    ///     as its starting set; the post-region `owns` becomes the
+    ///     intersection of arm-end `owns` sets (a local owns +1 at
+    ///     the join only if every arm leaves it owning +1).
+    ///
+    /// Snapshot at every ret-equivalent terminator records the
+    /// owns-set just before the terminator executes.
+    owned_at_ret: std.AutoHashMapUnmanaged(InstructionId, ArcLocalSet) = .empty,
+
     pub fn deinit(self: *ArcOwnership, allocator: std.mem.Allocator) void {
         self.consume_share_sites.deinit(allocator);
         self.return_source_locals.deinit(allocator);
@@ -249,6 +281,11 @@ pub const ArcOwnership = struct {
             set_ptr.deinit(allocator);
         }
         self.live_before_ret.deinit(allocator);
+        var owned_iter = self.owned_at_ret.valueIterator();
+        while (owned_iter.next()) |set_ptr| {
+            set_ptr.deinit(allocator);
+        }
+        self.owned_at_ret.deinit(allocator);
     }
 };
 
@@ -384,6 +421,7 @@ pub fn computeArcOwnership(
     analyzer.ownership_in_progress = null;
     try analyzer.classifyLastUses(&ownership);
     try analyzer.propagateReturnSourcesThroughAggregates(&ownership);
+    try analyzer.computeOwnedAtRet(&ownership);
 
     if (std.debug.runtime_safety) {
         try analyzer.checkSoundness(&ownership);
@@ -1173,6 +1211,285 @@ const Analyzer = struct {
                 }
             }
         }
+    }
+
+    // ----------------------------------------------------------
+    // Step 5b (Phase E.5 Gap 7): forward "defined-and-still-owned"
+    // dataflow. Liveness answers "which locals are read after this
+    // point" — a `share_value`'s source is dead per liveness once
+    // the share has fired. But share_value RETAINS rather than
+    // CONSUMES, so the source still owns its +1. The drop-insertion
+    // pass must release that source at scope exit; the existing
+    // `live_before_ret` table doesn't surface it.
+    //
+    // Forward dataflow over the structural region tree records, at
+    // every ret-equivalent terminator, the set of ARC-managed-owned
+    // locals that have been DEFINED on the path to the terminator
+    // and not yet RELEASED / MOVED-OUT / TAIL-CALL-CONSUMED. Joins
+    // (sub-region exits) take the intersection so the table records
+    // only locals owning +1 along EVERY path leading to the
+    // terminator.
+    // ----------------------------------------------------------
+
+    fn computeOwnedAtRet(self: *Analyzer, ownership: *ArcOwnership) !void {
+        if (self.arc_locals.items.len == 0) return;
+        const arc_count: u32 = @intCast(self.arc_locals.items.len);
+        var owns = try LiveSet.init(self.allocator, arc_count);
+        defer owns.deinit(self.allocator);
+
+        for (self.function.body) |block| {
+            _ = try self.forwardOwnsStream(block.instructions, &owns, ownership);
+        }
+    }
+
+    /// Process one stream forward, mutating `owns` in place to track
+    /// which ARC-managed-owned locals own +1 at the current program
+    /// point. Snapshots the set at every ret-equivalent terminator
+    /// into `ownership.owned_at_ret`. Returns nothing — the post-
+    /// stream `owns` value is left in `*owns` so the caller can
+    /// continue its own forward walk.
+    fn forwardOwnsStream(
+        self: *Analyzer,
+        stream: []const ir.Instruction,
+        owns: *LiveSet,
+        ownership: *ArcOwnership,
+    ) error{OutOfMemory}!void {
+        for (stream, 0..) |*instr, k| {
+            const id = self.idForStreamInstruction(stream, k);
+
+            // Recurse into nested regions FIRST. Each sub-stream sees
+            // the parent's `owns` as its starting set; the post-region
+            // `owns` becomes the intersection of arm-end `owns` sets.
+            try self.forwardOwnsChildren(instr, owns, ownership);
+
+            // Apply the instruction's effect on `owns`.
+            try self.applyOwnsEffect(instr.*, owns);
+
+            // Snapshot at ret-equivalent terminators. Note that for
+            // multi-arm terminators (switch_return, union_switch_return)
+            // each arm is recursed into via `forwardOwnsChildren` and
+            // their per-terminator snapshots are taken inside the arm's
+            // body's terminator (the implicit ret at the arm's tail).
+            // The parent terminator's snapshot still records the
+            // `owns` at the join point, which `arc_drop_insertion`
+            // uses as a fallback when an arm has no explicit
+            // terminator.
+            if (isReturnEquivalentTerminator(instr.*)) {
+                try self.snapshotOwnedAtRet(ownership, id, owns);
+            }
+        }
+    }
+
+    /// Recurse forward into every sub-stream of `instr`, accumulating
+    /// the post-region `owns` as the intersection of arm-end states.
+    /// Ordering MUST mirror the analyzer's `flattenChildren` so the
+    /// InstructionId numbering used by `idForStreamInstruction` (and
+    /// hence the `live_before_ret` lookup downstream) lines up.
+    fn forwardOwnsChildren(
+        self: *Analyzer,
+        instr: *const ir.Instruction,
+        owns: *LiveSet,
+        ownership: *ArcOwnership,
+    ) error{OutOfMemory}!void {
+        switch (instr.*) {
+            .if_expr => |x| {
+                var then_owns = try owns.clone(self.allocator);
+                defer then_owns.deinit(self.allocator);
+                try self.forwardOwnsStream(x.then_instrs, &then_owns, ownership);
+                var else_owns = try owns.clone(self.allocator);
+                defer else_owns.deinit(self.allocator);
+                try self.forwardOwnsStream(x.else_instrs, &else_owns, ownership);
+                // Join at the merge: a local owns +1 after the if iff
+                // it owns +1 in BOTH arms. Intersection.
+                owns.copyFrom(&then_owns);
+                owns.intersectWith(&else_owns);
+            },
+            .case_block => |cb| {
+                try self.forwardOwnsStream(cb.pre_instrs, owns, ownership);
+                if (cb.arms.len == 0 and cb.default_instrs.len == 0) return;
+                var has_join: bool = false;
+                var join: LiveSet = try LiveSet.init(self.allocator, owns.bit_count);
+                defer join.deinit(self.allocator);
+                for (cb.arms) |arm| {
+                    var arm_owns = try owns.clone(self.allocator);
+                    defer arm_owns.deinit(self.allocator);
+                    try self.forwardOwnsStream(arm.body_instrs, &arm_owns, ownership);
+                    if (!has_join) {
+                        join.copyFrom(&arm_owns);
+                        has_join = true;
+                    } else {
+                        join.intersectWith(&arm_owns);
+                    }
+                }
+                if (cb.default_instrs.len > 0) {
+                    var def_owns = try owns.clone(self.allocator);
+                    defer def_owns.deinit(self.allocator);
+                    try self.forwardOwnsStream(cb.default_instrs, &def_owns, ownership);
+                    if (!has_join) {
+                        join.copyFrom(&def_owns);
+                        has_join = true;
+                    } else {
+                        join.intersectWith(&def_owns);
+                    }
+                }
+                if (has_join) owns.copyFrom(&join);
+            },
+            .switch_literal => |sl| {
+                var has_join: bool = false;
+                var join: LiveSet = try LiveSet.init(self.allocator, owns.bit_count);
+                defer join.deinit(self.allocator);
+                for (sl.cases) |case| {
+                    var arm_owns = try owns.clone(self.allocator);
+                    defer arm_owns.deinit(self.allocator);
+                    try self.forwardOwnsStream(case.body_instrs, &arm_owns, ownership);
+                    if (!has_join) {
+                        join.copyFrom(&arm_owns);
+                        has_join = true;
+                    } else {
+                        join.intersectWith(&arm_owns);
+                    }
+                }
+                var def_owns = try owns.clone(self.allocator);
+                defer def_owns.deinit(self.allocator);
+                try self.forwardOwnsStream(sl.default_instrs, &def_owns, ownership);
+                if (!has_join) {
+                    join.copyFrom(&def_owns);
+                    has_join = true;
+                } else {
+                    join.intersectWith(&def_owns);
+                }
+                if (has_join) owns.copyFrom(&join);
+            },
+            .switch_return => |sr| {
+                // switch_return is itself a terminator: each arm body
+                // ends with an implicit ret on the arm's return_value.
+                // We propagate owns into each arm but the parent join
+                // is unreachable (control leaves the function).
+                for (sr.cases) |case| {
+                    var arm_owns = try owns.clone(self.allocator);
+                    defer arm_owns.deinit(self.allocator);
+                    try self.forwardOwnsStream(case.body_instrs, &arm_owns, ownership);
+                }
+                var def_owns = try owns.clone(self.allocator);
+                defer def_owns.deinit(self.allocator);
+                try self.forwardOwnsStream(sr.default_instrs, &def_owns, ownership);
+            },
+            .union_switch => |us| {
+                var has_join: bool = false;
+                var join: LiveSet = try LiveSet.init(self.allocator, owns.bit_count);
+                defer join.deinit(self.allocator);
+                for (us.cases) |case| {
+                    var arm_owns = try owns.clone(self.allocator);
+                    defer arm_owns.deinit(self.allocator);
+                    try self.forwardOwnsStream(case.body_instrs, &arm_owns, ownership);
+                    if (!has_join) {
+                        join.copyFrom(&arm_owns);
+                        has_join = true;
+                    } else {
+                        join.intersectWith(&arm_owns);
+                    }
+                }
+                if (has_join) owns.copyFrom(&join);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |case| {
+                    var arm_owns = try owns.clone(self.allocator);
+                    defer arm_owns.deinit(self.allocator);
+                    try self.forwardOwnsStream(case.body_instrs, &arm_owns, ownership);
+                }
+            },
+            .try_call_named => |tc| {
+                // Order mirrors flattenChildren: handler_instrs first,
+                // then success_instrs.
+                var handler_owns = try owns.clone(self.allocator);
+                defer handler_owns.deinit(self.allocator);
+                try self.forwardOwnsStream(tc.handler_instrs, &handler_owns, ownership);
+                var success_owns = try owns.clone(self.allocator);
+                defer success_owns.deinit(self.allocator);
+                try self.forwardOwnsStream(tc.success_instrs, &success_owns, ownership);
+                // Both paths can reach the rest of the enclosing
+                // stream after the try_call_named (depending on
+                // whether the called function returned ok or err).
+                // Take the intersection.
+                owns.copyFrom(&handler_owns);
+                owns.intersectWith(&success_owns);
+            },
+            .guard_block => |gb| {
+                try self.forwardOwnsStream(gb.body, owns, ownership);
+            },
+            .optional_dispatch => |od| {
+                var nil_owns = try owns.clone(self.allocator);
+                defer nil_owns.deinit(self.allocator);
+                try self.forwardOwnsStream(od.nil_instrs, &nil_owns, ownership);
+                var struct_owns = try owns.clone(self.allocator);
+                defer struct_owns.deinit(self.allocator);
+                try self.forwardOwnsStream(od.struct_instrs, &struct_owns, ownership);
+                owns.copyFrom(&nil_owns);
+                owns.intersectWith(&struct_owns);
+            },
+            else => {},
+        }
+    }
+
+    /// Apply a single instruction's forward effect on the `owns` set.
+    /// Defining instructions whose dest is ARC-managed-owned set the
+    /// dest's bit; `release` clears the value's bit; `move_value`
+    /// transfers ownership from source to dest; `tail_call` consumes
+    /// its arg locals.
+    fn applyOwnsEffect(
+        self: *Analyzer,
+        instr: ir.Instruction,
+        owns: *LiveSet,
+    ) error{OutOfMemory}!void {
+        const local_ownership = self.function.local_ownership;
+        switch (instr) {
+            .release => |r| {
+                if (self.local_to_arc_index.get(r.value)) |idx| owns.unset(idx);
+            },
+            .move_value => |mv| {
+                if (self.local_to_arc_index.get(mv.source)) |idx| owns.unset(idx);
+                if (mv.dest < local_ownership.len and local_ownership[mv.dest] == .owned) {
+                    if (self.local_to_arc_index.get(mv.dest)) |idx| owns.set(idx);
+                }
+            },
+            .tail_call => |tc| {
+                for (tc.args) |arg_local| {
+                    if (self.local_to_arc_index.get(arg_local)) |idx| owns.unset(idx);
+                }
+            },
+            else => {
+                // Generic case: every dest local that's classified as
+                // .owned in `local_ownership` gains a +1 at this
+                // instruction.
+                const defs = collectDefs(instr);
+                for (defs.slice()) |def_local| {
+                    if (def_local >= local_ownership.len) continue;
+                    if (local_ownership[def_local] != .owned) continue;
+                    if (self.local_to_arc_index.get(def_local)) |idx| owns.set(idx);
+                }
+            },
+        }
+    }
+
+    /// Materialise the `owns` bitset into a `LocalId`-keyed
+    /// `ArcLocalSet` and store it under `id` in `ownership.owned_at_ret`.
+    fn snapshotOwnedAtRet(
+        self: *Analyzer,
+        ownership: *ArcOwnership,
+        id: InstructionId,
+        owns: *const LiveSet,
+    ) error{OutOfMemory}!void {
+        var local_set: ArcLocalSet = .empty;
+        errdefer local_set.deinit(self.allocator);
+        var bit_index: u32 = 0;
+        const bit_count: u32 = @intCast(self.arc_locals.items.len);
+        while (bit_index < bit_count) : (bit_index += 1) {
+            if (owns.contains(bit_index)) {
+                const local_id = self.arc_locals.items[bit_index];
+                try local_set.put(self.allocator, local_id, {});
+            }
+        }
+        try ownership.owned_at_ret.putNoClobber(self.allocator, id, local_set);
     }
 
     // ----------------------------------------------------------
@@ -2076,6 +2393,44 @@ const LiveSet = struct {
             .small => |v| (v & (@as(u64, 1) << @intCast(bit))) != 0,
             .large => |l| l.isSet(bit),
         };
+    }
+
+    /// In-place bitwise intersection. Bits set in `self` after the
+    /// call are exactly those set in BOTH `self` (before) and
+    /// `other`. Same `bit_count` required.
+    pub fn intersectWith(self: *LiveSet, other: *const LiveSet) void {
+        std.debug.assert(self.bit_count == other.bit_count);
+        switch (self.storage) {
+            .small => |*v| switch (other.storage) {
+                .small => |ov| v.* &= ov,
+                .large => |ol| {
+                    var b: u32 = 0;
+                    while (b < self.bit_count and b < 64) : (b += 1) {
+                        if (!ol.isSet(b)) {
+                            v.* &= ~(@as(u64, 1) << @intCast(b));
+                        }
+                    }
+                },
+            },
+            .large => |*l| switch (other.storage) {
+                .small => |ov| {
+                    var b: u32 = 0;
+                    while (b < self.bit_count) : (b += 1) {
+                        if (b < 64) {
+                            if ((ov & (@as(u64, 1) << @intCast(b))) == 0) l.unset(b);
+                        } else {
+                            l.unset(b);
+                        }
+                    }
+                },
+                .large => |ol| {
+                    var b: u32 = 0;
+                    while (b < self.bit_count) : (b += 1) {
+                        if (l.isSet(b) and !ol.isSet(b)) l.unset(b);
+                    }
+                },
+            },
+        }
     }
 };
 

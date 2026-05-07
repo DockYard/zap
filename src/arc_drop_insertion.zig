@@ -476,8 +476,12 @@ const StreamRebuilder = struct {
         id: arc_liveness.InstructionId,
     ) error{OutOfMemory}![]ir.Instruction {
         if (!isReturnEquivalentTerminator(instr.*)) return &.{};
-        const live_set = self.ownership.live_before_ret.get(id) orelse return &.{};
-        if (live_set.count() == 0) return &.{};
+        const maybe_live_set = self.ownership.live_before_ret.get(id);
+        const maybe_owned_set = self.ownership.owned_at_ret.get(id);
+        if (maybe_live_set == null and maybe_owned_set == null) return &.{};
+        const live_count: u32 = if (maybe_live_set) |s| s.count() else 0;
+        const owned_count: u32 = if (maybe_owned_set) |s| s.count() else 0;
+        if (live_count == 0 and owned_count == 0) return &.{};
 
         var args_view: TailCallArgsView = .{ .args = &.{} };
         switch (instr.*) {
@@ -485,39 +489,66 @@ const StreamRebuilder = struct {
             else => {},
         }
 
-        // Worst case: every live local becomes a release. Allocate
-        // for that and trim.
+        // Phase E.5 Gap 7: union the liveness-derived set
+        // (`live_before_ret`) with the ownership-derived set
+        // (`owned_at_ret`). Liveness sees locals "used after this
+        // point"; ownership sees locals "owns +1 at this point".
+        // The two diverge for owned-by-construction bindings whose
+        // last use is a `share_value` (the share retains rather
+        // than consumes, so liveness sees the source as dead but
+        // ownership sees it as still owning +1). Both sets must
+        // be drained at scope exit; deduplicate via a hash set so
+        // the same local doesn't release twice.
+        var seen: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+        defer seen.deinit(self.allocator);
+        try seen.ensureTotalCapacity(self.allocator, live_count + owned_count);
+
         var releases: std.ArrayListUnmanaged(ir.Instruction) = .empty;
         errdefer releases.deinit(self.allocator);
-        try releases.ensureTotalCapacity(self.allocator, live_set.count());
+        try releases.ensureTotalCapacity(self.allocator, live_count + owned_count);
 
-        var iter = live_set.keyIterator();
-        while (iter.next()) |local_ptr| {
-            const local_id = local_ptr.*;
-            if (args_view.containsLocal(local_id)) continue;
-            // Phase B (Phase 6 redux plan §3.B): skip LocalIds bound
-            // to a `borrowed` formal parameter. The caller owns the
-            // value across the entire call (caller-side `share_value`
-            // retain + post-call `release` ABI), so the callee must
-            // not emit a scope-exit destroy on the parameter local.
-            // Emitting one would double-free at Phase F when the
-            // .map flag is flipped: the caller's post-call release
-            // would decrement an already-destroyed cell.
-            if (isBorrowedParameterLocal(self.function, local_id)) continue;
-            // Phase C (Phase 6 redux plan §3.C): skip LocalIds whose
-            // ownership class was refined to `.borrowed` by
-            // `arc_ownership.classifyAndNormalize` — these are
-            // produced by `.borrow_value` instructions, which alias
-            // an existing owner without bumping its refcount. A
-            // scope-exit destroy on a borrow would decrement the
-            // source's cell without a matching retain, leading to
-            // premature free. Mirrors the parameter filter above:
-            // both are borrows whose underlying owner outlives the
-            // borrow's scope.
-            if (isBorrowedLocal(self.function, local_id)) continue;
-            try releases.append(self.allocator, ir.Instruction{
-                .release = .{ .value = local_id },
-            });
+        const SetIter = struct {
+            iter: ?@TypeOf(@as(arc_liveness.ArcLocalSet, .empty).keyIterator()),
+        };
+        var live_iter: SetIter = .{ .iter = null };
+        if (maybe_live_set) |ls| live_iter.iter = ls.keyIterator();
+        var owned_iter: SetIter = .{ .iter = null };
+        if (maybe_owned_set) |os| owned_iter.iter = os.keyIterator();
+
+        const sources: [2]*SetIter = .{ &live_iter, &owned_iter };
+        for (sources) |source| {
+            var maybe_iter = source.iter;
+            if (maybe_iter == null) continue;
+            while (maybe_iter.?.next()) |local_ptr| {
+                const local_id = local_ptr.*;
+                if (seen.contains(local_id)) continue;
+                try seen.put(self.allocator, local_id, {});
+
+                if (args_view.containsLocal(local_id)) continue;
+                // Phase B (Phase 6 redux plan §3.B): skip LocalIds bound
+                // to a `borrowed` formal parameter. The caller owns the
+                // value across the entire call (caller-side `share_value`
+                // retain + post-call `release` ABI), so the callee must
+                // not emit a scope-exit destroy on the parameter local.
+                // Emitting one would double-free at Phase F when the
+                // .map flag is flipped: the caller's post-call release
+                // would decrement an already-destroyed cell.
+                if (isBorrowedParameterLocal(self.function, local_id)) continue;
+                // Phase C (Phase 6 redux plan §3.C): skip LocalIds whose
+                // ownership class was refined to `.borrowed` by
+                // `arc_ownership.classifyAndNormalize` — these are
+                // produced by `.borrow_value` instructions, which alias
+                // an existing owner without bumping its refcount. A
+                // scope-exit destroy on a borrow would decrement the
+                // source's cell without a matching retain, leading to
+                // premature free. Mirrors the parameter filter above:
+                // both are borrows whose underlying owner outlives the
+                // borrow's scope.
+                if (isBorrowedLocal(self.function, local_id)) continue;
+                try releases.append(self.allocator, ir.Instruction{
+                    .release = .{ .value = local_id },
+                });
+            }
         }
 
         return try releases.toOwnedSlice(self.allocator);
@@ -1615,4 +1646,82 @@ test "arc_drop_insertion: optional_dispatch arms with ARC-managed locals run cle
     // would trip the internal `std.debug.assert` at the end of
     // `rebuildStream`.
     try insertScopeExitDrops(suite.irAllocator(), pick_func, &ownership);
+}
+
+test "Phase E.5 Gap 7: owned binding whose last use is share_value gets scope-exit release" {
+    // Today liveness sees `share_value{shared, source}` and treats
+    // its `source` use as a normal read. After the share_value, no
+    // further use of `source` exists, so liveness reports source as
+    // dead — i.e. NOT in `live_before_ret[ret]`. But share_value
+    // RETAINS rather than CONSUMES, so source still owns +1 at ret
+    // and must be released. Phase E.5 Gap 7 adds an additional drop
+    // set sourced from the forward "defined-and-still-owned" tracker
+    // so binding-owned locals receive a scope-exit release on every
+    // function exit.
+    //
+    // We exercise this with a function whose body binds the result
+    // of a Test.fresh() call (a Handle owner) and then passes it
+    // into Test.consume_immediately() — the only use is the
+    // share_value into the consume call. The binding (`h`) is dead
+    // per liveness at ret yet must be released.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn fresh() -> Handle {
+        \\    "fresh"
+        \\  }
+        \\
+        \\  pub fn observe(h :: Handle) -> i64 { 0 }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    h = Test.fresh()
+        \\    Test.observe(h)
+        \\  }
+        \\}
+    ;
+    var suite = try DropTestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const run_func = suite.findFunctionByName("run") orelse return error.MissingFunction;
+    var ownership = try arc_liveness.computeArcOwnership(
+        std.testing.allocator,
+        run_func,
+        suite.typeStore(),
+        arc_liveness.defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // Identify the call_named for `Test.fresh` — its dest is the
+    // owned binding that must be released at scope exit.
+    var fresh_dest: ?ir.LocalId = null;
+    for (run_func.body) |block| {
+        for (block.instructions) |instr| {
+            switch (instr) {
+                .call_named => |c| {
+                    if (std.mem.indexOf(u8, c.name, "fresh") != null) {
+                        fresh_dest = c.dest;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(fresh_dest != null);
+
+    // Phase E.5 precondition: arc_managed_locals contains the call
+    // dest (Gap 5 ensures registration of binding-owned locals).
+    try std.testing.expect(ownership.arc_managed_locals.contains(fresh_dest.?));
+
+    const releases_before = countReleases(run_func);
+    try insertScopeExitDrops(suite.irAllocator(), run_func, &ownership);
+    const releases_after = countReleases(run_func);
+
+    // Phase E.5 Gap 7: at least one new release was inserted, and
+    // one of them targets the fresh-call dest.
+    try std.testing.expect(releases_after > releases_before);
+
+    var release_locals = try collectReleaseLocals(std.testing.allocator, run_func);
+    defer release_locals.deinit(std.testing.allocator);
+    try std.testing.expect(release_locals.contains(fresh_dest.?));
 }
