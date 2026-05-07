@@ -2244,31 +2244,57 @@ fn lookupCalleeConventions(
 ///     `IrBuilder.buildCall` for concrete `Map(K, V)` instantiations.
 ///   * `MapNested:K:V.put` etc. — encoded name for nested map values
 ///     (`Map(K, Map(K2, V2))` and similar).
+///   * `Vector.set`, `Vector.push`, `Vector.pop`, `Vector.append` —
+///     pre-monomorph generic name. The Phase 2 flat-buffer
+///     `Vector(T)` runtime uses the same rc-1 fast-path pattern as
+///     the dense Map; without slot-0 promotion, callers retain their
+///     receiver to refcount 2 before entering the runtime, the rc-1
+///     branch never fires, and every mutation copies. Receiver is
+///     always slot 0 (`v.set(i, x)` / `v.push(x)` / `v.pop()` /
+///     `a.append(b)`). For `append` only the LHS slot is owned-
+///     mutating; the RHS is a borrowed source whose elements are
+///     deep-retain copied — the codegen treats it through normal
+///     borrowed-receiver share/release plumbing.
+///   * `Vector:T.set` etc. — post-monomorph encoded name.
 ///
 /// All Zap-level callers route through these names via
-/// `lib/map.zap`'s `Map.put`/`Map.delete`/`Map.merge` thin wrappers.
-/// The runtime's fast path is independent of K/V — it gates only on
+/// `lib/map.zap` and `lib/vector.zap`'s thin wrappers. The runtime's
+/// fast path is independent of the element types — it gates only on
 /// the receiver's refcount — so a single shape predicate covers
 /// every monomorph.
 pub fn ownedMutatingBuiltinSlot(name: []const u8) ?usize {
     // Method suffix is the last `.`-separated component.
     const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
     const method = name[dot_index + 1 ..];
-    const is_method =
+    const prefix = name[0..dot_index];
+
+    const is_map_method =
         std.mem.eql(u8, method, "put") or
         std.mem.eql(u8, method, "delete") or
         std.mem.eql(u8, method, "merge");
-    if (!is_method) return null;
-    const prefix = name[0..dot_index];
-    // Accept `Map`, `Map:...`, `MapNested:...`. Reject anything that
-    // has the same suffix but a different receiver type (e.g. an
-    // unrelated user-defined `Foo.put` builtin shouldn't be promoted).
-    const is_map_prefix =
-        std.mem.eql(u8, prefix, "Map") or
-        std.mem.startsWith(u8, prefix, "Map:") or
-        std.mem.startsWith(u8, prefix, "MapNested:");
-    if (!is_map_prefix) return null;
-    return 0;
+    if (is_map_method) {
+        const is_map_prefix =
+            std.mem.eql(u8, prefix, "Map") or
+            std.mem.startsWith(u8, prefix, "Map:") or
+            std.mem.startsWith(u8, prefix, "MapNested:");
+        if (is_map_prefix) return 0;
+        return null;
+    }
+
+    const is_vector_method =
+        std.mem.eql(u8, method, "set") or
+        std.mem.eql(u8, method, "push") or
+        std.mem.eql(u8, method, "pop") or
+        std.mem.eql(u8, method, "append");
+    if (is_vector_method) {
+        const is_vector_prefix =
+            std.mem.eql(u8, prefix, "Vector") or
+            std.mem.startsWith(u8, prefix, "Vector:");
+        if (is_vector_prefix) return 0;
+        return null;
+    }
+
+    return null;
 }
 
 test "arc_liveness: ownedMutatingBuiltinSlot matches Map.put / delete / merge variants" {
@@ -2286,6 +2312,28 @@ test "arc_liveness: ownedMutatingBuiltinSlot matches Map.put / delete / merge va
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("MapAlt.put"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("put"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot(""));
+}
+
+test "arc_liveness: ownedMutatingBuiltinSlot matches Vector.set / push / pop / append variants" {
+    // Pre-monomorph generic names (parser writes these before the
+    // type system pins down the element type).
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.set"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.push"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.pop"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.append"));
+    // Post-monomorph encoded names (concrete instantiations).
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector:i64.set"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector:f64.push"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector:str.append"));
+    // Negative cases — non-mutating Vector methods stay borrowed.
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vector.get"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vector.length"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vector.capacity"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vector.new_filled"));
+    // Lookalike receiver names must not match.
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorAlt.set"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vec.set"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("set"));
 }
 
 /// Soundness check executed at the orchestration seam (debug builds
