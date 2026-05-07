@@ -482,10 +482,234 @@ fn shouldPromoteSlot(
         if (!consumes) return false;
         if (site.is_self_recursive) has_self_recursive = true;
     }
-    // Condition 1: at least one self-recursive site.
-    if (!has_self_recursive) return false;
-    _ = function;
+    // Condition 1: at least one consume-side anchor exists for this
+    // slot. The original phrasing required at least one self-recursive
+    // call site, which is the canonical k-nucleotide accumulator
+    // pattern. Phase 4 (dense Map) of the implementation plan adds a
+    // second anchor: the function body forwards `slot_index` directly
+    // into an owned-mutating call_builtin (`Map.put`/`.delete`/
+    // `.merge`). This covers `lib/map.zap`'s thin `Map.put` Zap-fn
+    // wrapper, which simply forwards the receiver to
+    // `:zig.Map.put(...)` — the runtime's rc-1 fast path consumes the
+    // receiver, so the wrapper's slot 0 is semantically equivalent to
+    // a self-recursive consumer for inference purposes.
+    //
+    // Without this extension the wrapper stays `.borrowed`, every
+    // caller of `Map.put` emits a retain around the call, the
+    // receiver enters the runtime with refcount >= 2, and the rc-1
+    // fast path never fires — the source of the k-nucleotide perf
+    // regression after the dense Map flip.
+    if (!has_self_recursive and !bodyConsumesParamViaOwnedBuiltin(function, slot_index)) {
+        return false;
+    }
     return true;
+}
+
+/// Does the function's body forward `param_index` into the receiver
+/// slot of an owned-mutating call_builtin? Walks the function's
+/// instruction streams and tracks the SSA chain from `param_get` to
+/// the call_builtin, allowing intermediate `move_value`,
+/// `local_get`, `borrow_value`, and `share_value` aliases.
+///
+/// The check is structural — we don't need a full last-use proof
+/// here because the inference's outer condition (every caller passes
+/// at last use) is what makes the promotion sound on the caller
+/// side, and the matching consume effect inside the wrapper's body
+/// is supplied by `arc_ownership.rewriteOwnedConsumeBuiltinSites`
+/// (which gates on per-call-site last-use independently). Inside the
+/// wrapper, the receiver flows directly into the consume site, so
+/// the structural check is sufficient.
+fn bodyConsumesParamViaOwnedBuiltin(
+    function: *const ir.Function,
+    param_index: usize,
+) bool {
+    // Cap the alias-set size to keep the analysis bounded. Map.put,
+    // Map.delete, Map.merge wrappers use a single param_get plus a
+    // single share_value, so even nested generic functions stay well
+    // under this threshold.
+    const max_aliases: usize = 256;
+    var alias_buf: [max_aliases]ir.LocalId = undefined;
+    var alias_len: usize = 0;
+
+    // Forward closure: starting from every `param_get index=param_index`
+    // dest in the function body, follow `move_value`/`local_get`/
+    // `borrow_value`/`share_value` chains. Iterate until the alias set
+    // stops growing.
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (function.body) |block| {
+            if (collectParamAliasesIntoStream(block.instructions, @intCast(param_index), &alias_buf, &alias_len, max_aliases)) {
+                changed = true;
+            }
+        }
+    }
+    if (alias_len == 0) return false;
+
+    // Now scan for any owned-mutating call_builtin whose receiver
+    // slot is in `alias_buf[0..alias_len]`.
+    for (function.body) |block| {
+        if (streamHasOwnedBuiltinConsumingAlias(block.instructions, alias_buf[0..alias_len])) return true;
+    }
+    return false;
+}
+
+fn collectParamAliasesIntoStream(
+    stream: []const ir.Instruction,
+    param_index: u32,
+    alias_buf: []ir.LocalId,
+    alias_len: *usize,
+    max_aliases: usize,
+) bool {
+    var changed = false;
+    for (stream) |*instr| {
+        switch (instr.*) {
+            .param_get => |pg| if (pg.index == param_index) {
+                if (markAlias(pg.dest, alias_buf, alias_len, max_aliases)) changed = true;
+            },
+            .move_value => |mv| if (containsAlias(alias_buf[0..alias_len.*], mv.source)) {
+                if (markAlias(mv.dest, alias_buf, alias_len, max_aliases)) changed = true;
+            },
+            .local_get => |lg| if (containsAlias(alias_buf[0..alias_len.*], lg.source)) {
+                if (markAlias(lg.dest, alias_buf, alias_len, max_aliases)) changed = true;
+            },
+            .borrow_value => |bv| if (containsAlias(alias_buf[0..alias_len.*], bv.source)) {
+                if (markAlias(bv.dest, alias_buf, alias_len, max_aliases)) changed = true;
+            },
+            .share_value => |sv| if (containsAlias(alias_buf[0..alias_len.*], sv.source)) {
+                if (markAlias(sv.dest, alias_buf, alias_len, max_aliases)) changed = true;
+            },
+            .if_expr => |ie| {
+                if (collectParamAliasesIntoStream(ie.then_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+                if (collectParamAliasesIntoStream(ie.else_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+            },
+            .case_block => |cb| {
+                if (collectParamAliasesIntoStream(cb.pre_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+                for (cb.arms) |arm| {
+                    if (collectParamAliasesIntoStream(arm.cond_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+                    if (collectParamAliasesIntoStream(arm.body_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+                }
+                if (collectParamAliasesIntoStream(cb.default_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| {
+                    if (collectParamAliasesIntoStream(c.body_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+                }
+                if (collectParamAliasesIntoStream(sl.default_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| {
+                    if (collectParamAliasesIntoStream(c.body_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+                }
+                if (collectParamAliasesIntoStream(sr.default_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| {
+                    if (collectParamAliasesIntoStream(c.body_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+                }
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| {
+                    if (collectParamAliasesIntoStream(c.body_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+                }
+            },
+            .try_call_named => |tcn| {
+                if (collectParamAliasesIntoStream(tcn.handler_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+                if (collectParamAliasesIntoStream(tcn.success_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+            },
+            .guard_block => |gb| {
+                if (collectParamAliasesIntoStream(gb.body, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+            },
+            .optional_dispatch => |od| {
+                if (collectParamAliasesIntoStream(od.nil_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+                if (collectParamAliasesIntoStream(od.struct_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+            },
+            else => {},
+        }
+    }
+    return changed;
+}
+
+fn markAlias(
+    local: ir.LocalId,
+    alias_buf: []ir.LocalId,
+    alias_len: *usize,
+    max_aliases: usize,
+) bool {
+    if (containsAlias(alias_buf[0..alias_len.*], local)) return false;
+    if (alias_len.* >= max_aliases) return false;
+    alias_buf[alias_len.*] = local;
+    alias_len.* += 1;
+    return true;
+}
+
+fn containsAlias(set: []const ir.LocalId, local: ir.LocalId) bool {
+    for (set) |id| {
+        if (id == local) return true;
+    }
+    return false;
+}
+
+fn streamHasOwnedBuiltinConsumingAlias(
+    stream: []const ir.Instruction,
+    alias_set: []const ir.LocalId,
+) bool {
+    for (stream) |*instr| {
+        switch (instr.*) {
+            .call_builtin => |cb| {
+                if (arc_liveness.ownedMutatingBuiltinSlot(cb.name)) |slot| {
+                    if (slot < cb.args.len and containsAlias(alias_set, cb.args[slot])) return true;
+                }
+            },
+            .if_expr => |ie| {
+                if (streamHasOwnedBuiltinConsumingAlias(ie.then_instrs, alias_set)) return true;
+                if (streamHasOwnedBuiltinConsumingAlias(ie.else_instrs, alias_set)) return true;
+            },
+            .case_block => |cb| {
+                if (streamHasOwnedBuiltinConsumingAlias(cb.pre_instrs, alias_set)) return true;
+                for (cb.arms) |arm| {
+                    if (streamHasOwnedBuiltinConsumingAlias(arm.cond_instrs, alias_set)) return true;
+                    if (streamHasOwnedBuiltinConsumingAlias(arm.body_instrs, alias_set)) return true;
+                }
+                if (streamHasOwnedBuiltinConsumingAlias(cb.default_instrs, alias_set)) return true;
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| {
+                    if (streamHasOwnedBuiltinConsumingAlias(c.body_instrs, alias_set)) return true;
+                }
+                if (streamHasOwnedBuiltinConsumingAlias(sl.default_instrs, alias_set)) return true;
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| {
+                    if (streamHasOwnedBuiltinConsumingAlias(c.body_instrs, alias_set)) return true;
+                }
+                if (streamHasOwnedBuiltinConsumingAlias(sr.default_instrs, alias_set)) return true;
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| {
+                    if (streamHasOwnedBuiltinConsumingAlias(c.body_instrs, alias_set)) return true;
+                }
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| {
+                    if (streamHasOwnedBuiltinConsumingAlias(c.body_instrs, alias_set)) return true;
+                }
+            },
+            .try_call_named => |tcn| {
+                if (streamHasOwnedBuiltinConsumingAlias(tcn.handler_instrs, alias_set)) return true;
+                if (streamHasOwnedBuiltinConsumingAlias(tcn.success_instrs, alias_set)) return true;
+            },
+            .guard_block => |gb| {
+                if (streamHasOwnedBuiltinConsumingAlias(gb.body, alias_set)) return true;
+            },
+            .optional_dispatch => |od| {
+                if (streamHasOwnedBuiltinConsumingAlias(od.nil_instrs, alias_set)) return true;
+                if (streamHasOwnedBuiltinConsumingAlias(od.struct_instrs, alias_set)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// Does this call site pass `args[slot_index]` in a "consume"

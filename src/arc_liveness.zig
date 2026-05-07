@@ -503,11 +503,66 @@ const Analyzer = struct {
     /// ownership table.
     ownership_in_progress: ?*ArcOwnership = null,
 
+    /// Phase 4 (dense Map) — alias group bookkeeping for `.owned`
+    /// parameter slots.
+    ///
+    /// When a function has multiple `param_get` instructions reading
+    /// the same `.owned`-convention parameter slot, every read is an
+    /// alias of the function-entry +1 for that slot. The forward
+    /// `owns` dataflow as written sets a separate bit for each alias
+    /// LocalId at the corresponding `param_get`, so when a downstream
+    /// consume site (e.g. `move_value` into a `Map.put` arg) clears
+    /// the bit tied to ONE alias, the OTHER aliases' bits stay set.
+    /// `arc_drop_insertion` then emits a stale scope-exit release on
+    /// those leftover aliases, producing the double-free signature
+    /// observed in `count_kmers_loop`.
+    ///
+    /// `param_alias_group` records, for each `param_get` dest of an
+    /// `.owned` slot, the list of ALL `param_get` dests that read the
+    /// same slot (including itself). Looking up any alias yields the
+    /// full group, so a consume site can clear every alias's bit in
+    /// one pass — preventing stale releases on sibling aliases that
+    /// the consume didn't directly touch.
+    ///
+    /// The forward dataflow consults this map at consume sites
+    /// (`move_value`, `applyCallConsumeEffect`,
+    /// `applyCallBuiltinConsumeEffect`, `local_set` transfer): when
+    /// the consumed LocalId is in the map, we clear EVERY alias's
+    /// owns bit so the slot's single +1 is consumed exactly once and
+    /// no sibling alias contributes a stale release at the next
+    /// terminator's `owned_at_ret`.
+    ///
+    /// We deliberately do NOT alter the `seen → arc_locals` mapping,
+    /// because liveness reconstruction (`snapshotLiveBeforeRet`,
+    /// `snapshotOwnedAtRet`) maps each bit back to a single LocalId
+    /// via `arc_locals[bit]`. Sharing one bit across aliases would
+    /// silently swap LocalIds at the reconstruction seam, returning
+    /// (e.g.) the case[1] alias for a case[0] terminator — wrong.
+    /// Per-alias bits with a "consume one, consume all" rule keeps
+    /// the reconstruction faithful to per-control-flow-path liveness.
+    ///
+    /// Lifetime: each value slice is allocated from the analyzer's
+    /// allocator and freed in `deinit`.
+    param_alias_group: std.AutoHashMapUnmanaged(ir.LocalId, []const ir.LocalId) = .empty,
+
     fn deinit(self: *Analyzer) void {
         self.records.deinit(self.allocator);
         self.pointer_to_id.deinit(self.allocator);
         self.arc_locals.deinit(self.allocator);
         self.local_to_arc_index.deinit(self.allocator);
+        // Free each alias group's slice. Multiple keys may point at
+        // the same slice (members of one group share the alias list);
+        // dedupe by tracking pointers we've already freed.
+        var freed: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        defer freed.deinit(self.allocator);
+        var alias_iter = self.param_alias_group.valueIterator();
+        while (alias_iter.next()) |slice_ptr| {
+            const ptr_addr: usize = @intFromPtr(slice_ptr.*.ptr);
+            if (freed.contains(ptr_addr)) continue;
+            freed.put(self.allocator, ptr_addr, {}) catch {};
+            self.allocator.free(slice_ptr.*);
+        }
+        self.param_alias_group.deinit(self.allocator);
         for (self.live_after.items) |*set| {
             set.deinit(self.allocator);
         }
@@ -642,12 +697,35 @@ const Analyzer = struct {
         // ARC-managed.
         const captures = self.function.captures;
 
+        // Phase 4: collect every `param_get` dest for each
+        // `.owned`-convention slot. After the records walk, build the
+        // alias-group slices: every dest in slot S's group points at
+        // a shared slice containing all dests of slot S. The forward
+        // dataflow consults this at consume sites to clear sibling
+        // aliases' bits in one pass.
+        var owned_param_dests: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(ir.LocalId)) = .empty;
+        defer {
+            var dests_iter = owned_param_dests.valueIterator();
+            while (dests_iter.next()) |list_ptr| list_ptr.deinit(self.allocator);
+            owned_param_dests.deinit(self.allocator);
+        }
+        const param_conventions = self.function.param_conventions;
+
         for (self.records.items) |rec| {
             switch (rec.instr.*) {
                 .param_get => |pg| {
                     if (arc_param_indices.contains(pg.index)) {
                         if (!seen.contains(pg.dest)) {
                             try seen.put(self.allocator, pg.dest, {});
+                        }
+                        // Collect this dest into the slot's alias
+                        // group when the convention is `.owned`.
+                        if (pg.index < param_conventions.len and
+                            param_conventions[pg.index] == .owned)
+                        {
+                            const gop = try owned_param_dests.getOrPut(self.allocator, pg.index);
+                            if (!gop.found_existing) gop.value_ptr.* = .empty;
+                            try gop.value_ptr.append(self.allocator, pg.dest);
                         }
                     }
                 },
@@ -756,6 +834,23 @@ const Analyzer = struct {
             const arc_idx: u32 = @intCast(self.arc_locals.items.len);
             try self.arc_locals.append(self.allocator, local_id);
             try self.local_to_arc_index.put(self.allocator, local_id, arc_idx);
+        }
+
+        // Phase 4: build the alias-group slices. For each `.owned`
+        // slot with 2+ param_get dests, allocate a slice containing
+        // every dest and register every dest as a key pointing at
+        // that shared slice. Slots with only one param_get are NOT
+        // registered — there's no other alias to clear, and skipping
+        // them keeps the lookup cost minimal at consume sites.
+        var dests_iter_2 = owned_param_dests.iterator();
+        while (dests_iter_2.next()) |entry| {
+            const dests_list = entry.value_ptr.*;
+            if (dests_list.items.len < 2) continue;
+            const slice = try self.allocator.alloc(ir.LocalId, dests_list.items.len);
+            @memcpy(slice, dests_list.items);
+            for (slice) |dest| {
+                try self.param_alias_group.put(self.allocator, dest, slice);
+            }
         }
     }
 
@@ -1545,10 +1640,10 @@ const Analyzer = struct {
         const local_ownership = self.function.local_ownership;
         switch (instr) {
             .release => |r| {
-                if (self.local_to_arc_index.get(r.value)) |idx| owns.unset(idx);
+                self.clearOwnsForLocalAndAliases(r.value, owns);
             },
             .move_value => |mv| {
-                if (self.local_to_arc_index.get(mv.source)) |idx| owns.unset(idx);
+                self.clearOwnsForLocalAndAliases(mv.source, owns);
                 if (mv.dest < local_ownership.len and local_ownership[mv.dest] == .owned) {
                     if (self.local_to_arc_index.get(mv.dest)) |idx| owns.set(idx);
                 }
@@ -1568,7 +1663,7 @@ const Analyzer = struct {
                 // cell the dest is about to consume.
                 if (self.local_to_arc_index.get(ls.value)) |src_idx| {
                     if (owns.contains(src_idx)) {
-                        owns.unset(src_idx);
+                        self.clearOwnsForLocalAndAliases(ls.value, owns);
                         if (ls.dest < local_ownership.len and local_ownership[ls.dest] == .owned) {
                             if (self.local_to_arc_index.get(ls.dest)) |dst_idx| owns.set(dst_idx);
                         }
@@ -1584,7 +1679,7 @@ const Analyzer = struct {
             },
             .tail_call => |tc| {
                 for (tc.args) |arg_local| {
-                    if (self.local_to_arc_index.get(arg_local)) |idx| owns.unset(idx);
+                    self.clearOwnsForLocalAndAliases(arg_local, owns);
                 }
             },
             // Phase E.10: aggregate-init instructions consume their
@@ -1611,7 +1706,7 @@ const Analyzer = struct {
             // for, double-decrementing the cell at scope exit.
             .tuple_init => |ti| {
                 for (ti.elements) |elem| {
-                    if (self.local_to_arc_index.get(elem)) |idx| owns.unset(idx);
+                    self.clearOwnsForLocalAndAliases(elem, owns);
                 }
                 if (ti.dest < local_ownership.len and local_ownership[ti.dest] == .owned) {
                     if (self.local_to_arc_index.get(ti.dest)) |idx| owns.set(idx);
@@ -1619,29 +1714,29 @@ const Analyzer = struct {
             },
             .list_init => |li| {
                 for (li.elements) |elem| {
-                    if (self.local_to_arc_index.get(elem)) |idx| owns.unset(idx);
+                    self.clearOwnsForLocalAndAliases(elem, owns);
                 }
                 if (li.dest < local_ownership.len and local_ownership[li.dest] == .owned) {
                     if (self.local_to_arc_index.get(li.dest)) |idx| owns.set(idx);
                 }
             },
             .list_cons => |lc| {
-                if (self.local_to_arc_index.get(lc.head)) |idx| owns.unset(idx);
-                if (self.local_to_arc_index.get(lc.tail)) |idx| owns.unset(idx);
+                self.clearOwnsForLocalAndAliases(lc.head, owns);
+                self.clearOwnsForLocalAndAliases(lc.tail, owns);
                 if (lc.dest < local_ownership.len and local_ownership[lc.dest] == .owned) {
                     if (self.local_to_arc_index.get(lc.dest)) |idx| owns.set(idx);
                 }
             },
             .struct_init => |si| {
                 for (si.fields) |field| {
-                    if (self.local_to_arc_index.get(field.value)) |idx| owns.unset(idx);
+                    self.clearOwnsForLocalAndAliases(field.value, owns);
                 }
                 if (si.dest < local_ownership.len and local_ownership[si.dest] == .owned) {
                     if (self.local_to_arc_index.get(si.dest)) |idx| owns.set(idx);
                 }
             },
             .union_init => |ui| {
-                if (self.local_to_arc_index.get(ui.value)) |idx| owns.unset(idx);
+                self.clearOwnsForLocalAndAliases(ui.value, owns);
                 if (ui.dest < local_ownership.len and local_ownership[ui.dest] == .owned) {
                     if (self.local_to_arc_index.get(ui.dest)) |idx| owns.set(idx);
                 }
@@ -1687,6 +1782,27 @@ const Analyzer = struct {
                 // the dedicated `.move_value` branch above.
                 self.applyCallDestEffect(cdsp.dest, owns);
             },
+            // Phase 4 (dense Map): `call_builtin` invocations of the
+            // curated owned-mutating intrinsics (`Map.put`/`.delete`/
+            // `.merge` — see `ownedMutatingBuiltinSlot`) consume their
+            // receiver. The codegen pass
+            // `arc_ownership.rewriteOwnedConsumeBuiltinSites` rewrites
+            // the share_value at the call site into a move_value and
+            // drops the post-call release; the dataflow must clear
+            // the receiver arg's owns bit so it doesn't carry through
+            // to a ret terminator and trigger a stale scope-exit
+            // release on top of the runtime's consume (double-free).
+            // For every other builtin the default borrow convention
+            // stays in effect — owns bits flow through unchanged and
+            // the dest gets +1 via the generic def handling.
+            .call_builtin => |cb| {
+                if (ownedMutatingBuiltinSlot(cb.name)) |slot| {
+                    if (slot < cb.args.len) {
+                        self.clearOwnsForLocalAndAliases(cb.args[slot], owns);
+                    }
+                }
+                self.applyCallDestEffect(cb.dest, owns);
+            },
             else => {
                 // Generic case: every dest local that's classified as
                 // .owned in `local_ownership` gains a +1 at this
@@ -1727,7 +1843,27 @@ const Analyzer = struct {
         while (slot < slot_count) : (slot += 1) {
             if (conventions[slot] != .owned) continue;
             const arg_local = args[slot];
-            if (self.local_to_arc_index.get(arg_local)) |idx| owns.unset(idx);
+            self.clearOwnsForLocalAndAliases(arg_local, owns);
+        }
+    }
+
+    /// Phase 4 helper: clear the owns bit for `local` AND, when
+    /// `local` is in a `param_alias_group`, the bits for every other
+    /// alias in the same group. Mirrors the dataflow rule "consuming
+    /// any alias of an `.owned` parameter consumes the slot's single
+    /// +1, leaving no sibling alias live".
+    ///
+    /// Concretely: when `move_value source=29 dest=30` consumes
+    /// `%29` (one alias of slot 4), we clear `arc_idx_29` AND every
+    /// other slot-4 alias's bit (e.g. `arc_idx_21` from a sibling
+    /// `param_get`). After the move, NO alias contributes a stale
+    /// release at the terminator's `owned_at_ret`.
+    fn clearOwnsForLocalAndAliases(self: *Analyzer, local: ir.LocalId, owns: *LiveSet) void {
+        if (self.local_to_arc_index.get(local)) |idx| owns.unset(idx);
+        if (self.param_alias_group.get(local)) |aliases| {
+            for (aliases) |alias| {
+                if (self.local_to_arc_index.get(alias)) |idx| owns.unset(idx);
+            }
         }
     }
 
@@ -2084,6 +2220,72 @@ fn lookupCalleeConventions(
         }
     }
     return null;
+}
+
+/// Curated list of `call_builtin` names whose first argument is a
+/// "consume" slot when the source local is at last use. The runtime
+/// implementations in `runtime.zig` (`Map(K,V).put`, `.delete`,
+/// `.merge`) have a refcount-aware fast path that mutates the
+/// receiver in place when its refcount is 1, so passing the receiver
+/// as a `move_value` (no caller-side retain) collapses repeated
+/// mutations into a single in-place sequence. Without this list,
+/// every call site would emit `share_value` (retain) + post-call
+/// `release`, which keeps the receiver's refcount at >= 2 and forces
+/// the runtime onto the always-clone slow path.
+///
+/// Returns the slot index of the consumed argument (always 0 today)
+/// when `name` matches a known owned-mutating builtin, or null when
+/// the builtin should keep its default borrow convention.
+///
+/// Recognised name shapes:
+///   * `Map.put`, `Map.delete`, `Map.merge` — pre-monomorph generic
+///     name used when the key/value types resolve to `.any`/`.term`.
+///   * `Map:K:V.put` etc. — post-monomorph encoded name produced by
+///     `IrBuilder.buildCall` for concrete `Map(K, V)` instantiations.
+///   * `MapNested:K:V.put` etc. — encoded name for nested map values
+///     (`Map(K, Map(K2, V2))` and similar).
+///
+/// All Zap-level callers route through these names via
+/// `lib/map.zap`'s `Map.put`/`Map.delete`/`Map.merge` thin wrappers.
+/// The runtime's fast path is independent of K/V — it gates only on
+/// the receiver's refcount — so a single shape predicate covers
+/// every monomorph.
+pub fn ownedMutatingBuiltinSlot(name: []const u8) ?usize {
+    // Method suffix is the last `.`-separated component.
+    const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
+    const method = name[dot_index + 1 ..];
+    const is_method =
+        std.mem.eql(u8, method, "put") or
+        std.mem.eql(u8, method, "delete") or
+        std.mem.eql(u8, method, "merge");
+    if (!is_method) return null;
+    const prefix = name[0..dot_index];
+    // Accept `Map`, `Map:...`, `MapNested:...`. Reject anything that
+    // has the same suffix but a different receiver type (e.g. an
+    // unrelated user-defined `Foo.put` builtin shouldn't be promoted).
+    const is_map_prefix =
+        std.mem.eql(u8, prefix, "Map") or
+        std.mem.startsWith(u8, prefix, "Map:") or
+        std.mem.startsWith(u8, prefix, "MapNested:");
+    if (!is_map_prefix) return null;
+    return 0;
+}
+
+test "arc_liveness: ownedMutatingBuiltinSlot matches Map.put / delete / merge variants" {
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map.put"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map.delete"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map.merge"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map:u32:i64.put"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map:str:str.delete"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("MapNested:str:list.merge"));
+    // Negative cases.
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Map.get"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Map.size"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("List.append"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Foo.put"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("MapAlt.put"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("put"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot(""));
 }
 
 /// Soundness check executed at the orchestration seam (debug builds

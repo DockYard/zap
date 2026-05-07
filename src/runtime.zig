@@ -357,6 +357,11 @@ pub var arc_retains_total: u64 = 0;
 pub var arc_releases_total: u64 = 0;
 pub var arc_consumes_total: u64 = 0;
 pub var arc_return_elisions_total: u64 = 0;
+/// Number of dense-Map mutating calls (put/delete) that took the
+/// rc-1 fast path (mutated the receiver in place).
+pub var dense_map_rc1_fast_path_total: u64 = 0;
+/// Total dense-Map mutating calls.
+pub var dense_map_mut_calls_total: u64 = 0;
 
 /// Per-pool live-cell statistics. Each pool wrapper (e.g.
 /// `ArcRuntime.ArcPool(T)`, `MArrayOf(T).InnerPool`, `Map(K,V).SelfPool`)
@@ -416,6 +421,12 @@ pub fn dumpArcStats(write_line: *const fn ([]const u8) void) void {
         arc_releases_total,
         arc_consumes_total,
         arc_return_elisions_total,
+    })) |line| {
+        write_line(line);
+    } else |_| {}
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] dense_map_mut_calls_total={d} dense_map_rc1_fast_path_total={d}\n", .{
+        dense_map_mut_calls_total,
+        dense_map_rc1_fast_path_total,
     })) |line| {
         write_line(line);
     } else |_| {}
@@ -4542,16 +4553,33 @@ pub fn Map(comptime K: type, comptime V: type) type {
             }
             const self = map.?;
 
-            // Phase 1 contract: `put` always returns a freshly-allocated
-            // cell with rc=1. The dense buffer's rc-1 fast path lands in
-            // Phase 4 alongside the codegen's `_owned`/`_borrowed`
-            // intrinsic split (see `docs/dense-map-implementation-plan.md`
-            // §1.6). The Phase 1 build keeps the caller-side ABI identical
-            // to the legacy HAMT — every caller treats the returned
-            // `?*const Self` as a new ownership and matches it with a
-            // single release; no caller relies on identity-return for
-            // refcount accounting. Allocating a fresh cell on every
-            // mutation preserves that contract.
+            // Phase 4 (dense Map): refcount-aware fast path.
+            //
+            // When the caller has transferred ownership of `self`
+            // (refcount == 1), mutate the buffer in place and return
+            // the same pointer (or a resized buffer with children
+            // moved over verbatim). When `self` is shared
+            // (refcount > 1), fall back to the deep-retain clone path
+            // so the original map stays valid. This is the central
+            // optimisation behind the dense Map design — in working-
+            // dictionary patterns the receiver is uniquely owned
+            // essentially every time, so the fast path collapses
+            // repeated put/delete into a stream of in-place mutations
+            // with no allocation churn.
+            //
+            // The codegen's owned-mutating call-site rewrite (in
+            // `arc_ownership.rewriteOwnedConsumeBuiltinSites` and
+            // `rewriteOwnedConsumeSites` plus the param convention
+            // promotion in `arc_param_convention.shouldPromoteSlot`)
+            // ensures that last-use Map.put calls reach this function
+            // with refcount == 1.
+            dense_map_mut_calls_total += 1;
+            if (self.header.count() == 1) {
+                dense_map_rc1_fast_path_total += 1;
+                const mut: *Self = @constCast(self);
+                return putInPlace(mut, key, value, callsite);
+            }
+
             const target_cap = pickCapacity(self.capacity, self.len + 1);
             const clone = cloneBufferRetainingChildren(self, target_cap, callsite) orelse return null;
             return putInPlace(clone, key, value, callsite);
@@ -4572,6 +4600,20 @@ pub fn Map(comptime K: type, comptime V: type) type {
             var dest: *Self = target;
             if (new_cap != old_cap) {
                 dest = cloneBufferMovingChildren(target, new_cap, callsite) orelse return null;
+                // Notify the instrumentation harness that the old
+                // buffer is being retired before its zero-transition
+                // release. The rc-1 fast-path resize transfers
+                // children to a fresh buffer and then frees the old
+                // one shallowly (no `release()` call), so the standard
+                // `mapInstrumentationOnRelease` hook never fires for
+                // these instances. Without this notification the
+                // differential classifier would see every resize as a
+                // class-V "lost" instance instead of the class-S
+                // "single owner mutated in place" shape it actually
+                // represents.
+                if (comptime instrument_map) {
+                    mapInstrumentationOnRelease(@intFromPtr(target), target.len);
+                }
                 target.bufferFreeShallow();
             }
             _ = putInPlaceInsert(dest, key, value);
@@ -4619,10 +4661,21 @@ pub fn Map(comptime K: type, comptime V: type) type {
         fn deleteInner(map: ?*const Self, key: K, callsite: u64) ?*const Self {
             const self = map orelse return null;
 
-            // Phase 1 contract: `delete` always returns a freshly-
-            // allocated cell with rc=1 (mirrors `put`). The rc-1 fast
-            // path lands in Phase 4 alongside the codegen's intrinsic
-            // split. See the matching note in `putInner`.
+            // Phase 4 (dense Map): refcount-aware fast path. On unique
+            // ownership we mutate the live buffer in place (with
+            // `deleteFoundInPlace` deep-releasing the removed entry's
+            // K/V). On absent-key we still return the same handle
+            // without allocating. On shared ownership we deep-retain
+            // clone, then run the same swap-remove on the clone — the
+            // source map stays unchanged.
+            if (self.header.count() == 1) {
+                const mut: *Self = @constCast(self);
+                if (findEntry(mut, key)) |found_entry_idx| {
+                    deleteFoundInPlace(mut, found_entry_idx);
+                }
+                return mut;
+            }
+
             const clone = cloneBufferRetainingChildren(self, self.capacity, callsite) orelse return null;
             if (findEntry(clone, key)) |found_entry_idx| {
                 deleteFoundInPlace(clone, found_entry_idx);

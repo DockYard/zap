@@ -2038,6 +2038,27 @@ fn runArcOwnershipAndVerify(
     ownership: *const zap.arc_liveness.ProgramArcOwnership,
     type_store: *const zap.types.TypeStore,
 ) CompileError!void {
+    // Phase 4 (dense Map): rewrite owned-mutating call_builtin sites
+    // (`Map.put`/`.delete`/`.merge`) at last-use BEFORE
+    // classifyAndNormalize. The pass uses `last_use_map` (computed
+    // before any IR mutation) to gate per-call-site share→move
+    // rewrites; classifyAndNormalize replaces `local_get` with
+    // `copy_value`/etc. and strips trailing `.retain` instructions,
+    // which shifts the InstructionId-by-position relationship that
+    // last_use_map keys depend on. Running here keeps the IR shape
+    // identical to the one the analyzer saw.
+    //
+    // The matching consume-effect for the analyzer's dataflow lives
+    // in `arc_liveness.applyOwnsEffect`'s `.call_builtin` branch (it
+    // clears the receiver's owns bit at the call site so
+    // `arc_drop_insertion` doesn't emit a stale post-call release on
+    // top of the runtime's consume).
+    for (program.functions, 0..) |_, i| {
+        const function: *ir.Function = @constCast(&program.functions[i]);
+        const fn_ownership = ownership.get(function.id) orelse continue;
+        zap.arc_ownership.rewriteOwnedConsumeBuiltinSites(alloc, function, fn_ownership) catch return error.OutOfMemory;
+    }
+
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
         const fn_ownership = ownership.get(function.id) orelse continue;

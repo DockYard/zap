@@ -194,6 +194,21 @@ const LocalUseCounts = struct {
     /// cell while the bump-allocated aggregate retained the now-
     /// dangling pointer) is suppressed.
     aggregate_store_use_count: u32 = 0,
+    /// Phase 4 (dense Map): count of uses that flow into a
+    /// `share_value` whose enclosing call has owned-consume semantics
+    /// — either the callee's matching param convention is `.owned`,
+    /// OR the callee is an owned-mutating call_builtin (`Map.put`/
+    /// `.delete`/`.merge` — see `arc_liveness.ownedMutatingBuiltinSlot`).
+    /// When a `.local_get`'s dest's ONLY use is one of these
+    /// positions, the classifier emits `.move_value` instead of
+    /// `.copy_value` so the source's owns bit transfers cleanly into
+    /// the consume site (after `rewriteOwnedConsumeSites` /
+    /// `rewriteOwnedConsumeBuiltinSites` rewrite the share_value).
+    /// Without this signal the classifier picks the conservative
+    /// `.copy_value`, which retains the cell to refcount 2 BEFORE the
+    /// runtime-side rc-1 fast path can fire — defeating the dense-Map
+    /// optimisation entirely.
+    owned_consume_use_count: u32 = 0,
     total_use_count: u32 = 0,
 };
 
@@ -253,6 +268,22 @@ const UseSummary = struct {
         if (!gop.found_existing) gop.value_ptr.* = .{};
         gop.value_ptr.total_use_count += 1;
         gop.value_ptr.aggregate_store_use_count += 1;
+    }
+
+    /// Phase 4 (dense Map): record a use of `local` that occurs as
+    /// the source of a `share_value` whose dest will be rewritten to
+    /// `move_value` because the receiving call has owned-consume
+    /// semantics. The share is effectively a consume site, not a
+    /// borrow + retain.
+    fn recordOwnedConsumeUse(
+        self: *UseSummary,
+        allocator: std.mem.Allocator,
+        local: ir.LocalId,
+    ) !void {
+        const gop = try self.counts.getOrPut(allocator, local);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.total_use_count += 1;
+        gop.value_ptr.owned_consume_use_count += 1;
     }
 
     fn get(self: *const UseSummary, local: ir.LocalId) LocalUseCounts {
@@ -341,23 +372,54 @@ fn collectConsumeShareDestsInStream(
     // this stream. The same pattern `rewriteOwnedConsumeSites`
     // uses to find share/release pairs — share_values and the
     // call that consumes them never cross structural boundaries.
+    //
+    // Two sources of owned-arg slots:
+    //   * regular calls (call_named/call_direct/try_call_named) whose
+    //     callee's `param_conventions` was promoted to `.owned` by
+    //     `arc_param_convention.inferConventions`.
+    //   * call_builtin invocations of the curated owned-mutating
+    //     intrinsics (`Map.put`/`.delete`/`.merge`) — these consume
+    //     their receiver via the runtime's rc-1 fast path. Recognised
+    //     by name via `arc_liveness.ownedMutatingBuiltinSlot`.
     var i: usize = 0;
     while (i < stream.len) : (i += 1) {
-        const args = callArgs(stream[i]) orelse continue;
-        const conventions = lookupCalleeConventionsForCall(program, &stream[i]) orelse continue;
-        const slot_count = @min(args.len, conventions.len);
-        var slot: usize = 0;
-        while (slot < slot_count) : (slot += 1) {
-            if (conventions[slot] != .owned) continue;
-            const arg_local = args[slot];
-            // Walk backward in the stream to find the matching
-            // share_value whose dest is `arg_local`.
-            var j: usize = i;
-            while (j > 0) {
-                j -= 1;
-                if (stream[j] == .share_value and stream[j].share_value.dest == arg_local) {
-                    try consume_share_dests.put(allocator, arg_local, {});
-                    break;
+        // First check: regular calls with `.owned` convention slots.
+        if (callArgs(stream[i])) |args| {
+            if (lookupCalleeConventionsForCall(program, &stream[i])) |conventions| {
+                const slot_count = @min(args.len, conventions.len);
+                var slot: usize = 0;
+                while (slot < slot_count) : (slot += 1) {
+                    if (conventions[slot] != .owned) continue;
+                    const arg_local = args[slot];
+                    var j: usize = i;
+                    while (j > 0) {
+                        j -= 1;
+                        if (stream[j] == .share_value and stream[j].share_value.dest == arg_local) {
+                            try consume_share_dests.put(allocator, arg_local, {});
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Second check: call_builtin owned-mutating intrinsics. The
+        // callArgs() helper deliberately does NOT include call_builtin
+        // (it's used by the convention-based logic above which doesn't
+        // apply to runtime targets), so handle the builtin case
+        // explicitly here.
+        if (stream[i] == .call_builtin) {
+            const cb = stream[i].call_builtin;
+            if (arc_liveness.ownedMutatingBuiltinSlot(cb.name)) |slot| {
+                if (slot < cb.args.len) {
+                    const arg_local = cb.args[slot];
+                    var j: usize = i;
+                    while (j > 0) {
+                        j -= 1;
+                        if (stream[j] == .share_value and stream[j].share_value.dest == arg_local) {
+                            try consume_share_dests.put(allocator, arg_local, {});
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -446,16 +508,25 @@ fn recordInstructionUses(
             // call release. The source local stays live across the
             // share; no ownership transfers to the share's dest.
             //
-            // Phase H.5: when the share's dest will be rewritten to
-            // `move_value` by `rewriteOwnedConsumeSites` (because
-            // its enclosing call's matching param convention is
-            // `.owned`), the share is *not* a borrow position — it
-            // becomes an ownership transfer. Record the source as a
-            // non-borrow use so the upstream `local_get` lowers to
-            // `.copy_value` (retain), giving the eventual
-            // `move_value` a real `+1` to transfer.
+            // Phase H.5 / Phase 4: when the share's dest will be
+            // rewritten to `move_value` by `rewriteOwnedConsumeSites`
+            // (callee param convention `.owned`) or by
+            // `rewriteOwnedConsumeBuiltinSites` (call_builtin name
+            // matches `ownedMutatingBuiltinSlot`), the share is *not*
+            // a borrow position — it becomes an ownership transfer.
+            // Tag the source's use as `owned_consume`, which lets
+            // `shouldMoveIntoOwnedConsume` (below) lower the upstream
+            // `.local_get` as `.move_value` instead of the
+            // conservative `.copy_value`. Without the move, the
+            // copy's retain bumps refcount to 2 BEFORE the runtime
+            // rc-1 fast path can fire, defeating the dense-Map
+            // optimisation entirely.
             const is_consume_share = consume_share_dests.contains(sv.dest);
-            try summary.recordUse(allocator, sv.source, !is_consume_share);
+            if (is_consume_share) {
+                try summary.recordOwnedConsumeUse(allocator, sv.source);
+            } else {
+                try summary.recordUse(allocator, sv.source, true);
+            }
         },
         .local_get => |lg| {
             // Chained alias — propagate the borrow signal.
@@ -756,6 +827,46 @@ fn shouldMove(
 /// flowing into `.map_init.entry.value` therefore continues to
 /// classify as `.copy_value` — the Map runtime's retain handles the
 /// stored cell's lifetime, so the conservative copy is correct.
+/// Phase 4 (dense Map): decide whether a `.local_get{dest, source}`
+/// should be lowered as `.move_value` because dest's only use is
+/// feeding a `share_value` whose receiving call has owned-consume
+/// semantics (callee param convention is `.owned` OR callee is an
+/// owned-mutating call_builtin like `Map.put`). Returns `true` when:
+///
+///   * dest is ARC-managed (`.owned` in `local_ownership`).
+///   * source is ARC-managed (`.owned`) too.
+///   * dest's only use is an owned-consume share
+///     (`owned_consume_use_count == total_use_count == 1`).
+///   * source's only use is this `.local_get`
+///     (`source.total_use_count == 1`).
+///
+/// Mirrors `shouldMoveIntoAggregate` but for the owned-consume share-
+/// value position. Without this rule the classifier picks
+/// `.copy_value` (retain) at every working-dictionary `Map.put` chain
+/// step, the runtime sees refcount >= 2, and the rc-1 fast path
+/// never fires — turning every put into a full buffer copy and
+/// regressing k-nucleotide back into the multi-minute regime.
+fn shouldMoveIntoOwnedConsume(
+    function: *const ir.Function,
+    summary: *const UseSummary,
+    dest: ir.LocalId,
+    source: ir.LocalId,
+) bool {
+    if (dest >= function.local_ownership.len) return false;
+    if (function.local_ownership[dest] != .owned) return false;
+    if (source >= function.local_ownership.len) return false;
+    if (function.local_ownership[source] != .owned) return false;
+
+    const dest_counts = summary.get(dest);
+    if (dest_counts.total_use_count != 1) return false;
+    if (dest_counts.owned_consume_use_count != 1) return false;
+
+    const source_counts = summary.get(source);
+    if (source_counts.total_use_count != 1) return false;
+
+    return true;
+}
+
 fn shouldMoveIntoAggregate(
     function: *const ir.Function,
     summary: *const UseSummary,
@@ -862,6 +973,27 @@ const StreamRewriter = struct {
                         // (so neither owner alias's scope-exit destroy
                         // fires on the cell whose live pointer the
                         // aggregate now holds).
+                        try new_instrs.append(self.allocator, .{
+                            .move_value = .{ .dest = lg.dest, .source = lg.source },
+                        });
+                    } else if (shouldMoveIntoOwnedConsume(self.function, self.use_summary, lg.dest, lg.source)) {
+                        // Phase 4 (dense Map): dest's only use feeds an
+                        // owned-mutating call site (call_named/call_direct
+                        // with `.owned`-promoted convention via
+                        // `arc_param_convention.inferConventions`, OR
+                        // call_builtin matching `ownedMutatingBuiltinSlot`).
+                        // The downstream rewrite passes
+                        // (`rewriteOwnedConsumeSites` /
+                        // `rewriteOwnedConsumeBuiltinSites`) turn the
+                        // share_value into a `move_value` and drop the
+                        // post-call release. Lowering the local_get as
+                        // `.move_value` here means the source's `+1`
+                        // flows through unchanged: source -> dest ->
+                        // (rewritten move into call arg) -> callee
+                        // consumes. Without this rule we emit
+                        // `.copy_value` (retain) and the runtime sees
+                        // refcount >= 2 at the call, missing the rc-1
+                        // fast path.
                         try new_instrs.append(self.allocator, .{
                             .move_value = .{ .dest = lg.dest, .source = lg.source },
                         });
@@ -1534,6 +1666,471 @@ fn callArgs(instr: ir.Instruction) ?[]const ir.LocalId {
         else => null,
     };
 }
+
+// ============================================================
+// Phase 4 (dense Map) — owned-mutating call_builtin consume rewrite
+// ============================================================
+//
+// `rewriteOwnedConsumeBuiltinSites` walks every instruction stream in
+// `function` and, for each `call_builtin` whose name is an owned-
+// mutating intrinsic (`Map.put` / `.delete` / `.merge` and their
+// post-monomorph encoded variants — see
+// `arc_liveness.ownedMutatingBuiltinSlot`), rewrites the receiver
+// arg's preparation pair from `share_value` / post-call `release`
+// into `move_value` / (no post-call release) when the source local
+// of the share is at last-use at the share site.
+//
+// This is the codegen counterpart to the dense Map's rc-1 fast path
+// (`runtime.zig::Map(K,V).putInner` / `deleteInner`). Without this
+// rewrite, every `:zig.Map.put` enters the runtime with refcount >= 2
+// (caller's `share_value` retains), the rc-1 check fails, and the
+// runtime always clones — turning every put into a full buffer copy
+// with a deep-retain of every existing K/V.
+//
+// Why this is a per-call-site rewrite (Option A) rather than a callee-
+// convention promotion (Option B): the receiver of a `call_builtin`
+// is a runtime function written in Zig, not a Zap `pub fn`, so there
+// is no `Function.param_conventions` slice to promote. The rewriter
+// therefore reads the per-instruction last-use signal directly from
+// `arc_liveness.ArcOwnership.last_use_map`. The matching consume
+// effect in the analyzer's dataflow lives in
+// `arc_liveness.applyOwnsEffect`'s `.call_builtin` branch.
+//
+// Soundness: the rewrite fires only when `last_use_map[source] ==
+// share_value_id`, i.e. the source local has no further reads after
+// the share. Substituting `share_value` (assign + retain) with
+// `move_value` (assign only, transfer ownership) is therefore
+// equivalent to the original share/release pair: the original
+// retained then released the cell; the rewrite skips both ops. The
+// runtime's owned-mutating function consumes the +1 the producer
+// originally emitted, which is the same +1 the share would have
+// retained-then-released.
+//
+// Companion to `rewriteOwnedConsumeSites` (Option B for `call_named`/
+// `call_direct` targets with `.owned` param conventions). Both passes
+// exist because user code goes through two layers when calling
+// `Map.put`:
+//   1. user code → `Map.put` (Zap fn) — handled by Option B (param
+//      convention promoted by `arc_param_convention.inferConventions`,
+//      then call site rewritten by `rewriteOwnedConsumeSites`).
+//   2. `Map.put` body → `:zig.Map.put` (call_builtin to runtime) —
+//      handled by THIS pass (Option A; per-call-site last-use gate).
+
+/// Rewrite consume sites for owned-mutating `call_builtin` invocations.
+/// Reads `last_use_map` from `fn_ownership` to gate each rewrite —
+/// only fires when the receiver's source local is at its last use at
+/// the matching `share_value` site. The pass mutates `function.body`
+/// in place via `@constCast` at the seam (the slice header is `const`
+/// to the rest of the IR but writeable here by design, mirroring
+/// `rewriteOwnedConsumeSites`).
+///
+/// The pass MUST run before `arc_ownership.classifyAndNormalize`
+/// rewrites `local_get` instructions, because that pass also strips
+/// the immediately-following `retain` instruction it emitted, which
+/// changes the instruction count and therefore the InstructionId
+/// assignment. By running before classify, the IR shape matches the
+/// shape the analyzer saw when populating `last_use_map`, so the
+/// share's instruction id can be reproduced by walking the IR in the
+/// same depth-first order the analyzer used.
+pub fn rewriteOwnedConsumeBuiltinSites(
+    allocator: std.mem.Allocator,
+    function: *ir.Function,
+    fn_ownership: *const arc_liveness.ArcOwnership,
+) !void {
+    var rewriter = BuiltinConsumeSiteRewriter{
+        .allocator = allocator,
+        .ownership = fn_ownership,
+    };
+
+    for (function.body, 0..) |_, block_index| {
+        const block_ptr: *ir.Block = @constCast(&function.body[block_index]);
+        const original = block_ptr.instructions;
+        rewriter.next_id = computeStreamStartIdForBlock(function, block_index);
+        const rebuilt = try rewriter.rewriteStream(original);
+        if (rebuilt) |new_slice| {
+            block_ptr.instructions = new_slice;
+        }
+    }
+}
+
+/// Compute the InstructionId that arc_liveness.assignInstructionIds
+/// (via `flattenStream`) would have assigned to the first instruction
+/// of `function.body[block_index]`. We reproduce that traversal here
+/// so the rewriter's last-use queries hit the same ids the analyzer
+/// recorded when populating `last_use_map`.
+fn computeStreamStartIdForBlock(
+    function: *const ir.Function,
+    block_index: usize,
+) arc_liveness.InstructionId {
+    var id: arc_liveness.InstructionId = 0;
+    var i: usize = 0;
+    while (i < block_index) : (i += 1) {
+        id = countStreamInstructionIds(function.body[i].instructions, id);
+    }
+    return id;
+}
+
+fn countStreamInstructionIds(
+    stream: []const ir.Instruction,
+    start_id: arc_liveness.InstructionId,
+) arc_liveness.InstructionId {
+    var id = start_id;
+    for (stream) |*instr| {
+        id += 1;
+        id = countNestedStreamInstructionIds(instr, id);
+    }
+    return id;
+}
+
+fn countNestedStreamInstructionIds(
+    instr: *const ir.Instruction,
+    start_id: arc_liveness.InstructionId,
+) arc_liveness.InstructionId {
+    var id = start_id;
+    switch (instr.*) {
+        .if_expr => |ie| {
+            id = countStreamInstructionIds(ie.then_instrs, id);
+            id = countStreamInstructionIds(ie.else_instrs, id);
+        },
+        .case_block => |cb| {
+            id = countStreamInstructionIds(cb.pre_instrs, id);
+            for (cb.arms) |arm| {
+                id = countStreamInstructionIds(arm.cond_instrs, id);
+                id = countStreamInstructionIds(arm.body_instrs, id);
+            }
+            id = countStreamInstructionIds(cb.default_instrs, id);
+        },
+        .switch_literal => |sl| {
+            for (sl.cases) |c| id = countStreamInstructionIds(c.body_instrs, id);
+            id = countStreamInstructionIds(sl.default_instrs, id);
+        },
+        .switch_return => |sr| {
+            for (sr.cases) |c| id = countStreamInstructionIds(c.body_instrs, id);
+            id = countStreamInstructionIds(sr.default_instrs, id);
+        },
+        .union_switch => |us| {
+            for (us.cases) |c| id = countStreamInstructionIds(c.body_instrs, id);
+        },
+        .union_switch_return => |usr| {
+            for (usr.cases) |c| id = countStreamInstructionIds(c.body_instrs, id);
+        },
+        .try_call_named => |tcn| {
+            id = countStreamInstructionIds(tcn.handler_instrs, id);
+            id = countStreamInstructionIds(tcn.success_instrs, id);
+        },
+        .guard_block => |gb| {
+            id = countStreamInstructionIds(gb.body, id);
+        },
+        .optional_dispatch => |od| {
+            id = countStreamInstructionIds(od.nil_instrs, id);
+            id = countStreamInstructionIds(od.struct_instrs, id);
+        },
+        else => {},
+    }
+    return id;
+}
+
+const BuiltinConsumeSiteRewriter = struct {
+    allocator: std.mem.Allocator,
+    ownership: *const arc_liveness.ArcOwnership,
+    /// Running InstructionId mirrored from arc_liveness's traversal.
+    next_id: arc_liveness.InstructionId = 0,
+
+    fn rewriteStream(
+        self: *BuiltinConsumeSiteRewriter,
+        stream: []const ir.Instruction,
+    ) error{OutOfMemory}!?[]const ir.Instruction {
+        // First pass: assign InstructionIds to each top-level entry,
+        // recurse into nested streams, and collect any rebuilt
+        // children. The recursion must walk in the same depth-first
+        // order as arc_liveness.flattenStream so the ids we record
+        // line up with last_use_map entries.
+        var rebuilt_children: std.ArrayListUnmanaged(?ir.Instruction) = .empty;
+        defer rebuilt_children.deinit(self.allocator);
+        try rebuilt_children.ensureTotalCapacity(self.allocator, stream.len);
+
+        var top_level_ids: std.ArrayListUnmanaged(arc_liveness.InstructionId) = .empty;
+        defer top_level_ids.deinit(self.allocator);
+        try top_level_ids.ensureTotalCapacity(self.allocator, stream.len);
+
+        var any_change = false;
+        for (stream) |*instr| {
+            const id = self.next_id;
+            self.next_id += 1;
+            try top_level_ids.append(self.allocator, id);
+            const child = try self.rewriteChildren(instr);
+            if (child) |_| any_change = true;
+            try rebuilt_children.append(self.allocator, child);
+        }
+
+        // Second pass: scan for owned-mutating call_builtin sites,
+        // pair each with the most recent share_value targeting its
+        // receiver, gate on last-use, and queue rewrites.
+        var rewrite_share_to_move: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        defer rewrite_share_to_move.deinit(self.allocator);
+        var drop_release: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        defer drop_release.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < stream.len) : (i += 1) {
+            const original = stream[i];
+            const effective = rebuilt_children.items[i] orelse original;
+            const cb = switch (effective) {
+                .call_builtin => |x| x,
+                else => continue,
+            };
+            const slot = arc_liveness.ownedMutatingBuiltinSlot(cb.name) orelse continue;
+            if (slot >= cb.args.len) continue;
+            const arg_local = cb.args[slot];
+
+            // Walk backward in the same stream for the most recent
+            // `share_value{dest=arg_local}`. Track its index AND its
+            // assigned InstructionId so we can query last_use_map.
+            var found_share_index: ?usize = null;
+            var found_share_id: arc_liveness.InstructionId = 0;
+            var j: usize = i;
+            while (j > 0) {
+                j -= 1;
+                const prev = rebuilt_children.items[j] orelse stream[j];
+                if (prev == .share_value and prev.share_value.dest == arg_local) {
+                    found_share_index = j;
+                    found_share_id = top_level_ids.items[j];
+                    break;
+                }
+            }
+            const share_index = found_share_index orelse continue;
+            const share = (rebuilt_children.items[share_index] orelse stream[share_index]).share_value;
+
+            // Last-use gate: only rewrite when the source local is
+            // dead immediately after the share. The analyzer records
+            // the share_value's instruction id as the source's last
+            // use exactly in that case.
+            const last_use = self.ownership.last_use_map.get(share.source) orelse continue;
+            if (last_use != found_share_id) continue;
+
+            try rewrite_share_to_move.put(self.allocator, share_index, {});
+            any_change = true;
+
+            // Walk forward from i+1 looking for the matching
+            // `release{value=arg_local}`. The IR builder packs all
+            // post-call releases together immediately after the call,
+            // so any non-release instruction terminates the search.
+            var k: usize = i + 1;
+            while (k < stream.len) : (k += 1) {
+                const peek = rebuilt_children.items[k] orelse stream[k];
+                switch (peek) {
+                    .release => |rel| {
+                        if (rel.value == arg_local) {
+                            try drop_release.put(self.allocator, k, {});
+                            any_change = true;
+                            break;
+                        }
+                        // Keep scanning past releases of OTHER locals
+                        // — they will get their own release-drop entry
+                        // when the outer iteration reaches them.
+                    },
+                    else => break,
+                }
+            }
+        }
+
+        if (!any_change) return null;
+
+        var new_instrs: std.ArrayListUnmanaged(ir.Instruction) = .empty;
+        errdefer new_instrs.deinit(self.allocator);
+        try new_instrs.ensureTotalCapacity(self.allocator, stream.len);
+
+        for (stream, 0..) |_, idx| {
+            if (drop_release.contains(idx)) continue;
+            const effective = rebuilt_children.items[idx] orelse stream[idx];
+            if (rewrite_share_to_move.contains(idx)) {
+                std.debug.assert(effective == .share_value);
+                const sv = effective.share_value;
+                try new_instrs.append(self.allocator, .{
+                    .move_value = .{ .dest = sv.dest, .source = sv.source },
+                });
+            } else {
+                try new_instrs.append(self.allocator, effective);
+            }
+        }
+        return try new_instrs.toOwnedSlice(self.allocator);
+    }
+
+    fn rewriteChildren(
+        self: *BuiltinConsumeSiteRewriter,
+        instr: *const ir.Instruction,
+    ) error{OutOfMemory}!?ir.Instruction {
+        switch (instr.*) {
+            .if_expr => |ie| {
+                const new_then = try self.rewriteStream(ie.then_instrs);
+                const new_else = try self.rewriteStream(ie.else_instrs);
+                if (new_then == null and new_else == null) return null;
+                var copy = ie;
+                if (new_then) |s| copy.then_instrs = s;
+                if (new_else) |s| copy.else_instrs = s;
+                return ir.Instruction{ .if_expr = copy };
+            },
+            .case_block => |cb| {
+                var any_change = false;
+                const new_pre = try self.rewriteStream(cb.pre_instrs);
+                if (new_pre != null) any_change = true;
+                const new_default = try self.rewriteStream(cb.default_instrs);
+                if (new_default != null) any_change = true;
+                var new_arms = try self.allocator.alloc(ir.IrCaseArm, cb.arms.len);
+                var arms_changed = false;
+                for (cb.arms, 0..) |arm, idx| {
+                    var arm_copy = arm;
+                    const new_cond = try self.rewriteStream(arm.cond_instrs);
+                    const new_body = try self.rewriteStream(arm.body_instrs);
+                    if (new_cond) |s| {
+                        arm_copy.cond_instrs = s;
+                        arms_changed = true;
+                    }
+                    if (new_body) |s| {
+                        arm_copy.body_instrs = s;
+                        arms_changed = true;
+                    }
+                    new_arms[idx] = arm_copy;
+                }
+                if (!any_change and !arms_changed) {
+                    self.allocator.free(new_arms);
+                    return null;
+                }
+                var copy = cb;
+                if (new_pre) |s| copy.pre_instrs = s;
+                if (new_default) |s| copy.default_instrs = s;
+                if (arms_changed) {
+                    copy.arms = new_arms;
+                } else {
+                    self.allocator.free(new_arms);
+                }
+                return ir.Instruction{ .case_block = copy };
+            },
+            .switch_literal => |sl| {
+                var any_change = false;
+                const new_default = try self.rewriteStream(sl.default_instrs);
+                if (new_default != null) any_change = true;
+                var new_cases = try self.allocator.alloc(ir.LitCase, sl.cases.len);
+                var cases_changed = false;
+                for (sl.cases, 0..) |c, idx| {
+                    var c_copy = c;
+                    const new_body = try self.rewriteStream(c.body_instrs);
+                    if (new_body) |s| {
+                        c_copy.body_instrs = s;
+                        cases_changed = true;
+                    }
+                    new_cases[idx] = c_copy;
+                }
+                if (!any_change and !cases_changed) {
+                    self.allocator.free(new_cases);
+                    return null;
+                }
+                var copy = sl;
+                if (new_default) |s| copy.default_instrs = s;
+                if (cases_changed) {
+                    copy.cases = new_cases;
+                } else {
+                    self.allocator.free(new_cases);
+                }
+                return ir.Instruction{ .switch_literal = copy };
+            },
+            .switch_return => |sr| {
+                var any_change = false;
+                const new_default = try self.rewriteStream(sr.default_instrs);
+                if (new_default != null) any_change = true;
+                var new_cases = try self.allocator.alloc(ir.ReturnCase, sr.cases.len);
+                var cases_changed = false;
+                for (sr.cases, 0..) |c, idx| {
+                    var c_copy = c;
+                    const new_body = try self.rewriteStream(c.body_instrs);
+                    if (new_body) |s| {
+                        c_copy.body_instrs = s;
+                        cases_changed = true;
+                    }
+                    new_cases[idx] = c_copy;
+                }
+                if (!any_change and !cases_changed) {
+                    self.allocator.free(new_cases);
+                    return null;
+                }
+                var copy = sr;
+                if (new_default) |s| copy.default_instrs = s;
+                if (cases_changed) {
+                    copy.cases = new_cases;
+                } else {
+                    self.allocator.free(new_cases);
+                }
+                return ir.Instruction{ .switch_return = copy };
+            },
+            .union_switch => |us| {
+                var new_cases = try self.allocator.alloc(ir.UnionCase, us.cases.len);
+                var cases_changed = false;
+                for (us.cases, 0..) |c, idx| {
+                    var c_copy = c;
+                    const new_body = try self.rewriteStream(c.body_instrs);
+                    if (new_body) |s| {
+                        c_copy.body_instrs = s;
+                        cases_changed = true;
+                    }
+                    new_cases[idx] = c_copy;
+                }
+                if (!cases_changed) {
+                    self.allocator.free(new_cases);
+                    return null;
+                }
+                var copy = us;
+                copy.cases = new_cases;
+                return ir.Instruction{ .union_switch = copy };
+            },
+            .union_switch_return => |usr| {
+                var new_cases = try self.allocator.alloc(ir.UnionCase, usr.cases.len);
+                var cases_changed = false;
+                for (usr.cases, 0..) |c, idx| {
+                    var c_copy = c;
+                    const new_body = try self.rewriteStream(c.body_instrs);
+                    if (new_body) |s| {
+                        c_copy.body_instrs = s;
+                        cases_changed = true;
+                    }
+                    new_cases[idx] = c_copy;
+                }
+                if (!cases_changed) {
+                    self.allocator.free(new_cases);
+                    return null;
+                }
+                var copy = usr;
+                copy.cases = new_cases;
+                return ir.Instruction{ .union_switch_return = copy };
+            },
+            .try_call_named => |tcn| {
+                const new_handler = try self.rewriteStream(tcn.handler_instrs);
+                const new_success = try self.rewriteStream(tcn.success_instrs);
+                if (new_handler == null and new_success == null) return null;
+                var copy = tcn;
+                if (new_handler) |s| copy.handler_instrs = s;
+                if (new_success) |s| copy.success_instrs = s;
+                return ir.Instruction{ .try_call_named = copy };
+            },
+            .guard_block => |gb| {
+                const new_body = try self.rewriteStream(gb.body);
+                if (new_body == null) return null;
+                var copy = gb;
+                copy.body = new_body.?;
+                return ir.Instruction{ .guard_block = copy };
+            },
+            .optional_dispatch => |od| {
+                const new_nil = try self.rewriteStream(od.nil_instrs);
+                const new_struct = try self.rewriteStream(od.struct_instrs);
+                if (new_nil == null and new_struct == null) return null;
+                var copy = od;
+                if (new_nil) |s| copy.nil_instrs = s;
+                if (new_struct) |s| copy.struct_instrs = s;
+                return ir.Instruction{ .optional_dispatch = copy };
+            },
+            else => return null,
+        }
+    }
+};
 
 test "arc_ownership: stub function signature compiles" {
     // Phase A's stub must not error and must not require any
@@ -2572,4 +3169,322 @@ test "arc_ownership: still emits copy_value when source has additional uses outs
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     try std.testing.expectEqual(@as(usize, 0), totals.move_count);
     try std.testing.expectEqual(@as(usize, 1), totals.copy_count);
+}
+
+// ============================================================
+// Phase 4 (dense Map) tests — rewriteOwnedConsumeBuiltinSites
+// ============================================================
+//
+// These tests verify the call_builtin consume-rewrite pass for
+// owned-mutating runtime intrinsics (`Map.put`, `.delete`, `.merge`).
+// Each test hand-rolls a tiny IR shape that mirrors what the IR
+// builder emits for `:zig.Map.put(map, k, v)` inside `Map.put`'s body
+// in `lib/map.zap`, plus a synthetic `ArcOwnership.last_use_map` that
+// records when the receiver source is at last use at the share site.
+//
+// The positive cases assert the share→move conversion fires AND the
+// post-call release is dropped. The negative cases assert the rewrite
+// is a no-op when:
+//   * the source has additional uses after the share (not at last use)
+//   * the call_builtin is a non-mutating helper (e.g. `Map.get`)
+
+test "arc_ownership: rewriteOwnedConsumeBuiltinSites converts share to move + drops release for Map.put at last-use" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Stream:
+    //   [0] const_int %0
+    //   [1] share_value %1 <- %0
+    //   [2] call_builtin "Map.put" args=[%1, %2_arg, %3_arg] dest=%4
+    //   [3] release %1
+    //   [4] ret
+    //
+    // Local %0's last use is at the share_value (id 1). After the
+    // rewrite the share becomes move_value and the release of %1 is
+    // dropped.
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 1;
+    args[1] = 5;
+    args[2] = 6;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .share;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .ret = .{ .value = null } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .trivial, .trivial, .owned, .trivial, .trivial,
+    });
+    var function = ir.Function{
+        .id = 200,
+        .name = "Mod__caller__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 7,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    // Synthetic last_use_map: %0's last use is the share_value at id 1.
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(arena);
+    try ownership.last_use_map.put(arena, 0, 1);
+
+    try rewriteOwnedConsumeBuiltinSites(arena, &function, &ownership);
+
+    const rewritten = function.body[0].instructions;
+    var saw_share = false;
+    var saw_release_of_1 = false;
+    var saw_move_dest_1 = false;
+    for (rewritten) |instr| {
+        switch (instr) {
+            .share_value => saw_share = true,
+            .release => |r| if (r.value == 1) {
+                saw_release_of_1 = true;
+            },
+            .move_value => |mv| if (mv.dest == 1 and mv.source == 0) {
+                saw_move_dest_1 = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(!saw_share);
+    try std.testing.expect(!saw_release_of_1);
+    try std.testing.expect(saw_move_dest_1);
+}
+
+test "arc_ownership: rewriteOwnedConsumeBuiltinSites is a no-op when source has additional uses (not last use)" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Same shape as the positive test, but the source local %0 has
+    // a use AFTER the share — `last_use_map[%0]` points at the
+    // trailing local_get (id 4). The rewrite must leave the share /
+    // release pair untouched.
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 1;
+    args[1] = 5;
+    args[2] = 6;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .share;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .local_get = .{ .dest = 7, .source = 0 } },
+        .{ .ret = .{ .value = null } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .trivial, .trivial, .owned, .trivial, .trivial, .owned,
+    });
+    var function = ir.Function{
+        .id = 201,
+        .name = "Mod__caller__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 8,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(arena);
+    // %0's last use is at id 4 (the local_get), NOT the share at id 1.
+    try ownership.last_use_map.put(arena, 0, 4);
+
+    try rewriteOwnedConsumeBuiltinSites(arena, &function, &ownership);
+
+    const rewritten = function.body[0].instructions;
+    var saw_share = false;
+    var saw_release_of_1 = false;
+    var saw_move_dest_1 = false;
+    for (rewritten) |instr| {
+        switch (instr) {
+            .share_value => saw_share = true,
+            .release => |r| if (r.value == 1) {
+                saw_release_of_1 = true;
+            },
+            .move_value => |mv| if (mv.dest == 1 and mv.source == 0) {
+                saw_move_dest_1 = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_share);
+    try std.testing.expect(saw_release_of_1);
+    try std.testing.expect(!saw_move_dest_1);
+}
+
+test "arc_ownership: rewriteOwnedConsumeBuiltinSites is a no-op for non-mutating Map builtins (Map.get)" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 1;
+    args[1] = 5;
+    args[2] = 6;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .share;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.get",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .ret = .{ .value = null } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .trivial, .trivial, .owned, .trivial, .trivial,
+    });
+    var function = ir.Function{
+        .id = 202,
+        .name = "Mod__caller__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 7,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(arena);
+    try ownership.last_use_map.put(arena, 0, 1);
+
+    try rewriteOwnedConsumeBuiltinSites(arena, &function, &ownership);
+
+    const rewritten = function.body[0].instructions;
+    var saw_share = false;
+    var saw_release_of_1 = false;
+    var saw_move_dest_1 = false;
+    for (rewritten) |instr| {
+        switch (instr) {
+            .share_value => saw_share = true,
+            .release => |r| if (r.value == 1) {
+                saw_release_of_1 = true;
+            },
+            .move_value => |mv| if (mv.dest == 1 and mv.source == 0) {
+                saw_move_dest_1 = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_share);
+    try std.testing.expect(saw_release_of_1);
+    try std.testing.expect(!saw_move_dest_1);
+}
+
+test "arc_ownership: rewriteOwnedConsumeBuiltinSites recognizes monomorphized Map:K:V.put name" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 1;
+    args[1] = 5;
+    args[2] = 6;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .share;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map:u32:i64.put",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .ret = .{ .value = null } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .trivial, .trivial, .owned, .trivial, .trivial,
+    });
+    var function = ir.Function{
+        .id = 203,
+        .name = "Mod__caller__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 7,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(arena);
+    try ownership.last_use_map.put(arena, 0, 1);
+
+    try rewriteOwnedConsumeBuiltinSites(arena, &function, &ownership);
+
+    const rewritten = function.body[0].instructions;
+    var saw_move_dest_1 = false;
+    for (rewritten) |instr| {
+        switch (instr) {
+            .move_value => |mv| {
+                if (mv.dest == 1 and mv.source == 0) saw_move_dest_1 = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_move_dest_1);
 }
