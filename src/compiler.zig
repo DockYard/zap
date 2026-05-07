@@ -2665,9 +2665,52 @@ pub fn validateOneStructPerFile(
     return null;
 }
 
-/// Get the embedded runtime source.
+/// Get the embedded runtime source, with the Phase A Map workload
+/// instrumentation flag flipped on when the host compiler was built
+/// with `-Dinstrument-map=true`. The runtime source contains a single
+/// `INSTRUMENT_MAP_DEFAULT` constant that drives the comptime
+/// `instrument_map` flag — when this compiler was built with
+/// instrumentation enabled, every Zap user binary it produces should
+/// inherit the same flag, which we achieve via a one-line textual
+/// rewrite at registration time. The host test suite uses a separate
+/// `build_options` import path inside `runtime.zig` (see the comment
+/// on `instrument_map` there) so this rewrite is unrelated to the
+/// host-side flag plumbing.
+///
+/// The returned slice is either a borrowed view of the embedded source
+/// (when the flag is off) or a freshly-allocated owned buffer (when
+/// the flag is on). Callers that hold onto the slice past the
+/// allocator's lifetime must duplicate.
 pub fn getRuntimeSource() []const u8 {
-    return runtime_source;
+    if (!@import("build_options").instrument_map) {
+        return runtime_source;
+    }
+    return rewriteRuntimeForInstrumentation();
+}
+
+/// Lazily-built rewritten runtime source. Built once per process and
+/// cached so repeated invocations of `getRuntimeSource()` (the builder
+/// and full-build paths each call it) return a stable pointer.
+var rewritten_runtime_source: ?[]const u8 = null;
+
+fn rewriteRuntimeForInstrumentation() []const u8 {
+    if (rewritten_runtime_source) |cached| return cached;
+    const needle = "const INSTRUMENT_MAP_DEFAULT: bool = false;";
+    const replacement = "const INSTRUMENT_MAP_DEFAULT: bool = true;";
+    const idx = std.mem.indexOf(u8, runtime_source, needle) orelse {
+        // Embedded runtime is missing the marker — fail loud rather
+        // than silently shipping an un-instrumented user binary when
+        // the toolchain promised instrumentation.
+        @panic("runtime.zig is missing the INSTRUMENT_MAP_DEFAULT marker; instrumentation rewrite cannot proceed");
+    };
+    const total_len = runtime_source.len - needle.len + replacement.len;
+    var buf = std.heap.page_allocator.alloc(u8, total_len) catch
+        @panic("out of memory rewriting runtime source for instrumentation");
+    @memcpy(buf[0..idx], runtime_source[0..idx]);
+    @memcpy(buf[idx .. idx + replacement.len], replacement);
+    @memcpy(buf[idx + replacement.len ..], runtime_source[idx + needle.len ..]);
+    rewritten_runtime_source = buf;
+    return buf;
 }
 
 // ============================================================

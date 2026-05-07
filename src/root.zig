@@ -1,3 +1,9 @@
+// Build-time configuration. Re-exported under a uniquely-named decl so
+// `runtime.zig` can find it via `@import("root")` without colliding with
+// other roots (the embedded user-binary root has no such decl, so the
+// runtime there falls back to its baked-in default).
+pub const zap_runtime_instrument_map_override: bool = @import("build_options").instrument_map;
+
 pub const Token = @import("token.zig").Token;
 pub const Lexer = @import("lexer.zig").Lexer;
 pub const ast = @import("ast.zig");

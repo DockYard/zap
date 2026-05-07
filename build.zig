@@ -11,11 +11,31 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // -----------------------------------------------------------------------
+    // Map workload instrumentation flag
+    //
+    // When set true, the runtime compiles in HAMT Map(K,V) instrumentation
+    // hooks: per-instance lifetime records, lineage tracking, and a JSON
+    // exit handler that emits aggregate workload statistics. When false
+    // (the default), every hook is comptime-eliminated and the runtime is
+    // bit-identical to the unflagged build. See
+    // `docs/map-workload-instrumentation-plan.md`.
+    // -----------------------------------------------------------------------
+    const instrument_map = b.option(
+        bool,
+        "instrument-map",
+        "Compile in Map(K,V) workload instrumentation (default false)",
+    ) orelse false;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "instrument_map", instrument_map);
+
     // Library import unit — no native deps needed
     const mod = b.addModule("zap", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+    mod.addOptions("build_options", build_options);
 
     // -----------------------------------------------------------------------
     // Setup step: download pre-built deps
@@ -108,16 +128,18 @@ pub fn build(b: *std.Build) void {
     // -----------------------------------------------------------------------
     // Executable
     // -----------------------------------------------------------------------
+    const exe_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zap", .module = mod },
+        },
+    });
+    exe_module.addOptions("build_options", build_options);
     const exe = b.addExecutable(.{
         .name = "zap",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zap", .module = mod },
-            },
-        }),
+        .root_module = exe_module,
     });
 
     exe.root_module.addAnonymousImport("zig_lib_archive", .{

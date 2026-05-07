@@ -208,6 +208,43 @@ pub fn resetAllocator() void {
 // ============================================================
 
 // ============================================================
+// Map workload instrumentation comptime flag
+//
+// `instrument_map` is a comptime-known boolean that gates the entire
+// Map(K, V) instrumentation overlay (see `docs/map-workload-
+// instrumentation-plan.md`). When false, every hook compiles to nothing
+// and the runtime is bit-identical to the un-instrumented build. When
+// true, allocMap/retain/release/put/delete/merge/get hooks emit per-
+// instance and per-lineage records, and an `atexit` handler writes a
+// JSON summary to `$ZAP_INSTRUMENT_OUT` (default
+// `./map-instrumentation.json`).
+//
+// Resolution order:
+//   1. The build-system root (the compiler binary built by `zig build`)
+//      can override the flag by declaring
+//      `pub const zap_runtime_instrument_map_override: bool = ...;`.
+//      `src/root.zig` re-exports the `-Dinstrument-map` build option
+//      under that name, so a `zig build -Dinstrument-map=true` flips
+//      the flag on for the host test suite.
+//   2. The embedded-runtime root (a Zap user binary) does not declare
+//      that override, so the flag falls back to the source-level
+//      `INSTRUMENT_MAP_DEFAULT` constant. `compiler.zig` rewrites that
+//      default at source-registration time when the host compiler was
+//      itself built with `-Dinstrument-map=true`, so user binaries
+//      inherit the flag from the toolchain build.
+// ============================================================
+
+const INSTRUMENT_MAP_DEFAULT: bool = false;
+
+pub const instrument_map: bool = blk: {
+    const root = @import("root");
+    if (@hasDecl(root, "zap_runtime_instrument_map_override")) {
+        break :blk @as(bool, root.zap_runtime_instrument_map_override);
+    }
+    break :blk INSTRUMENT_MAP_DEFAULT;
+};
+
+// ============================================================
 // ARC — Atomic Reference Counting (spec §31.4)
 // ============================================================
 
@@ -420,6 +457,677 @@ fn ensureArcStatsAtexit() void {
     const value = envGetRuntime("ZAP_ARC_STATS") orelse return;
     if (value.len == 0 or value[0] == '0') return;
     _ = atexit(arcStatsAtexit);
+}
+
+// ============================================================
+// Map workload instrumentation runtime state
+//
+// The instrumentation state lives in this module rather than inside
+// `Map(K, V)` so it is shared across every `(K, V)` instantiation. All
+// records are keyed by Map cell pointer (cast to `usize`) and are
+// independent of the key/value type — the analyzer only cares about
+// allocation lifetimes, refcount transitions, and operation counts.
+//
+// The state must NOT use `runtime.zig::Map` itself (that would recurse
+// infinitely through the very hooks we're emitting). It uses
+// `std.AutoHashMap` backed by `std.heap.page_allocator` directly.
+//
+// All public entry points are no-ops at the call site when
+// `instrument_map == false` because the call sites are themselves
+// gated by `comptime if (instrument_map)`. The functions still exist
+// in both build modes so call sites compile, but the bodies short-
+// circuit immediately when the flag is false.
+// ============================================================
+
+/// Per-Map-instance lifetime record. Populated incrementally as the
+/// cell is allocated, retained, mutated, queried, and finally released.
+/// At release time the record is finalised, classified into S/W/V, and
+/// either appended to the in-memory finalised list or streamed to the
+/// optional JSONL detail file.
+pub const MapInstanceRecord = struct {
+    instance_id: u64,
+    lineage_id: u64,
+    parent_instance_id: u64,
+    alloc_size: u32,
+    creation_callsite: u64,
+    puts: u32,
+    deletes: u32,
+    merges: u32,
+    gets: u32,
+    peak_strong_count: u32,
+    had_share_event: bool,
+    had_post_share_mutation: bool,
+    alloc_time_ns: u64,
+    release_time_ns: u64,
+    size_at_release: u32,
+    /// Class assigned at release time. 'S' (single — never shared),
+    /// 'W' (working-dict — shared at some point but never mutated
+    /// post-share), or 'V' (versioned — shared and post-share-mutated).
+    class: u8,
+};
+
+/// Per-lineage running aggregate. A lineage groups every Map instance
+/// that derived from one another via `put`/`delete`/`merge`. The
+/// `live_count` rises on alloc within the lineage and falls on
+/// release; `peak_concurrent_versions` records the historical maximum
+/// of `live_count`.
+pub const MapLineageState = struct {
+    lineage_id: u64,
+    live_count: u32,
+    peak_concurrent_versions: u32,
+    instance_count: u32,
+    total_node_clones: u64,
+};
+
+const InstrumentationState = struct {
+    initialised: bool = false,
+    program_start_ns: u64 = 0,
+    next_instance_id: u64 = 1,
+    next_lineage_id: u64 = 1,
+    /// Active per-instance records — one entry while the cell is alive,
+    /// removed at release-zero.
+    active: std.AutoHashMap(usize, MapInstanceRecord) = undefined,
+    /// Finalised per-instance records (released cells). The summary
+    /// emitter walks this list at exit; the optional detail-file
+    /// emitter streams each record as it is added.
+    finalised: std.ArrayListUnmanaged(MapInstanceRecord) = .empty,
+    /// Per-lineage state. Lineages persist for the lifetime of the
+    /// process so the lineage_id assigned in `allocMap` remains valid
+    /// for every derived instance.
+    lineages: std.AutoHashMap(u64, MapLineageState) = undefined,
+    /// Thread-local "current parent" used to plumb lineage and parent
+    /// instance ids from a mutation entry point (`put`/`delete`/
+    /// `merge`) down to the fresh `allocMap` call without threading a
+    /// new parameter through every internal helper. The mutation entry
+    /// stashes the input map's id pair before invoking allocMap-bound
+    /// code paths and clears it on return. Single-threaded today; if
+    /// Zap goes multi-threaded the field becomes per-thread.
+    parent_lineage_id: u64 = 0,
+    parent_instance_id: u64 = 0,
+    parent_active: bool = false,
+    /// Counts release records where the input had `had_share_event`
+    /// AND a post-share mutation was observed. Sum of per-instance
+    /// `had_post_share_mutation` flags, materialised eagerly so the
+    /// summary emitter does not re-walk every record.
+    post_share_mutation_count: u64 = 0,
+    /// Aggregate node-clone count across every lineage; mirrors the
+    /// per-lineage `total_node_clones` so the summary can report a
+    /// single workload-level number.
+    total_node_clones: u64 = 0,
+    /// Top-N callsite tally. Allocated lazily during the first record
+    /// finalisation; key is the return-address fingerprint captured at
+    /// `allocMap`, value is the total count of instances created at
+    /// that site.
+    callsite_counts: std.AutoHashMap(u64, u64) = undefined,
+    atexit_registered: bool = false,
+    detail_file: ?std.fs.File = null,
+    detail_attempted: bool = false,
+};
+
+var instrumentation_state: InstrumentationState = .{};
+
+fn instrumentationAllocator() std.mem.Allocator {
+    // Page allocator avoids any chance of recursive instrumentation if
+    // a future allocator integration goes through Map(K, V). Maps used
+    // here are small (one entry per live cell), so the per-allocation
+    // overhead is acceptable for measurement infrastructure.
+    return std.heap.page_allocator;
+}
+
+fn instrumentationNowNs() u64 {
+    var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const total: i128 = @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
+    if (total < 0) return 0;
+    return @intCast(total);
+}
+
+fn ensureInstrumentationInit() void {
+    if (!instrument_map) return;
+    if (instrumentation_state.initialised) return;
+    const alloc = instrumentationAllocator();
+    instrumentation_state.active = std.AutoHashMap(usize, MapInstanceRecord).init(alloc);
+    instrumentation_state.lineages = std.AutoHashMap(u64, MapLineageState).init(alloc);
+    instrumentation_state.callsite_counts = std.AutoHashMap(u64, u64).init(alloc);
+    instrumentation_state.program_start_ns = instrumentationNowNs();
+    instrumentation_state.initialised = true;
+    if (!instrumentation_state.atexit_registered) {
+        instrumentation_state.atexit_registered = true;
+        _ = atexit(mapInstrumentationAtexit);
+    }
+    if (!instrumentation_state.detail_attempted) {
+        instrumentation_state.detail_attempted = true;
+        const detail_var = envGetRuntime("ZAP_INSTRUMENT_DETAIL");
+        if (detail_var) |v| {
+            if (v.len != 0 and v[0] != '0') {
+                if (std.fs.cwd().createFile("map-instrumentation.jsonl", .{ .truncate = true })) |file| {
+                    instrumentation_state.detail_file = file;
+                } else |_| {}
+            }
+        }
+    }
+}
+
+fn mapInstrumentationStartLineage() u64 {
+    const id = instrumentation_state.next_lineage_id;
+    instrumentation_state.next_lineage_id += 1;
+    const entry = instrumentation_state.lineages.getOrPut(id) catch return id;
+    if (!entry.found_existing) {
+        entry.value_ptr.* = .{
+            .lineage_id = id,
+            .live_count = 0,
+            .peak_concurrent_versions = 0,
+            .instance_count = 0,
+            .total_node_clones = 0,
+        };
+    }
+    return id;
+}
+
+fn mapInstrumentationLineageBumpLive(lineage_id: u64) void {
+    const entry = instrumentation_state.lineages.getOrPut(lineage_id) catch return;
+    if (!entry.found_existing) {
+        entry.value_ptr.* = .{
+            .lineage_id = lineage_id,
+            .live_count = 0,
+            .peak_concurrent_versions = 0,
+            .instance_count = 0,
+            .total_node_clones = 0,
+        };
+    }
+    entry.value_ptr.live_count += 1;
+    entry.value_ptr.instance_count += 1;
+    if (entry.value_ptr.live_count > entry.value_ptr.peak_concurrent_versions) {
+        entry.value_ptr.peak_concurrent_versions = entry.value_ptr.live_count;
+    }
+}
+
+fn mapInstrumentationLineageDropLive(lineage_id: u64) void {
+    if (instrumentation_state.lineages.getPtr(lineage_id)) |state| {
+        if (state.live_count > 0) state.live_count -= 1;
+    }
+}
+
+fn mapInstrumentationLineageBumpClones(lineage_id: u64, n: u64) void {
+    if (instrumentation_state.lineages.getPtr(lineage_id)) |state| {
+        state.total_node_clones += n;
+    }
+    instrumentation_state.total_node_clones += n;
+}
+
+/// Record a fresh Map cell allocation. Returns the new instance_id so
+/// the caller (the per-(K,V) `allocMap` wrapper) can stamp it on the
+/// cell record, but the record itself is keyed by cell pointer.
+pub fn mapInstrumentationOnAlloc(
+    cell_ptr: usize,
+    alloc_size: u32,
+    creation_callsite: u64,
+) void {
+    if (!instrument_map) return;
+    ensureInstrumentationInit();
+    const instance_id = instrumentation_state.next_instance_id;
+    instrumentation_state.next_instance_id += 1;
+
+    const lineage_id = if (instrumentation_state.parent_active)
+        instrumentation_state.parent_lineage_id
+    else
+        mapInstrumentationStartLineage();
+    const parent_instance_id = if (instrumentation_state.parent_active)
+        instrumentation_state.parent_instance_id
+    else
+        0;
+
+    mapInstrumentationLineageBumpLive(lineage_id);
+
+    const record: MapInstanceRecord = .{
+        .instance_id = instance_id,
+        .lineage_id = lineage_id,
+        .parent_instance_id = parent_instance_id,
+        .alloc_size = alloc_size,
+        .creation_callsite = creation_callsite,
+        .puts = 0,
+        .deletes = 0,
+        .merges = 0,
+        .gets = 0,
+        .peak_strong_count = 1,
+        .had_share_event = false,
+        .had_post_share_mutation = false,
+        .alloc_time_ns = instrumentationNowNs(),
+        .release_time_ns = 0,
+        .size_at_release = 0,
+        .class = 'S',
+    };
+    instrumentation_state.active.put(cell_ptr, record) catch {};
+}
+
+/// Hook invoked from `Map(K, V).retain` after the refcount bump. The
+/// caller passes the post-bump strong count so the hook does not have
+/// to re-read the atomic.
+pub fn mapInstrumentationOnRetain(cell_ptr: usize, new_strong_count: u32) void {
+    if (!instrument_map) return;
+    if (!instrumentation_state.initialised) return;
+    if (instrumentation_state.active.getPtr(cell_ptr)) |record| {
+        if (new_strong_count > record.peak_strong_count) {
+            record.peak_strong_count = new_strong_count;
+        }
+        if (new_strong_count >= 2 and !record.had_share_event) {
+            record.had_share_event = true;
+        }
+    }
+}
+
+/// Hook invoked from `Map(K, V).release` immediately before the cell
+/// is destroyed (after the zero-transition has been confirmed). The
+/// caller passes the final size so the hook does not re-walk the
+/// trie. Classifies the record into S/W/V and moves it to the
+/// finalised list (and the optional detail file).
+pub fn mapInstrumentationOnRelease(cell_ptr: usize, size_at_release: u32) void {
+    if (!instrument_map) return;
+    if (!instrumentation_state.initialised) return;
+    const removed = instrumentation_state.active.fetchRemove(cell_ptr) orelse return;
+    var record = removed.value;
+    record.size_at_release = size_at_release;
+    record.release_time_ns = instrumentationNowNs();
+    record.class = if (!record.had_share_event)
+        @as(u8, 'S')
+    else if (record.had_post_share_mutation)
+        @as(u8, 'V')
+    else
+        @as(u8, 'W');
+    if (record.had_post_share_mutation) {
+        instrumentation_state.post_share_mutation_count += 1;
+    }
+    mapInstrumentationLineageDropLive(record.lineage_id);
+
+    // Tally callsite count.
+    const callsite_entry = instrumentation_state.callsite_counts.getOrPut(record.creation_callsite) catch null;
+    if (callsite_entry) |entry| {
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* += 1;
+    }
+
+    instrumentation_state.finalised.append(instrumentationAllocator(), record) catch {};
+    if (instrumentation_state.detail_file) |file| {
+        writeRecordJsonLine(file, record) catch {};
+    }
+}
+
+/// Hook invoked from `put`/`delete`/`merge`. Bumps the appropriate
+/// per-instance counter on the *input* map. Returns the input
+/// instance_id so the caller can plumb it as `parent_instance_id`
+/// into the impending allocMap call via the thread-local context.
+pub fn mapInstrumentationBumpMutation(
+    cell_ptr: usize,
+    op: enum { put, delete, merge },
+) struct { instance_id: u64, lineage_id: u64, had_share_event: bool } {
+    if (!instrument_map) return .{ .instance_id = 0, .lineage_id = 0, .had_share_event = false };
+    if (!instrumentation_state.initialised) return .{ .instance_id = 0, .lineage_id = 0, .had_share_event = false };
+    if (instrumentation_state.active.getPtr(cell_ptr)) |record| {
+        switch (op) {
+            .put => record.puts += 1,
+            .delete => record.deletes += 1,
+            .merge => record.merges += 1,
+        }
+        return .{
+            .instance_id = record.instance_id,
+            .lineage_id = record.lineage_id,
+            .had_share_event = record.had_share_event,
+        };
+    }
+    return .{ .instance_id = 0, .lineage_id = 0, .had_share_event = false };
+}
+
+/// After a mutation produces a fresh derived map at `result_ptr`, mark
+/// the *input* map as having had a post-share mutation (iff the input
+/// was previously shared and the result is a distinct cell). Called
+/// from `put`/`delete`/`merge` after the new cell pointer is known.
+pub fn mapInstrumentationNotePostShareMutation(input_cell_ptr: usize) void {
+    if (!instrument_map) return;
+    if (!instrumentation_state.initialised) return;
+    if (instrumentation_state.active.getPtr(input_cell_ptr)) |record| {
+        if (record.had_share_event and !record.had_post_share_mutation) {
+            record.had_post_share_mutation = true;
+        }
+    }
+}
+
+/// Bump the `gets` counter on the receiver map. Called from `get`,
+/// `getStr`, `hasKey`, and `size`.
+pub fn mapInstrumentationOnGet(cell_ptr: usize) void {
+    if (!instrument_map) return;
+    if (!instrumentation_state.initialised) return;
+    if (instrumentation_state.active.getPtr(cell_ptr)) |record| {
+        record.gets += 1;
+    }
+}
+
+/// Set the thread-local parent context before invoking allocMap from
+/// inside a `put`/`delete`/`merge`. Pair with
+/// `mapInstrumentationClearParent` after allocMap returns. The pair is
+/// not nested — the outer mutation is the only owner of the slot.
+pub fn mapInstrumentationSetParent(lineage_id: u64, instance_id: u64) void {
+    if (!instrument_map) return;
+    instrumentation_state.parent_lineage_id = lineage_id;
+    instrumentation_state.parent_instance_id = instance_id;
+    instrumentation_state.parent_active = true;
+}
+
+pub fn mapInstrumentationClearParent() void {
+    if (!instrument_map) return;
+    instrumentation_state.parent_active = false;
+    instrumentation_state.parent_lineage_id = 0;
+    instrumentation_state.parent_instance_id = 0;
+}
+
+/// Bump the per-lineage HAMT node-clone count. Invoked from inside
+/// `put`/`delete`'s path-copy code after a fresh `HamtNode` is
+/// allocated. The lineage id is the input map's lineage, which the
+/// hook reads from the active record.
+pub fn mapInstrumentationNoteNodeClone(input_cell_ptr: usize) void {
+    if (!instrument_map) return;
+    if (!instrumentation_state.initialised) return;
+    if (instrumentation_state.active.getPtr(input_cell_ptr)) |record| {
+        mapInstrumentationLineageBumpClones(record.lineage_id, 1);
+    }
+}
+
+fn writeRecordJsonLine(file: std.fs.File, record: MapInstanceRecord) !void {
+    var buf: [768]u8 = undefined;
+    const class_str: []const u8 = switch (record.class) {
+        'S' => "S",
+        'W' => "W",
+        'V' => "V",
+        else => "?",
+    };
+    const formatted = try std.fmt.bufPrint(&buf,
+        "{{\"instance_id\":{d},\"lineage_id\":{d},\"parent_instance_id\":{d}," ++
+        "\"alloc_size\":{d},\"creation_callsite\":{d},\"puts\":{d},\"deletes\":{d}," ++
+        "\"merges\":{d},\"gets\":{d},\"peak_strong_count\":{d},\"had_share_event\":{},\"had_post_share_mutation\":{}," ++
+        "\"alloc_time_ns\":{d},\"release_time_ns\":{d},\"size_at_release\":{d},\"class\":\"{s}\"}}\n",
+        .{
+            record.instance_id,        record.lineage_id,
+            record.parent_instance_id, record.alloc_size,
+            record.creation_callsite,  record.puts,
+            record.deletes,            record.merges,
+            record.gets,               record.peak_strong_count,
+            record.had_share_event,    record.had_post_share_mutation,
+            record.alloc_time_ns,      record.release_time_ns,
+            record.size_at_release,    class_str,
+        });
+    _ = std.c.write(file.handle, formatted.ptr, formatted.len);
+}
+
+fn classifyHistogramSize(s: u32) usize {
+    if (s == 0) return 0;
+    if (s <= 7) return 1;
+    if (s <= 31) return 2;
+    if (s <= 127) return 3;
+    if (s <= 1023) return 4;
+    return 5;
+}
+
+fn classifyConcurrentVersions(p: u32) usize {
+    if (p <= 1) return 0;
+    if (p == 2) return 1;
+    if (p <= 5) return 2;
+    if (p <= 20) return 3;
+    return 4;
+}
+
+fn workloadNameFromArgv0() []const u8 {
+    const argv = std.os.argv;
+    if (argv.len == 0) return "unknown";
+    const path = std.mem.span(argv[0]);
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |idx| {
+        return path[idx + 1 ..];
+    }
+    return path;
+}
+
+fn writeJsonString(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+    try buf.append(alloc, '"');
+    for (s) |c| {
+        switch (c) {
+            '\\' => try buf.appendSlice(alloc, "\\\\"),
+            '"' => try buf.appendSlice(alloc, "\\\""),
+            '\n' => try buf.appendSlice(alloc, "\\n"),
+            '\r' => try buf.appendSlice(alloc, "\\r"),
+            '\t' => try buf.appendSlice(alloc, "\\t"),
+            else => {
+                if (c < 0x20) {
+                    var hex_buf: [8]u8 = undefined;
+                    const slc = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{@as(u16, c)}) catch continue;
+                    try buf.appendSlice(alloc, slc);
+                } else {
+                    try buf.append(alloc, c);
+                }
+            },
+        }
+    }
+    try buf.append(alloc, '"');
+}
+
+fn renderInstrumentationSummaryJson(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator) !void {
+    const state = &instrumentation_state;
+    const records = state.finalised.items;
+
+    var class_counts: [3]u64 = .{ 0, 0, 0 }; // S, W, V
+    var size_hist: [6]u64 = .{ 0, 0, 0, 0, 0, 0 };
+    var versions_hist: [5]u64 = .{ 0, 0, 0, 0, 0 };
+
+    for (records) |rec| {
+        const idx: usize = switch (rec.class) {
+            'S' => 0,
+            'W' => 1,
+            'V' => 2,
+            else => continue,
+        };
+        class_counts[idx] += 1;
+        size_hist[classifyHistogramSize(rec.size_at_release)] += 1;
+    }
+
+    var lineage_class_S: u64 = 0;
+    var lineage_class_W: u64 = 0;
+    var lineage_class_V: u64 = 0;
+    var lin_it = state.lineages.iterator();
+    while (lin_it.next()) |entry| {
+        versions_hist[classifyConcurrentVersions(entry.value_ptr.peak_concurrent_versions)] += 1;
+        // Lineage class — derived from member-instance distribution.
+        // S iff exactly one instance and it was class S.
+        // V iff any instance class is V.
+        // Otherwise W.
+        var has_v = false;
+        var has_w = false;
+        var instance_total: u64 = 0;
+        for (records) |rec| {
+            if (rec.lineage_id != entry.value_ptr.lineage_id) continue;
+            instance_total += 1;
+            if (rec.class == 'V') has_v = true;
+            if (rec.class == 'W') has_w = true;
+        }
+        if (instance_total == 0) continue;
+        if (has_v) {
+            lineage_class_V += 1;
+        } else if (has_w or entry.value_ptr.peak_concurrent_versions >= 2) {
+            lineage_class_W += 1;
+        } else {
+            lineage_class_S += 1;
+        }
+    }
+
+    const total_records: u64 = @intCast(records.len);
+    const total_lineages: u64 = state.lineages.count();
+
+    // Sort callsites by count descending.
+    const CallsiteEntry = struct { site: u64, count: u64 };
+    var callsites: std.ArrayListUnmanaged(CallsiteEntry) = .empty;
+    defer callsites.deinit(alloc);
+    var cs_it = state.callsite_counts.iterator();
+    while (cs_it.next()) |entry| {
+        try callsites.append(alloc, .{ .site = entry.key_ptr.*, .count = entry.value_ptr.* });
+    }
+    std.mem.sort(CallsiteEntry, callsites.items, {}, struct {
+        fn lessThan(_: void, a: CallsiteEntry, b: CallsiteEntry) bool {
+            return a.count > b.count;
+        }
+    }.lessThan);
+
+    const duration_ns = instrumentationNowNs() - state.program_start_ns;
+    const workload = workloadNameFromArgv0();
+
+    try buf.appendSlice(alloc, "{\n  \"workload\": ");
+    try writeJsonString(buf, alloc, workload);
+    try buf.appendSlice(alloc, ",\n  \"binary\": ");
+    if (std.os.argv.len > 0) {
+        try writeJsonString(buf, alloc, std.mem.span(std.os.argv[0]));
+    } else {
+        try buf.appendSlice(alloc, "\"\"");
+    }
+    var line_buf: [256]u8 = undefined;
+    {
+        const slc = try std.fmt.bufPrint(&line_buf, ",\n  \"duration_ns\": {d},\n", .{duration_ns});
+        try buf.appendSlice(alloc, slc);
+    }
+    try buf.appendSlice(alloc, "  \"summary\": {\n");
+    {
+        const slc = try std.fmt.bufPrint(&line_buf, "    \"total_instances\": {d},\n", .{total_records});
+        try buf.appendSlice(alloc, slc);
+    }
+    {
+        const slc = try std.fmt.bufPrint(&line_buf, "    \"total_lineages\": {d},\n", .{total_lineages});
+        try buf.appendSlice(alloc, slc);
+    }
+    try buf.appendSlice(alloc, "    \"by_class\": {\n");
+    const denom: f64 = if (total_records == 0) 1.0 else @floatFromInt(total_records);
+    {
+        const slc = try std.fmt.bufPrint(&line_buf, "      \"S\": {{\"count\": {d}, \"frac\": {d:.4}}},\n", .{ class_counts[0], @as(f64, @floatFromInt(class_counts[0])) / denom });
+        try buf.appendSlice(alloc, slc);
+    }
+    {
+        const slc = try std.fmt.bufPrint(&line_buf, "      \"W\": {{\"count\": {d}, \"frac\": {d:.4}}},\n", .{ class_counts[1], @as(f64, @floatFromInt(class_counts[1])) / denom });
+        try buf.appendSlice(alloc, slc);
+    }
+    {
+        const slc = try std.fmt.bufPrint(&line_buf, "      \"V\": {{\"count\": {d}, \"frac\": {d:.4}}}\n", .{ class_counts[2], @as(f64, @floatFromInt(class_counts[2])) / denom });
+        try buf.appendSlice(alloc, slc);
+    }
+    try buf.appendSlice(alloc, "    },\n");
+    try buf.appendSlice(alloc, "    \"by_lineage_class\": {\n");
+    {
+        const slc = try std.fmt.bufPrint(&line_buf, "      \"S\": {d},\n      \"W\": {d},\n      \"V\": {d}\n", .{ lineage_class_S, lineage_class_W, lineage_class_V });
+        try buf.appendSlice(alloc, slc);
+    }
+    try buf.appendSlice(alloc, "    },\n");
+
+    const size_labels = [_][]const u8{ "0", "1-7", "8-31", "32-127", "128-1023", "1024+" };
+    try buf.appendSlice(alloc, "    \"size_histogram\": {\n");
+    inline for (size_labels, 0..) |label, i| {
+        const sep: []const u8 = if (i + 1 < size_labels.len) "," else "";
+        const slc = try std.fmt.bufPrint(&line_buf, "      \"{s}\": {d}{s}\n", .{ label, size_hist[i], sep });
+        try buf.appendSlice(alloc, slc);
+    }
+    try buf.appendSlice(alloc, "    },\n");
+
+    const ver_labels = [_][]const u8{ "1", "2", "3-5", "6-20", "21+" };
+    try buf.appendSlice(alloc, "    \"peak_concurrent_versions_histogram\": {\n");
+    inline for (ver_labels, 0..) |label, i| {
+        const sep: []const u8 = if (i + 1 < ver_labels.len) "," else "";
+        const slc = try std.fmt.bufPrint(&line_buf, "      \"{s}\": {d}{s}\n", .{ label, versions_hist[i], sep });
+        try buf.appendSlice(alloc, slc);
+    }
+    try buf.appendSlice(alloc, "    },\n");
+
+    {
+        const slc = try std.fmt.bufPrint(&line_buf, "    \"post_share_mutation_count\": {d},\n", .{state.post_share_mutation_count});
+        try buf.appendSlice(alloc, slc);
+    }
+    {
+        const slc = try std.fmt.bufPrint(&line_buf, "    \"total_node_clones\": {d},\n", .{state.total_node_clones});
+        try buf.appendSlice(alloc, slc);
+    }
+    try buf.appendSlice(alloc, "    \"top_callsites_by_instance_count\": [\n");
+    const top_n = @min(@as(usize, 20), callsites.items.len);
+    for (callsites.items[0..top_n], 0..) |entry, idx| {
+        const sep: []const u8 = if (idx + 1 < top_n) "," else "";
+        const slc = try std.fmt.bufPrint(&line_buf, "      {{\"site\": \"0x{x}\", \"count\": {d}}}{s}\n", .{ entry.site, entry.count, sep });
+        try buf.appendSlice(alloc, slc);
+    }
+    try buf.appendSlice(alloc, "    ]\n");
+    try buf.appendSlice(alloc, "  }\n}\n");
+}
+
+fn flushPendingActiveRecords() void {
+    // Records still in `active` represent maps whose owners didn't run
+    // a release before the program exited (e.g. globals, leaked refs).
+    // Finalise them as-is so the summary reflects every observed
+    // allocation. Class is computed from the bools as if release just
+    // ran, with size_at_release left at 0 (we don't have a Self typed
+    // pointer to read total_count from at this layer).
+    var it = instrumentation_state.active.iterator();
+    while (it.next()) |entry| {
+        var record = entry.value_ptr.*;
+        record.release_time_ns = instrumentationNowNs();
+        record.class = if (!record.had_share_event)
+            @as(u8, 'S')
+        else if (record.had_post_share_mutation)
+            @as(u8, 'V')
+        else
+            @as(u8, 'W');
+        if (record.had_post_share_mutation) {
+            instrumentation_state.post_share_mutation_count += 1;
+        }
+        instrumentation_state.finalised.append(instrumentationAllocator(), record) catch {};
+        if (instrumentation_state.detail_file) |file| {
+            writeRecordJsonLine(file, record) catch {};
+        }
+    }
+    instrumentation_state.active.clearRetainingCapacity();
+}
+
+fn mapInstrumentationAtexit() callconv(.c) void {
+    if (!instrument_map) return;
+    if (!instrumentation_state.initialised) return;
+    flushStdoutBuf();
+    flushPendingActiveRecords();
+    if (instrumentation_state.detail_file) |file| {
+        file.close();
+        instrumentation_state.detail_file = null;
+    }
+    const out_path = envGetRuntime("ZAP_INSTRUMENT_OUT") orelse "map-instrumentation.json";
+    var path_buf: [512]u8 = undefined;
+    if (out_path.len >= path_buf.len) return;
+    @memcpy(path_buf[0..out_path.len], out_path);
+    path_buf[out_path.len] = 0;
+
+    const alloc = instrumentationAllocator();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+    renderInstrumentationSummaryJson(&buf, alloc) catch return;
+
+    var file = std.fs.cwd().createFile(out_path, .{ .truncate = true }) catch return;
+    defer file.close();
+    _ = std.c.write(file.handle, buf.items.ptr, buf.items.len);
+}
+
+/// Test-only helper: returns a copy of the finalised record matching
+/// `cell_ptr`, or null. Walks the finalised list linearly (O(n)) — only
+/// the unit tests use this, and they exit immediately after asserting.
+pub fn mapInstrumentationFindFinalised(cell_ptr_used_at_alloc: usize, instance_id: u64) ?MapInstanceRecord {
+    _ = cell_ptr_used_at_alloc;
+    if (!instrument_map) return null;
+    if (!instrumentation_state.initialised) return null;
+    for (instrumentation_state.finalised.items) |rec| {
+        if (rec.instance_id == instance_id) return rec;
+    }
+    return null;
+}
+
+/// Test-only helper: returns the active record's instance_id for the
+/// most recently allocated cell.
+pub fn mapInstrumentationLastInstanceId() u64 {
+    if (!instrument_map) return 0;
+    if (!instrumentation_state.initialised) return 0;
+    return instrumentation_state.next_instance_id - 1;
 }
 
 // ============================================================
@@ -3456,6 +4164,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 const mut: *Self = @constCast(m);
                 mut.header.retain();
                 arc_retains_total += 1;
+                if (comptime instrument_map) {
+                    const new_count = mut.header.count();
+                    mapInstrumentationOnRetain(@intFromPtr(m), new_count);
+                }
             }
             return map;
         }
@@ -3470,6 +4182,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
             arc_releases_total += 1;
             if (!mut.header.release()) return;
             // Final owner — tear down owned children before destroying the cell.
+            if (comptime instrument_map) {
+                mapInstrumentationOnRelease(@intFromPtr(m), m.total_count);
+            }
             if (m.repr_tag == 0) {
                 if (m.flat_count > 0) {
                     freeEntries(m.flat_entries, @intCast(m.flat_count));
@@ -3530,6 +4245,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 .flat_count = count,
                 .trie_root = null,
             };
+            if (comptime instrument_map) {
+                mapInstrumentationOnAlloc(@intFromPtr(cell), count, @returnAddress());
+            }
             return cell;
         }
 
@@ -3543,6 +4261,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 .flat_count = 0,
                 .trie_root = root,
             };
+            if (comptime instrument_map) {
+                mapInstrumentationOnAlloc(@intFromPtr(cell), total, @returnAddress());
+            }
             return cell;
         }
 
@@ -4002,6 +4723,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
         pub fn get(map: ?*const Self, key: K, default: V) V {
             if (map) |m| {
+                if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
                 if (m.repr_tag == 0) {
                     // Flat: linear scan
                     for (m.flat_entries[0..m.flat_count]) |entry| {
@@ -4019,13 +4741,16 @@ pub fn Map(comptime K: type, comptime V: type) type {
         }
 
         pub fn getStr(map: ?*const Self, key: K, default: []const u8) []const u8 {
-            _ = map;
             _ = key;
+            if (map) |m| {
+                if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
+            }
             return default;
         }
 
         pub fn hasKey(map: ?*const Self, key: K) bool {
             if (map) |m| {
+                if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
                 if (m.repr_tag == 0) {
                     for (m.flat_entries[0..m.flat_count]) |entry| {
                         if (keysEqual(entry.key, key)) return true;
@@ -4041,7 +4766,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
         }
 
         pub fn size(map: ?*const Self) i64 {
-            if (map) |m| return @intCast(m.total_count);
+            if (map) |m| {
+                if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
+                return @intCast(m.total_count);
+            }
             return 0;
         }
 
@@ -4060,6 +4788,26 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// value as a fresh ownership and would double-release without
         /// the bump.
         pub fn put(map: ?*const Self, key: K, value: V) ?*const Self {
+            if (comptime instrument_map) {
+                if (map) |m| {
+                    const ctx = mapInstrumentationBumpMutation(@intFromPtr(m), .put);
+                    mapInstrumentationSetParent(ctx.lineage_id, ctx.instance_id);
+                    defer mapInstrumentationClearParent();
+                    const result = putInner(map, key, value);
+                    if (ctx.had_share_event) {
+                        if (result) |r| {
+                            if (@intFromPtr(r) != @intFromPtr(m)) {
+                                mapInstrumentationNotePostShareMutation(@intFromPtr(m));
+                            }
+                        }
+                    }
+                    return result;
+                }
+            }
+            return putInner(map, key, value);
+        }
+
+        fn putInner(map: ?*const Self, key: K, value: V) ?*const Self {
             if (map == null) {
                 // Create new single-entry flat map
                 const entries = allocEntries(1) orelse return null;
@@ -4129,6 +4877,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
                     retainNode_or_self_for_unchanged_return(map);
                     return map;
                 };
+                if (comptime instrument_map) {
+                    mapInstrumentationNoteNodeClone(@intFromPtr(m));
+                }
                 const new_total = if (was_present) m.total_count else m.total_count + 1;
                 return makeTrieMap(new_root, new_total);
             }
@@ -4137,6 +4888,28 @@ pub fn Map(comptime K: type, comptime V: type) type {
         }
 
         pub fn delete(map: ?*const Self, key: K) ?*const Self {
+            if (comptime instrument_map) {
+                if (map) |m| {
+                    const ctx = mapInstrumentationBumpMutation(@intFromPtr(m), .delete);
+                    mapInstrumentationSetParent(ctx.lineage_id, ctx.instance_id);
+                    defer mapInstrumentationClearParent();
+                    const result = deleteInner(map, key);
+                    if (ctx.had_share_event) {
+                        if (result) |r| {
+                            if (@intFromPtr(r) != @intFromPtr(m)) {
+                                mapInstrumentationNotePostShareMutation(@intFromPtr(m));
+                            }
+                        } else {
+                            mapInstrumentationNotePostShareMutation(@intFromPtr(m));
+                        }
+                    }
+                    return result;
+                }
+            }
+            return deleteInner(map, key);
+        }
+
+        fn deleteInner(map: ?*const Self, key: K) ?*const Self {
             if (map == null) return null;
             const m = map.?;
 
@@ -4182,6 +4955,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
                     retainNode_or_self_for_unchanged_return(map);
                     return map;
                 };
+                if (comptime instrument_map) {
+                    mapInstrumentationNoteNodeClone(@intFromPtr(m));
+                }
                 const new_total = m.total_count - 1;
                 if (new_total == 0) {
                     releaseNode(new_root);
@@ -4263,6 +5039,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
         pub fn merge(map_a: ?*const Self, map_b: ?*const Self) ?*const Self {
             if (map_a == null) return map_b;
             if (map_b == null) return map_a;
+            if (comptime instrument_map) {
+                _ = mapInstrumentationBumpMutation(@intFromPtr(map_a.?), .merge);
+                _ = mapInstrumentationBumpMutation(@intFromPtr(map_b.?), .merge);
+            }
             // Apply all entries from b onto a
             var result = map_a;
             const b = map_b.?;
@@ -8602,4 +9382,130 @@ test "String operations" {
 
 test "String concat" {
     try std.testing.expectEqualStrings("hello world", String.concat("hello", " world"));
+}
+
+// ============================================================
+// Map workload instrumentation differential tests (Phase A)
+//
+// These three tests validate the S/W/V classifier against three
+// canonical lifetime patterns. They are gated by `comptime if
+// (instrument_map)`: when the compiler is built with the default
+// `-Dinstrument-map=false` they pass trivially, and when built with
+// `-Dinstrument-map=true` they exercise the full classifier path.
+// ============================================================
+
+test "instrumentation: S — never shared" {
+    if (!comptime instrument_map) return;
+    const MapI64 = Map(i64, i64);
+    const before_id = mapInstrumentationLastInstanceId();
+    const m_initial = MapI64.put(null, 1, 100) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    var m: ?*const MapI64 = m_initial;
+    var k: i64 = 2;
+    while (k <= 5) : (k += 1) {
+        const next_m = MapI64.put(m, k, k * 100) orelse {
+            try std.testing.expect(false);
+            return;
+        };
+        MapI64.release(m);
+        m = next_m;
+    }
+    // First derived id is `before_id + 1`. We re-resolve via a probe:
+    // the initial allocation registered exactly one instance with the
+    // first-allocated cell pointer, which became the parent for the
+    // four follow-up `put` calls. Releasing m releases the chain head.
+    MapI64.release(m);
+
+    // Walk the finalised list looking for the chain we just produced
+    // (lineage_id was assigned to the first allocation; every put
+    // inherited it via the parent context). We expect 5 records (one
+    // per allocation), all class S with peak_strong_count = 1.
+    var saw_first: bool = false;
+    var seen_class_S: u32 = 0;
+    var puts_on_first: u32 = 0;
+    var gets_on_first: u32 = 0;
+    for (instrumentation_state.finalised.items) |rec| {
+        if (rec.instance_id <= before_id) continue;
+        try std.testing.expectEqual(@as(u32, 1), rec.peak_strong_count);
+        if (rec.class == 'S') seen_class_S += 1;
+        if (!saw_first and rec.parent_instance_id == 0) {
+            saw_first = true;
+            puts_on_first = rec.puts;
+            gets_on_first = rec.gets;
+        }
+    }
+    try std.testing.expect(seen_class_S >= 5);
+    try std.testing.expect(saw_first);
+    // The first map had four `put` calls applied to it (the chain
+    // wraps it four times before the final release).
+    try std.testing.expectEqual(@as(u32, 1), puts_on_first);
+    try std.testing.expectEqual(@as(u32, 0), gets_on_first);
+}
+
+test "instrumentation: W — shared but never post-share-mutated" {
+    if (!comptime instrument_map) return;
+    const MapI64 = Map(i64, i64);
+    const m = MapI64.put(null, 1, 100) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const cell_ptr = @intFromPtr(m);
+    const initial_record = instrumentation_state.active.getPtr(cell_ptr).?;
+    const instance_id = initial_record.instance_id;
+
+    // Share by retaining — refcount goes 1 → 2.
+    _ = MapI64.retain(m);
+    // Drop the share without mutating — refcount returns to 1.
+    MapI64.release(m);
+    // Final release — class W expected (had_share_event=true,
+    // had_post_share_mutation=false).
+    MapI64.release(m);
+
+    const rec = mapInstrumentationFindFinalised(0, instance_id) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expect(rec.had_share_event);
+    try std.testing.expect(!rec.had_post_share_mutation);
+    try std.testing.expectEqual(@as(u8, 'W'), rec.class);
+    try std.testing.expectEqual(@as(u32, 2), rec.peak_strong_count);
+}
+
+test "instrumentation: V — shared and post-share-mutated" {
+    if (!comptime instrument_map) return;
+    const MapI64 = Map(i64, i64);
+    const original = MapI64.put(null, 1, 100) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const original_ptr = @intFromPtr(original);
+    const original_id = instrumentation_state.active.getPtr(original_ptr).?.instance_id;
+
+    // Share — refcount goes 1 → 2 — `had_share_event` flips on.
+    _ = MapI64.retain(original);
+
+    // Mutate while still shared. `put` allocates a fresh derived map.
+    const derived = MapI64.put(original, 2, 200) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    // The mutation hook should have flagged `had_post_share_mutation`
+    // on the original cell.
+
+    // Release the second share, then the original cell, then the
+    // derived. We expect the original cell to land in finalised with
+    // class V.
+    MapI64.release(original);
+    MapI64.release(original);
+    MapI64.release(derived);
+
+    const rec = mapInstrumentationFindFinalised(0, original_id) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expect(rec.had_share_event);
+    try std.testing.expect(rec.had_post_share_mutation);
+    try std.testing.expectEqual(@as(u8, 'V'), rec.class);
 }
