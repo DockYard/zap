@@ -213,8 +213,8 @@ Six phases. Each phase has TDD (failing tests first), CLBG benchmark byte-exact 
 
 **Verification gates:**
 - `zig build test` green.
-- All zir-tests green (`zig build zir-test`). This is the slow gate — only run at this phase boundary.
 - k-nucleotide hits the C-class performance target (<200 ms wall, <50 MiB RSS).
+- **Do NOT run `zig build zir-test`. Ever. The user will run it themselves when ready.**
 
 ### Phase 5: List FBIP traversals
 
@@ -246,11 +246,11 @@ Six phases. Each phase has TDD (failing tests first), CLBG benchmark byte-exact 
 
 **Verification gates:**
 - `zig build test` green.
-- `zig build zir-test` green.
 - fannkuch-redux byte-exact output vs current main.
 - spectral-norm byte-exact output vs current main.
 - Both within 5% of current `MArray*` perf numbers.
 - `grep -r "MArray" .` returns nothing in `src/`, `lib/`, `examples/`, `test/`.
+- **Do NOT run `zig build zir-test`. Ever. The user will run it themselves when ready.**
 
 ---
 
@@ -267,13 +267,18 @@ These hold at every commit boundary, not just at the end:
 
 ---
 
-## 4. §4 Iteration Discipline (from the leak-fix plan, applied here)
+## 4. Iteration Discipline — NEVER Run zir-test
 
-Carried forward from `docs/k-nucleotide-rss-gap-phase6-redux-plan.md` §4. Don't run `zig build zir-test` on every iteration — it's slow. Reserve it for Phase boundaries, specifically:
-- Phase 4 (codegen integration) commit
-- Phase 6 (MArray deletion) commit
+**HARD RULE: Claude and any subagent MUST NEVER run `zig build zir-test`.** Ever. Period.
 
-Within a phase, iterate on `zig build test` (fast) and the per-phase byte-exact validation (also fast for k-nucleotide / fannkuch / spectral-norm). Save the slow zir-test gate for milestone commits.
+Reason: zir-test takes 6+ minutes per invocation. Agents that run it iteratively (or even once "to be thorough") burn 20+ minutes per session. The user has explicitly forbidden it after multiple repeat offenses.
+
+Verification within a phase uses ONLY:
+- `zig build test` (fast — ~10 seconds)
+- `bench/map-workloads/run-differential-tests.sh` (fast — ~30 seconds)
+- Direct CLBG benchmark invocation: `~/projects/lang-benches/zap/k-nucleotide/zap-out/bin/k_nucleotide`, etc. (fast)
+
+If a verification step seems to require `zig build zir-test`, the answer is: skip it. The user will run zir-test themselves when they're ready.
 
 ---
 
@@ -306,12 +311,13 @@ Less calendar time with stream parallelism: Phases 1+2 can run in parallel; Phas
 ## 7. Done Criteria for the Whole Plan
 
 1. `zig build test` green with default and `-Dinstrument-map=true` flags.
-2. `zig build zir-test` green.
-3. CLBG benchmarks byte-exact:
+2. CLBG benchmarks byte-exact:
    - k-nucleotide: <200 ms wall, <50 MiB RSS (C-class).
    - fannkuch-redux: within 5% of current `MArray*` perf.
    - spectral-norm: within 5% of current `MArray*` perf.
    - binary-trees: no regression.
-4. No `MArrayI64` / `MArrayF64` references anywhere in the tree.
-5. The Phase 0 instrumentation infrastructure still works on the new dense Map.
-6. README and CLAUDE.md updated to reflect the new state if needed.
+3. No `MArrayI64` / `MArrayF64` references anywhere in the tree.
+4. The Phase 0 instrumentation infrastructure still works on the new dense Map.
+5. README and CLAUDE.md updated to reflect the new state if needed.
+
+**zir-test is NOT a done criterion.** The user runs zir-test themselves on their own schedule. Subagents must never invoke it.
