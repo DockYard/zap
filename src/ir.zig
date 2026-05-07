@@ -2382,7 +2382,7 @@ pub const IrBuilder = struct {
         // ZIR backend's tail_call lowering picks musttail (TCO-safe
         // signatures) vs loopification (byref) — see `rewriteTailCalls`
         // doc for the dispatch rationale.
-        entry_instrs = try self.rewriteTailCalls(entry_instrs, name_str, params.items, return_type);
+        entry_instrs = try self.rewriteTailCalls(entry_instrs, name_str, func_id, params.items, return_type);
 
         const has_tail_call = containsTailCall(entry_instrs);
         const tco_safe = isTcoEligible(params.items, return_type);
@@ -2861,6 +2861,7 @@ pub const IrBuilder = struct {
         self: *IrBuilder,
         instrs: []const Instruction,
         func_name: []const u8,
+        enclosing_function_id: FunctionId,
         params: []const Param,
         return_type: ZigType,
     ) ![]const Instruction {
@@ -2892,7 +2893,7 @@ pub const IrBuilder = struct {
                     // Rewrite tail calls inside switch_return cases
                     var new_cases: std.ArrayList(ReturnCase) = .empty;
                     for (sr.cases) |case| {
-                        const new_body = try self.rewriteTailCallsInBody(case.body_instrs, case.return_value, func_name);
+                        const new_body = try self.rewriteTailCallsInBody(case.body_instrs, case.return_value, func_name, enclosing_function_id);
                         if (new_body.rewritten) {
                             try new_cases.append(self.allocator, .{
                                 .value = case.value,
@@ -2904,7 +2905,7 @@ pub const IrBuilder = struct {
                         }
                     }
                     // Also check default arm
-                    const new_default = try self.rewriteTailCallsInBody(sr.default_instrs, sr.default_result, func_name);
+                    const new_default = try self.rewriteTailCallsInBody(sr.default_instrs, sr.default_result, func_name, enclosing_function_id);
                     try result.append(self.allocator, .{
                         .switch_return = .{
                             .scrutinee_param = sr.scrutinee_param,
@@ -3089,7 +3090,7 @@ pub const IrBuilder = struct {
                         // window.
                         if (probe == result.items.len and probe > 0) {
                             const branch_instr = result.items[probe - 1];
-                            const rewritten_branch = try self.tryRewriteTailThroughBranch(branch_instr, r.value.?, func_name);
+                            const rewritten_branch = try self.tryRewriteTailThroughBranch(branch_instr, r.value.?, func_name, enclosing_function_id);
                             if (rewritten_branch) |new_branch| {
                                 // The rewritten branch subsumes the
                                 // outer `ret`: every arm now terminates
@@ -3126,6 +3127,7 @@ pub const IrBuilder = struct {
         body: []const Instruction,
         return_value: ?LocalId,
         func_name: []const u8,
+        enclosing_function_id: FunctionId,
     ) !TailCallRewrite {
         if (body.len == 0 or return_value == null) return .{ .instrs = body, .rewritten = false };
 
@@ -3159,7 +3161,18 @@ pub const IrBuilder = struct {
                 .call_direct => |cd| break :blk .{
                     .args = cd.args,
                     .tail_name = func_name,
-                    .dest_matches = cd.dest == return_value.?,
+                    // A `call_direct` only counts as a tail-recursive
+                    // self-call when its `function` field references the
+                    // enclosing function. Without this guard, a sibling-
+                    // function call (e.g., `add_ten(0)` in a `case` arm
+                    // of `compute`) would be rewritten into
+                    // `tail_call name=compute`, producing unbounded
+                    // self-recursion at runtime. The dest-equality
+                    // check alone is insufficient: every direct call
+                    // whose result becomes the arm's value satisfies
+                    // it, regardless of which function was actually
+                    // invoked.
+                    .dest_matches = cd.function == enclosing_function_id and cd.dest == return_value.?,
                 },
                 .call_named => |cn| break :blk .{
                     .args = cn.args,
@@ -3262,12 +3275,13 @@ pub const IrBuilder = struct {
         branch_instr: Instruction,
         dest_local: LocalId,
         func_name: []const u8,
+        enclosing_function_id: FunctionId,
     ) !?Instruction {
         switch (branch_instr) {
             .if_expr => |ie| {
                 if (ie.dest != dest_local) return null;
-                const new_then = try self.rewriteTailCallsInBody(ie.then_instrs, ie.then_result, func_name);
-                const new_else = try self.rewriteTailCallsInBody(ie.else_instrs, ie.else_result, func_name);
+                const new_then = try self.rewriteTailCallsInBody(ie.then_instrs, ie.then_result, func_name, enclosing_function_id);
+                const new_else = try self.rewriteTailCallsInBody(ie.else_instrs, ie.else_result, func_name, enclosing_function_id);
                 if (!new_then.rewritten and !new_else.rewritten) return null;
 
                 const final_then_instrs = if (new_then.rewritten)
@@ -3298,11 +3312,11 @@ pub const IrBuilder = struct {
                 var rewrite_results: std.ArrayList(TailCallRewrite) = .empty;
                 defer rewrite_results.deinit(self.allocator);
                 for (sl.cases) |case| {
-                    const r = try self.rewriteTailCallsInBody(case.body_instrs, case.result, func_name);
+                    const r = try self.rewriteTailCallsInBody(case.body_instrs, case.result, func_name, enclosing_function_id);
                     if (r.rewritten) any_rewritten = true;
                     try rewrite_results.append(self.allocator, r);
                 }
-                const new_default = try self.rewriteTailCallsInBody(sl.default_instrs, sl.default_result, func_name);
+                const new_default = try self.rewriteTailCallsInBody(sl.default_instrs, sl.default_result, func_name, enclosing_function_id);
                 if (new_default.rewritten) any_rewritten = true;
                 if (!any_rewritten) return null;
 
@@ -8155,7 +8169,7 @@ test "rewriteTailCalls walks past borrow_value/copy_value/move_value/retain trai
     const params = try alloc.alloc(Param, 1);
     params[0] = .{ .name = "c", .type_expr = .void, .type_id = null };
 
-    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", params, .void);
+    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", 0, params, .void);
 
     var saw_tail_call = false;
     var saw_borrow_value = false;
@@ -8226,7 +8240,7 @@ test "rewriteTailCalls bails out on non-tail-mappable trailing instruction (Phas
 
     const params = try alloc.alloc(Param, 0);
 
-    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", params, .void);
+    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", 0, params, .void);
 
     var saw_tail_call = false;
     var saw_call_named = false;
@@ -8291,7 +8305,7 @@ test "rewriteTailCalls elides matched share_value/release pair and substitutes c
     const params = try alloc.alloc(Param, 1);
     params[0] = .{ .name = "c", .type_expr = .void, .type_id = null };
 
-    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", params, .void);
+    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", 0, params, .void);
 
     var saw_tail_call = false;
     var saw_share_value = false;
@@ -8350,7 +8364,7 @@ test "rewriteTailCalls handles unmatched release without breaking (Phase E.8)" {
     const params = try alloc.alloc(Param, 1);
     params[0] = .{ .name = "c", .type_expr = .void, .type_id = null };
 
-    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", params, .void);
+    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", 0, params, .void);
 
     var saw_tail_call = false;
     var saw_release = false;
