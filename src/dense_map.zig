@@ -345,6 +345,38 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
             return fresh;
         }
 
+        /// Move-clone variant used on the *unique-owner resize* path.
+        /// The K/V references of each entry are *not* retained — they
+        /// transfer ownership from the old buffer to the new one. The
+        /// caller must dispose of the old buffer via `bufferFreeShallow`
+        /// (so the old entries don't get deep-released).
+        fn cloneBufferMovingChildren(self: *const Self, new_capacity: u32) error{OutOfMemory}!*Self {
+            std.debug.assert(std.math.isPowerOfTwo(new_capacity));
+            const old = self;
+            const old_hdr = old.header();
+            std.debug.assert(new_capacity >= old_hdr.len);
+
+            const fresh = try bufferAlloc(new_capacity, old_hdr.hash_seed);
+            const fresh_hdr = fresh.headerMut();
+
+            const old_entries = old.entriesPtr();
+            const new_entries = fresh.entriesPtr();
+            for (0..old_hdr.len) |i| {
+                new_entries[i] = old_entries[i];
+            }
+            fresh_hdr.len = old_hdr.len;
+
+            if (new_capacity == old_hdr.capacity) {
+                const old_buckets = old.bucketsPtr();
+                const new_buckets = fresh.bucketsPtr();
+                for (0..old_hdr.capacity) |i| {
+                    new_buckets[i] = old_buckets[i];
+                }
+            } else {
+                fresh.rebucketAll();
+            }
+            return fresh;
+        }
 
         /// Re-place every live entry into the bucket array via Robin Hood
         /// probing. Assumes the bucket array is currently all-EMPTY (as fresh
@@ -427,107 +459,162 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
         }
 
         // -------------------------------------------------------------------
-        // Insert (always allocates a fresh buffer; rc-1 fast path lands in 1.6)
+        // Insert (rc-1 fast path)
         // -------------------------------------------------------------------
 
-        /// Insert or update `(key, value)`. Returns a fresh buffer; the
-        /// input (if any) is left untouched but should be released by
-        /// the caller after switching the live handle.
+        /// Insert or update `(key, value)`. The K and V passed in are
+        /// considered transferred to the map: on insert the map becomes
+        /// the new owner; on update the *old* value at that key is
+        /// deep-released and the new value takes its place.
         ///
-        /// In this sub-deliverable we deliberately have no rc-1 fast
-        /// path: every `put` clones the buffer (with deep-retain on
-        /// every K/V) so the new buffer is a separate ARC owner of the
-        /// entry children. The fast path is wired in at 1.6.
+        /// Refcount-aware:
+        ///   * rc(map) == 1: mutate the buffer in place. The same `*Self`
+        ///     pointer is returned when no resize is needed; if a resize
+        ///     fires the new buffer pointer is returned and the old
+        ///     buffer is shallow-freed (entries moved over verbatim).
+        ///   * rc(map) > 1: clone the buffer with deep-retain on every
+        ///     existing K/V, then mutate the clone. Both maps remain
+        ///     valid; the caller is expected to release the original.
+        ///   * map == null: allocate a fresh buffer at INITIAL_CAPACITY.
         pub fn put(maybe_self: ?*const Self, key: K, value: V) error{OutOfMemory}!*Self {
-            // Step 1: figure out whether the key already exists in the
-            // input map. If so the new map is a same-size clone with
-            // the matching entry's value overwritten.
-            if (maybe_self) |self| {
-                if (findEntry(self, key)) |existing_idx| {
-                    const fresh = try cloneBufferRetainingChildren(self, self.header().capacity);
-                    const allocator = std.heap.page_allocator;
-                    // The cloned entry slot holds a freshly-retained
-                    // copy of the old value. Release that copy before
-                    // overwriting it with the new value.
-                    releaseEntryValue(fresh.entryAt(existing_idx).value, allocator);
-                    fresh.entryAt(existing_idx).value = value;
-                    // The K passed in is a transferred owner; the
-                    // existing key already covers this slot, so release
-                    // the duplicate to keep refcounts balanced.
-                    releaseEntryKey(key, allocator);
-                    return fresh;
-                }
+            // Empty map: allocate fresh and insert.
+            if (maybe_self == null) {
+                const fresh = try bufferAlloc(INITIAL_CAPACITY, wyhash.nextSeed());
+                _ = try putInPlaceInsert(fresh, key, value);
+                return fresh;
+            }
+            const self = maybe_self.?;
+
+            if (self.header().arc_header.count() == 1) {
+                // Unique owner: mutate in place. May reallocate the
+                // buffer on resize.
+                const mut: *Self = @constCast(self);
+                return try putInPlace(mut, key, value);
             }
 
-            // Step 2: this is a true insert. Decide the target capacity.
-            const old_len: u32 = if (maybe_self) |s| s.header().len else 0;
-            const old_cap: u32 = if (maybe_self) |s| s.header().capacity else 0;
-            const new_cap: u32 = pickCapacity(old_cap, old_len + 1);
+            // Shared owner: deep-retain clone, then mutate the clone.
+            const target_cap = pickCapacity(self.header().capacity, self.header().len + 1);
+            const clone = try cloneBufferRetainingChildren(self, target_cap);
+            return try putInPlace(clone, key, value);
+        }
 
-            // Step 3: allocate the destination. Either clone (same
-            // capacity) or fresh + rebucket (resize).
-            var fresh: *Self = if (maybe_self) |s|
-                try cloneBufferRetainingChildren(s, new_cap)
-            else
-                try bufferAlloc(new_cap, wyhash.nextSeed());
+        /// Mutate `target` (assumed to be the unique owner of its
+        /// buffer) by inserting or updating the `(key, value)` pair.
+        /// Returns the same pointer when the buffer has room, or a
+        /// freshly-allocated buffer (with the old shallow-freed) when a
+        /// resize is needed. On update, the existing value is deep-
+        /// released before being overwritten.
+        fn putInPlace(target: *Self, key: K, value: V) error{OutOfMemory}!*Self {
+            // Update path: key already in the map.
+            if (findEntry(target, key)) |existing_idx| {
+                const allocator = std.heap.page_allocator;
+                const entry = target.entryAt(existing_idx);
+                // Release the old value; the new value transfers in.
+                releaseEntryValue(entry.value, allocator);
+                // The key didn't change; do not touch its refcount.
+                entry.value = value;
+                // The K passed in by the caller represents a transferred
+                // owner. Since we already had the equivalent key, we
+                // must release the duplicate to keep refcounts balanced.
+                releaseEntryKey(key, allocator);
+                return target;
+            }
 
-            // Step 4: append the new entry, install its bucket via Robin Hood.
-            const hash = fresh.hashKey(key);
-            const fresh_hdr = fresh.headerMut();
-            const new_idx: u32 = fresh_hdr.len;
-            std.debug.assert(new_idx < fresh_hdr.entry_cap);
-            const entries = fresh.entriesPtr();
+            // Insert path. Resize first if needed.
+            const old_cap = target.header().capacity;
+            const new_cap = pickCapacity(old_cap, target.header().len + 1);
+            var dest: *Self = target;
+            if (new_cap != old_cap) {
+                // Move entries to a larger buffer. Children transfer
+                // (no retain/release), old buffer is shallow-freed.
+                dest = try cloneBufferMovingChildren(target, new_cap);
+                target.bufferFreeShallow();
+            }
+            _ = try putInPlaceInsert(dest, key, value);
+            return dest;
+        }
+
+        /// Append a new `(key, value)` entry to `dest`, install its
+        /// bucket via Robin Hood. Caller has already verified the key is
+        /// absent and the buffer has at least one free slot.
+        fn putInPlaceInsert(dest: *Self, key: K, value: V) error{OutOfMemory}!*Self {
+            const hash = dest.hashKey(key);
+            const dest_hdr = dest.headerMut();
+            const new_idx: u32 = dest_hdr.len;
+            std.debug.assert(new_idx < dest_hdr.entry_cap);
+            const entries = dest.entriesPtr();
             entries[new_idx] = .{ .hash = hash, .key = key, .value = value };
-            fresh_hdr.len = new_idx + 1;
-
-            fresh.installBucket(hash, new_idx);
-            return fresh;
+            dest_hdr.len = new_idx + 1;
+            dest.installBucket(hash, new_idx);
+            return dest;
         }
 
         // -------------------------------------------------------------------
         // Delete (swap-remove + Robin Hood backshift)
         // -------------------------------------------------------------------
 
-        /// Remove `key` from the map. Returns a fresh buffer (the
-        /// contract matches `put`: every mutating op clones in this
-        /// iteration; the rc-1 fast path lands in 1.6). The input
-        /// buffer is left untouched and must be released by the caller.
+        /// Remove `key` from the map.
         ///
-        /// Behavior:
+        /// Refcount-aware:
         ///   * `map == null` -> returns null.
-        ///   * `key` absent -> returns a fresh same-shape clone with
-        ///     identical contents (matches the persistent-map
-        ///     contract).
-        ///   * `key` present -> swap-remove on the clone: swap
-        ///     `entries[entry_idx]` with `entries[len-1]` (if not
+        ///   * `rc(map) == 1` and key found -> swap-remove + backshift in
+        ///     place. Same `*Self` returned, with the removed entry's K
+        ///     and V deep-released.
+        ///   * `rc(map) == 1` and key absent -> same `*Self` returned,
+        ///     no allocation, no mutation.
+        ///   * `rc(map) > 1` and key found -> deep-retain clone, then
+        ///     swap-remove + backshift on the clone. The clone's
+        ///     newly-retained-then-removed K/V are deep-released so the
+        ///     net refcount on those children stays unchanged.
+        ///   * `rc(map) > 1` and key absent -> deep-retain clone returned
+        ///     (preserves the "fresh handle" contract on shared input).
+        ///
+        /// Swap-remove mechanics:
+        ///   * Swap `entries[entry_idx]` with `entries[len-1]` (if not
         ///     already the tail), patch the bucket that pointed at
         ///     `len-1` to point at `entry_idx`, decrement `len`, then
         ///     backshift the bucket array starting from the deleted
         ///     slot until we hit either an empty slot or a bucket
-        ///     already at its ideal position (`dist == 1`). The
-        ///     removed entry's K and V are deep-released.
+        ///     already at its ideal position (`dist == 1`).
         pub fn delete(maybe_map: ?*const Self, key: K) ?*const Self {
             const map = maybe_map orelse return null;
 
-            // Always allocate a fresh buffer (with deep-retain on every
-            // K/V). We mutate the clone, never the original.
-            const fresh = cloneBufferRetainingChildren(map, map.header().capacity) catch return null;
+            const is_unique = map.header().arc_header.count() == 1;
+            if (is_unique) {
+                const mut: *Self = @constCast(map);
+                if (findEntry(mut, key)) |found_entry_idx| {
+                    deleteFoundInPlace(mut, found_entry_idx);
+                    return mut;
+                }
+                // Absent key, unique owner: no-op, return same handle.
+                return mut;
+            }
 
-            const found_entry_idx = findEntry(fresh, key) orelse return fresh;
+            // Shared owner: clone with deep-retain.
+            const clone = cloneBufferRetainingChildren(map, map.header().capacity) catch return null;
+            if (findEntry(clone, key)) |found_entry_idx| {
+                deleteFoundInPlace(clone, found_entry_idx);
+            }
+            return clone;
+        }
 
-            const fresh_hdr = fresh.headerMut();
-            const old_len = fresh_hdr.len;
+        /// Perform swap-remove + backshift on `target` (assumed unique
+        /// owner) at the entry slot returned by `findEntry`. The
+        /// removed entry's K and V are deep-released.
+        fn deleteFoundInPlace(target: *Self, found_entry_idx: u32) void {
+            const target_hdr = target.headerMut();
+            const old_len = target_hdr.len;
             std.debug.assert(old_len > 0);
 
-            // Locate the bucket that currently owns `key` so we can
-            // clear it and start backshifting from there.
-            const target_hash = fresh.entryAtConst(found_entry_idx).hash;
-            const deleted_slot = fresh.findBucketSlotForEntry(target_hash, found_entry_idx);
+            // Locate the bucket that currently owns the deleted entry.
+            const target_hash = target.entryAtConst(found_entry_idx).hash;
+            const deleted_slot = target.findBucketSlotForEntry(target_hash, found_entry_idx);
 
-            // Deep-release the K and V of the deleted entry.
+            // Deep-release the K and V of the deleted entry. Read them
+            // out of the entry slot before any swap-remove mutation.
             const allocator = std.heap.page_allocator;
             {
-                const removed_entry = fresh.entryAtConst(found_entry_idx).*;
+                const removed_entry = target.entryAtConst(found_entry_idx).*;
                 releaseEntryKey(removed_entry.key, allocator);
                 releaseEntryValue(removed_entry.value, allocator);
             }
@@ -535,36 +622,34 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
             // Swap-remove on the entries array.
             if (found_entry_idx != old_len - 1) {
                 const tail_idx: u32 = old_len - 1;
-                const tail_entry = fresh.entryAt(tail_idx).*;
+                const tail_entry = target.entryAt(tail_idx).*;
 
                 // Find the bucket that points at `tail_idx` and repoint
-                // it at `found_entry_idx`. Re-probe with the tail
-                // entry's cached hash + key.
-                const tail_slot = fresh.findBucketSlotForEntry(tail_entry.hash, tail_idx);
-                fresh.bucketAt(tail_slot).entry_idx = found_entry_idx;
+                // it at `found_entry_idx`.
+                const tail_slot = target.findBucketSlotForEntry(tail_entry.hash, tail_idx);
+                target.bucketAt(tail_slot).entry_idx = found_entry_idx;
 
                 // Move the tail entry into the freed slot.
-                fresh.entryAt(found_entry_idx).* = tail_entry;
+                target.entryAt(found_entry_idx).* = tail_entry;
             }
 
             // Decrement len. The previous tail entry slot is now
             // logically dead (its contents are stale but unreferenced).
-            fresh_hdr.len = old_len - 1;
+            target_hdr.len = old_len - 1;
 
             // Backshift buckets starting at `deleted_slot`. Walk
             // forward; while the next slot is occupied AND its dist > 1,
             // move it back and decrement its dist by one. Stop on empty
             // or dist == 1.
-            const buckets = fresh.bucketsPtr();
+            const buckets = target.bucketsPtr();
             buckets[deleted_slot] = .{ .dist_and_fingerprint = EMPTY, .entry_idx = 0 };
             var cur = deleted_slot;
             while (true) {
-                const nxt = fresh.nextSlot(cur);
+                const nxt = target.nextSlot(cur);
                 const nxt_dnf = buckets[nxt].dist_and_fingerprint;
                 if (nxt_dnf == EMPTY) break;
                 const nxt_dist = nxt_dnf >> 8;
                 if (nxt_dist <= 1) break;
-                // Shift the next bucket back into `cur`, decrementing its dist.
                 const fp = nxt_dnf & FINGERPRINT_MASK;
                 const new_dist = nxt_dist - 1;
                 buckets[cur] = .{
@@ -574,8 +659,64 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
                 buckets[nxt] = .{ .dist_and_fingerprint = EMPTY, .entry_idx = 0 };
                 cur = nxt;
             }
+        }
 
-            return fresh;
+        // -------------------------------------------------------------------
+        // Merge (1.6 — built on top of put, inherits the rc-1 fast path)
+        // -------------------------------------------------------------------
+
+        /// Merge `map_b` into `map_a`. Where the two maps share keys,
+        /// b's value wins (matches the runtime's HAMT Map.merge
+        /// contract). Returns a new map (or one of the inputs retained
+        /// when the other side is null).
+        ///
+        /// Implementation walks `map_b`'s entries in order and `put`s
+        /// each into `map_a`. Each `put` runs the rc-1 fast path
+        /// independently, so a merge into a unique-owner left map is
+        /// O(len_b) put operations with no extra allocations beyond
+        /// resizes.
+        pub fn merge(map_a: ?*const Self, map_b: ?*const Self) error{OutOfMemory}!?*const Self {
+            // Null operand handling.
+            if (map_a == null and map_b == null) return null;
+            if (map_a == null) return retain(map_b);
+            if (map_b == null) return retain(map_a);
+
+            // Both non-null: fold each entry of `b` into `a`. The
+            // initial result is `a` retained — `put` will either return
+            // the same handle (unique-owner fast path) or allocate a
+            // fresh clone, in which case the prior intermediate is
+            // released.
+            //
+            // Each entry passed to `put` has its K and V deep-retained
+            // first. `put` semantics consume those references — on
+            // insert it stashes them in the new entry slot, on update
+            // it releases them in lockstep with the existing slot's
+            // value. This keeps the source map `b` unaffected.
+            var result: ?*const Self = retain(map_a);
+            const b = map_b.?;
+            const b_len = b.header().len;
+            const b_entries = b.entriesPtr();
+            var i: u32 = 0;
+            while (i < b_len) : (i += 1) {
+                const entry = b_entries[i];
+                retainEntryKey(entry.key);
+                retainEntryValue(entry.value);
+                const next_result = put(result, entry.key, entry.value) catch |err| {
+                    // On allocation failure, release the partial result
+                    // and the references we just retained, then bubble
+                    // up. The caller still owns map_a and map_b.
+                    const allocator = std.heap.page_allocator;
+                    releaseEntryKey(entry.key, allocator);
+                    releaseEntryValue(entry.value, allocator);
+                    release(result);
+                    return err;
+                };
+                if (next_result != result) {
+                    release(result);
+                    result = next_result;
+                }
+            }
+            return result;
         }
 
         /// Find the bucket slot that currently references `entry_idx` for the
@@ -931,7 +1072,6 @@ test "DenseMap insertion order preserved" {
     const ks = [_]u64{ 7, 3, 11, 5, 9 };
     for (ks) |k| {
         const next = try M.put(m, k, k * 10);
-        M.release(@constCast(m));
         m = next;
     }
 
@@ -968,7 +1108,6 @@ test "DenseMap put 100 random integer keys, retrieve all" {
 
     for (unique[0..unique_count]) |k| {
         const next = try M.put(m, k, k +% 7);
-        M.release(@constCast(m));
         m = next;
     }
 
@@ -1033,7 +1172,6 @@ test "DenseMap forced collisions at small capacity" {
 
     for (collide[1..]) |k| {
         const next = try M.put(m, k, k);
-        M.release(@constCast(m));
         m = next;
     }
     try testing.expectEqual(@as(u32, 6), m.?.size());
@@ -1054,7 +1192,6 @@ test "DenseMap resize doubles capacity at load factor breach" {
     var i: u64 = 0;
     while (i < 7) : (i += 1) {
         const next = try M.put(m, i, i * 11);
-        M.release(@constCast(m));
         m = next;
     }
     try testing.expectEqual(@as(u32, 8), m.?.header().capacity);
@@ -1062,7 +1199,6 @@ test "DenseMap resize doubles capacity at load factor breach" {
 
     // 8th insert triggers resize.
     const next = try M.put(m, 7, 77);
-    M.release(@constCast(m));
     m = next;
     try testing.expectEqual(@as(u32, 16), m.?.header().capacity);
     try testing.expectEqual(@as(u32, 8), m.?.size());
@@ -1094,7 +1230,6 @@ test "DenseMap Robin Hood invariant after adversarial inserts" {
     while (i < 50) : (i += 1) {
         const k = random.int(u64);
         const next = try M.put(m, k, k);
-        M.release(@constCast(m));
         m = next;
     }
 
@@ -1120,12 +1255,10 @@ test "DenseMap byte-slice keys" {
     m = try M.put(m, "alpha", 1);
     {
         const next = try M.put(m, "beta", 2);
-        M.release(@constCast(m));
         m = next;
     }
     {
         const next = try M.put(m, "gamma", 3);
-        M.release(@constCast(m));
         m = next;
     }
 
@@ -1143,7 +1276,6 @@ test "DenseMap u32 (Atom-like) keys" {
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
         const next = try M.put(m, i, @as(u64, i) * 100);
-        M.release(@constCast(m));
         m = next;
     }
     try testing.expectEqual(@as(u32, 20), m.?.size());
@@ -1173,7 +1305,6 @@ test "DenseMap delete: swap-remove of middle entry preserves other keys" {
     var i: u64 = 1;
     while (i <= 5) : (i += 1) {
         const next = try M.put(m, i, i * 10);
-        M.release(@constCast(m));
         m = next;
     }
     try testing.expectEqual(@as(u32, 5), m.?.size());
@@ -1182,7 +1313,6 @@ test "DenseMap delete: swap-remove of middle entry preserves other keys" {
     // be replaced by what was previously at entries[4] (key=5). The expected
     // entry order becomes [1, 5, 3, 4].
     const after = M.delete(m, 2);
-    M.release(@constCast(m));
     m = after;
     try testing.expect(m != null);
     try testing.expectEqual(@as(u32, 4), m.?.size());
@@ -1213,13 +1343,11 @@ test "DenseMap delete: last entry needs no swap" {
     var i: u64 = 1;
     while (i <= 4) : (i += 1) {
         const next = try M.put(m, i, i);
-        M.release(@constCast(m));
         m = next;
     }
 
     // Delete the last-inserted key — no swap necessary.
     const after = M.delete(m, 4);
-    M.release(@constCast(m));
     m = after;
 
     try testing.expectEqual(@as(u32, 3), m.?.size());
@@ -1237,14 +1365,17 @@ test "DenseMap delete: only entry yields empty (len=0) map" {
 
     m = try M.put(m, 7, 70);
     const after = M.delete(m, 7);
-    M.release(@constCast(m));
     m = after;
     try testing.expect(m != null); // still a valid (empty) buffer
     try testing.expectEqual(@as(u32, 0), m.?.size());
     try testing.expect(!M.hasKey(m, 7));
 }
 
-test "DenseMap delete: absent key returns fresh clone with same contents" {
+test "DenseMap delete: absent key on unique owner returns same pointer (rc-1 fast path)" {
+    // Phase 1.6 rc-1 fast path: when the input map is uniquely owned
+    // (refcount == 1) AND the key is not present, `delete` performs
+    // no allocation and returns the same handle untouched. The
+    // contents must remain valid and unchanged.
     const M = DenseMap(u64, u64);
     var m: ?*const M = null;
     defer M.release(@constCast(m));
@@ -1252,20 +1383,18 @@ test "DenseMap delete: absent key returns fresh clone with same contents" {
     var i: u64 = 1;
     while (i <= 3) : (i += 1) {
         const next = try M.put(m, i, i * 5);
-        M.release(@constCast(m));
         m = next;
     }
     const original = m.?;
 
     const after = M.delete(m, 999); // not present
     try testing.expect(after != null);
-    try testing.expect(after.? != original); // fresh allocation
+    try testing.expectEqual(original, after.?); // same pointer (rc-1 fast path)
     try testing.expectEqual(@as(u32, 3), after.?.size());
     try testing.expectEqual(@as(u64, 5), M.get(after, 1, 0));
     try testing.expectEqual(@as(u64, 10), M.get(after, 2, 0));
     try testing.expectEqual(@as(u64, 15), M.get(after, 3, 0));
 
-    M.release(@constCast(m));
     m = after;
 }
 
@@ -1299,7 +1428,6 @@ test "DenseMap delete: with forced collisions, remaining keys still findable" {
 
     for (collide[1..]) |k| {
         const next = try M.put(m, k, k);
-        M.release(@constCast(m));
         m = next;
     }
     try testing.expectEqual(@as(u32, 4), m.?.size());
@@ -1307,7 +1435,6 @@ test "DenseMap delete: with forced collisions, remaining keys still findable" {
     // Delete the middle (chronologically 2nd) of the colliding keys.
     const victim = collide[1];
     const after = M.delete(m, victim);
-    M.release(@constCast(m));
     m = after;
 
     try testing.expectEqual(@as(u32, 3), m.?.size());
@@ -1342,7 +1469,6 @@ test "DenseMap delete: backshift compacts displaced buckets" {
     }
     for (collide[1..]) |k| {
         const next = try M.put(m, k, k);
-        M.release(@constCast(m));
         m = next;
     }
     try testing.expectEqual(@as(u32, 5), m.?.size());
@@ -1359,7 +1485,6 @@ test "DenseMap delete: backshift compacts displaced buckets" {
 
     // Delete the home-slot occupant (the first inserted key).
     const after = M.delete(m, collide[0]);
-    M.release(@constCast(m));
     m = after;
     try testing.expectEqual(@as(u32, 4), m.?.size());
 
@@ -1399,7 +1524,6 @@ test "DenseMap keys: returns insertion order" {
     const ks_in = [_]u64{ 10, 20, 30 };
     for (ks_in) |k| {
         const next = try M.put(m, k, k * 7);
-        M.release(@constCast(m));
         m = next;
     }
 
@@ -1419,13 +1543,11 @@ test "DenseMap keys: reflects swap-remove ordering after delete" {
     var i: u64 = 1;
     while (i <= 5) : (i += 1) {
         const next = try M.put(m, i, i);
-        M.release(@constCast(m));
         m = next;
     }
 
     // Delete the 2nd-inserted key. Swap-remove brings key=5 into entries[1].
     const after = M.delete(m, 2);
-    M.release(@constCast(m));
     m = after;
 
     const ks = M.keys(m);
@@ -1452,7 +1574,6 @@ test "DenseMap values: insertion order" {
     const ks = [_]u64{ 1, 2, 3 };
     for (ks) |k| {
         const next = try M.put(m, k, k * 100);
-        M.release(@constCast(m));
         m = next;
     }
     const vs = M.values(m);
@@ -1471,11 +1592,9 @@ test "DenseMap values: reflects swap-remove ordering after delete" {
     var i: u64 = 1;
     while (i <= 5) : (i += 1) {
         const next = try M.put(m, i, i * 11);
-        M.release(@constCast(m));
         m = next;
     }
     const after = M.delete(m, 2);
-    M.release(@constCast(m));
     m = after;
     const vs = M.values(m);
     defer M.freeValues(vs);
@@ -1500,7 +1619,6 @@ test "DenseMap next: yields every entry exactly once across repeated calls" {
     const ks_in = [_]u64{ 10, 20, 30, 40, 50 };
     for (ks_in) |k| {
         const next = try M.put(m, k, k + 1);
-        M.release(@constCast(m));
         m = next;
     }
 
@@ -1569,7 +1687,6 @@ test "DenseMap delete: Robin Hood invariant holds after deletion" {
         }
         if (dup) continue;
         const next = try M.put(m, k, k);
-        M.release(@constCast(m));
         m = next;
         inserted[n] = k;
         n += 1;
@@ -1579,7 +1696,6 @@ test "DenseMap delete: Robin Hood invariant holds after deletion" {
     var i: usize = 0;
     while (i < inserted.len) : (i += 3) {
         const next = M.delete(m, inserted[i]);
-        M.release(@constCast(m));
         m = next;
     }
 
@@ -1696,21 +1812,9 @@ test "DenseMap release deep-releases ARC-managed V children on zero-transition" 
     try testing.expectEqual(@as(u32, 1), stub_b.header.count());
     try testing.expectEqual(@as(u32, 1), stub_c.header.count());
 
-    {
-        const next = try M.put(m, 1, stub_a);
-        M.release(@constCast(m));
-        m = next;
-    }
-    {
-        const next = try M.put(m, 2, stub_b);
-        M.release(@constCast(m));
-        m = next;
-    }
-    {
-        const next = try M.put(m, 3, stub_c);
-        M.release(@constCast(m));
-        m = next;
-    }
+    m = try M.put(m, 1, stub_a);
+    m = try M.put(m, 2, stub_b);
+    m = try M.put(m, 3, stub_c);
 
     // Map holds the only reference to each stub.
     try testing.expectEqual(@as(u32, 1), stub_a.header.count());
@@ -1732,11 +1836,7 @@ test "DenseMap release: shared ARC children survive when other owners exist" {
     // to the map. After put, refcount is 2: the external owner +
     // the map.
     _ = ArcStub.retain(stub);
-    {
-        const next = try M.put(m, 1, stub);
-        M.release(@constCast(m));
-        m = next;
-    }
+    m = try M.put(m, 1, stub);
     try testing.expectEqual(@as(u32, 2), stub.header.count());
 
     // Releasing the map deep-releases its copy of the stub pointer.
@@ -1759,27 +1859,15 @@ test "DenseMap delete deep-releases the removed entry's ARC value" {
     _ = ArcStub.retain(stub_keep); // external owner so we can observe
     _ = ArcStub.retain(stub_drop); // external owner so we can observe
 
-    {
-        const next = try M.put(m, 1, stub_keep);
-        M.release(@constCast(m));
-        m = next;
-    }
-    {
-        const next = try M.put(m, 2, stub_drop);
-        M.release(@constCast(m));
-        m = next;
-    }
+    m = try M.put(m, 1, stub_keep);
+    m = try M.put(m, 2, stub_drop);
 
     // External(1) + map(1) = 2 each.
     try testing.expectEqual(@as(u32, 2), stub_keep.header.count());
     try testing.expectEqual(@as(u32, 2), stub_drop.header.count());
 
     // Delete key 2: the map releases its copy of stub_drop.
-    {
-        const after = M.delete(m, 2);
-        M.release(@constCast(m));
-        m = after;
-    }
+    m = M.delete(m, 2);
     try testing.expectEqual(@as(u32, 2), stub_keep.header.count());
     try testing.expectEqual(@as(u32, 1), stub_drop.header.count());
 
@@ -1798,19 +1886,11 @@ test "DenseMap put-update deep-releases the overwritten ARC value" {
     _ = ArcStub.retain(stub_old);
     _ = ArcStub.retain(stub_new);
 
-    {
-        const next = try M.put(m, 1, stub_old);
-        M.release(@constCast(m));
-        m = next;
-    }
+    m = try M.put(m, 1, stub_old);
     try testing.expectEqual(@as(u32, 2), stub_old.header.count());
 
     // Overwrite the value at key 1. The old value must be released.
-    {
-        const next = try M.put(m, 1, stub_new);
-        M.release(@constCast(m));
-        m = next;
-    }
+    m = try M.put(m, 1, stub_new);
     try testing.expectEqual(@as(u32, 1), stub_old.header.count()); // map dropped its copy
     try testing.expectEqual(@as(u32, 2), stub_new.header.count()); // map now holds new
 
@@ -1818,3 +1898,282 @@ test "DenseMap put-update deep-releases the overwritten ARC value" {
     ArcStub.release(stub_new);
 }
 
+// =============================================================================
+// 1.6 — rc-1 fast path on put / delete + merge
+// =============================================================================
+
+test "DenseMap put on unique-owner map returns same pointer when no resize" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    m = try M.put(m, 1, 10);
+    const before = m.?;
+    // Unique owner, capacity has room: same pointer must come back.
+    m = try M.put(m, 2, 20);
+    try testing.expectEqual(before, m.?);
+    m = try M.put(m, 3, 30);
+    try testing.expectEqual(before, m.?);
+
+    // Update path also returns same pointer.
+    m = try M.put(m, 2, 222);
+    try testing.expectEqual(before, m.?);
+    try testing.expectEqual(@as(u64, 222), M.get(m, 2, 0));
+}
+
+test "DenseMap put on unique-owner map returns new pointer when resize triggers" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    // Fill to load factor (7 entries at cap=8 is exactly 7/8 — the 8th
+    // insert triggers a resize).
+    var i: u64 = 0;
+    while (i < 7) : (i += 1) {
+        m = try M.put(m, i, i);
+    }
+    const before = m.?;
+    try testing.expectEqual(@as(u32, 8), before.header().capacity);
+
+    // Resize: pointer changes.
+    m = try M.put(m, 7, 7);
+    try testing.expect(before != m.?);
+    try testing.expectEqual(@as(u32, 16), m.?.header().capacity);
+    try testing.expectEqual(@as(u32, 8), m.?.size());
+
+    // All keys preserved through the resize.
+    i = 0;
+    while (i < 8) : (i += 1) {
+        try testing.expectEqual(i, M.get(m, i, 999));
+    }
+}
+
+test "DenseMap put on shared map returns new pointer; original unchanged" {
+    const M = DenseMap(u64, u64);
+    var m_a: ?*const M = null;
+    defer M.release(@constCast(m_a));
+
+    m_a = try M.put(m_a, 1, 100);
+    m_a = try M.put(m_a, 2, 200);
+
+    // Share by retain. Both owners now hold the same buffer.
+    const m_b = M.retain(m_a);
+    defer M.release(@constCast(m_b));
+    try testing.expectEqual(@as(u32, 2), m_a.?.header().arc_header.count());
+
+    // Put on m_a must clone (rc>1). The clone has rc=1, the original
+    // still has rc=2 (original count) -1 (we don't drop) wait... actually
+    // we don't drop a reference — the function leaves m_a untouched.
+    // The clone has rc=1 and m_a's buffer still has rc=2 (m_a + m_b).
+    const m_a_new = try M.put(m_a, 3, 300);
+    try testing.expect(m_a_new != m_a.?);
+    try testing.expectEqual(@as(u32, 1), m_a_new.header().arc_header.count());
+    try testing.expectEqual(@as(u32, 2), m_a.?.header().arc_header.count());
+
+    // Original still has 2 entries; clone has 3.
+    try testing.expectEqual(@as(u32, 2), m_a.?.size());
+    try testing.expectEqual(@as(u32, 3), m_a_new.size());
+    try testing.expect(!M.hasKey(m_a, 3));
+    try testing.expect(M.hasKey(m_a_new, 3));
+
+    // Drop the clone.
+    M.release(m_a_new);
+}
+
+test "DenseMap delete on unique-owner map returns same pointer" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    var i: u64 = 1;
+    while (i <= 4) : (i += 1) {
+        m = try M.put(m, i, i);
+    }
+    const before = m.?;
+
+    // rc=1, key found: same pointer.
+    m = M.delete(m, 2);
+    try testing.expectEqual(before, m.?);
+    try testing.expectEqual(@as(u32, 3), m.?.size());
+    try testing.expect(!M.hasKey(m, 2));
+}
+
+test "DenseMap delete on shared map returns new pointer; original unchanged" {
+    const M = DenseMap(u64, u64);
+    var m_a: ?*const M = null;
+    defer M.release(@constCast(m_a));
+
+    m_a = try M.put(m_a, 1, 1);
+    m_a = try M.put(m_a, 2, 2);
+    m_a = try M.put(m_a, 3, 3);
+
+    const m_b = M.retain(m_a);
+    defer M.release(@constCast(m_b));
+
+    // rc=2, key found -> clone+delete.
+    const m_a_new = M.delete(m_a, 2);
+    try testing.expect(m_a_new != null);
+    try testing.expect(m_a_new.? != m_a.?);
+
+    // Original unchanged, clone has the deletion applied.
+    try testing.expectEqual(@as(u32, 3), m_a.?.size());
+    try testing.expect(M.hasKey(m_a, 2));
+    try testing.expectEqual(@as(u32, 2), m_a_new.?.size());
+    try testing.expect(!M.hasKey(m_a_new, 2));
+
+    M.release(m_a_new);
+}
+
+test "DenseMap delete absent key on unique owner returns same pointer" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    m = try M.put(m, 1, 1);
+    m = try M.put(m, 2, 2);
+    const before = m.?;
+
+    // rc=1, key absent: same pointer.
+    m = M.delete(m, 999);
+    try testing.expectEqual(before, m.?);
+    try testing.expectEqual(@as(u32, 2), m.?.size());
+}
+
+test "DenseMap delete absent key on shared map returns fresh clone" {
+    const M = DenseMap(u64, u64);
+    var m_a: ?*const M = null;
+    defer M.release(@constCast(m_a));
+
+    m_a = try M.put(m_a, 1, 1);
+    m_a = try M.put(m_a, 2, 2);
+
+    const m_b = M.retain(m_a);
+    defer M.release(@constCast(m_b));
+
+    // rc=2, key absent: clone (with deep-retain of K/V), no mutation.
+    const m_clone = M.delete(m_a, 999);
+    try testing.expect(m_clone != null);
+    try testing.expect(m_clone.? != m_a.?);
+    try testing.expectEqual(@as(u32, 2), m_clone.?.size());
+    try testing.expectEqual(@as(u64, 1), M.get(m_clone, 1, 0));
+    try testing.expectEqual(@as(u64, 2), M.get(m_clone, 2, 0));
+
+    M.release(m_clone);
+}
+
+test "DenseMap merge: non-overlapping keys yields union" {
+    const M = DenseMap(u64, u64);
+    var a: ?*const M = null;
+    var b: ?*const M = null;
+    defer M.release(@constCast(a));
+    defer M.release(@constCast(b));
+
+    a = try M.put(a, 1, 100);
+    a = try M.put(a, 2, 200);
+    b = try M.put(b, 3, 300);
+    b = try M.put(b, 4, 400);
+
+    const merged = try M.merge(a, b);
+    defer M.release(@constCast(merged));
+
+    try testing.expect(merged != null);
+    try testing.expectEqual(@as(u32, 4), merged.?.size());
+    try testing.expectEqual(@as(u64, 100), M.get(merged, 1, 0));
+    try testing.expectEqual(@as(u64, 200), M.get(merged, 2, 0));
+    try testing.expectEqual(@as(u64, 300), M.get(merged, 3, 0));
+    try testing.expectEqual(@as(u64, 400), M.get(merged, 4, 0));
+}
+
+test "DenseMap merge: overlapping keys — b's value wins" {
+    const M = DenseMap(u64, u64);
+    var a: ?*const M = null;
+    var b: ?*const M = null;
+    defer M.release(@constCast(a));
+    defer M.release(@constCast(b));
+
+    a = try M.put(a, 1, 100);
+    a = try M.put(a, 2, 200);
+    b = try M.put(b, 2, 222); // overlap on key 2
+    b = try M.put(b, 3, 333);
+
+    const merged = try M.merge(a, b);
+    defer M.release(@constCast(merged));
+
+    try testing.expectEqual(@as(u32, 3), merged.?.size());
+    try testing.expectEqual(@as(u64, 100), M.get(merged, 1, 0));
+    try testing.expectEqual(@as(u64, 222), M.get(merged, 2, 0)); // b wins
+    try testing.expectEqual(@as(u64, 333), M.get(merged, 3, 0));
+}
+
+test "DenseMap merge: null left operand returns retained right" {
+    const M = DenseMap(u64, u64);
+    var b: ?*const M = null;
+    defer M.release(@constCast(b));
+
+    b = try M.put(b, 1, 1);
+    b = try M.put(b, 2, 2);
+    const before_count = b.?.header().arc_header.count();
+
+    const merged = try M.merge(null, b);
+    defer M.release(@constCast(merged));
+
+    // The merged handle is the same buffer as b, just retained.
+    try testing.expectEqual(b, merged);
+    try testing.expectEqual(before_count + 1, b.?.header().arc_header.count());
+}
+
+test "DenseMap merge: null right operand returns retained left" {
+    const M = DenseMap(u64, u64);
+    var a: ?*const M = null;
+    defer M.release(@constCast(a));
+
+    a = try M.put(a, 1, 1);
+    const before_count = a.?.header().arc_header.count();
+
+    const merged = try M.merge(a, null);
+    defer M.release(@constCast(merged));
+
+    try testing.expectEqual(a, merged);
+    try testing.expectEqual(before_count + 1, a.?.header().arc_header.count());
+}
+
+test "DenseMap merge: both null returns null" {
+    const M = DenseMap(u64, u64);
+    const merged = try M.merge(null, null);
+    try testing.expectEqual(@as(?*const M, null), merged);
+}
+
+test "DenseMap merge: source maps unaffected by ARC walk" {
+    // The merge walks `b`'s entries and `put`s each into a result. The
+    // source map `b` (and `a`) must be unaffected — their refcounts
+    // stay where they were, and their entries remain valid.
+    const M = DenseMap(u64, ?*const ArcStub);
+    var a: ?*const M = null;
+    var b: ?*const M = null;
+    defer M.release(@constCast(a));
+    defer M.release(@constCast(b));
+
+    const stub_a = ArcStub.create(1);
+    const stub_b = ArcStub.create(2);
+    _ = ArcStub.retain(stub_a); // external observer
+    _ = ArcStub.retain(stub_b);
+
+    a = try M.put(a, 1, stub_a);
+    b = try M.put(b, 2, stub_b);
+
+    // External(1) + map(1) = 2 each.
+    try testing.expectEqual(@as(u32, 2), stub_a.header.count());
+    try testing.expectEqual(@as(u32, 2), stub_b.header.count());
+
+    const merged = try M.merge(a, b);
+    defer M.release(@constCast(merged));
+
+    // After merge: stub_a is in (a) and (merged) — 1+1+1 = 3 owners.
+    // stub_b is in (b) and (merged) — also 3 owners.
+    try testing.expectEqual(@as(u32, 3), stub_a.header.count());
+    try testing.expectEqual(@as(u32, 3), stub_b.header.count());
+
+    // Cleanup: release external observers.
+    ArcStub.release(stub_a);
+    ArcStub.release(stub_b);
+}
