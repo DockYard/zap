@@ -659,18 +659,50 @@ fn ownershipOf(
     return function.local_ownership[local_id];
 }
 
-/// Look up `local_id`'s parameter convention if the local is a
-/// parameter binding, otherwise `null`. Parameter LocalIds occupy
-/// the first `param_conventions.len` slots in the function's
-/// local-id space (the IR builder allocates them in order via
-/// `param_get` instructions before any other locals).
+/// Look up `local_id`'s parameter convention if the local is the
+/// destination of a `param_get` instruction, otherwise `null`.
+///
+/// Phase H.1 fix: previously this routine treated `local_id <
+/// param_conventions.len` as "is parameter local," but that
+/// assumption only holds when the IR builder happens to emit
+/// param_get destinations in slots `0..arity-1`. Multi-clause
+/// dispatch and pattern-bound clauses pre-reserve binding locals
+/// before allocating param locals, so a "small" local id can
+/// belong to a non-parameter binding (e.g. a `share_value` dest
+/// allocated immediately after a `param_get`). Looking up
+/// `param_conventions[local_id]` in that case returns the wrong
+/// convention and trips V4 spuriously.
+///
+/// The reliable mapping is "scan the function body for the
+/// `.param_get` whose `dest == local_id` and return the convention
+/// for `param_conventions[index]`." Scanning is O(local_count) per
+/// call; verifier work is already O(local_count) overall, so this
+/// stays linear in function size.
 fn paramConventionOf(
     function: *const ir.Function,
     local_id: ir.LocalId,
 ) ?ir.ParamConvention {
-    if (local_id >= function.param_conventions.len) return null;
-    return function.param_conventions[local_id];
+    var ctx = ParamGetWalker{ .target = local_id };
+    ir.forEachInstruction(function, &ctx, ParamGetWalker.visit);
+    const idx = ctx.found_index orelse return null;
+    if (idx >= function.param_conventions.len) return null;
+    return function.param_conventions[idx];
 }
+
+const ParamGetWalker = struct {
+    target: ir.LocalId,
+    found_index: ?u32 = null,
+
+    fn visit(self: *@This(), instr: *const ir.Instruction) void {
+        if (self.found_index != null) return;
+        switch (instr.*) {
+            .param_get => |pg| {
+                if (pg.dest == self.target) self.found_index = pg.index;
+            },
+            else => {},
+        }
+    }
+};
 
 /// Test-mode flag suppressing diagnostic output. Negative tests
 /// expect a violation and don't need the verifier to spam the
@@ -1007,11 +1039,16 @@ test "arc_verifier: rejects release of borrowed-convention parameter (V4)" {
     // is defensive: even if `local_ownership` drifted to `.owned`,
     // the parameter convention is the source of truth.
     const allocator = testing.allocator;
-    // Local 0 is a parameter; its local_ownership says .owned but
-    // its param_conventions says .borrowed.
+    // Phase H.1: V4's parameter detection now scans `.param_get`
+    // instructions to map local ids to parameter indices (the prior
+    // "first arity slots are params" heuristic broke once binding
+    // pre-allocation pushed param locals past arity-1). The test IR
+    // therefore needs an explicit `.param_get` to declare local 0 as
+    // parameter index 0.
     const ownership = [_]ir.OwnershipClass{.owned};
     const conventions = [_]ir.ParamConvention{.borrowed};
     const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
         .{ .release = .{ .value = 0 } },
     };
     var function = try buildTestFunction(

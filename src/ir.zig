@@ -1171,6 +1171,20 @@ pub fn isArcManagedTypeId(type_store: *const types_mod.TypeStore, type_id: types
     // ownership-transfer-aware liveness, V1–V7 verifiers) so that
     // every `.map` value flows through the same retain/release ABI as
     // opaque types.
+    //
+    // Phase H.1 lays the substrate for adding `.list` to this set —
+    // `List(T)` cells now carry an inline `ArcHeader`, are pool-
+    // allocated, and implement deep retain/release. The flag itself
+    // is NOT flipped here yet: the IR-level chain still has gaps
+    // that produce unanalyzable ZIR for runtime-built lists (Zig's
+    // Air/Liveness asserts `post-live-set should be a subset of
+    // pre-live-set` on the generated code). The supporting fixes
+    // landed in this phase — list-binding HIR-type propagation
+    // (`recordListChildHirType`), share_value HIR-type fallback for
+    // call-result locals tagged `UNKNOWN`, and the verifier's
+    // `paramConventionOf` walking `param_get` instructions — make
+    // the flip cleanly possible once the Air/Liveness gap is
+    // closed in Phase H.2.
     return switch (type_store.getType(type_id)) {
         .opaque_type, .map => true,
         else => false,
@@ -4690,6 +4704,14 @@ pub const IrBuilder = struct {
                         .list_head = .{ .dest = head_local, .list = current_list, .element_type = elem_type, .via_helper = dispatch_via_helper },
                     });
                     try self.known_local_types.put(head_local, elem_type);
+                    // Phase H.1: propagate the HIR element type so any
+                    // downstream local_get/share_value chain that flows
+                    // from this head into a function argument sees a
+                    // consistent ARC-managed status. Without this, the
+                    // chain falls back to `.trivial` and the verifier's
+                    // V2 invariant rejects the matching post-call
+                    // release once `.list` joins the ARC-managed set.
+                    try self.recordListChildHirType(current_list, head_local, .element);
                     try scrutinee_map.put(clc.head_scrutinee_ids[i], head_local);
                     if (i + 1 < clc.head_count) {
                         const next_list = self.next_local;
@@ -4698,6 +4720,10 @@ pub const IrBuilder = struct {
                             .list_tail = .{ .dest = next_list, .list = current_list, .element_type = elem_type, .via_helper = dispatch_via_helper },
                         });
                         try self.known_local_types.put(next_list, scrutinee_list_type);
+                        // Same propagation for intermediate tail locals
+                        // (multi-head pattern unfolds chain into a series
+                        // of list_tails feeding into the next list_head).
+                        try self.recordListChildHirType(current_list, next_list, .list);
                         current_list = next_list;
                     }
                 }
@@ -4707,6 +4733,7 @@ pub const IrBuilder = struct {
                     .list_tail = .{ .dest = tail_local, .list = current_list, .element_type = elem_type, .via_helper = dispatch_via_helper },
                 });
                 try self.known_local_types.put(tail_local, scrutinee_list_type);
+                try self.recordListChildHirType(current_list, tail_local, .list);
                 try scrutinee_map.put(clc.tail_scrutinee_id, tail_local);
                 try self.lowerDecisionTreeForCase(clc.success, case_arms, scrutinee_map, 0);
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
@@ -4872,6 +4899,14 @@ pub const IrBuilder = struct {
                             if (param_type != .any) {
                                 try self.known_local_types.put(pl, param_type);
                             }
+                            // Propagate the param's HIR type so downstream
+                            // chains (local_get, share_value, release) see
+                            // the correct ARC-managed status. Without this,
+                            // the fallback-param local's hir type stays
+                            // unset and any reuse of `binding.local_index`
+                            // via local_get below cannot inherit the
+                            // expected list HIR type.
+                            try self.local_hir_types.put(pl, clause.params[binding.param_index].type_id);
                         }
                         break :blk pl;
                     };
@@ -4885,6 +4920,16 @@ pub const IrBuilder = struct {
                         },
                     });
                     try self.known_local_types.put(binding.local_index, list_elem_type);
+                    // Phase H.1: propagate the HIR element type onto the
+                    // binding local. Without this, the binding's
+                    // `local_hir_types` entry stays at whatever the local
+                    // id had been used for previously (often non-ARC),
+                    // which causes `isArcManagedLocal(binding)` to return
+                    // false and breaks any downstream
+                    // share_value/release chain whose source flows from
+                    // this binding. Pulled from the list's recorded HIR
+                    // type via the type-store's `.list.element` field.
+                    try self.recordListChildHirType(list_local, binding.local_index, .element);
                 }
                 // Emit cons tail bindings: copy decision tree tail locals to binding locals
                 for (clause.cons_tail_bindings) |binding| {
@@ -4902,6 +4947,18 @@ pub const IrBuilder = struct {
                         .list_tail = .{ .dest = binding.local_index, .list = list_local, .element_type = list_elem_type },
                     });
                     try self.known_local_types.put(binding.local_index, scrutinee_list_type);
+                    // Phase H.1: propagate the HIR list type onto the
+                    // tail binding local. The tail of a list has the
+                    // same list HIR type as the source list — pull it
+                    // from the source's recorded `local_hir_types`
+                    // entry. Without this, the binding's hir type
+                    // stays unset (or stale from a prior reuse of the
+                    // local id), and the downstream
+                    // share_value/release path fires on a local whose
+                    // ownership class is computed as `.trivial`,
+                    // tripping the verifier's V2 invariant once
+                    // `.list` joins the ARC-managed type set.
+                    try self.recordListChildHirType(list_local, binding.local_index, .list);
                 }
                 // Emit binary/struct bindings
                 try self.emitBinaryBindings(clause);
@@ -5025,6 +5082,7 @@ pub const IrBuilder = struct {
                         .list_get = .{ .dest = elem_local, .list = scrutinee_local, .index = i, .element_type = elem_type },
                     });
                     try self.known_local_types.put(elem_local, elem_type);
+                    try self.recordListChildHirType(scrutinee_local, elem_local, .element);
                     try scrutinee_map.put(findParamGetIdInDecision(cl.success, i), elem_local);
                 }
                 try self.lowerDecisionTreeForDispatch(cl.success, clauses, scrutinee_map);
@@ -5057,6 +5115,7 @@ pub const IrBuilder = struct {
                         .list_head = .{ .dest = head_local, .list = current_list, .element_type = elem_type },
                     });
                     try self.known_local_types.put(head_local, elem_type);
+                    try self.recordListChildHirType(current_list, head_local, .element);
                     try scrutinee_map.put(clc.head_scrutinee_ids[i], head_local);
                     if (i + 1 < clc.head_count) {
                         const next_list = self.next_local;
@@ -5065,6 +5124,7 @@ pub const IrBuilder = struct {
                             .list_tail = .{ .dest = next_list, .list = current_list, .element_type = elem_type },
                         });
                         try self.known_local_types.put(next_list, scrutinee_list_type);
+                        try self.recordListChildHirType(current_list, next_list, .list);
                         current_list = next_list;
                     }
                 }
@@ -5075,6 +5135,7 @@ pub const IrBuilder = struct {
                     .list_tail = .{ .dest = tail_local, .list = current_list, .element_type = elem_type },
                 });
                 try self.known_local_types.put(tail_local, scrutinee_list_type);
+                try self.recordListChildHirType(current_list, tail_local, .list);
                 try scrutinee_map.put(clc.tail_scrutinee_id, tail_local);
 
                 try self.lowerDecisionTreeForDispatch(clc.success, clauses, scrutinee_map);
@@ -5449,13 +5510,60 @@ pub const IrBuilder = struct {
         return last_local;
     }
 
+    /// Phase H.1: kind of HIR-type relationship between a list local
+    /// and a child binding produced by pattern destructuring or
+    /// decision-tree extraction. Used by `recordListChildHirType` to
+    /// pick the correct extraction (`.element` -> the list's element
+    /// type; `.list` -> the same list type as the source).
+    const ListChildKind = enum { element, list };
+
+    /// Look up the HIR type recorded for `list_local` and propagate
+    /// the appropriate child type onto `child_local`. For `.element`,
+    /// the child receives the list's element TypeId; for `.list`, the
+    /// child receives the same list TypeId (e.g. tail bindings whose
+    /// type matches the source list).
+    ///
+    /// Phase H.1: this is the load-bearing fix that lets list-child
+    /// bindings (head extraction, tail extraction) participate in the
+    /// same ARC-managed classification as their source. Without it,
+    /// the binding's `local_hir_types` entry stays unset (or stale
+    /// from a prior reuse of the local id), and any downstream
+    /// `share_value`/`release` chain whose source flows from this
+    /// binding fires on a local whose ownership class is `.trivial`
+    /// — tripping the verifier's V2 invariant the moment `.list`
+    /// joins the ARC-managed type set.
+    ///
+    /// Silent no-op when the source's HIR type is unknown or not a
+    /// list — the conservative fallback preserves existing behavior
+    /// for non-list scrutinees and makes the helper safe to call from
+    /// every list-extraction site.
+    fn recordListChildHirType(
+        self: *IrBuilder,
+        list_local: LocalId,
+        child_local: LocalId,
+        kind: ListChildKind,
+    ) !void {
+        const list_hir = self.local_hir_types.get(list_local) orelse return;
+        const store = self.type_store orelse return;
+        if (list_hir >= store.types.items.len) return;
+        const list_type = store.getType(list_hir);
+        if (list_type != .list) return;
+        switch (kind) {
+            .element => try self.local_hir_types.put(child_local, list_type.list.element),
+            .list => try self.local_hir_types.put(child_local, list_hir),
+        }
+    }
+
     fn isArcManagedType(self: *const IrBuilder, type_id: hir_mod.TypeId) bool {
         const store = self.type_store orelse return false;
-        // Phase F flip: `.map` joins `.opaque_type` as ARC-managed.
-        // Mirror `isArcManagedTypeId` exactly — both predicates are
-        // queried from different code paths (free-function vs. method)
-        // but must agree on every type. See the doc comment on
-        // `isArcManagedTypeId` for the architectural rationale.
+        // Phase F flip: `.map` joined `.opaque_type` as ARC-managed.
+        // Phase H.1 substrate landed (`List(T)` Arc-header + pool
+        // refactor in `runtime.zig`); the `.list` flip itself is
+        // deferred to Phase H.2 because the IR-level chain still
+        // produces ZIR that Zig's Air/Liveness rejects with the
+        // `post-live-set should be a subset of pre-live-set`
+        // assertion. Keep `isArcManagedTypeId` and this method in
+        // lockstep — both must agree on every type.
         return switch (store.getType(type_id)) {
             .opaque_type, .map => true,
             else => false,
@@ -5998,12 +6106,27 @@ pub const IrBuilder = struct {
                                 // looks like it targets a `.trivial` local
                                 // (the default for unknown HIR types) and
                                 // the verifier raises a spurious mismatch.
-                                // Prefer the source's tracked HIR type;
-                                // fall back to `arg.expr.type_id` (which
-                                // is ARC-managed by construction in this
-                                // branch) when the source has no tracked
-                                // type.
-                                const shared_hir_type: hir_mod.TypeId = self.local_hir_types.get(arg_local) orelse arg.expr.type_id;
+                                //
+                                // Phase H.1: prefer `arg.expr.type_id` when
+                                // it is ARC-managed and the source local's
+                                // tracked HIR type is `UNKNOWN` or non-ARC.
+                                // The for-comprehension desugaring produces
+                                // call results whose `local_hir_types` entry
+                                // ends up tagged with the synthetic
+                                // `UNKNOWN` type, but the type checker has
+                                // resolved the call's `expr.type_id` to the
+                                // correct list type. Using the type-checked
+                                // expression type at the share site keeps
+                                // the shared-local's ownership class in
+                                // sync with the runtime ABI: we already
+                                // know `arg.expr.type_id` is ARC-managed
+                                // (the surrounding `if` predicate gates
+                                // the branch on exactly that).
+                                const tracked_hir = self.local_hir_types.get(arg_local);
+                                const shared_hir_type: hir_mod.TypeId = if (tracked_hir) |tid|
+                                    (if (self.isArcManagedType(tid)) tid else arg.expr.type_id)
+                                else
+                                    arg.expr.type_id;
                                 try self.local_hir_types.put(shared_local, shared_hir_type);
                                 // Propagate param-backed marker so dispatch
                                 // encoders that fall back to runtime type-
