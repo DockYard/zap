@@ -713,6 +713,18 @@ pub fn mapInstrumentationOnAlloc(
 /// Hook invoked from `Map(K, V).retain` after the refcount bump. The
 /// caller passes the post-bump strong count so the hook does not have
 /// to re-read the atomic.
+///
+/// `Map.retain` is reached through two paths. Container-style
+/// retains (List cons head retain, Map entry storage, struct field
+/// assignment) route through `ArcRuntime.retainAnyPersistent`, which
+/// dispatches to the type's `retain` method and therefore reaches
+/// this hook. Transient borrow-pass retains emitted by the IR
+/// verifier (the `share_value mode=retain` lowering paired with a
+/// matching post-call release) route through `ArcRuntime.retainAny`,
+/// which performs a direct header bump and never reaches this hook.
+/// That split is what lets the Map workload classifier distinguish a
+/// genuine concurrent owner (true sharing event) from temporary
+/// borrow plumbing that resolves before the next mutation.
 pub fn mapInstrumentationOnRetain(cell_ptr: usize, new_strong_count: u32) void {
     if (!instrument_map) return;
     if (!instrumentation_state.initialised) return;
@@ -787,10 +799,16 @@ pub fn mapInstrumentationBumpMutation(
     return .{ .instance_id = 0, .lineage_id = 0, .had_share_event = false };
 }
 
-/// After a mutation produces a fresh derived map at `result_ptr`, mark
-/// the *input* map as having had a post-share mutation (iff the input
-/// was previously shared and the result is a distinct cell). Called
-/// from `put`/`delete`/`merge` after the new cell pointer is known.
+/// After a mutation produces a fresh derived map at `result_ptr`,
+/// mark the *input* map as having had a post-share mutation iff the
+/// input was already classified as having had a share event and the
+/// result is a distinct cell. Called from `put`/`delete`/`merge`
+/// after the new cell pointer is known. The share-event flag is set
+/// only by `mapInstrumentationOnRetain` for retains that route
+/// through `retainAnyPersistent` — transient borrow-pass retains
+/// (`retainAny`) never flip the flag, so a "post-share mutation"
+/// here means a genuine concurrent owner observed the older
+/// version.
 pub fn mapInstrumentationNotePostShareMutation(input_cell_ptr: usize) void {
     if (!instrument_map) return;
     if (!instrumentation_state.initialised) return;
@@ -1465,7 +1483,16 @@ pub const ArcRuntime = struct {
         }
     }
 
-    /// Retain (increment refcount) an Arc-managed value given a pointer to the value field.
+    /// Generic ARC retain used for *transient* borrow-pass plumbing —
+    /// the IR `share_value mode=retain` lowering. This pairs with a
+    /// matching post-call `releaseAny` so the retain represents
+    /// temporary ownership that resolves before the next user-visible
+    /// mutation. Type-specific instrumentation hooks (Map workload
+    /// share-event classifier in particular) deliberately do *not*
+    /// fire on this path. Use `retainAnyPersistent` instead when the
+    /// retain represents a new long-lived owner — for example a List
+    /// cons cell stashing the value in its head, a Map entry's
+    /// retained value, or a struct field assignment.
     pub fn retainAny(ptr: anytype) void {
         if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
             const unwrapped = ptr orelse return;
@@ -1473,13 +1500,32 @@ pub const ArcRuntime = struct {
         }
         const T = arcPtrChild(@TypeOf(ptr));
         if (comptime hasInlineArcHeader(T)) {
-            // Route through `T.retain` when the type provides one so
-            // type-specific bookkeeping (e.g. Map workload
-            // instrumentation hooks) observes every share event,
-            // including those that originate from container retains
-            // (List head retain, struct field retain, etc.). When `T`
-            // does not expose a `retain` method, fall back to the
-            // direct header bump.
+            const mut: *T = @constCast(ptr);
+            mut.header.retain();
+            arc_retains_total += 1;
+            return;
+        }
+        const Inner = Arc(T).Inner;
+        const inner: *Inner = @constCast(@fieldParentPtr("value", ptr));
+        inner.header.retain();
+        arc_retains_total += 1;
+    }
+
+    /// Retain for *persistent* container ownership: the caller is
+    /// stashing the ARC value inside another long-lived owner — a
+    /// List cons cell, a Map entry's value, a struct field. Routes
+    /// through the type's public `retain` method when one exists so
+    /// type-specific bookkeeping fires; in particular this is the
+    /// retain path the Map workload instrumentation classifies as a
+    /// real concurrent-owner share event. `retainAny` (above) covers
+    /// the symmetric transient case.
+    pub fn retainAnyPersistent(ptr: anytype) void {
+        if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
+            const unwrapped = ptr orelse return;
+            return retainAnyPersistent(unwrapped);
+        }
+        const T = arcPtrChild(@TypeOf(ptr));
+        if (comptime hasInlineArcHeader(T)) {
             if (comptime @hasDecl(T, "retain")) {
                 _ = T.retain(@as(?*const T, ptr));
                 return;
@@ -5444,7 +5490,12 @@ pub fn List(comptime T: type) type {
                 },
                 .pointer => |p| {
                     if (p.size == .one) {
-                        ArcRuntime.retainAny(@as(*const p.child, @constCast(head_value)));
+                        // List cons cells are persistent containers
+                        // — the head value remains owned by the cell
+                        // for as long as the cell lives. Use the
+                        // persistent retain path so type-specific
+                        // share-event instrumentation fires.
+                        ArcRuntime.retainAnyPersistent(@as(*const p.child, @constCast(head_value)));
                     }
                 },
                 .@"struct" => {
@@ -5465,7 +5516,7 @@ pub fn List(comptime T: type) type {
                 },
                 .pointer => |p| {
                     if (p.size == .one) {
-                        ArcRuntime.retainAny(@as(*const p.child, @constCast(value)));
+                        ArcRuntime.retainAnyPersistent(@as(*const p.child, @constCast(value)));
                     }
                 },
                 .@"struct" => {
