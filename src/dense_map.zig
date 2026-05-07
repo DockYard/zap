@@ -572,6 +572,110 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
         }
 
         // -------------------------------------------------------------------
+        // Iteration API (1.7)
+        // -------------------------------------------------------------------
+        //
+        // The runtime's existing `Map(K, V)` returns `?*const List(K|V)` from
+        // `keys` / `values`. Wiring DenseMap to `runtime.zig::List` here would
+        // create a circular import: `runtime.zig` already takes ownership of
+        // building the public Map (Phase 1d swap). For this isolated phase
+        // we hand back plain slices into the live entries array; the Phase
+        // 1d runtime swap will adapt them to `List(T)` at the call boundary.
+        //
+        // TODO(phase-1d): when DenseMap replaces the public Map(K, V) in
+        // runtime.zig, change `keys` / `values` to return `?*const List(K|V)`
+        // by cons-ing the slice contents at the runtime layer (or accept a
+        // List-builder function as a comptime parameter).
+
+        /// Walk all keys in insertion order. Materializes a heap-allocated
+        /// slice; callers must release it via `freeKeys`. Empty map returns
+        /// an empty slice that's still safe to pass to `freeKeys`.
+        pub fn keys(maybe_map: ?*const Self) []const K {
+            const map = maybe_map orelse return &[_]K{};
+            const len = map.header().len;
+            if (len == 0) return &[_]K{};
+            const allocator = std.heap.page_allocator;
+            const out = allocator.alloc(K, len) catch
+                @panic("DenseMap.keys: out of memory");
+            const entries = map.entriesPtr();
+            for (0..len) |i| {
+                out[i] = entries[i].key;
+            }
+            return out;
+        }
+
+        /// Release a slice produced by `keys`. Empty slices are a no-op.
+        pub fn freeKeys(slice: []const K) void {
+            if (slice.len == 0) return;
+            std.heap.page_allocator.free(slice);
+        }
+
+        /// Walk all values in insertion order. Materializes a heap-allocated
+        /// slice; callers must release it via `freeValues`.
+        pub fn values(maybe_map: ?*const Self) []const V {
+            const map = maybe_map orelse return &[_]V{};
+            const len = map.header().len;
+            if (len == 0) return &[_]V{};
+            const allocator = std.heap.page_allocator;
+            const out = allocator.alloc(V, len) catch
+                @panic("DenseMap.values: out of memory");
+            const entries = map.entriesPtr();
+            for (0..len) |i| {
+                out[i] = entries[i].value;
+            }
+            return out;
+        }
+
+        /// Release a slice produced by `values`.
+        pub fn freeValues(slice: []const V) void {
+            if (slice.len == 0) return;
+            std.heap.page_allocator.free(slice);
+        }
+
+        /// Single-step iterator. Returns `(state, (key, value), remaining)`:
+        ///
+        ///   * state == 0 (cont): more entries remain. The yielded
+        ///     `(key, value)` pair is the first entry in insertion order.
+        ///     `remaining` is a fresh map handle with that entry removed
+        ///     (allocated via `delete`); the caller owns it.
+        ///   * state == 1 (done): no entries remain. `(key, value)` are
+        ///     undefined, `remaining` equals `map` (the caller still owns
+        ///     whatever they passed in).
+        ///
+        /// Mirrors the runtime's existing `Map.next` shape so the Phase 1d
+        /// runtime swap is a drop-in. `0` and `1` correspond to the runtime's
+        /// `ATOM_CONT` and `ATOM_DONE` once we wire to the runtime's atom
+        /// table; here they're plain integers since DenseMap stays
+        /// dependency-free.
+        pub fn next(maybe_map: ?*const Self) struct {
+            u32,
+            struct { K, V },
+            ?*const Self,
+        } {
+            const map = maybe_map orelse return .{
+                1,
+                .{ defaultK(), defaultV() },
+                null,
+            };
+            if (map.header().len == 0) {
+                return .{ 1, .{ defaultK(), defaultV() }, map };
+            }
+            const first = map.entryAtConst(0).*;
+            const remaining = delete(map, first.key);
+            return .{ 0, .{ first.key, first.value }, remaining };
+        }
+
+        /// Default `K` for a "done" iterator step. Caller must not read it.
+        inline fn defaultK() K {
+            return std.mem.zeroes(K);
+        }
+
+        /// Default `V` for a "done" iterator step. Caller must not read it.
+        inline fn defaultV() V {
+            return std.mem.zeroes(V);
+        }
+
+        // -------------------------------------------------------------------
         // Debug iterator (entries in insertion order).
         // -------------------------------------------------------------------
 
@@ -1106,6 +1210,172 @@ test "DenseMap delete: backshift compacts displaced buckets" {
     for (collide[1..]) |k| {
         try testing.expect(M.hasKey(m, k));
     }
+}
+
+// =============================================================================
+// 1.7 — iteration API (keys, values, next)
+// =============================================================================
+
+test "DenseMap keys: empty map returns empty slice" {
+    const M = DenseMap(u64, u64);
+    const ks = M.keys(null);
+    defer M.freeKeys(ks);
+    try testing.expectEqual(@as(usize, 0), ks.len);
+}
+
+test "DenseMap keys: returns insertion order" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    const ks_in = [_]u64{ 10, 20, 30 };
+    for (ks_in) |k| {
+        const next = try M.put(m, k, k * 7);
+        M.release(@constCast(m));
+        m = next;
+    }
+
+    const ks = M.keys(m);
+    defer M.freeKeys(ks);
+    try testing.expectEqual(@as(usize, 3), ks.len);
+    try testing.expectEqual(@as(u64, 10), ks[0]);
+    try testing.expectEqual(@as(u64, 20), ks[1]);
+    try testing.expectEqual(@as(u64, 30), ks[2]);
+}
+
+test "DenseMap keys: reflects swap-remove ordering after delete" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    var i: u64 = 1;
+    while (i <= 5) : (i += 1) {
+        const next = try M.put(m, i, i);
+        M.release(@constCast(m));
+        m = next;
+    }
+
+    // Delete the 2nd-inserted key. Swap-remove brings key=5 into entries[1].
+    const after = M.delete(m, 2);
+    M.release(@constCast(m));
+    m = after;
+
+    const ks = M.keys(m);
+    defer M.freeKeys(ks);
+    try testing.expectEqual(@as(usize, 4), ks.len);
+    try testing.expectEqual(@as(u64, 1), ks[0]);
+    try testing.expectEqual(@as(u64, 5), ks[1]);
+    try testing.expectEqual(@as(u64, 3), ks[2]);
+    try testing.expectEqual(@as(u64, 4), ks[3]);
+}
+
+test "DenseMap values: empty map returns empty slice" {
+    const M = DenseMap(u64, u64);
+    const vs = M.values(null);
+    defer M.freeValues(vs);
+    try testing.expectEqual(@as(usize, 0), vs.len);
+}
+
+test "DenseMap values: insertion order" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    const ks = [_]u64{ 1, 2, 3 };
+    for (ks) |k| {
+        const next = try M.put(m, k, k * 100);
+        M.release(@constCast(m));
+        m = next;
+    }
+    const vs = M.values(m);
+    defer M.freeValues(vs);
+    try testing.expectEqual(@as(usize, 3), vs.len);
+    try testing.expectEqual(@as(u64, 100), vs[0]);
+    try testing.expectEqual(@as(u64, 200), vs[1]);
+    try testing.expectEqual(@as(u64, 300), vs[2]);
+}
+
+test "DenseMap values: reflects swap-remove ordering after delete" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    var i: u64 = 1;
+    while (i <= 5) : (i += 1) {
+        const next = try M.put(m, i, i * 11);
+        M.release(@constCast(m));
+        m = next;
+    }
+    const after = M.delete(m, 2);
+    M.release(@constCast(m));
+    m = after;
+    const vs = M.values(m);
+    defer M.freeValues(vs);
+    try testing.expectEqual(@as(usize, 4), vs.len);
+    try testing.expectEqual(@as(u64, 11), vs[0]);
+    try testing.expectEqual(@as(u64, 55), vs[1]); // was 5*11
+    try testing.expectEqual(@as(u64, 33), vs[2]);
+    try testing.expectEqual(@as(u64, 44), vs[3]);
+}
+
+test "DenseMap next: empty map yields ATOM_DONE" {
+    const M = DenseMap(u64, u64);
+    const result = M.next(null);
+    try testing.expectEqual(@as(u32, 1), result[0]); // 1 = done
+    try testing.expectEqual(@as(?*const M, null), result[2]);
+}
+
+test "DenseMap next: yields every entry exactly once across repeated calls" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+
+    const ks_in = [_]u64{ 10, 20, 30, 40, 50 };
+    for (ks_in) |k| {
+        const next = try M.put(m, k, k + 1);
+        M.release(@constCast(m));
+        m = next;
+    }
+
+    var seen: [5]bool = .{ false, false, false, false, false };
+    var current: ?*const M = m;
+    var iterations: usize = 0;
+    while (true) {
+        const result = M.next(current);
+        // Free the previous map handle, the iterator hands back the new one.
+        if (current != null and result[2] != current) {
+            M.release(@constCast(current));
+        }
+        current = result[2];
+        if (result[0] == 1) break; // done
+        try testing.expectEqual(@as(u32, 0), result[0]); // cont
+        const k = result[1][0];
+        const v = result[1][1];
+        try testing.expectEqual(k + 1, v);
+        // Mark the slot.
+        var matched = false;
+        for (ks_in, 0..) |kk, idx| {
+            if (kk == k) {
+                try testing.expect(!seen[idx]);
+                seen[idx] = true;
+                matched = true;
+                break;
+            }
+        }
+        try testing.expect(matched);
+        iterations += 1;
+        if (iterations > 100) return error.RuntimeIterationOverflow;
+    }
+    M.release(@constCast(current));
+    try testing.expectEqual(@as(usize, 5), iterations);
+    for (seen) |s| try testing.expect(s);
+}
+
+test "DenseMap next: on done, remaining_map equals input (no-op clone behavior aside)" {
+    const M = DenseMap(u64, u64);
+    const result = M.next(null);
+    // For the empty map case, both must be null.
+    try testing.expectEqual(@as(u32, 1), result[0]);
+    try testing.expectEqual(@as(?*const M, null), result[2]);
 }
 
 test "DenseMap delete: Robin Hood invariant holds after deletion" {
