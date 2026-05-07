@@ -362,6 +362,14 @@ pub var arc_return_elisions_total: u64 = 0;
 pub var dense_map_rc1_fast_path_total: u64 = 0;
 /// Total dense-Map mutating calls.
 pub var dense_map_mut_calls_total: u64 = 0;
+/// Number of `Vector.set/push/pop/append` calls that took the rc-1
+/// fast path (mutated the receiver in place rather than cloning).
+pub var vector_rc1_fast_path_total: u64 = 0;
+/// Total `Vector.set/push/pop/append` calls. Comparing
+/// `vector_rc1_fast_path_total` against this gives the
+/// share-vs-mutate ratio for Vector workloads, mirroring the
+/// dense-Map counters.
+pub var vector_mut_calls_total: u64 = 0;
 
 /// Per-pool live-cell statistics. Each pool wrapper (e.g.
 /// `ArcRuntime.ArcPool(T)`, `MArrayOf(T).InnerPool`, `Map(K,V).SelfPool`)
@@ -427,6 +435,12 @@ pub fn dumpArcStats(write_line: *const fn ([]const u8) void) void {
     if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] dense_map_mut_calls_total={d} dense_map_rc1_fast_path_total={d}\n", .{
         dense_map_mut_calls_total,
         dense_map_rc1_fast_path_total,
+    })) |line| {
+        write_line(line);
+    } else |_| {}
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] vector_mut_calls_total={d} vector_rc1_fast_path_total={d}\n", .{
+        vector_mut_calls_total,
+        vector_rc1_fast_path_total,
     })) |line| {
         write_line(line);
     } else |_| {}
@@ -1863,6 +1877,11 @@ pub fn Vector(comptime T: type) type {
         /// prefix before returning. Refcount starts at 1.
         fn bufferAlloc(capacity_arg: u32, len_arg: u32) ?*Self {
             std.debug.assert(len_arg <= capacity_arg);
+            // Register the `ZAP_ARC_STATS=1` atexit hook on first
+            // alloc so vector-only programs (no Map, no pool-backed
+            // type) still produce the runtime stats dump when the
+            // user opts in. Idempotent.
+            ensureArcStatsAtexit();
             const allocator = std.heap.c_allocator;
             const align_v = comptime bufferAlign();
             const total = bufferSize(capacity_arg);
@@ -2061,7 +2080,9 @@ pub fn Vector(comptime T: type) type {
             const slot: u32 = @intCast(index);
             if (slot >= v.len) @panic("Vector.set: index out of bounds");
 
+            vector_mut_calls_total += 1;
             if (v.header.count() == 1) {
+                vector_rc1_fast_path_total += 1;
                 const mut: *Self = @constCast(v);
                 const existing = mut.slotAt(slot).*;
                 releaseElement(existing, std.heap.c_allocator);
@@ -2093,7 +2114,9 @@ pub fn Vector(comptime T: type) type {
         /// from old-buffer ownership to new-buffer ownership without
         /// touching ARC counts.
         pub fn push(vec: ?*const Self, value: T) ?*const Self {
+            vector_mut_calls_total += 1;
             if (vec == null) {
+                vector_rc1_fast_path_total += 1;
                 const fresh = bufferAlloc(pickCapacity(0, 1), 0) orelse return null;
                 fresh.slotAtPtr(0).* = value;
                 fresh.len = 1;
@@ -2102,6 +2125,7 @@ pub fn Vector(comptime T: type) type {
             const v = vec.?;
 
             if (v.header.count() == 1) {
+                vector_rc1_fast_path_total += 1;
                 const mut: *Self = @constCast(v);
                 if (mut.len < mut.cap) {
                     mut.slotAtPtr(mut.len).* = value;
@@ -2137,7 +2161,9 @@ pub fn Vector(comptime T: type) type {
             const v = vec orelse @panic("Vector.pop: null vector");
             if (v.len == 0) @panic("Vector.pop: empty vector");
 
+            vector_mut_calls_total += 1;
             if (v.header.count() == 1) {
+                vector_rc1_fast_path_total += 1;
                 const mut: *Self = @constCast(v);
                 const last = mut.slotAtPtr(mut.len - 1).*;
                 releaseElement(last, std.heap.c_allocator);
@@ -2171,7 +2197,9 @@ pub fn Vector(comptime T: type) type {
             const bv = b.?;
             const total_len = av.len + bv.len;
 
+            vector_mut_calls_total += 1;
             if (av.header.count() == 1 and av.cap >= total_len) {
+                vector_rc1_fast_path_total += 1;
                 const mut: *Self = @constCast(av);
                 const dst_data = mut.dataPtr();
                 const src_data = bv.dataPtr();
