@@ -1493,6 +1493,35 @@ const Analyzer = struct {
                     if (self.local_to_arc_index.get(mv.dest)) |idx| owns.set(idx);
                 }
             },
+            .local_set => |ls| {
+                // Phase E.9: a `local_set` whose value is an
+                // ARC-owned local transfers ownership from source to
+                // dest — both LocalIds alias the same heap cell, so
+                // tracking them as two independent `+1`s in the owns
+                // set is overcounting. Treating local_set as a move
+                // (clear source, set dest) keeps the set's invariant
+                // "owns[i] == 1 iff there is exactly one live owner
+                // alias for the i-th ARC local". Without this, a
+                // post-local_set tail_call's `live_before_ret` snapshot
+                // includes both source and dest, and drop insertion
+                // emits a stale `release{source}` that double-frees the
+                // cell the dest is about to consume.
+                if (self.local_to_arc_index.get(ls.value)) |src_idx| {
+                    if (owns.contains(src_idx)) {
+                        owns.unset(src_idx);
+                        if (ls.dest < local_ownership.len and local_ownership[ls.dest] == .owned) {
+                            if (self.local_to_arc_index.get(ls.dest)) |dst_idx| owns.set(dst_idx);
+                        }
+                        return;
+                    }
+                }
+                // Source is not currently owned (or not ARC-managed);
+                // fall through to the generic handler — it adds the
+                // dest to owns iff its local_ownership is .owned.
+                if (ls.dest < local_ownership.len and local_ownership[ls.dest] == .owned) {
+                    if (self.local_to_arc_index.get(ls.dest)) |idx| owns.set(idx);
+                }
+            },
             .tail_call => |tc| {
                 for (tc.args) |arg_local| {
                     if (self.local_to_arc_index.get(arg_local)) |idx| owns.unset(idx);

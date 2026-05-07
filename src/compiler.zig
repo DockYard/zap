@@ -2086,30 +2086,100 @@ fn runArcDropInsertion(
         for (program.functions) |*function| {
             if (std.mem.indexOf(u8, function.name, glob)) |_| {
                 std.debug.print("=== IR dump (post-drop-insertion): {s} ===\n", .{function.name});
+                std.debug.print("  param_conventions=[", .{});
+                for (function.param_conventions, 0..) |c, ci| {
+                    if (ci > 0) std.debug.print(", ", .{});
+                    std.debug.print(".{s}", .{@tagName(c)});
+                }
+                std.debug.print("]\n", .{});
                 for (function.body, 0..) |block, bidx| {
                     std.debug.print("  block[{d}]:\n", .{bidx});
-                    for (block.instructions, 0..) |instr, idx| {
-                        std.debug.print("    [{d}] {s}", .{ idx, @tagName(instr) });
-                        switch (instr) {
-                            .local_get => |lg| std.debug.print(" dest={d} source={d}", .{ lg.dest, lg.source }),
-                            .share_value => |sv| std.debug.print(" dest={d} source={d} mode={s}", .{ sv.dest, sv.source, @tagName(sv.mode) }),
-                            .retain => |r| std.debug.print(" value={d}", .{r.value}),
-                            .release => |r| std.debug.print(" value={d}", .{r.value}),
-                            .map_init => |mi| std.debug.print(" dest={d}", .{mi.dest}),
-                            .ret => |r| std.debug.print(" value={?d}", .{r.value}),
-                            .call_named => |cn| std.debug.print(" name={s} dest={d}", .{ cn.name, cn.dest }),
-                            .call_direct => |cd| std.debug.print(" dest={d}", .{cd.dest}),
-                            .param_get => |pg| std.debug.print(" dest={d} index={d}", .{ pg.dest, pg.index }),
-                            .const_int => |ci| std.debug.print(" dest={d}", .{ci.dest}),
-                            .switch_literal => |sl| std.debug.print(" dest={d} cases={d}", .{ sl.dest, sl.cases.len }),
-                            .tail_call => |tc| std.debug.print(" args={d}", .{tc.args.len}),
-                            else => {},
-                        }
-                        std.debug.print("\n", .{});
-                    }
+                    dumpStream(block.instructions, 4);
                 }
                 std.debug.print("=== end ===\n", .{});
             }
+        }
+    }
+}
+
+fn dumpStream(stream: []const ir.Instruction, indent: usize) void {
+    for (stream, 0..) |instr, idx| {
+        var spaces: [32]u8 = undefined;
+        const used = @min(indent, spaces.len);
+        @memset(spaces[0..used], ' ');
+        std.debug.print("{s}[{d}] {s}", .{ spaces[0..used], idx, @tagName(instr) });
+        switch (instr) {
+            .local_get => |lg| std.debug.print(" dest={d} source={d}", .{ lg.dest, lg.source }),
+            .share_value => |sv| std.debug.print(" dest={d} source={d} mode={s}", .{ sv.dest, sv.source, @tagName(sv.mode) }),
+            .move_value => |mv| std.debug.print(" dest={d} source={d}", .{ mv.dest, mv.source }),
+            .borrow_value => |bv| std.debug.print(" dest={d} source={d}", .{ bv.dest, bv.source }),
+            .copy_value => |cv| std.debug.print(" dest={d} source={d}", .{ cv.dest, cv.source }),
+            .retain => |r| std.debug.print(" value={d}", .{r.value}),
+            .release => |r| std.debug.print(" value={d}", .{r.value}),
+            .map_init => |mi| std.debug.print(" dest={d}", .{mi.dest}),
+            .ret => |r| std.debug.print(" value={?d}", .{r.value}),
+            .call_named => |cn| {
+                std.debug.print(" name={s} dest={d} args=[", .{ cn.name, cn.dest });
+                for (cn.args, 0..) |a, ai| {
+                    if (ai > 0) std.debug.print(",", .{});
+                    std.debug.print("{d}", .{a});
+                }
+                std.debug.print("]", .{});
+            },
+            .call_direct => |cd| {
+                std.debug.print(" dest={d} fn={d} args=[", .{ cd.dest, cd.function });
+                for (cd.args, 0..) |a, ai| {
+                    if (ai > 0) std.debug.print(",", .{});
+                    std.debug.print("{d}", .{a});
+                }
+                std.debug.print("]", .{});
+            },
+            .param_get => |pg| std.debug.print(" dest={d} index={d}", .{ pg.dest, pg.index }),
+            .const_int => |ci| std.debug.print(" dest={d}", .{ci.dest}),
+            .switch_literal => |sl| std.debug.print(" dest={d} scrut={d} cases={d}", .{ sl.dest, sl.scrutinee, sl.cases.len }),
+            .tail_call => |tc| {
+                std.debug.print(" name={s} args=[", .{tc.name});
+                for (tc.args, 0..) |a, ai| {
+                    if (ai > 0) std.debug.print(",", .{});
+                    std.debug.print("{d}", .{a});
+                }
+                std.debug.print("]", .{});
+            },
+            .if_expr => |ie| std.debug.print(" dest={d}", .{ie.dest}),
+            .local_set => |ls| std.debug.print(" dest={d} value={d}", .{ ls.dest, ls.value }),
+            else => {},
+        }
+        std.debug.print("\n", .{});
+        switch (instr) {
+            .if_expr => |ie| {
+                std.debug.print("{s}  then:\n", .{(spaces[0..used])});
+                dumpStream(ie.then_instrs, indent + 4);
+                std.debug.print("{s}  else:\n", .{(spaces[0..used])});
+                dumpStream(ie.else_instrs, indent + 4);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases, 0..) |c, ci| {
+                    std.debug.print("{s}  case[{d}]:\n", .{ spaces[0..used], ci });
+                    dumpStream(c.body_instrs, indent + 4);
+                }
+                std.debug.print("{s}  default:\n", .{(spaces[0..used])});
+                dumpStream(sl.default_instrs, indent + 4);
+            },
+            .switch_return => |sr| {
+                for (sr.cases, 0..) |c, ci| {
+                    std.debug.print("{s}  case[{d}]:\n", .{ spaces[0..used], ci });
+                    dumpStream(c.body_instrs, indent + 4);
+                }
+            },
+            .case_block => |cb| {
+                for (cb.arms, 0..) |arm, ai| {
+                    std.debug.print("{s}  arm[{d}].cond:\n", .{ spaces[0..used], ai });
+                    dumpStream(arm.cond_instrs, indent + 4);
+                    std.debug.print("{s}  arm[{d}].body:\n", .{ spaces[0..used], ai });
+                    dumpStream(arm.body_instrs, indent + 4);
+                }
+            },
+            else => {},
         }
     }
 }

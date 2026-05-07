@@ -1761,7 +1761,28 @@ test "Phase E.5 Gap 7: owned binding whose last use is share_value gets scope-ex
 
     var release_locals = try collectReleaseLocals(std.testing.allocator, run_func);
     defer release_locals.deinit(std.testing.allocator);
-    try std.testing.expect(release_locals.contains(fresh_dest.?));
+    // Phase E.9: arc_liveness's `applyOwnsEffect` for `local_set`
+    // transfers ownership from source to dest when both are .owned
+    // (the two LocalIds alias the same cell — counting them as
+    // independent owners would overcount). The released local may
+    // therefore be either the call-dest (`fresh_dest`) or the
+    // binding-dest (`local_set`'s dest) downstream of the call.
+    // Accept either as a valid scope-exit release target — both
+    // free the same cell.
+    var binding_dest: ?ir.LocalId = null;
+    for (run_func.body) |block| {
+        for (block.instructions) |instr| {
+            switch (instr) {
+                .local_set => |ls| {
+                    if (ls.value == fresh_dest.?) binding_dest = ls.dest;
+                },
+                else => {},
+            }
+        }
+    }
+    const released_call_dest = release_locals.contains(fresh_dest.?);
+    const released_binding = if (binding_dest) |bd| release_locals.contains(bd) else false;
+    try std.testing.expect(released_call_dest or released_binding);
 }
 
 test "Phase E.5 Gap 6: paramIndexForLocal walks body to find param_get dest" {
