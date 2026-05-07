@@ -1456,7 +1456,29 @@ const Analyzer = struct {
                 owns.intersectWith(&success_owns);
             },
             .guard_block => |gb| {
-                try self.forwardOwnsStream(gb.body, owns, ownership);
+                // The guard_block's body executes only when the guard
+                // condition holds. We must clone `owns` before the body
+                // walks it so the body's ownership mutations do not
+                // leak into the parent stream when the guard fails or
+                // when the body terminates without falling through.
+                //
+                // - If the body falls through to its end, the
+                //   post-guard_block `owns` is the intersection of
+                //   parent_owns (guard-failed path) and body_owns
+                //   (guard-succeeded path).
+                // - If the body terminates (case_break/jump/branch/
+                //   ret/tail_call), the body never reaches the merge,
+                //   so the parent's `owns` is unchanged. Any owns the
+                //   body acquired (e.g. `list_tail dest=N`) belong
+                //   solely to the body's terminating path and must not
+                //   leak past the guard_block into the surrounding
+                //   stream's owned_at_ret snapshot.
+                var body_owns = try owns.clone(self.allocator);
+                defer body_owns.deinit(self.allocator);
+                try self.forwardOwnsStream(gb.body, &body_owns, ownership);
+                if (streamFallsThrough(gb.body)) {
+                    owns.intersectWith(&body_owns);
+                }
             },
             .optional_dispatch => |od| {
                 var nil_owns = try owns.clone(self.allocator);
@@ -1991,6 +2013,20 @@ const DisjointChecker = struct {
 // ============================================================
 // Helpers: terminators, def/use lists, type predicates.
 // ============================================================
+
+/// Returns true when control reaches the end of `stream` along at
+/// least one path — i.e. the stream's last reachable instruction is
+/// not an unconditional terminator. Used by `forwardOwnsChildren`
+/// for `guard_block` to decide whether the body's ownership
+/// mutations should be merged back into the parent's `owns` set.
+///
+/// An empty stream falls through trivially. A stream whose final
+/// instruction is a terminator (case_break/ret/tail_call/jump/
+/// branch/etc) does not.
+fn streamFallsThrough(stream: []const ir.Instruction) bool {
+    if (stream.len == 0) return true;
+    return !isTerminator(stream[stream.len - 1]);
+}
 
 fn isTerminator(instr: ir.Instruction) bool {
     return switch (instr) {
