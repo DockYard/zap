@@ -1,0 +1,41 @@
+{
+  "workload": "working_dict",
+  "binary": "./zap-out/bin/working_dict",
+  "duration_ns": 1078000,
+  "summary": {
+    "total_instances": 540,
+    "total_lineages": 60,
+    "by_class": {
+      "S": {"count": 540, "frac": 1.0000},
+      "W": {"count": 0, "frac": 0.0000},
+      "V": {"count": 0, "frac": 0.0000}
+    },
+    "by_lineage_class": {
+      "S": 0,
+      "W": 60,
+      "V": 0
+    },
+    "size_histogram": {
+      "0": 0,
+      "1-7": 420,
+      "8-31": 120,
+      "32-127": 0,
+      "128-1023": 0,
+      "1024+": 0
+    },
+    "peak_concurrent_versions_histogram": {
+      "1": 0,
+      "2": 0,
+      "3-5": 0,
+      "6-20": 60,
+      "21+": 0
+    },
+    "post_share_mutation_count": 0,
+    "total_node_clones": 0,
+    "top_callsites_by_instance_count": [
+      {"site": "0x1042beb90", "count": 420},
+      {"site": "0x1042bebf0", "count": 60},
+      {"site": "0x1042be6f8", "count": 60}
+    ]
+  }
+}
