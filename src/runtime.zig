@@ -8094,6 +8094,49 @@ test "MArrayI64 / MArrayF64 specialised aliases are concrete instantiations" {
     try std.testing.expectEqual(@as(f64, 0.25), MArrayF64.get(floats, 1));
 }
 
+test "releaseChildrenAny releases ?*const Map(K, V) field" {
+    // Phase F regression test: when a struct holds a `?*const Map(K, V)`
+    // child field, `releaseChildrenAny` must walk the field via
+    // `releaseFieldChildAny` -> `releaseArcAny` and dispatch into the
+    // Map's inline-header `release` method. Prior to Phase F the `.map`
+    // type was not flagged as ARC-managed at the IR level, so this code
+    // path was never exercised through the codegen. Now that `.map` is
+    // ARC-managed, the runtime helper that releases struct children
+    // must correctly recognize the inline-header path and avoid the
+    // `Arc(T)`-wrapper double-counting that would arise if it routed
+    // through `prepareReleaseAny`.
+    const MapI64 = Map(i64, i64);
+
+    const before_releases = arc_releases_total;
+
+    const keys = [_]i64{ 1, 2, 3 };
+    const vals = [_]i64{ 10, 20, 30 };
+    const map_ptr = MapI64.fromPairs(&keys, &vals, 3) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(@as(i64, 20), MapI64.get(map_ptr, 2, -1));
+
+    // Wrap the Map pointer inside a struct, mimicking the codegen-emitted
+    // shape for an aggregate that owns a Map child via an indirect-storage
+    // optional pointer field.
+    const Holder = struct {
+        map_field: ?*const MapI64,
+        scalar: i64,
+    };
+    const holder = Holder{ .map_field = map_ptr, .scalar = 7 };
+
+    // releaseChildrenAny must traverse `map_field` and invoke the Map's
+    // inline-header `release` (not the generic Arc(T) path). The non-arc
+    // `scalar` field must be skipped without compile error.
+    ArcRuntime.releaseChildrenAny(Holder, std.testing.allocator, holder);
+
+    // The Map's `release` bumps `arc_releases_total` exactly once when it
+    // hits the zero-transition. The generic wrapper short-circuits the
+    // bump for inline-header types, so we expect exactly one release tick.
+    try std.testing.expectEqual(before_releases + 1, arc_releases_total);
+}
+
 test "Atom well-known values" {
     try std.testing.expectEqual(@as(u32, 0), Atom.nil.id);
     try std.testing.expectEqual(@as(u32, 1), Atom.true.id);

@@ -1165,12 +1165,16 @@ pub const ZigType = union(enum) {
 /// an IrBuilder.
 pub fn isArcManagedTypeId(type_store: *const types_mod.TypeStore, type_id: types_mod.TypeId) bool {
     if (type_id >= type_store.types.items.len) return false;
-    // The `.map` flip is reserved for Phase F (the milestone). Phase A
-    // populates ParamConvention metadata for `.map` parameters in
-    // anticipation, but the metadata is consulted only when the flag is
-    // flipped. Until then, the predicate stays at `.opaque_type` only —
-    // matching pre-Phase-6-redux behavior so Phase A is pure plumbing.
-    return type_store.getType(type_id) == .opaque_type;
+    // Phase F (the k-nucleotide RSS gap milestone) flipped `.map` to
+    // join `.opaque_type` as ARC-managed. Phases A–E.9 built the
+    // substrate (param-convention inference, consume-site rewrites,
+    // ownership-transfer-aware liveness, V1–V7 verifiers) so that
+    // every `.map` value flows through the same retain/release ABI as
+    // opaque types.
+    return switch (type_store.getType(type_id)) {
+        .opaque_type, .map => true,
+        else => false,
+    };
 }
 
 /// Default `ParamConvention` for a parameter of HIR type `type_id`.
@@ -5433,8 +5437,15 @@ pub const IrBuilder = struct {
 
     fn isArcManagedType(self: *const IrBuilder, type_id: hir_mod.TypeId) bool {
         const store = self.type_store orelse return false;
-        // See `isArcManagedTypeId` above — flag flip is Phase F.
-        return store.getType(type_id) == .opaque_type;
+        // Phase F flip: `.map` joins `.opaque_type` as ARC-managed.
+        // Mirror `isArcManagedTypeId` exactly — both predicates are
+        // queried from different code paths (free-function vs. method)
+        // but must agree on every type. See the doc comment on
+        // `isArcManagedTypeId` for the architectural rationale.
+        return switch (store.getType(type_id)) {
+            .opaque_type, .map => true,
+            else => false,
+        };
     }
 
     /// Returns whether the value held in `local` is ARC-managed at the

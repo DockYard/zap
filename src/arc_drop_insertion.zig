@@ -47,8 +47,10 @@ const arc_liveness = @import("arc_liveness.zig");
 // The pass is generic, type-blind, and uniform: it runs on every
 // function regardless of whether any ARC-managed locals are present.
 // When `live_before_ret` is empty for every terminator (the common
-// case today, since only `.opaque_type` is currently flagged) the
-// pass is a no-op — every stream short-circuits as "unchanged" and
+// case for functions with no ARC-managed locals — Phase F flipped
+// `.map` to join `.opaque_type`, so any function touching maps now
+// participates) the pass is a no-op — every stream short-circuits as
+// "unchanged" and
 // the caller observes identical IR.
 //
 // ----------------------------------------------------------------
