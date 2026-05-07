@@ -2024,6 +2024,17 @@ fn runArcOwnershipAndVerify(
         const fn_ownership = ownership.get(function.id) orelse continue;
         zap.arc_ownership.classifyAndNormalize(alloc, function, fn_ownership, type_store) catch return error.OutOfMemory;
     }
+    // Phase E.9 step 2: for each function whose param_conventions
+    // contains an `.owned` slot (set by Step 1's inference), rewrite
+    // every call site targeting it from `share_value`/`release` into
+    // `move_value` (no caller-side retain) and drop the post-call
+    // release. The callee's own scope-exit drop (Phase B's filter
+    // releases `.owned` parameters) becomes the sole decrement,
+    // closing the per-iteration leak that survived Phase E.8.
+    for (program.functions, 0..) |_, i| {
+        const function: *ir.Function = @constCast(&program.functions[i]);
+        zap.arc_ownership.rewriteOwnedConsumeSites(alloc, function, program) catch return error.OutOfMemory;
+    }
     for (program.functions) |*function| {
         zap.arc_verifier.verify(alloc, function) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
