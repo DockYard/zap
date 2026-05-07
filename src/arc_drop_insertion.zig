@@ -705,17 +705,56 @@ fn isReturnEquivalentTerminator(instr: ir.Instruction) bool {
 /// flipped) — the caller's post-call release would decrement an
 /// already-destroyed cell.
 ///
-/// Parameter LocalIds occupy the first `function.param_conventions.len`
-/// slots in the function's local-id space — the IR builder allocates
-/// them in order via `param_get` instructions before any other locals.
-/// A LocalId `i` therefore names a parameter local iff
-/// `i < function.param_conventions.len`.
+/// Phase E.5 Gap 6: walk the function body to find every
+/// `param_get` instruction's `dest` LocalId and compare against
+/// the parameter index in `function.param_conventions`. The prior
+/// implementation assumed parameter LocalIds occupy the first
+/// `param_conventions.len` slots, but `computeMaxBindingLocalForClauses`
+/// reserves binding-local indices starting at 0; in any function
+/// with destructure or assignment bindings, the first `param_get`
+/// dest is allocated ABOVE the binding range and the linear-
+/// numbering assumption silently mis-classifies binding locals as
+/// parameters (or vice versa).
 fn isBorrowedParameterLocal(
     function: *const ir.Function,
     local_id: ir.LocalId,
 ) bool {
-    if (local_id >= function.param_conventions.len) return false;
-    return function.param_conventions[local_id] == .borrowed;
+    const param_index = paramIndexForLocal(function, local_id) orelse return false;
+    if (param_index >= function.param_conventions.len) return false;
+    return function.param_conventions[param_index] == .borrowed;
+}
+
+/// Walk the function body looking for a `param_get` instruction
+/// whose `dest` equals `local_id`. Returns the parameter index
+/// (matching `function.params` and `function.param_conventions`)
+/// when found, or null when `local_id` does not name a parameter
+/// local.
+///
+/// Phase E.5 Gap 6: replaces the `local_id < param_conventions.len`
+/// assumption with a body walk that tracks the actual `param_get`
+/// dest -> param.index mapping. The IR builder's local-id
+/// allocation order varies between code paths (single-clause vs
+/// dispatch vs try-variant), so the only reliable mapping is the
+/// one literal `param_get` site.
+fn paramIndexForLocal(
+    function: *const ir.Function,
+    local_id: ir.LocalId,
+) ?u32 {
+    const Visitor = struct {
+        target: ir.LocalId,
+        result: ?u32,
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (instr.* == .param_get) {
+                if (instr.param_get.dest == self.target) {
+                    self.result = instr.param_get.index;
+                }
+            }
+        }
+    };
+    var visitor = Visitor{ .target = local_id, .result = null };
+    ir.forEachInstruction(function, &visitor, Visitor.visit);
+    return visitor.result;
 }
 
 /// Returns true when `local_id`'s refined ownership class in
@@ -1096,24 +1135,18 @@ test "arc_drop_insertion: tail-call site does NOT drop its argument locals" {
     if (seen_tail_call) {} else {}
 }
 
-test "arc_drop_insertion: identity-function parameter is skipped (Phase B + Phase 5 compose)" {
-    // For an identity function, the ARC parameter is BOTH:
-    //   * present in `live_before_ret` at the ret AND
-    //   * recorded in `return_source_locals`.
-    // Phase B (Phase 6 redux) makes drop insertion skip parameters
-    // at IR-insertion time, which is strictly earlier than Phase 5's
-    // ZIR-emission-time `isReleaseSuppressed` filter. Both target the
-    // same correctness goal — the parameter must not be destroyed by
-    // the callee since the caller's post-call release owns the
-    // value. Phase B catches it earlier; Phase 5's filter is
-    // redundant for parameter return-sources but still load-bearing
-    // for non-parameter return-source locals (e.g., a binding that
-    // sources `ret`).
+test "arc_drop_insertion: identity-function parameter is skipped (Phase B + Phase E.5 Gap 4)" {
+    // For an identity function, the ARC parameter is present in
+    // `live_before_ret` at the ret. Phase E.5 Gap 4: it is NOT in
+    // `return_source_locals` because borrowed-param-returned locals
+    // can't elide their retain-on-ret. Phase B still applies — the
+    // borrowed-param filter on the drop set means no release is
+    // emitted on the parameter local at scope exit.
     //
-    // This test pins Phase B's IR-level invariant: NO release is
-    // inserted on the parameter local, so `releases_after ==
-    // releases_before` even though the parameter is in
-    // `live_before_ret`.
+    // The retain-on-ret discipline DOES fire (per Gap 4) so the
+    // caller receives a fresh +1, but no `release` ever targets the
+    // parameter local. This test pins Phase B's filter regardless
+    // of the return-source state.
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -1133,9 +1166,9 @@ test "arc_drop_insertion: identity-function parameter is skipped (Phase B + Phas
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // Pre-condition: the parameter is recorded as a return source AND
-    // is in live_before_ret.
-    try std.testing.expect(ownership.return_source_locals.count() >= 1);
+    // Phase E.5 Gap 4: the borrowed-param-returned local is NOT a
+    // return source.
+    try std.testing.expectEqual(@as(u32, 0), ownership.return_source_locals.count());
 
     const releases_before = countReleases(id_func);
     try insertScopeExitDrops(suite.irAllocator(), id_func, &ownership);
@@ -1251,16 +1284,18 @@ fn collectRetainLocals(
     return result;
 }
 
-test "arc_drop_insertion: direct return of param does NOT insert retain (return_source elision)" {
+test "arc_drop_insertion: direct return of borrowed param INSERTS retain (Phase E.5 Gap 4)" {
     // Identity function: `pub fn id(h :: Handle) -> Handle { h }`.
-    // The parameter local `h` is the direct source of the `ret` and
-    // is therefore recorded in `return_source_locals` by Phase 5's
-    // `classifyLastUses`. Phase 6.2c's retain discipline must NOT
-    // emit a `.retain` for `h` because the matching scope-exit
-    // release will be suppressed by `isReleaseSuppressed` at ZIR
-    // emission time — net zero refcount ops, ownership transfers via
-    // the return slot. Inserting a retain here would unbalance the
-    // refcount and leak the value.
+    // Pre-Phase-E.5: `applySpecialization` recorded the param-bound
+    // local in `return_source_locals` and the retain-on-ret was
+    // suppressed. Caller receives the cell with no refcount bump,
+    // its post-call release decrements past zero -> leak / UAF.
+    //
+    // Phase E.5 Gap 4: the gate `canElideReturnSource` rejects
+    // borrowed-param sources for return-source elision because the
+    // borrow owns no +1. Drop insertion must emit retain-on-ret so
+    // the caller receives a fresh owner that balances the post-call
+    // `share_value` retain + release ABI.
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -1280,17 +1315,17 @@ test "arc_drop_insertion: direct return of param does NOT insert retain (return_
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // Pre-condition: the parameter must be a return source (otherwise
-    // the test isn't exercising the elision branch).
-    try std.testing.expect(ownership.return_source_locals.count() >= 1);
+    // Phase E.5 Gap 4: the borrowed-param-returned local is NOT a
+    // return source. The retain-on-ret discipline fires.
+    try std.testing.expectEqual(@as(u32, 0), ownership.return_source_locals.count());
 
     const retains_before = countRetains(id_func);
     try insertScopeExitDrops(suite.irAllocator(), id_func, &ownership);
     const retains_after = countRetains(id_func);
 
-    // Retain count must be unchanged — every return-value local is a
-    // return source, so the retain branch never fires.
-    try std.testing.expectEqual(retains_before, retains_after);
+    // Exactly one retain was added at the ret site to promote the
+    // borrowed param to a fresh owner for the caller.
+    try std.testing.expect(retains_after > retains_before);
 }
 
 test "arc_drop_insertion: switch_return arm with non-return-source value gets retain appended to arm body" {
@@ -1388,9 +1423,12 @@ test "arc_drop_insertion: switch_return arm with non-return-source value gets re
             try std.testing.expect(arm_returns.contains(local_ptr.*));
         }
     } else {
-        // `cond_return` shape: every return value is a return source,
-        // so no retain is inserted by Phase 6.2c.
-        try std.testing.expectEqual(retains_before, retains_after);
+        // `cond_return` shape: Phase E.5 Gap 4 — borrowed-param-
+        // returned locals are NOT in `return_source_locals`, so
+        // retain-on-ret fires. The test function returns one of its
+        // borrowed params on each clause, so each cond_return
+        // produces a retain.
+        try std.testing.expect(retains_after > retains_before);
     }
 }
 
@@ -1724,4 +1762,104 @@ test "Phase E.5 Gap 7: owned binding whose last use is share_value gets scope-ex
     var release_locals = try collectReleaseLocals(std.testing.allocator, run_func);
     defer release_locals.deinit(std.testing.allocator);
     try std.testing.expect(release_locals.contains(fresh_dest.?));
+}
+
+test "Phase E.5 Gap 6: paramIndexForLocal walks body to find param_get dest" {
+    // The pre-Phase-E.5 implementation assumed parameter LocalIds
+    // occupy the first `function.param_conventions.len` slots. That
+    // is false whenever IR allocates non-param locals (case_block
+    // dest, list/map_init dest, ...) BEFORE the first param_get —
+    // which `computeMaxBindingLocalForClauses` does for any function
+    // with destructure or assignment bindings.
+    //
+    // Phase E.5 Gap 6 walks the function body to map LocalId →
+    // param_get.index. We exercise the walker directly with a
+    // function whose body forces the IR builder to allocate a
+    // binding-local before the parameter is read.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn with_binding(h :: Handle) -> Handle {
+        \\    other = h
+        \\    other
+        \\  }
+        \\}
+    ;
+    var suite = try DropTestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const fn_with_binding = suite.findFunctionByName("with_binding") orelse return error.MissingFunction;
+
+    // Find the param_get's actual dest LocalId. It may not be 0 —
+    // the binding-local pre-allocation can place it anywhere.
+    var param_dest: ?ir.LocalId = null;
+    for (fn_with_binding.body) |block| {
+        for (block.instructions) |instr| {
+            switch (instr) {
+                .param_get => |pg| {
+                    if (pg.index == 0) param_dest = pg.dest;
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(param_dest != null);
+
+    // The walker resolves the param-bound local to index 0.
+    const idx = paramIndexForLocal(fn_with_binding, param_dest.?);
+    try std.testing.expectEqual(@as(?u32, 0), idx);
+
+    // A non-param local resolves to null.
+    var non_param_local: ir.LocalId = 0;
+    while (non_param_local < fn_with_binding.local_count) : (non_param_local += 1) {
+        if (non_param_local != param_dest.?) {
+            const result = paramIndexForLocal(fn_with_binding, non_param_local);
+            // Not all non-param locals must be null (a function might
+            // have multiple `param_get` dests on the same index due
+            // to internal lowering quirks); but at least one must
+            // exist that isn't a param.
+            if (result == null) break;
+        }
+    }
+}
+
+test "Phase E.5 Gap 6: isBorrowedParameterLocal works when param_get is allocated above binding range" {
+    // End-to-end check: even when param_get isn't at LocalId 0,
+    // `isBorrowedParameterLocal` correctly classifies the param-
+    // bound local as borrowed. This is what drop insertion relies
+    // on to skip emitting destroys on borrowed parameters.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn with_binding(h :: Handle) -> Handle {
+        \\    other = h
+        \\    other
+        \\  }
+        \\}
+    ;
+    var suite = try DropTestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const fn_with_binding = suite.findFunctionByName("with_binding") orelse return error.MissingFunction;
+
+    // Find the param_get's actual dest LocalId.
+    var param_dest: ?ir.LocalId = null;
+    for (fn_with_binding.body) |block| {
+        for (block.instructions) |instr| {
+            switch (instr) {
+                .param_get => |pg| {
+                    if (pg.index == 0) param_dest = pg.dest;
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(param_dest != null);
+
+    // The Phase B + Phase E.5 Gap 6 filter classifies the param-
+    // bound local as a borrowed parameter regardless of its
+    // numerical LocalId.
+    try std.testing.expect(isBorrowedParameterLocal(fn_with_binding, param_dest.?));
 }

@@ -1162,20 +1162,54 @@ const Analyzer = struct {
             },
             .ret => |r| {
                 if (r.value) |v| {
-                    if (v == last_use_local) {
+                    if (v == last_use_local and self.canElideReturnSource(v)) {
                         try ownership.return_source_locals.put(self.allocator, last_use_local, {});
                     }
                 }
             },
             .cond_return => |cr| {
                 if (cr.value) |v| {
-                    if (v == last_use_local) {
+                    if (v == last_use_local and self.canElideReturnSource(v)) {
                         try ownership.return_source_locals.put(self.allocator, last_use_local, {});
                     }
                 }
             },
             else => {},
         }
+    }
+
+    /// Phase E.5 Gap 4: gate return-source elision against the
+    /// returned local's underlying ownership convention. A borrowed
+    /// param flowing directly into ret cannot elide the matching
+    /// retain — the param owns no +1, so eliding the retain leaves
+    /// the caller with a borrow that will under-flow the post-call
+    /// release. The proper transfer requires a `copy_value` to
+    /// promote the borrow to an owner; eliding the destroy on that
+    /// owner is wrong because it materialised a fresh +1.
+    ///
+    /// Returns `true` when `local` is safe to add to
+    /// `return_source_locals`, `false` when it must NOT be (the
+    /// retain-on-ret discipline must fire, the destroy is genuine).
+    ///
+    /// Today the only rejection case is "this local was loaded from
+    /// a borrowed param via `param_get`". When per-callee borrow /
+    /// consume metadata lands (Phase H+), more rejections may apply.
+    fn canElideReturnSource(self: *const Analyzer, local: ir.LocalId) bool {
+        // Walk the records list looking for a `param_get` whose
+        // dest is `local`. If found and the matching param is
+        // borrowed, refuse to elide.
+        for (self.records.items) |rec| {
+            switch (rec.instr.*) {
+                .param_get => |pg| {
+                    if (pg.dest == local) {
+                        if (pg.index >= self.function.param_conventions.len) return true;
+                        return self.function.param_conventions[pg.index] != .borrowed;
+                    }
+                },
+                else => {},
+            }
+        }
+        return true;
     }
 
     /// Phase-5 prep: when a `ret v` returns a local that is itself
@@ -1206,6 +1240,13 @@ const Analyzer = struct {
                 for (arm_results[0..n]) |arm_local| {
                     if (!self.local_to_arc_index.contains(arm_local)) continue;
                     if (ownership.return_source_locals.contains(arm_local)) continue;
+                    // Phase E.5 Gap 4: refuse to elide when an arm
+                    // result is a borrowed-param dest. The whole
+                    // aggregate's return-source elision must back off
+                    // (the verifier and drop-insertion treat the
+                    // aggregate dest as a return source, but the arm
+                    // local's own retain-on-ret must fire).
+                    if (!self.canElideReturnSource(arm_local)) continue;
                     try ownership.return_source_locals.put(self.allocator, arm_local, {});
                     changed = true;
                 }
@@ -2554,7 +2595,15 @@ test "arc_liveness: linear last-use share_value is not promoted to consume (borr
     try std.testing.expectEqual(@as(usize, 0), ownership.consume_share_sites.count());
 }
 
-test "arc_liveness: identity function returns its parameter (return_source)" {
+test "arc_liveness: identity function returns its borrowed parameter (Phase E.5 Gap 4)" {
+    // Pre-Phase-E.5: the parameter local was added to
+    // `return_source_locals` because its last use was `ret`.
+    // Phase E.5 Gap 4: a borrowed-param-returned local is NOT
+    // eligible for return-source elision — the borrow owns no +1,
+    // so eliding the retain on ret would leave the caller with
+    // a borrow that under-flows the post-call release ABI.
+    // `canElideReturnSource` rejects these locals; the table
+    // stays empty and the retain-on-ret discipline fires.
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -2576,9 +2625,10 @@ test "arc_liveness: identity function returns its parameter (return_source)" {
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // `h` is the parameter local; its last use is the function's `ret`.
-    try std.testing.expect(ownership.return_source_locals.count() == 1);
-    try std.testing.expect(ownership.consume_share_sites.count() == 0);
+    // Phase E.5 Gap 4: borrowed param returned directly is NOT a
+    // return source.
+    try std.testing.expectEqual(@as(u32, 0), ownership.return_source_locals.count());
+    try std.testing.expectEqual(@as(u32, 0), ownership.consume_share_sites.count());
 }
 
 test "arc_liveness: branching case last-uses param in both arms" {
@@ -3009,10 +3059,13 @@ fn collectReleaseSources(
     return result;
 }
 
-test "arc_liveness: Phase 5 — direct return populates return_source_locals" {
-    // The identity function on an Arc-managed type is the canonical
-    // shape Phase 5's filter must handle: the parameter local is the
-    // value of `ret`, so its scope-exit release (if any) is elided.
+test "arc_liveness: Phase 5 — direct return of borrowed param NOT in return_source (Phase E.5 Gap 4)" {
+    // Pre-Phase-E.5 behavior: the identity function added its
+    // borrowed-param local to `return_source_locals` because its
+    // last use was `ret`. Phase E.5 Gap 4: the borrow owns no +1,
+    // so eliding the retain on ret is wrong — the caller would
+    // receive a borrow that under-flows the post-call release ABI.
+    // `canElideReturnSource` rejects borrowed-param-returned locals.
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -3032,28 +3085,23 @@ test "arc_liveness: Phase 5 — direct return populates return_source_locals" {
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // The return-source set must contain exactly `h`. Replaying it
-    // into the ZirDriver via `markReturned` is what Phase 4's
-    // `beginFunction` does at lowering time; the load-bearing
-    // invariant for Phase 5 is that the *set is non-empty* so the
-    // backend has at least one local to filter on.
-    try std.testing.expect(ownership.return_source_locals.count() >= 1);
+    // Phase E.5 Gap 4: borrowed-param-returned locals are NOT
+    // return sources.
+    try std.testing.expectEqual(@as(u32, 0), ownership.return_source_locals.count());
     try std.testing.expectEqual(@as(usize, 0), ownership.consume_share_sites.count());
 }
 
-test "arc_liveness: Phase 5 — branching identity returns each arm's local as return source" {
-    // `pick(b, x, y)` where each arm is a direct-return of a
-    // parameter must record both arm-result locals as return sources.
-    // The IR builder lowers the case-expression by allocating an
-    // aggregate dest local; the analyzer's
-    // `propagateReturnSourcesThroughAggregates` step folds the arm
-    // results back into the return-source set, which Phase 5's filter
-    // then suppresses at scope exit.
+test "arc_liveness: Phase 5 — branching pick of borrowed params NOT in return_source (Phase E.5 Gap 4)" {
+    // Pre-Phase-E.5: arm-result locals `x` and `y` (plus the
+    // aggregate dest) were added to `return_source_locals` because
+    // each arm directly returns a borrowed param.
     //
-    // Uses `case` rather than `if/else` because Zap's HIR-pass surface
-    // for if-expression-as-return-value-aggregate is not yet wired
-    // for opaque-typed branch results; `case` is the canonical surface
-    // syntax for branching last-value semantics in the existing tests.
+    // Phase E.5 Gap 4: `canElideReturnSource` rejects borrowed-param-
+    // returned locals; the gate cascades into
+    // `propagateReturnSourcesThroughAggregates` so the case
+    // expression's aggregate dest backs off too. Result: the set is
+    // empty, and per-arm retains fire to give the caller a fresh
+    // owner.
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -3078,13 +3126,61 @@ test "arc_liveness: Phase 5 — branching identity returns each arm's local as r
     );
     defer ownership.deinit(std.testing.allocator);
 
-    // Both `x` and `y` (and possibly the case-expression's aggregate
-    // dest) should be return sources. The exact count depends on
-    // whether the IR materialises an aggregate local; the load-bearing
-    // assertion is that the set contains more than one local — pinning
-    // that the propagate-through-aggregates step wired up in Phase 4
-    // does the right thing for Phase 5's filter.
-    try std.testing.expect(ownership.return_source_locals.count() >= 2);
+    // The aggregate case-block dest may still be added to
+    // return_source_locals by `applySpecialization` on the ret
+    // (since the aggregate dest is not itself a param_get). What
+    // MUST be true after Phase E.5 Gap 4: the underlying borrowed-
+    // param locals (`x`, `y`) are NOT propagated through.
+    var iter = ownership.return_source_locals.keyIterator();
+    while (iter.next()) |local_ptr| {
+        // Each entry must NOT be a borrowed param.
+        for (pick_func.body) |block| {
+            for (block.instructions) |instr| {
+                switch (instr) {
+                    .param_get => |pg| {
+                        if (pg.dest == local_ptr.*) {
+                            try std.testing.expect(pg.index >= pick_func.param_conventions.len or
+                                pick_func.param_conventions[pg.index] != .borrowed);
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+}
+
+test "arc_liveness: Phase 5 — owned-binding ret IS in return_source (Phase E.5 Gap 4 inverse)" {
+    // Inverse to the borrowed-param exclusion: when the ret value
+    // is sourced from a freshly-allocated owner (e.g., the dest of
+    // a Test.fresh() call), `canElideReturnSource` accepts it. The
+    // returned value flows through the call's ownership transfer
+    // semantics; the post-call retain is unnecessary because the
+    // call_named already produced +1.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn fresh() -> Handle { "x" }
+        \\
+        \\  pub fn make() -> Handle { Test.fresh() }
+        \\}
+    ;
+    var suite = try TestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const make_func = suite.findFunctionByName("make") orelse return error.MissingFunction;
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        make_func,
+        suite.typeStore(),
+        defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // The call_named dest IS a return source (Gap 4 only excludes
+    // borrowed-param-returned locals).
+    try std.testing.expect(ownership.return_source_locals.count() >= 1);
 }
 
 test "arc_liveness: Phase 5 — k-nucleotide-shaped tail loop populates both categories" {
@@ -3171,32 +3267,37 @@ test "arc_liveness: Phase 5 — function returning helper(x) does not list param
     // the disjointness invariant is trivially satisfied either way.
 }
 
-test "arc_liveness: Phase 5 — release filter suppresses return-source releases" {
+test "arc_liveness: Phase 5 — release filter pipes through return_source_locals" {
     // Phase 5's load-bearing post-condition: the ZIR backend's
     // release-emission filter (`isReleaseSuppressed`) returns true
     // for every local recorded in `arc_returned_locals`. The Phase
     // 4-installed `markReturned` hook copies entries from the
     // analyzer's `return_source_locals` into `arc_returned_locals`
     // at function-begin time; here we exercise the end-to-end set
-    // membership via the public driver API. The mechanics — that the
-    // analyzer + `markReturned` produce a non-empty
-    // `arc_returned_locals` and that `isReleaseSuppressed` reports
-    // true for those locals — are what guarantee the scope-exit
-    // release for a return-source local is elided in lowering.
+    // membership via the public driver API.
+    //
+    // Phase E.5 Gap 4: the canonical identity function on a borrowed
+    // ARC param now produces an EMPTY `return_source_locals` because
+    // borrowed params can't elide their retain-on-ret. We exercise
+    // a non-borrowed shape — a function whose ret-source is the
+    // dest of a Test.fresh() call (an owned binding) — to keep the
+    // pipe-through assertion meaningful.
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
         \\
-        \\  pub fn id(h :: Handle) -> Handle { h }
+        \\  pub fn fresh() -> Handle { "x" }
+        \\
+        \\  pub fn make() -> Handle { Test.fresh() }
         \\}
     ;
     var suite = try TestSuite.init(std.testing.allocator, source);
     defer suite.deinit();
 
-    const id_func = suite.findFunctionByName("id") orelse return error.MissingFunction;
+    const make_func = suite.findFunctionByName("make") orelse return error.MissingFunction;
     var ownership = try computeArcOwnership(
         std.testing.allocator,
-        id_func,
+        make_func,
         suite.typeStore(),
         defaultArcManagedTypeId,
     );
@@ -3235,7 +3336,7 @@ test "arc_liveness: Phase 5 — release filter suppresses return-source releases
     // that *does* exist on a return-source local would be filtered
     // by `isReleaseSuppressed`. The collector below verifies the
     // helper does in fact run without error, pinning the public API.
-    var release_sources = try collectReleaseSources(std.testing.allocator, id_func);
+    var release_sources = try collectReleaseSources(std.testing.allocator, make_func);
     defer release_sources.deinit(std.testing.allocator);
     // No assertion on count: the test's contract is the membership
     // check above, not a specific release-count expectation.
