@@ -1763,6 +1763,494 @@ pub const MArrayI64 = MArrayOf(i64);
 pub const MArrayF64 = MArrayOf(f64);
 
 // ============================================================
+// Vector(T) — Phase 2 of the dense-Map / flat-Vector implementation
+// plan (`docs/dense-map-implementation-plan.md` §1.3).
+//
+// Single-allocation flat-buffer mutable array with COW semantics. The
+// cell pointer (`?*const Vector(T)`) points to the buffer. `null` is
+// the empty-vector sentinel — no allocation until first `new_*`.
+//
+// Layout (single contiguous allocation through `c_allocator`):
+//
+//   [ Self    (header, len, capacity)         ]   <- buffer pointer
+//   [ data: [capacity]T                        ]
+//
+// The first field is `header: ArcHeader` so `hasInlineArcHeader`
+// recognises the type for ARC dispatch (same shape as `Map(K, V)`,
+// `List(T)`, `MArrayOf(T)`).
+//
+// Mutation pattern (rc-1 fast path): every mutating function checks
+// `header.count() == 1`; on the unique-owner branch it mutates the
+// live buffer in place (possibly resized) and returns the same/new
+// pointer; on the shared branch it deep-retain clones first so the
+// original observer keeps a stable view.
+//
+// Why `c_allocator` instead of `page_allocator`: tiny vectors with a
+// few elements would each get a fresh 16 KiB page from
+// `page_allocator`. libc malloc has size classes that pack small
+// allocations efficiently — same choice the dense Map made.
+// ============================================================
+
+pub fn Vector(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        // Inline buffer header. The cell pointer IS the buffer
+        // pointer; `header: ArcHeader` lives at offset 0 so
+        // `ArcRuntime.hasInlineArcHeader` recognises this type as
+        // self-managed (same shape as List(T), Map(K, V), MArrayOf(T)
+        // cells).
+
+        /// ARC refcount. Initialised to 1 by `bufferAlloc`.
+        header: ArcHeader,
+        /// Number of populated elements (cursor for the next push).
+        len: u32,
+        /// Total capacity in elements (always >= len).
+        cap: u32,
+
+        // -------------------------------------------------------------------
+        // Layout helpers
+        // -------------------------------------------------------------------
+
+        inline fn dataByteOffset() usize {
+            return std.mem.alignForward(usize, @sizeOf(Self), @alignOf(T));
+        }
+
+        inline fn bufferSize(capacity_arg: u32) usize {
+            return dataByteOffset() + @as(usize, capacity_arg) * @sizeOf(T);
+        }
+
+        inline fn bufferAlign() std.mem.Alignment {
+            const a_self = std.mem.Alignment.of(Self);
+            const a_t = std.mem.Alignment.of(T);
+            return a_self.max(a_t);
+        }
+
+        inline fn dataPtr(self: *const Self) [*]T {
+            const base: [*]u8 = @ptrCast(@constCast(self));
+            return @as([*]T, @ptrCast(@alignCast(base + dataByteOffset())));
+        }
+
+        inline fn slotAt(self: *Self, idx: u32) *T {
+            std.debug.assert(idx < self.len);
+            return &self.dataPtr()[idx];
+        }
+
+        inline fn slotAtConst(self: *const Self, idx: u32) *const T {
+            std.debug.assert(idx < self.len);
+            return &self.dataPtr()[idx];
+        }
+
+        // -------------------------------------------------------------------
+        // Buffer alloc / free
+        // -------------------------------------------------------------------
+
+        /// Allocate a freshly-initialised buffer with `capacity_arg`
+        /// element slots and `len_arg` populated entries. The data
+        /// region is left UNINITIALISED — callers fill the populated
+        /// prefix before returning. Refcount starts at 1.
+        fn bufferAlloc(capacity_arg: u32, len_arg: u32) ?*Self {
+            std.debug.assert(len_arg <= capacity_arg);
+            const allocator = std.heap.c_allocator;
+            const align_v = comptime bufferAlign();
+            const total = bufferSize(capacity_arg);
+            const raw = allocator.alignedAlloc(u8, align_v, total) catch return null;
+            const self_ptr: *Self = @ptrCast(@alignCast(raw.ptr));
+            self_ptr.* = .{
+                .header = ArcHeader.init(),
+                .len = len_arg,
+                .cap = capacity_arg,
+            };
+            return self_ptr;
+        }
+
+        /// Free the buffer without deep-releasing T children. Used on
+        /// the unique-owner resize path where children have been moved
+        /// to the resized buffer.
+        fn bufferFreeShallow(self: *Self) void {
+            const allocator = std.heap.c_allocator;
+            const total = bufferSize(self.cap);
+            const align_v = comptime bufferAlign();
+            const raw_ptr: [*]u8 = @ptrCast(self);
+            const raw_slice = @as([*]align(align_v.toByteUnits()) u8, @alignCast(raw_ptr))[0..total];
+            allocator.free(raw_slice);
+        }
+
+        /// Free the buffer after deep-releasing every populated element.
+        /// Called on the zero-transition of `release`.
+        fn bufferFreeDeep(self: *Self) void {
+            const len = self.len;
+            const data = self.dataPtr();
+            const allocator = std.heap.c_allocator;
+            for (0..len) |i| {
+                releaseElement(data[i], allocator);
+            }
+            self.bufferFreeShallow();
+        }
+
+        // -------------------------------------------------------------------
+        // Retain / release
+        // -------------------------------------------------------------------
+
+        /// Increment the refcount and return the same handle. Mirrors
+        /// `Map(K, V).retain` / `MArrayOf(T).retain`.
+        pub fn retain(vec: ?*const Self) ?*const Self {
+            if (vec) |v| {
+                const mut: *Self = @constCast(v);
+                mut.header.retain();
+                arc_retains_total += 1;
+            }
+            return vec;
+        }
+
+        /// Decrement the refcount; on the zero-transition deep-release
+        /// every element and free the buffer. Mirrors Map's pattern of
+        /// bumping `arc_releases_total` unconditionally.
+        pub fn release(vec: ?*const Self) void {
+            if (vec == null) return;
+            const v = vec.?;
+            const mut: *Self = @constCast(v);
+            arc_releases_total += 1;
+            if (!mut.header.release()) return;
+            mut.bufferFreeDeep();
+        }
+
+        /// Inline-header dispatch hook used by the generic ARC
+        /// machinery (`releaseFieldChildAny` / `releaseArcAny`).
+        pub fn arcReleaseDeep(allocator: std.mem.Allocator, ptr: *const Self) void {
+            _ = allocator;
+            release(@as(?*const Self, ptr));
+        }
+
+        // -------------------------------------------------------------------
+        // Clone helpers
+        // -------------------------------------------------------------------
+
+        /// Clone with deep-retain of element children. Used on the
+        /// shared (rc>1) mutation path so the original cell stays
+        /// valid while the clone takes the mutation.
+        fn cloneBufferRetainingChildren(self: *const Self, new_capacity: u32) ?*Self {
+            std.debug.assert(new_capacity >= self.len);
+            const fresh = bufferAlloc(new_capacity, self.len) orelse return null;
+            const old_data = self.dataPtr();
+            const new_data = fresh.dataPtr();
+            for (0..self.len) |i| {
+                new_data[i] = old_data[i];
+                retainElement(old_data[i]);
+            }
+            return fresh;
+        }
+
+        /// Clone WITHOUT retaining element children. Used on the
+        /// unique-owner resize path: the old buffer's elements
+        /// transfer verbatim to the new buffer, and the old buffer is
+        /// freed shallowly afterward (no per-element release).
+        fn cloneBufferMovingChildren(self: *const Self, new_capacity: u32) ?*Self {
+            std.debug.assert(new_capacity >= self.len);
+            const fresh = bufferAlloc(new_capacity, self.len) orelse return null;
+            const old_data = self.dataPtr();
+            const new_data = fresh.dataPtr();
+            for (0..self.len) |i| {
+                new_data[i] = old_data[i];
+            }
+            return fresh;
+        }
+
+        // -------------------------------------------------------------------
+        // Capacity selection
+        // -------------------------------------------------------------------
+
+        /// Pick the next power-of-two capacity that fits `target_len`.
+        /// Default initial capacity is 4 (matches typical small-vector
+        /// micro-benchmarks; larger workloads grow exponentially via
+        /// doubling).
+        fn pickCapacity(old_cap: u32, target_len: u32) u32 {
+            var cap: u32 = if (old_cap == 0) 4 else old_cap;
+            while (cap < target_len) cap *= 2;
+            return cap;
+        }
+
+        // -------------------------------------------------------------------
+        // Public introspection
+        // -------------------------------------------------------------------
+
+        /// Number of populated elements.
+        pub fn length(vec: ?*const Self) i64 {
+            const v = vec orelse return 0;
+            return @intCast(v.len);
+        }
+
+        /// Total capacity (number of element slots in the buffer).
+        pub fn capacity(vec: ?*const Self) i64 {
+            const v = vec orelse return 0;
+            return @intCast(v.cap);
+        }
+
+        // -------------------------------------------------------------------
+        // Allocation
+        // -------------------------------------------------------------------
+
+        /// Allocate a vector of exactly `size` elements, each set to
+        /// `init`. Mirrors `MArrayOf(T).new(size, init)` so callers
+        /// can be ported one-for-one.
+        ///
+        /// For ARC-managed `T`: the caller hands one +1 of `init` to
+        /// the vector. We need `size` durable owners (one per slot),
+        /// so we retain `size - 1` additional times. The zero-element
+        /// edge case requires the caller's +1 to be dropped.
+        pub fn new_filled(size: i64, init: T) ?*const Self {
+            if (size < 0) @panic("Vector.new_filled: negative size");
+            const slot_count: u32 = @intCast(size);
+            const fresh = bufferAlloc(slot_count, slot_count) orelse return null;
+            const data = fresh.dataPtr();
+            for (0..slot_count) |i| {
+                data[i] = init;
+            }
+            // The caller's +1 covers slot 0; retain (slot_count - 1)
+            // times for the remaining slots. For trivial T this loop
+            // compiles to nothing.
+            if (slot_count == 0) {
+                releaseElement(init, std.heap.c_allocator);
+            } else {
+                var k: u32 = 1;
+                while (k < slot_count) : (k += 1) retainElement(init);
+            }
+            return fresh;
+        }
+
+        /// Allocate an empty vector with the given reserved capacity.
+        /// The buffer is allocated but `len == 0`.
+        pub fn new_empty(initial_capacity: i64) ?*const Self {
+            if (initial_capacity < 0) @panic("Vector.new_empty: negative capacity");
+            const cap_arg: u32 = @intCast(initial_capacity);
+            const cap_final: u32 = if (cap_arg == 0) 4 else cap_arg;
+            return bufferAlloc(cap_final, 0);
+        }
+
+        // -------------------------------------------------------------------
+        // Get / set
+        // -------------------------------------------------------------------
+
+        /// Bounds-checked element read. Panics on null vector or
+        /// out-of-range index (matches `MArrayOf(T).get`'s contract).
+        pub fn get(vec: ?*const Self, index: i64) T {
+            const v = vec orelse @panic("Vector.get: null vector");
+            const slot: u32 = @intCast(index);
+            if (slot >= v.len) @panic("Vector.get: index out of bounds");
+            return v.slotAtConst(slot).*;
+        }
+
+        /// Bounds-checked element write. Refcount-aware: on rc==1 the
+        /// existing buffer is mutated in place and the same pointer is
+        /// returned; on rc>1 the buffer is deep-retain cloned first so
+        /// the original observer stays valid.
+        pub fn set(vec: ?*const Self, index: i64, value: T) ?*const Self {
+            const v = vec orelse @panic("Vector.set: null vector");
+            const slot: u32 = @intCast(index);
+            if (slot >= v.len) @panic("Vector.set: index out of bounds");
+
+            if (v.header.count() == 1) {
+                const mut: *Self = @constCast(v);
+                const existing = mut.slotAt(slot).*;
+                releaseElement(existing, std.heap.c_allocator);
+                mut.slotAt(slot).* = value;
+                return mut;
+            }
+
+            const clone = cloneBufferRetainingChildren(v, v.cap) orelse return null;
+            const clone_existing = clone.slotAt(slot).*;
+            releaseElement(clone_existing, std.heap.c_allocator);
+            clone.slotAt(slot).* = value;
+            return clone;
+        }
+
+        // -------------------------------------------------------------------
+        // Push / pop / append
+        // -------------------------------------------------------------------
+
+        /// Append `value` to the end. Refcount-aware: on rc==1 the
+        /// existing buffer is mutated in place (possibly resized — see
+        /// note below); on rc>1 the buffer is deep-retain cloned first
+        /// with sufficient capacity to hold the new element.
+        ///
+        /// Resize note: when the rc==1 path needs to grow capacity, we
+        /// allocate a fresh buffer via `cloneBufferMovingChildren`
+        /// (transferring elements verbatim with no per-element retain)
+        /// and then `bufferFreeShallow` on the old buffer. The net
+        /// effect on T's refcounts is zero: each element transitions
+        /// from old-buffer ownership to new-buffer ownership without
+        /// touching ARC counts.
+        pub fn push(vec: ?*const Self, value: T) ?*const Self {
+            if (vec == null) {
+                const fresh = bufferAlloc(pickCapacity(0, 1), 0) orelse return null;
+                fresh.slotAtPtr(0).* = value;
+                fresh.len = 1;
+                return fresh;
+            }
+            const v = vec.?;
+
+            if (v.header.count() == 1) {
+                const mut: *Self = @constCast(v);
+                if (mut.len < mut.cap) {
+                    mut.slotAtPtr(mut.len).* = value;
+                    mut.len += 1;
+                    return mut;
+                }
+                // Need to grow. Move children to a fresh, larger
+                // buffer; free the old buffer shallowly so the moved
+                // children are not double-released.
+                const new_cap = pickCapacity(mut.cap, mut.len + 1);
+                const grown = cloneBufferMovingChildren(mut, new_cap) orelse return null;
+                mut.bufferFreeShallow();
+                grown.slotAtPtr(grown.len).* = value;
+                grown.len += 1;
+                return grown;
+            }
+
+            // Shared: deep-retain clone with sufficient capacity for
+            // the appended element.
+            const new_cap = pickCapacity(v.cap, v.len + 1);
+            const clone = cloneBufferRetainingChildren(v, new_cap) orelse return null;
+            clone.slotAtPtr(clone.len).* = value;
+            clone.len += 1;
+            return clone;
+        }
+
+        /// Remove the last element. Refcount-aware: on rc==1 the
+        /// existing buffer is mutated in place; on rc>1 a deep-retain
+        /// clone is made and pop'd. Returns the resulting vector
+        /// (NOT the popped value — mirrors the Roc-style `Dict.delete`
+        /// in the dense Map). On an empty vector this panics.
+        pub fn pop(vec: ?*const Self) ?*const Self {
+            const v = vec orelse @panic("Vector.pop: null vector");
+            if (v.len == 0) @panic("Vector.pop: empty vector");
+
+            if (v.header.count() == 1) {
+                const mut: *Self = @constCast(v);
+                const last = mut.slotAtPtr(mut.len - 1).*;
+                releaseElement(last, std.heap.c_allocator);
+                mut.len -= 1;
+                return mut;
+            }
+
+            const clone = cloneBufferRetainingChildren(v, v.cap) orelse return null;
+            const last = clone.slotAtPtr(clone.len - 1).*;
+            releaseElement(last, std.heap.c_allocator);
+            clone.len -= 1;
+            return clone;
+        }
+
+        /// Concatenate two vectors. The result is logically `a ++ b`.
+        /// Refcount-aware: when `rc(a) == 1` and `cap(a) >= len(a) +
+        /// len(b)`, append B's elements into A's buffer in place;
+        /// otherwise allocate a fresh buffer with adequate capacity
+        /// (copying A's children with the appropriate retain
+        /// semantics for the chosen path).
+        ///
+        /// `b`'s elements are deep-retained as they're copied (B
+        /// retains its observers). The caller still owns the +1 on
+        /// `b`; releasing `b` after the call is the caller's
+        /// responsibility, mirroring `Map.merge`'s ABI.
+        pub fn append(a: ?*const Self, b: ?*const Self) ?*const Self {
+            if (a == null and b == null) return null;
+            if (b == null) return retain(a);
+            if (a == null) return cloneBufferRetainingChildren(b.?, b.?.len);
+            const av = a.?;
+            const bv = b.?;
+            const total_len = av.len + bv.len;
+
+            if (av.header.count() == 1 and av.cap >= total_len) {
+                const mut: *Self = @constCast(av);
+                const dst_data = mut.dataPtr();
+                const src_data = bv.dataPtr();
+                var i: u32 = 0;
+                while (i < bv.len) : (i += 1) {
+                    dst_data[mut.len + i] = src_data[i];
+                    retainElement(src_data[i]);
+                }
+                mut.len = total_len;
+                return mut;
+            }
+
+            // Either A is shared (must clone) OR A's buffer is too
+            // small (must grow). Either way, allocate a fresh buffer
+            // with enough room and deep-retain copy A and B's
+            // elements into it.
+            const new_cap = pickCapacity(av.cap, total_len);
+            const fresh = bufferAlloc(new_cap, total_len) orelse return null;
+            const fresh_data = fresh.dataPtr();
+            const a_data = av.dataPtr();
+            const b_data = bv.dataPtr();
+            var i: u32 = 0;
+            while (i < av.len) : (i += 1) {
+                fresh_data[i] = a_data[i];
+                retainElement(a_data[i]);
+            }
+            while (i < total_len) : (i += 1) {
+                fresh_data[i] = b_data[i - av.len];
+                retainElement(b_data[i - av.len]);
+            }
+            return fresh;
+        }
+
+        // -------------------------------------------------------------------
+        // Internal slot accessors (allow writes past `len` for push)
+        // -------------------------------------------------------------------
+
+        inline fn slotAtPtr(self: *Self, idx: u32) *T {
+            std.debug.assert(idx < self.cap);
+            return &self.dataPtr()[idx];
+        }
+
+        // -------------------------------------------------------------------
+        // ARC element walkers
+        // -------------------------------------------------------------------
+
+        inline fn releaseElement(value: T, allocator: std.mem.Allocator) void {
+            releaseElementShape(T, value, allocator);
+        }
+
+        inline fn retainElement(value: T) void {
+            retainElementShape(T, value);
+        }
+
+        fn releaseElementShape(comptime ElemT: type, value: ElemT, allocator: std.mem.Allocator) void {
+            switch (@typeInfo(ElemT)) {
+                .optional => |opt| {
+                    if (value) |inner| releaseElementShape(opt.child, inner, allocator);
+                },
+                .pointer => |p| {
+                    if (p.size == .one) {
+                        ArcRuntime.releaseArcAny(p.child, allocator, @constCast(value));
+                    }
+                },
+                .@"struct" => {
+                    ArcRuntime.releaseChildrenAny(ElemT, allocator, value);
+                },
+                else => {},
+            }
+        }
+
+        fn retainElementShape(comptime ElemT: type, value: ElemT) void {
+            switch (@typeInfo(ElemT)) {
+                .optional => |opt| {
+                    if (value) |inner| retainElementShape(opt.child, inner);
+                },
+                .pointer => |p| {
+                    if (p.size == .one) {
+                        ArcRuntime.retainAnyPersistent(@as(*const p.child, @constCast(value)));
+                    }
+                },
+                .@"struct" => {
+                    ArcRuntime.retainChildrenAny(ElemT, value);
+                },
+                else => {},
+            }
+        }
+    };
+}
+
+// ============================================================
 // Atom — Interned atom values (spec §5.6)
 // ============================================================
 
@@ -9365,4 +9853,269 @@ test "instrumentation: V — shared and post-share-mutated" {
     try std.testing.expect(rec.had_share_event);
     try std.testing.expect(rec.had_post_share_mutation);
     try std.testing.expectEqual(@as(u8, 'V'), rec.class);
+}
+
+// ============================================================
+// Vector(T) — Phase 2: flat-buffer mutable array
+// ============================================================
+
+test "Vector(i64) new_filled allocates and initialises every slot" {
+    const VecI64 = Vector(i64);
+    const v = VecI64.new_filled(5, 7) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer VecI64.release(v);
+
+    try std.testing.expectEqual(@as(i64, 5), VecI64.length(v));
+    var i: i64 = 0;
+    while (i < 5) : (i += 1) {
+        try std.testing.expectEqual(@as(i64, 7), VecI64.get(v, i));
+    }
+}
+
+test "Vector(i64) new_empty allocates with reserved capacity and zero len" {
+    const VecI64 = Vector(i64);
+    const v = VecI64.new_empty(8) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer VecI64.release(v);
+
+    try std.testing.expectEqual(@as(i64, 0), VecI64.length(v));
+    try std.testing.expect(VecI64.capacity(v) >= 8);
+}
+
+test "Vector(i64) get/set roundtrips on rc==1 vector returns same handle" {
+    const VecI64 = Vector(i64);
+    const v = VecI64.new_filled(3, 0) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer VecI64.release(v);
+
+    const after_set = VecI64.set(v, 1, 42) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    // rc==1 fast path: same handle returned, in-place mutation.
+    try std.testing.expectEqual(@intFromPtr(v), @intFromPtr(after_set));
+    try std.testing.expectEqual(@as(i64, 42), VecI64.get(after_set, 1));
+}
+
+test "Vector(i64) set on rc>1 vector clones; original stays unchanged" {
+    const VecI64 = Vector(i64);
+    const original = VecI64.new_filled(3, 0) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer VecI64.release(original);
+
+    // Bump refcount; now `set` must COW.
+    const shared = VecI64.retain(original);
+    defer VecI64.release(shared);
+
+    const updated = VecI64.set(original, 1, 99) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer VecI64.release(updated);
+
+    try std.testing.expect(@intFromPtr(updated) != @intFromPtr(original));
+    // Original unchanged.
+    try std.testing.expectEqual(@as(i64, 0), VecI64.get(original, 1));
+    // Updated has the new value.
+    try std.testing.expectEqual(@as(i64, 99), VecI64.get(updated, 1));
+}
+
+test "Vector(i64) push grows length and persists value (rc==1)" {
+    const VecI64 = Vector(i64);
+    const v0 = VecI64.new_empty(2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const v1 = VecI64.push(v0, 10) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const v2 = VecI64.push(v1, 20) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    // rc==1: each push reuses buffer (until capacity is exceeded).
+    const v3 = VecI64.push(v2, 30) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer VecI64.release(v3);
+
+    try std.testing.expectEqual(@as(i64, 3), VecI64.length(v3));
+    try std.testing.expectEqual(@as(i64, 10), VecI64.get(v3, 0));
+    try std.testing.expectEqual(@as(i64, 20), VecI64.get(v3, 1));
+    try std.testing.expectEqual(@as(i64, 30), VecI64.get(v3, 2));
+}
+
+test "Vector(i64) push past capacity triggers in-place grow on rc==1" {
+    const VecI64 = Vector(i64);
+    var current: ?*const VecI64 = VecI64.new_empty(2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    var i: i64 = 0;
+    while (i < 16) : (i += 1) {
+        current = VecI64.push(current, i) orelse {
+            try std.testing.expect(false);
+            return;
+        };
+    }
+    defer VecI64.release(current);
+
+    try std.testing.expectEqual(@as(i64, 16), VecI64.length(current));
+    var k: i64 = 0;
+    while (k < 16) : (k += 1) {
+        try std.testing.expectEqual(k, VecI64.get(current, k));
+    }
+    try std.testing.expect(VecI64.capacity(current) >= 16);
+}
+
+test "Vector(i64) pop decrements length on rc==1" {
+    const VecI64 = Vector(i64);
+    const v = VecI64.new_filled(3, 7) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const popped = VecI64.pop(v) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer VecI64.release(popped);
+
+    try std.testing.expectEqual(@intFromPtr(v), @intFromPtr(popped));
+    try std.testing.expectEqual(@as(i64, 2), VecI64.length(popped));
+}
+
+test "Vector(i64) append concatenates two vectors in correct order" {
+    const VecI64 = Vector(i64);
+    var a: ?*const VecI64 = VecI64.new_empty(0) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    a = VecI64.push(a, 1) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    a = VecI64.push(a, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    var b: ?*const VecI64 = VecI64.new_empty(0) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    b = VecI64.push(b, 3) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    b = VecI64.push(b, 4) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    const result = VecI64.append(a, b) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer VecI64.release(result);
+    defer VecI64.release(b);
+
+    try std.testing.expectEqual(@as(i64, 4), VecI64.length(result));
+    try std.testing.expectEqual(@as(i64, 1), VecI64.get(result, 0));
+    try std.testing.expectEqual(@as(i64, 2), VecI64.get(result, 1));
+    try std.testing.expectEqual(@as(i64, 3), VecI64.get(result, 2));
+    try std.testing.expectEqual(@as(i64, 4), VecI64.get(result, 3));
+}
+
+test "Vector(i64) retain/release roundtrips refcount" {
+    const VecI64 = Vector(i64);
+    const v = VecI64.new_filled(2, 99) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(@as(u32, 1), v.header.count());
+
+    const second = VecI64.retain(v);
+    try std.testing.expectEqual(@as(u32, 2), v.header.count());
+
+    // First release: count drops to 1, buffer alive.
+    VecI64.release(second);
+    try std.testing.expectEqual(@as(u32, 1), v.header.count());
+
+    // Final release: buffer freed.
+    VecI64.release(v);
+}
+
+test "Vector(f64) initialises slots and round-trips writes (rc==1 in place)" {
+    const VecF64 = Vector(f64);
+    const v = VecF64.new_filled(4, 1.5) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(@as(i64, 4), VecF64.length(v));
+    try std.testing.expectEqual(@as(f64, 1.5), VecF64.get(v, 2));
+
+    const after_set = VecF64.set(v, 2, 2.75) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(@intFromPtr(v), @intFromPtr(after_set));
+    try std.testing.expectEqual(@as(f64, 2.75), VecF64.get(after_set, 2));
+    VecF64.release(after_set);
+}
+
+test "Vector deep-releases ARC-managed children on zero-transition" {
+    // Phase 2: when T is an ARC-managed pointer (e.g. ?*const Map(K, V)),
+    // Vector(T)'s release on the zero-transition must walk every live
+    // element and deep-release it. We mirror the Map and List
+    // regression-test pattern.
+    const MapI64 = Map(i64, i64);
+    const VecMap = Vector(?*const MapI64);
+
+    const before_releases = arc_releases_total;
+
+    const keys_one = [_]i64{ 1, 2 };
+    const vals_one = [_]i64{ 10, 20 };
+    const map_one = MapI64.fromPairs(&keys_one, &vals_one, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const keys_two = [_]i64{ 3, 4 };
+    const vals_two = [_]i64{ 30, 40 };
+    const map_two = MapI64.fromPairs(&keys_two, &vals_two, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    var vec: ?*const VecMap = VecMap.new_empty(2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    // `push` consumes the value (as the cell's durable owner), so each
+    // pushed Map's +1 transfers into the Vector.
+    vec = VecMap.push(vec, map_one) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    vec = VecMap.push(vec, map_two) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    // Release the vector. The Vector's own `release` bumps
+    // `arc_releases_total` once (unconditionally, mirroring Map's
+    // pattern). On the zero-transition the deep-release walk fires
+    // `release` on each child Map, bumping the counter twice more
+    // (one per Map cell freed). Net: +3.
+    VecMap.release(vec);
+    try std.testing.expectEqual(before_releases + 3, arc_releases_total);
 }
