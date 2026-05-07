@@ -560,7 +560,13 @@ const InstrumentationState = struct {
     /// that site.
     callsite_counts: std.AutoHashMap(u64, u64) = undefined,
     atexit_registered: bool = false,
-    detail_file: ?std.fs.File = null,
+    /// Posix file descriptor for the optional `map-instrumentation.jsonl`
+    /// detail file, or `-1` when no detail file is open. We use a raw
+    /// fd rather than `std.fs.File` because the embedded user-binary
+    /// runtime context exposes only a restricted std surface (the rest
+    /// of `runtime.zig` follows the same pattern — see `File.write` at
+    /// the bottom of this file).
+    detail_fd: i32 = -1,
     detail_attempted: bool = false,
 };
 
@@ -600,9 +606,13 @@ fn ensureInstrumentationInit() void {
         const detail_var = envGetRuntime("ZAP_INSTRUMENT_DETAIL");
         if (detail_var) |v| {
             if (v.len != 0 and v[0] != '0') {
-                if (std.fs.cwd().createFile("map-instrumentation.jsonl", .{ .truncate = true })) |file| {
-                    instrumentation_state.detail_file = file;
-                } else |_| {}
+                const path_z = std.posix.toPosixPath("map-instrumentation.jsonl") catch null;
+                if (path_z) |pz| {
+                    const fd = std.c.open(&pz, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+                    if (fd >= 0) {
+                        instrumentation_state.detail_fd = fd;
+                    }
+                }
             }
         }
     }
@@ -747,8 +757,8 @@ pub fn mapInstrumentationOnRelease(cell_ptr: usize, size_at_release: u32) void {
     }
 
     instrumentation_state.finalised.append(instrumentationAllocator(), record) catch {};
-    if (instrumentation_state.detail_file) |file| {
-        writeRecordJsonLine(file, record) catch {};
+    if (instrumentation_state.detail_fd >= 0) {
+        writeRecordJsonLine(instrumentation_state.detail_fd, record) catch {};
     }
 }
 
@@ -831,7 +841,7 @@ pub fn mapInstrumentationNoteNodeClone(input_cell_ptr: usize) void {
     }
 }
 
-fn writeRecordJsonLine(file: std.fs.File, record: MapInstanceRecord) !void {
+fn writeRecordJsonLine(fd: i32, record: MapInstanceRecord) !void {
     var buf: [768]u8 = undefined;
     const class_str: []const u8 = switch (record.class) {
         'S' => "S",
@@ -854,7 +864,7 @@ fn writeRecordJsonLine(file: std.fs.File, record: MapInstanceRecord) !void {
             record.alloc_time_ns,      record.release_time_ns,
             record.size_at_release,    class_str,
         });
-    _ = std.c.write(file.handle, formatted.ptr, formatted.len);
+    _ = std.c.write(fd, formatted.ptr, formatted.len);
 }
 
 fn classifyHistogramSize(s: u32) usize {
@@ -875,7 +885,7 @@ fn classifyConcurrentVersions(p: u32) usize {
 }
 
 fn workloadNameFromArgv0() []const u8 {
-    const argv = std.os.argv;
+    const argv = getArgv();
     if (argv.len == 0) return "unknown";
     const path = std.mem.span(argv[0]);
     if (std.mem.lastIndexOfScalar(u8, path, '/')) |idx| {
@@ -978,10 +988,13 @@ fn renderInstrumentationSummaryJson(buf: *std.ArrayListUnmanaged(u8), alloc: std
     try buf.appendSlice(alloc, "{\n  \"workload\": ");
     try writeJsonString(buf, alloc, workload);
     try buf.appendSlice(alloc, ",\n  \"binary\": ");
-    if (std.os.argv.len > 0) {
-        try writeJsonString(buf, alloc, std.mem.span(std.os.argv[0]));
-    } else {
-        try buf.appendSlice(alloc, "\"\"");
+    {
+        const argv = getArgv();
+        if (argv.len > 0) {
+            try writeJsonString(buf, alloc, std.mem.span(argv[0]));
+        } else {
+            try buf.appendSlice(alloc, "\"\"");
+        }
     }
     var line_buf: [256]u8 = undefined;
     {
@@ -1077,8 +1090,8 @@ fn flushPendingActiveRecords() void {
             instrumentation_state.post_share_mutation_count += 1;
         }
         instrumentation_state.finalised.append(instrumentationAllocator(), record) catch {};
-        if (instrumentation_state.detail_file) |file| {
-            writeRecordJsonLine(file, record) catch {};
+        if (instrumentation_state.detail_fd >= 0) {
+            writeRecordJsonLine(instrumentation_state.detail_fd, record) catch {};
         }
     }
     instrumentation_state.active.clearRetainingCapacity();
@@ -1089,24 +1102,27 @@ fn mapInstrumentationAtexit() callconv(.c) void {
     if (!instrumentation_state.initialised) return;
     flushStdoutBuf();
     flushPendingActiveRecords();
-    if (instrumentation_state.detail_file) |file| {
-        file.close();
-        instrumentation_state.detail_file = null;
+    if (instrumentation_state.detail_fd >= 0) {
+        _ = std.c.close(instrumentation_state.detail_fd);
+        instrumentation_state.detail_fd = -1;
     }
     const out_path = envGetRuntime("ZAP_INSTRUMENT_OUT") orelse "map-instrumentation.json";
-    var path_buf: [512]u8 = undefined;
-    if (out_path.len >= path_buf.len) return;
-    @memcpy(path_buf[0..out_path.len], out_path);
-    path_buf[out_path.len] = 0;
+    const out_path_z = std.posix.toPosixPath(out_path) catch return;
 
     const alloc = instrumentationAllocator();
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(alloc);
     renderInstrumentationSummaryJson(&buf, alloc) catch return;
 
-    var file = std.fs.cwd().createFile(out_path, .{ .truncate = true }) catch return;
-    defer file.close();
-    _ = std.c.write(file.handle, buf.items.ptr, buf.items.len);
+    const fd = std.c.open(&out_path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    var written: usize = 0;
+    while (written < buf.items.len) {
+        const n = std.c.write(fd, buf.items[written..].ptr, buf.items[written..].len);
+        if (n <= 0) break;
+        written += @intCast(n);
+    }
 }
 
 /// Test-only helper: returns a copy of the finalised record matching
