@@ -611,7 +611,17 @@ pub const ArcRuntime = struct {
             return releaseAny(allocator, unwrapped);
         }
         const T = arcPtrChild(@TypeOf(ptr));
-        arc_releases_total += 1;
+        // Inline-header types (`Map(K, V)`, `MArrayOf(T)`, ...) own
+        // their own pool and bump `arc_releases_total` inside their
+        // dedicated `release` method; if the generic wrapper also
+        // bumped, every release routed through `releaseAny` would
+        // double-count. Skip the bump here when `T` is self-managed —
+        // the inner `T.release(...)` call inside `releaseArcAny`
+        // accounts for this release. For Arc(T)-wrapped values the
+        // wrapper is the only counter site, so the bump stays.
+        if (comptime !hasInlineArcHeader(T)) {
+            arc_releases_total += 1;
+        }
         releaseArcAny(T, allocator, ptr);
     }
 
