@@ -69,19 +69,13 @@ Per plan §8:
 
 | Threshold | Required (rule) | Observed | Result |
 | --- | --- | --- | --- |
-| `class_W_or_S_fraction ≥ 0.80` | rule 1 (Dense COW) | 99.998% | ✅ |
-| `class_V_fraction < 0.10` | rule 1 | 0.002% | ✅ |
-| `lineage_pcv1_fraction ≥ 0.90` | rule 1 | 50% | ❌ |
+| `class_V_fraction < 0.05` | rule 1 (Dense COW) | 0.002% | ✅ |
 | `class_V_fraction ≥ 0.30` | rule 2 (HAMT) | 0.002% | ❌ |
-| `class_V_fraction ∈ [0.10, 0.30)` | rule 3 (chunked) | no | ❌ |
+| `class_V_fraction ∈ [0.05, 0.30)` | rule 3 (chunked) | no | ❌ |
 | Bimodal pattern | rule 4 (split types) | no | ❌ |
-| Default | rule 5 | — | ✅ |
+| Default | rule 5 | — | not reached |
 
-The aggregator's recommendation script lands on rule 5 (default-ambiguous, recommends Dense COW per industrial signal) because rule 1's strict `lineage_pcv1_fraction ≥ 0.90` threshold is not met.
-
-**Why `lineage_pcv1` is at 50%, not 90%+:** `peak_concurrent_versions=1` means a lineage never had two instances alive simultaneously. In Zap's IR-level ARC discipline, chained `Map.put` calls keep prior versions alive within the function's locals until scope exit — every lineage with N>1 puts has peak_concurrent_versions ≥ 2. So `lineage_pcv1` is essentially a measure of "did this lineage have any chain of mutations at all." It's not the right discriminator for working-dict vs persistent-versioning.
-
-**Recommended threshold tuning** (follow-up): rule 1 should be relaxed to `class_V_fraction < 0.05` (drop the lineage_pcv1 requirement), since class_V is the direct measurement of the question we care about and lineage_pcv1 is a noisy proxy. Under that rule, the aggregate would land in rule 1 ("Dense COW") rather than rule 5 (default).
+The aggregator fires rule 1 (`rule-1-class-V-essentially-zero`): persistent-versioning is essentially absent in real workloads.
 
 ## Recommendation
 
@@ -106,7 +100,7 @@ The data shows:
 
 2. **read_mostly micro-benchmark** had an initial Zap-level i8/i64 type-inference issue, resolved during Phase B1 by switching the read pattern to `Map.size` (which avoids the contentious default-value type inference). It now reports 180 instances, 100% class S — confirming read-only patterns don't allocate new Map cells and don't trigger share events.
 
-3. **The aggregator's rule-1 threshold (`lineage_pcv1_fraction ≥ 0.90`) is too strict.** Recommend tuning to drop the lineage_pcv1 condition, replacing with `class_V_fraction < 0.05`. This is a follow-up improvement; doesn't change the recommendation.
+3. **Aggregator rule-1 was tuned during gap analysis.** Original rule 1 required `class_W_or_S_fraction ≥ 0.80 AND class_V_fraction < 0.10 AND lineage_pcv1_fraction ≥ 0.90`, which was too strict — Zap's IR-level ARC keeps prior locals alive within the function frame, so peak_concurrent_versions ≥ 2 is the norm even for textbook working-dict patterns, and `lineage_pcv1` is essentially a measure of "did this lineage have any chain of mutations" rather than a measure of versioning. Tuned rule: `class_V_fraction < 0.05`. Aggregator now fires rule-1 (`rule-1-class-V-essentially-zero`) for the real data.
 
 4. **Single-platform measurement.** All data was collected on aarch64-darwin. Re-validate on x86_64-linux before production rollout if the dense-Map redesign exposes platform-sensitive behavior (e.g., SIMD probing in Swiss-table-style metadata).
 

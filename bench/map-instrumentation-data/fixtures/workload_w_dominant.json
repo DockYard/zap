@@ -6,9 +6,9 @@
     "total_instances": 100000,
     "total_lineages": 80000,
     "by_class": {
-      "S": {"count": 30000, "frac": 0.3000},
+      "S": {"count": 32000, "frac": 0.3200},
       "W": {"count": 65000, "frac": 0.6500},
-      "V": {"count": 5000,  "frac": 0.0500}
+      "V": {"count": 3000,  "frac": 0.0300}
     },
     "by_lineage_class": {
       "S": 30000,

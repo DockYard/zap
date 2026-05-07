@@ -346,16 +346,21 @@ AGGREGATE_JSON=$(jq '
 # Recommendation logic from plan §8.
 #
 # Decision tree (in order):
-#  1. class_W_or_S_fraction >= 0.80
-#     AND class_V_fraction < 0.10
-#     AND lineage_pcv1_fraction >= 0.90
-#       -> Dense COW
+#  1. class_V_fraction < 0.05
+#       -> Dense COW (essentially zero persistent-versioning observed)
+#       NOTE: lineage_pcv1_fraction is NOT a condition. Zap's IR-level
+#       ARC keeps prior locals alive within the function frame, so
+#       peak_concurrent_versions=2 is the norm even for textbook
+#       working-dict patterns. class_V_fraction is the direct
+#       measurement of the question we care about; lineage_pcv1 is a
+#       noisy proxy that gates on Zap's per-frame ARC discipline,
+#       not on the workload's persistent-versioning behavior.
 #  2. class_V_fraction >= 0.30
 #       -> HAMT-plus-make_mut
-#  3. class_V_fraction in [0.10, 0.30)
+#  3. class_V_fraction in [0.05, 0.30)
 #     AND small_map_fraction_lt32 >= 0.50  (proxy: small maps dominate)
 #       -> Dense COW + chunked-COW fallback for large maps
-#  4. class_V_fraction in [0.10, 0.30)
+#  4. class_V_fraction in [0.05, 0.30)
 #     AND large_map_fraction_ge128 >= 0.05 (bimodal: tiny W + a few big V)
 #       -> Dense COW default + opt-in PersistentMap
 #  5. else (genuinely ambiguous)
@@ -370,23 +375,25 @@ RECOMMENDATION_JSON=$(jq '
     | .lineage_pcv1_fraction as $PCV1
     | .small_map_fraction_lt32  as $SMALL
     | .large_map_fraction_ge128 as $LARGE
-    | if ($WS >= 0.80) and ($V < 0.10) and ($PCV1 >= 0.90) then
+    | if ($V < 0.05) then
         {
             choice: "Dense COW",
-            rule:   "rule-1-class-W-or-S-dominates",
+            rule:   "rule-1-class-V-essentially-zero",
             rationale: (
-                "class_W_or_S_fraction = " + ($WS|tostring) +
-                " (>= 0.80 by " + (($WS - 0.80)|tostring) + "); " +
                 "class_V_fraction = " + ($V|tostring) +
-                " (< 0.10 by " + ((0.10 - $V)|tostring) + "); " +
-                "lineage_pcv1_fraction = " + ($PCV1|tostring) +
-                " (>= 0.90 by " + (($PCV1 - 0.90)|tostring) + "). " +
-                "All three Dense-COW thresholds satisfied per plan §8 row 1."
+                " (< 0.05 by " + ((0.05 - $V)|tostring) + "). " +
+                "Persistent-versioning is essentially absent; Dense COW " +
+                "is the right default per plan §8. " +
+                "(class_W_or_S_fraction = " + ($WS|tostring) +
+                ", lineage_pcv1_fraction = " + ($PCV1|tostring) +
+                " are informational only — Zap IR-level ARC keeps prior " +
+                "locals alive within a function frame, so peak_concurrent_" +
+                "versions >= 2 even for textbook working-dict patterns.)"
             ),
             thresholds: {
-                class_W_or_S_fraction: { observed: $WS,    required: ">= 0.80", delta: ($WS - 0.80) },
-                class_V_fraction:      { observed: $V,     required: "< 0.10",  delta: (0.10 - $V) },
-                lineage_pcv1_fraction: { observed: $PCV1,  required: ">= 0.90", delta: ($PCV1 - 0.90) }
+                class_V_fraction:      { observed: $V,     required: "< 0.05",  delta: (0.05 - $V) },
+                class_W_or_S_fraction: { observed: $WS,    required: "informational", delta: ($WS - 0.80) },
+                lineage_pcv1_fraction: { observed: $PCV1,  required: "informational", delta: ($PCV1 - 0.90) }
             }
         }
       elif ($V >= 0.30) then
@@ -403,30 +410,30 @@ RECOMMENDATION_JSON=$(jq '
                 class_V_fraction: { observed: $V, required: ">= 0.30", delta: ($V - 0.30) }
             }
         }
-      elif ($V >= 0.10) and ($V < 0.30) and ($SMALL >= 0.50) then
+      elif ($V >= 0.05) and ($V < 0.30) and ($SMALL >= 0.50) then
         {
             choice: "Dense COW + chunked-COW fallback for large maps",
             rule:   "rule-3-moderate-V-small-dominant",
             rationale: (
                 "class_V_fraction = " + ($V|tostring) +
-                " (in [0.10, 0.30) by " + (($V - 0.10)|tostring) + " above 0.10); " +
+                " (in [0.05, 0.30) by " + (($V - 0.05)|tostring) + " above 0.05); " +
                 "small_map_fraction_lt32 = " + ($SMALL|tostring) +
                 " (>= 0.50 by " + (($SMALL - 0.50)|tostring) + "). " +
                 "Most V-class shared maps are small; compose Dense COW with " +
                 "chunked-COW fallback for >32-entry maps per plan §8 row 3."
             ),
             thresholds: {
-                class_V_fraction:        { observed: $V,     required: "in [0.10, 0.30)", delta: ($V - 0.10) },
+                class_V_fraction:        { observed: $V,     required: "in [0.05, 0.30)", delta: ($V - 0.05) },
                 small_map_fraction_lt32: { observed: $SMALL, required: ">= 0.50",         delta: ($SMALL - 0.50) }
             }
         }
-      elif ($V >= 0.10) and ($V < 0.30) and ($LARGE >= 0.05) then
+      elif ($V >= 0.05) and ($V < 0.30) and ($LARGE >= 0.05) then
         {
             choice: "Dense COW default + opt-in PersistentMap",
             rule:   "rule-4-bimodal-tiny-and-large",
             rationale: (
                 "class_V_fraction = " + ($V|tostring) +
-                " (in [0.10, 0.30) by " + (($V - 0.10)|tostring) + " above 0.10); " +
+                " (in [0.05, 0.30) by " + (($V - 0.05)|tostring) + " above 0.05); " +
                 "large_map_fraction_ge128 = " + ($LARGE|tostring) +
                 " (>= 0.05 by " + (($LARGE - 0.05)|tostring) + "); " +
                 "small_map_fraction_lt32 = " + ($SMALL|tostring) +
@@ -435,7 +442,7 @@ RECOMMENDATION_JSON=$(jq '
                 "PersistentMap per plan §8 row 4."
             ),
             thresholds: {
-                class_V_fraction:         { observed: $V,     required: "in [0.10, 0.30)", delta: ($V - 0.10) },
+                class_V_fraction:         { observed: $V,     required: "in [0.05, 0.30)", delta: ($V - 0.05) },
                 large_map_fraction_ge128: { observed: $LARGE, required: ">= 0.05",         delta: ($LARGE - 0.05) }
             }
         }

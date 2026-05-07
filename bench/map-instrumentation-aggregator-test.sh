@@ -26,7 +26,7 @@ fi
 
 # Each entry: fixture-name|expected-choice|expected-rule
 declare -a CASES=(
-    "w_dominant|Dense COW|rule-1-class-W-or-S-dominates"
+    "w_dominant|Dense COW|rule-1-class-V-essentially-zero"
     "v_dominant|HAMT-plus-make_mut|rule-2-class-V-dominates"
     "mixed_small|Dense COW + chunked-COW fallback for large maps|rule-3-moderate-V-small-dominant"
     "mixed_bimodal|Dense COW default + opt-in PersistentMap|rule-4-bimodal-tiny-and-large"
