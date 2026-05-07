@@ -1,0 +1,42 @@
+{
+  "workload": "synthetic-v-dominant",
+  "binary": "/synthetic/v-dominant",
+  "duration_ns": 2000000000,
+  "summary": {
+    "total_instances": 100000,
+    "total_lineages": 5000,
+    "by_class": {
+      "S": {"count": 5000,  "frac": 0.0500},
+      "W": {"count": 50000, "frac": 0.5000},
+      "V": {"count": 45000, "frac": 0.4500}
+    },
+    "by_lineage_class": {
+      "S": 1000,
+      "W": 1500,
+      "V": 2500
+    },
+    "size_histogram": {
+      "0": 500,
+      "1-7": 2000,
+      "8-31": 7500,
+      "32-127": 25000,
+      "128-1023": 50000,
+      "1024+": 15000
+    },
+    "peak_concurrent_versions_histogram": {
+      "1": 1000,
+      "2": 1800,
+      "3-5": 1500,
+      "6-20": 600,
+      "21+": 100
+    },
+    "post_share_mutation_count": 45000,
+    "total_node_clones": 9876543,
+    "total_ops": 8000000,
+    "top_callsites_by_instance_count": [
+      {"site": "0x1111", "count": 70000},
+      {"site": "0x2222", "count": 20000},
+      {"site": "0x3333", "count": 10000}
+    ]
+  }
+}

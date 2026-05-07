@@ -1,0 +1,42 @@
+{
+  "workload": "synthetic-mixed-small",
+  "binary": "/synthetic/mixed-small",
+  "duration_ns": 1500000000,
+  "summary": {
+    "total_instances": 100000,
+    "total_lineages": 40000,
+    "by_class": {
+      "S": {"count": 30000, "frac": 0.3000},
+      "W": {"count": 55000, "frac": 0.5500},
+      "V": {"count": 15000, "frac": 0.1500}
+    },
+    "by_lineage_class": {
+      "S": 20000,
+      "W": 15000,
+      "V": 5000
+    },
+    "size_histogram": {
+      "0": 5000,
+      "1-7": 50000,
+      "8-31": 30000,
+      "32-127": 10000,
+      "128-1023": 4500,
+      "1024+": 500
+    },
+    "peak_concurrent_versions_histogram": {
+      "1": 32000,
+      "2": 5000,
+      "3-5": 2000,
+      "6-20": 800,
+      "21+": 200
+    },
+    "post_share_mutation_count": 15000,
+    "total_node_clones": 543210,
+    "total_ops": 3000000,
+    "top_callsites_by_instance_count": [
+      {"site": "0xdead", "count": 50000},
+      {"site": "0xbeef", "count": 30000},
+      {"site": "0xcafe", "count": 20000}
+    ]
+  }
+}

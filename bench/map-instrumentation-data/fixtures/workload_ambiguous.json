@@ -1,0 +1,41 @@
+{
+  "workload": "synthetic-ambiguous",
+  "binary": "/synthetic/ambiguous",
+  "duration_ns": 800000000,
+  "summary": {
+    "total_instances": 100000,
+    "total_lineages": 25000,
+    "by_class": {
+      "S": {"count": 20000, "frac": 0.2000},
+      "W": {"count": 55000, "frac": 0.5500},
+      "V": {"count": 25000, "frac": 0.2500}
+    },
+    "by_lineage_class": {
+      "S": 10000,
+      "W": 12000,
+      "V": 3000
+    },
+    "size_histogram": {
+      "0": 5000,
+      "1-7": 20000,
+      "8-31": 15000,
+      "32-127": 56000,
+      "128-1023": 3900,
+      "1024+": 100
+    },
+    "peak_concurrent_versions_histogram": {
+      "1": 18000,
+      "2": 4500,
+      "3-5": 1800,
+      "6-20": 600,
+      "21+": 100
+    },
+    "post_share_mutation_count": 25000,
+    "total_node_clones": 987654,
+    "total_ops": 2500000,
+    "top_callsites_by_instance_count": [
+      {"site": "0x9999", "count": 60000},
+      {"site": "0x8888", "count": 40000}
+    ]
+  }
+}

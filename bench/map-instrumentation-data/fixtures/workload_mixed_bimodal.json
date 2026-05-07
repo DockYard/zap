@@ -1,0 +1,42 @@
+{
+  "workload": "synthetic-mixed-bimodal",
+  "binary": "/synthetic/mixed-bimodal",
+  "duration_ns": 1750000000,
+  "summary": {
+    "total_instances": 100000,
+    "total_lineages": 30000,
+    "by_class": {
+      "S": {"count": 20000, "frac": 0.2000},
+      "W": {"count": 60000, "frac": 0.6000},
+      "V": {"count": 20000, "frac": 0.2000}
+    },
+    "by_lineage_class": {
+      "S": 10000,
+      "W": 15000,
+      "V": 5000
+    },
+    "size_histogram": {
+      "0": 10000,
+      "1-7": 30000,
+      "8-31": 5000,
+      "32-127": 35000,
+      "128-1023": 15000,
+      "1024+": 5000
+    },
+    "peak_concurrent_versions_histogram": {
+      "1": 23000,
+      "2": 3500,
+      "3-5": 2500,
+      "6-20": 800,
+      "21+": 200
+    },
+    "post_share_mutation_count": 20000,
+    "total_node_clones": 1234567,
+    "total_ops": 4000000,
+    "top_callsites_by_instance_count": [
+      {"site": "0xfade", "count": 60000},
+      {"site": "0xface", "count": 30000},
+      {"site": "0xfeed", "count": 10000}
+    ]
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "workload": "synthetic-w-dominant",
+  "binary": "/synthetic/w-dominant",
+  "duration_ns": 1000000000,
+  "summary": {
+    "total_instances": 100000,
+    "total_lineages": 80000,
+    "by_class": {
+      "S": {"count": 30000, "frac": 0.3000},
+      "W": {"count": 65000, "frac": 0.6500},
+      "V": {"count": 5000,  "frac": 0.0500}
+    },
+    "by_lineage_class": {
+      "S": 30000,
+      "W": 48000,
+      "V": 2000
+    },
+    "size_histogram": {
+      "0": 1000,
+      "1-7": 40000,
+      "8-31": 35000,
+      "32-127": 18000,
+      "128-1023": 5500,
+      "1024+": 500
+    },
+    "peak_concurrent_versions_histogram": {
+      "1": 76000,
+      "2": 3000,
+      "3-5": 800,
+      "6-20": 180,
+      "21+": 20
+    },
+    "post_share_mutation_count": 5000,
+    "total_node_clones": 12345,
+    "total_ops": 5000000,
+    "top_callsites_by_instance_count": [
+      {"site": "0xaaaa", "count": 60000},
+      {"site": "0xbbbb", "count": 30000},
+      {"site": "0xcccc", "count": 10000}
+    ]
+  }
+}

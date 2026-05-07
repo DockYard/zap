@@ -11,3 +11,9 @@ zap-deps-*.tar.xz
 opencode.json
 .mcp.json
 /tmp/
+
+# Map instrumentation aggregator outputs (generated artifacts).
+bench/map-instrumentation-data/aggregate.json
+bench/map-instrumentation-data/aggregate.md
+bench/map-instrumentation-data/fixtures/aggregate.json
+bench/map-instrumentation-data/fixtures/aggregate.md
