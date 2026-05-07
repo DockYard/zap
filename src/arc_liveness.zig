@@ -380,11 +380,34 @@ pub fn computeArcOwnership(
     type_store: *const types_mod.TypeStore,
     arc_managed: ArcManagedFn,
 ) !ArcOwnership {
+    return computeArcOwnershipWithProgram(allocator, function, type_store, arc_managed, null);
+}
+
+/// Variant of `computeArcOwnership` that accepts an optional program
+/// reference so the per-call ownership-effect analysis can look up
+/// the callee's `param_conventions` and clear the source local's
+/// owns bit when the callee consumes the arg (`.owned` convention).
+///
+/// Without this, a `move_value` produced by `arc_ownership.rewrite
+/// OwnedConsumeSites` for an `.owned`-convention call site sets the
+/// dest's owns bit (the dest is `.owned` in `local_ownership`) but
+/// nothing clears it after the call — `live_before_ret` then carries
+/// the local through to ret, and `arc_drop_insertion` emits a stale
+/// `release` that double-decrements a cell the callee already
+/// consumed via its own scope-exit drop.
+pub fn computeArcOwnershipWithProgram(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    type_store: *const types_mod.TypeStore,
+    arc_managed: ArcManagedFn,
+    program: ?*const ir.Program,
+) !ArcOwnership {
     var analyzer = Analyzer{
         .allocator = allocator,
         .function = function,
         .type_store = type_store,
         .arc_managed = arc_managed,
+        .program = program,
         .records = .empty,
         .pointer_to_id = .empty,
         .arc_locals = .empty,
@@ -439,6 +462,21 @@ const Analyzer = struct {
     function: *const ir.Function,
     type_store: *const types_mod.TypeStore,
     arc_managed: ArcManagedFn,
+    /// Optional program reference. When non-null, the per-call
+    /// ownership-effect analysis (`applyOwnsEffect` for
+    /// `.call_direct` / `.call_named` / `.call_dispatch`) consults
+    /// the callee's `param_conventions` and clears each arg local's
+    /// owns bit at the slots whose convention is `.owned`. This is
+    /// the dataflow counterpart to `arc_ownership.rewriteOwnedConsume
+    /// Sites`: that pass converts the caller's `share_value` into
+    /// `move_value` and drops the post-call release so the callee's
+    /// scope-exit drop is the sole decrement; without the matching
+    /// owns-bit clear here, `live_before_ret` would still carry the
+    /// consumed local and `arc_drop_insertion` would re-emit the very
+    /// release the rewrite was trying to elide. Left null when the
+    /// caller doesn't have a program in hand (analyzer tests build
+    /// hand-rolled `ir.Function` values without a containing program).
+    program: ?*const ir.Program = null,
 
     records: std.ArrayListUnmanaged(InstructionRecord),
 
@@ -1608,6 +1646,47 @@ const Analyzer = struct {
                     if (self.local_to_arc_index.get(ui.dest)) |idx| owns.set(idx);
                 }
             },
+            // Phase H.5: when a non-tail call targets a callee whose
+            // matching `param_conventions[i]` is `.owned`, the callee
+            // consumes the i-th arg local — its scope-exit drop is
+            // the sole decrement that balances the producer's +1.
+            // The dataflow must clear the consumed arg's owns bit
+            // here so `live_before_ret` doesn't carry the local
+            // through to ret, which would let `arc_drop_insertion`
+            // emit a stale post-call release on top of the callee's
+            // own drop (double-free).
+            //
+            // Mirrors the `tail_call` case above. The only difference
+            // is which arg slots qualify: a tail_call consumes every
+            // arg unconditionally (the callee inherits every slot
+            // through the tail jump), while a regular call consumes
+            // only the slots whose param convention was promoted to
+            // `.owned` by `arc_param_convention.inferConventions`.
+            //
+            // After clearing the consumed arg bits, the dest-side
+            // `+1` is set via the generic-case fallthrough below by
+            // a synthetic dispatch — we re-enter the generic handler
+            // by checking `defs` directly so the def-local's owns
+            // bit gets set when the call returns an `.owned` value.
+            .call_direct => |cd| {
+                self.applyCallConsumeEffect(cd.function, null, cd.args, owns);
+                self.applyCallDestEffect(cd.dest, owns);
+            },
+            .call_named => |cn| {
+                self.applyCallConsumeEffect(null, cn.name, cn.args, owns);
+                self.applyCallDestEffect(cn.dest, owns);
+            },
+            .call_dispatch => |cdsp| {
+                // call_dispatch resolves at runtime; conservative
+                // here means we cannot know which clause's param
+                // conventions apply. Fall back to the generic dest
+                // handling — the callee's `arg_modes` already
+                // reflects the HIR-level ownership, so when a
+                // `.move` mode was set the IR builder emitted a
+                // `move_value` whose source-bit clear is handled by
+                // the dedicated `.move_value` branch above.
+                self.applyCallDestEffect(cdsp.dest, owns);
+            },
             else => {
                 // Generic case: every dest local that's classified as
                 // .owned in `local_ownership` gains a +1 at this
@@ -1620,6 +1699,47 @@ const Analyzer = struct {
                 }
             },
         }
+    }
+
+    /// Look up the callee's `param_conventions` slice via the
+    /// program reference, and clear each arg local's owns bit at
+    /// the slots whose convention is `.owned` (consume sites). When
+    /// the program reference is null (analyzer tests construct
+    /// hand-rolled functions outside any program), or the callee
+    /// cannot be located, the call is treated as borrowing — every
+    /// arg's owns bit stays set and the post-call dataflow falls
+    /// through to the existing scope-exit drop discipline. This is
+    /// the conservative choice: missing the consume signal at most
+    /// emits a redundant retain/release pair, while incorrectly
+    /// treating a borrow as a consume would suppress a legitimate
+    /// drop.
+    fn applyCallConsumeEffect(
+        self: *Analyzer,
+        callee_id: ?ir.FunctionId,
+        callee_name: ?[]const u8,
+        args: []const ir.LocalId,
+        owns: *LiveSet,
+    ) void {
+        const program = self.program orelse return;
+        const conventions = lookupCalleeConventions(program, callee_id, callee_name) orelse return;
+        const slot_count = @min(args.len, conventions.len);
+        var slot: usize = 0;
+        while (slot < slot_count) : (slot += 1) {
+            if (conventions[slot] != .owned) continue;
+            const arg_local = args[slot];
+            if (self.local_to_arc_index.get(arg_local)) |idx| owns.unset(idx);
+        }
+    }
+
+    /// Set the call's dest local owns bit when the dest's
+    /// `local_ownership` class is `.owned`. Mirrors the generic-
+    /// case fallthrough in `applyOwnsEffect` so the call branches
+    /// don't lose the dest-side `+1` accounting.
+    fn applyCallDestEffect(self: *Analyzer, dest: ir.LocalId, owns: *LiveSet) void {
+        const local_ownership = self.function.local_ownership;
+        if (dest >= local_ownership.len) return;
+        if (local_ownership[dest] != .owned) return;
+        if (self.local_to_arc_index.get(dest)) |idx| owns.set(idx);
     }
 
     /// Materialise the `owns` bitset into a `LocalId`-keyed
@@ -1700,11 +1820,12 @@ pub fn runProgramArcLiveness(
     type_store: *const types_mod.TypeStore,
 ) !void {
     for (program.functions) |*function| {
-        var ownership = try computeArcOwnership(
+        var ownership = try computeArcOwnershipWithProgram(
             allocator,
             function,
             type_store,
             defaultArcManagedTypeId,
+            program,
         );
         defer ownership.deinit(allocator);
     }
@@ -1781,11 +1902,12 @@ pub fn runProgramArcOwnership(
     errdefer table.deinit();
 
     for (program.functions) |*function| {
-        var ownership = try computeArcOwnership(
+        var ownership = try computeArcOwnershipWithProgram(
             allocator,
             function,
             type_store,
             defaultArcManagedTypeId,
+            program,
         );
 
         // Soundness contract from §2.3 of the implementation plan:
@@ -1925,6 +2047,44 @@ const WriteBackWalker = struct {
         }
     }
 };
+
+/// Resolve a callee's `param_conventions` slice from either its
+/// `FunctionId` or its symbolic `name`. Returns null when neither
+/// lookup hits a registered function — for the analyzer this means
+/// "treat the callee as borrowing every arg" (the conservative
+/// default). Used by the per-call ownership-effect analysis
+/// (`Analyzer.applyCallConsumeEffect`) so the dataflow can clear
+/// owns bits for arg slots whose callee convention was promoted to
+/// `.owned` by `arc_param_convention.inferConventions`.
+///
+/// Linear scan: programs typically contain hundreds of functions,
+/// the call sites that invoke this helper are bounded by the
+/// program's call-site count, and the lookup never recurses. A
+/// hash-index would be marginally faster but we'd have to thread
+/// it through every analyzer construction site (including the
+/// hand-rolled-Function tests). The straight-line scan keeps the
+/// public surface minimal and the per-call cost negligible at
+/// today's program sizes.
+fn lookupCalleeConventions(
+    program: *const ir.Program,
+    callee_id: ?ir.FunctionId,
+    callee_name: ?[]const u8,
+) ?[]const ir.ParamConvention {
+    if (callee_id) |id| {
+        for (program.functions) |func| {
+            if (func.id == id) return func.param_conventions;
+        }
+    }
+    if (callee_name) |name| {
+        for (program.functions) |func| {
+            if (std.mem.eql(u8, func.name, name)) return func.param_conventions;
+            if (func.local_name.len != 0 and std.mem.eql(u8, func.local_name, name)) {
+                return func.param_conventions;
+            }
+        }
+    }
+    return null;
+}
 
 /// Soundness check executed at the orchestration seam (debug builds
 /// only). Walks the function's instructions, and for every consume

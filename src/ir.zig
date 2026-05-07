@@ -7174,6 +7174,28 @@ fn maxLocalSetIndexInExpr(expr: *const hir_mod.Expr) LocalId {
             max_local = @max(max_local, maxLocalSetIndexInExpr(ce.scrutinee));
             for (ce.arms) |arm| {
                 max_local = @max(max_local, maxLocalSetIndexInBlock(arm.body));
+                // Phase H.5: case-arm bindings allocate `local_index`
+                // from the HIR builder's per-clause `next_local`
+                // counter (see `collectCasePatternBindings`). The
+                // IR-builder reservation in
+                // `computeMaxBindingLocalForClauses` walks every
+                // `tuple_bindings`/`list_bindings`/etc. on the clause
+                // to keep its own `next_local` above any reserved
+                // index, but it never visited the case arm's
+                // `bindings` list — so a case-arm binding's
+                // `local_index` could collide with a top-level
+                // `local_set` (e.g. `opts = [...]` whose list_init
+                // dest gets `next_local++`). The collision rebinds
+                // an already-ARC-managed local mid-function, which
+                // makes `local_ownership[binding] = .owned` and
+                // causes the classifier to emit `copy_value` (with
+                // a runtime retain) on top of a non-ARC value
+                // (e.g. a String binding inside a keyword pattern).
+                // Walk the arm's bindings here so the reservation is
+                // sound across every case-arm pattern shape.
+                for (arm.bindings) |binding| {
+                    max_local = @max(max_local, binding.local_index + 1);
+                }
             }
         },
         .block => |*blk| {

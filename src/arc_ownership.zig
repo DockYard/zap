@@ -96,6 +96,35 @@ pub fn classifyAndNormalize(
     ownership: *const arc_liveness.ArcOwnership,
     type_store: *const types_mod.TypeStore,
 ) !void {
+    return classifyAndNormalizeWithProgram(allocator, function, ownership, type_store, null);
+}
+
+/// Variant of `classifyAndNormalize` that accepts an optional
+/// program reference so the use-summary pass can consult callee
+/// `param_conventions` and refine `share_value.source` borrow-
+/// position accounting.
+///
+/// Phase H.5: `rewriteOwnedConsumeSites` converts `share_value`
+/// into `move_value` whenever the call's matching param convention
+/// is `.owned`. After the rewrite the source must own `+1` —
+/// `move_value` transfers ownership rather than aliasing. If the
+/// classifier ran without program awareness, it would record the
+/// `share_value.source` use as a borrow (the default for share)
+/// and emit `borrow_value` upstream — making the post-rewrite
+/// chain `borrow_value → move_value`, which is unsound (the move
+/// has nothing to transfer because the upstream borrow never
+/// retained). Threading the program through here lets the
+/// classifier mark such share sites as non-borrow positions
+/// up-front, so the upstream `local_get` lowers to `copy_value`
+/// (retain), giving the eventual `move_value` a real `+1` to
+/// transfer.
+pub fn classifyAndNormalizeWithProgram(
+    allocator: std.mem.Allocator,
+    function: *ir.Function,
+    ownership: *const arc_liveness.ArcOwnership,
+    type_store: *const types_mod.TypeStore,
+    program: ?*const ir.Program,
+) !void {
     _ = ownership;
     _ = type_store;
 
@@ -114,7 +143,7 @@ pub fn classifyAndNormalize(
     // optional_dispatch handled by reusing the helper).
     var use_summary: UseSummary = .{};
     defer use_summary.deinit(allocator);
-    try collectUseSummary(allocator, function, &use_summary);
+    try collectUseSummaryWithProgram(allocator, function, &use_summary, program);
 
     var rewriter = StreamRewriter{
         .allocator = allocator,
@@ -236,20 +265,164 @@ fn collectUseSummary(
     function: *const ir.Function,
     summary: *UseSummary,
 ) !void {
+    return collectUseSummaryWithProgram(allocator, function, summary, null);
+}
+
+fn collectUseSummaryWithProgram(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    summary: *UseSummary,
+    program: ?*const ir.Program,
+) !void {
+    // Phase H.5: pre-collect the set of share_value dests whose
+    // matching call's callee param convention is `.owned`. Those
+    // shares will be rewritten to `move_value` by
+    // `rewriteOwnedConsumeSites`, so the upstream chain that feeds
+    // the share's source must own `+1` — `move_value` transfers
+    // ownership and has nothing to transfer if the upstream is a
+    // borrow. Recording the share's source use as non-borrow here
+    // forces the producer's `local_get` to lower as `.copy_value`
+    // (retain) instead of `.borrow_value`, so the move has a real
+    // `+1` to transfer at the eventual call site.
+    var consume_share_dests: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+    defer consume_share_dests.deinit(allocator);
+    if (program) |prog| {
+        try collectConsumeShareDests(allocator, function, prog, &consume_share_dests);
+    }
+
     const Walker = struct {
         allocator: std.mem.Allocator,
         summary: *UseSummary,
+        consume_share_dests: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
         err: ?anyerror = null,
         fn visit(self: *@This(), instr: *const ir.Instruction) void {
             if (self.err != null) return;
-            recordInstructionUses(self.allocator, self.summary, instr) catch |e| {
+            recordInstructionUses(self.allocator, self.summary, instr, self.consume_share_dests) catch |e| {
                 self.err = e;
             };
         }
     };
-    var walker = Walker{ .allocator = allocator, .summary = summary };
+    var walker = Walker{ .allocator = allocator, .summary = summary, .consume_share_dests = &consume_share_dests };
     ir.forEachInstruction(function, &walker, Walker.visit);
     if (walker.err) |e| return e;
+}
+
+/// Pre-pass for `collectUseSummaryWithProgram`. Walks every
+/// instruction stream in `function` and records the LocalId of
+/// each `share_value` whose dest flows into a call whose callee
+/// param convention at the matching slot is `.owned`. Those
+/// `share_value` sites will be rewritten to `move_value` by
+/// `rewriteOwnedConsumeSites`, and the classifier needs to know
+/// in advance so it doesn't emit a `borrow_value` upstream that
+/// the move can't transfer through.
+fn collectConsumeShareDests(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: *const ir.Program,
+    consume_share_dests: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+) !void {
+    for (function.body) |block| {
+        try collectConsumeShareDestsInStream(allocator, block.instructions, program, consume_share_dests);
+    }
+}
+
+fn collectConsumeShareDestsInStream(
+    allocator: std.mem.Allocator,
+    stream: []const ir.Instruction,
+    program: *const ir.Program,
+    consume_share_dests: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+) error{OutOfMemory}!void {
+    for (stream) |*instr| {
+        try collectConsumeShareDestsInInstr(allocator, instr, program, consume_share_dests);
+    }
+
+    // Within the same stream, scan for call sites whose owned-arg
+    // slots reference a share_value's dest produced earlier in
+    // this stream. The same pattern `rewriteOwnedConsumeSites`
+    // uses to find share/release pairs — share_values and the
+    // call that consumes them never cross structural boundaries.
+    var i: usize = 0;
+    while (i < stream.len) : (i += 1) {
+        const args = callArgs(stream[i]) orelse continue;
+        const conventions = lookupCalleeConventionsForCall(program, &stream[i]) orelse continue;
+        const slot_count = @min(args.len, conventions.len);
+        var slot: usize = 0;
+        while (slot < slot_count) : (slot += 1) {
+            if (conventions[slot] != .owned) continue;
+            const arg_local = args[slot];
+            // Walk backward in the stream to find the matching
+            // share_value whose dest is `arg_local`.
+            var j: usize = i;
+            while (j > 0) {
+                j -= 1;
+                if (stream[j] == .share_value and stream[j].share_value.dest == arg_local) {
+                    try consume_share_dests.put(allocator, arg_local, {});
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn collectConsumeShareDestsInInstr(
+    allocator: std.mem.Allocator,
+    instr: *const ir.Instruction,
+    program: *const ir.Program,
+    consume_share_dests: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+) error{OutOfMemory}!void {
+    switch (instr.*) {
+        .if_expr => |ie| {
+            try collectConsumeShareDestsInStream(allocator, ie.then_instrs, program, consume_share_dests);
+            try collectConsumeShareDestsInStream(allocator, ie.else_instrs, program, consume_share_dests);
+        },
+        .case_block => |cb| {
+            try collectConsumeShareDestsInStream(allocator, cb.pre_instrs, program, consume_share_dests);
+            for (cb.arms) |arm| {
+                try collectConsumeShareDestsInStream(allocator, arm.cond_instrs, program, consume_share_dests);
+                try collectConsumeShareDestsInStream(allocator, arm.body_instrs, program, consume_share_dests);
+            }
+            try collectConsumeShareDestsInStream(allocator, cb.default_instrs, program, consume_share_dests);
+        },
+        .switch_literal => |sl| {
+            for (sl.cases) |c| {
+                try collectConsumeShareDestsInStream(allocator, c.body_instrs, program, consume_share_dests);
+            }
+            try collectConsumeShareDestsInStream(allocator, sl.default_instrs, program, consume_share_dests);
+        },
+        .switch_return => |sr| {
+            for (sr.cases) |c| {
+                try collectConsumeShareDestsInStream(allocator, c.body_instrs, program, consume_share_dests);
+            }
+        },
+        .guard_block => |gb| {
+            try collectConsumeShareDestsInStream(allocator, gb.body, program, consume_share_dests);
+        },
+        else => {},
+    }
+}
+
+fn lookupCalleeConventionsForCall(
+    program: *const ir.Program,
+    instr: *const ir.Instruction,
+) ?[]const ir.ParamConvention {
+    switch (instr.*) {
+        .call_direct => |cd| {
+            for (program.functions) |func| {
+                if (func.id == cd.function) return func.param_conventions;
+            }
+            return null;
+        },
+        .call_named => |cn| {
+            for (program.functions) |func| {
+                if (std.mem.eql(u8, func.name, cn.name)) return func.param_conventions;
+                if (func.local_name.len != 0 and std.mem.eql(u8, func.local_name, cn.name)) {
+                    return func.param_conventions;
+                }
+            }
+            return null;
+        },
+        else => return null,
+    }
 }
 
 /// Record every "use" of a local that this instruction performs.
@@ -264,6 +437,7 @@ fn recordInstructionUses(
     allocator: std.mem.Allocator,
     summary: *UseSummary,
     instr: *const ir.Instruction,
+    consume_share_dests: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
 ) !void {
     switch (instr.*) {
         .share_value => |sv| {
@@ -271,7 +445,17 @@ fn recordInstructionUses(
             // share produces a fresh local that pairs with a post-
             // call release. The source local stays live across the
             // share; no ownership transfers to the share's dest.
-            try summary.recordUse(allocator, sv.source, true);
+            //
+            // Phase H.5: when the share's dest will be rewritten to
+            // `move_value` by `rewriteOwnedConsumeSites` (because
+            // its enclosing call's matching param convention is
+            // `.owned`), the share is *not* a borrow position — it
+            // becomes an ownership transfer. Record the source as a
+            // non-borrow use so the upstream `local_get` lowers to
+            // `.copy_value` (retain), giving the eventual
+            // `move_value` a real `+1` to transfer.
+            const is_consume_share = consume_share_dests.contains(sv.dest);
+            try summary.recordUse(allocator, sv.source, !is_consume_share);
         },
         .local_get => |lg| {
             // Chained alias — propagate the borrow signal.

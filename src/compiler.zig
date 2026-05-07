@@ -2041,7 +2041,7 @@ fn runArcOwnershipAndVerify(
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
         const fn_ownership = ownership.get(function.id) orelse continue;
-        zap.arc_ownership.classifyAndNormalize(alloc, function, fn_ownership, type_store) catch return error.OutOfMemory;
+        zap.arc_ownership.classifyAndNormalizeWithProgram(alloc, function, fn_ownership, type_store, program) catch return error.OutOfMemory;
     }
     // Phase E.9 step 2: for each function whose param_conventions
     // contains an `.owned` slot (set by Step 1's inference), rewrite
@@ -2132,6 +2132,11 @@ fn dumpStream(stream: []const ir.Instruction, indent: usize) void {
                     if (ai > 0) std.debug.print(",", .{});
                     std.debug.print("{d}", .{a});
                 }
+                std.debug.print("] modes=[", .{});
+                for (cd.arg_modes, 0..) |m, mi| {
+                    if (mi > 0) std.debug.print(",", .{});
+                    std.debug.print(".{s}", .{@tagName(m)});
+                }
                 std.debug.print("]", .{});
             },
             .param_get => |pg| std.debug.print(" dest={d} index={d}", .{ pg.dest, pg.index }),
@@ -2147,6 +2152,20 @@ fn dumpStream(stream: []const ir.Instruction, indent: usize) void {
             },
             .if_expr => |ie| std.debug.print(" dest={d}", .{ie.dest}),
             .local_set => |ls| std.debug.print(" dest={d} value={d}", .{ ls.dest, ls.value }),
+            .list_get => |lg| std.debug.print(" dest={d} list={d} idx={d}", .{ lg.dest, lg.list, lg.index }),
+            .list_head => |lh| std.debug.print(" dest={d} list={d}", .{ lh.dest, lh.list }),
+            .list_tail => |lt| std.debug.print(" dest={d} list={d}", .{ lt.dest, lt.list }),
+            .list_is_not_empty => |lne| std.debug.print(" dest={d} list={d}", .{ lne.dest, lne.list }),
+            .list_len_check => |llc| std.debug.print(" dest={d} scrut={d} expected={d}", .{ llc.dest, llc.scrutinee, llc.expected_len }),
+            .index_get => |ig| std.debug.print(" dest={d} obj={d} idx={d}", .{ ig.dest, ig.object, ig.index }),
+            .match_atom => |ma| std.debug.print(" dest={d} scrut={d} atom={s}", .{ ma.dest, ma.scrutinee, ma.atom_name }),
+            .guard_block => |gb| std.debug.print(" cond={d}", .{gb.condition}),
+            .case_break => |cbk| std.debug.print(" value={?d}", .{cbk.value}),
+            .const_string => |cs| std.debug.print(" dest={d}", .{cs.dest}),
+            .const_atom => |ca| std.debug.print(" dest={d}", .{ca.dest}),
+            .tuple_init => |ti| std.debug.print(" dest={d}", .{ti.dest}),
+            .list_init => |li| std.debug.print(" dest={d}", .{li.dest}),
+            .list_cons => |lc| std.debug.print(" dest={d} head={d} tail={d}", .{ lc.dest, lc.head, lc.tail }),
             else => {},
         }
         std.debug.print("\n", .{});
@@ -2171,7 +2190,13 @@ fn dumpStream(stream: []const ir.Instruction, indent: usize) void {
                     dumpStream(c.body_instrs, indent + 4);
                 }
             },
+            .guard_block => |gb| {
+                std.debug.print("{s}  guard_body:\n", .{spaces[0..used]});
+                dumpStream(gb.body, indent + 4);
+            },
             .case_block => |cb| {
+                std.debug.print("{s}  pre_instrs:\n", .{spaces[0..used]});
+                dumpStream(cb.pre_instrs, indent + 4);
                 for (cb.arms, 0..) |arm, ai| {
                     std.debug.print("{s}  arm[{d}].cond:\n", .{ spaces[0..used], ai });
                     dumpStream(arm.cond_instrs, indent + 4);
