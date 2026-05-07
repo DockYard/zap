@@ -4210,6 +4210,14 @@ pub const ZirDriver = struct {
             // ARC sources, but is now produced explicitly by the
             // arc_ownership classifier rather than emitted at every
             // `.local_get` site.
+            //
+            // Use `retainAnyPersistent` (not `retainAny`): the new
+            // local is a *persistent* second owner of the source's
+            // cell that lives until its own scope-exit release, not a
+            // transient borrow paired with an immediate release. The
+            // Map workload classifier treats this retain as a
+            // genuine sharing event because the source's cell is
+            // observably held by two long-lived owners simultaneously.
             .copy_value => |cv| {
                 try self.propagateReuseBackedStructLocal(cv.dest, cv.source);
                 try self.propagateReuseBackedUnionLocal(cv.dest, cv.source);
@@ -4226,7 +4234,7 @@ pub const ZirDriver = struct {
                         if (rt_import == error_ref) return error.EmitFailed;
                         const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                         if (arc_runtime == error_ref) return error.EmitFailed;
-                        const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
+                        const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAnyPersistent", 19);
                         if (retain_fn == error_ref) return error.EmitFailed;
                         const args = [_]u32{materialized_ref};
                         _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);

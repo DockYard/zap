@@ -1476,7 +1476,12 @@ pub const ArcRuntime = struct {
             },
             .pointer => |p| {
                 if (p.size == .one) {
-                    retainAny(@as(*const p.child, value));
+                    // Struct/aggregate field deep-retain represents a
+                    // genuine new persistent owner of the inner ARC
+                    // value (the parent aggregate). Route through the
+                    // persistent path so type-specific instrumentation
+                    // (Map share-event tracking) observes the share.
+                    retainAnyPersistent(@as(*const p.child, value));
                 }
             },
             else => {},
