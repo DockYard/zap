@@ -950,6 +950,15 @@ const Pipeline = struct {
         // backend can consult `return_source_locals` per function.
         const ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
             return self.failWith("Error during ARC ownership analysis", error.IrFailed);
+        // Phase E.9 of the Phase 6 redux plan: per-callee parameter
+        // convention inference. Promotes `.borrowed` to `.owned` for
+        // function parameters whose every call site (recursive AND
+        // non-recursive) consumes the source local. The promotion is
+        // a prerequisite for emitting `move_value` at non-tail call
+        // sites in `arc_ownership` (Step 2) and is enforced by V7 in
+        // `arc_verifier` (Step 4).
+        zap.arc_param_convention.inferConventions(self.alloc, &program, &ownership, type_store) catch
+            return self.failWith("Error during ARC parameter convention inference", error.IrFailed);
         // Phase A of the Phase 6 redux plan: run the new ownership
         // classification + verifier passes between `arc_liveness` and
         // `arc_drop_insertion`. Both passes are stubs at this phase
@@ -999,6 +1008,13 @@ const Pipeline = struct {
         next_try_id.* = ir_builder.next_try_id;
         const ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
             return self.failWith("Error during ARC ownership analysis", error.IrFailed);
+        // Phase E.9: same per-callee inference as `runIrLowering`.
+        // Both pipelines must run the inference before
+        // `arc_ownership` so the classifier sees the refined
+        // conventions when deciding whether to emit `move_value` at
+        // non-tail call sites.
+        zap.arc_param_convention.inferConventions(self.alloc, &program, &ownership, type_store) catch
+            return self.failWith("Error during ARC parameter convention inference", error.IrFailed);
         // Phase A of the Phase 6 redux plan: same wiring as
         // `runIrLowering` so per-struct and whole-program lowering
         // exercise the identical pass list.
