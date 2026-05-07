@@ -29,11 +29,20 @@
 //!   * NO ARC, NO retain/release, NO deep-release of K or V.
 //!   * NO `delete`, `merge`, `keys`, `values`, `next`. Those are 1.4 / 1.7.
 //!
-//! Backing allocator: `std.heap.page_allocator` for now. Swapping to the
-//! ARC-managed allocator happens in 1.8.
+//! Backing allocator: `std.heap.page_allocator`. The buffer carries an
+//! `ArcHeader` at offset 0 so retain/release follow the same atomic refcount
+//! discipline used by the rest of the runtime's ARC-managed types
+//! (`runtime.zig::Map(K, V)`, `List(T)`, `MArrayOf(T)`). DenseMap is the
+//! only file that imports `runtime.zig`'s ARC primitives — the dependency
+//! is one-way (runtime.zig does not import dense_map.zig) so no cycle
+//! forms. The Phase 1d swap will replace the body of `runtime.Map(K, V)`
+//! with this DenseMap implementation directly.
 
 const std = @import("std");
 const wyhash = @import("wyhash.zig");
+const runtime = @import("runtime.zig");
+const ArcHeader = runtime.ArcHeader;
+const ArcRuntime = runtime.ArcRuntime;
 
 /// Empty bucket sentinel. Any `Bucket.dist_and_fingerprint` equal to this means
 /// "no occupant". Chosen to match the layout described in the plan.
@@ -73,6 +82,10 @@ comptime {
 
 /// Header lives at the start of the buffer.
 ///
+///   * `arc_header`: ARC refcount for the whole buffer. Lives at offset 0
+///     so the rest of the runtime's ARC machinery (which assumes inline-
+///     header types put `ArcHeader` first) can inspect it through an
+///     opaque pointer if needed. Initialized to refcount=1 by `bufferAlloc`.
 ///   * `len`: number of populated entries (also the cursor for the next
 ///     entry). Always equals number of non-EMPTY buckets.
 ///   * `capacity`: number of buckets (always a power of 2, >= 8).
@@ -80,7 +93,12 @@ comptime {
 ///     would exceed 7/8).
 ///   * `hash_seed`: per-instance random seed sampled from `wyhash.nextSeed`
 ///     at construction time. Used for every hash so resize is deterministic.
-pub const Header = extern struct {
+///
+/// Note: not `extern` because `ArcHeader` is a regular Zig struct with a
+/// `std.atomic.Value` field. Layout is computed manually via the offset
+/// helpers below — we never rely on C-ABI layout for this header.
+pub const Header = struct {
+    arc_header: ArcHeader,
     len: u32,
     capacity: u32,
     entry_cap: u32,
@@ -199,16 +217,18 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
         ///
         /// All bucket slots are initialized to EMPTY. `len` is 0. The seed is
         /// drawn from `wyhash.nextSeed` so two maps with the same insertions
-        /// don't share a hash seed.
+        /// don't share a hash seed. The `arc_header` is initialized to
+        /// refcount=1 so the returned handle owns the buffer.
         fn bufferAlloc(capacity: u32, seed: u64) error{OutOfMemory}!*Self {
             std.debug.assert(std.math.isPowerOfTwo(capacity));
             const total = bufferSize(Entry, capacity, capacity);
             const allocator = std.heap.page_allocator;
             const align_v = comptime bufferAlignment(Entry);
             const raw = try allocator.alignedAlloc(u8, align_v, total);
-            // Initialize the header.
+            // Initialize the header (refcount=1).
             const hdr_ptr: *Header = @ptrCast(@alignCast(raw.ptr));
             hdr_ptr.* = .{
+                .arc_header = ArcHeader.init(),
                 .len = 0,
                 .capacity = capacity,
                 .entry_cap = capacity,
@@ -226,9 +246,13 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
             return self_ptr;
         }
 
-        /// Release the buffer (and the handle). No-op for null.
-        pub fn release(maybe_self: ?*Self) void {
-            const self = maybe_self orelse return;
+        /// Free the buffer slice and the `*Self` handle WITHOUT deep-
+        /// releasing the entries' K/V children. Used when the entries
+        /// have already been moved into a new buffer (during a unique-
+        /// owner resize) — the references they held now belong to the
+        /// new buffer, so dropping the old buffer must not run release on
+        /// them.
+        fn bufferFreeShallow(self: *Self) void {
             const allocator = std.heap.page_allocator;
             const cap = self.header().capacity;
             const total = bufferSize(Entry, cap, self.header().entry_cap);
@@ -238,33 +262,77 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
             allocator.destroy(self);
         }
 
-        /// Clone the buffer into a new buffer, possibly with a larger capacity.
+        /// Deep-release every K and V child carried by the live entries,
+        /// then free the buffer slice and the `*Self` handle. Invoked
+        /// only on the zero-transition of `release(map)`.
+        fn bufferFreeDeep(self: *Self) void {
+            const len = self.header().len;
+            const entries = self.entriesPtr();
+            const allocator = std.heap.page_allocator;
+            // Deep-release K and V children one entry at a time. The
+            // dispatch is comptime on K / V — a no-op for primitive
+            // types, recurses for ARC-managed pointers.
+            for (0..len) |i| {
+                releaseEntryKey(entries[i].key, allocator);
+                releaseEntryValue(entries[i].value, allocator);
+            }
+            self.bufferFreeShallow();
+        }
+
+        /// Increment the buffer's refcount and return the same handle.
+        /// Null maps (the empty-map sentinel) are a no-op.
+        pub fn retain(maybe_self: ?*const Self) ?*const Self {
+            if (maybe_self) |self| {
+                const mut: *Self = @constCast(self);
+                mut.headerMut().arc_header.retain();
+            }
+            return maybe_self;
+        }
+
+        /// Decrement the buffer's refcount. On the zero-transition,
+        /// deep-release every K/V child and free the buffer slice plus
+        /// the `*Self` handle. No-op for null.
+        pub fn release(maybe_self: ?*const Self) void {
+            const self = maybe_self orelse return;
+            const mut: *Self = @constCast(self);
+            if (!mut.headerMut().arc_header.release()) return;
+            mut.bufferFreeDeep();
+        }
+
+        /// Clone the buffer into a new buffer, possibly with a larger
+        /// capacity. Each K and V child is *deep-retained* so the clone
+        /// owns its own references — the caller is then free to drop the
+        /// original without affecting the clone. Used on the shared-
+        /// owner branch of put / delete / merge and any other site that
+        /// must produce a new owner of the same entries.
         ///
-        /// If `new_capacity == old.capacity` we copy buckets+entries verbatim.
-        /// Otherwise we allocate at the new capacity, copy entries verbatim
-        /// (preserving insertion order), and rebucket by re-probing each
-        /// entry's cached hash.
-        fn bufferClone(self: *const Self, new_capacity: u32) error{OutOfMemory}!*Self {
+        /// If `new_capacity == old.capacity` we copy buckets+entries
+        /// verbatim. Otherwise we allocate at the new capacity, copy
+        /// entries verbatim (preserving insertion order), and rebucket
+        /// by re-probing each entry's cached hash.
+        fn cloneBufferRetainingChildren(self: *const Self, new_capacity: u32) error{OutOfMemory}!*Self {
             std.debug.assert(std.math.isPowerOfTwo(new_capacity));
             const old = self;
             const old_hdr = old.header();
             std.debug.assert(new_capacity >= old_hdr.len);
 
             const fresh = try bufferAlloc(new_capacity, old_hdr.hash_seed);
-            // Set len after we copy entries so size() during construction is
-            // accurate even if anyone is watching.
             const fresh_hdr = fresh.headerMut();
 
-            // Copy entries verbatim — preserves insertion order.
+            // Copy entries verbatim. Each entry's K and V is then
+            // deep-retained so the clone owns its own references.
             const old_entries = old.entriesPtr();
             const new_entries = fresh.entriesPtr();
             for (0..old_hdr.len) |i| {
                 new_entries[i] = old_entries[i];
+                retainEntryKey(new_entries[i].key);
+                retainEntryValue(new_entries[i].value);
             }
             fresh_hdr.len = old_hdr.len;
 
             if (new_capacity == old_hdr.capacity) {
-                // Same capacity: copy buckets verbatim (entry indices stay valid).
+                // Same capacity: copy buckets verbatim (entry indices
+                // stay valid).
                 const old_buckets = old.bucketsPtr();
                 const new_buckets = fresh.bucketsPtr();
                 for (0..old_hdr.capacity) |i| {
@@ -276,6 +344,7 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
             }
             return fresh;
         }
+
 
         /// Re-place every live entry into the bucket array via Robin Hood
         /// probing. Assumes the bucket array is currently all-EMPTY (as fresh
@@ -358,23 +427,34 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
         }
 
         // -------------------------------------------------------------------
-        // Insert (no rc-1 fast path yet — always allocates a fresh buffer)
+        // Insert (always allocates a fresh buffer; rc-1 fast path lands in 1.6)
         // -------------------------------------------------------------------
 
-        /// Insert or update `(key, value)`. Returns a fresh buffer; the input
-        /// (if any) is left untouched but should be released by the caller
-        /// after switching the live handle.
+        /// Insert or update `(key, value)`. Returns a fresh buffer; the
+        /// input (if any) is left untouched but should be released by
+        /// the caller after switching the live handle.
         ///
-        /// In this sub-deliverable we deliberately have no rc-1 fast path:
-        /// every `put` clones the buffer. The fast path is wired in at 1.6.
+        /// In this sub-deliverable we deliberately have no rc-1 fast
+        /// path: every `put` clones the buffer (with deep-retain on
+        /// every K/V) so the new buffer is a separate ARC owner of the
+        /// entry children. The fast path is wired in at 1.6.
         pub fn put(maybe_self: ?*const Self, key: K, value: V) error{OutOfMemory}!*Self {
-            // Step 1: figure out whether the key already exists in the input
-            // map. If so the new map is a same-size clone with the matching
-            // entry's value overwritten.
+            // Step 1: figure out whether the key already exists in the
+            // input map. If so the new map is a same-size clone with
+            // the matching entry's value overwritten.
             if (maybe_self) |self| {
                 if (findEntry(self, key)) |existing_idx| {
-                    const fresh = try bufferClone(self, self.header().capacity);
+                    const fresh = try cloneBufferRetainingChildren(self, self.header().capacity);
+                    const allocator = std.heap.page_allocator;
+                    // The cloned entry slot holds a freshly-retained
+                    // copy of the old value. Release that copy before
+                    // overwriting it with the new value.
+                    releaseEntryValue(fresh.entryAt(existing_idx).value, allocator);
                     fresh.entryAt(existing_idx).value = value;
+                    // The K passed in is a transferred owner; the
+                    // existing key already covers this slot, so release
+                    // the duplicate to keep refcounts balanced.
+                    releaseEntryKey(key, allocator);
                     return fresh;
                 }
             }
@@ -384,10 +464,10 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
             const old_cap: u32 = if (maybe_self) |s| s.header().capacity else 0;
             const new_cap: u32 = pickCapacity(old_cap, old_len + 1);
 
-            // Step 3: allocate the destination. Either clone (same capacity)
-            // or fresh + rebucket (resize).
+            // Step 3: allocate the destination. Either clone (same
+            // capacity) or fresh + rebucket (resize).
             var fresh: *Self = if (maybe_self) |s|
-                try bufferClone(s, new_cap)
+                try cloneBufferRetainingChildren(s, new_cap)
             else
                 try bufferAlloc(new_cap, wyhash.nextSeed());
 
@@ -408,29 +488,30 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
         // Delete (swap-remove + Robin Hood backshift)
         // -------------------------------------------------------------------
 
-        /// Remove `key` from the map. Returns a fresh buffer (the contract
-        /// matches `put`: every mutating op clones in this iteration; the
-        /// rc-1 fast path lands in 1.6). The input buffer is left untouched
-        /// and must be released by the caller.
+        /// Remove `key` from the map. Returns a fresh buffer (the
+        /// contract matches `put`: every mutating op clones in this
+        /// iteration; the rc-1 fast path lands in 1.6). The input
+        /// buffer is left untouched and must be released by the caller.
         ///
         /// Behavior:
-        ///   * `map == null` -> returns null (the empty map is closed under
-        ///     delete).
-        ///   * `key` absent -> returns a fresh same-shape clone with identical
-        ///     contents (matches the persistent-map contract: callers can
-        ///     always rely on getting a fresh handle back).
-        ///   * `key` present -> swap-remove: swap `entries[entry_idx]` with
-        ///     `entries[len-1]` (if not already the tail), patch the bucket
-        ///     that pointed at `len-1` to point at `entry_idx`, decrement
-        ///     `len`, then backshift the bucket array starting from the
-        ///     deleted slot until we hit either an empty slot or a bucket
-        ///     already at its ideal position (`dist == 1`).
+        ///   * `map == null` -> returns null.
+        ///   * `key` absent -> returns a fresh same-shape clone with
+        ///     identical contents (matches the persistent-map
+        ///     contract).
+        ///   * `key` present -> swap-remove on the clone: swap
+        ///     `entries[entry_idx]` with `entries[len-1]` (if not
+        ///     already the tail), patch the bucket that pointed at
+        ///     `len-1` to point at `entry_idx`, decrement `len`, then
+        ///     backshift the bucket array starting from the deleted
+        ///     slot until we hit either an empty slot or a bucket
+        ///     already at its ideal position (`dist == 1`). The
+        ///     removed entry's K and V are deep-released.
         pub fn delete(maybe_map: ?*const Self, key: K) ?*const Self {
             const map = maybe_map orelse return null;
 
-            // Always allocate a fresh buffer. We mutate the clone, never the
-            // original — the caller still owns the input.
-            const fresh = bufferClone(map, map.header().capacity) catch return null;
+            // Always allocate a fresh buffer (with deep-retain on every
+            // K/V). We mutate the clone, never the original.
+            const fresh = cloneBufferRetainingChildren(map, map.header().capacity) catch return null;
 
             const found_entry_idx = findEntry(fresh, key) orelse return fresh;
 
@@ -438,19 +519,27 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
             const old_len = fresh_hdr.len;
             std.debug.assert(old_len > 0);
 
-            // Locate the bucket that currently owns `key` so we can clear it
-            // and start backshifting from there.
+            // Locate the bucket that currently owns `key` so we can
+            // clear it and start backshifting from there.
             const target_hash = fresh.entryAtConst(found_entry_idx).hash;
             const deleted_slot = fresh.findBucketSlotForEntry(target_hash, found_entry_idx);
+
+            // Deep-release the K and V of the deleted entry.
+            const allocator = std.heap.page_allocator;
+            {
+                const removed_entry = fresh.entryAtConst(found_entry_idx).*;
+                releaseEntryKey(removed_entry.key, allocator);
+                releaseEntryValue(removed_entry.value, allocator);
+            }
 
             // Swap-remove on the entries array.
             if (found_entry_idx != old_len - 1) {
                 const tail_idx: u32 = old_len - 1;
                 const tail_entry = fresh.entryAt(tail_idx).*;
 
-                // Find the bucket that points at `tail_idx` and repoint it at
-                // `found_entry_idx`. Re-probe with the tail entry's cached
-                // hash + key — Robin Hood lookup will land on it.
+                // Find the bucket that points at `tail_idx` and repoint
+                // it at `found_entry_idx`. Re-probe with the tail
+                // entry's cached hash + key.
                 const tail_slot = fresh.findBucketSlotForEntry(tail_entry.hash, tail_idx);
                 fresh.bucketAt(tail_slot).entry_idx = found_entry_idx;
 
@@ -458,13 +547,14 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
                 fresh.entryAt(found_entry_idx).* = tail_entry;
             }
 
-            // Decrement len. The previous tail entry slot is now logically
-            // dead (its contents are stale but unreferenced).
+            // Decrement len. The previous tail entry slot is now
+            // logically dead (its contents are stale but unreferenced).
             fresh_hdr.len = old_len - 1;
 
-            // Backshift buckets starting at `deleted_slot`. Walk forward;
-            // while the next slot is occupied AND its dist > 1, move it back
-            // and decrement its dist by one. Stop on empty or dist == 1.
+            // Backshift buckets starting at `deleted_slot`. Walk
+            // forward; while the next slot is occupied AND its dist > 1,
+            // move it back and decrement its dist by one. Stop on empty
+            // or dist == 1.
             const buckets = fresh.bucketsPtr();
             buckets[deleted_slot] = .{ .dist_and_fingerprint = EMPTY, .entry_idx = 0 };
             var cur = deleted_slot;
@@ -569,6 +659,86 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
                     a == b,
                 else => @compileError("DenseMap: unsupported key type " ++ @typeName(K)),
             };
+        }
+
+        // -------------------------------------------------------------------
+        // ARC child walkers
+        // -------------------------------------------------------------------
+        //
+        // The K and V types may carry ARC-managed children (e.g. V is a
+        // `?*const SomeArcType` or a struct containing such a pointer).
+        // The runtime's canonical walker (`ArcRuntime.releaseChildrenAny`)
+        // only descends into struct aggregates — it does not handle the
+        // raw "T is itself an ARC pointer" or "T is an optional pointer"
+        // shape directly. We mirror the dispatcher pattern from
+        // `runtime.zig::List.releaseHeadChildren` / `retainHeadChildren`
+        // here so both shapes work transparently.
+        //
+        // For primitive K/V types (integers, bools, byte slices) every
+        // arm comptime-evaluates to a no-op.
+
+        inline fn releaseEntryKey(key: K, allocator: std.mem.Allocator) void {
+            releaseAnyShape(K, key, allocator);
+        }
+
+        inline fn releaseEntryValue(value: V, allocator: std.mem.Allocator) void {
+            releaseAnyShape(V, value, allocator);
+        }
+
+        inline fn retainEntryKey(key: K) void {
+            retainAnyShape(K, key);
+        }
+
+        inline fn retainEntryValue(value: V) void {
+            retainAnyShape(V, value);
+        }
+
+        /// Deep-release a value of arbitrary shape. Mirrors
+        /// `runtime.zig::List.releaseHeadChildren` — the arms cover the
+        /// three shapes that can transitively own ARC children:
+        ///   - optional: unwrap and recurse on the payload
+        ///   - single-item pointer: dispatch into the runtime's
+        ///     per-type ARC release helper
+        ///   - struct aggregate: walk fields via `releaseChildrenAny`
+        /// All other shapes (ints, slices, bools) are a no-op.
+        fn releaseAnyShape(comptime T: type, value: T, allocator: std.mem.Allocator) void {
+            switch (@typeInfo(T)) {
+                .optional => |opt| {
+                    if (value) |inner| releaseAnyShape(opt.child, inner, allocator);
+                },
+                .pointer => |p| {
+                    if (p.size == .one) {
+                        ArcRuntime.releaseArcAny(p.child, allocator, @constCast(value));
+                    }
+                },
+                .@"struct" => {
+                    ArcRuntime.releaseChildrenAny(T, allocator, value);
+                },
+                else => {},
+            }
+        }
+
+        /// Deep-retain a value of arbitrary shape. Symmetric to
+        /// `releaseAnyShape`. Used on clone paths where the new buffer
+        /// becomes a co-owner of every K/V already held by the source
+        /// buffer. Routes through the *persistent* retain path
+        /// (`retainAnyPersistent`) so type-specific share instrumentation
+        /// (e.g. Map's classifier) sees the share event.
+        fn retainAnyShape(comptime T: type, value: T) void {
+            switch (@typeInfo(T)) {
+                .optional => |opt| {
+                    if (value) |inner| retainAnyShape(opt.child, inner);
+                },
+                .pointer => |p| {
+                    if (p.size == .one) {
+                        ArcRuntime.retainAnyPersistent(@as(*const p.child, @constCast(value)));
+                    }
+                },
+                .@"struct" => {
+                    ArcRuntime.retainChildrenAny(T, value);
+                },
+                else => {},
+            }
         }
 
         // -------------------------------------------------------------------
@@ -747,7 +917,6 @@ test "DenseMap put updates existing key (size doesn't grow)" {
 
     // Update the value.
     const m_new = try M.put(m, 5, 500);
-    M.release(m); // release prior buffer
     m = m_new;
 
     try testing.expectEqual(@as(u32, 1), m.?.size());
@@ -762,7 +931,7 @@ test "DenseMap insertion order preserved" {
     const ks = [_]u64{ 7, 3, 11, 5, 9 };
     for (ks) |k| {
         const next = try M.put(m, k, k * 10);
-        M.release(m);
+        M.release(@constCast(m));
         m = next;
     }
 
@@ -799,7 +968,7 @@ test "DenseMap put 100 random integer keys, retrieve all" {
 
     for (unique[0..unique_count]) |k| {
         const next = try M.put(m, k, k +% 7);
-        M.release(m);
+        M.release(@constCast(m));
         m = next;
     }
 
@@ -823,7 +992,6 @@ test "DenseMap forced collisions at small capacity" {
     // because we just need *some* set of 6 colliding keys.
     m = try M.put(m, 1, 1);
     const seed = m.?.header().hash_seed;
-    M.release(m);
     m = null;
 
     // Find 6 keys with the same (hash & 7).
@@ -865,7 +1033,7 @@ test "DenseMap forced collisions at small capacity" {
 
     for (collide[1..]) |k| {
         const next = try M.put(m, k, k);
-        M.release(m);
+        M.release(@constCast(m));
         m = next;
     }
     try testing.expectEqual(@as(u32, 6), m.?.size());
@@ -886,7 +1054,7 @@ test "DenseMap resize doubles capacity at load factor breach" {
     var i: u64 = 0;
     while (i < 7) : (i += 1) {
         const next = try M.put(m, i, i * 11);
-        M.release(m);
+        M.release(@constCast(m));
         m = next;
     }
     try testing.expectEqual(@as(u32, 8), m.?.header().capacity);
@@ -894,7 +1062,7 @@ test "DenseMap resize doubles capacity at load factor breach" {
 
     // 8th insert triggers resize.
     const next = try M.put(m, 7, 77);
-    M.release(m);
+    M.release(@constCast(m));
     m = next;
     try testing.expectEqual(@as(u32, 16), m.?.header().capacity);
     try testing.expectEqual(@as(u32, 8), m.?.size());
@@ -926,7 +1094,7 @@ test "DenseMap Robin Hood invariant after adversarial inserts" {
     while (i < 50) : (i += 1) {
         const k = random.int(u64);
         const next = try M.put(m, k, k);
-        M.release(m);
+        M.release(@constCast(m));
         m = next;
     }
 
@@ -952,12 +1120,12 @@ test "DenseMap byte-slice keys" {
     m = try M.put(m, "alpha", 1);
     {
         const next = try M.put(m, "beta", 2);
-        M.release(m);
+        M.release(@constCast(m));
         m = next;
     }
     {
         const next = try M.put(m, "gamma", 3);
-        M.release(m);
+        M.release(@constCast(m));
         m = next;
     }
 
@@ -975,7 +1143,7 @@ test "DenseMap u32 (Atom-like) keys" {
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
         const next = try M.put(m, i, @as(u64, i) * 100);
-        M.release(m);
+        M.release(@constCast(m));
         m = next;
     }
     try testing.expectEqual(@as(u32, 20), m.?.size());
@@ -1429,3 +1597,224 @@ test "DenseMap delete: Robin Hood invariant holds after deletion" {
         try testing.expect(dist_b <= dist_a + 1);
     }
 }
+
+// =============================================================================
+// 1.8 — ARC integration: retain / release / deep child walking
+// =============================================================================
+
+/// Minimal ARC-managed inline-header stub used to verify that DenseMap
+/// deep-releases its V children when the outer buffer's refcount hits
+/// zero. Mirrors the shape recognised by `ArcRuntime.hasInlineArcHeader`:
+/// a `header: ArcHeader` field at offset 0, plus a `release` method that
+/// returns the cell to its allocation source on the zero-transition.
+const ArcStub = struct {
+    header: ArcHeader,
+    payload: u64,
+
+    fn create(payload: u64) *ArcStub {
+        const ptr = std.heap.page_allocator.create(ArcStub) catch
+            @panic("ArcStub.create OOM");
+        ptr.* = .{ .header = ArcHeader.init(), .payload = payload };
+        return ptr;
+    }
+
+    pub fn retain(maybe_self: ?*const ArcStub) ?*const ArcStub {
+        if (maybe_self) |s| {
+            const mut: *ArcStub = @constCast(s);
+            mut.header.retain();
+        }
+        return maybe_self;
+    }
+
+    pub fn release(maybe_self: ?*const ArcStub) void {
+        const s = maybe_self orelse return;
+        const mut: *ArcStub = @constCast(s);
+        if (!mut.header.release()) return;
+        std.heap.page_allocator.destroy(mut);
+    }
+};
+
+test "DenseMap retain increments refcount; release decrements" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+
+    m = try M.put(m, 1, 100);
+    try testing.expectEqual(@as(u32, 1), m.?.header().arc_header.count());
+
+    const r = M.retain(m);
+    try testing.expectEqual(m, r);
+    try testing.expectEqual(@as(u32, 2), m.?.header().arc_header.count());
+
+    M.release(r);
+    try testing.expectEqual(@as(u32, 1), m.?.header().arc_header.count());
+
+    M.release(m);
+    // m is now dangling — caller must not use it. No further checks.
+}
+
+test "DenseMap release on null is a no-op" {
+    const M = DenseMap(u64, u64);
+    M.release(null);
+    const r = M.retain(null);
+    try testing.expectEqual(@as(?*const M, null), r);
+}
+
+test "DenseMap multiple retains followed by matching releases free correctly" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+
+    m = try M.put(m, 1, 1);
+    m = try M.put(m, 2, 2);
+
+    // 3 outstanding owners: original m, plus two retains.
+    _ = M.retain(m);
+    _ = M.retain(m);
+    try testing.expectEqual(@as(u32, 3), m.?.header().arc_header.count());
+
+    M.release(m);
+    try testing.expectEqual(@as(u32, 2), m.?.header().arc_header.count());
+    M.release(m);
+    try testing.expectEqual(@as(u32, 1), m.?.header().arc_header.count());
+
+    // Final release frees the buffer.
+    M.release(m);
+}
+
+test "DenseMap release deep-releases ARC-managed V children on zero-transition" {
+    const M = DenseMap(u64, ?*const ArcStub);
+    var m: ?*const M = null;
+
+    // Allocate three ArcStub values and stash them in the map. The map
+    // holds the only reference to each; when the map releases, each
+    // stub must be deep-released (refcount drops to 0 and the stub
+    // is freed).
+    const stub_a = ArcStub.create(10);
+    const stub_b = ArcStub.create(20);
+    const stub_c = ArcStub.create(30);
+
+    try testing.expectEqual(@as(u32, 1), stub_a.header.count());
+    try testing.expectEqual(@as(u32, 1), stub_b.header.count());
+    try testing.expectEqual(@as(u32, 1), stub_c.header.count());
+
+    {
+        const next = try M.put(m, 1, stub_a);
+        M.release(@constCast(m));
+        m = next;
+    }
+    {
+        const next = try M.put(m, 2, stub_b);
+        M.release(@constCast(m));
+        m = next;
+    }
+    {
+        const next = try M.put(m, 3, stub_c);
+        M.release(@constCast(m));
+        m = next;
+    }
+
+    // Map holds the only reference to each stub.
+    try testing.expectEqual(@as(u32, 1), stub_a.header.count());
+    try testing.expectEqual(@as(u32, 1), stub_b.header.count());
+    try testing.expectEqual(@as(u32, 1), stub_c.header.count());
+
+    // Releasing the map deep-releases each stub. After this point the
+    // stub pointers are dangling — we can't read their refcount safely
+    // anymore, so we don't.
+    M.release(m);
+}
+
+test "DenseMap release: shared ARC children survive when other owners exist" {
+    const M = DenseMap(u64, ?*const ArcStub);
+    var m: ?*const M = null;
+
+    const stub = ArcStub.create(99);
+    // Mimic an external owner by retaining the stub before handing it
+    // to the map. After put, refcount is 2: the external owner +
+    // the map.
+    _ = ArcStub.retain(stub);
+    {
+        const next = try M.put(m, 1, stub);
+        M.release(@constCast(m));
+        m = next;
+    }
+    try testing.expectEqual(@as(u32, 2), stub.header.count());
+
+    // Releasing the map deep-releases its copy of the stub pointer.
+    // The external owner's reference still holds, so the stub must
+    // survive.
+    M.release(m);
+    try testing.expectEqual(@as(u32, 1), stub.header.count());
+
+    // Final external release frees the stub.
+    ArcStub.release(stub);
+}
+
+test "DenseMap delete deep-releases the removed entry's ARC value" {
+    const M = DenseMap(u64, ?*const ArcStub);
+    var m: ?*const M = null;
+    defer M.release(m);
+
+    const stub_keep = ArcStub.create(1);
+    const stub_drop = ArcStub.create(2);
+    _ = ArcStub.retain(stub_keep); // external owner so we can observe
+    _ = ArcStub.retain(stub_drop); // external owner so we can observe
+
+    {
+        const next = try M.put(m, 1, stub_keep);
+        M.release(@constCast(m));
+        m = next;
+    }
+    {
+        const next = try M.put(m, 2, stub_drop);
+        M.release(@constCast(m));
+        m = next;
+    }
+
+    // External(1) + map(1) = 2 each.
+    try testing.expectEqual(@as(u32, 2), stub_keep.header.count());
+    try testing.expectEqual(@as(u32, 2), stub_drop.header.count());
+
+    // Delete key 2: the map releases its copy of stub_drop.
+    {
+        const after = M.delete(m, 2);
+        M.release(@constCast(m));
+        m = after;
+    }
+    try testing.expectEqual(@as(u32, 2), stub_keep.header.count());
+    try testing.expectEqual(@as(u32, 1), stub_drop.header.count());
+
+    // Clean up external owners.
+    ArcStub.release(stub_keep);
+    ArcStub.release(stub_drop);
+}
+
+test "DenseMap put-update deep-releases the overwritten ARC value" {
+    const M = DenseMap(u64, ?*const ArcStub);
+    var m: ?*const M = null;
+    defer M.release(m);
+
+    const stub_old = ArcStub.create(1);
+    const stub_new = ArcStub.create(2);
+    _ = ArcStub.retain(stub_old);
+    _ = ArcStub.retain(stub_new);
+
+    {
+        const next = try M.put(m, 1, stub_old);
+        M.release(@constCast(m));
+        m = next;
+    }
+    try testing.expectEqual(@as(u32, 2), stub_old.header.count());
+
+    // Overwrite the value at key 1. The old value must be released.
+    {
+        const next = try M.put(m, 1, stub_new);
+        M.release(@constCast(m));
+        m = next;
+    }
+    try testing.expectEqual(@as(u32, 1), stub_old.header.count()); // map dropped its copy
+    try testing.expectEqual(@as(u32, 2), stub_new.header.count()); // map now holds new
+
+    ArcStub.release(stub_old);
+    ArcStub.release(stub_new);
+}
+
