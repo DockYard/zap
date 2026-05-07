@@ -404,6 +404,113 @@ pub fn DenseMap(comptime K: type, comptime V: type) type {
             return fresh;
         }
 
+        // -------------------------------------------------------------------
+        // Delete (swap-remove + Robin Hood backshift)
+        // -------------------------------------------------------------------
+
+        /// Remove `key` from the map. Returns a fresh buffer (the contract
+        /// matches `put`: every mutating op clones in this iteration; the
+        /// rc-1 fast path lands in 1.6). The input buffer is left untouched
+        /// and must be released by the caller.
+        ///
+        /// Behavior:
+        ///   * `map == null` -> returns null (the empty map is closed under
+        ///     delete).
+        ///   * `key` absent -> returns a fresh same-shape clone with identical
+        ///     contents (matches the persistent-map contract: callers can
+        ///     always rely on getting a fresh handle back).
+        ///   * `key` present -> swap-remove: swap `entries[entry_idx]` with
+        ///     `entries[len-1]` (if not already the tail), patch the bucket
+        ///     that pointed at `len-1` to point at `entry_idx`, decrement
+        ///     `len`, then backshift the bucket array starting from the
+        ///     deleted slot until we hit either an empty slot or a bucket
+        ///     already at its ideal position (`dist == 1`).
+        pub fn delete(maybe_map: ?*const Self, key: K) ?*const Self {
+            const map = maybe_map orelse return null;
+
+            // Always allocate a fresh buffer. We mutate the clone, never the
+            // original — the caller still owns the input.
+            const fresh = bufferClone(map, map.header().capacity) catch return null;
+
+            const found_entry_idx = findEntry(fresh, key) orelse return fresh;
+
+            const fresh_hdr = fresh.headerMut();
+            const old_len = fresh_hdr.len;
+            std.debug.assert(old_len > 0);
+
+            // Locate the bucket that currently owns `key` so we can clear it
+            // and start backshifting from there.
+            const target_hash = fresh.entryAtConst(found_entry_idx).hash;
+            const deleted_slot = fresh.findBucketSlotForEntry(target_hash, found_entry_idx);
+
+            // Swap-remove on the entries array.
+            if (found_entry_idx != old_len - 1) {
+                const tail_idx: u32 = old_len - 1;
+                const tail_entry = fresh.entryAt(tail_idx).*;
+
+                // Find the bucket that points at `tail_idx` and repoint it at
+                // `found_entry_idx`. Re-probe with the tail entry's cached
+                // hash + key — Robin Hood lookup will land on it.
+                const tail_slot = fresh.findBucketSlotForEntry(tail_entry.hash, tail_idx);
+                fresh.bucketAt(tail_slot).entry_idx = found_entry_idx;
+
+                // Move the tail entry into the freed slot.
+                fresh.entryAt(found_entry_idx).* = tail_entry;
+            }
+
+            // Decrement len. The previous tail entry slot is now logically
+            // dead (its contents are stale but unreferenced).
+            fresh_hdr.len = old_len - 1;
+
+            // Backshift buckets starting at `deleted_slot`. Walk forward;
+            // while the next slot is occupied AND its dist > 1, move it back
+            // and decrement its dist by one. Stop on empty or dist == 1.
+            const buckets = fresh.bucketsPtr();
+            buckets[deleted_slot] = .{ .dist_and_fingerprint = EMPTY, .entry_idx = 0 };
+            var cur = deleted_slot;
+            while (true) {
+                const nxt = fresh.nextSlot(cur);
+                const nxt_dnf = buckets[nxt].dist_and_fingerprint;
+                if (nxt_dnf == EMPTY) break;
+                const nxt_dist = nxt_dnf >> 8;
+                if (nxt_dist <= 1) break;
+                // Shift the next bucket back into `cur`, decrementing its dist.
+                const fp = nxt_dnf & FINGERPRINT_MASK;
+                const new_dist = nxt_dist - 1;
+                buckets[cur] = .{
+                    .dist_and_fingerprint = (new_dist << 8) | fp,
+                    .entry_idx = buckets[nxt].entry_idx,
+                };
+                buckets[nxt] = .{ .dist_and_fingerprint = EMPTY, .entry_idx = 0 };
+                cur = nxt;
+            }
+
+            return fresh;
+        }
+
+        /// Find the bucket slot that currently references `entry_idx` for the
+        /// given cached hash. Used by `delete` both to locate the deleted
+        /// key's bucket and to re-locate the tail entry's bucket after
+        /// swap-remove. The lookup is a Robin Hood probe filtered on
+        /// `entry_idx` (rather than key-equality) since the entry's key may
+        /// be a slice that's expensive to compare and the entry_idx is
+        /// already unique.
+        fn findBucketSlotForEntry(self: *Self, hash: u64, entry_idx: u32) u32 {
+            var probe = initialProbe(hash);
+            var slot = self.homeSlot(hash);
+            const buckets = self.bucketsPtr();
+            while (true) {
+                const b = buckets[slot];
+                std.debug.assert(b.dist_and_fingerprint != EMPTY);
+                std.debug.assert(b.dist_and_fingerprint >= probe);
+                if (b.dist_and_fingerprint == probe and b.entry_idx == entry_idx) {
+                    return slot;
+                }
+                probe += DIST_INC;
+                slot = self.nextSlot(slot);
+            }
+        }
+
         /// Place a single bucket record for `(hash, entry_idx)` into the
         /// bucket array via Robin Hood probing. Assumes the entry is already
         /// stored in `entries[entry_idx]`.
@@ -779,4 +886,276 @@ test "DenseMap empty map operations" {
     try testing.expect(!M.hasKey(null, 0));
     try testing.expectEqual(@as(u64, 42), M.get(null, 0, 42));
     try testing.expectEqual(@as(?u32, null), M.findEntry(null, 0));
+}
+
+// =============================================================================
+// 1.4 — delete with swap-remove
+// =============================================================================
+
+test "DenseMap delete: swap-remove of middle entry preserves other keys" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    // Insert 5 keys (1,2,3,4,5).
+    var i: u64 = 1;
+    while (i <= 5) : (i += 1) {
+        const next = try M.put(m, i, i * 10);
+        M.release(@constCast(m));
+        m = next;
+    }
+    try testing.expectEqual(@as(u32, 5), m.?.size());
+
+    // Delete the 2nd-inserted key (key=2). With swap-remove, entries[1] should
+    // be replaced by what was previously at entries[4] (key=5). The expected
+    // entry order becomes [1, 5, 3, 4].
+    const after = M.delete(m, 2);
+    M.release(@constCast(m));
+    m = after;
+    try testing.expect(m != null);
+    try testing.expectEqual(@as(u32, 4), m.?.size());
+
+    // Key 2 must no longer be present.
+    try testing.expect(!M.hasKey(m, 2));
+
+    // The remaining keys must still be findable.
+    try testing.expectEqual(@as(u64, 10), M.get(m, 1, 0));
+    try testing.expectEqual(@as(u64, 30), M.get(m, 3, 0));
+    try testing.expectEqual(@as(u64, 40), M.get(m, 4, 0));
+    try testing.expectEqual(@as(u64, 50), M.get(m, 5, 0));
+
+    // Insertion-order walk must reflect swap-remove: [1, 5, 3, 4].
+    const entries = m.?.debugEntriesSlice();
+    try testing.expectEqual(@as(usize, 4), entries.len);
+    try testing.expectEqual(@as(u64, 1), entries[0].key);
+    try testing.expectEqual(@as(u64, 5), entries[1].key);
+    try testing.expectEqual(@as(u64, 3), entries[2].key);
+    try testing.expectEqual(@as(u64, 4), entries[3].key);
+}
+
+test "DenseMap delete: last entry needs no swap" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    var i: u64 = 1;
+    while (i <= 4) : (i += 1) {
+        const next = try M.put(m, i, i);
+        M.release(@constCast(m));
+        m = next;
+    }
+
+    // Delete the last-inserted key — no swap necessary.
+    const after = M.delete(m, 4);
+    M.release(@constCast(m));
+    m = after;
+
+    try testing.expectEqual(@as(u32, 3), m.?.size());
+    try testing.expect(!M.hasKey(m, 4));
+    const entries = m.?.debugEntriesSlice();
+    try testing.expectEqual(@as(u64, 1), entries[0].key);
+    try testing.expectEqual(@as(u64, 2), entries[1].key);
+    try testing.expectEqual(@as(u64, 3), entries[2].key);
+}
+
+test "DenseMap delete: only entry yields empty (len=0) map" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    m = try M.put(m, 7, 70);
+    const after = M.delete(m, 7);
+    M.release(@constCast(m));
+    m = after;
+    try testing.expect(m != null); // still a valid (empty) buffer
+    try testing.expectEqual(@as(u32, 0), m.?.size());
+    try testing.expect(!M.hasKey(m, 7));
+}
+
+test "DenseMap delete: absent key returns fresh clone with same contents" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    var i: u64 = 1;
+    while (i <= 3) : (i += 1) {
+        const next = try M.put(m, i, i * 5);
+        M.release(@constCast(m));
+        m = next;
+    }
+    const original = m.?;
+
+    const after = M.delete(m, 999); // not present
+    try testing.expect(after != null);
+    try testing.expect(after.? != original); // fresh allocation
+    try testing.expectEqual(@as(u32, 3), after.?.size());
+    try testing.expectEqual(@as(u64, 5), M.get(after, 1, 0));
+    try testing.expectEqual(@as(u64, 10), M.get(after, 2, 0));
+    try testing.expectEqual(@as(u64, 15), M.get(after, 3, 0));
+
+    M.release(@constCast(m));
+    m = after;
+}
+
+test "DenseMap delete: null map returns null (no-op)" {
+    const M = DenseMap(u64, u64);
+    const result = M.delete(null, 42);
+    try testing.expectEqual(@as(?*const M, null), result);
+}
+
+test "DenseMap delete: with forced collisions, remaining keys still findable" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    // Insert one key to learn the seed.
+    m = try M.put(m, 1, 1);
+    const seed = m.?.header().hash_seed;
+
+    // Find 4 keys (including key=1) sharing the same home slot at cap=8.
+    var collide: [4]u64 = undefined;
+    collide[0] = 1;
+    var found: usize = 1;
+    const home0 = wyhash.hash(seed, @as(u64, 1)) & 7;
+    var probe_key: u64 = 2;
+    while (found < collide.len) : (probe_key += 1) {
+        if ((wyhash.hash(seed, probe_key) & 7) == home0) {
+            collide[found] = probe_key;
+            found += 1;
+        }
+    }
+
+    for (collide[1..]) |k| {
+        const next = try M.put(m, k, k);
+        M.release(@constCast(m));
+        m = next;
+    }
+    try testing.expectEqual(@as(u32, 4), m.?.size());
+
+    // Delete the middle (chronologically 2nd) of the colliding keys.
+    const victim = collide[1];
+    const after = M.delete(m, victim);
+    M.release(@constCast(m));
+    m = after;
+
+    try testing.expectEqual(@as(u32, 3), m.?.size());
+    try testing.expect(!M.hasKey(m, victim));
+    try testing.expect(M.hasKey(m, collide[0]));
+    try testing.expect(M.hasKey(m, collide[2]));
+    try testing.expect(M.hasKey(m, collide[3]));
+}
+
+test "DenseMap delete: backshift compacts displaced buckets" {
+    // Force a long probe chain by inserting keys whose home slot is the same.
+    // After deleting the home-slot occupant, the displaced buckets must be
+    // shifted back so they all sit at smaller probe distances.
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    m = try M.put(m, 1, 1);
+    const seed = m.?.header().hash_seed;
+
+    // Find 5 keys all sharing the same home slot at cap=8.
+    var collide: [5]u64 = undefined;
+    collide[0] = 1;
+    var found: usize = 1;
+    const home0 = wyhash.hash(seed, @as(u64, 1)) & 7;
+    var probe_key: u64 = 2;
+    while (found < collide.len) : (probe_key += 1) {
+        if ((wyhash.hash(seed, probe_key) & 7) == home0) {
+            collide[found] = probe_key;
+            found += 1;
+        }
+    }
+    for (collide[1..]) |k| {
+        const next = try M.put(m, k, k);
+        M.release(@constCast(m));
+        m = next;
+    }
+    try testing.expectEqual(@as(u32, 5), m.?.size());
+
+    // Snapshot dist counts before delete.
+    const cap = m.?.header().capacity;
+    const before_buckets = m.?.debugBucketsSlice();
+    var before_total_dist: u32 = 0;
+    for (before_buckets[0..cap]) |b| {
+        if (b.dist_and_fingerprint != EMPTY) {
+            before_total_dist += b.dist_and_fingerprint >> 8;
+        }
+    }
+
+    // Delete the home-slot occupant (the first inserted key).
+    const after = M.delete(m, collide[0]);
+    M.release(@constCast(m));
+    m = after;
+    try testing.expectEqual(@as(u32, 4), m.?.size());
+
+    // After backshift, the total displacement across remaining buckets must
+    // strictly decrease (each survivor moved closer to its home slot).
+    const after_buckets = m.?.debugBucketsSlice();
+    var after_total_dist: u32 = 0;
+    for (after_buckets[0..m.?.header().capacity]) |b| {
+        if (b.dist_and_fingerprint != EMPTY) {
+            after_total_dist += b.dist_and_fingerprint >> 8;
+        }
+    }
+    try testing.expect(after_total_dist < before_total_dist);
+
+    // All remaining keys still findable.
+    for (collide[1..]) |k| {
+        try testing.expect(M.hasKey(m, k));
+    }
+}
+
+test "DenseMap delete: Robin Hood invariant holds after deletion" {
+    const M = DenseMap(u64, u64);
+    var m: ?*const M = null;
+    defer M.release(@constCast(m));
+
+    var prng = std.Random.DefaultPrng.init(0xDEADBEEFCAFEBABE);
+    const random = prng.random();
+
+    // Insert 30 random keys.
+    var inserted: [30]u64 = undefined;
+    var n: usize = 0;
+    while (n < inserted.len) {
+        const k = random.int(u64);
+        // Skip dupes.
+        var dup = false;
+        for (inserted[0..n]) |existing| {
+            if (existing == k) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        const next = try M.put(m, k, k);
+        M.release(@constCast(m));
+        m = next;
+        inserted[n] = k;
+        n += 1;
+    }
+
+    // Delete every 3rd key.
+    var i: usize = 0;
+    while (i < inserted.len) : (i += 3) {
+        const next = M.delete(m, inserted[i]);
+        M.release(@constCast(m));
+        m = next;
+    }
+
+    // Verify Robin Hood local invariant: dist[i+1] <= dist[i] + 1 between
+    // consecutive non-empty buckets.
+    const cap = m.?.header().capacity;
+    const buckets = m.?.debugBucketsSlice();
+    var idx: u32 = 0;
+    while (idx < cap) : (idx += 1) {
+        const a = buckets[idx];
+        const b = buckets[(idx + 1) & (cap - 1)];
+        if (a.dist_and_fingerprint == EMPTY or b.dist_and_fingerprint == EMPTY) continue;
+        const dist_a = a.dist_and_fingerprint >> 8;
+        const dist_b = b.dist_and_fingerprint >> 8;
+        try testing.expect(dist_b <= dist_a + 1);
+    }
 }
