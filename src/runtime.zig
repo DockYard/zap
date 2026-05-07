@@ -1473,6 +1473,17 @@ pub const ArcRuntime = struct {
         }
         const T = arcPtrChild(@TypeOf(ptr));
         if (comptime hasInlineArcHeader(T)) {
+            // Route through `T.retain` when the type provides one so
+            // type-specific bookkeeping (e.g. Map workload
+            // instrumentation hooks) observes every share event,
+            // including those that originate from container retains
+            // (List head retain, struct field retain, etc.). When `T`
+            // does not expose a `retain` method, fall back to the
+            // direct header bump.
+            if (comptime @hasDecl(T, "retain")) {
+                _ = T.retain(@as(?*const T, ptr));
+                return;
+            }
             const mut: *T = @constCast(ptr);
             mut.header.retain();
             arc_retains_total += 1;
