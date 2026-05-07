@@ -2703,6 +2703,64 @@ pub const IrBuilder = struct {
         return false;
     }
 
+    /// Phase E.6: classify a trailing instruction sitting between a
+    /// recursive `call_named` and its `ret` as "tail-mappable" — i.e.,
+    /// an instruction the tail-call rewriter can reorder around the
+    /// rewrite without changing semantics.
+    ///
+    /// The set of tail-mappable instructions covers the no-op /
+    /// refcount-only opcodes that ARC infrastructure may emit between
+    /// the call and the return:
+    ///   * `.release` — post-call ARC release for a shared arg local,
+    ///     or a forward-dataflow scope-exit drop synthesized by
+    ///     ownership analysis.
+    ///   * `.retain` — refcount bump that pairs with a downstream
+    ///     release; semantically a no-op when paired but must be
+    ///     preserved for accounting.
+    ///   * `.borrow_value` — Phase C alias instruction; lowers to a
+    ///     plain assignment with no runtime effect.
+    ///   * `.copy_value` — Phase C copy instruction; lowers to
+    ///     assignment + retain.
+    ///   * `.move_value` — ownership transfer; lowers to assignment.
+    ///
+    /// Any other instruction between `call_named` and `ret` blocks
+    /// the rewrite — the verifier's V6 invariant rejects such IR
+    /// because the runtime stack would grow unboundedly on deep
+    /// recursion.
+    fn isTailMappableTrailingInstr(instr: Instruction) bool {
+        return switch (instr) {
+            .release, .retain, .borrow_value, .copy_value, .move_value => true,
+            else => false,
+        };
+    }
+
+    /// Phase E.6: a trailing instruction sitting between the recursive
+    /// `call_named` and its `ret` is dropped on rewrite iff it is a
+    /// `.release` whose target is one of the call's argument locals.
+    /// Once the call becomes a `tail_call`, the callee inherits
+    /// ownership of every arg through the tail jump — there is no
+    /// "after the call" for that release to fire in (control transfers
+    /// out of the function), and the next iteration's matching
+    /// parameter already accounts for the refcount unit. Eliminating
+    /// the per-arg releases is therefore the correct ownership-
+    /// transfer accounting.
+    ///
+    /// Every other tail-mappable instruction (non-arg releases, retains,
+    /// borrow_value, copy_value, move_value) is preserved before the
+    /// new `tail_call` so it observes pre-tail refcounts and fires
+    /// before control leaves the function.
+    fn isTailReleaseOfArg(instr: Instruction, args: []const LocalId) bool {
+        switch (instr) {
+            .release => |r| {
+                for (args) |arg_local| {
+                    if (arg_local == r.value) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
     fn rewriteTailCalls(
         self: *IrBuilder,
         instrs: []const Instruction,
@@ -2761,80 +2819,72 @@ pub const IrBuilder = struct {
                     });
                 },
                 .ret => |r| {
-                    // Walk backward in `result` past any post-call
-                    // `.release` instructions to find the matching
-                    // `call_named`. Phase 6.2b's IR drop-insertion pass
-                    // appends `.release` instructions before terminator
-                    // returns, but the share_value call-arg lowering
-                    // also emits per-call cleanup `.release` IR
-                    // immediately after the call (see
-                    // `IrBuilder.lowerExpr`'s call branch — every entry
-                    // in `shared_release_locals` becomes a post-call
-                    // release on the per-call shared dest local). When
-                    // both pieces fire on a tail-position recursive
-                    // call, the layout becomes
-                    //   ... call_named(d, e) ; release(d) ; release(e) ; ret(call.dest)
-                    // and the original "is the immediately-preceding
-                    // instruction a call_named?" check fails. Walking
-                    // past intervening releases restores the rewrite
-                    // for the k-nucleotide hot loop and any other
-                    // ARC-arg tail-recursive function.
+                    // Walk backward in `result` past any tail-mappable
+                    // trailing instructions (releases, retains, and the
+                    // Phase C alias/copy/move opcodes) to find the
+                    // matching `call_named`. Several distinct sources
+                    // can interleave instructions between the recursive
+                    // call and the `ret`:
+                    //
+                    //   * Phase 6.2b's IR drop-insertion pass appends
+                    //     `.release` instructions before terminator
+                    //     returns for owned-at-ret locals.
+                    //   * The share_value call-arg lowering emits per-
+                    //     call cleanup `.release` IR immediately after
+                    //     the call (every entry in
+                    //     `shared_release_locals` becomes a post-call
+                    //     release on the per-call shared dest local).
+                    //   * Phase C's `arc_ownership` pass may rewrite
+                    //     trailing `local_get` reads into
+                    //     `.borrow_value` or `.copy_value`.
+                    //   * Move/retain instructions can also surface
+                    //     between the call and the ret as forward-
+                    //     dataflow ownership normalisation evolves.
+                    //
+                    // When any of these fire on a tail-position
+                    // recursive call, the naive "is the immediately-
+                    // preceding instruction a call_named?" check
+                    // fails. Walking past every tail-mappable trailing
+                    // instruction restores the rewrite for the k-
+                    // nucleotide hot loop and any other ARC-arg tail-
+                    // recursive function. The verifier's V6 invariant
+                    // (in `arc_verifier.zig`) catches the converse: any
+                    // non-tail-mappable instruction sitting between a
+                    // self-recursive call and its `ret` is rejected at
+                    // compile time so deep recursion never silently
+                    // blows the stack.
                     if (result.items.len > 0 and r.value != null) {
                         var probe: usize = result.items.len;
-                        while (probe > 0 and result.items[probe - 1] == .release) : (probe -= 1) {}
+                        while (probe > 0 and isTailMappableTrailingInstr(result.items[probe - 1])) : (probe -= 1) {}
                         if (probe > 0 and result.items[probe - 1] == .call_named) {
                             const cn = result.items[probe - 1].call_named;
                             if (std.mem.eql(u8, cn.name, func_name) and r.value.? == cn.dest) {
-                                // The intervening `.release` instructions
-                                // each target a per-call shared dest
-                                // local that was created by `share_value`
-                                // for one of the call's args. Once we
-                                // rewrite to `tail_call`, the callee
-                                // inherits ownership of every arg —
-                                // there is no "after the call" for the
-                                // release to fire in (control transfers
-                                // out of the function), and the next
-                                // iteration's matching parameter
-                                // already accounts for the refcount
-                                // unit. Eliminating the per-arg
-                                // releases is therefore the correct
-                                // ownership-transfer accounting.
-                                //
-                                // Releases of locals NOT in the call's
-                                // arg list (in practice this never
-                                // happens today — the call lowering
-                                // only emits post-call releases for its
-                                // own shared_release_locals — but we
-                                // are defensive against future call
-                                // lowerings that interleave additional
-                                // releases) are preserved; they go
-                                // BEFORE the new tail_call so they
-                                // observe pre-tail refcounts and fire
-                                // before control leaves the function.
-                                var preserved_releases: std.ArrayList(Instruction) = .empty;
-                                defer preserved_releases.deinit(self.allocator);
+                                // For each trailing tail-mappable
+                                // instruction, decide:
+                                //   * `.release{value=arg}` — drop on
+                                //     rewrite (callee inherits
+                                //     ownership through tail jump).
+                                //   * everything else — preserve before
+                                //     the new `tail_call` so the
+                                //     refcount op observes pre-tail
+                                //     state and fires before control
+                                //     leaves the function.
+                                var preserved: std.ArrayList(Instruction) = .empty;
+                                defer preserved.deinit(self.allocator);
                                 for (result.items[probe..]) |trailing| {
-                                    std.debug.assert(trailing == .release);
-                                    var is_arg = false;
-                                    for (cn.args) |arg_local| {
-                                        if (arg_local == trailing.release.value) {
-                                            is_arg = true;
-                                            break;
-                                        }
-                                    }
-                                    if (!is_arg) {
-                                        try preserved_releases.append(self.allocator, trailing);
-                                    }
+                                    std.debug.assert(isTailMappableTrailingInstr(trailing));
+                                    if (isTailReleaseOfArg(trailing, cn.args)) continue;
+                                    try preserved.append(self.allocator, trailing);
                                 }
 
                                 // Truncate result down to (and including)
                                 // the call_named slot, then re-emit:
-                                //   preserved_releases..., tail_call
+                                //   preserved..., tail_call
                                 // The original `ret` is dropped — the
                                 // tail_call is itself the terminator.
                                 result.items.len = probe - 1;
-                                for (preserved_releases.items) |rel| {
-                                    try result.append(self.allocator, rel);
+                                for (preserved.items) |kept| {
+                                    try result.append(self.allocator, kept);
                                 }
                                 try result.append(self.allocator, .{ .tail_call = .{
                                     .name = cn.name,
@@ -2865,21 +2915,25 @@ pub const IrBuilder = struct {
     ) !TailCallRewrite {
         if (body.len == 0 or return_value == null) return .{ .instrs = body, .rewritten = false };
 
-        // Walk backward past trailing `.release` instructions to find
-        // the call. Mirrors the behaviour added in `rewriteTailCalls`:
-        // the share_value-driven post-call cleanup releases live
-        // between the call and the implicit return, defeating a naive
-        // "is the last instruction a call?" check. See the long
-        // comment in `rewriteTailCalls` for the full reasoning,
-        // including why the per-arg releases must be dropped (the
-        // callee inherits ownership) and how non-arg releases (if
-        // ever produced) must be reordered before the new tail_call.
+        // Walk backward past trailing tail-mappable instructions
+        // (releases, retains, and the Phase C alias/copy/move opcodes)
+        // to find the call. Mirrors the behaviour in
+        // `rewriteTailCalls`: ARC infrastructure (share_value cleanup
+        // releases, drop insertion, and the Phase C ownership
+        // normalisation) interleaves no-op / refcount-only
+        // instructions between the recursive call and the implicit
+        // return; without walking past them the naive "is the last
+        // instruction a call?" check fails. See `rewriteTailCalls` for
+        // the full reasoning, including why per-arg releases must be
+        // dropped on rewrite (the callee inherits ownership through
+        // the tail jump) and how every other tail-mappable trailing
+        // instruction is preserved before the new `tail_call`.
         var call_index: usize = body.len;
-        while (call_index > 0 and body[call_index - 1] == .release) : (call_index -= 1) {}
+        while (call_index > 0 and isTailMappableTrailingInstr(body[call_index - 1])) : (call_index -= 1) {}
         if (call_index == 0) return .{ .instrs = body, .rewritten = false };
         const call_instr = body[call_index - 1];
 
-        const trailing_releases = body[call_index..];
+        const trailing = body[call_index..];
 
         const TailCallShape = struct {
             args: []const LocalId,
@@ -2906,26 +2960,20 @@ pub const IrBuilder = struct {
         }
         const sh = shape.?;
 
-        var preserved_releases: std.ArrayList(Instruction) = .empty;
-        defer preserved_releases.deinit(self.allocator);
-        for (trailing_releases) |trailing| {
-            std.debug.assert(trailing == .release);
-            var is_arg = false;
-            for (sh.args) |arg_local| {
-                if (arg_local == trailing.release.value) {
-                    is_arg = true;
-                    break;
-                }
-            }
-            if (!is_arg) try preserved_releases.append(self.allocator, trailing);
+        var preserved: std.ArrayList(Instruction) = .empty;
+        defer preserved.deinit(self.allocator);
+        for (trailing) |trailing_instr| {
+            std.debug.assert(isTailMappableTrailingInstr(trailing_instr));
+            if (isTailReleaseOfArg(trailing_instr, sh.args)) continue;
+            try preserved.append(self.allocator, trailing_instr);
         }
 
         var new_body: std.ArrayList(Instruction) = .empty;
         for (body[0 .. call_index - 1]) |bi| {
             try new_body.append(self.allocator, bi);
         }
-        for (preserved_releases.items) |rel| {
-            try new_body.append(self.allocator, rel);
+        for (preserved.items) |kept| {
+            try new_body.append(self.allocator, kept);
         }
         try new_body.append(self.allocator, .{
             .tail_call = .{ .name = sh.tail_name, .args = sh.args },
@@ -7653,6 +7701,147 @@ test "rewriteTailCalls walks past intervening releases for ARC tail recursion" {
     try std.testing.expect(saw_tail_call);
     try std.testing.expect(!saw_call_named_to_self);
     try std.testing.expect(!saw_orphan_release);
+}
+
+test "rewriteTailCalls walks past borrow_value/copy_value/move_value/retain trailing instructions (Phase E.6)" {
+    // Phase E.6 of the Phase 6 redux plan: between the recursive
+    // `call_named` and the trailing `ret`, ARC infrastructure may
+    // interleave any of:
+    //
+    //   * `.release` (post-call shared-arg cleanup, drop insertion)
+    //   * `.retain` (refcount bump pairs)
+    //   * `.borrow_value` / `.copy_value` (Phase C alias/copy)
+    //   * `.move_value` (ownership transfer)
+    //
+    // The rewriter must walk past every one of these and recognise the
+    // tail-position recursive call. This test hand-constructs an
+    // instruction stream containing each kind of trailing instruction
+    // and checks the rewrite produces a `.tail_call` with no surviving
+    // `.call_named` to self.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var ir_builder = IrBuilder.init(alloc, &interner);
+    defer ir_builder.deinit();
+
+    // Hand-built layout for `pub fn step(c) -> Cell { step(c) }` after
+    // arg lowering, drop insertion, and Phase C ownership normalisation
+    // have run:
+    //
+    //   %0 = call_named(name="step", args=[%10], dest=%20)
+    //   borrow_value %30 <- %10        // Phase C alias (no runtime effect)
+    //   copy_value   %31 <- %10        // Phase C copy (retain)
+    //   move_value   %32 <- %20        // ownership transfer of call result
+    //   retain       %31               // refcount bump
+    //   release      %10               // shared-arg release (DROPPED on rewrite — %10 in args)
+    //   release      %99               // non-arg release (PRESERVED before tail_call)
+    //   ret          %20
+    const args = try alloc.alloc(LocalId, 1);
+    args[0] = 10;
+    const arg_modes = try alloc.alloc(ValueMode, 1);
+    arg_modes[0] = .share;
+
+    const instrs = try alloc.alloc(Instruction, 8);
+    instrs[0] = .{ .call_named = .{ .dest = 20, .name = "step", .args = args, .arg_modes = arg_modes } };
+    instrs[1] = .{ .borrow_value = .{ .dest = 30, .source = 10 } };
+    instrs[2] = .{ .copy_value = .{ .dest = 31, .source = 10 } };
+    instrs[3] = .{ .move_value = .{ .dest = 32, .source = 20 } };
+    instrs[4] = .{ .retain = .{ .value = 31 } };
+    instrs[5] = .{ .release = .{ .value = 10 } };
+    instrs[6] = .{ .release = .{ .value = 99 } };
+    instrs[7] = .{ .ret = .{ .value = 20 } };
+
+    const params = try alloc.alloc(Param, 1);
+    params[0] = .{ .name = "c", .type_expr = .void, .type_id = null };
+
+    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", params, .void);
+
+    var saw_tail_call = false;
+    var saw_borrow_value = false;
+    var saw_copy_value = false;
+    var saw_move_value = false;
+    var saw_retain = false;
+    var preserved_non_arg_release = false;
+    var dropped_arg_release = true;
+    var saw_call_named_to_self = false;
+    for (rewritten) |instr| {
+        switch (instr) {
+            .tail_call => |tc| {
+                if (std.mem.eql(u8, tc.name, "step")) saw_tail_call = true;
+            },
+            .call_named => |cn| {
+                if (std.mem.eql(u8, cn.name, "step")) saw_call_named_to_self = true;
+            },
+            .borrow_value => saw_borrow_value = true,
+            .copy_value => saw_copy_value = true,
+            .move_value => saw_move_value = true,
+            .retain => saw_retain = true,
+            .release => |r| {
+                if (r.value == 99) preserved_non_arg_release = true;
+                if (r.value == 10) dropped_arg_release = false;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_tail_call);
+    try std.testing.expect(!saw_call_named_to_self);
+    try std.testing.expect(saw_borrow_value);
+    try std.testing.expect(saw_copy_value);
+    try std.testing.expect(saw_move_value);
+    try std.testing.expect(saw_retain);
+    try std.testing.expect(preserved_non_arg_release);
+    try std.testing.expect(dropped_arg_release);
+}
+
+test "rewriteTailCalls bails out on non-tail-mappable trailing instruction (Phase E.6)" {
+    // Phase E.6: when an instruction sitting between the recursive
+    // call and the `ret` is NOT in the tail-mappable set (for example
+    // a `.struct_init`), the rewriter must NOT silently fall back to
+    // `.call_named + .ret` — that would hide the regression behind a
+    // stack-blowing recursion at runtime. Instead, it leaves the call
+    // unchanged so the verifier's V6 invariant fires at compile time.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var ir_builder = IrBuilder.init(alloc, &interner);
+    defer ir_builder.deinit();
+
+    const args = try alloc.alloc(LocalId, 0);
+    _ = args;
+    const arg_modes = try alloc.alloc(ValueMode, 0);
+    _ = arg_modes;
+
+    const fields = try alloc.alloc(StructFieldInit, 1);
+    fields[0] = .{ .name = "f", .value = 5 };
+
+    const instrs = try alloc.alloc(Instruction, 3);
+    instrs[0] = .{ .call_named = .{ .dest = 20, .name = "step", .args = &.{}, .arg_modes = &.{} } };
+    instrs[1] = .{ .struct_init = .{ .dest = 21, .type_name = "T", .fields = fields } };
+    instrs[2] = .{ .ret = .{ .value = 20 } };
+
+    const params = try alloc.alloc(Param, 0);
+
+    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", params, .void);
+
+    var saw_tail_call = false;
+    var saw_call_named = false;
+    for (rewritten) |instr| {
+        switch (instr) {
+            .tail_call => saw_tail_call = true,
+            .call_named => saw_call_named = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(!saw_tail_call);
+    try std.testing.expect(saw_call_named);
 }
 
 test "IR local_get of ARC-managed source emits retain on dest" {

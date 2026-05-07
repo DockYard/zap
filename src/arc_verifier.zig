@@ -119,10 +119,159 @@ fn verifyStream(
     ctx: *VerifyContext,
     stream: []const ir.Instruction,
 ) VerifyError!void {
+    // Phase E.6: scan the stream for tail-position self-recursive
+    // calls that the IrBuilder's tail-call rewriter could not
+    // eliminate. V6 is a stream-level invariant (it depends on the
+    // sequence of instructions, not just one) so it runs before the
+    // per-instruction checks.
+    try verifyTailCallRewritability(ctx, stream);
+
     for (stream) |*instr| {
         try verifyInstruction(ctx, instr);
         try verifyChildren(ctx, instr);
     }
+}
+
+/// V6: every self-recursive `.call_named` whose result feeds directly
+/// into a `.ret` (i.e., it stands in tail position) MUST be reachable
+/// to the IrBuilder's tail-call rewriter. The rewriter walks past
+/// trailing tail-mappable instructions (releases, retains,
+/// borrow_value, copy_value, move_value) — anything else between the
+/// call and the return blocks the rewrite, leaving a regular
+/// `call_named + ret` pair that the runtime would execute as an
+/// unbounded stack-growing recursion. This invariant catches the
+/// regression at compile time so future ownership-pass changes that
+/// introduce non-tail-mappable instructions in the trailing path
+/// surface here instead of as a stack overflow on a deep workload
+/// (e.g., k-nucleotide's `count_kmers_loop`).
+///
+/// The check is scoped to a single instruction stream. Walk forward;
+/// when we observe a `.call_named` to self, remember its dest. If a
+/// `.ret` whose value matches that dest appears later in the same
+/// stream, every instruction strictly between the call and the ret
+/// must be in the tail-mappable set. The first non-tail-mappable
+/// instruction triggers a V6 diagnostic naming the offending
+/// instruction tag.
+///
+/// Calls in non-tail position (where the call's dest is not the
+/// stream's eventual return value) are silently ignored — V6 is not
+/// trying to mandate that every recursive call be a tail call, only
+/// that every call SOMEONE wrote in tail position remain rewritable.
+fn verifyTailCallRewritability(
+    ctx: *VerifyContext,
+    stream: []const ir.Instruction,
+) VerifyError!void {
+    const function = ctx.function;
+    var index: usize = 0;
+    while (index < stream.len) : (index += 1) {
+        const call_instr = stream[index];
+        const call_dest: ir.LocalId, const call_name: []const u8 = switch (call_instr) {
+            .call_named => |cn| .{ cn.dest, cn.name },
+            else => continue,
+        };
+        if (!std.mem.eql(u8, call_name, function.name)) continue;
+
+        // Look forward for a `.ret` whose value is the call's dest.
+        // Any instruction strictly between the call and that `ret`
+        // must be tail-mappable; otherwise V6 fails. We only flag a
+        // violation when a matching `.ret` is found — if the call's
+        // dest never feeds a `.ret` in this stream, the call is not
+        // in tail position and V6 is silent.
+        var probe: usize = index + 1;
+        while (probe < stream.len) : (probe += 1) {
+            const next = stream[probe];
+            if (next == .ret) {
+                const ret_value = next.ret.value orelse break;
+                if (ret_value != call_dest) break;
+                // Tail position confirmed. Verify every instruction
+                // between `call_instr` (exclusive) and `next`
+                // (exclusive) is tail-mappable.
+                var between_index: usize = index + 1;
+                while (between_index < probe) : (between_index += 1) {
+                    const between = stream[between_index];
+                    if (!isTailMappableTrailingInstr(between)) {
+                        emitTailCallRewritabilityDiagnostic(
+                            function,
+                            index,
+                            between_index,
+                            probe,
+                            between,
+                        );
+                        return error.ArcInvariantViolation;
+                    }
+                }
+                break;
+            }
+            // A non-ret instruction along the way is fine on its own
+            // (it might itself be tail-mappable or might break tail
+            // position). The decision waits until we either hit the
+            // matching ret (above) or a non-matching terminator
+            // (below).
+            if (terminatesStream(next)) break;
+        }
+    }
+}
+
+/// Phase E.6: classify whether `instr` is a tail-mappable trailing
+/// instruction — i.e., one the IrBuilder's tail-call rewriter walks
+/// past when matching the call+ret pattern. The set must stay in
+/// lockstep with `IrBuilder.isTailMappableTrailingInstr` in
+/// `src/ir.zig`. Drift between the two is a correctness bug: V6
+/// would either falsely accept IR the rewriter can't actually rewrite
+/// or falsely reject IR the rewriter handles cleanly.
+fn isTailMappableTrailingInstr(instr: ir.Instruction) bool {
+    return switch (instr) {
+        .release, .retain, .borrow_value, .copy_value, .move_value => true,
+        else => false,
+    };
+}
+
+/// True for instructions that terminate the surrounding stream's
+/// linear control flow (any subsequent instruction in the same slice
+/// would be unreachable). The V6 forward scan stops at a terminator
+/// that is not the matching `.ret` because nothing past a terminator
+/// can reach a tail-position `ret`.
+fn terminatesStream(instr: ir.Instruction) bool {
+    return switch (instr) {
+        .ret,
+        .cond_return,
+        .tail_call,
+        .jump,
+        .switch_return,
+        .union_switch_return,
+        .branch,
+        .match_fail,
+        .match_error_return,
+        => true,
+        else => false,
+    };
+}
+
+/// Emit a V6 diagnostic naming the function, the call instruction
+/// index, the offending non-tail-mappable instruction tag, and the
+/// surrounding ret index — enough context for a developer to find
+/// the exact site without instrumenting the verifier further.
+fn emitTailCallRewritabilityDiagnostic(
+    function: *const ir.Function,
+    call_index: usize,
+    offending_index: usize,
+    ret_index: usize,
+    offending: ir.Instruction,
+) void {
+    if (suppress_diagnostics) return;
+    std.debug.print(
+        "arc_verifier: function '{s}' violates V6:\n" ++
+            "  self-recursive call at instruction {d} followed by non-tail-mappable instruction {d} (.{s})\n" ++
+            "  the tail-call rewriter cannot eliminate this call; deep recursion will blow the stack\n" ++
+            "  matching ret is at instruction {d}\n",
+        .{
+            function.name,
+            call_index,
+            offending_index,
+            @tagName(offending),
+            ret_index,
+        },
+    );
 }
 
 /// Recurse into every nested instruction stream owned by `instr`.
@@ -737,6 +886,180 @@ test "arc_verifier: recurses into optional_dispatch arms" {
     var function = try buildTestFunction(
         allocator,
         "test_recursion",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(allocator, &function);
+
+    const result = verify(allocator, &function);
+    try testing.expectError(error.ArcInvariantViolation, result);
+}
+
+test "arc_verifier: rejects self-recursive call followed by non-tail-mappable instruction (V6)" {
+    var guard = SuppressDiagnostics.init();
+    defer guard.deinit();
+    // V6: a self-recursive `.call_named` whose result feeds a `.ret`
+    // is in tail position. The IrBuilder's tail-call rewriter walks
+    // past releases / retains / borrow_value / copy_value /
+    // move_value when matching the call+ret pattern; any other
+    // instruction between them blocks the rewrite. V6 catches that
+    // regression at compile time. Here a `.struct_init` between the
+    // call and the ret is the offending non-tail-mappable
+    // instruction.
+    const allocator = testing.allocator;
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned };
+    const conventions = [_]ir.ParamConvention{};
+    const fields = [_]ir.StructFieldInit{
+        .{ .name = "f", .value = 0 },
+    };
+    const instrs = [_]ir.Instruction{
+        .{ .call_named = .{ .dest = 1, .name = "test_v6", .args = &.{}, .arg_modes = &.{} } },
+        .{ .struct_init = .{ .dest = 2, .type_name = "T", .fields = &fields } },
+        .{ .ret = .{ .value = 1 } },
+    };
+    var function = try buildTestFunction(
+        allocator,
+        "test_v6",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(allocator, &function);
+
+    const result = verify(allocator, &function);
+    try testing.expectError(error.ArcInvariantViolation, result);
+}
+
+test "arc_verifier: accepts self-recursive call followed only by tail-mappable instructions (V6)" {
+    // Positive control for V6: when every instruction between a
+    // self-recursive `.call_named` and its `.ret` is tail-mappable
+    // (releases, retains, borrow_value, copy_value, move_value), the
+    // rewriter could have rewritten the call into `.tail_call`. In
+    // practice this exact shape only appears if the rewriter chose
+    // not to fire (e.g., because a future refinement gates rewrites
+    // on additional criteria); V6's job is solely to verify that the
+    // trailing instructions are within the rewriter's whitelist, not
+    // to mandate the rewrite ran.
+    const allocator = testing.allocator;
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned, .owned };
+    const conventions = [_]ir.ParamConvention{};
+    const instrs = [_]ir.Instruction{
+        .{ .call_named = .{ .dest = 1, .name = "test_v6_pos", .args = &.{}, .arg_modes = &.{} } },
+        .{ .borrow_value = .{ .dest = 2, .source = 1 } },
+        .{ .copy_value = .{ .dest = 3, .source = 1 } },
+        .{ .retain = .{ .value = 1 } },
+        .{ .release = .{ .value = 1 } },
+        .{ .ret = .{ .value = 1 } },
+    };
+    var function = try buildTestFunction(
+        allocator,
+        "test_v6_pos",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(allocator, &function);
+
+    try verify(allocator, &function);
+}
+
+test "arc_verifier: V6 silent on non-self-recursive call_named" {
+    // V6 only fires for SELF-recursive calls. A `.call_named` whose
+    // name does not match the enclosing function's name is unrelated
+    // to the tail-call rewriter's invariant.
+    const allocator = testing.allocator;
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned };
+    const conventions = [_]ir.ParamConvention{};
+    const fields = [_]ir.StructFieldInit{
+        .{ .name = "f", .value = 0 },
+    };
+    const instrs = [_]ir.Instruction{
+        .{ .call_named = .{ .dest = 1, .name = "OtherFunction", .args = &.{}, .arg_modes = &.{} } },
+        .{ .struct_init = .{ .dest = 2, .type_name = "T", .fields = &fields } },
+        .{ .ret = .{ .value = 1 } },
+    };
+    var function = try buildTestFunction(
+        allocator,
+        "test_v6_silent",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(allocator, &function);
+
+    try verify(allocator, &function);
+}
+
+test "arc_verifier: V6 silent when self-recursive call is not in tail position" {
+    // V6 only fires for self-recursive calls in TAIL position — i.e.,
+    // the call's dest feeds the function's `.ret`. A self-recursive
+    // call whose dest is consumed by intermediate computation before
+    // a non-matching `.ret` is genuinely non-tail and the rewriter
+    // legitimately cannot rewrite it. V6 must remain silent here so
+    // legal non-tail-recursive Zap programs continue to verify clean.
+    const allocator = testing.allocator;
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned, .owned };
+    const conventions = [_]ir.ParamConvention{};
+    const fields = [_]ir.StructFieldInit{
+        .{ .name = "f", .value = 1 },
+    };
+    const instrs = [_]ir.Instruction{
+        .{ .call_named = .{ .dest = 1, .name = "test_v6_nontail", .args = &.{}, .arg_modes = &.{} } },
+        .{ .struct_init = .{ .dest = 2, .type_name = "T", .fields = &fields } },
+        // Note: ret value is %2 (the struct), NOT %1 (the call dest).
+        // The call is therefore not in tail position.
+        .{ .ret = .{ .value = 2 } },
+    };
+    var function = try buildTestFunction(
+        allocator,
+        "test_v6_nontail",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(allocator, &function);
+
+    try verify(allocator, &function);
+}
+
+test "arc_verifier: V6 walks into nested switch_return arms" {
+    var guard = SuppressDiagnostics.init();
+    defer guard.deinit();
+    // V6 must inspect every nested instruction stream — the tail-call
+    // rewriter handles `switch_return` cases (see
+    // `IrBuilder.rewriteTailCallsInBody`). A V6 violation buried in a
+    // case body must still surface at compile time.
+    const allocator = testing.allocator;
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned };
+    const conventions = [_]ir.ParamConvention{};
+    const fields = [_]ir.StructFieldInit{
+        .{ .name = "f", .value = 0 },
+    };
+    const arm_instrs = [_]ir.Instruction{
+        .{ .call_named = .{ .dest = 1, .name = "test_v6_nested", .args = &.{}, .arg_modes = &.{} } },
+        .{ .struct_init = .{ .dest = 2, .type_name = "T", .fields = &fields } },
+        .{ .ret = .{ .value = 1 } },
+    };
+    const cases = [_]ir.ReturnCase{
+        .{ .value = .{ .int = 0 }, .body_instrs = &arm_instrs, .return_value = null },
+    };
+    const instrs = [_]ir.Instruction{
+        .{ .switch_return = .{
+            .scrutinee_param = 0,
+            .cases = &cases,
+            .default_instrs = &.{},
+            .default_result = null,
+        } },
+    };
+    var function = try buildTestFunction(
+        allocator,
+        "test_v6_nested",
         &instrs,
         &ownership,
         &conventions,
