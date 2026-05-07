@@ -57,7 +57,6 @@ pub const monomorphize = @import("monomorphize.zig");
 pub const env = @import("env.zig");
 pub const signature = @import("signature.zig");
 pub const wyhash = @import("wyhash.zig");
-pub const dense_map = @import("dense_map.zig");
 
 test {
     _ = @import("token.zig");
@@ -103,5 +102,4 @@ test {
     _ = @import("monomorphize.zig");
     _ = @import("env.zig");
     _ = @import("wyhash.zig");
-    _ = @import("dense_map.zig");
 }

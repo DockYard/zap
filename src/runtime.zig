@@ -847,10 +847,13 @@ pub fn mapInstrumentationClearParent() void {
     instrumentation_state.parent_instance_id = 0;
 }
 
-/// Bump the per-lineage HAMT node-clone count. Invoked from inside
-/// `put`/`delete`'s path-copy code after a fresh `HamtNode` is
-/// allocated. The lineage id is the input map's lineage, which the
-/// hook reads from the active record.
+/// Bump the per-lineage clone count. Historical name — invoked by the
+/// HAMT path-copy code; kept as a stable instrumentation surface for
+/// future allocators that want to flag every internal clone. The dense
+/// Map does not call this hook in its current form (cloning is whole-
+/// buffer, already counted via `mapInstrumentationOnAlloc`'s lineage
+/// `instance_count`); the function stays a no-op-friendly surface for
+/// callers that detect a buffer clone.
 pub fn mapInstrumentationNoteNodeClone(input_cell_ptr: usize) void {
     if (!instrument_map) return;
     if (!instrumentation_state.initialised) return;
@@ -4034,209 +4037,309 @@ pub fn coerceFromMaybeTerm(value: anytype, default: anytype) Term.ToCoercedResul
 }
 
 // ============================================================
-// Map — Generic HAMT-based persistent map.
+// wyhash — embedded hash function for the dense Map.
 //
-// Map(K, V) generates a type-specific map for any key/value types.
-// Maps use nullable pointers: null = empty, non-null = map cell.
-// Hybrid: flat array for small maps, HAMT trie for larger.
+// Wraps Zig's stdlib production wyhash (the same `final v3` used by
+// `ankerl::unordered_dense` by default) and adds a per-process random
+// seed source. Inlined into runtime.zig (rather than imported from
+// `wyhash.zig`) because runtime.zig is the single registered runtime
+// source for every user binary — additional sibling files cannot be
+// imported. The host build retains `src/wyhash.zig` for unit tests.
+// ============================================================
+
+const Wyhash = struct {
+    const StdWyhash = std.hash.Wyhash;
+
+    /// Strictly-monotonic counter bumped on every seed materialization.
+    /// Combined with ASLR-derived entropy via SplitMix64 to produce a
+    /// per-instance seed unpredictable to an attacker without process
+    /// introspection.
+    var seed_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+    threadlocal var thread_seed_state: ?u64 = null;
+
+    inline fn splitMix64(state: u64) u64 {
+        var z = state +% 0x9E3779B97F4A7C15;
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+        return z ^ (z >> 31);
+    }
+
+    fn osEntropy() u64 {
+        var buf: [8]u8 = undefined;
+        switch (builtin.os.tag) {
+            .linux => {
+                const rc = std.os.linux.getrandom(&buf, buf.len, 0);
+                if (rc == buf.len) {
+                    return std.mem.readInt(u64, &buf, .little);
+                }
+            },
+            else => {},
+        }
+        return 0;
+    }
+
+    pub fn nextSeed() u64 {
+        const counter = seed_counter.fetchAdd(1, .monotonic);
+        if (thread_seed_state == null) {
+            const ra: u64 = @intCast(@returnAddress());
+            thread_seed_state = splitMix64(ra ^ osEntropy() ^ 0xD1B54A32D192ED03);
+        }
+        thread_seed_state = splitMix64(thread_seed_state.? +% counter);
+        return thread_seed_state.?;
+    }
+
+    pub inline fn hashU64(seed: u64, value: u64) u64 {
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, value, .little);
+        return StdWyhash.hash(seed, &bytes);
+    }
+
+    pub inline fn hashU32(seed: u64, value: u32) u64 {
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, value, .little);
+        return StdWyhash.hash(seed, &bytes);
+    }
+
+    pub inline fn hashBytes(seed: u64, bytes: []const u8) u64 {
+        return StdWyhash.hash(seed, bytes);
+    }
+
+    /// Comptime-dispatched hasher matching `wyhash.zig::hash`.
+    pub inline fn hash(seed: u64, value: anytype) u64 {
+        const T = @TypeOf(value);
+        const ti = @typeInfo(T);
+        return switch (ti) {
+            .int => |int_info| blk: {
+                if (int_info.bits <= 32) {
+                    break :blk hashU32(seed, @intCast(@as(std.meta.Int(.unsigned, int_info.bits), @bitCast(value))));
+                }
+                if (int_info.bits == 64) {
+                    break :blk hashU64(seed, @bitCast(value));
+                }
+                var bytes: [@sizeOf(T)]u8 = undefined;
+                std.mem.writeInt(T, &bytes, value, .little);
+                break :blk hashBytes(seed, &bytes);
+            },
+            .comptime_int => hashU64(seed, @intCast(value)),
+            .bool => blk: {
+                const b: [1]u8 = .{@intFromBool(value)};
+                break :blk hashBytes(seed, &b);
+            },
+            .pointer => |ptr_info| blk: {
+                if (ptr_info.size == .slice and ptr_info.child == u8) {
+                    break :blk hashBytes(seed, value);
+                }
+                break :blk hashU64(seed, @intCast(@intFromPtr(value)));
+            },
+            else => @compileError("wyhash.hash: unsupported key type " ++ @typeName(T)),
+        };
+    }
+};
+
+// ============================================================
+// Dense Map constants. Layout described in
+// `docs/dense-map-implementation-plan.md` §1.1.
+// ============================================================
+
+/// Empty bucket sentinel.
+const DENSE_MAP_EMPTY: u32 = 0xFFFFFFFF;
+/// Distance increment encoded in `dist_and_fingerprint` (high 24 bits).
+const DENSE_MAP_DIST_INC: u32 = 0x100;
+/// Mask for the 8-bit fingerprint (low byte of `dist_and_fingerprint`).
+const DENSE_MAP_FINGERPRINT_MASK: u32 = 0xFF;
+/// Initial capacity at first allocation (power of 2).
+const DENSE_MAP_INITIAL_CAPACITY: u32 = 8;
+/// Load factor numerator/denominator: resize when len+1 > cap*7/8.
+const DENSE_MAP_LOAD_NUM: u32 = 7;
+const DENSE_MAP_LOAD_DEN: u32 = 8;
+
+/// Bucket — 8 bytes. `dist_and_fingerprint` packs distance (high 24 bits,
+/// +1 shifted by `DENSE_MAP_DIST_INC` so home slot reads `0x100`) and
+/// fingerprint (low 8 bits = high byte of the 64-bit hash).
+pub const DenseMapBucket = extern struct {
+    dist_and_fingerprint: u32,
+    entry_idx: u32,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(DenseMapBucket) == 8);
+}
+
+// ============================================================
+// Map — dense, insertion-ordered, open-addressed table.
+//
+// The cell pointer (`?*const Map(K, V)`) is the buffer pointer.
+// `null` is the empty-map sentinel — no allocation until first put.
+// The struct's first field is `header: ArcHeader` so the runtime's
+// `hasInlineArcHeader` recognises it for ARC dispatch (same shape as
+// `List(T)` cells and the legacy HAMT cell).
+//
+// Layout (single contiguous allocation):
+//
+//   [ Self            (header, len, capacity, entry_cap, hash_seed) ]
+//   [ buckets[capacity] of DenseMapBucket                            ]
+//   [ entries[entry_cap] of MapEntry { hash, key, value }            ]
+//
+// Robin Hood probing with a `(dist << 8) | fingerprint` packed metric
+// drives insertion and lookup. Delete is swap-remove on entries plus
+// backshift on buckets. Refcount-aware mutators dispatch on
+// `header.count() == 1` for the rc-1 fast path.
 // ============================================================
 
 pub fn Map(comptime K: type, comptime V: type) type {
     return struct {
         const Self = @This();
-        // Hybrid representation: flat array for small maps, HAMT trie for larger maps.
-        // The HAMT (Hash Array Mapped Trie) provides O(log32 n) lookup, insert, and
-        // delete for large maps while the flat array remains optimal for <= 8 entries.
-        //
-        // Memory model: Self and HamtNode are ARC-managed. Each carries an
-        // `ArcHeader` as its first field so retain/release is a refcount bump
-        // on the cell pointer. Path-copy `put`/`delete` produce a new spine
-        // whose nodes carry refcount=1; every shared subtree pointer carried
-        // forward into the new spine is `retain`'d. When a Map cell or
-        // HamtNode reaches refcount zero it deep-releases its trie children
-        // before its Inner allocation returns to the per-(K,V) MemoryPool;
-        // the variable-length entries / node-ptrs buffers are freed back to
-        // page_allocator. This keeps persistent semantics while ensuring
-        // O(active set) memory rather than O(total mutations).
 
-        // First field: ArcHeader. Layout-stable across Map(K,V) instantiations
-        // so codegen-side release helpers see a uniform "header at offset 0"
-        // shape and can release any Map pointer through `Self.release`.
+        // Inline buffer header. Self IS the header; the cell pointer is
+        // the buffer pointer. `header: ArcHeader` lives at offset 0 so
+        // `ArcRuntime.hasInlineArcHeader` recognises this type as
+        // self-managed (same shape as List(T) cells).
+
+        /// ARC refcount. Initialised to 1 by `bufferAlloc`.
         header: ArcHeader,
-        total_count: u32,
-        repr_tag: u8, // 0 = flat, 1 = trie
-        // Payload is one of:
-        //   flat: entries + count stored inline
-        //   trie: root node pointer
-        flat_entries: [*]const MapEntry,
-        flat_count: u32,
-        trie_root: ?*const HamtNode,
+        /// Number of populated entries (also the cursor for the next entry).
+        len: u32,
+        /// Number of bucket slots (always a power of 2, >= INITIAL_CAPACITY).
+        capacity: u32,
+        /// Number of entry slots (kept in lockstep with `capacity` here).
+        entry_cap: u32,
+        /// Per-instance hash seed sampled at construction. Used for every
+        /// key hash so resize is deterministic.
+        hash_seed: u64,
 
-        const FLAT_THRESHOLD = 8;
-        const BITS_PER_LEVEL = 5;
-        const BRANCHING_FACTOR = 1 << BITS_PER_LEVEL; // 32
-        const LEVEL_MASK: u32 = BRANCHING_FACTOR - 1; // 0x1F
-        const MAX_DEPTH = 7; // ceil(32 / 5)
-
+        /// Entry stored densely in insertion order. Plain (non-extern)
+        /// struct so K and V can be slices, optionals, tagged unions, etc.
         pub const MapEntry = struct {
+            hash: u64,
             key: K,
             value: V,
         };
 
-        /// HAMT trie node: bitmap-indexed with packed children array.
-        /// Each child is either a leaf entry or a pointer to a sub-node.
-        ///
-        /// First field is ArcHeader so the node participates in the same
-        /// retain/release dance as the parent Map cell. `children_entries`
-        /// and `children_nodes` are heap-allocated through page_allocator
-        /// (sized by `child_count`) and freed when this node's refcount
-        /// reaches zero.
-        const HamtNode = struct {
-            header: ArcHeader,
-            bitmap: u32,
-            children_entries: [*]const MapEntry, // leaf entries (parallel to children_nodes)
-            children_nodes: [*]const ?*const HamtNode, // sub-nodes (null = leaf at this slot)
-            // u6 fits 0..63 — `child_count` may equal `BRANCHING_FACTOR`
-            // (32) when every bit is set, which doesn't fit u5.
-            child_count: u6,
-            // When set, the node is a collision bucket: hash bits have
-            // been exhausted at this depth (or beyond), so `bitmap`
-            // and `children_nodes` are unused, and `children_entries`
-            // is treated as a flat list of `child_count` entries
-            // looked up by linear scan over `keysEqual`. Without this
-            // flag the previous "max depth" code path silently
-            // replaced collisions, dropping data — surfaced by the
-            // CLBG `k-nucleotide` 18-mer query.
-            is_collision: bool = false,
-        };
+        // -------------------------------------------------------------------
+        // Layout helpers
+        // -------------------------------------------------------------------
 
-        // Per-(K,V) thread-local MemoryPool for Self cells. Mirrors
-        // ArcRuntime.ArcPool / MArrayOf.InnerPool: hot-path allocation
-        // becomes a free-list pop, reclamation becomes a free-list push,
-        // OS page commit happens once per pool growth instead of per
-        // allocation. Single-threaded Zap programs share the pool across
-        // all Map(K,V) operations.
-        const SelfPool = struct {
-            const PoolT = std.heap.MemoryPool(Self);
-            threadlocal var pool: PoolT = .empty;
-            threadlocal var stats: PoolStats = .{ .name = "Map(" ++ @typeName(K) ++ "," ++ @typeName(V) ++ ").Self" };
+        inline fn bucketsByteOffset() usize {
+            return std.mem.alignForward(usize, @sizeOf(Self), @alignOf(DenseMapBucket));
+        }
 
-            fn create() *Self {
-                ensureArcStatsAtexit();
-                stats.noteAllocation();
-                return pool.create(std.heap.page_allocator) catch
-                    @panic("Map cell pool: out of memory");
+        inline fn entriesByteOffset(capacity_arg: u32) usize {
+            const after_buckets = bucketsByteOffset() + @as(usize, capacity_arg) * @sizeOf(DenseMapBucket);
+            return std.mem.alignForward(usize, after_buckets, @alignOf(MapEntry));
+        }
+
+        inline fn bufferSize(capacity_arg: u32, entry_cap_arg: u32) usize {
+            return entriesByteOffset(capacity_arg) + @as(usize, entry_cap_arg) * @sizeOf(MapEntry);
+        }
+
+        inline fn bufferAlign() std.mem.Alignment {
+            const a_self = std.mem.Alignment.of(Self);
+            const a_bucket = std.mem.Alignment.of(DenseMapBucket);
+            const a_entry = std.mem.Alignment.of(MapEntry);
+            return a_self.max(a_bucket).max(a_entry);
+        }
+
+        inline fn bucketsPtr(self: *const Self) [*]DenseMapBucket {
+            const base: [*]u8 = @ptrCast(@constCast(self));
+            return @as([*]DenseMapBucket, @ptrCast(@alignCast(base + bucketsByteOffset())));
+        }
+
+        inline fn entriesPtr(self: *const Self) [*]MapEntry {
+            const base: [*]u8 = @ptrCast(@constCast(self));
+            return @as([*]MapEntry, @ptrCast(@alignCast(base + entriesByteOffset(self.capacity))));
+        }
+
+        inline fn bucketAt(self: *Self, idx: u32) *DenseMapBucket {
+            std.debug.assert(idx < self.capacity);
+            return &self.bucketsPtr()[idx];
+        }
+
+        inline fn entryAt(self: *Self, idx: u32) *MapEntry {
+            std.debug.assert(idx < self.len);
+            return &self.entriesPtr()[idx];
+        }
+
+        inline fn entryAtConst(self: *const Self, idx: u32) *const MapEntry {
+            std.debug.assert(idx < self.len);
+            return &self.entriesPtr()[idx];
+        }
+
+        // -------------------------------------------------------------------
+        // Public introspection
+        // -------------------------------------------------------------------
+
+        pub fn size(map: ?*const Self) i64 {
+            if (map) |m| {
+                if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
+                return @intCast(m.len);
             }
+            return 0;
+        }
 
-            fn destroy(cell: *Self) void {
-                stats.noteDeallocation();
-                pool.destroy(cell);
+        pub fn isEmpty(map: ?*const Self) bool {
+            return map == null;
+        }
+
+        pub fn empty() ?*const Self {
+            return null;
+        }
+
+        // -------------------------------------------------------------------
+        // Buffer alloc / free
+        // -------------------------------------------------------------------
+
+        /// Allocate a freshly-zeroed buffer with the given capacity.
+        /// Refcount=1, all buckets EMPTY, `len=0`.
+        fn bufferAlloc(capacity_arg: u32, seed: u64, creation_callsite: u64) ?*Self {
+            std.debug.assert(std.math.isPowerOfTwo(capacity_arg));
+            const total = bufferSize(capacity_arg, capacity_arg);
+            const allocator = std.heap.c_allocator;
+            const align_v = comptime bufferAlign();
+            const raw = allocator.alignedAlloc(u8, align_v, total) catch return null;
+            const self_ptr: *Self = @ptrCast(@alignCast(raw.ptr));
+            self_ptr.* = .{
+                .header = ArcHeader.init(),
+                .len = 0,
+                .capacity = capacity_arg,
+                .entry_cap = capacity_arg,
+                .hash_seed = seed,
+            };
+            const buckets_ptr = self_ptr.bucketsPtr();
+            for (0..capacity_arg) |i| {
+                buckets_ptr[i] = .{ .dist_and_fingerprint = DENSE_MAP_EMPTY, .entry_idx = 0 };
             }
-        };
-
-        const NodePool = struct {
-            const PoolT = std.heap.MemoryPool(HamtNode);
-            threadlocal var pool: PoolT = .empty;
-            threadlocal var stats: PoolStats = .{ .name = "Map(" ++ @typeName(K) ++ "," ++ @typeName(V) ++ ").HamtNode" };
-
-            fn create() *HamtNode {
-                ensureArcStatsAtexit();
-                stats.noteAllocation();
-                return pool.create(std.heap.page_allocator) catch
-                    @panic("Map node pool: out of memory");
+            if (comptime instrument_map) {
+                mapInstrumentationOnAlloc(@intFromPtr(self_ptr), 0, creation_callsite);
             }
+            return self_ptr;
+        }
 
-            fn destroy(node: *HamtNode) void {
-                stats.noteDeallocation();
-                pool.destroy(node);
+        /// Free the buffer without deep-releasing K/V children. Used on
+        /// the unique-owner resize path where children have been moved.
+        fn bufferFreeShallow(self: *Self) void {
+            const allocator = std.heap.c_allocator;
+            const total = bufferSize(self.capacity, self.entry_cap);
+            const align_v = comptime bufferAlign();
+            const raw_ptr: [*]u8 = @ptrCast(self);
+            const raw_slice = @as([*]align(align_v.toByteUnits()) u8, @alignCast(raw_ptr))[0..total];
+            allocator.free(raw_slice);
+        }
+
+        fn bufferFreeDeep(self: *Self) void {
+            const len = self.len;
+            const entries = self.entriesPtr();
+            const allocator = std.heap.c_allocator;
+            for (0..len) |i| {
+                releaseEntryKey(entries[i].key, allocator);
+                releaseEntryValue(entries[i].value, allocator);
             }
-        };
-
-        /// Hash a key value for HAMT lookup. Supports u32 (atoms), i64, []const u8 (strings), bool, Term.
-        fn hashKey(key: K) u32 {
-            const raw: u32 = if (K == u32)
-                key
-            else if (K == i64)
-                @truncate(@as(u64, @bitCast(key)))
-            else if (K == []const u8) blk: {
-                var h: u32 = 2166136261;
-                for (key) |byte| {
-                    h ^= byte;
-                    h *%= 16777619;
-                }
-                break :blk h;
-            } else if (K == bool)
-                if (key) @as(u32, 1) else @as(u32, 0)
-            else if (K == Term)
-                key.hash()
-            else
-                0;
-            // Murmur3 finalizer
-            var h = raw;
-            h ^= h >> 16;
-            h *%= 0x85ebca6b;
-            h ^= h >> 13;
-            h *%= 0xc2b2ae35;
-            h ^= h >> 16;
-            return h;
+            self.bufferFreeShallow();
         }
 
-        fn keysEqual(a: K, b: K) bool {
-            if (K == []const u8) return std.mem.eql(u8, a, b);
-            if (K == Term) return Term.eql(a, b);
-            return a == b;
-        }
+        // -------------------------------------------------------------------
+        // Retain / release
+        // -------------------------------------------------------------------
 
-        fn allocMap() ?*Self {
-            return SelfPool.create();
-        }
-
-        // Variable-length children arrays (entries + node ptrs) range
-        // from a few bytes to a few hundred. Routing those allocations
-        // through `page_allocator` would mmap one page per allocation
-        // (16 KiB on macOS aarch64), turning a 32-byte HAMT node array
-        // into a 16 KiB syscall and ~500x amplification at the OS layer.
-        // `c_allocator` (libc malloc) has proper small-object size
-        // classes and free-list reuse, which is what these allocations
-        // need. Single-threaded Zap programs share libc malloc state
-        // safely; the small-object hot path doesn't contend.
-        fn entriesAllocator() std.mem.Allocator {
-            return std.heap.c_allocator;
-        }
-
-        fn allocEntries(count: usize) ?[*]MapEntry {
-            if (count == 0) return @as([*]MapEntry, undefined);
-            const slice = entriesAllocator().alloc(MapEntry, count) catch return null;
-            return slice.ptr;
-        }
-
-        fn allocHamtNode() ?*HamtNode {
-            return NodePool.create();
-        }
-
-        fn allocNodePtrs(count: usize) ?[*]?*const HamtNode {
-            if (count == 0) return @as([*]?*const HamtNode, undefined);
-            const slice = entriesAllocator().alloc(?*const HamtNode, count) catch return null;
-            for (0..count) |i| {
-                slice[i] = null;
-            }
-            return slice.ptr;
-        }
-
-        fn freeEntries(buf: [*]const MapEntry, count: usize) void {
-            if (count == 0) return;
-            entriesAllocator().free(@constCast(buf[0..count]));
-        }
-
-        fn freeNodePtrs(buf: [*]const ?*const HamtNode, count: usize) void {
-            if (count == 0) return;
-            entriesAllocator().free(@constCast(buf[0..count]));
-        }
-
-        // ----- ARC retain/release for Map cells and HamtNodes -----
-
-        /// Increment the refcount of a Map cell and return the same handle.
-        /// Null maps (the empty-map sentinel) are a no-op.
         pub fn retain(map: ?*const Self) ?*const Self {
             if (map) |m| {
                 const mut: *Self = @constCast(m);
@@ -4250,574 +4353,154 @@ pub fn Map(comptime K: type, comptime V: type) type {
             return map;
         }
 
-        /// Decrement the refcount of a Map cell. On the zero-transition,
-        /// deep-release the trie root and free the variable-length flat
-        /// entries buffer before returning the cell to the SelfPool.
         pub fn release(map: ?*const Self) void {
             if (map == null) return;
             const m = map.?;
             const mut: *Self = @constCast(m);
             arc_releases_total += 1;
             if (!mut.header.release()) return;
-            // Final owner — tear down owned children before destroying the cell.
             if (comptime instrument_map) {
-                mapInstrumentationOnRelease(@intFromPtr(m), m.total_count);
+                mapInstrumentationOnRelease(@intFromPtr(m), m.len);
             }
-            if (m.repr_tag == 0) {
-                if (m.flat_count > 0) {
-                    freeEntries(m.flat_entries, @intCast(m.flat_count));
-                }
-            } else if (m.trie_root) |root| {
-                releaseNode(root);
-            }
-            SelfPool.destroy(mut);
+            mut.bufferFreeDeep();
         }
 
-        /// Increment a HamtNode's refcount. Used at every spot where a
-        /// path-copy operation carries a sibling subtree forward into a
-        /// new node — both the old node and the new node will eventually
-        /// release that pointer, and the refcount must absorb both.
-        fn retainNode(node: *const HamtNode) void {
-            const mut: *HamtNode = @constCast(node);
-            mut.header.retain();
-        }
-
-        /// Decrement a HamtNode's refcount. On zero, recursively release
-        /// each child sub-node, free the entries / node-ptrs buffers, and
-        /// return the node to the NodePool.
-        fn releaseNode(node: *const HamtNode) void {
-            const mut: *HamtNode = @constCast(node);
-            if (!mut.header.release()) return;
-            const count: usize = @intCast(node.child_count);
-            if (node.is_collision) {
-                // Collision-bucket: only `children_entries` is owned;
-                // `children_nodes` is unused (`undefined` placeholder).
-                if (count > 0) freeEntries(node.children_entries, count);
-            } else if (count > 0) {
-                // Walk children_nodes and release each non-null sub-tree.
-                for (0..count) |i| {
-                    if (node.children_nodes[i]) |sub| releaseNode(sub);
-                }
-                freeEntries(node.children_entries, count);
-                freeNodePtrs(node.children_nodes, count);
-            }
-            NodePool.destroy(mut);
-        }
-
-        /// Codegen-side deep-release entry point. Invoked by
-        /// `ArcRuntime.releaseArcAny` when the Zap-emitted release path
-        /// dispatches on a `Map(K, V)` value pointer. Mirrors `release`
-        /// but takes the value-pointer shape that codegen produces.
         pub fn arcReleaseDeep(allocator: std.mem.Allocator, ptr: *const Self) void {
             _ = allocator;
             release(@as(?*const Self, ptr));
         }
 
-        fn makeFlatMap(entries: [*]const MapEntry, count: u32) ?*const Self {
-            const cell = allocMap() orelse return null;
-            cell.* = .{
-                .header = ArcHeader.init(),
-                .total_count = count,
-                .repr_tag = 0,
-                .flat_entries = entries,
-                .flat_count = count,
-                .trie_root = null,
-            };
-            if (comptime instrument_map) {
-                mapInstrumentationOnAlloc(@intFromPtr(cell), count, @returnAddress());
+        // -------------------------------------------------------------------
+        // Clone helpers (deep-retain-children vs move-children)
+        // -------------------------------------------------------------------
+
+        fn cloneBufferRetainingChildren(self: *const Self, new_capacity: u32, creation_callsite: u64) ?*Self {
+            std.debug.assert(std.math.isPowerOfTwo(new_capacity));
+            std.debug.assert(new_capacity >= self.len);
+            const fresh = bufferAlloc(new_capacity, self.hash_seed, creation_callsite) orelse return null;
+
+            const old_entries = self.entriesPtr();
+            const new_entries = fresh.entriesPtr();
+            for (0..self.len) |i| {
+                new_entries[i] = old_entries[i];
+                retainEntryKey(new_entries[i].key);
+                retainEntryValue(new_entries[i].value);
             }
-            return cell;
-        }
+            fresh.len = self.len;
 
-        fn makeTrieMap(root: *const HamtNode, total: u32) ?*const Self {
-            const cell = allocMap() orelse return null;
-            cell.* = .{
-                .header = ArcHeader.init(),
-                .total_count = total,
-                .repr_tag = 1,
-                .flat_entries = undefined,
-                .flat_count = 0,
-                .trie_root = root,
-            };
-            if (comptime instrument_map) {
-                mapInstrumentationOnAlloc(@intFromPtr(cell), total, @returnAddress());
-            }
-            return cell;
-        }
-
-        // === HAMT internal operations ===
-
-        /// Get the index into the bitmap for a given hash at a given depth.
-        fn sparseIndex(bitmap: u32, bit: u32) u5 {
-            return @intCast(@popCount(bitmap & (bit - 1)));
-        }
-
-        fn hamtGet(node: *const HamtNode, key: K, hash: u32, depth: u8) ?V {
-            // Collision-bucket node: hash bits at this depth or
-            // beyond can no longer differentiate keys, so we walk
-            // the flat entry list and compare by `keysEqual`.
-            if (node.is_collision) {
-                const total: usize = @intCast(node.child_count);
-                for (0..total) |i| {
-                    const e = node.children_entries[i];
-                    if (keysEqual(e.key, key)) return e.value;
+            if (new_capacity == self.capacity) {
+                const old_buckets = self.bucketsPtr();
+                const new_buckets = fresh.bucketsPtr();
+                for (0..self.capacity) |i| {
+                    new_buckets[i] = old_buckets[i];
                 }
-                return null;
-            }
-            // `depth * BITS_PER_LEVEL` may exceed `u5`'s range during
-            // a transient recursive descent past the collision guard
-            // (the guard at `MAX_DEPTH - 1` only prevents creating
-            // *new* deeper sub-nodes; it does not prevent walking
-            // through a sub-node already created at the threshold
-            // depth). Promote `depth` to `u8` and narrow only at the
-            // shift site so the multiply fits.
-            const shift: u5 = @intCast(depth * BITS_PER_LEVEL);
-            const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
-
-            if (node.bitmap & bit == 0) return null;
-
-            const idx = sparseIndex(node.bitmap, bit);
-            if (node.children_nodes[idx]) |sub| {
-                // Recurse into sub-node
-                return hamtGet(sub, key, hash, depth + 1);
             } else {
-                // Leaf entry
-                const entry = node.children_entries[idx];
-                return if (keysEqual(entry.key, key)) entry.value else null;
+                fresh.rebucketAll();
+            }
+            return fresh;
+        }
+
+        fn cloneBufferMovingChildren(self: *const Self, new_capacity: u32, creation_callsite: u64) ?*Self {
+            std.debug.assert(std.math.isPowerOfTwo(new_capacity));
+            std.debug.assert(new_capacity >= self.len);
+            const fresh = bufferAlloc(new_capacity, self.hash_seed, creation_callsite) orelse return null;
+
+            const old_entries = self.entriesPtr();
+            const new_entries = fresh.entriesPtr();
+            for (0..self.len) |i| {
+                new_entries[i] = old_entries[i];
+            }
+            fresh.len = self.len;
+
+            if (new_capacity == self.capacity) {
+                const old_buckets = self.bucketsPtr();
+                const new_buckets = fresh.bucketsPtr();
+                for (0..self.capacity) |i| {
+                    new_buckets[i] = old_buckets[i];
+                }
+            } else {
+                fresh.rebucketAll();
+            }
+            return fresh;
+        }
+
+        fn rebucketAll(self: *Self) void {
+            const len = self.len;
+            for (0..len) |i| {
+                const entry_idx: u32 = @intCast(i);
+                const entry = self.entryAt(entry_idx);
+                self.installBucket(entry.hash, entry_idx);
             }
         }
 
-        fn hamtPut(node: *const HamtNode, key: K, value: V, hash: u32, depth: u8) ?*const HamtNode {
-            // Collision-bucket node: append or update via linear scan.
-            if (node.is_collision) {
-                const total: usize = @intCast(node.child_count);
-                // Update existing entry if present.
-                for (0..total) |i| {
-                    if (keysEqual(node.children_entries[i].key, key)) {
-                        const new_entries = allocEntries(total) orelse return null;
-                        @memcpy(new_entries[0..total], node.children_entries[0..total]);
-                        new_entries[i] = .{ .key = key, .value = value };
-                        const new_node = allocHamtNode() orelse return null;
-                        new_node.* = .{
-                            .header = ArcHeader.init(),
-                            .bitmap = 0,
-                            .children_entries = new_entries,
-                            .children_nodes = undefined,
-                            .child_count = node.child_count,
-                            .is_collision = true,
-                        };
-                        return new_node;
-                    }
-                }
-                // Append new entry.
-                const new_count = total + 1;
-                const new_entries = allocEntries(new_count) orelse return null;
-                if (total > 0) {
-                    @memcpy(new_entries[0..total], node.children_entries[0..total]);
-                }
-                new_entries[total] = .{ .key = key, .value = value };
-                const new_node = allocHamtNode() orelse return null;
-                new_node.* = .{
-                    .header = ArcHeader.init(),
-                    .bitmap = 0,
-                    .children_entries = new_entries,
-                    .children_nodes = undefined,
-                    .child_count = @intCast(new_count),
-                    .is_collision = true,
-                };
-                return new_node;
-            }
-            const shift: u5 = @intCast(depth * BITS_PER_LEVEL);
-            const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
-            const idx = sparseIndex(node.bitmap, bit);
+        // -------------------------------------------------------------------
+        // Hash / probe helpers
+        // -------------------------------------------------------------------
 
-            if (node.bitmap & bit == 0) {
-                // Empty slot — insert new leaf. Sibling sub-nodes copied
-                // from the old node are aliased into the new spine, so
-                // each must be retain'd; the old node will release them
-                // when it eventually drops.
-                const old_count: usize = @intCast(node.child_count);
-                const new_count = old_count + 1;
-                const new_entries = allocEntries(new_count) orelse return null;
-                const new_nodes = allocNodePtrs(new_count) orelse return null;
-                const new_node = allocHamtNode() orelse return null;
-
-                // Copy entries before idx
-                if (idx > 0) {
-                    @memcpy(new_entries[0..idx], node.children_entries[0..idx]);
-                    @memcpy(new_nodes[0..idx], node.children_nodes[0..idx]);
-                    for (0..idx) |i| {
-                        if (new_nodes[i]) |sub| retainNode(sub);
-                    }
-                }
-                // Insert new leaf at idx
-                new_entries[idx] = .{ .key = key, .value = value };
-                new_nodes[idx] = null; // leaf
-                // Copy entries after idx
-                const after = old_count - idx;
-                if (after > 0) {
-                    @memcpy(new_entries[idx + 1 ..][0..after], node.children_entries[idx..][0..after]);
-                    @memcpy(new_nodes[idx + 1 ..][0..after], node.children_nodes[idx..][0..after]);
-                    for (0..after) |i| {
-                        if (new_nodes[idx + 1 + i]) |sub| retainNode(sub);
-                    }
-                }
-
-                new_node.* = .{
-                    .header = ArcHeader.init(),
-                    .bitmap = node.bitmap | bit,
-                    .children_entries = new_entries,
-                    .children_nodes = new_nodes,
-                    .child_count = @intCast(new_count),
-                };
-                return new_node;
-            }
-
-            if (node.children_nodes[idx]) |sub| {
-                // Recurse into existing sub-node. `updated_sub` is a
-                // brand-new node owned by us with refcount=1; it
-                // replaces `sub` at index `idx` of the new spine, so
-                // `copyNodeWithUpdatedChild` must NOT retain it (the
-                // returned ownership is already fresh).
-                const updated_sub = hamtPut(sub, key, value, hash, depth + 1) orelse return null;
-                return copyNodeWithUpdatedChild(node, idx, null, updated_sub);
-            }
-
-            // Existing leaf at this slot
-            const existing = node.children_entries[idx];
-            if (keysEqual(existing.key, key)) {
-                // Update value
-                return copyNodeWithUpdatedEntry(node, idx, .{ .key = key, .value = value });
-            }
-
-            // Hash collision at this depth — create sub-node.
-            if (depth >= MAX_DEPTH - 1) {
-                // Hash bits exhausted: build a collision-bucket
-                // sub-node holding both entries as a flat list. The
-                // previous code replaced the existing entry here,
-                // silently dropping data when two keys shared every
-                // 5-bit chunk of their 32-bit hash.
-                const collision_entries = allocEntries(2) orelse return null;
-                collision_entries[0] = existing;
-                collision_entries[1] = .{ .key = key, .value = value };
-                const collision_sub = allocHamtNode() orelse return null;
-                collision_sub.* = .{
-                    .header = ArcHeader.init(),
-                    .bitmap = 0,
-                    .children_entries = collision_entries,
-                    .children_nodes = undefined,
-                    .child_count = 2,
-                    .is_collision = true,
-                };
-                return copyNodeWithUpdatedChild(node, idx, null, collision_sub);
-            }
-
-            // Create a new sub-node containing both the existing and new entries.
-            // `initial_sub` is a fresh refcount=1 node consumed by the first
-            // hamtPut, which releases its input on the recursive copy path
-            // (because we own the only reference). We must mirror that
-            // ownership — the intermediate `sub_with_existing` is consumed
-            // by the second hamtPut. To avoid double-release, we explicitly
-            // release the intermediate nodes that hamtPut leaves behind.
-            const existing_hash = hashKey(existing.key);
-            const initial_sub = allocHamtNode() orelse return null;
-            initial_sub.* = .{
-                .header = ArcHeader.init(),
-                .bitmap = 0,
-                .children_entries = undefined,
-                .children_nodes = undefined,
-                .child_count = 0,
-            };
-            const sub_with_existing = hamtPut(initial_sub, existing.key, existing.value, existing_hash, depth + 1) orelse {
-                releaseNode(initial_sub);
-                return null;
-            };
-            // The first hamtPut produced a new node referencing 0 children
-            // (initial_sub had child_count=0); initial_sub itself is no
-            // longer referenced by anyone except us. Release it.
-            releaseNode(initial_sub);
-            const sub_with_both = hamtPut(sub_with_existing, key, value, hash, depth + 1) orelse {
-                releaseNode(sub_with_existing);
-                return null;
-            };
-            // sub_with_existing was the input to the second put; that put
-            // built a new node carrying retain'd references to whatever
-            // children sub_with_existing held. sub_with_existing is now
-            // dropped from our hand.
-            releaseNode(sub_with_existing);
-            return copyNodeWithUpdatedChild(node, idx, null, sub_with_both);
+        inline fn hashKey(self: *const Self, key: K) u64 {
+            if (K == Term) return hashTerm(self.hash_seed, key);
+            return Wyhash.hash(self.hash_seed, key);
         }
 
-        fn hamtDelete(node: *const HamtNode, key: K, hash: u32, depth: u8) ?*const HamtNode {
-            // Collision-bucket: drop the matching entry by linear scan.
-            if (node.is_collision) {
-                const total: usize = @intCast(node.child_count);
-                var hit: ?usize = null;
-                for (0..total) |i| {
-                    if (keysEqual(node.children_entries[i].key, key)) {
-                        hit = i;
-                        break;
-                    }
-                }
-                const drop = hit orelse {
-                    // Not found — return the existing node with its
-                    // refcount unchanged from the caller's perspective.
-                    // The caller treats the result the same whether it's
-                    // a fresh node or a re-used pointer; downstream
-                    // copyNodeWithUpdatedChild retains it as appropriate.
-                    retainNode(node);
-                    return node;
-                };
-                if (total <= 1) {
-                    // Bucket emptied — caller will remove the whole sub-node.
-                    const empty_node = allocHamtNode() orelse return null;
-                    empty_node.* = .{
-                        .header = ArcHeader.init(),
-                        .bitmap = 0,
-                        .children_entries = undefined,
-                        .children_nodes = undefined,
-                        .child_count = 0,
-                        .is_collision = true,
-                    };
-                    return empty_node;
-                }
-                const new_count = total - 1;
-                const new_entries = allocEntries(new_count) orelse return null;
-                if (drop > 0) @memcpy(new_entries[0..drop], node.children_entries[0..drop]);
-                if (drop < new_count) @memcpy(new_entries[drop..new_count], node.children_entries[drop + 1 .. total]);
-                const new_node = allocHamtNode() orelse return null;
-                new_node.* = .{
-                    .header = ArcHeader.init(),
-                    .bitmap = 0,
-                    .children_entries = new_entries,
-                    .children_nodes = undefined,
-                    .child_count = @intCast(new_count),
-                    .is_collision = true,
-                };
-                return new_node;
-            }
-            const shift: u5 = @intCast(depth * BITS_PER_LEVEL);
-            const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
-
-            if (node.bitmap & bit == 0) {
-                retainNode(node);
-                return node; // not found
-            }
-
-            const idx = sparseIndex(node.bitmap, bit);
-
-            if (node.children_nodes[idx]) |sub| {
-                const updated = hamtDelete(sub, key, hash, depth + 1) orelse return null;
-                if (updated.child_count == 0) {
-                    // Drop the empty sub-node we just produced; the
-                    // returned node won't reference it.
-                    releaseNode(updated);
-                    return removeChildFromNode(node, idx, bit);
-                }
-                return copyNodeWithUpdatedChild(node, idx, null, updated);
-            }
-
-            // Leaf
-            const existing = node.children_entries[idx];
-            if (!keysEqual(existing.key, key)) {
-                retainNode(node);
-                return node; // not found
-            }
-            return removeChildFromNode(node, idx, bit);
+        inline fn initialProbe(h: u64) u32 {
+            const fp: u32 = @intCast(h >> 56);
+            return DENSE_MAP_DIST_INC | fp;
         }
 
-        fn copyNodeWithUpdatedEntry(node: *const HamtNode, idx: usize, entry: MapEntry) ?*const HamtNode {
-            const count: usize = @intCast(node.child_count);
-            const new_entries = allocEntries(count) orelse return null;
-            const new_nodes = allocNodePtrs(count) orelse return null;
-            const new_node = allocHamtNode() orelse return null;
-
-            @memcpy(new_entries[0..count], node.children_entries[0..count]);
-            @memcpy(new_nodes[0..count], node.children_nodes[0..count]);
-            new_entries[idx] = entry;
-            // All sibling sub-nodes (every slot of new_nodes) are now
-            // aliased between the old and new spine. Bump their refcount
-            // so the eventual release of the old spine doesn't free them
-            // while the new spine is still alive.
-            for (0..count) |i| {
-                if (new_nodes[i]) |sub| retainNode(sub);
-            }
-
-            new_node.* = .{
-                .header = ArcHeader.init(),
-                .bitmap = node.bitmap,
-                .children_entries = new_entries,
-                .children_nodes = new_nodes,
-                .child_count = node.child_count,
-            };
-            return new_node;
+        inline fn homeSlot(self: *const Self, h: u64) u32 {
+            const mask: u32 = self.capacity - 1;
+            return @as(u32, @truncate(h)) & mask;
         }
 
-        /// Build a path-copied node where slot `idx` is replaced by
-        /// `sub`. Caller owns `sub` (one fresh reference) and that
-        /// reference transfers into the new node — sub is NOT retained
-        /// here. Sibling sub-nodes at every other slot are retained
-        /// because they are aliased into the new spine.
-        fn copyNodeWithUpdatedChild(node: *const HamtNode, idx: usize, entry: ?MapEntry, sub: *const HamtNode) ?*const HamtNode {
-            const count: usize = @intCast(node.child_count);
-            const new_entries = allocEntries(count) orelse return null;
-            const new_nodes = allocNodePtrs(count) orelse return null;
-            const new_node = allocHamtNode() orelse return null;
-
-            @memcpy(new_entries[0..count], node.children_entries[0..count]);
-            @memcpy(new_nodes[0..count], node.children_nodes[0..count]);
-            // Retain all aliased siblings (every slot except idx, which
-            // is about to be overwritten with our owned `sub`). This
-            // must happen BEFORE we overwrite slot idx — otherwise the
-            // pointer at idx could be retained then leaked.
-            for (0..count) |i| {
-                if (i == idx) continue;
-                if (new_nodes[i]) |sibling_sub| retainNode(sibling_sub);
-            }
-            if (entry) |e| new_entries[idx] = e;
-            new_nodes[idx] = sub;
-
-            new_node.* = .{
-                .header = ArcHeader.init(),
-                .bitmap = node.bitmap,
-                .children_entries = new_entries,
-                .children_nodes = new_nodes,
-                .child_count = node.child_count,
-            };
-            return new_node;
+        inline fn nextSlot(self: *const Self, slot: u32) u32 {
+            const mask: u32 = self.capacity - 1;
+            return (slot + 1) & mask;
         }
 
-        fn removeChildFromNode(node: *const HamtNode, idx: usize, bit: u32) ?*const HamtNode {
-            const old_count: usize = @intCast(node.child_count);
-            if (old_count <= 1) {
-                const empty_node = allocHamtNode() orelse return null;
-                empty_node.* = .{
-                    .header = ArcHeader.init(),
-                    .bitmap = 0,
-                    .children_entries = undefined,
-                    .children_nodes = undefined,
-                    .child_count = 0,
-                };
-                return empty_node;
-            }
-            const new_count = old_count - 1;
-            const new_entries = allocEntries(new_count) orelse return null;
-            const new_nodes = allocNodePtrs(new_count) orelse return null;
-            const new_node = allocHamtNode() orelse return null;
+        // -------------------------------------------------------------------
+        // Lookup
+        // -------------------------------------------------------------------
 
-            var dst: usize = 0;
-            for (0..old_count) |i| {
-                if (i != idx) {
-                    new_entries[dst] = node.children_entries[i];
-                    new_nodes[dst] = node.children_nodes[i];
-                    if (new_nodes[dst]) |sub| retainNode(sub);
-                    dst += 1;
+        fn findEntry(map: ?*const Self, key: K) ?u32 {
+            const self = map orelse return null;
+            if (self.len == 0) return null;
+            const h = self.hashKey(key);
+            var probe = initialProbe(h);
+            var slot = self.homeSlot(h);
+            const buckets = self.bucketsPtr();
+            const entries = self.entriesPtr();
+            while (true) {
+                const b = buckets[slot];
+                if (b.dist_and_fingerprint == DENSE_MAP_EMPTY) return null;
+                if (b.dist_and_fingerprint < probe) return null;
+                if (b.dist_and_fingerprint == probe) {
+                    const e = &entries[b.entry_idx];
+                    if (e.hash == h and keysEqual(e.key, key)) return b.entry_idx;
                 }
-            }
-
-            new_node.* = .{
-                .header = ArcHeader.init(),
-                .bitmap = node.bitmap & ~bit,
-                .children_entries = new_entries,
-                .children_nodes = new_nodes,
-                .child_count = @intCast(new_count),
-            };
-            return new_node;
-        }
-
-        /// Collect all entries from a HAMT trie into a flat list.
-        /// Caller is responsible for freeing the result via the same
-        /// allocator passed in (`entriesAllocator()` for the canonical
-        /// path). Using `c_allocator` here mirrors the entries / nodes
-        /// buffers — small allocations with proper free semantics.
-        fn hamtCollect(node: *const HamtNode, result: *std.ArrayListUnmanaged(MapEntry)) void {
-            const count: usize = @intCast(node.child_count);
-            // Collision-bucket nodes hold every entry inline; no
-            // sub-nodes to recurse into.
-            if (node.is_collision) {
-                for (0..count) |i| {
-                    result.append(entriesAllocator(), node.children_entries[i]) catch {};
-                }
-                return;
-            }
-            for (0..count) |i| {
-                if (node.children_nodes[i]) |sub| {
-                    hamtCollect(sub, result);
-                } else {
-                    // Use a fixed-size buffer approach since we can't return errors
-                    result.append(entriesAllocator(), node.children_entries[i]) catch {};
-                }
+                probe += DENSE_MAP_DIST_INC;
+                slot = self.nextSlot(slot);
             }
         }
 
-        /// Convert flat entries to a HAMT trie. Each iteration creates a
-        /// fresh root referenced once by `root`; the previous root must
-        /// be released so it doesn't leak.
-        fn flatToTrie(entries: [*]const MapEntry, count: u32) ?*const HamtNode {
-            const initial = allocHamtNode() orelse return null;
-            initial.* = .{
-                .header = ArcHeader.init(),
-                .bitmap = 0,
-                .children_entries = undefined,
-                .children_nodes = undefined,
-                .child_count = 0,
-            };
-
-            var root: *const HamtNode = initial;
-            for (0..count) |i| {
-                const entry = entries[i];
-                const hash = hashKey(entry.key);
-                const next_root = hamtPut(root, entry.key, entry.value, hash, 0) orelse {
-                    releaseNode(root);
-                    return null;
-                };
-                releaseNode(root);
-                root = next_root;
+        pub fn hasKey(map: ?*const Self, key: K) bool {
+            if (map) |m| {
+                if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
             }
-            return root;
-        }
-
-        // === Public API (unchanged signatures) ===
-
-        pub fn empty() ?*const Self {
-            return null;
-        }
-
-        pub fn fromPairs(key_ids: []const K, vals: []const V, count: u32) ?*const Self {
-            if (count == 0) return null;
-            const n: usize = @intCast(count);
-            const entry_arr = allocEntries(n) orelse return null;
-            for (0..n) |i| {
-                entry_arr[i] = .{ .key = key_ids[i], .value = vals[i] };
-            }
-
-            if (count <= FLAT_THRESHOLD) {
-                return makeFlatMap(entry_arr, count);
-            }
-            // Build HAMT from entries
-            const root = flatToTrie(entry_arr, count) orelse return makeFlatMap(entry_arr, count);
-            return makeTrieMap(root, count);
+            return findEntry(map, key) != null;
         }
 
         pub fn get(map: ?*const Self, key: K, default: V) V {
             if (map) |m| {
                 if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
-                if (m.repr_tag == 0) {
-                    // Flat: linear scan
-                    for (m.flat_entries[0..m.flat_count]) |entry| {
-                        if (keysEqual(entry.key, key)) return entry.value;
-                    }
-                } else {
-                    // Trie: hash lookup
-                    if (m.trie_root) |root| {
-                        const hash = hashKey(key);
-                        return hamtGet(root, key, hash, 0) orelse default;
-                    }
-                }
             }
-            return default;
+            const self = map orelse return default;
+            const idx = findEntry(self, key) orelse return default;
+            return self.entryAtConst(idx).value;
         }
 
+        /// Vestigial helper kept for HAMT-era callers that hardcoded a
+        /// `[]const u8` default into the result. The legacy implementation
+        /// always returned the default; we preserve the behaviour.
         pub fn getStr(map: ?*const Self, key: K, default: []const u8) []const u8 {
             _ = key;
             if (map) |m| {
@@ -4826,52 +4509,18 @@ pub fn Map(comptime K: type, comptime V: type) type {
             return default;
         }
 
-        pub fn hasKey(map: ?*const Self, key: K) bool {
-            if (map) |m| {
-                if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
-                if (m.repr_tag == 0) {
-                    for (m.flat_entries[0..m.flat_count]) |entry| {
-                        if (keysEqual(entry.key, key)) return true;
-                    }
-                } else {
-                    if (m.trie_root) |root| {
-                        const hash = hashKey(key);
-                        return hamtGet(root, key, hash, 0) != null;
-                    }
-                }
-            }
-            return false;
-        }
+        // -------------------------------------------------------------------
+        // Insert
+        // -------------------------------------------------------------------
 
-        pub fn size(map: ?*const Self) i64 {
-            if (map) |m| {
-                if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
-                return @intCast(m.total_count);
-            }
-            return 0;
-        }
-
-        pub fn isEmpty(map: ?*const Self) bool {
-            return map == null;
-        }
-
-        /// `put` and `delete` are non-consuming on the input map. The
-        /// caller's reference remains live with refcount unchanged; the
-        /// returned map (a fresh cell when allocated) carries refcount 1
-        /// and any shared trie subtrees are retain'd along the path-copy
-        /// spine inside hamtPut / copyNodeWithUpdatedChild. When the
-        /// returned `?*const Self` is the same pointer as the input
-        /// (no-change cases like updating absent keys), the caller's
-        /// existing reference IS retained — codegen treats the return
-        /// value as a fresh ownership and would double-release without
-        /// the bump.
         pub fn put(map: ?*const Self, key: K, value: V) ?*const Self {
+            const callsite = @returnAddress();
             if (comptime instrument_map) {
                 if (map) |m| {
                     const ctx = mapInstrumentationBumpMutation(@intFromPtr(m), .put);
                     mapInstrumentationSetParent(ctx.lineage_id, ctx.instance_id);
                     defer mapInstrumentationClearParent();
-                    const result = putInner(map, key, value);
+                    const result = putInner(map, key, value, callsite);
                     if (ctx.had_share_event) {
                         if (result) |r| {
                             if (@intFromPtr(r) != @intFromPtr(m)) {
@@ -4882,96 +4531,76 @@ pub fn Map(comptime K: type, comptime V: type) type {
                     return result;
                 }
             }
-            return putInner(map, key, value);
+            return putInner(map, key, value, callsite);
         }
 
-        fn putInner(map: ?*const Self, key: K, value: V) ?*const Self {
+        fn putInner(map: ?*const Self, key: K, value: V, callsite: u64) ?*const Self {
             if (map == null) {
-                // Create new single-entry flat map
-                const entries = allocEntries(1) orelse return null;
-                entries[0] = .{ .key = key, .value = value };
-                return makeFlatMap(entries, 1);
+                const fresh = bufferAlloc(DENSE_MAP_INITIAL_CAPACITY, Wyhash.nextSeed(), callsite) orelse return null;
+                _ = putInPlaceInsert(fresh, key, value);
+                return fresh;
             }
+            const self = map.?;
 
-            const m = map.?;
-
-            if (m.repr_tag == 0) {
-                // Currently flat
-                const old_count: usize = @intCast(m.flat_count);
-
-                // Check if key exists (update)
-                for (0..old_count) |i| {
-                    if (keysEqual(m.flat_entries[i].key, key)) {
-                        // Update existing key — copy and replace
-                        const new_entries = allocEntries(old_count) orelse {
-                            retainNode_or_self_for_unchanged_return(map);
-                            return map;
-                        };
-                        for (0..old_count) |j| {
-                            new_entries[j] = if (j == i) MapEntry{ .key = key, .value = value } else m.flat_entries[j];
-                        }
-                        if (old_count <= FLAT_THRESHOLD) {
-                            return makeFlatMap(new_entries, m.flat_count);
-                        }
-                        const root = flatToTrie(new_entries, m.flat_count) orelse {
-                            // flatToTrie failed; fall back to flat. Reuse
-                            // the entries buffer.
-                            return makeFlatMap(new_entries, m.flat_count);
-                        };
-                        // Trie now owns the entry data via leaf nodes;
-                        // free the transient flat buffer.
-                        freeEntries(new_entries, m.flat_count);
-                        return makeTrieMap(root, m.flat_count);
-                    }
-                }
-
-                // New key — append
-                const new_count: u32 = m.flat_count + 1;
-                const new_entries = allocEntries(old_count + 1) orelse {
-                    retainNode_or_self_for_unchanged_return(map);
-                    return map;
-                };
-                for (0..old_count) |i| {
-                    new_entries[i] = m.flat_entries[i];
-                }
-                new_entries[old_count] = .{ .key = key, .value = value };
-
-                if (new_count <= FLAT_THRESHOLD) {
-                    return makeFlatMap(new_entries, new_count);
-                }
-                // Promote to trie
-                const root = flatToTrie(new_entries, new_count) orelse {
-                    return makeFlatMap(new_entries, new_count);
-                };
-                freeEntries(new_entries, new_count);
-                return makeTrieMap(root, new_count);
-            }
-
-            // Trie mode
-            if (m.trie_root) |root| {
-                const hash = hashKey(key);
-                const was_present = hamtGet(root, key, hash, 0) != null;
-                const new_root = hamtPut(root, key, value, hash, 0) orelse {
-                    retainNode_or_self_for_unchanged_return(map);
-                    return map;
-                };
-                if (comptime instrument_map) {
-                    mapInstrumentationNoteNodeClone(@intFromPtr(m));
-                }
-                const new_total = if (was_present) m.total_count else m.total_count + 1;
-                return makeTrieMap(new_root, new_total);
-            }
-            retainNode_or_self_for_unchanged_return(map);
-            return map;
+            // Phase 1 contract: `put` always returns a freshly-allocated
+            // cell with rc=1. The dense buffer's rc-1 fast path lands in
+            // Phase 4 alongside the codegen's `_owned`/`_borrowed`
+            // intrinsic split (see `docs/dense-map-implementation-plan.md`
+            // §1.6). The Phase 1 build keeps the caller-side ABI identical
+            // to the legacy HAMT — every caller treats the returned
+            // `?*const Self` as a new ownership and matches it with a
+            // single release; no caller relies on identity-return for
+            // refcount accounting. Allocating a fresh cell on every
+            // mutation preserves that contract.
+            const target_cap = pickCapacity(self.capacity, self.len + 1);
+            const clone = cloneBufferRetainingChildren(self, target_cap, callsite) orelse return null;
+            return putInPlace(clone, key, value, callsite);
         }
+
+        fn putInPlace(target: *Self, key: K, value: V, callsite: u64) ?*const Self {
+            if (findEntry(target, key)) |existing_idx| {
+                const allocator = std.heap.c_allocator;
+                const entry = target.entryAt(existing_idx);
+                releaseEntryValue(entry.value, allocator);
+                entry.value = value;
+                releaseEntryKey(key, allocator);
+                return target;
+            }
+
+            const old_cap = target.capacity;
+            const new_cap = pickCapacity(old_cap, target.len + 1);
+            var dest: *Self = target;
+            if (new_cap != old_cap) {
+                dest = cloneBufferMovingChildren(target, new_cap, callsite) orelse return null;
+                target.bufferFreeShallow();
+            }
+            _ = putInPlaceInsert(dest, key, value);
+            return dest;
+        }
+
+        fn putInPlaceInsert(dest: *Self, key: K, value: V) *Self {
+            const h = dest.hashKey(key);
+            const new_idx: u32 = dest.len;
+            std.debug.assert(new_idx < dest.entry_cap);
+            const entries = dest.entriesPtr();
+            entries[new_idx] = .{ .hash = h, .key = key, .value = value };
+            dest.len = new_idx + 1;
+            dest.installBucket(h, new_idx);
+            return dest;
+        }
+
+        // -------------------------------------------------------------------
+        // Delete (swap-remove + Robin Hood backshift)
+        // -------------------------------------------------------------------
 
         pub fn delete(map: ?*const Self, key: K) ?*const Self {
+            const callsite = @returnAddress();
             if (comptime instrument_map) {
                 if (map) |m| {
                     const ctx = mapInstrumentationBumpMutation(@intFromPtr(m), .delete);
                     mapInstrumentationSetParent(ctx.lineage_id, ctx.instance_id);
                     defer mapInstrumentationClearParent();
-                    const result = deleteInner(map, key);
+                    const result = deleteInner(map, key, callsite);
                     if (ctx.had_share_event) {
                         if (result) |r| {
                             if (@intFromPtr(r) != @intFromPtr(m)) {
@@ -4984,259 +4613,351 @@ pub fn Map(comptime K: type, comptime V: type) type {
                     return result;
                 }
             }
-            return deleteInner(map, key);
+            return deleteInner(map, key, callsite);
         }
 
-        fn deleteInner(map: ?*const Self, key: K) ?*const Self {
-            if (map == null) return null;
-            const m = map.?;
+        fn deleteInner(map: ?*const Self, key: K, callsite: u64) ?*const Self {
+            const self = map orelse return null;
 
-            if (m.repr_tag == 0) {
-                // Flat mode
-                var found = false;
-                for (m.flat_entries[0..m.flat_count]) |entry| {
-                    if (keysEqual(entry.key, key)) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    retainNode_or_self_for_unchanged_return(map);
-                    return map;
-                }
+            // Phase 1 contract: `delete` always returns a freshly-
+            // allocated cell with rc=1 (mirrors `put`). The rc-1 fast
+            // path lands in Phase 4 alongside the codegen's intrinsic
+            // split. See the matching note in `putInner`.
+            const clone = cloneBufferRetainingChildren(self, self.capacity, callsite) orelse return null;
+            if (findEntry(clone, key)) |found_entry_idx| {
+                deleteFoundInPlace(clone, found_entry_idx);
+            }
+            return clone;
+        }
 
-                const new_count = m.flat_count - 1;
-                if (new_count == 0) return null;
+        fn deleteFoundInPlace(target: *Self, found_entry_idx: u32) void {
+            const old_len = target.len;
+            std.debug.assert(old_len > 0);
 
-                const new_entries = allocEntries(new_count) orelse {
-                    retainNode_or_self_for_unchanged_return(map);
-                    return map;
+            const target_hash = target.entryAtConst(found_entry_idx).hash;
+            const deleted_slot = target.findBucketSlotForEntry(target_hash, found_entry_idx);
+
+            const allocator = std.heap.c_allocator;
+            {
+                const removed_entry = target.entryAtConst(found_entry_idx).*;
+                releaseEntryKey(removed_entry.key, allocator);
+                releaseEntryValue(removed_entry.value, allocator);
+            }
+
+            if (found_entry_idx != old_len - 1) {
+                const tail_idx: u32 = old_len - 1;
+                const tail_entry = target.entryAt(tail_idx).*;
+
+                const tail_slot = target.findBucketSlotForEntry(tail_entry.hash, tail_idx);
+                target.bucketAt(tail_slot).entry_idx = found_entry_idx;
+
+                target.entryAt(found_entry_idx).* = tail_entry;
+            }
+
+            target.len = old_len - 1;
+
+            const buckets = target.bucketsPtr();
+            buckets[deleted_slot] = .{ .dist_and_fingerprint = DENSE_MAP_EMPTY, .entry_idx = 0 };
+            var cur = deleted_slot;
+            while (true) {
+                const nxt = target.nextSlot(cur);
+                const nxt_dnf = buckets[nxt].dist_and_fingerprint;
+                if (nxt_dnf == DENSE_MAP_EMPTY) break;
+                const nxt_dist = nxt_dnf >> 8;
+                if (nxt_dist <= 1) break;
+                const fp = nxt_dnf & DENSE_MAP_FINGERPRINT_MASK;
+                const new_dist = nxt_dist - 1;
+                buckets[cur] = .{
+                    .dist_and_fingerprint = (new_dist << 8) | fp,
+                    .entry_idx = buckets[nxt].entry_idx,
                 };
-                var dst: usize = 0;
-                for (m.flat_entries[0..m.flat_count]) |entry| {
-                    if (!keysEqual(entry.key, key)) {
-                        new_entries[dst] = entry;
-                        dst += 1;
-                    }
-                }
-                return makeFlatMap(new_entries, new_count);
+                buckets[nxt] = .{ .dist_and_fingerprint = DENSE_MAP_EMPTY, .entry_idx = 0 };
+                cur = nxt;
             }
-
-            // Trie mode
-            if (m.trie_root) |root| {
-                const hash = hashKey(key);
-                if (hamtGet(root, key, hash, 0) == null) {
-                    retainNode_or_self_for_unchanged_return(map);
-                    return map; // not found
-                }
-                const new_root = hamtDelete(root, key, hash, 0) orelse {
-                    retainNode_or_self_for_unchanged_return(map);
-                    return map;
-                };
-                if (comptime instrument_map) {
-                    mapInstrumentationNoteNodeClone(@intFromPtr(m));
-                }
-                const new_total = m.total_count - 1;
-                if (new_total == 0) {
-                    releaseNode(new_root);
-                    return null;
-                }
-                // Demote to flat if below threshold
-                if (new_total <= FLAT_THRESHOLD) {
-                    var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
-                    defer collected.deinit(entriesAllocator());
-                    hamtCollect(new_root, &collected);
-                    if (collected.items.len > 0) {
-                        const entries = allocEntries(collected.items.len) orelse {
-                            return makeTrieMap(new_root, new_total);
-                        };
-                        for (collected.items, 0..) |entry, i| {
-                            entries[i] = entry;
-                        }
-                        // Discard the trie now that entries live in the
-                        // flat representation.
-                        releaseNode(new_root);
-                        return makeFlatMap(entries, new_total);
-                    }
-                }
-                return makeTrieMap(new_root, new_total);
-            }
-            retainNode_or_self_for_unchanged_return(map);
-            return map;
         }
 
-        /// Bump the refcount of a Map cell on a no-change return path.
-        /// `put` and `delete` callers treat the return value as a fresh
-        /// owned reference, so when we hand back the same pointer we
-        /// must increment so the eventual matched release decrements
-        /// against the bumped count, not the caller's original.
-        fn retainNode_or_self_for_unchanged_return(map: ?*const Self) void {
-            _ = retain(map);
-        }
-
-        /// Iterator protocol for maps.
-        /// Returns `{:cont, {key, value}, remaining_map}` on each step or
-        /// `{:done, undefined, map}` when the map is empty. Each call removes
-        /// one entry; full iteration runs in O(n log n) for a map of n
-        /// entries. Iteration order is unspecified across runs but stable
-        /// within a single iteration on a single map value.
-        pub fn next(map: ?*const Self) struct {
-            u32,
-            struct { K, V },
-            ?*const Self,
-        } {
-            if (map == null or map.?.total_count == 0) {
-                return .{ ATOM_DONE, .{ undefined, undefined }, map };
-            }
-            const m = map.?;
-
-            const first_entry: MapEntry = if (m.repr_tag == 0)
-                m.flat_entries[0]
-            else
-                firstTrieEntry(m.trie_root.?);
-
-            const remaining = delete(map, first_entry.key);
-            return .{ ATOM_CONT, .{ first_entry.key, first_entry.value }, remaining };
-        }
-
-        /// Find the first leaf entry in a HAMT subtree by depth-first
-        /// traversal. Caller must guarantee the tree is non-empty (the
-        /// root's parent map had `total_count > 0`).
-        fn firstTrieEntry(node: *const HamtNode) MapEntry {
-            const count: usize = @intCast(node.child_count);
-            for (0..count) |i| {
-                if (node.children_nodes[i]) |sub| {
-                    return firstTrieEntry(sub);
-                } else {
-                    return node.children_entries[i];
-                }
-            }
-            unreachable;
-        }
+        // -------------------------------------------------------------------
+        // Merge
+        // -------------------------------------------------------------------
 
         pub fn merge(map_a: ?*const Self, map_b: ?*const Self) ?*const Self {
-            if (map_a == null) return map_b;
-            if (map_b == null) return map_a;
             if (comptime instrument_map) {
-                _ = mapInstrumentationBumpMutation(@intFromPtr(map_a.?), .merge);
-                _ = mapInstrumentationBumpMutation(@intFromPtr(map_b.?), .merge);
+                if (map_a) |m| _ = mapInstrumentationBumpMutation(@intFromPtr(m), .merge);
+                if (map_b) |m| _ = mapInstrumentationBumpMutation(@intFromPtr(m), .merge);
             }
-            // Apply all entries from b onto a
-            var result = map_a;
-            const b = map_b.?;
 
-            if (b.repr_tag == 0) {
-                for (b.flat_entries[0..b.flat_count]) |entry| {
-                    result = put(result, entry.key, entry.value);
-                }
-            } else {
-                // Collect trie entries and apply
-                var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
-                defer collected.deinit(entriesAllocator());
-                if (b.trie_root) |root| hamtCollect(root, &collected);
-                for (collected.items) |entry| {
-                    result = put(result, entry.key, entry.value);
+            if (map_a == null and map_b == null) return null;
+            if (map_a == null) return retain(map_b);
+            if (map_b == null) return retain(map_a);
+
+            // Both non-null: fold each entry of `b` into a result whose
+            // initial state is `a` retained. Each `put` either returns
+            // the same handle (rc-1 fast path on a unique-owner clone
+            // we just made) or a fresh clone, in which case we release
+            // the prior intermediate.
+            var result: ?*const Self = retain(map_a);
+            const b = map_b.?;
+            const b_len = b.len;
+            const b_entries = b.entriesPtr();
+            var i: u32 = 0;
+            while (i < b_len) : (i += 1) {
+                const entry = b_entries[i];
+                retainEntryKey(entry.key);
+                retainEntryValue(entry.value);
+                const next_result = put(result, entry.key, entry.value) orelse {
+                    const allocator = std.heap.c_allocator;
+                    releaseEntryKey(entry.key, allocator);
+                    releaseEntryValue(entry.value, allocator);
+                    release(result);
+                    return null;
+                };
+                if (next_result != result) {
+                    release(result);
+                    result = next_result;
                 }
             }
             return result;
         }
 
-        pub fn keys(map: ?*const Self) ?*const List(K) {
-            if (map == null) return null;
-            const m = map.?;
-
-            if (m.repr_tag == 0) {
-                var result: ?*const List(K) = null;
-                var i: usize = m.flat_count;
-                while (i > 0) {
-                    i -= 1;
-                    result = List(K).cons(m.flat_entries[i].key, result);
+        fn findBucketSlotForEntry(self: *Self, h: u64, entry_idx: u32) u32 {
+            var probe = initialProbe(h);
+            var slot = self.homeSlot(h);
+            const buckets = self.bucketsPtr();
+            while (true) {
+                const b = buckets[slot];
+                std.debug.assert(b.dist_and_fingerprint != DENSE_MAP_EMPTY);
+                std.debug.assert(b.dist_and_fingerprint >= probe);
+                if (b.dist_and_fingerprint == probe and b.entry_idx == entry_idx) {
+                    return slot;
                 }
-                return result;
+                probe += DENSE_MAP_DIST_INC;
+                slot = self.nextSlot(slot);
             }
+        }
 
-            // Trie: collect and build list
-            var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
-            defer collected.deinit(entriesAllocator());
-            if (m.trie_root) |root| hamtCollect(root, &collected);
+        fn installBucket(self: *Self, h: u64, entry_idx: u32) void {
+            var probe = initialProbe(h);
+            var slot = self.homeSlot(h);
+            var cur_entry_idx = entry_idx;
+            const buckets = self.bucketsPtr();
+            while (true) {
+                const dnf = buckets[slot].dist_and_fingerprint;
+                if (dnf == DENSE_MAP_EMPTY) {
+                    buckets[slot] = .{ .dist_and_fingerprint = probe, .entry_idx = cur_entry_idx };
+                    return;
+                }
+                if (dnf < probe) {
+                    const displaced = buckets[slot];
+                    buckets[slot] = .{ .dist_and_fingerprint = probe, .entry_idx = cur_entry_idx };
+                    probe = displaced.dist_and_fingerprint;
+                    cur_entry_idx = displaced.entry_idx;
+                }
+                probe += DENSE_MAP_DIST_INC;
+                slot = self.nextSlot(slot);
+            }
+        }
+
+        fn pickCapacity(old_cap: u32, target_len: u32) u32 {
+            var cap: u32 = if (old_cap == 0) DENSE_MAP_INITIAL_CAPACITY else old_cap;
+            while (target_len * DENSE_MAP_LOAD_DEN > cap * DENSE_MAP_LOAD_NUM) {
+                cap *= 2;
+            }
+            return cap;
+        }
+
+        // -------------------------------------------------------------------
+        // Key equality / Term hashing
+        // -------------------------------------------------------------------
+
+        inline fn keysEqual(a: K, b: K) bool {
+            if (K == Term) return Term.eql(a, b);
+            const ti = @typeInfo(K);
+            return switch (ti) {
+                .int, .comptime_int, .bool => a == b,
+                .pointer => |p| if (p.size == .slice and p.child == u8)
+                    std.mem.eql(u8, a, b)
+                else
+                    a == b,
+                else => @compileError("Map: unsupported key type " ++ @typeName(K)),
+            };
+        }
+
+        fn hashTerm(seed: u64, t: Term) u64 {
+            return switch (t) {
+                .int => |v| Wyhash.hashU64(seed, @bitCast(v)),
+                .float => |v| Wyhash.hashU64(seed, @bitCast(v)),
+                .str => |v| Wyhash.hashBytes(seed, v),
+                .bool_val => |v| Wyhash.hashU32(seed, if (v) 1 else 0),
+                .atom => |v| Wyhash.hashU32(seed, v),
+                .nil => Wyhash.hashU64(seed, 0),
+                .list => |v| Wyhash.hashU64(seed, @intFromPtr(v)),
+                .map => |v| Wyhash.hashU64(seed, @intFromPtr(v)),
+                .tuple => |elems| blk: {
+                    var h: u64 = seed;
+                    for (elems) |elem| {
+                        h ^= hashTerm(h, elem);
+                    }
+                    break :blk h;
+                },
+            };
+        }
+
+        // -------------------------------------------------------------------
+        // ARC child walkers
+        // -------------------------------------------------------------------
+
+        inline fn releaseEntryKey(key: K, allocator: std.mem.Allocator) void {
+            releaseAnyShape(K, key, allocator);
+        }
+
+        inline fn releaseEntryValue(value: V, allocator: std.mem.Allocator) void {
+            releaseAnyShape(V, value, allocator);
+        }
+
+        inline fn retainEntryKey(key: K) void {
+            retainAnyShape(K, key);
+        }
+
+        inline fn retainEntryValue(value: V) void {
+            retainAnyShape(V, value);
+        }
+
+        fn releaseAnyShape(comptime T: type, value: T, allocator: std.mem.Allocator) void {
+            switch (@typeInfo(T)) {
+                .optional => |opt| {
+                    if (value) |inner| releaseAnyShape(opt.child, inner, allocator);
+                },
+                .pointer => |p| {
+                    if (p.size == .one) {
+                        ArcRuntime.releaseArcAny(p.child, allocator, @constCast(value));
+                    }
+                },
+                .@"struct" => {
+                    ArcRuntime.releaseChildrenAny(T, allocator, value);
+                },
+                else => {},
+            }
+        }
+
+        fn retainAnyShape(comptime T: type, value: T) void {
+            switch (@typeInfo(T)) {
+                .optional => |opt| {
+                    if (value) |inner| retainAnyShape(opt.child, inner);
+                },
+                .pointer => |p| {
+                    if (p.size == .one) {
+                        ArcRuntime.retainAnyPersistent(@as(*const p.child, @constCast(value)));
+                    }
+                },
+                .@"struct" => {
+                    ArcRuntime.retainChildrenAny(T, value);
+                },
+                else => {},
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Iteration API
+        // -------------------------------------------------------------------
+
+        pub fn keys(map: ?*const Self) ?*const List(K) {
+            const self = map orelse return null;
+            if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(self));
+            const len = self.len;
+            if (len == 0) return null;
+            const entries = self.entriesPtr();
             var result: ?*const List(K) = null;
-            var i: usize = collected.items.len;
+            var i: usize = len;
             while (i > 0) {
                 i -= 1;
-                result = List(K).cons(collected.items[i].key, result);
+                retainEntryKey(entries[i].key);
+                result = List(K).cons(entries[i].key, result);
             }
             return result;
         }
 
         pub fn values(map: ?*const Self) ?*const List(V) {
-            if (map == null) return null;
-            const m = map.?;
-
-            if (m.repr_tag == 0) {
-                var result: ?*const List(V) = null;
-                var i: usize = m.flat_count;
-                while (i > 0) {
-                    i -= 1;
-                    result = List(V).cons(m.flat_entries[i].value, result);
-                }
-                return result;
-            }
-
-            // Trie: collect and build list
-            var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
-            defer collected.deinit(entriesAllocator());
-            if (m.trie_root) |root| hamtCollect(root, &collected);
+            const self = map orelse return null;
+            if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(self));
+            const len = self.len;
+            if (len == 0) return null;
+            const entries = self.entriesPtr();
             var result: ?*const List(V) = null;
-            var i: usize = collected.items.len;
+            var i: usize = len;
             while (i > 0) {
                 i -= 1;
-                result = List(V).cons(collected.items[i].value, result);
+                retainEntryValue(entries[i].value);
+                result = List(V).cons(entries[i].value, result);
             }
             return result;
         }
 
-        /// Simple reduce: folds map entries with a (acc, key, value) -> acc callback.
-        /// Iterates all entries and applies the callback with the accumulator.
+        pub fn next(map: ?*const Self) struct {
+            u32,
+            struct { K, V },
+            ?*const Self,
+        } {
+            if (map == null or map.?.len == 0) {
+                return .{ ATOM_DONE, .{ defaultK(), defaultV() }, map };
+            }
+            const self = map.?;
+            const first = self.entryAtConst(0).*;
+            // Deep-retain the yielded K/V so the caller has owned copies
+            // even after `delete` runs swap-remove (which deep-releases
+            // the entry's K/V).
+            retainEntryKey(first.key);
+            retainEntryValue(first.value);
+            const remaining = delete(self, first.key);
+            return .{ ATOM_CONT, .{ first.key, first.value }, remaining };
+        }
+
+        inline fn defaultK() K {
+            if (K == Term) return Term{ .nil = {} };
+            return std.mem.zeroes(K);
+        }
+
+        inline fn defaultV() V {
+            if (V == Term) return Term{ .nil = {} };
+            return std.mem.zeroes(V);
+        }
+
+        // -------------------------------------------------------------------
+        // fromPairs — bulk construction from parallel arrays
+        // -------------------------------------------------------------------
+
+        pub fn fromPairs(key_ids: []const K, vals: []const V, count: u32) ?*const Self {
+            if (count == 0) return null;
+            const callsite = @returnAddress();
+            const cap = pickCapacity(0, count);
+            const self = bufferAlloc(cap, Wyhash.nextSeed(), callsite) orelse return null;
+            for (0..@intCast(count)) |i| {
+                _ = putInPlaceInsert(self, key_ids[i], vals[i]);
+            }
+            return self;
+        }
+
+        // -------------------------------------------------------------------
+        // Reductions
+        // -------------------------------------------------------------------
+
         pub fn enumReduceSimple(map: ?*const Self, initial: i64, callback: anytype) i64 {
             if (map == null) return initial;
-            const m = map.?;
+            const self = map.?;
             var acc: i64 = initial;
-
-            if (m.repr_tag == 0) {
-                // Flat representation
-                for (0..m.flat_count) |i| {
-                    acc = callback(acc, @as(i64, @intCast(m.flat_entries[i].key)), m.flat_entries[i].value);
-                }
-            } else if (m.trie_root) |root| {
-                // Trie: collect entries then iterate
-                var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
-                defer collected.deinit(entriesAllocator());
-                hamtCollect(root, &collected);
-                for (collected.items) |entry| {
-                    acc = callback(acc, @as(i64, @intCast(entry.key)), entry.value);
-                }
+            const entries = self.entriesPtr();
+            for (0..self.len) |i| {
+                acc = callback(acc, @as(i64, @intCast(entries[i].key)), entries[i].value);
             }
             return acc;
         }
 
-        /// Reduce for Enumerable: folds map values with a (acc, value) -> acc callback.
-        /// Only passes the value (not the key) to match the Enumerable protocol.
         pub fn enumReduceValues(map: ?*const Self, initial: i64, callback: anytype) i64 {
             if (map == null) return initial;
-            const m = map.?;
+            const self = map.?;
             var acc: i64 = initial;
-
-            if (m.repr_tag == 0) {
-                for (0..m.flat_count) |i| {
-                    acc = callback(acc, m.flat_entries[i].value);
-                }
-            } else if (m.trie_root) |root| {
-                var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
-                defer collected.deinit(entriesAllocator());
-                hamtCollect(root, &collected);
-                for (collected.items) |entry| {
-                    acc = callback(acc, entry.value);
-                }
+            const entries = self.entriesPtr();
+            for (0..self.len) |i| {
+                acc = callback(acc, entries[i].value);
             }
             return acc;
         }
