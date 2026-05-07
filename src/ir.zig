@@ -2761,6 +2761,98 @@ pub const IrBuilder = struct {
         }
     }
 
+    /// Phase E.8 orphan-share fix: when the tail-call rewriter drops a
+    /// trailing `.release{value=X}` of a call-arg slot, it must also
+    /// drop the matching `.share_value{dest=X, source=Y}` earlier in
+    /// the body and substitute the call's arg `X` with `Y`. Otherwise
+    /// the share_value's retain becomes orphaned (no matching release
+    /// after the rewrite, since the callee inherits ownership through
+    /// the tail jump) and accumulates +1 refcount per iteration —
+    /// exactly the leak signature observed in Phase F retry-3.
+    ///
+    /// Builds the drop-set + substitution table by scanning the
+    /// trailing instructions for arg-cleanup releases. Returns:
+    ///   * `dropped_share_dests` — LocalIds of `.share_value`
+    ///     instructions to elide from the prelude (caller-allocated
+    ///     hash set populated here; caller frees).
+    ///   * `arg_substitutions` — for each call arg, the source local
+    ///     to substitute (caller-allocated hash map populated here).
+    ///
+    /// Lookup of the matching share_value walks the prelude (the
+    /// instructions BEFORE the call slot) and finds the most recent
+    /// `.share_value{dest=X, source=Y}`. If no match is found, only
+    /// the release is dropped (existing E.6 behaviour); the call's
+    /// arg stays as-is.
+    fn collectOrphanShareRewrites(
+        prelude: []const Instruction,
+        trailing: []const Instruction,
+        call_args: []const LocalId,
+        dropped_share_dests: *std.AutoHashMap(LocalId, void),
+        arg_substitutions: *std.AutoHashMap(LocalId, LocalId),
+    ) !void {
+        for (trailing) |trailing_instr| {
+            const released_local = switch (trailing_instr) {
+                .release => |r| r.value,
+                else => continue,
+            };
+            // Only match arg-cleanup releases — those whose target
+            // is one of the call's argument locals.
+            var is_arg_release = false;
+            for (call_args) |arg_local| {
+                if (arg_local == released_local) {
+                    is_arg_release = true;
+                    break;
+                }
+            }
+            if (!is_arg_release) continue;
+
+            // Walk the prelude backward to find the most recent
+            // `.share_value{dest=released_local, source=Y}`. The
+            // backward scan matches the one share-per-arg produced
+            // by `lowerExpr`'s arg-shape lowering; multiple shares
+            // for the same dest cannot occur at the IR-builder
+            // level (each share allocates a fresh `next_local`).
+            var idx: usize = prelude.len;
+            while (idx > 0) {
+                idx -= 1;
+                switch (prelude[idx]) {
+                    .share_value => |sv| {
+                        if (sv.dest == released_local) {
+                            try dropped_share_dests.put(sv.dest, {});
+                            try arg_substitutions.put(sv.dest, sv.source);
+                            break;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
+    /// Phase E.8: apply the substitution table to the call's arg
+    /// list, producing a fresh slice when any arg changes. When no
+    /// substitutions apply, returns the original slice (no copy).
+    fn applyArgSubstitutions(
+        allocator: std.mem.Allocator,
+        args: []const LocalId,
+        arg_substitutions: *const std.AutoHashMap(LocalId, LocalId),
+    ) ![]const LocalId {
+        if (arg_substitutions.count() == 0) return args;
+        var any_change = false;
+        for (args) |arg_local| {
+            if (arg_substitutions.contains(arg_local)) {
+                any_change = true;
+                break;
+            }
+        }
+        if (!any_change) return args;
+        const new_args = try allocator.alloc(LocalId, args.len);
+        for (args, 0..) |arg_local, i| {
+            new_args[i] = arg_substitutions.get(arg_local) orelse arg_local;
+        }
+        return new_args;
+    }
+
     fn rewriteTailCalls(
         self: *IrBuilder,
         instrs: []const Instruction,
@@ -2859,6 +2951,30 @@ pub const IrBuilder = struct {
                         if (probe > 0 and result.items[probe - 1] == .call_named) {
                             const cn = result.items[probe - 1].call_named;
                             if (std.mem.eql(u8, cn.name, func_name) and r.value.? == cn.dest) {
+                                // Phase E.8 orphan-share fix: scan
+                                // the trailing arg-cleanup releases
+                                // and find their matching prelude
+                                // `.share_value` instructions. We
+                                // will drop both the trailing
+                                // release AND the matching
+                                // `.share_value` from the prelude,
+                                // then substitute the call's arg with
+                                // the share's source. Without this,
+                                // the share_value's retain would
+                                // accumulate +1 refcount per
+                                // iteration (Phase F retry-3 leak).
+                                var dropped_share_dests = std.AutoHashMap(LocalId, void).init(self.allocator);
+                                defer dropped_share_dests.deinit();
+                                var arg_substitutions = std.AutoHashMap(LocalId, LocalId).init(self.allocator);
+                                defer arg_substitutions.deinit();
+                                try collectOrphanShareRewrites(
+                                    result.items[0 .. probe - 1],
+                                    result.items[probe..],
+                                    cn.args,
+                                    &dropped_share_dests,
+                                    &arg_substitutions,
+                                );
+
                                 // For each trailing tail-mappable
                                 // instruction, decide:
                                 //   * `.release{value=arg}` — drop on
@@ -2877,18 +2993,42 @@ pub const IrBuilder = struct {
                                     try preserved.append(self.allocator, trailing);
                                 }
 
-                                // Truncate result down to (and including)
-                                // the call_named slot, then re-emit:
-                                //   preserved..., tail_call
+                                // Build the new prelude in a fresh
+                                // ArrayList, eliding any `.share_value`
+                                // whose dest is in the drop set. We
+                                // can't mutate `result.items[0..probe-1]`
+                                // in place because shrinking it would
+                                // require a memmove; collecting into
+                                // a temp slice keeps the code clear.
+                                var rebuilt_prelude: std.ArrayList(Instruction) = .empty;
+                                defer rebuilt_prelude.deinit(self.allocator);
+                                for (result.items[0 .. probe - 1]) |prelude_instr| {
+                                    switch (prelude_instr) {
+                                        .share_value => |sv| {
+                                            if (dropped_share_dests.contains(sv.dest)) continue;
+                                        },
+                                        else => {},
+                                    }
+                                    try rebuilt_prelude.append(self.allocator, prelude_instr);
+                                }
+
+                                // Truncate result and re-emit the
+                                // rebuilt prelude, preserved
+                                // trailing instructions, and the new
+                                // `tail_call` (with substituted args).
                                 // The original `ret` is dropped — the
                                 // tail_call is itself the terminator.
-                                result.items.len = probe - 1;
+                                const substituted_args = try applyArgSubstitutions(self.allocator, cn.args, &arg_substitutions);
+                                result.clearRetainingCapacity();
+                                for (rebuilt_prelude.items) |kept| {
+                                    try result.append(self.allocator, kept);
+                                }
                                 for (preserved.items) |kept| {
                                     try result.append(self.allocator, kept);
                                 }
                                 try result.append(self.allocator, .{ .tail_call = .{
                                     .name = cn.name,
-                                    .args = cn.args,
+                                    .args = substituted_args,
                                 } });
                                 continue; // skip the ret
                             }
@@ -3030,6 +3170,22 @@ pub const IrBuilder = struct {
         }
         const sh = shape.?;
 
+        // Phase E.8 orphan-share fix — see `rewriteTailCalls` for
+        // full reasoning. Mirror the same scan-and-substitute logic
+        // here so structural tail-calls through `if_expr` /
+        // `switch_literal` arms also benefit from the leak fix.
+        var dropped_share_dests = std.AutoHashMap(LocalId, void).init(self.allocator);
+        defer dropped_share_dests.deinit();
+        var arg_substitutions = std.AutoHashMap(LocalId, LocalId).init(self.allocator);
+        defer arg_substitutions.deinit();
+        try collectOrphanShareRewrites(
+            body[0 .. call_index - 1],
+            trailing,
+            sh.args,
+            &dropped_share_dests,
+            &arg_substitutions,
+        );
+
         var preserved: std.ArrayList(Instruction) = .empty;
         defer preserved.deinit(self.allocator);
         for (trailing) |trailing_instr| {
@@ -3040,13 +3196,20 @@ pub const IrBuilder = struct {
 
         var new_body: std.ArrayList(Instruction) = .empty;
         for (body[0 .. call_index - 1]) |bi| {
+            switch (bi) {
+                .share_value => |sv| {
+                    if (dropped_share_dests.contains(sv.dest)) continue;
+                },
+                else => {},
+            }
             try new_body.append(self.allocator, bi);
         }
         for (preserved.items) |kept| {
             try new_body.append(self.allocator, kept);
         }
+        const substituted_args = try applyArgSubstitutions(self.allocator, sh.args, &arg_substitutions);
         try new_body.append(self.allocator, .{
-            .tail_call = .{ .name = sh.tail_name, .args = sh.args },
+            .tail_call = .{ .name = sh.tail_name, .args = substituted_args },
         });
         return .{ .instrs = try new_body.toOwnedSlice(self.allocator), .rewritten = true };
     }
@@ -8065,6 +8228,139 @@ test "rewriteTailCalls bails out on non-tail-mappable trailing instruction (Phas
     }
     try std.testing.expect(!saw_tail_call);
     try std.testing.expect(saw_call_named);
+}
+
+test "rewriteTailCalls elides matched share_value/release pair and substitutes call arg (Phase E.8)" {
+    // Phase E.8 of the Phase 6 redux plan — orphan-share fix.
+    //
+    // The tail-call rewriter drops a trailing `.release{value=X}` of a
+    // call-arg slot because the callee inherits ownership through the
+    // tail jump. Without a matching cleanup of the prelude, the
+    // `.share_value{dest=X, source=Y}` that originally retained the
+    // cell for the call argument becomes an "orphan share" — a +1
+    // retain whose paired release no longer exists. At iteration
+    // scale (millions of calls) the orphan retains accumulate and
+    // produce the exact pool-leak signature observed in Phase F's
+    // retry-3 (8.75M Map cells/run, refcount=2 at every step).
+    //
+    // The fix: when the rewriter drops a trailing `.release{value=X}`,
+    // it must also drop the matching `.share_value{dest=X, source=Y}`
+    // earlier in the body and substitute the call's arg `X` with `Y`.
+    //
+    // Hand-built layout:
+    //   share_value  %30 <- %10            // retain for call arg
+    //   call_named   step args=[%30] -> %20
+    //   release      %30                   // post-call cleanup (DROPPED)
+    //   ret          %20
+    //
+    // After rewrite:
+    //   tail_call    step args=[%10]       // arg substituted to source
+    //   (no share_value, no release, no call_named)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var ir_builder = IrBuilder.init(alloc, &interner);
+    defer ir_builder.deinit();
+
+    const args = try alloc.alloc(LocalId, 1);
+    args[0] = 30;
+    const arg_modes = try alloc.alloc(ValueMode, 1);
+    arg_modes[0] = .share;
+
+    const instrs = try alloc.alloc(Instruction, 4);
+    instrs[0] = .{ .share_value = .{ .dest = 30, .source = 10 } };
+    instrs[1] = .{ .call_named = .{ .dest = 20, .name = "step", .args = args, .arg_modes = arg_modes } };
+    instrs[2] = .{ .release = .{ .value = 30 } };
+    instrs[3] = .{ .ret = .{ .value = 20 } };
+
+    const params = try alloc.alloc(Param, 1);
+    params[0] = .{ .name = "c", .type_expr = .void, .type_id = null };
+
+    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", params, .void);
+
+    var saw_tail_call = false;
+    var saw_share_value = false;
+    var saw_release = false;
+    var saw_call_named = false;
+    var tail_call_arg: ?LocalId = null;
+    for (rewritten) |instr| {
+        switch (instr) {
+            .tail_call => |tc| {
+                saw_tail_call = true;
+                if (tc.args.len > 0) tail_call_arg = tc.args[0];
+            },
+            .share_value => saw_share_value = true,
+            .release => saw_release = true,
+            .call_named => saw_call_named = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_tail_call);
+    try std.testing.expect(!saw_share_value);
+    try std.testing.expect(!saw_release);
+    try std.testing.expect(!saw_call_named);
+    // The tail_call's arg must be the original source local (10),
+    // not the now-removed share dest (30).
+    try std.testing.expectEqual(@as(?LocalId, 10), tail_call_arg);
+}
+
+test "rewriteTailCalls handles unmatched release without breaking (Phase E.8)" {
+    // Phase E.8: the orphan-share fix must not regress the pre-existing
+    // E.6 behaviour for releases that have no matching `share_value`
+    // earlier in the body. This can happen e.g. when the source local
+    // was passed in as a parameter that was bumped via `.retain`
+    // rather than aliased through `.share_value`. The rewriter still
+    // drops the release (it's an arg-cleanup release), but there is
+    // no share to find — the call's arg stays as-is.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var ir_builder = IrBuilder.init(alloc, &interner);
+    defer ir_builder.deinit();
+
+    const args = try alloc.alloc(LocalId, 1);
+    args[0] = 10;
+    const arg_modes = try alloc.alloc(ValueMode, 1);
+    arg_modes[0] = .share;
+
+    const instrs = try alloc.alloc(Instruction, 3);
+    instrs[0] = .{ .call_named = .{ .dest = 20, .name = "step", .args = args, .arg_modes = arg_modes } };
+    instrs[1] = .{ .release = .{ .value = 10 } };
+    instrs[2] = .{ .ret = .{ .value = 20 } };
+
+    const params = try alloc.alloc(Param, 1);
+    params[0] = .{ .name = "c", .type_expr = .void, .type_id = null };
+
+    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", params, .void);
+
+    var saw_tail_call = false;
+    var saw_release = false;
+    var saw_call_named = false;
+    var tail_call_arg: ?LocalId = null;
+    for (rewritten) |instr| {
+        switch (instr) {
+            .tail_call => |tc| {
+                saw_tail_call = true;
+                if (tc.args.len > 0) tail_call_arg = tc.args[0];
+            },
+            .release => saw_release = true,
+            .call_named => saw_call_named = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_tail_call);
+    try std.testing.expect(!saw_release);
+    try std.testing.expect(!saw_call_named);
+    // Without a matching share, the arg stays as the original local.
+    try std.testing.expectEqual(@as(?LocalId, 10), tail_call_arg);
 }
 
 test "IR local_get of ARC-managed source emits retain on dest" {
