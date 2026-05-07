@@ -3139,10 +3139,12 @@ test "ZIR: Phase 4 Map workload byte-exact with retain/release balance check" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
     // Post-Phase-F: `.map` IS ARC-managed. Phase E.9's per-callee
     // consume convention infers `.owned` for tail-recursive accumulator
-    // params, so the recursive call uses move_value (consume mode).
-    // `consumes_total` is now > 0.
+    // params, but the optimization emits `.move_value` (not the
+    // counter-bumping `share_value(.consume)`), so `consumes_total`
+    // stays 0 — Phase 6.9 gated consume_share_sites entirely off and
+    // E.9 replaces them with move_value emission instead.
     const consumes_total = parseArcStatCounter(result.stderr, "consumes_total") orelse return error.RunFailed;
-    try std.testing.expect(consumes_total > 0);
+    try std.testing.expectEqual(@as(u64, 0), consumes_total);
     // Soundness retained: with Phase E.9's ownership discipline,
     // releases >= retains is the new invariant (each iteration's
     // intermediate Map.put result is released at scope exit, plus
@@ -3150,6 +3152,11 @@ test "ZIR: Phase 4 Map workload byte-exact with retain/release balance check" {
     const retains = parseArcStatCounter(result.stderr, "retains_total") orelse return error.RunFailed;
     const releases = parseArcStatCounter(result.stderr, "releases_total") orelse return error.RunFailed;
     try std.testing.expect(releases >= retains);
+    // Return-source elision fires for the base-case `if i >= n { m }`
+    // returning the parameter directly. This is the load-bearing
+    // signal that Phase F's discipline is engaged on this workload.
+    const return_elisions_total = parseArcStatCounter(result.stderr, "return_elisions_total") orelse return error.RunFailed;
+    try std.testing.expect(return_elisions_total > 0);
 }
 
 // ----------------------------------------------------------------
@@ -3194,18 +3201,20 @@ test "ZIR: Phase 5 return-elision counter fires for Map workload (post-Phase-F)"
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
     // Post-Phase-F: `.map` is ARC-managed. The base case's `m`
     // sources the ret directly; that local is in
-    // `return_source_locals` (modulo Phase E.5 Gap 4's borrow gate
-    // — which doesn't apply once Phase E.9 inferred the param as
-    // `.owned`). The matching scope-exit release is suppressed and
-    // `arc_return_elisions_total` bumps. Both counters are now >= 0
-    // with `consumes_total > 0` from the recursive tail-call's
-    // move_value emission (Phase E.8).
+    // `return_source_locals` (Phase E.5 Gap 4's borrow gate is
+    // bypassed because Phase E.9 inferred the param as `.owned`).
+    // The matching scope-exit release is suppressed and
+    // `arc_return_elisions_total` bumps. consumes_total stays 0
+    // because Phase E.9 emits `.move_value` (not the counter-
+    // bumping `share_value(.consume)`); the Phase 6.9 consume gate
+    // is still in effect — E.9 replaces consume_share_sites with
+    // move_value emission rather than re-enabling them.
     const return_elisions_total = parseArcStatCounter(result.stderr, "return_elisions_total") orelse
         return error.RunFailed;
+    try std.testing.expect(return_elisions_total > 0);
     const consumes_total = parseArcStatCounter(result.stderr, "consumes_total") orelse
         return error.RunFailed;
-    try std.testing.expect(consumes_total > 0);
-    _ = return_elisions_total; // observed value depends on inferred convention; positive observation in Phase 4 suffices
+    try std.testing.expectEqual(@as(u64, 0), consumes_total);
 }
 
 // Phase 5 byte-exact regression: a non-ARC integer-arithmetic
