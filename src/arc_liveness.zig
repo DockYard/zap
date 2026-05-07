@@ -606,6 +606,43 @@ const Analyzer = struct {
             }
         }
 
+        // (e) Phase E.5 Gap 5: every instruction whose dest local is
+        // classified as ARC-managed in `Function.local_ownership` is
+        // an owned-by-construction binding. This catches the bindings
+        // that don't pass through `share_value` / `retain` / `release`
+        // on their definition path:
+        //
+        //   * `m = map_init(...)`        — fresh-owner Map
+        //   * `xs = list_init(...)`      — fresh-owner List
+        //   * `s = struct_init(...)`     — owns ARC fields if any
+        //   * `result = Map.put(m, k, v)` — call returning a fresh
+        //                                   ARC cell
+        //   * `name = expr` (local_set propagating an ARC value)
+        //   * `dest = local_get/borrow_value/copy_value(source)` for
+        //                                  ARC-managed source
+        //
+        // Without this registration, `arc_drop_insertion` never sees
+        // these locals as candidates for scope-exit drops, so the
+        // owned cells leak on every function exit. The verifier's
+        // V1/V3 invariants likewise rely on the ARC-managed set being
+        // complete.
+        //
+        // The function's `local_ownership` array is the canonical
+        // ARC-managed predicate: it's populated by IrBuilder from
+        // `local_hir_types`, which Phase E.5 Gaps 1-3 ensure is
+        // complete. Walking every instruction's dest and consulting
+        // `local_ownership[dest] != .trivial` is therefore both
+        // necessary and sufficient.
+        const local_ownership = self.function.local_ownership;
+        for (self.records.items) |rec| {
+            const defs = collectDefs(rec.instr.*);
+            for (defs.slice()) |def_local| {
+                if (def_local >= local_ownership.len) continue;
+                if (local_ownership[def_local] == .trivial) continue;
+                if (!seen.contains(def_local)) try seen.put(self.allocator, def_local, {});
+            }
+        }
+
         // Aggregating instructions (if_expr, case_block,
         // switch_literal, union_switch) propagate ARC-managed-ness
         // from their arm-result locals to their dest. Iterate to a

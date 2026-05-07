@@ -1364,6 +1364,17 @@ pub const IrBuilder = struct {
     current_hir_program: ?*const hir_mod.Program = null,
     /// Current function's declared param types (for param_get fallback when expr type is UNKNOWN).
     current_param_types: std.ArrayListUnmanaged(ZigType) = .empty,
+    /// Current function's declared parameter HIR types, indexed by
+    /// parameter position. Populated alongside `current_param_types`
+    /// at clause prelude. Phase E.5 Gap 2: the body's `param_get`
+    /// HIR-expression lowering consults this list to populate
+    /// `local_hir_types[dest]` with the canonical param HIR type
+    /// even when the source HIR expression's `type_id` was set to
+    /// `UNKNOWN` (which happens for some monomorphized / type-erased
+    /// signatures). Without this fallback `local_ownership` for the
+    /// param-bound dest local is `.trivial` and the verifier never
+    /// classifies the param read as ARC-managed.
+    current_param_hir_types: std.ArrayListUnmanaged(hir_mod.TypeId) = .empty,
     /// Contextual type supplied by a call argument slot while lowering the
     /// argument expression. Used for empty container literals whose own HIR
     /// type is intentionally underconstrained.
@@ -1914,6 +1925,7 @@ pub const IrBuilder = struct {
         self.param_backed_locals.clearRetainingCapacity();
         self.term_tuple_locals.clearRetainingCapacity();
         self.current_param_types = .empty;
+        self.current_param_hir_types = .empty;
 
         var captures: std.ArrayList(Capture) = .empty;
         for (group.captures, 0..) |capture, idx| {
@@ -1935,6 +1947,7 @@ pub const IrBuilder = struct {
                 .type_id = param.type_id,
             });
             try self.current_param_types.append(self.allocator, resolved_type);
+            try self.current_param_hir_types.append(self.allocator, param.type_id);
         }
 
         const single_clause = [_]hir_mod.Clause{clause.*};
@@ -2013,6 +2026,7 @@ pub const IrBuilder = struct {
         self.param_backed_locals.clearRetainingCapacity();
         self.term_tuple_locals.clearRetainingCapacity();
         self.current_param_types = .empty;
+        self.current_param_hir_types = .empty;
 
         // Use first clause for arity and return type
         const first_clause = &group.clauses[0];
@@ -2075,6 +2089,7 @@ pub const IrBuilder = struct {
                 .type_id = param.type_id,
             });
             try self.current_param_types.append(self.allocator, resolved_type);
+            try self.current_param_hir_types.append(self.allocator, param.type_id);
         }
 
         // Reserve local indices used by destructure bindings across all clauses.
@@ -5406,6 +5421,23 @@ pub const IrBuilder = struct {
                 if (param_zig_type != .any) {
                     try self.known_local_types.put(dest, param_zig_type);
                 }
+                // Phase E.5 Gap 2: override the universal
+                // `local_hir_types[dest] = expr.type_id` (set above at
+                // expression entry) with the function signature's
+                // declared parameter HIR type when available. The HIR
+                // expression's `type_id` may be `UNKNOWN` (or stale
+                // from before monomorphization) for some param_get
+                // sites; the function's declared param HIR type is the
+                // authoritative source. Without this override
+                // `isArcManagedLocal(dest)` returns false on the param-
+                // bound local in single-clause functions, so
+                // `local_ownership[dest] = .trivial` and downstream
+                // arc_liveness/verifier never treat the param read as
+                // ARC-managed.
+                if (idx < self.current_param_hir_types.items.len) {
+                    const declared_hir_type = self.current_param_hir_types.items[idx];
+                    try self.local_hir_types.put(dest, declared_hir_type);
+                }
                 // Mark this local as param-backed so call-name encoding
                 // can detect bridge calls that thread function parameters
                 // straight into a `:zig.<Container>.<method>` site.
@@ -5497,6 +5529,23 @@ pub const IrBuilder = struct {
                                 if (self.known_local_types.get(arg_local)) |src_type| {
                                     try self.known_local_types.put(shared_local, src_type);
                                 }
+                                // Phase E.5 Gap 1: propagate the source's
+                                // HIR type onto `shared_local` so the
+                                // verifier's V2 invariant (release target
+                                // must match the local's HIR-derived
+                                // ownership class) sees the shared local
+                                // as ARC-managed. Without this propagation
+                                // a downstream `.release{value=shared_local}`
+                                // looks like it targets a `.trivial` local
+                                // (the default for unknown HIR types) and
+                                // the verifier raises a spurious mismatch.
+                                // Prefer the source's tracked HIR type;
+                                // fall back to `arg.expr.type_id` (which
+                                // is ARC-managed by construction in this
+                                // branch) when the source has no tracked
+                                // type.
+                                const shared_hir_type: hir_mod.TypeId = self.local_hir_types.get(arg_local) orelse arg.expr.type_id;
+                                try self.local_hir_types.put(shared_local, shared_hir_type);
                                 // Propagate param-backed marker so dispatch
                                 // encoders that fall back to runtime type-
                                 // derived helpers for `param: anytype`
@@ -6459,6 +6508,18 @@ fn isTotalMatchPattern(pattern: *const hir_mod.MatchPattern) bool {
 /// covered — omitting any one silently corrupts the local layout for the
 /// affected pattern shape (this was the bug that broke `__try` variants on
 /// map-pattern functions).
+///
+/// Phase E.5 Gap 3: also counts assignment-binding (`local_set.index`)
+/// indices used in each clause body. HIR allocates these indices from
+/// the same per-clause `next_local` counter as pattern bindings, so an
+/// assignment like `name = expr` inside the body produces a
+/// `local_set.index` that occupies the same numbering space as
+/// pattern-binding indices. If the IR-level `next_local` is initialized
+/// only from pattern bindings, IR-level expression lowering allocates
+/// fresh locals starting BELOW the assignment-binding indices and
+/// silently collides, causing `local_set` propagation to overwrite the
+/// IR builder's `local_hir_types[ls.index]` with a stale entry.
+/// Walking the body for `local_set` indices closes that collision.
 fn computeMaxBindingLocalForClauses(clauses: []const hir_mod.Clause) LocalId {
     var max_local: LocalId = 0;
     for (clauses) |clause| {
@@ -6480,6 +6541,84 @@ fn computeMaxBindingLocalForClauses(clauses: []const hir_mod.Clause) LocalId {
         for (clause.map_bindings) |binding| {
             max_local = @max(max_local, binding.local_index + 1);
         }
+        // Walk the clause body for `local_set` indices (assignment
+        // bindings allocated via HIR's per-clause `next_local`).
+        const body_max = maxLocalSetIndexInBlock(clause.body);
+        max_local = @max(max_local, body_max);
+    }
+    return max_local;
+}
+
+/// Recursively walks a HIR block, returning one past the largest
+/// `local_set.index` reached anywhere inside the block (including
+/// nested blocks, function-group bodies, branches, case arms, error
+/// pipes, etc.). Returns `0` when the block contains no `local_set`.
+fn maxLocalSetIndexInBlock(block: *const hir_mod.Block) LocalId {
+    var max_local: LocalId = 0;
+    for (block.stmts) |stmt| {
+        switch (stmt) {
+            .local_set => |ls| {
+                max_local = @max(max_local, ls.index + 1);
+                const value_max = maxLocalSetIndexInExpr(ls.value);
+                max_local = @max(max_local, value_max);
+            },
+            .expr => |expr| {
+                const expr_max = maxLocalSetIndexInExpr(expr);
+                max_local = @max(max_local, expr_max);
+            },
+            .function_group => |group| {
+                // Closures capture by reference; their bodies use a
+                // fresh `next_local` counter, so they cannot collide
+                // with the enclosing function's local space. Skip.
+                _ = group;
+            },
+        }
+    }
+    return max_local;
+}
+
+/// Recursively walks a HIR expression for `local_set` indices that
+/// appear inside its sub-blocks (case arms, branches, error pipes,
+/// blocks-as-expressions, ...). Mirrors `maxLocalSetIndexInBlock`.
+fn maxLocalSetIndexInExpr(expr: *const hir_mod.Expr) LocalId {
+    var max_local: LocalId = 0;
+    switch (expr.kind) {
+        .branch => |*br| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(br.condition));
+            max_local = @max(max_local, maxLocalSetIndexInBlock(br.then_block));
+            if (br.else_block) |eb| max_local = @max(max_local, maxLocalSetIndexInBlock(eb));
+        },
+        .case => |*ce| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(ce.scrutinee));
+            for (ce.arms) |arm| {
+                max_local = @max(max_local, maxLocalSetIndexInBlock(arm.body));
+            }
+        },
+        .block => |*blk| {
+            max_local = @max(max_local, maxLocalSetIndexInBlock(blk));
+        },
+        .binary => |b| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(b.lhs));
+            max_local = @max(max_local, maxLocalSetIndexInExpr(b.rhs));
+        },
+        .unary => |u| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(u.operand));
+        },
+        .call => |c| {
+            for (c.args) |arg| {
+                max_local = @max(max_local, maxLocalSetIndexInExpr(arg.expr));
+            }
+        },
+        .union_init => |ui| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(ui.value));
+        },
+        .error_pipe => |ep| {
+            for (ep.steps) |step| {
+                max_local = @max(max_local, maxLocalSetIndexInExpr(step.expr));
+            }
+            max_local = @max(max_local, maxLocalSetIndexInExpr(ep.handler));
+        },
+        else => {},
     }
     return max_local;
 }
@@ -7937,4 +8076,376 @@ test "ownership metadata: defaultParamConvention and defaultResultConvention agr
     try std.testing.expectEqual(ResultConvention.trivial, defaultResultConvention(null, null));
     try std.testing.expectEqual(ParamConvention.trivial, defaultParamConvention(null, 0));
     try std.testing.expectEqual(ResultConvention.trivial, defaultResultConvention(null, 0));
+}
+
+test "Phase E.5 Gap 1: share_value shared_local has ARC-managed local_ownership" {
+    // When IrBuilder lowers a call argument with `.share` mode and an
+    // ARC-managed expression type, it allocates a fresh `shared_local`
+    // and emits `share_value{shared_local, source_local}`. The shared
+    // local owns +1 from the share's retain and must be classified as
+    // ARC-managed in `Function.local_ownership`. Without HIR-type
+    // propagation onto `shared_local`, `local_ownership[shared_local]`
+    // would default to `.trivial` and the verifier's V2 invariant
+    // (release target's HIR type matches the local's ownership class)
+    // would mismatch when the post-call `release{shared_local}` fires.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn use(h :: Handle) -> Handle { h }
+        \\
+        \\  pub fn run(h :: Handle) -> Handle {
+        \\    Test.use(h)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var run_func: ?*const Function = null;
+    for (ir_program.functions) |*function| {
+        if (std.mem.indexOf(u8, function.name, "run") != null) {
+            run_func = function;
+            break;
+        }
+    }
+    const func = run_func orelse return error.MissingFunction;
+
+    // Find the share_value instruction in the function body.
+    var found_share = false;
+    for (func.body) |block| {
+        for (block.instructions) |instr| {
+            switch (instr) {
+                .share_value => |sv| {
+                    found_share = true;
+                    // The shared local must be classified as ARC-managed
+                    // in local_ownership. Phase A's stub classifier
+                    // labels every ARC-managed local as `.owned` until
+                    // arc_ownership refines it; either `.owned` or
+                    // `.borrowed` is acceptable here, but never
+                    // `.trivial`.
+                    try std.testing.expect(sv.dest < func.local_ownership.len);
+                    try std.testing.expect(func.local_ownership[sv.dest] != .trivial);
+                    // Likewise the source must be ARC-managed (the share
+                    // only fires when the source's HIR type is ARC).
+                    try std.testing.expect(sv.source < func.local_ownership.len);
+                    try std.testing.expect(func.local_ownership[sv.source] != .trivial);
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(found_share);
+}
+
+test "Phase E.5 Gap 2: param_get HIR-expression dest gets ARC-managed local_ownership in single-clause function" {
+    // A single-clause function `pub fn id(h :: Handle) -> Handle { h }`
+    // lowers `h` to a HIR `param_get` expression. The IR's
+    // `lowerExpr.param_get` arm allocates a fresh dest local and
+    // emits `param_get{dest, index=0}`. The dest local must be
+    // classified as ARC-managed in `local_ownership` because its
+    // value originates from a borrowed-convention parameter of an
+    // ARC-managed type. Without populating `local_hir_types[dest]`
+    // from the function's declared param types,
+    // `local_ownership[dest]` would default to `.trivial` and
+    // arc_liveness would never include the dest in
+    // `arc_managed_locals`.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn id(h :: Handle) -> Handle { h }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var id_func: ?*const Function = null;
+    for (ir_program.functions) |*function| {
+        if (std.mem.indexOf(u8, function.name, "id") != null) {
+            id_func = function;
+            break;
+        }
+    }
+    const func = id_func orelse return error.MissingFunction;
+
+    // Walk the body for every `param_get` instruction. Each dest
+    // local must be classified as ARC-managed (non-trivial) since
+    // the parameter's HIR type is the ARC-managed `Handle` opaque.
+    var found_param_get = false;
+    for (func.body) |block| {
+        for (block.instructions) |instr| {
+            switch (instr) {
+                .param_get => |pg| {
+                    found_param_get = true;
+                    try std.testing.expect(pg.dest < func.local_ownership.len);
+                    try std.testing.expect(func.local_ownership[pg.dest] != .trivial);
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(found_param_get);
+}
+
+test "Phase E.5 Gap 3: assignment-binding indices reserved before IR-level next_local allocation" {
+    // A function with `name = expr; ... name ...` allocates `name`'s
+    // local index via HIR's per-clause `next_local` counter. That
+    // counter is shared with pattern bindings, so the resulting
+    // index can land in the IR builder's expression-lowering range
+    // unless `computeMaxBindingLocalForClauses` accounts for body
+    // `local_set.index` values. Concretely: the IR builder must
+    // reserve enough locals up-front so no `lowerExpr` allocation
+    // collides with an assignment binding's index.
+    //
+    // We exercise this by writing a function whose body assigns a
+    // local then reads it. Every `local_set.dest` index must be at
+    // least as large as `func.local_ownership.len` would be if the
+    // pre-allocation were missing — equivalently: every local_set
+    // dest must fall within `func.local_count`, and no IR-emitted
+    // instruction before the local_set targets that same dest.
+    const source =
+        \\pub struct Test {
+        \\  pub fn assign_then_read() -> i64 {
+        \\    x = 42
+        \\    x + 1
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var assign_func: ?*const Function = null;
+    for (ir_program.functions) |*function| {
+        if (std.mem.indexOf(u8, function.name, "assign_then_read") != null) {
+            assign_func = function;
+            break;
+        }
+    }
+    const func = assign_func orelse return error.MissingFunction;
+
+    // Find every local_set; its dest index must be valid.
+    var local_set_dest: ?LocalId = null;
+    for (func.body) |block| {
+        for (block.instructions) |instr| {
+            switch (instr) {
+                .local_set => |ls| {
+                    try std.testing.expect(ls.dest < func.local_count);
+                    local_set_dest = ls.dest;
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(local_set_dest != null);
+
+    // The local_set's dest must NOT have been allocated as a fresh
+    // dest by an earlier `lowerExpr` in the same function — i.e. it
+    // must be in the reserved binding-local range. Walk the body
+    // once and assert no instruction *before* the local_set defines
+    // ls.dest as its own dest (that would indicate a collision).
+    const dest = local_set_dest.?;
+    var seen_local_set_for_dest = false;
+    for (func.body) |block| {
+        for (block.instructions) |instr| {
+            if (instr == .local_set and instr.local_set.dest == dest) {
+                seen_local_set_for_dest = true;
+                continue;
+            }
+            if (seen_local_set_for_dest) break;
+            // Before the local_set: ensure no instruction's dest
+            // equals our binding-local index.
+            const conflicting_dest: ?LocalId = switch (instr) {
+                .const_int => |x| x.dest,
+                .const_float => |x| x.dest,
+                .const_string => |x| x.dest,
+                .const_bool => |x| x.dest,
+                .const_atom => |x| x.dest,
+                .binary_op => |x| x.dest,
+                .unary_op => |x| x.dest,
+                .call_named => |x| x.dest,
+                .call_direct => |x| x.dest,
+                .call_builtin => |x| x.dest,
+                else => null,
+            };
+            if (conflicting_dest) |cd| {
+                try std.testing.expect(cd != dest);
+            }
+        }
+    }
+}
+
+test "Phase E.5 Gap 5: arc_managed_locals registers map_init / list_init / call dests of ARC type" {
+    // `arc_liveness.identifyArcLocals` must register every local
+    // whose value is ARC-managed by construction — not only those
+    // that flow through `share_value` / `retain` / `release`. The
+    // canonical anchor is `Function.local_ownership[L] != .trivial`
+    // (populated by IrBuilder from `local_hir_types`). Without this
+    // registration, scope-exit drops never fire on owned bindings
+    // such as `m = map_init(...)`, leaking the cell on every
+    // function exit.
+    //
+    // We use `opaque_type` (Handle) as our ARC-managed scalar. A
+    // function that calls another ARC-returning function and binds
+    // the result must register that binding local as ARC-managed
+    // even though no `share_value` mentions it on the value side.
+    //
+    // This test pins the contract; the implementation lives in
+    // `arc_liveness.identifyArcLocals`.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn make() -> Handle {
+        \\    Test.fresh()
+        \\  }
+        \\
+        \\  pub fn fresh() -> Handle {
+        \\    "x"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var make_func: ?*const Function = null;
+    for (ir_program.functions) |*function| {
+        if (std.mem.indexOf(u8, function.name, "make") != null) {
+            make_func = function;
+            break;
+        }
+    }
+    const func = make_func orelse return error.MissingFunction;
+
+    // Find the call instruction; its dest must be ARC-managed in
+    // local_ownership (precondition for arc_liveness to register
+    // it). This is a Phase A/B/C invariant the gap relies on.
+    var call_dest: ?LocalId = null;
+    for (func.body) |block| {
+        for (block.instructions) |instr| {
+            switch (instr) {
+                .call_named => |c| {
+                    if (c.dest < func.local_ownership.len and
+                        func.local_ownership[c.dest] != .trivial)
+                    {
+                        call_dest = c.dest;
+                    }
+                },
+                .call_direct => |c| {
+                    if (c.dest < func.local_ownership.len and
+                        func.local_ownership[c.dest] != .trivial)
+                    {
+                        call_dest = c.dest;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(call_dest != null);
+
+    // Now run arc_liveness and assert the call dest is in
+    // arc_managed_locals.
+    const arc_liveness = @import("arc_liveness.zig");
+    var ownership = try arc_liveness.computeArcOwnership(
+        std.testing.allocator,
+        func,
+        checker.store,
+        arc_liveness.defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    try std.testing.expect(ownership.arc_managed_locals.contains(call_dest.?));
 }
