@@ -1,6 +1,6 @@
 # Phase 0 Findings — Map Workload Classification
 
-**Generated:** 2026-05-07
+**Generated:** 2026-05-07 (initial), updated after Phase B1 read_mostly landed
 **Plan reference:** `docs/map-workload-instrumentation-plan.md`
 **Aggregate data:** `bench/map-instrumentation-data/aggregate.{json,md}`
 
@@ -12,7 +12,7 @@ The data unambiguously supports a **dense open-addressed hash table with whole-b
 
 ## Aggregate metrics
 
-Across 3 successfully-instrumented workloads (k-nucleotide, working_dict, versioned), weighted by total Map ops:
+Across 4 successfully-instrumented workloads (k-nucleotide, working_dict, versioned, read_mostly), weighted by total Map ops:
 
 | Metric | Value |
 | --- | ---: |
@@ -34,6 +34,7 @@ Across 3 successfully-instrumented workloads (k-nucleotide, working_dict, versio
 | k-nucleotide | 8,750,004 | 14 | **100%** | 0% | 0% | 0 | 7,499,921 |
 | versioned (synthetic) | 480 | 40 | 50% | 8.33% | 41.67% | 200 | 0 |
 | working_dict (synthetic) | 540 | 60 | **100%** | 0% | 0% | 0 | 0 |
+| read_mostly (synthetic) | 180 | 20 | **100%** | 0% | 0% | 0 | 0 |
 
 ### k-nucleotide (the dispositive benchmark)
 
@@ -103,7 +104,7 @@ The data shows:
 
 1. **Most Zap programs are too trivial to exercise Map.** Out of 27 attempted workloads, only 3 produced data. The signal comes overwhelmingly from k-nucleotide. As the language matures and more programs use `Map` in earnest, the workload mix may shift. The instrumentation infrastructure (build flag `-Dinstrument-map=true`, runner `bench/map-instrumentation-runner.sh`, aggregator `bench/map-instrumentation-aggregator.sh`) is preserved in-repo and can be re-run any time to re-validate.
 
-2. **read_mostly micro-benchmark fails to build** due to a Zap-level i8/i64 type-inference issue separate from instrumentation. This doesn't affect the conclusion (read patterns don't allocate new Map cells, so they don't change the share-event signal). Documented as an unresolved gap.
+2. **read_mostly micro-benchmark** had an initial Zap-level i8/i64 type-inference issue, resolved during Phase B1 by switching the read pattern to `Map.size` (which avoids the contentious default-value type inference). It now reports 180 instances, 100% class S — confirming read-only patterns don't allocate new Map cells and don't trigger share events.
 
 3. **The aggregator's rule-1 threshold (`lineage_pcv1_fraction ≥ 0.90`) is too strict.** Recommend tuning to drop the lineage_pcv1 condition, replacing with `class_V_fraction < 0.05`. This is a follow-up improvement; doesn't change the recommendation.
 

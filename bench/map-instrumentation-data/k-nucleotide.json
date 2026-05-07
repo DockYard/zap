@@ -1,7 +1,7 @@
 {
   "workload": "k_nucleotide",
   "binary": "/Users/bcardarella/projects/lang-benches/k-nucleotide/zap-out/bin/k_nucleotide",
-  "duration_ns": 3800374000,
+  "duration_ns": 3740570000,
   "summary": {
     "total_instances": 8750004,
     "total_lineages": 14,
@@ -33,10 +33,10 @@
     "post_share_mutation_count": 0,
     "total_node_clones": 7499921,
     "top_callsites_by_instance_count": [
-      {"site": "0x100c09490", "count": 8749954},
-      {"site": "0x100c0904c", "count": 7},
-      {"site": "0x100be101c", "count": 5},
-      {"site": "0x100be1450", "count": 2}
+      {"site": "0x100dd147c", "count": 8749954},
+      {"site": "0x100dd1038", "count": 7},
+      {"site": "0x100da901c", "count": 5},
+      {"site": "0x100da9450", "count": 2}
     ]
   }
 }

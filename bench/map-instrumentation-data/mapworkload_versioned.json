@@ -1,7 +1,7 @@
 {
   "workload": "versioned",
   "binary": "/Users/bcardarella/projects/zap/bench/map-workloads/versioned//zap-out/bin/versioned",
-  "duration_ns": 938000,
+  "duration_ns": 1946000,
   "summary": {
     "total_instances": 480,
     "total_lineages": 40,
@@ -33,8 +33,8 @@
     "post_share_mutation_count": 200,
     "total_node_clones": 0,
     "top_callsites_by_instance_count": [
-      {"site": "0x10475ec94", "count": 120},
-      {"site": "0x10475eea8", "count": 80}
+      {"site": "0x104cc2c94", "count": 120},
+      {"site": "0x104cc2ea8", "count": 80}
     ]
   }
 }
