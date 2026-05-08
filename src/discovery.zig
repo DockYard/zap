@@ -37,6 +37,15 @@ pub const FileGraph = struct {
     /// top-level struct such as protocol/impl-only files.
     known_files: std.StringHashMap(void),
 
+    /// Realpath (absolute, fully resolved) form of every file recorded
+    /// in the graph. Independent from `known_files` — `known_files`
+    /// keys preserve the surface path the caller provided (used for
+    /// downstream tooling that operates on user-facing paths), while
+    /// `canonical_files` keys are the deduplicated identity for the
+    /// underlying inode. Discovery uses this map to skip a file
+    /// already recorded under a different surface path.
+    canonical_files: std.StringHashMap(void),
+
     /// File path → list of struct names it references
     file_imports: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
 
@@ -78,6 +87,7 @@ pub const FileGraph = struct {
             .file_to_struct = std.StringHashMap([]const u8).init(allocator),
             .file_to_structs = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
             .known_files = std.StringHashMap(void).init(allocator),
+            .canonical_files = std.StringHashMap(void).init(allocator),
             .file_imports = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
             .file_imported_by = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
             .topo_order = .empty,
@@ -98,6 +108,11 @@ pub const FileGraph = struct {
         }
         self.file_to_structs.deinit();
         self.known_files.deinit();
+        {
+            var it = self.canonical_files.iterator();
+            while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        }
+        self.canonical_files.deinit();
         {
             var it = self.file_imports.iterator();
             while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
@@ -217,7 +232,21 @@ pub fn discoverWithSourceFiles(
     try drainDiscoveryQueue(alloc, &graph, &queue, source_roots, &native_type_structs);
 
     for (explicit_source_files) |file_path| {
-        if (graph.known_files.contains(file_path)) continue;
+        // Pre-check against the canonical (realpath) form so we don't
+        // re-read a file that's already recorded under a different
+        // surface path. This avoids the duplicate-record hazard that
+        // arises when the entry-point struct→file resolution
+        // produces, e.g., `./fannkuch_redux.zap` while the explicit
+        // glob expansion produces `././fannkuch_redux.zap` — both
+        // resolve to the same realpath. `recordSourceFile` enforces
+        // the same invariant so this pre-check is purely an
+        // I/O optimization; correctness still holds without it.
+        const canonical_check = canonicalizeFilePath(alloc, file_path) catch return error.OutOfMemory;
+        if (graph.canonical_files.contains(canonical_check)) {
+            alloc.free(canonical_check);
+            continue;
+        }
+        alloc.free(canonical_check);
 
         const source_root_name = sourceRootNameForFile(alloc, file_path, source_roots) orelse "project";
         const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch
@@ -288,6 +317,26 @@ fn drainDiscoveryQueue(
 
 const NativeTypeStructs = std.EnumArray(zap.scope.NativeTypeKind, ?[]const u8);
 
+/// Canonicalize a file path to its absolute, fully-resolved form so
+/// duplicate-file detection in the FileGraph can match paths that
+/// point at the same on-disk file even when callers pass different
+/// surface representations (e.g. `./foo.zap` vs `././foo.zap` vs an
+/// absolute path).
+///
+/// When the path cannot be resolved (e.g. read-only filesystem,
+/// symlink loop) the original path is returned as a best-effort
+/// fallback so discovery stays functional — the duplicate hazard the
+/// canonicalization addresses is unique to paths that successfully
+/// resolve to the same file, and unresolved paths cannot collide on
+/// disk.
+///
+/// The returned slice is owned by `alloc`.
+fn canonicalizeFilePath(alloc: std.mem.Allocator, file_path: []const u8) ![]const u8 {
+    return std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, file_path, alloc) catch {
+        return alloc.dupe(u8, file_path);
+    };
+}
+
 fn recordSourceFile(
     alloc: std.mem.Allocator,
     graph: *FileGraph,
@@ -298,6 +347,23 @@ fn recordSourceFile(
     queue: *std.ArrayListUnmanaged([]const u8),
     native_type_structs: *const NativeTypeStructs,
 ) DiscoveryError!void {
+    // Track the canonical (realpath) form of every recorded file so
+    // callers that pass different surface representations of the same
+    // on-disk file (e.g. the entry-point struct→file resolution
+    // produces `./foo.zap` while glob expansion produces
+    // `././foo.zap`) don't double-record the file. Without this, the
+    // same struct can land in `file_to_structs` twice and the
+    // downstream `compileStructByStruct` pipeline lowers it to two
+    // distinct `ir.Function` records with the same name — silently
+    // breaking the chain-consistency invariants that arc/v8 audits
+    // rely on.
+    const canonical = canonicalizeFilePath(alloc, file_path) catch return error.OutOfMemory;
+    if (graph.canonical_files.contains(canonical)) {
+        alloc.free(canonical);
+        return;
+    }
+    graph.canonical_files.put(canonical, {}) catch return error.OutOfMemory;
+
     graph.known_files.put(file_path, {}) catch return error.OutOfMemory;
     graph.file_source_root.put(file_path, source_root_name) catch return error.OutOfMemory;
 
@@ -1276,6 +1342,76 @@ test "discoverWithSourceFiles tracks multiple structs in one source file without
     try std.testing.expect(graph.struct_to_file.contains("Test.MultiTest"));
     try std.testing.expectEqual(@as(usize, 2), graph.structsForFile(multi_path).len);
     try std.testing.expectEqual(@as(usize, 2), graph.topo_order.items.len);
+}
+
+test "discoverWithSourceFiles dedupes a file passed both via entry-point resolution and explicit_source_files with different surface paths" {
+    // Regression for the duplicate-name IR-function bug surfaced by
+    // fannkuch-redux's chain-consistency audit. The compiler was
+    // recording the same source file twice in the FileGraph when the
+    // entry-point struct→file resolver produced a path with one
+    // representation (e.g. `<root>/app.zap`) and the explicit source
+    // file glob produced another representation of the same file
+    // (e.g. with a `././` prefix). Both keys hashed independently, so
+    // `file_to_structs` ended up with two entries for the same file
+    // and `topo_order` listed the same struct twice — which then
+    // caused `compileStructByStruct` to run HIR/IR for the struct
+    // twice, producing two `ir.Function` records with the same name
+    // but different `FunctionId`s.
+    //
+    // The fix canonicalizes file paths to their realpath form for
+    // duplicate detection, so any two surface paths that resolve to
+    // the same on-disk file collapse to one record.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "pub struct App {\n  pub fn main() -> i64 {\n    1\n  }\n}\n",
+    });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const canonical_app_path = try std.fs.path.join(alloc, &.{ tmp_path, "app.zap" });
+    // Same file, two different surface representations: one direct,
+    // one with an extra `./` segment that `std.fs.path.join` does not
+    // collapse on its own. Without the realpath-keyed dedup, the
+    // FileGraph would record both as distinct keys.
+    const aliased_app_path = try std.fs.path.join(alloc, &.{ tmp_path, ".", "app.zap" });
+    try std.testing.expect(!std.mem.eql(u8, canonical_app_path, aliased_app_path));
+
+    const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
+
+    var graph = try discoverWithSourceFiles(
+        alloc,
+        "App",
+        roots,
+        &BUILTIN_TYPE_NAMES,
+        &.{aliased_app_path},
+        null,
+    );
+    defer graph.deinit();
+
+    // App should appear in struct_to_file under exactly one path key,
+    // and that key should resolve to the same realpath as both
+    // surface paths.
+    try std.testing.expect(graph.struct_to_file.contains("App"));
+
+    // topo_order has exactly one entry — without the fix, the
+    // duplicate would surface here as an extra entry pointing at the
+    // aliased path key.
+    try std.testing.expectEqual(@as(usize, 1), graph.topo_order.items.len);
+
+    // Either of the two surface paths used during discovery should
+    // map back to the App struct via structsForFile/structForFile,
+    // because at most one canonicalized record exists for the file.
+    var matched_records: usize = 0;
+    if (graph.structsForFile(canonical_app_path).len > 0) matched_records += 1;
+    if (graph.structsForFile(aliased_app_path).len > 0) matched_records += 1;
+    try std.testing.expect(matched_records >= 1);
+    try std.testing.expectEqual(@as(usize, 1), matched_records);
 }
 
 test "discoverWithSourceFiles keeps structless source files in graph" {

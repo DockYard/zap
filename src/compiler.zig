@@ -1868,11 +1868,28 @@ pub fn compileStructByStruct(
     // Phase 1: every struct → HIR. Shared TypeStore and globally-
     // unique group IDs let later phases monomorphize across struct
     // boundaries.
+    //
+    // Dedupe `struct_order` defensively. Discovery already canonicalizes
+    // file paths so the same on-disk struct cannot be queued twice via
+    // different surface paths, but per-struct HIR lowering must run at
+    // most once per struct regardless: a second lowering would emit a
+    // second `ir.Function` record for every public function with the
+    // same name but a different `FunctionId`, which silently breaks
+    // every downstream pass that maps function names to IDs (the v8
+    // fixpoint signature table, the ARC convention `lift_set`, the
+    // chain-consistency audit). Treat upstream duplicates as a bug to
+    // surface — once discovery is the single source of truth this
+    // guard becomes a defensive no-op, but it also keeps callers that
+    // assemble `struct_order` themselves from triggering the same
+    // hazard.
     var phase_timer = ZapTimer.start();
     var per_struct_timer = ZapTimer.start();
     var hir_results: std.ArrayListUnmanaged(StructHirResult) = .empty;
     var group_id_offset: u32 = 0;
+    var lowered_structs = std.StringHashMap(void).init(alloc);
+    defer lowered_structs.deinit();
     for (struct_order, 0..) |mod_name, mod_idx| {
+        if (lowered_structs.contains(mod_name)) continue;
         if (options.show_progress) {
             std.debug.print("\r\x1b[K  [hir {d}/{d}] {s}", .{ mod_idx + 1, struct_order.len, mod_name });
         }
@@ -1889,6 +1906,7 @@ pub fn compileStructByStruct(
         }
         group_id_offset = hir_result.next_group_id;
         hir_results.append(alloc, hir_result) catch return error.OutOfMemory;
+        lowered_structs.put(mod_name, {}) catch return error.OutOfMemory;
     }
     if (profilingEnabled()) {
         std.debug.print("\n[stage Phase1-AllHIR] ms={d}\n", .{phase_timer.lapMs()});
@@ -4357,6 +4375,74 @@ test "compileStructByStruct isolates per-struct diagnostics" {
     }
     try std.testing.expect(found_clean_a);
     try std.testing.expect(found_clean_b);
+}
+
+test "compileStructByStruct dedupes a struct that appears twice in struct_order" {
+    // Regression for the duplicate-name IR-function bug. If discovery
+    // ever regresses and produces a `struct_order` that lists the
+    // same struct name twice, the per-struct HIR loop must NOT lower
+    // the struct twice. A second lowering produces a second
+    // `ir.Function` record with the same name but a different
+    // `FunctionId`, which silently breaks every downstream pass that
+    // maps function names to ids — most importantly the v8 fixpoint
+    // signature table and the ARC-convention `lift_set`. Both keys
+    // are `FunctionId`s, so callers reaching the duplicate via name
+    // resolution land on a different id than the audit walker does,
+    // and the lookups silently miss.
+    //
+    // The fix has two layers: (a) discovery canonicalizes file paths
+    // so duplicates cannot enter `struct_order` in the first place,
+    // and (b) `compileStructByStruct` defensively skips a struct it
+    // has already lowered. This test exercises layer (b) by passing
+    // a deliberately-duplicated `struct_order`.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_units = [_]SourceUnit{
+        .{
+            .file_path = "dup_target.zap",
+            .source = "pub struct DupTarget {\n" ++
+                "  pub fn answer() -> i64 { 42 }\n" ++
+                "}\n",
+        },
+    };
+
+    var ctx = try collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+
+    // Pass the struct twice on purpose. Without the dedup, the
+    // pipeline would lower DupTarget.answer twice, producing two
+    // `ir.Function` records with the same `name` but different
+    // `FunctionId`s — the duplicate-IR hazard.
+    const duplicated_order = [_][]const u8{ "DupTarget", "DupTarget" };
+
+    const result = try compileStructByStruct(
+        alloc,
+        &ctx,
+        &duplicated_order,
+        .{ .show_progress = false },
+    );
+
+    var seen_function_names: std.StringHashMapUnmanaged(usize) = .empty;
+    for (result.ir_program.functions) |func| {
+        const gop = try seen_function_names.getOrPut(alloc, func.name);
+        if (gop.found_existing) {
+            gop.value_ptr.* += 1;
+        } else {
+            gop.value_ptr.* = 1;
+        }
+    }
+
+    var dup_iter = seen_function_names.iterator();
+    while (dup_iter.next()) |entry| {
+        if (entry.value_ptr.* > 1) {
+            std.debug.print(
+                "duplicate IR function name detected: '{s}' x{d}\n",
+                .{ entry.key_ptr.*, entry.value_ptr.* },
+            );
+            return error.DuplicateIrFunctionName;
+        }
+    }
 }
 
 test "remapFunctionDecl rewrites name_expr through the remap table" {
