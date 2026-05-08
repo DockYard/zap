@@ -2086,16 +2086,36 @@ fn runArcOwnershipAndVerify(
     // consumed by V8 matches the post-classification shape, and
     // BEFORE `arc_verifier.verify` so the V8 invariant in the
     // verifier sees this pass's rewrites and catches any mistake.
+    //
+    // A1 (interprocedural V8): before the per-function V8, run the
+    // whole-program fixpoint to compute per-callee per-param
+    // unique-on-entry contracts. The per-function pass then consults
+    // the fixpoint when classifying `param_get`: a slot proven
+    // unique-on-entry across every reachable caller produces a
+    // unique dest, propagating into the function's owned-mutating
+    // call sites. This activates V8 on accumulator-recursion patterns
+    // (fannkuch-redux, k-nucleotide) where the receiver is passed
+    // through tail-recursive calls.
+    var program_uniqueness = zap.v8_interprocedural.analyzeProgram(alloc, program) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer program_uniqueness.deinit(alloc);
+
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
-        var uniqueness = zap.v8_uniqueness.analyzeUniqueness(alloc, function, program) catch |err| switch (err) {
+        var uniqueness = zap.v8_uniqueness.analyzeUniquenessWithFixpoint(
+            alloc,
+            function,
+            program,
+            &program_uniqueness,
+        ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
         };
         defer uniqueness.deinit(alloc);
         zap.arc_ownership.rewriteUncheckedV8SitesWithProgram(alloc, function, &uniqueness, program) catch return error.OutOfMemory;
     }
     for (program.functions) |*function| {
-        zap.arc_verifier.verify(alloc, function, program) catch |err| switch (err) {
+        zap.arc_verifier.verifyWithFixpoint(alloc, function, program, &program_uniqueness) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // Phase E (Phase 6 redux plan §3.E): the verifier rejects
             // IR that violates an ARC ownership invariant. The plan

@@ -2,6 +2,7 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
 const v8_uniqueness = @import("v8_uniqueness.zig");
+const v8_interprocedural = @import("v8_interprocedural.zig");
 
 // ============================================================
 // ARC ownership verifier.
@@ -126,11 +127,27 @@ pub fn verify(
     function: *const ir.Function,
     program: *const ir.Program,
 ) VerifyError!void {
+    return verifyWithFixpoint(allocator, function, program, null);
+}
+
+/// Variant of `verify` that consults a whole-program uniqueness
+/// fixpoint when running V8. The fixpoint feeds through to the
+/// per-function V8 analysis so `param_get` for slots proven
+/// unique-on-entry is treated as definitely unique. Required when
+/// the codegen used the same fixpoint to emit `*_owned_unchecked`
+/// calls — the verifier must agree on which sites pass V8 or it
+/// will reject codegen's output.
+pub fn verifyWithFixpoint(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: *const ir.Program,
+    fixpoint: ?*const v8_interprocedural.ProgramUniqueness,
+) VerifyError!void {
     var ctx = VerifyContext{ .function = function, .program = program };
     for (function.body) |block| {
         try verifyStream(&ctx, block.instructions);
     }
-    try runV8(allocator, function, program);
+    try runV8(allocator, function, program, fixpoint);
 }
 
 /// Per-verification context. Phase E.9 V7 added the `program`
@@ -931,6 +948,7 @@ fn runV8(
     allocator: std.mem.Allocator,
     function: *const ir.Function,
     program: *const ir.Program,
+    fixpoint: ?*const v8_interprocedural.ProgramUniqueness,
 ) VerifyError!void {
     // Fast path: scan the function for any unchecked call before
     // running the analysis. Most functions have no unchecked sites
@@ -938,7 +956,7 @@ fn runV8(
     // those keeps verifier overhead minimal.
     if (!hasUncheckedCallSite(function)) return;
 
-    var uniqueness = v8_uniqueness.analyzeUniqueness(allocator, function, program) catch |err| switch (err) {
+    var uniqueness = v8_uniqueness.analyzeUniquenessWithFixpoint(allocator, function, program, fixpoint) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer uniqueness.deinit(allocator);
@@ -2383,4 +2401,67 @@ test "arc_verifier: V8 rejects unchecked Vector.set on parameter receiver" {
 
     const result = verifyFunctionStandalone(testing.allocator, &function);
     try testing.expectError(error.ArcInvariantViolation, result);
+}
+
+test "arc_verifier: V8 accepts unchecked Map.put with fixpoint-proven unique parameter" {
+    // Companion to "V8 rejects unchecked Map.put with parameter receiver":
+    // when the interprocedural V8 fixpoint proves the parameter slot is
+    // unique-on-entry, the verifier accepts the unchecked call site.
+    // This is the integration seam that activates V8 on accumulator-
+    // recursion patterns where the receiver is a parameter.
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Same shape as the negative test, but with a fixpoint indicating
+    // slot 0 is unique-on-entry.
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 3;
+    args[1] = 1;
+    args[2] = 2;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .move_value = .{ .dest = 3, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put_owned_unchecked",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    };
+    const ownership = [_]ir.OwnershipClass{
+        .owned, .trivial, .trivial, .owned, .owned,
+    };
+    const conventions = [_]ir.ParamConvention{.owned};
+    var function = try buildTestFunction(
+        testing.allocator,
+        "test_v8_pos_param_with_fixpoint",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(testing.allocator, &function);
+
+    const functions = [_]ir.Function{function};
+    const program = ir.Program{
+        .functions = &functions,
+        .type_defs = &.{},
+        .entry = null,
+    };
+
+    // Build a fixpoint that says slot 0 is unique-on-entry.
+    var fixpoint: v8_interprocedural.ProgramUniqueness = .{};
+    defer fixpoint.deinit(testing.allocator);
+    const slots = try testing.allocator.alloc(bool, 1);
+    slots[0] = true;
+    try fixpoint.by_function.put(testing.allocator, function.id, slots);
+
+    try verifyWithFixpoint(testing.allocator, &functions[0], &program, &fixpoint);
 }

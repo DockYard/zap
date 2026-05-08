@@ -1,6 +1,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
+const v8_interprocedural = @import("v8_interprocedural.zig");
 
 // ============================================================
 // V8 — static-uniqueness analysis (Phase 3 of the dense-map plan).
@@ -141,10 +142,31 @@ pub fn analyzeUniqueness(
     function: *const ir.Function,
     program: ?*const ir.Program,
 ) !Uniqueness {
+    return analyzeUniquenessWithFixpoint(allocator, function, program, null);
+}
+
+/// Variant of `analyzeUniqueness` that consults a whole-program
+/// uniqueness fixpoint when classifying `param_get` instructions.
+/// When `fixpoint` is non-null and reports the parameter slot as
+/// proven unique-on-entry, the dest of the `param_get` is treated as
+/// `definitely_unique`. Otherwise the conservative default applies.
+///
+/// This is the integration seam for the interprocedural V8 fixpoint
+/// (see `v8_interprocedural.zig`). The compiler driver runs the
+/// fixpoint once per program, then calls this variant for every
+/// function so each per-function analysis sees the proven entry
+/// uniqueness.
+pub fn analyzeUniquenessWithFixpoint(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: ?*const ir.Program,
+    fixpoint: ?*const v8_interprocedural.ProgramUniqueness,
+) !Uniqueness {
     var analyzer = Analyzer{
         .allocator = allocator,
         .function = function,
         .program = program,
+        .fixpoint = fixpoint,
         .unique = .empty,
         .next_id = 0,
         .result = .{},
@@ -164,6 +186,13 @@ const Analyzer = struct {
     allocator: std.mem.Allocator,
     function: *const ir.Function,
     program: ?*const ir.Program,
+    /// Optional whole-program uniqueness fixpoint. When non-null, the
+    /// `param_get` handler consults this for the function's parameter
+    /// slots: a slot proven unique-on-entry by the fixpoint causes
+    /// the `param_get`'s dest to be marked `definitely_unique` so
+    /// downstream owned-mutating calls fed by an alias of that slot
+    /// observe the parameter's proven uniqueness.
+    fixpoint: ?*const v8_interprocedural.ProgramUniqueness,
     /// Set of LocalIds proven `definitely_unique` at the current
     /// program point. Updated by `applyEffect` as the walker visits
     /// each instruction in depth-first order.
@@ -606,13 +635,24 @@ const Analyzer = struct {
                 }
             },
             .param_get => |pg| {
-                // Parameters: the caller controls the refcount.
-                // Even an `.owned`-convention parameter could have
-                // been retained by an upstream caller (the convention
-                // says nothing about the caller's strategy beyond
-                // "the callee takes the +1"). Conservatively NOT
-                // unique.
-                _ = self.unique.remove(pg.dest);
+                // Interprocedural V8 (A1): consult the fixpoint when
+                // available. A slot proven `unique_on_entry` by the
+                // whole-program fixpoint guarantees every reachable
+                // caller passed a refcount=1 cell, so the param's
+                // first observation in this function is unique.
+                //
+                // Without the fixpoint we conservatively treat every
+                // parameter as potentially shared (the original
+                // intraprocedural default).
+                if (self.fixpoint) |fp| {
+                    if (fp.isUniqueOnEntry(self.function.id, pg.index)) {
+                        try self.unique.put(self.allocator, pg.dest, {});
+                    } else {
+                        _ = self.unique.remove(pg.dest);
+                    }
+                } else {
+                    _ = self.unique.remove(pg.dest);
+                }
             },
 
             // ----- Control flow / non-data-producing instructions -----
@@ -1176,4 +1216,89 @@ test "v8_uniqueness: non-owned-mutating call sites are absent from the result" {
 
     try testing.expect(!u.isUnique(2));
     try testing.expect(!u.sites.contains(2));
+}
+
+test "v8_uniqueness: param_get becomes unique when fixpoint says unique-on-entry" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Wrapper function shape — Map.put forwarder. Slot 0 is .owned.
+    //   [0] param_get %0 <- param[0]    -- map parameter
+    //   [1] move_value %1 <- %0
+    //   [2] const_int %2 = 0
+    //   [3] const_int %3 = 0
+    //   [4] call_builtin "Map.put" args=[%1, %2, %3] dest=%4
+    //   [5] ret %4
+    //
+    // Without fixpoint: V8 fails at id 4 (param_get clears uniqueness;
+    // %1's source is non-unique; the original conservative behaviour).
+    //
+    // With fixpoint (slot 0 unique-on-entry): V8 holds at id 4.
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 1;
+    args[1] = 2;
+    args[2] = 3;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .move_value = .{ .dest = 1, .source = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .const_int = .{ .dest = 3, .value = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+        .{ .ret = .{ .value = 4 } },
+    };
+    const conventions = [_]ir.ParamConvention{.owned};
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{
+        .label = 0,
+        .instructions = try arena.dupe(ir.Instruction, &instrs),
+    };
+    const ownership = try arena.alloc(ir.OwnershipClass, 5);
+    for (ownership) |*o| o.* = .owned;
+    const params = try arena.alloc(ir.Param, 1);
+    params[0] = .{ .name = "m", .type_expr = .void };
+    const function = ir.Function{
+        .id = 0,
+        .name = "wrapper",
+        .scope_id = 0,
+        .arity = 1,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = try arena.dupe(ir.ParamConvention, &conventions),
+        .local_ownership = ownership,
+        .result_convention = .owned,
+    };
+
+    // Without fixpoint: V8 should fail.
+    {
+        var u = try analyzeUniqueness(testing.allocator, &function, null);
+        defer u.deinit(testing.allocator);
+        try testing.expect(!u.isUnique(4));
+    }
+
+    // With fixpoint that says slot 0 is unique-on-entry: V8 holds.
+    {
+        var fixpoint: v8_interprocedural.ProgramUniqueness = .{};
+        defer fixpoint.deinit(testing.allocator);
+        const slots = try testing.allocator.alloc(bool, 1);
+        slots[0] = true;
+        try fixpoint.by_function.put(testing.allocator, 0, slots);
+
+        var u = try analyzeUniquenessWithFixpoint(testing.allocator, &function, null, &fixpoint);
+        defer u.deinit(testing.allocator);
+        try testing.expect(u.isUnique(4));
+    }
 }
