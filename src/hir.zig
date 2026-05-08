@@ -2303,9 +2303,15 @@ pub const HirBuilder = struct {
     /// reference node in hand (synthetic capture lookups, etc.) — that
     /// path falls through to the lexical-chain walker.
     fn resolveBindingType(self: *const HirBuilder, name: ast.StringId, reference_scopes: scope_mod.ScopeSet) types_mod.TypeId {
-        // Check assignment bindings first — these have types from the value
-        // expression and are always valid regardless of scope chain direction.
-        for (self.current_assignment_bindings.items) |binding| {
+        // Elixir-style shadowing: walk assignment bindings in reverse
+        // so the most recent rebinding wins over any earlier ones.
+        // This must mirror `buildBindingReference`'s ordering — both
+        // must agree on which binding `name` resolves to. See that
+        // function for the full rationale (Vector(T) ARC, etc.).
+        var assignment_idx = self.current_assignment_bindings.items.len;
+        while (assignment_idx > 0) {
+            assignment_idx -= 1;
+            const binding = self.current_assignment_bindings.items[assignment_idx];
             if (binding.name == name and binding.type_id != types_mod.TypeStore.UNKNOWN) {
                 return binding.type_id;
             }
@@ -2979,6 +2985,29 @@ pub const HirBuilder = struct {
         span: ast.SourceSpan,
         reference_scopes: scope_mod.ScopeSet,
     ) anyerror!?*const Expr {
+        // Elixir-style shadowing: assignment bindings (`name = expr`)
+        // shadow parameters of the same name, and the most recent
+        // rebinding wins over earlier ones in the same scope. See
+        // also `resolveBindingType` — both must agree on resolution.
+        // Reverse iteration of `current_assignment_bindings` picks the
+        // most recently appended binding, which is the most recent
+        // assignment in the lexical sequence of the current block.
+        // This is critical once `Vector(T)` (and other COW-mutable
+        // ARC types) become ARC-managed: an in-place pattern such as
+        // `arr = VectorI64.set(arr, i, v)` retains the receiver
+        // (refcount=2), so the call's COW path produces a NEW buffer
+        // bound to a fresh local. Without most-recent-wins resolution,
+        // every subsequent `arr` reference would silently observe the
+        // pre-call parameter, yielding stale reads from the original
+        // buffer.
+        var assignment_idx = self.current_assignment_bindings.items.len;
+        while (assignment_idx > 0) {
+            assignment_idx -= 1;
+            const binding = self.current_assignment_bindings.items[assignment_idx];
+            if (binding.name == name) {
+                return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
+            }
+        }
         for (self.current_param_names, 0..) |param_name, idx| {
             if (param_name) |pn| {
                 if (pn == name) {
@@ -3021,11 +3050,6 @@ pub const HirBuilder = struct {
             }
         }
         for (self.current_case_bindings.items) |binding| {
-            if (binding.name == name) {
-                return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
-            }
-        }
-        for (self.current_assignment_bindings.items) |binding| {
             if (binding.name == name) {
                 return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
             }
@@ -6368,6 +6392,161 @@ test "HIR function_ref keeps concrete function type" {
     try std.testing.expectEqual(@as(usize, 1), typ.function.params.len);
     try std.testing.expectEqual(types_mod.TypeStore.I64, typ.function.params[0]);
     try std.testing.expectEqual(types_mod.TypeStore.I64, typ.function.return_type);
+}
+
+test "HIR assignment rebinding shadows parameter (Elixir-style scope)" {
+    // Regression: prior to the shadow fix, `buildBindingReference`
+    // checked parameters BEFORE assignment bindings, so a rebind
+    // (`x = expr`) would silently leave every later `x` reference
+    // pointing at the original `param_get` rather than the new
+    // `local_get`. Once Vector(T) (and any other COW-mutable
+    // ARC-managed type) joins the ARC-managed set, the IR retains
+    // the receiver across the call, the runtime's COW path produces
+    // a fresh buffer, and that fresh buffer flows into a new local —
+    // the rebinding. Without this fix every later read of `x` would
+    // observe the pre-call buffer instead of the post-call buffer
+    // (silent miscompile, no crash).
+    //
+    // The test checks the resolution at HIR build time: after
+    // building `x = x + 100; x` for a parameter `x`, the function's
+    // body must contain a `local_set` followed by a `local_get`
+    // that targets the SAME local index (the rebinding) — NOT a
+    // `param_get` referencing slot 0 (the parameter).
+    const source =
+        \\pub struct Test {
+        \\  pub fn rebind(x :: i64) -> i64 {
+        \\    x = x + 100
+        \\    x
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    defer type_store.deinit();
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const stmts = hir_program.structs[0].functions[0].clauses[0].body.stmts;
+    // Expected lowering shape:
+    //   stmts[0] = local_set { index = N, value = (param_get 0) + 100 }
+    //   stmts[1] = expr { local_get N }
+    try std.testing.expect(stmts.len == 2);
+    try std.testing.expect(stmts[0] == .local_set);
+    try std.testing.expect(stmts[1] == .expr);
+
+    const rebind_index = stmts[0].local_set.index;
+    const final_expr = stmts[1].expr;
+    // The final expression must resolve to a `local_get` of the
+    // rebound local — NOT a `param_get`. Pre-fix this would have
+    // been `.param_get = 0` (the parameter slot), which is the
+    // exact silent miscompile the fix eliminates.
+    try std.testing.expect(final_expr.kind == .local_get);
+    try std.testing.expectEqual(rebind_index, final_expr.kind.local_get);
+}
+
+test "HIR chained assignment rebinds resolve most-recent-wins" {
+    // Chained rebindings: `x = x + 100; x = x + 1; x`. The third
+    // statement (the bare `x` reference) must resolve to the LATEST
+    // rebinding's local, not the parameter and not the first
+    // rebinding. This validates that `current_assignment_bindings`
+    // is walked in reverse so the most recently appended binding
+    // wins. Without reverse iteration the second rebinding would
+    // still resolve correctly (the first `x = x + 100` is also a
+    // local_get for the parameter, since at that point only the
+    // parameter is in scope), but the third reference would pick
+    // up the FIRST rebinding's local instead of the second's.
+    const source =
+        \\pub struct Test {
+        \\  pub fn chain(x :: i64) -> i64 {
+        \\    x = x + 100
+        \\    x = x + 1
+        \\    x
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    defer type_store.deinit();
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const stmts = hir_program.structs[0].functions[0].clauses[0].body.stmts;
+    try std.testing.expect(stmts.len == 3);
+    try std.testing.expect(stmts[0] == .local_set);
+    try std.testing.expect(stmts[1] == .local_set);
+    try std.testing.expect(stmts[2] == .expr);
+
+    const second_rebind_index = stmts[1].local_set.index;
+    const final_expr = stmts[2].expr;
+    try std.testing.expect(final_expr.kind == .local_get);
+    // The final reference must resolve to the SECOND rebinding,
+    // not the first — most-recent-wins semantics.
+    try std.testing.expectEqual(second_rebind_index, final_expr.kind.local_get);
+
+    // The second rebinding's RHS reads the FIRST rebinding (not the
+    // parameter), since that was the most recent binding at the
+    // time the second `x = x + 1` was lowered. We walk the RHS
+    // looking for a `local_get` reference and assert it points at
+    // the first rebinding's local — the exact shape of `+` lowering
+    // (call vs. native primitive) varies by typed-arith path, so
+    // we don't assert on the outer expression kind.
+    const first_rebind_index = stmts[0].local_set.index;
+    const second_rebind_rhs = stmts[1].local_set.value;
+    const found_first_rebind = walkForLocalGet(second_rebind_rhs, first_rebind_index);
+    try std.testing.expect(found_first_rebind);
+}
+
+/// Test helper: returns true iff `expr` (or any sub-expression
+/// reachable through call/binary/unary operands) contains a
+/// `local_get` referencing `target`. Used by the shadow-rebinding
+/// regression tests to ignore the exact lowering of `+` (which can
+/// be a `binary` for typed-arith primitives or a `call` for the
+/// Kernel-routed path, depending on the operand types).
+fn walkForLocalGet(expr: *const Expr, target: u32) bool {
+    switch (expr.kind) {
+        .local_get => |idx| return idx == target,
+        .call => |c| {
+            for (c.args) |arg| {
+                if (walkForLocalGet(arg.expr, target)) return true;
+            }
+            return false;
+        },
+        .binary => |b| {
+            if (walkForLocalGet(b.lhs, target)) return true;
+            if (walkForLocalGet(b.rhs, target)) return true;
+            return false;
+        },
+        .unary => |u| return walkForLocalGet(u.operand, target),
+        else => return false,
+    }
 }
 
 /// Map a TypeId to a human-readable name string for synthesized type naming.
