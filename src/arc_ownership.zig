@@ -2,6 +2,7 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
 const types_mod = @import("types.zig");
+const v8_uniqueness = @import("v8_uniqueness.zig");
 
 // ============================================================
 // ARC ownership classification and normalization pass.
@@ -2132,6 +2133,649 @@ const BuiltinConsumeSiteRewriter = struct {
     }
 };
 
+// ============================================================
+// Phase H/V8 (dense Map) — codegen rewrite to unchecked variants
+// ============================================================
+//
+// `rewriteUncheckedV8Sites` is the codegen counterpart to the V8
+// static-uniqueness analysis (`v8_uniqueness.zig`). The analysis
+// produces a per-call-site predicate: at this owned-mutating call,
+// is the receiver provably refcount=1 by construction? When the
+// answer is yes, the runtime's rc==1 fast path will fire — but the
+// runtime still pays a per-call cost for the atomic load + branch
+// that decides between the unique-mutate and shared-clone paths.
+//
+// This pass closes that gap. At every owned-mutating call site
+// (`Map.put` / `.delete` / `.merge`, `Vector.set` / `.push` / `.pop`
+// / `.append` and their post-monomorph encoded variants — see
+// `arc_liveness.ownedMutatingBuiltinSlot`) where V8 = true, we swap
+// the call's name to its `_owned_unchecked` peer. The unchecked
+// variant has an identical Zig signature and identical post-state
+// semantics; it just skips the rc-load-and-branch.
+//
+// Safety: the V8 verifier (`arc_verifier.runV8`) re-runs the
+// analysis after this rewrite and rejects any unchecked call where
+// uniqueness was not proven. A wrong rewrite here is therefore
+// caught by the verifier rather than reaching the runtime.
+//
+// Pipeline placement (per docs/dense-map-implementation-plan.md
+// §1.6):
+//
+//     ... → rewriteOwnedConsumeBuiltinSites   (Phase 4)
+//          → classifyAndNormalize             (borrow/copy)
+//             → rewriteOwnedConsumeSites      (Phase E.9.2)
+//                → rewriteUncheckedV8Sites    (THIS PASS)
+//                   → arc_verifier.verify     (V1-V8 — V8 catches mistakes)
+//                      → arc_drop_insertion
+//                         → ...
+//
+// This pass runs AFTER classifyAndNormalize and the Phase E.9.2
+// owned-consume rewrite for two reasons:
+//   1. The IR shape consumed by V8 must match the post-classification
+//      shape (move_value / borrow_value / copy_value all decided);
+//      the Phase 4 / E.9.2 rewrites give us that shape.
+//   2. The verifier runs immediately after this pass on the
+//      post-rewrite IR, so the verifier sees exactly what codegen
+//      will emit.
+//
+// The rewrite is purely a name swap: arg list, dest local, arg modes,
+// and surrounding instructions are unchanged. Only `call_builtin.name`
+// (or `call_named.name` / `try_call_named.name`) is rewritten.
+
+/// Rewrite owned-mutating call sites whose V8 predicate holds to use
+/// the `*_owned_unchecked` runtime variant. Reads `uniqueness` to
+/// gate per-site rewrites; sites where V8 fails are left untouched
+/// (the checked variant is correct).
+///
+/// `uniqueness` MUST have been computed against the SAME IR shape
+/// `function` currently presents — i.e., after every prior pass that
+/// could mutate instruction streams. Run this pass after
+/// `classifyAndNormalize` and `rewriteOwnedConsumeSites` so the
+/// instruction-id traversal aligns with the analysis.
+///
+/// Two rewrite shapes are produced:
+///
+///   1. `call_builtin "Map.put"` -> `call_builtin "Map.put_owned_unchecked"`
+///      (and Vector / monomorphized peers). The name is rewritten in
+///      place; arg list, dest, and arg modes are preserved verbatim.
+///
+///   2. `call_named "Map__put__3"` (or similar mangled name to a Zap
+///      thin wrapper whose body forwards to an owned-mutating
+///      call_builtin) -> `call_builtin "<runtime_name>_owned_unchecked"`.
+///      The wrapper is bypassed entirely: we look at the wrapper's
+///      body, lift the runtime call name, and emit the unchecked
+///      variant directly. The wrapper itself is unchanged (other
+///      callers without V8 still go through it).
+///
+/// `program` is required to resolve call_named callees to their
+/// wrapper bodies. Without `program`, only call_builtin sites are
+/// rewritten (used by the unit tests).
+pub fn rewriteUncheckedV8Sites(
+    allocator: std.mem.Allocator,
+    function: *ir.Function,
+    uniqueness: *const v8_uniqueness.Uniqueness,
+) !void {
+    return rewriteUncheckedV8SitesWithProgram(allocator, function, uniqueness, null);
+}
+
+/// Variant of `rewriteUncheckedV8Sites` that takes a program reference
+/// so call_named sites to Zap thin wrappers can be rewritten to
+/// call_builtin to the unchecked runtime variant. Used by the
+/// production pipeline (`compiler.zig::runArcOwnershipAndVerify`);
+/// unit tests that don't need the call_named rewrite call the
+/// no-program variant.
+pub fn rewriteUncheckedV8SitesWithProgram(
+    allocator: std.mem.Allocator,
+    function: *ir.Function,
+    uniqueness: *const v8_uniqueness.Uniqueness,
+    program: ?*const ir.Program,
+) !void {
+    var rewriter = UncheckedV8SiteRewriter{
+        .allocator = allocator,
+        .uniqueness = uniqueness,
+        .program = program,
+    };
+
+    for (function.body, 0..) |_, block_index| {
+        const block_ptr: *ir.Block = @constCast(&function.body[block_index]);
+        const original = block_ptr.instructions;
+        rewriter.next_id = computeStreamStartIdForBlock(function, block_index);
+        const rebuilt = try rewriter.rewriteStream(original);
+        if (rebuilt) |new_slice| {
+            block_ptr.instructions = new_slice;
+        }
+    }
+}
+
+/// Construct the unchecked peer of `name`. Returns `null` if `name`
+/// is not an owned-mutating builtin or already an unchecked variant.
+///
+/// Examples:
+///   "Map.put"                  -> "Map.put_owned_unchecked"
+///   "Map:i64:i64.put"          -> "Map:i64:i64.put_owned_unchecked"
+///   "VectorI64.set"            -> "VectorI64.set_owned_unchecked"
+///   "Vector.push"              -> "Vector.push_owned_unchecked"
+///   "Map.put_owned_unchecked"  -> null  (already unchecked)
+///   "Map.get"                  -> null  (not owned-mutating)
+fn allocUncheckedName(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+) !?[]const u8 {
+    if (arc_liveness.isUncheckedOwnedMutatingBuiltin(name)) return null;
+    if (arc_liveness.ownedMutatingBuiltinSlot(name) == null) return null;
+    return try std.fmt.allocPrint(allocator, "{s}_owned_unchecked", .{name});
+}
+
+const UncheckedV8SiteRewriter = struct {
+    allocator: std.mem.Allocator,
+    uniqueness: *const v8_uniqueness.Uniqueness,
+    program: ?*const ir.Program,
+    /// Running InstructionId mirrored from
+    /// `arc_liveness.assignInstructionIds` / `v8_uniqueness.Analyzer`'s
+    /// depth-first walk. The id at each owned-mutating call site must
+    /// match the id under which V8 recorded its predicate; otherwise
+    /// the rewrite would consult the wrong site.
+    next_id: arc_liveness.InstructionId = 0,
+
+    /// Per-site rewrite plan: either rename the existing call (in
+    /// place name swap) or replace the whole instruction (turn a
+    /// call_named to a thin wrapper into a direct call_builtin to the
+    /// unchecked runtime variant).
+    const SiteRewrite = union(enum) {
+        rename: []const u8,
+        replace: ir.Instruction,
+    };
+
+    fn rewriteStream(
+        self: *UncheckedV8SiteRewriter,
+        stream: []const ir.Instruction,
+    ) error{OutOfMemory}!?[]const ir.Instruction {
+        // First pass: recurse into nested streams, assign ids, and
+        // collect any rebuilt children. The recursion mirrors
+        // `v8_uniqueness.Analyzer.walkStream`'s DFS so per-call ids
+        // line up with the analysis's recorded predicate.
+        var rebuilt_children: std.ArrayListUnmanaged(?ir.Instruction) = .empty;
+        defer rebuilt_children.deinit(self.allocator);
+        try rebuilt_children.ensureTotalCapacity(self.allocator, stream.len);
+
+        var top_level_ids: std.ArrayListUnmanaged(arc_liveness.InstructionId) = .empty;
+        defer top_level_ids.deinit(self.allocator);
+        try top_level_ids.ensureTotalCapacity(self.allocator, stream.len);
+
+        var any_change = false;
+        for (stream) |*instr| {
+            const id = self.next_id;
+            self.next_id += 1;
+            try top_level_ids.append(self.allocator, id);
+            const child = try self.rewriteChildren(instr);
+            if (child) |_| any_change = true;
+            try rebuilt_children.append(self.allocator, child);
+        }
+
+        // Second pass: scan for owned-mutating call sites whose V8
+        // predicate is true; queue per-call rewrites.
+        var plan: std.AutoHashMapUnmanaged(usize, SiteRewrite) = .empty;
+        defer plan.deinit(self.allocator);
+
+        for (stream, 0..) |_, idx| {
+            const effective = rebuilt_children.items[idx] orelse stream[idx];
+            const id = top_level_ids.items[idx];
+            if (!self.uniqueness.isUnique(id)) continue;
+
+            // Direct builtin name swap.
+            if (ownedMutatingCallName(effective)) |checked_name| {
+                if (try allocUncheckedName(self.allocator, checked_name)) |unchecked| {
+                    try plan.put(self.allocator, idx, .{ .rename = unchecked });
+                    any_change = true;
+                    continue;
+                }
+            }
+
+            // Zap-fn wrapper (call_named / call_direct / try_call_named):
+            // bypass the wrapper by lifting its body's runtime call
+            // and emitting the unchecked variant directly.
+            if (try self.planCalleeBypass(effective)) |bypass| {
+                try plan.put(self.allocator, idx, .{ .replace = bypass });
+                any_change = true;
+            }
+        }
+
+        if (!any_change) return null;
+
+        var new_instrs: std.ArrayListUnmanaged(ir.Instruction) = .empty;
+        errdefer new_instrs.deinit(self.allocator);
+        try new_instrs.ensureTotalCapacity(self.allocator, stream.len);
+
+        for (stream, 0..) |_, idx| {
+            const effective = rebuilt_children.items[idx] orelse stream[idx];
+            if (plan.get(idx)) |rewrite| {
+                switch (rewrite) {
+                    .rename => |new_name| try new_instrs.append(self.allocator, withRenamedCall(effective, new_name)),
+                    .replace => |new_instr| try new_instrs.append(self.allocator, new_instr),
+                }
+            } else {
+                try new_instrs.append(self.allocator, effective);
+            }
+        }
+
+        return try new_instrs.toOwnedSlice(self.allocator);
+    }
+
+    /// If `instr` is a call to a Zap thin wrapper that forwards to an
+    /// owned-mutating runtime call_builtin, return a `call_builtin`
+    /// instruction that bypasses the wrapper and invokes the
+    /// `*_owned_unchecked` runtime variant directly. Returns null
+    /// when the call is not a recognised wrapper shape, when the
+    /// program reference is absent, or when no V8-eligible runtime
+    /// call is found inside the wrapper body.
+    ///
+    /// The wrapper bypass is sound because:
+    ///   * V8 holds at this site (caller's gate, checked by caller).
+    ///   * The Zap wrapper has at least one `.owned` slot + `.owned`
+    ///     result (the convention pair), meaning it consumes the
+    ///     caller's +1 and returns a fresh +1. Bypassing forwards
+    ///     the +1 directly to the runtime, which has the same
+    ///     contract.
+    ///   * `arg_modes`, dest, and args are preserved verbatim.
+    fn planCalleeBypass(
+        self: *UncheckedV8SiteRewriter,
+        instr: ir.Instruction,
+    ) error{OutOfMemory}!?ir.Instruction {
+        const program = self.program orelse return null;
+        const callee_info = calleeInfoFromCall(instr) orelse return null;
+        const callee = lookupFunctionByName(program, callee_info.name) orelse
+            (lookupFunctionById(program, callee_info.function_id) orelse return null);
+
+        // Soundness gate: the wrapper MUST have at least one `.owned`
+        // slot + `.owned` result convention. Without this, V8 wouldn't
+        // have classified the call as owned-mutating, so reaching
+        // here means it did, but we re-check defensively to avoid a
+        // mismatch between v8_uniqueness's classifier and ours.
+        if (functionHasOwnedReceiverConvention(callee) == null) return null;
+
+        const runtime_name = (findRuntimeOwnedMutatingCall(callee)) orelse return null;
+
+        // Only bypass when the wrapper's body is a thin 1:1 forward
+        // to the runtime intrinsic — same arity, args lined up, no
+        // intermediate reshaping. The signature compatibility check
+        // is structural: the bypass replacement passes the exact
+        // arg list to the unchecked builtin, so the wrapper must
+        // accept the same arity. Mismatched arity is a sign that the
+        // wrapper does extra work (e.g., default-arg expansion or a
+        // pre-call helper) that we cannot safely skip.
+        if (callee.arity != callee_info.args.len) return null;
+
+        const unchecked = (try allocUncheckedName(self.allocator, runtime_name)) orelse return null;
+
+        return ir.Instruction{ .call_builtin = .{
+            .dest = callee_info.dest,
+            .name = unchecked,
+            .args = callee_info.args,
+            .arg_modes = callee_info.arg_modes,
+        } };
+    }
+
+
+    fn rewriteChildren(
+        self: *UncheckedV8SiteRewriter,
+        instr: *const ir.Instruction,
+    ) error{OutOfMemory}!?ir.Instruction {
+        switch (instr.*) {
+            .if_expr => |ie| {
+                const new_then = try self.rewriteStream(ie.then_instrs);
+                const new_else = try self.rewriteStream(ie.else_instrs);
+                if (new_then == null and new_else == null) return null;
+                var copy = ie;
+                if (new_then) |s| copy.then_instrs = s;
+                if (new_else) |s| copy.else_instrs = s;
+                return ir.Instruction{ .if_expr = copy };
+            },
+            .case_block => |cb| {
+                var any_change = false;
+                const new_pre = try self.rewriteStream(cb.pre_instrs);
+                if (new_pre != null) any_change = true;
+                const new_default = try self.rewriteStream(cb.default_instrs);
+                if (new_default != null) any_change = true;
+                var new_arms = try self.allocator.alloc(ir.IrCaseArm, cb.arms.len);
+                var arms_changed = false;
+                for (cb.arms, 0..) |arm, idx| {
+                    var arm_copy = arm;
+                    const new_cond = try self.rewriteStream(arm.cond_instrs);
+                    const new_body = try self.rewriteStream(arm.body_instrs);
+                    if (new_cond) |s| {
+                        arm_copy.cond_instrs = s;
+                        arms_changed = true;
+                    }
+                    if (new_body) |s| {
+                        arm_copy.body_instrs = s;
+                        arms_changed = true;
+                    }
+                    new_arms[idx] = arm_copy;
+                }
+                if (!any_change and !arms_changed) {
+                    self.allocator.free(new_arms);
+                    return null;
+                }
+                var copy = cb;
+                if (new_pre) |s| copy.pre_instrs = s;
+                if (new_default) |s| copy.default_instrs = s;
+                if (arms_changed) {
+                    copy.arms = new_arms;
+                } else {
+                    self.allocator.free(new_arms);
+                }
+                return ir.Instruction{ .case_block = copy };
+            },
+            .switch_literal => |sl| {
+                var any_change = false;
+                const new_default = try self.rewriteStream(sl.default_instrs);
+                if (new_default != null) any_change = true;
+                var new_cases = try self.allocator.alloc(ir.LitCase, sl.cases.len);
+                var cases_changed = false;
+                for (sl.cases, 0..) |c, idx| {
+                    var c_copy = c;
+                    const new_body = try self.rewriteStream(c.body_instrs);
+                    if (new_body) |s| {
+                        c_copy.body_instrs = s;
+                        cases_changed = true;
+                    }
+                    new_cases[idx] = c_copy;
+                }
+                if (!any_change and !cases_changed) {
+                    self.allocator.free(new_cases);
+                    return null;
+                }
+                var copy = sl;
+                if (new_default) |s| copy.default_instrs = s;
+                if (cases_changed) {
+                    copy.cases = new_cases;
+                } else {
+                    self.allocator.free(new_cases);
+                }
+                return ir.Instruction{ .switch_literal = copy };
+            },
+            .switch_return => |sr| {
+                var any_change = false;
+                const new_default = try self.rewriteStream(sr.default_instrs);
+                if (new_default != null) any_change = true;
+                var new_cases = try self.allocator.alloc(ir.ReturnCase, sr.cases.len);
+                var cases_changed = false;
+                for (sr.cases, 0..) |c, idx| {
+                    var c_copy = c;
+                    const new_body = try self.rewriteStream(c.body_instrs);
+                    if (new_body) |s| {
+                        c_copy.body_instrs = s;
+                        cases_changed = true;
+                    }
+                    new_cases[idx] = c_copy;
+                }
+                if (!any_change and !cases_changed) {
+                    self.allocator.free(new_cases);
+                    return null;
+                }
+                var copy = sr;
+                if (new_default) |s| copy.default_instrs = s;
+                if (cases_changed) {
+                    copy.cases = new_cases;
+                } else {
+                    self.allocator.free(new_cases);
+                }
+                return ir.Instruction{ .switch_return = copy };
+            },
+            .union_switch => |us| {
+                var new_cases = try self.allocator.alloc(ir.UnionCase, us.cases.len);
+                var cases_changed = false;
+                for (us.cases, 0..) |c, idx| {
+                    var c_copy = c;
+                    const new_body = try self.rewriteStream(c.body_instrs);
+                    if (new_body) |s| {
+                        c_copy.body_instrs = s;
+                        cases_changed = true;
+                    }
+                    new_cases[idx] = c_copy;
+                }
+                if (!cases_changed) {
+                    self.allocator.free(new_cases);
+                    return null;
+                }
+                var copy = us;
+                copy.cases = new_cases;
+                return ir.Instruction{ .union_switch = copy };
+            },
+            .union_switch_return => |usr| {
+                var new_cases = try self.allocator.alloc(ir.UnionCase, usr.cases.len);
+                var cases_changed = false;
+                for (usr.cases, 0..) |c, idx| {
+                    var c_copy = c;
+                    const new_body = try self.rewriteStream(c.body_instrs);
+                    if (new_body) |s| {
+                        c_copy.body_instrs = s;
+                        cases_changed = true;
+                    }
+                    new_cases[idx] = c_copy;
+                }
+                if (!cases_changed) {
+                    self.allocator.free(new_cases);
+                    return null;
+                }
+                var copy = usr;
+                copy.cases = new_cases;
+                return ir.Instruction{ .union_switch_return = copy };
+            },
+            .try_call_named => |tcn| {
+                const new_handler = try self.rewriteStream(tcn.handler_instrs);
+                const new_success = try self.rewriteStream(tcn.success_instrs);
+                if (new_handler == null and new_success == null) return null;
+                var copy = tcn;
+                if (new_handler) |s| copy.handler_instrs = s;
+                if (new_success) |s| copy.success_instrs = s;
+                return ir.Instruction{ .try_call_named = copy };
+            },
+            .guard_block => |gb| {
+                const new_body = try self.rewriteStream(gb.body);
+                if (new_body == null) return null;
+                var copy = gb;
+                copy.body = new_body.?;
+                return ir.Instruction{ .guard_block = copy };
+            },
+            .optional_dispatch => |od| {
+                const new_nil = try self.rewriteStream(od.nil_instrs);
+                const new_struct = try self.rewriteStream(od.struct_instrs);
+                if (new_nil == null and new_struct == null) return null;
+                var copy = od;
+                if (new_nil) |s| copy.nil_instrs = s;
+                if (new_struct) |s| copy.struct_instrs = s;
+                return ir.Instruction{ .optional_dispatch = copy };
+            },
+            else => return null,
+        }
+    }
+};
+
+/// Read the callee name from an owned-mutating call site, regardless
+/// of which call instruction shape it takes. Returns null when the
+/// instruction is not a recognised owned-mutating call.
+fn ownedMutatingCallName(instr: ir.Instruction) ?[]const u8 {
+    return switch (instr) {
+        .call_builtin => |cb| cb.name,
+        .call_named => |cn| cn.name,
+        .try_call_named => |tcn| tcn.name,
+        else => null,
+    };
+}
+
+const CalleeInfo = struct {
+    name: []const u8,
+    function_id: ?ir.FunctionId,
+    dest: ir.LocalId,
+    args: []const ir.LocalId,
+    arg_modes: []const ir.ValueMode,
+};
+
+/// Extract the parts of a call instruction needed to build a
+/// `call_builtin` replacement. Returns null when the instruction is
+/// not a call shape we can rewrite (e.g., closure / dispatch calls
+/// don't have a stable runtime name and aren't covered).
+fn calleeInfoFromCall(instr: ir.Instruction) ?CalleeInfo {
+    return switch (instr) {
+        .call_named => |cn| .{
+            .name = cn.name,
+            .function_id = null,
+            .dest = cn.dest,
+            .args = cn.args,
+            .arg_modes = cn.arg_modes,
+        },
+        .call_direct => |cd| .{
+            .name = "",
+            .function_id = cd.function,
+            .dest = cd.dest,
+            .args = cd.args,
+            .arg_modes = cd.arg_modes,
+        },
+        .try_call_named => |tcn| .{
+            .name = tcn.name,
+            .function_id = null,
+            .dest = tcn.dest,
+            .args = tcn.args,
+            .arg_modes = tcn.arg_modes,
+        },
+        else => null,
+    };
+}
+
+/// Return the index of the first `.owned` parameter slot when
+/// `function` has at least one such slot AND
+/// `result_convention == .owned`. Returns null otherwise. Mirror of
+/// `v8_uniqueness.calleeFunctionOwnedReceiverSlot` to keep the
+/// rewriter and analyzer in lock-step on what counts as an owned-
+/// mutating Zap-fn wrapper.
+fn functionHasOwnedReceiverConvention(function: *const ir.Function) ?usize {
+    if (function.result_convention != .owned) return null;
+    for (function.param_conventions, 0..) |conv, idx| {
+        if (conv == .owned) return idx;
+    }
+    return null;
+}
+
+fn lookupFunctionByName(program: *const ir.Program, name: []const u8) ?*const ir.Function {
+    if (name.len == 0) return null;
+    for (program.functions) |*func| {
+        if (std.mem.eql(u8, func.name, name)) return func;
+    }
+    return null;
+}
+
+fn lookupFunctionById(program: *const ir.Program, id: ?ir.FunctionId) ?*const ir.Function {
+    const fid = id orelse return null;
+    for (program.functions) |*func| {
+        if (func.id == fid) return func;
+    }
+    return null;
+}
+
+/// Walk `function`'s body for the FIRST owned-mutating runtime
+/// call_builtin and return its name. The Zap thin wrappers in
+/// `lib/vector_*.zap` and `lib/map.zap` each contain a single
+/// forwarding `:zig.<Type>.<method>(...)` line, so the first hit is
+/// the runtime call. Returns null when no owned-mutating runtime
+/// call_builtin exists in the wrapper's body (the function is not a
+/// thin wrapper around an owned-mutating intrinsic).
+fn findRuntimeOwnedMutatingCall(function: *const ir.Function) ?[]const u8 {
+    for (function.body) |block| {
+        if (findRuntimeOwnedMutatingCallInStream(block.instructions)) |name| return name;
+    }
+    return null;
+}
+
+fn findRuntimeOwnedMutatingCallInStream(stream: []const ir.Instruction) ?[]const u8 {
+    for (stream) |*instr| {
+        switch (instr.*) {
+            .call_builtin => |cb| {
+                if (arc_liveness.ownedMutatingBuiltinSlot(cb.name) != null and
+                    !arc_liveness.isUncheckedOwnedMutatingBuiltin(cb.name))
+                {
+                    return cb.name;
+                }
+            },
+            .if_expr => |ie| {
+                if (findRuntimeOwnedMutatingCallInStream(ie.then_instrs)) |n| return n;
+                if (findRuntimeOwnedMutatingCallInStream(ie.else_instrs)) |n| return n;
+            },
+            .case_block => |cb| {
+                if (findRuntimeOwnedMutatingCallInStream(cb.pre_instrs)) |n| return n;
+                for (cb.arms) |arm| {
+                    if (findRuntimeOwnedMutatingCallInStream(arm.cond_instrs)) |n| return n;
+                    if (findRuntimeOwnedMutatingCallInStream(arm.body_instrs)) |n| return n;
+                }
+                if (findRuntimeOwnedMutatingCallInStream(cb.default_instrs)) |n| return n;
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| {
+                    if (findRuntimeOwnedMutatingCallInStream(c.body_instrs)) |n| return n;
+                }
+                if (findRuntimeOwnedMutatingCallInStream(sl.default_instrs)) |n| return n;
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| {
+                    if (findRuntimeOwnedMutatingCallInStream(c.body_instrs)) |n| return n;
+                }
+                if (findRuntimeOwnedMutatingCallInStream(sr.default_instrs)) |n| return n;
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| {
+                    if (findRuntimeOwnedMutatingCallInStream(c.body_instrs)) |n| return n;
+                }
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| {
+                    if (findRuntimeOwnedMutatingCallInStream(c.body_instrs)) |n| return n;
+                }
+            },
+            .try_call_named => |tcn| {
+                if (findRuntimeOwnedMutatingCallInStream(tcn.handler_instrs)) |n| return n;
+                if (findRuntimeOwnedMutatingCallInStream(tcn.success_instrs)) |n| return n;
+            },
+            .guard_block => |gb| {
+                if (findRuntimeOwnedMutatingCallInStream(gb.body)) |n| return n;
+            },
+            .optional_dispatch => |od| {
+                if (findRuntimeOwnedMutatingCallInStream(od.nil_instrs)) |n| return n;
+                if (findRuntimeOwnedMutatingCallInStream(od.struct_instrs)) |n| return n;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Return a copy of `instr` with its callee name replaced by
+/// `new_name`. Only the name field is rewritten; arg list, dest,
+/// arg_modes, and any nested streams are preserved verbatim. The
+/// caller is responsible for invoking this only on instruction
+/// shapes that have a name field — `ownedMutatingCallName` returning
+/// non-null is the gate.
+fn withRenamedCall(instr: ir.Instruction, new_name: []const u8) ir.Instruction {
+    return switch (instr) {
+        .call_builtin => |cb| .{ .call_builtin = .{
+            .dest = cb.dest,
+            .name = new_name,
+            .args = cb.args,
+            .arg_modes = cb.arg_modes,
+        } },
+        .call_named => |cn| blk: {
+            var copy = cn;
+            copy.name = new_name;
+            break :blk .{ .call_named = copy };
+        },
+        .try_call_named => |tcn| blk: {
+            var copy = tcn;
+            copy.name = new_name;
+            break :blk .{ .try_call_named = copy };
+        },
+        else => instr,
+    };
+}
+
 test "arc_ownership: stub function signature compiles" {
     // Phase A's stub must not error and must not require any
     // particular function shape. The integration test in compiler.zig
@@ -3487,4 +4131,659 @@ test "arc_ownership: rewriteOwnedConsumeBuiltinSites recognizes monomorphized Ma
         }
     }
     try std.testing.expect(saw_move_dest_1);
+}
+
+// ============================================================
+// Phase H/V8 (codegen) tests — rewriteUncheckedV8Sites
+// ============================================================
+//
+// These tests verify the post-Phase-4 codegen rewrite pass that
+// flips owned-mutating call sites from their checked names to the
+// `*_owned_unchecked` peers when the V8 static-uniqueness analysis
+// reports the receiver is provably refcount=1 by construction.
+//
+// Each test hand-rolls a tiny IR shape and runs the analysis end-
+// to-end (real `v8_uniqueness.analyzeUniqueness`), then invokes the
+// rewriter and asserts on the call site's name field.
+//
+// Positive cases (V8 holds): name is rewritten to `*_owned_unchecked`.
+// Negative cases (V8 fails): name is unchanged.
+// Regression cases: parked-receiver and parameter-receiver shapes
+// where V8 must fail; the rewrite must not fire.
+
+fn expectCallBuiltinName(stream: []const ir.Instruction, dest: ir.LocalId, expected: []const u8) !void {
+    for (stream) |instr| {
+        switch (instr) {
+            .call_builtin => |cb| if (cb.dest == dest) {
+                try std.testing.expectEqualStrings(expected, cb.name);
+                return;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(false); // call site not found
+}
+
+test "arc_ownership: rewriteUncheckedV8Sites swaps Map.put -> Map.put_owned_unchecked when V8 holds" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Stream:
+    //   [0] map_init %0 = {}                 -- fresh-alloc, unique
+    //   [1] const_int %1 = 0
+    //   [2] const_int %2 = 0
+    //   [3] move_value %3 <- %0              -- transfers uniqueness
+    //   [4] call_builtin "Map.put" args=[%3, %1, %2] dest=%4
+    //
+    // V8 holds at id 4 -> rewrite to "Map.put_owned_unchecked".
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 3;
+    args[1] = 1;
+    args[2] = 2;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .move_value = .{ .dest = 3, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .trivial, .trivial, .owned, .owned,
+    });
+    var function = ir.Function{
+        .id = 300,
+        .name = "Mod__caller__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    var uniqueness = try v8_uniqueness.analyzeUniqueness(arena, &function, null);
+    defer uniqueness.deinit(arena);
+    try std.testing.expect(uniqueness.isUnique(4));
+
+    try rewriteUncheckedV8Sites(arena, &function, &uniqueness);
+
+    try expectCallBuiltinName(function.body[0].instructions, 4, "Map.put_owned_unchecked");
+}
+
+test "arc_ownership: rewriteUncheckedV8Sites leaves Map.put unchanged when V8 fails (parked receiver)" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Stream — same shape as the v8_uniqueness "parked" test:
+    //   [0] map_init %0 = {}              -- fresh, unique
+    //   [1] const_nil %1
+    //   [2] list_cons %2 = [%0 | %1]      -- parks %0 (V8 cleared)
+    //   [3] const_int %3 = 0
+    //   [4] const_int %4 = 0
+    //   [5] move_value %5 <- %0
+    //   [6] call_builtin "Map.put" args=[%5, %3, %4] dest=%6
+    //
+    // V8 fails at id 6 -> name MUST stay "Map.put".
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 5;
+    args[1] = 3;
+    args[2] = 4;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .const_nil = 1 },
+        .{ .list_cons = .{ .dest = 2, .head = 0, .tail = 1 } },
+        .{ .const_int = .{ .dest = 3, .value = 0 } },
+        .{ .const_int = .{ .dest = 4, .value = 0 } },
+        .{ .move_value = .{ .dest = 5, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 6,
+            .name = "Map.put",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .trivial, .owned, .trivial, .trivial, .owned, .owned,
+    });
+    var function = ir.Function{
+        .id = 301,
+        .name = "Mod__caller__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 7,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    var uniqueness = try v8_uniqueness.analyzeUniqueness(arena, &function, null);
+    defer uniqueness.deinit(arena);
+    try std.testing.expect(!uniqueness.isUnique(6));
+
+    try rewriteUncheckedV8Sites(arena, &function, &uniqueness);
+
+    try expectCallBuiltinName(function.body[0].instructions, 6, "Map.put");
+}
+
+test "arc_ownership: rewriteUncheckedV8Sites swaps Vector.set, Vector.push, Vector.pop, Vector.append" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Stream:
+    //   [0] call_builtin "Vector.new_filled" -> %0    -- not classified by V8
+    //   [1] move_value %1 <- %0
+    //   [2] const_int %2 = 0
+    //   [3] const_int %3 = 1
+    //   [4] call_builtin "Vector.set" args=[%1, %2, %3] dest=%4    -- result unique
+    //   [5] move_value %5 <- %4
+    //   [6] const_int %6 = 9
+    //   [7] call_builtin "Vector.push" args=[%5, %6] dest=%7       -- result unique
+    //   [8] move_value %8 <- %7
+    //   [9] call_builtin "Vector.pop" args=[%8] dest=%9             -- result unique
+    //   [10] move_value %10 <- %9
+    //   [11] call_builtin "Vector.append" args=[%10, %10] dest=%11  -- V8 holds
+    //
+    // The Vector.set at id 4 fails V8 (Vector.new_filled is not classified as
+    // unique-producer). But ids 7, 9, 11 follow owned-mutating predecessors
+    // and so V8 holds.
+    const ctor_args = try arena.alloc(ir.LocalId, 0);
+    const ctor_modes = try arena.alloc(ir.ValueMode, 0);
+    const set_args = try arena.alloc(ir.LocalId, 3);
+    set_args[0] = 1;
+    set_args[1] = 2;
+    set_args[2] = 3;
+    const set_modes = try arena.alloc(ir.ValueMode, 3);
+    set_modes[0] = .move;
+    set_modes[1] = .borrow;
+    set_modes[2] = .borrow;
+    const push_args = try arena.alloc(ir.LocalId, 2);
+    push_args[0] = 5;
+    push_args[1] = 6;
+    const push_modes = try arena.alloc(ir.ValueMode, 2);
+    push_modes[0] = .move;
+    push_modes[1] = .borrow;
+    const pop_args = try arena.alloc(ir.LocalId, 1);
+    pop_args[0] = 8;
+    const pop_modes = try arena.alloc(ir.ValueMode, 1);
+    pop_modes[0] = .move;
+    const append_args = try arena.alloc(ir.LocalId, 2);
+    append_args[0] = 10;
+    append_args[1] = 10;
+    const append_modes = try arena.alloc(ir.ValueMode, 2);
+    append_modes[0] = .move;
+    append_modes[1] = .borrow;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .call_builtin = .{
+            .dest = 0,
+            .name = "Vector.new_filled",
+            .args = ctor_args,
+            .arg_modes = ctor_modes,
+        } },
+        .{ .move_value = .{ .dest = 1, .source = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .const_int = .{ .dest = 3, .value = 1 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Vector.set",
+            .args = set_args,
+            .arg_modes = set_modes,
+        } },
+        .{ .move_value = .{ .dest = 5, .source = 4 } },
+        .{ .const_int = .{ .dest = 6, .value = 9 } },
+        .{ .call_builtin = .{
+            .dest = 7,
+            .name = "Vector.push",
+            .args = push_args,
+            .arg_modes = push_modes,
+        } },
+        .{ .move_value = .{ .dest = 8, .source = 7 } },
+        .{ .call_builtin = .{
+            .dest = 9,
+            .name = "Vector.pop",
+            .args = pop_args,
+            .arg_modes = pop_modes,
+        } },
+        .{ .move_value = .{ .dest = 10, .source = 9 } },
+        .{ .call_builtin = .{
+            .dest = 11,
+            .name = "Vector.append",
+            .args = append_args,
+            .arg_modes = append_modes,
+        } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .trivial, .trivial, .owned, .owned, .trivial, .owned, .owned, .owned, .owned, .owned,
+    });
+    var function = ir.Function{
+        .id = 302,
+        .name = "Mod__caller__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 12,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    var uniqueness = try v8_uniqueness.analyzeUniqueness(arena, &function, null);
+    defer uniqueness.deinit(arena);
+    // V8 holds at the chained sites; the first Vector.set may also
+    // be unique because Vector.new_filled is owned-mutating-classified
+    // (it's NOT in ownedMutatingBuiltinSlot, so its result is NOT
+    // classified as unique by the analysis -> Vector.set's V8 fails).
+    try std.testing.expect(uniqueness.isUnique(7));
+    try std.testing.expect(uniqueness.isUnique(9));
+    try std.testing.expect(uniqueness.isUnique(11));
+
+    try rewriteUncheckedV8Sites(arena, &function, &uniqueness);
+
+    // Vector.set at id 4 had V8 = false -> name stays.
+    try expectCallBuiltinName(function.body[0].instructions, 4, "Vector.set");
+    try expectCallBuiltinName(function.body[0].instructions, 7, "Vector.push_owned_unchecked");
+    try expectCallBuiltinName(function.body[0].instructions, 9, "Vector.pop_owned_unchecked");
+    try expectCallBuiltinName(function.body[0].instructions, 11, "Vector.append_owned_unchecked");
+}
+
+test "arc_ownership: rewriteUncheckedV8Sites handles Map.delete and Map.merge" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Stream:
+    //   [0] map_init %0 = {}                  -- fresh, unique
+    //   [1] const_int %1 = 0
+    //   [2] move_value %2 <- %0
+    //   [3] call_builtin "Map.delete" args=[%2, %1] dest=%3
+    //   [4] map_init %4 = {}
+    //   [5] move_value %5 <- %3
+    //   [6] move_value %6 <- %4
+    //   [7] call_builtin "Map.merge" args=[%5, %6] dest=%7
+    //
+    // V8 holds at ids 3 and 7 -> both rewrite to unchecked.
+    const delete_args = try arena.alloc(ir.LocalId, 2);
+    delete_args[0] = 2;
+    delete_args[1] = 1;
+    const delete_modes = try arena.alloc(ir.ValueMode, 2);
+    delete_modes[0] = .move;
+    delete_modes[1] = .borrow;
+    const merge_args = try arena.alloc(ir.LocalId, 2);
+    merge_args[0] = 5;
+    merge_args[1] = 6;
+    const merge_modes = try arena.alloc(ir.ValueMode, 2);
+    merge_modes[0] = .move;
+    merge_modes[1] = .move;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .move_value = .{ .dest = 2, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 3,
+            .name = "Map.delete",
+            .args = delete_args,
+            .arg_modes = delete_modes,
+        } },
+        .{ .map_init = .{ .dest = 4, .entries = &.{} } },
+        .{ .move_value = .{ .dest = 5, .source = 3 } },
+        .{ .move_value = .{ .dest = 6, .source = 4 } },
+        .{ .call_builtin = .{
+            .dest = 7,
+            .name = "Map.merge",
+            .args = merge_args,
+            .arg_modes = merge_modes,
+        } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .trivial, .owned, .owned, .owned, .owned, .owned, .owned,
+    });
+    var function = ir.Function{
+        .id = 303,
+        .name = "Mod__caller__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 8,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    var uniqueness = try v8_uniqueness.analyzeUniqueness(arena, &function, null);
+    defer uniqueness.deinit(arena);
+    try std.testing.expect(uniqueness.isUnique(3));
+    try std.testing.expect(uniqueness.isUnique(7));
+
+    try rewriteUncheckedV8Sites(arena, &function, &uniqueness);
+
+    try expectCallBuiltinName(function.body[0].instructions, 3, "Map.delete_owned_unchecked");
+    try expectCallBuiltinName(function.body[0].instructions, 7, "Map.merge_owned_unchecked");
+}
+
+test "arc_ownership: rewriteUncheckedV8Sites preserves monomorphized Map:K:V.method names" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Stream:
+    //   [0] map_init %0 = {}
+    //   [1] const_int %1 = 7
+    //   [2] const_int %2 = 11
+    //   [3] move_value %3 <- %0
+    //   [4] call_builtin "Map:i64:i64.put" args=[%3, %1, %2] dest=%4
+    //
+    // V8 holds -> name becomes "Map:i64:i64.put_owned_unchecked".
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 3;
+    args[1] = 1;
+    args[2] = 2;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .const_int = .{ .dest = 1, .value = 7 } },
+        .{ .const_int = .{ .dest = 2, .value = 11 } },
+        .{ .move_value = .{ .dest = 3, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map:i64:i64.put",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .trivial, .trivial, .owned, .owned,
+    });
+    var function = ir.Function{
+        .id = 304,
+        .name = "Mod__caller__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    var uniqueness = try v8_uniqueness.analyzeUniqueness(arena, &function, null);
+    defer uniqueness.deinit(arena);
+    try std.testing.expect(uniqueness.isUnique(4));
+
+    try rewriteUncheckedV8Sites(arena, &function, &uniqueness);
+
+    try expectCallBuiltinName(function.body[0].instructions, 4, "Map:i64:i64.put_owned_unchecked");
+}
+
+test "arc_ownership: rewriteUncheckedV8Sites no-op for parameter receiver (V8 fails)" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Stream simulating the body of `Map.put` (lib/map.zap) — receives
+    // the map as parameter index 0 and forwards to :zig.Map.put.
+    //
+    //   [0] param_get %0 = param[0]
+    //   [1] param_get %1 = param[1]
+    //   [2] param_get %2 = param[2]
+    //   [3] move_value %3 <- %0
+    //   [4] call_builtin "Map.put" args=[%3, %1, %2] dest=%4
+    //
+    // V8 fails -> name MUST stay "Map.put". This is the regression
+    // gate the user-spec asks for: a wrapper-body call site whose
+    // receiver is a parameter must NEVER be rewritten.
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 3;
+    args[1] = 1;
+    args[2] = 2;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .param_get = .{ .dest = 1, .index = 1 } },
+        .{ .param_get = .{ .dest = 2, .index = 2 } },
+        .{ .move_value = .{ .dest = 3, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .trivial, .trivial, .owned, .owned,
+    });
+    const conventions = try arena.dupe(ir.ParamConvention, &[_]ir.ParamConvention{
+        .owned, .trivial, .trivial,
+    });
+    const params = try arena.alloc(ir.Param, 3);
+    for (params) |*p| p.* = .{ .name = "p", .type_expr = .void, .type_id = null };
+    var function = ir.Function{
+        .id = 305,
+        .name = "Map__put__3",
+        .scope_id = 0,
+        .arity = 3,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    var uniqueness = try v8_uniqueness.analyzeUniqueness(arena, &function, null);
+    defer uniqueness.deinit(arena);
+    try std.testing.expect(!uniqueness.isUnique(4));
+
+    try rewriteUncheckedV8Sites(arena, &function, &uniqueness);
+
+    try expectCallBuiltinName(function.body[0].instructions, 4, "Map.put");
+}
+
+test "arc_ownership: rewriteUncheckedV8Sites is idempotent on already-unchecked names" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // If a call site already uses the unchecked variant, the rewrite
+    // must leave it alone (no double-suffix). This is a defensive
+    // gate against accidentally introducing a "_owned_unchecked_owned_unchecked"
+    // name through repeated pass execution.
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 3;
+    args[1] = 1;
+    args[2] = 2;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .move_value = .{ .dest = 3, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put_owned_unchecked",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .trivial, .trivial, .owned, .owned,
+    });
+    var function = ir.Function{
+        .id = 306,
+        .name = "Mod__caller__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    var uniqueness = try v8_uniqueness.analyzeUniqueness(arena, &function, null);
+    defer uniqueness.deinit(arena);
+
+    try rewriteUncheckedV8Sites(arena, &function, &uniqueness);
+
+    try expectCallBuiltinName(function.body[0].instructions, 4, "Map.put_owned_unchecked");
+}
+
+test "arc_ownership: rewriteUncheckedV8Sites no-op on non-mutating builtins (Map.get)" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 3;
+    args[1] = 1;
+    args[2] = 2;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .share;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .share_value = .{ .dest = 3, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.get",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .trivial, .trivial, .owned, .trivial,
+    });
+    var function = ir.Function{
+        .id = 307,
+        .name = "Mod__caller__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    var uniqueness = try v8_uniqueness.analyzeUniqueness(arena, &function, null);
+    defer uniqueness.deinit(arena);
+
+    try rewriteUncheckedV8Sites(arena, &function, &uniqueness);
+
+    // Map.get is not in ownedMutatingBuiltinSlot, so V8 doesn't classify
+    // its receiver and the rewrite must not fire.
+    try expectCallBuiltinName(function.body[0].instructions, 4, "Map.get");
+}
+
+test "arc_ownership: allocUncheckedName basic mappings" {
+    const allocator = std.testing.allocator;
+
+    {
+        const got = try allocUncheckedName(allocator, "Map.put");
+        defer if (got) |s| allocator.free(s);
+        try std.testing.expect(got != null);
+        try std.testing.expectEqualStrings("Map.put_owned_unchecked", got.?);
+    }
+    {
+        const got = try allocUncheckedName(allocator, "Map:i64:i64.put");
+        defer if (got) |s| allocator.free(s);
+        try std.testing.expect(got != null);
+        try std.testing.expectEqualStrings("Map:i64:i64.put_owned_unchecked", got.?);
+    }
+    {
+        const got = try allocUncheckedName(allocator, "VectorI64.set");
+        defer if (got) |s| allocator.free(s);
+        try std.testing.expect(got != null);
+        try std.testing.expectEqualStrings("VectorI64.set_owned_unchecked", got.?);
+    }
+    {
+        // Already unchecked -> null.
+        const got = try allocUncheckedName(allocator, "Map.put_owned_unchecked");
+        try std.testing.expect(got == null);
+    }
+    {
+        // Not owned-mutating -> null.
+        const got = try allocUncheckedName(allocator, "Map.get");
+        try std.testing.expect(got == null);
+    }
+    {
+        // Lookalike receiver name -> null.
+        const got = try allocUncheckedName(allocator, "Foo.put");
+        try std.testing.expect(got == null);
+    }
 }

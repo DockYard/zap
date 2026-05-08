@@ -2256,6 +2256,17 @@ fn lookupCalleeConventions(
 ///     deep-retain copied — the codegen treats it through normal
 ///     borrowed-receiver share/release plumbing.
 ///   * `Vector:T.set` etc. — post-monomorph encoded name.
+///   * `VectorI64.set`, `VectorF64.set`, etc. — concrete-alias names
+///     used by `lib/vector_i64.zap` / `lib/vector_f64.zap`. Each Zap
+///     surface forwards its body through `:zig.VectorI64.set` etc.,
+///     which the IR builder emits as `call_builtin "VectorI64.set"`
+///     verbatim. Without registering these alias prefixes, the Phase
+///     4 / V8 codegen passes never see the call site and every
+///     `VectorI64.set` enters the runtime at refcount >= 2 — the same
+///     buffer-copy regression that motivated the generic registration
+///     in the first place. Recognising them here closes that gap for
+///     fannkuch-redux and any other benchmark that uses the typed
+///     surface.
 ///
 /// All Zap-level callers route through these names via
 /// `lib/map.zap` and `lib/vector.zap`'s thin wrappers. The runtime's
@@ -2301,7 +2312,9 @@ pub fn ownedMutatingBuiltinSlot(name: []const u8) ?usize {
     if (is_vector_method) {
         const is_vector_prefix =
             std.mem.eql(u8, prefix, "Vector") or
-            std.mem.startsWith(u8, prefix, "Vector:");
+            std.mem.startsWith(u8, prefix, "Vector:") or
+            std.mem.eql(u8, prefix, "VectorI64") or
+            std.mem.eql(u8, prefix, "VectorF64");
         if (is_vector_prefix) return 0;
         return null;
     }
@@ -2359,15 +2372,32 @@ test "arc_liveness: ownedMutatingBuiltinSlot matches Vector.set / push / pop / a
     try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector:i64.set"));
     try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector:f64.push"));
     try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector:str.append"));
+    // VectorI64 / VectorF64 type-aliased prefixes used by
+    // `lib/vector_i64.zap` / `lib/vector_f64.zap`. The Zap surface
+    // forwards through `:zig.VectorI64.set` (a `call_builtin` with
+    // name `VectorI64.set` verbatim), so this prefix MUST match for
+    // the Phase 4 / V8 codegen to fire on benchmarks like fannkuch-redux.
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorI64.set"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorI64.push"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorI64.pop"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorI64.append"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorF64.set"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorF64.push"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorF64.pop"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorF64.append"));
     // Negative cases — non-mutating Vector methods stay borrowed.
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vector.get"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vector.length"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vector.capacity"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vector.new_filled"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorI64.get"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorF64.length"));
     // Lookalike receiver names must not match.
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorAlt.set"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vec.set"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("set"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorI8.set"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorIntegers.set"));
 }
 
 test "arc_liveness: ownedMutatingBuiltinSlot recognizes Phase 3 unchecked variants" {
@@ -2385,6 +2415,9 @@ test "arc_liveness: ownedMutatingBuiltinSlot recognizes Phase 3 unchecked varian
     try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.pop_owned_unchecked"));
     try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.append_owned_unchecked"));
     try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector:i64.set_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorI64.set_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorI64.push_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorF64.append_owned_unchecked"));
     // Negative: unchecked suffix on non-mutating methods still null.
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Map.get_owned_unchecked"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Map.size_owned_unchecked"));
@@ -2402,6 +2435,9 @@ test "arc_liveness: isUncheckedOwnedMutatingBuiltin distinguishes checked and un
     try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Vector.pop_owned_unchecked"));
     try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Vector.append_owned_unchecked"));
     try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Vector:f64.append_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("VectorI64.set_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("VectorI64.push_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("VectorF64.append_owned_unchecked"));
     // Negative: checked variants are NOT unchecked.
     try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("Map.put"));
     try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("Map.delete"));

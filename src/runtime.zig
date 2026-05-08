@@ -4329,6 +4329,42 @@ pub fn mapMerge(a: anytype, b: anytype) ?*const MapTypeOf(@TypeOf(a)) {
     return M.merge(a, b);
 }
 
+// ---------------------------------------------------------------
+// V8 unchecked-mutation bridge helpers
+// ---------------------------------------------------------------
+//
+// The codegen rewriter (`arc_ownership.rewriteUncheckedV8Sites`) emits
+// `call_builtin "Map.put_owned_unchecked"` etc. for sites where V8
+// proves static uniqueness. The ZIR backend's generic-container path
+// (`is_generic_container = mod_name == "Map"`) routes those calls
+// through `mapBridgeMethodToHelper`, which dispatches to these
+// `anytype`-typed helpers. Each helper recovers the concrete
+// `Map(K, V)` type from `@TypeOf(map)` and calls the matching
+// `*_owned_unchecked` method.
+//
+// Soundness contract: see `Map(K, V).put_owned_unchecked` in this
+// module — the receiver MUST have refcount == 1 by construction.
+// V8 enforces that gate at the codegen layer.
+
+pub fn mapPutOwnedUnchecked(map: anytype, key: anytype, value: anytype) ?*const MapTypeOf(@TypeOf(map)) {
+    const M = MapTypeOf(@TypeOf(map));
+    const V = @FieldType(M.MapEntry, "value");
+    if (V == Term) {
+        return M.put_owned_unchecked(map, key, Term.from(value));
+    }
+    return M.put_owned_unchecked(map, key, value);
+}
+
+pub fn mapDeleteOwnedUnchecked(map: anytype, key: anytype) ?*const MapTypeOf(@TypeOf(map)) {
+    const M = MapTypeOf(@TypeOf(map));
+    return M.delete_owned_unchecked(map, key);
+}
+
+pub fn mapMergeOwnedUnchecked(a: anytype, b: anytype) ?*const MapTypeOf(@TypeOf(a)) {
+    const M = MapTypeOf(@TypeOf(a));
+    return M.merge_owned_unchecked(a, b);
+}
+
 pub fn mapSize(map: anytype) i64 {
     const M = MapTypeOf(@TypeOf(map));
     return M.size(map);

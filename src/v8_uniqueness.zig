@@ -335,23 +335,28 @@ const Analyzer = struct {
         receiver: ir.LocalId,
     };
 
-    /// If `instr` is an owned-mutating call site (per
-    /// `arc_liveness.ownedMutatingBuiltinSlot` for `call_builtin`,
-    /// or a `call_named` / `call_direct` whose name matches an owned-
-    /// mutating builtin pattern), return the receiver LocalId at the
-    /// receiver slot. Otherwise null.
+    /// If `instr` is an owned-mutating call site, return the receiver
+    /// LocalId at the receiver slot. Otherwise null.
     ///
-    /// We accept both `call_builtin` (the post-monomorph runtime
-    /// intrinsic) and `call_named` whose name matches the same
-    /// pattern (the user-facing Zap-fn wrapper, e.g. `Map.put`).
-    /// Either site is a candidate for the unchecked-variant codegen
-    /// in a follow-up session.
-    ///
-    /// `call_direct` requires a program reference to resolve the
-    /// `FunctionId` to a name; without a program, we skip
-    /// `call_direct` sites. The codegen targets are typed
-    /// `call_builtin` and `call_named`, so this is not a meaningful
-    /// loss in practice.
+    /// Recognised shapes:
+    ///   * `call_builtin` whose name matches `ownedMutatingBuiltinSlot`
+    ///     (the post-monomorph runtime intrinsic).
+    ///   * `call_named` / `try_call_named` whose name matches the
+    ///     builtin pattern (used by tests and any future direct-name
+    ///     wrappers).
+    ///   * `call_named` / `call_direct` to a Zap function whose
+    ///     param_conventions contain at least one `.owned` slot AND
+    ///     `result_convention == .owned`. The first `.owned` slot is
+    ///     treated as the receiver. This covers:
+    ///       - `lib/vector_i64.zap`'s `VectorI64.set`/`push`/etc.
+    ///         where slot 0 is the receiver
+    ///       - `k-nucleotide`'s `count_kmers_loop` where the map
+    ///         accumulator is at slot 4 (after seq/n/k/i)
+    ///     The `.owned` + `.owned` pair is the contract established
+    ///     by `arc_param_convention.inferConventions`: the caller
+    ///     transferred a +1, the callee consumes it via an owned-
+    ///     mutating builtin (or self-recursive accumulator), and the
+    ///     result is a fresh +1.
     fn callSiteOwnedMutating(
         self: *Analyzer,
         instr: *const ir.Instruction,
@@ -363,20 +368,38 @@ const Analyzer = struct {
                 return .{ .receiver = cb.args[slot] };
             },
             .call_named => |cn| {
-                const slot = arc_liveness.ownedMutatingBuiltinSlot(cn.name) orelse return null;
-                if (slot >= cn.args.len) return null;
-                return .{ .receiver = cn.args[slot] };
+                if (arc_liveness.ownedMutatingBuiltinSlot(cn.name)) |slot| {
+                    if (slot >= cn.args.len) return null;
+                    return .{ .receiver = cn.args[slot] };
+                }
+                if (self.calleeOwnedReceiverSlot(cn.name)) |slot| {
+                    if (slot >= cn.args.len) return null;
+                    return .{ .receiver = cn.args[slot] };
+                }
+                return null;
             },
             .call_direct => |cd| {
-                const name = self.lookupFunctionName(cd.function) orelse return null;
-                const slot = arc_liveness.ownedMutatingBuiltinSlot(name) orelse return null;
-                if (slot >= cd.args.len) return null;
-                return .{ .receiver = cd.args[slot] };
+                const callee = self.lookupFunction(cd.function) orelse return null;
+                if (arc_liveness.ownedMutatingBuiltinSlot(callee.name)) |slot| {
+                    if (slot >= cd.args.len) return null;
+                    return .{ .receiver = cd.args[slot] };
+                }
+                if (calleeFunctionOwnedReceiverSlot(callee)) |slot| {
+                    if (slot >= cd.args.len) return null;
+                    return .{ .receiver = cd.args[slot] };
+                }
+                return null;
             },
             .try_call_named => |tcn| {
-                const slot = arc_liveness.ownedMutatingBuiltinSlot(tcn.name) orelse return null;
-                if (slot >= tcn.args.len) return null;
-                return .{ .receiver = tcn.args[slot] };
+                if (arc_liveness.ownedMutatingBuiltinSlot(tcn.name)) |slot| {
+                    if (slot >= tcn.args.len) return null;
+                    return .{ .receiver = tcn.args[slot] };
+                }
+                if (self.calleeOwnedReceiverSlot(tcn.name)) |slot| {
+                    if (slot >= tcn.args.len) return null;
+                    return .{ .receiver = tcn.args[slot] };
+                }
+                return null;
             },
             else => return null,
         }
@@ -386,6 +409,29 @@ const Analyzer = struct {
         const program = self.program orelse return null;
         for (program.functions) |func| {
             if (func.id == function_id) return func.name;
+        }
+        return null;
+    }
+
+    fn lookupFunction(self: *const Analyzer, function_id: ir.FunctionId) ?*const ir.Function {
+        const program = self.program orelse return null;
+        for (program.functions) |*func| {
+            if (func.id == function_id) return func;
+        }
+        return null;
+    }
+
+    /// Look up the callee by name and return its owned-receiver slot
+    /// index when the function has the `.owned` slot + `.owned` result
+    /// convention pair. Returns null when the program reference is
+    /// absent (test scaffolding), the name doesn't match, or the
+    /// function isn't an owned-mutating Zap-fn wrapper.
+    fn calleeOwnedReceiverSlot(self: *const Analyzer, name: []const u8) ?usize {
+        const program = self.program orelse return null;
+        for (program.functions) |*func| {
+            if (std.mem.eql(u8, func.name, name)) {
+                return calleeFunctionOwnedReceiverSlot(func);
+            }
         }
         return null;
     }
@@ -488,17 +534,18 @@ const Analyzer = struct {
                 }
             },
             .call_named => |cn| {
-                try self.applyOwnedMutatingCallEffect(cn.name, cn.args, cn.dest);
+                try self.applyCalleeEffect(cn.name, cn.args, cn.dest);
             },
             .call_direct => |cd| {
-                if (self.lookupFunctionName(cd.function)) |name| {
-                    try self.applyOwnedMutatingCallEffect(name, cd.args, cd.dest);
+                const callee = self.lookupFunction(cd.function);
+                if (callee) |func| {
+                    try self.applyCalleeEffectWithFunction(func, cd.args, cd.dest);
                 } else {
                     _ = self.unique.remove(cd.dest);
                 }
             },
             .try_call_named => |tcn| {
-                try self.applyOwnedMutatingCallEffect(tcn.name, tcn.args, tcn.dest);
+                try self.applyCalleeEffect(tcn.name, tcn.args, tcn.dest);
             },
 
             // ----- Move transfers uniqueness -----
@@ -533,12 +580,30 @@ const Analyzer = struct {
                 _ = self.unique.remove(bv.dest);
             },
 
-            // ----- Local aliasing: conservatively clear dest -----
+            // ----- Local aliasing transfers uniqueness on the source-
+            // unique path. `arc_liveness.applyOwnsEffect` treats both
+            // as ownership transfers (Phase E.9 step 5: local_set is a
+            // move from source to dest; local_get is a fresh alias
+            // that the classifier elsewhere upgrades to a move when
+            // the source is at last use). V8 mirrors that contract:
+            // when the source is provably unique, the dest takes over
+            // the uniqueness; otherwise the dest is conservatively
+            // not classified.
             .local_get => |lg| {
-                _ = self.unique.remove(lg.dest);
+                if (self.unique.contains(lg.source)) {
+                    _ = self.unique.remove(lg.source);
+                    try self.unique.put(self.allocator, lg.dest, {});
+                } else {
+                    _ = self.unique.remove(lg.dest);
+                }
             },
             .local_set => |ls| {
-                _ = self.unique.remove(ls.dest);
+                if (self.unique.contains(ls.value)) {
+                    _ = self.unique.remove(ls.value);
+                    try self.unique.put(self.allocator, ls.dest, {});
+                } else {
+                    _ = self.unique.remove(ls.dest);
+                }
             },
             .param_get => |pg| {
                 // Parameters: the caller controls the refcount.
@@ -574,7 +639,12 @@ const Analyzer = struct {
         }
     }
 
-    fn applyOwnedMutatingCallEffect(
+    /// Apply the per-callee dataflow effect. Recognises two shapes:
+    ///   1. Builtin-name match (`ownedMutatingBuiltinSlot(name) != null`).
+    ///   2. Zap-fn convention match (any `.owned` slot + `.owned` result).
+    /// Both shapes mark the call's dest as unique (the runtime
+    /// contract for owned-mutating returns is rc=1 by construction).
+    fn applyCalleeEffect(
         self: *Analyzer,
         name: []const u8,
         args: []const ir.LocalId,
@@ -585,12 +655,57 @@ const Analyzer = struct {
                 _ = self.unique.remove(args[slot]);
             }
             try self.unique.put(self.allocator, dest, {});
-        } else {
-            // Non-mutating call: result not classified.
-            _ = self.unique.remove(dest);
+            return;
         }
+        if (self.calleeOwnedReceiverSlot(name)) |slot| {
+            if (slot < args.len) {
+                _ = self.unique.remove(args[slot]);
+            }
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
+        // Non-mutating call: result not classified.
+        _ = self.unique.remove(dest);
+    }
+
+    fn applyCalleeEffectWithFunction(
+        self: *Analyzer,
+        function: *const ir.Function,
+        args: []const ir.LocalId,
+        dest: ir.LocalId,
+    ) error{OutOfMemory}!void {
+        if (arc_liveness.ownedMutatingBuiltinSlot(function.name)) |slot| {
+            if (slot < args.len) {
+                _ = self.unique.remove(args[slot]);
+            }
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
+        if (calleeFunctionOwnedReceiverSlot(function)) |slot| {
+            if (slot < args.len) {
+                _ = self.unique.remove(args[slot]);
+            }
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
+        _ = self.unique.remove(dest);
     }
 };
+
+/// Return the index of the first `.owned` parameter slot when
+/// `function` has at least one such slot AND `result_convention == .owned`.
+/// Returns null otherwise. The `.owned` + `.owned` pair is the
+/// contract established by `arc_param_convention.inferConventions`:
+/// the caller transferred a +1 into the slot, the callee consumes it
+/// (either by forwarding to an owned-mutating builtin or by
+/// self-recursive accumulator passing), and the result is a fresh +1.
+fn calleeFunctionOwnedReceiverSlot(function: *const ir.Function) ?usize {
+    if (function.result_convention != .owned) return null;
+    for (function.param_conventions, 0..) |conv, idx| {
+        if (conv == .owned) return idx;
+    }
+    return null;
+}
 
 const Snapshot = struct {
     set: std.AutoHashMapUnmanaged(ir.LocalId, void),

@@ -2075,6 +2075,25 @@ fn runArcOwnershipAndVerify(
         const function: *ir.Function = @constCast(&program.functions[i]);
         zap.arc_ownership.rewriteOwnedConsumeSites(alloc, function, program) catch return error.OutOfMemory;
     }
+    // Phase H/V8 (codegen): for each owned-mutating call site whose
+    // V8 static-uniqueness predicate holds, swap the callee name to
+    // its `*_owned_unchecked` peer. This is a strict refinement of
+    // Phase 4's move-on-last-use rewrite — V8 holds only at sites
+    // where Phase 4 also fired (and additionally proved that the
+    // receiver's cell was never aliased before the call).
+    //
+    // Runs AFTER `rewriteOwnedConsumeSites` so the IR shape
+    // consumed by V8 matches the post-classification shape, and
+    // BEFORE `arc_verifier.verify` so the V8 invariant in the
+    // verifier sees this pass's rewrites and catches any mistake.
+    for (program.functions, 0..) |_, i| {
+        const function: *ir.Function = @constCast(&program.functions[i]);
+        var uniqueness = zap.v8_uniqueness.analyzeUniqueness(alloc, function, program) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer uniqueness.deinit(alloc);
+        zap.arc_ownership.rewriteUncheckedV8SitesWithProgram(alloc, function, &uniqueness, program) catch return error.OutOfMemory;
+    }
     for (program.functions) |*function| {
         zap.arc_verifier.verify(alloc, function, program) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,

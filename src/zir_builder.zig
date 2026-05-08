@@ -2742,6 +2742,14 @@ pub const ZirDriver = struct {
             if (std.mem.eql(u8, func_name, "put")) return "mapPut";
             if (std.mem.eql(u8, func_name, "delete")) return "mapDelete";
             if (std.mem.eql(u8, func_name, "merge")) return "mapMerge";
+            // Phase H/V8 codegen: unchecked variants share the same
+            // Zig signature as the checked peers. The runtime exposes
+            // `mapPutOwnedUnchecked`/`mapDeleteOwnedUnchecked`/
+            // `mapMergeOwnedUnchecked` helpers that route through
+            // `Map(K, V).put_owned_unchecked` etc. via `anytype`.
+            if (std.mem.eql(u8, func_name, "put_owned_unchecked")) return "mapPutOwnedUnchecked";
+            if (std.mem.eql(u8, func_name, "delete_owned_unchecked")) return "mapDeleteOwnedUnchecked";
+            if (std.mem.eql(u8, func_name, "merge_owned_unchecked")) return "mapMergeOwnedUnchecked";
             if (std.mem.eql(u8, func_name, "size")) return "mapSize";
             if (std.mem.eql(u8, func_name, "isEmpty")) return "mapIsEmpty";
             if (std.mem.eql(u8, func_name, "next")) return "mapNext";
