@@ -1868,6 +1868,59 @@ const Analyzer = struct {
                 }
                 self.applyCallDestEffect(cb.dest, owns);
             },
+            // Phase H.6: `param_get` for an `.owned`-convention slot
+            // produces an ALIAS to the function's single +1 for that
+            // parameter — not an independent owner. The function's
+            // entry transfer of ownership accounts for the +1 exactly
+            // once; multiple `param_get` reads of the same slot return
+            // the same heap pointer over and over, never bumping the
+            // cell's refcount.
+            //
+            // The forward `owns` dataflow tracks "which ARC-managed
+            // locals own +1 at the current program point". For an
+            // `.owned` parameter slot, that bit's role is "the slot's
+            // single +1 is still held by the function". Setting a
+            // separate bit for every `param_get` dest of the same slot
+            // double-counts: the slot's +1 is one, not N. At a
+            // ret-equivalent terminator, `arc_drop_insertion` would
+            // then emit one `release` per alias, decrementing the
+            // cell N times against its single +1. The observable
+            // failure is a use-after-free on the next use of the
+            // parameter, surfacing as `Vector.get/set: index out of
+            // bounds` (or worse, silent data corruption) when a tail-
+            // recursive caller reads the parameter on the next
+            // iteration.
+            //
+            // The correct rule: set the slot's bit only when no
+            // sibling alias's bit is currently in `owns`. The
+            // `param_alias_group` map (built in Step 2) records every
+            // dest that reads the same `.owned` slot; consulting it
+            // here lets us answer "is the slot's +1 already accounted
+            // for by an earlier alias?" in one hash lookup. Pairs
+            // with `clearOwnsForLocalAndAliases`'s "consume one,
+            // consume all" rule: between them, the slot's bit count
+            // tracks the slot's actual ownership state — exactly one
+            // bit set when the slot is held, zero bits set after a
+            // consume of any alias.
+            //
+            // For `param_get` of a slot with no alias group entry
+            // (single-read slots, or `.borrowed`/`.trivial` slots
+            // that don't qualify), the original generic rule still
+            // applies via `applyCallDestEffect`-style fallthrough.
+            .param_get => |pg| {
+                if (pg.dest >= local_ownership.len) return;
+                if (local_ownership[pg.dest] != .owned) return;
+                const dest_idx = self.local_to_arc_index.get(pg.dest) orelse return;
+                if (self.param_alias_group.get(pg.dest)) |aliases| {
+                    for (aliases) |alias| {
+                        if (alias == pg.dest) continue;
+                        if (self.local_to_arc_index.get(alias)) |alias_idx| {
+                            if (owns.contains(alias_idx)) return;
+                        }
+                    }
+                }
+                owns.set(dest_idx);
+            },
             else => {
                 // Generic case: every dest local that's classified as
                 // .owned in `local_ownership` gains a +1 at this
@@ -4776,4 +4829,160 @@ test "arc_liveness: deeply nested case recursion is depth-uniform (Phase D)" {
         if (set_ptr.count() >= 1) saw_arc_local = true;
     }
     try std.testing.expect(saw_arc_local);
+}
+
+test "arc_liveness: Phase H.6 — multiple param_get of same .owned slot share one +1" {
+    // Regression: fannkuch's `main_loop` reads its `.owned` parameter
+    // `p` twice via independent `param_get` instructions — once for a
+    // borrow-then-release call (`copy_prefix`), then again to feed a
+    // tuple-returning helper (`three_thru`). Pre-fix, the forward
+    // owns dataflow set a separate +1 bit at every `param_get` of the
+    // same slot. The terminator's `owned_at_ret` snapshot then carried
+    // BOTH alias bits, drop-insertion emitted one `release` per alias,
+    // and the runtime double-released the slot's single +1. The next
+    // tail-recursive iteration observed `Vector` cells with garbage
+    // length headers and crashed with `Vector.get/set: index out of
+    // bounds`.
+    //
+    // The fix: in `applyOwnsEffect`, treat `param_get` of an `.owned`
+    // slot as setting the bit only when no sibling alias's bit is
+    // currently set — the slot has exactly one +1, and aliases share
+    // it. Pairs with the existing `clearOwnsForLocalAndAliases` rule
+    // ("consume one alias, consume all"). Together they keep the bit
+    // count in lockstep with the slot's actual ownership state.
+    //
+    // We hand-roll a minimal `ir.Function` that mirrors fannkuch's
+    // `main_loop` shape — TWO `param_get` reads of slot 0 (an `.owned`
+    // ARC param) with a `share_value`-bracketed call between them,
+    // then a `ret` of one of the params. End-to-end parsing wouldn't
+    // reproduce the bug because the test pipeline doesn't run
+    // `arc_param_convention.inferConventions` (which is what promotes
+    // `.borrowed` to `.owned` in the production pipeline). Driving
+    // the analyzer directly with a pre-promoted shape exercises the
+    // exact dataflow path the production bug hit.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Pre-build the call-arg slices on the arena so they outlive the
+    // walker; each instruction owns a `[]const ir.LocalId` slice.
+    const call_args = try arena.alloc(ir.LocalId, 1);
+    call_args[0] = 11;
+    const call_arg_modes = try arena.alloc(ir.ValueMode, 1);
+    call_arg_modes[0] = .borrow;
+    const ret_value: ir.LocalId = 1;
+    _ = ret_value;
+
+    // Stream (mirrors `main_loop`'s `param_get` … `share_value` …
+    // `release` … `param_get` … `ret` shape):
+    //
+    //   [0] param_get %1 = param[0]      -- first alias of slot 0
+    //   [1] share_value %2 <- %1 retain  -- bumps slot 0 RC for
+    //                                       a borrow-style call
+    //   [2] call_named "borrow_call" args=[%2] dest=%3 -- borrow
+    //   [3] release %2                   -- drops the share's +1
+    //   [4] param_get %4 = param[0]      -- SECOND alias of slot 0
+    //   [5] ret %4
+    //
+    // Liveness tracks slot 0's single +1 across the function. The
+    // pre-fix dataflow set BOTH `%1` and `%4`'s owns bits; the snapshot
+    // at the `ret` then carried both, and `arc_drop_insertion` would
+    // emit two scope-exit `release` instructions against slot 0's
+    // single +1.
+    const stream = try arena.alloc(ir.Instruction, 6);
+    stream[0] = .{ .param_get = .{ .dest = 1, .index = 0 } };
+    stream[1] = .{ .share_value = .{ .dest = 2, .source = 1, .mode = .retain } };
+    stream[2] = .{ .call_named = .{
+        .name = "borrow_call",
+        .dest = 3,
+        .args = call_args,
+        .arg_modes = call_arg_modes,
+    } };
+    stream[3] = .{ .release = .{ .value = 2 } };
+    stream[4] = .{ .param_get = .{ .dest = 4, .index = 0 } };
+    stream[5] = .{ .ret = .{ .value = 4 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    // local_count = 5 (slots 0..4). Mark slot 0 (`pg.dest=1`) and
+    // slot 4 as `.owned`, the rest as `.trivial`. The `local_to_arc_index`
+    // map tracks ARC-managed locals; the forward owns dataflow only
+    // accumulates bits for `.owned` locals.
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 5);
+    for (local_ownership) |*o| o.* = .trivial;
+    local_ownership[1] = .owned;
+    local_ownership[2] = .owned;
+    local_ownership[4] = .owned;
+
+    const params = try arena.alloc(ir.Param, 1);
+    // `arc_managed` callback below returns true unconditionally, so any
+    // non-null `type_id` here passes the ARC-param filter at
+    // `arc_param_indices` construction time. `0` is a valid `TypeId`
+    // (TypeStore reserves `BOOL = 0`), so this doesn't conflict with
+    // any sentinel.
+    params[0] = .{ .name = "p", .type_expr = .vector_i64, .type_id = 0 };
+
+    const param_conventions = try arena.alloc(ir.ParamConvention, 1);
+    param_conventions[0] = .owned;
+
+    const function = ir.Function{
+        .id = 0,
+        .name = "phase_h6_test",
+        .scope_id = 0,
+        .arity = 1,
+        .params = params,
+        .return_type = .vector_i64,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = param_conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        &function,
+        suite_dummy_type_store_for_h6, // any pointer that won't be dereferenced; arc_managed callback below skips
+        arc_managed_for_h6,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // Probe the `owned_at_ret` snapshot at the `ret` instruction. With
+    // the fix, the snapshot has exactly ONE entry for slot 0 (either
+    // `%1` or `%4`, but not both). Without the fix, it has BOTH.
+    // Walk the snapshot and count slot-0 aliases.
+    var slot0_count: u32 = 0;
+    var owned_iter = ownership.owned_at_ret.valueIterator();
+    while (owned_iter.next()) |set_ptr| {
+        var entry_iter = set_ptr.keyIterator();
+        while (entry_iter.next()) |local_ptr| {
+            // Both `%1` and `%4` are `param_get(0)` dests by
+            // construction; either's bit indicates "slot 0 has +1".
+            if (local_ptr.* == 1 or local_ptr.* == 4) slot0_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 1), slot0_count);
+}
+
+// Stand-in `TypeStore` pointer for the Phase H.6 hand-rolled test.
+// The test's `arc_managed_for_h6` callback hard-codes a yes for
+// every type id without consulting the store, so the analyzer never
+// dereferences this pointer. We declare a single dummy storage cell
+// here at module scope so the test's `function` value can borrow it
+// without lifetime concerns.
+var suite_dummy_type_store_for_h6_storage: types_mod.TypeStore = undefined;
+const suite_dummy_type_store_for_h6: *const types_mod.TypeStore = &suite_dummy_type_store_for_h6_storage;
+
+fn arc_managed_for_h6(_: *const types_mod.TypeStore, _: hir_mod.TypeId) bool {
+    // The hand-rolled test fixture never queries this — the
+    // function's `local_ownership` already classifies every local,
+    // and the analyzer's ARC-managed predicate is consulted via
+    // `local_ownership` rather than via this callback when the
+    // local has an ownership class set. Returning true is the
+    // conservative default; returning false would also work because
+    // the test's locals are wired directly via `local_ownership`.
+    return true;
 }
