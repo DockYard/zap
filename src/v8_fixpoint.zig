@@ -981,6 +981,33 @@ const FlowWalker = struct {
             return;
         };
 
+        // Phase 1.8 item #5 — borrow short-circuit. When the callee
+        // resolves to a function whose parameter slot is `.borrowed`,
+        // the ABI guarantees that callee never consumes the value's
+        // refcount. Combined with a non-aliasing signature
+        // (`unobserved` or `top` — i.e., no observed escape — the only
+        // upgrades that fire on the callee body's flows would be the
+        // PU/CU flows the v8_fixpoint already classifies), the call
+        // is a "borrow pass-through" and must not poison the caller's
+        // carrier accumulator. The verifier (V8) remains the safety
+        // net: a wrong inference produces a compilation rejection,
+        // never a miscompilation.
+        //
+        // The guard fires only when:
+        //   1. The callee resolves to a function in the program, AND
+        //   2. The relevant slot's convention is `.borrowed`, AND
+        //   3. The slot's signature class is `top` or `unobserved`
+        //      (no concrete escape observation has been recorded —
+        //      `aliases` is excluded by construction).
+        //
+        // For example: `VectorI64.get(vec, index)` (a Zap function
+        // forwarding to a non-mutating runtime builtin) has slot 0
+        // `.borrowed` and signature `top` post-cleanup. Without this
+        // guard, every caller's V8 carrier accumulator gets polluted
+        // to ⊤; with it, the caller's accumulator passes through
+        // unchanged so downstream PU/CU flows keep firing.
+        const callee_func = lookupFunction(self.program, callee_id);
+
         // Track which arg position (if any) preserves uniqueness
         // through to the dest. This determines whether the dest
         // *carries* a parameter forward.
@@ -1014,10 +1041,28 @@ const FlowWalker = struct {
                     try self.upgradeParam(carrier_slot, ParamSig.aliasesOut());
                 },
                 .top, .unobserved => {
-                    // For `unobserved` we choose the conservative
-                    // option: this call site contributes ⊤. The
-                    // outer SCC fixpoint may iterate this function
-                    // again once the callee's signature settles.
+                    // Phase 1.8 item #5 — borrow short-circuit gate.
+                    // When the callee's slot is `.borrowed` and the
+                    // signature lacks any escape evidence
+                    // (top/unobserved), the call is a no-effect
+                    // borrow pass-through on the caller's carrier.
+                    // The borrow ABI rules out consume; no upgrade
+                    // observation rules out alias-into-aggregate.
+                    if (callee_func) |fp| {
+                        if (arg_idx < fp.param_conventions.len and
+                            fp.param_conventions[arg_idx] == .borrowed)
+                        {
+                            // Borrow pass-through: leave the caller's
+                            // carrier untouched. Don't upgrade and
+                            // don't set `preserves_carrier_from_arg`
+                            // (the call's dest, even if a Vector,
+                            // doesn't preserve the caller's parameter
+                            // chain through this call — borrows
+                            // produce a fresh dest unrelated to the
+                            // borrowed source's owner identity).
+                            continue;
+                        }
+                    }
                     if (callee_class == .unobserved) {
                         // Within an SCC, the callee's signature
                         // hasn't settled yet. Don't pollute the
@@ -1244,4 +1289,213 @@ test "v8_fixpoint: function with no in-scope callers is conservative top when tr
 
     const sig = sigs.forFunction(0).?;
     try testing.expectEqual(UniquenessClass.top, sig.params[0].class);
+}
+
+test "v8_fixpoint: borrow-passthrough callee with top signature does not poison caller (Phase 1.8 item #5)" {
+    // Two-function setup that exercises the borrow short-circuit
+    // specifically. The callee's body has CONFLICTING flows that
+    // join to `top` WITHIN the callee's SCC analysis (PU from
+    // returning the param + AL from a tuple_init storing the param).
+    // Without the short-circuit, the caller's classifyCallToFunction
+    // sees the callee's slot class as `top` mid-SCC and pollutes the
+    // caller's carrier accumulator — the caller's param 0 reaches
+    // `top` instead of PU.
+    //
+    // With the short-circuit (item #5): the callee's slot is
+    // `.borrowed`, so even when its class settles at `top`, the
+    // call site is treated as no-effect on the caller's carrier.
+    // The caller's param 0 reaches PU via the downstream
+    // owned-mutating call.
+    //
+    //   callee(p :: VectorI64) -> VectorI64 {     # borrowed slot 0, top sig
+    //     _ = {p, p}                                # AL flow
+    //     p                                          # PU flow (ret)
+    //   }
+    //
+    //   caller(v :: VectorI64) -> VectorI64 {      # owned slot 0
+    //     _ = callee(v)                             # borrow-passthrough call
+    //     Vector.set(v, 0, 0)                       # PU flow → caller slot 0 = PU
+    //   }
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Function 0 (id=0): "borrow_aliaser" -- the borrowed callee whose
+    // body has conflicting flows for slot 0:
+    //   [0] param_get  dest=0  index=0
+    //   [1] tuple_init dest=1  elements=[0]    -- AL flow on slot 0
+    //   [2] ret         value=0                 -- PU flow on slot 0
+    //
+    // Slot 0 conv = .borrowed. Body flows: AL (tuple_init) ⊔ PU (ret) = top.
+    // After SCC analysis (no cleanup needed — the body produces top
+    // directly), the signature for slot 0 is `top` AND the slot conv
+    // remains `.borrowed`.
+    const tuple_elems_callee = try arena.alloc(ir.LocalId, 1);
+    tuple_elems_callee[0] = 0;
+    const callee_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .tuple_init = .{ .dest = 1, .elements = tuple_elems_callee } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    var callee_func = try buildTestFunction(
+        arena,
+        "borrow_aliaser",
+        &callee_instrs,
+        2,
+        &[_]ir.ParamConvention{.borrowed},
+        .owned,
+    );
+    callee_func.id = 0;
+
+    // Function 1 (id=1): "caller" -- exercises the borrow short-circuit.
+    //   [0] param_get   dest=0  index=0      (read v for the borrow_aliaser call)
+    //   [1] call_named  dest=1  name="borrow_aliaser" args=[0]
+    //   [2] param_get   dest=2  index=0      (read v again for the set)
+    //   [3] const_int   dest=3  value=0
+    //   [4] const_int   dest=4  value=0
+    //   [5] move_value  dest=5  source=2
+    //   [6] call_builtin dest=6 name="VectorI64.set" args=[5,3,4]
+    //   [7] ret         value=6
+    const caller_call_args = try arena.alloc(ir.LocalId, 1);
+    caller_call_args[0] = 0;
+    const caller_call_arg_modes = try arena.alloc(ir.ValueMode, 1);
+    caller_call_arg_modes[0] = .borrow;
+    const set_args = try arena.alloc(ir.LocalId, 3);
+    set_args[0] = 5;
+    set_args[1] = 3;
+    set_args[2] = 4;
+    const set_arg_modes = try arena.alloc(ir.ValueMode, 3);
+    set_arg_modes[0] = .move;
+    set_arg_modes[1] = .borrow;
+    set_arg_modes[2] = .borrow;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .call_named = .{
+            .dest = 1,
+            .name = "borrow_aliaser",
+            .args = caller_call_args,
+            .arg_modes = caller_call_arg_modes,
+        } },
+        .{ .param_get = .{ .dest = 2, .index = 0 } },
+        .{ .const_int = .{ .dest = 3, .value = 0 } },
+        .{ .const_int = .{ .dest = 4, .value = 0 } },
+        .{ .move_value = .{ .dest = 5, .source = 2 } },
+        .{ .call_builtin = .{
+            .dest = 6,
+            .name = "VectorI64.set",
+            .args = set_args,
+            .arg_modes = set_arg_modes,
+        } },
+        .{ .ret = .{ .value = 6 } },
+    };
+    var caller_func = try buildTestFunction(
+        arena,
+        "caller",
+        &caller_instrs,
+        7,
+        &[_]ir.ParamConvention{.owned},
+        .owned,
+    );
+    caller_func.id = 1;
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = callee_func;
+    functions[1] = caller_func;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var sigs = try computeSignatures(testing.allocator, &program);
+    defer sigs.deinit(testing.allocator);
+
+    // Sanity: the borrow_aliaser callee's slot 0 reached `top` from
+    // the AL ⊔ PU join.
+    const callee_sig = sigs.forFunction(0).?;
+    try testing.expectEqual(UniquenessClass.top, callee_sig.params[0].class);
+
+    // Phase 1.8 item #5 expectation: caller's param 0 is PU (preserved
+    // through Vector.set). Without the short-circuit, the call to
+    // `borrow_aliaser` (callee class top, callee slot 0 .borrowed)
+    // would poison caller's slot 0 to top.
+    const caller_sig = sigs.forFunction(1).?;
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, caller_sig.params[0].class);
+}
+
+test "v8_fixpoint: aliases-out callee still poisons caller (sound check for borrow short-circuit)" {
+    // Two-function setup where the callee genuinely escapes its
+    // borrowed parameter into a tuple. The callee's signature is
+    // `aliases`, NOT `top`. The borrow short-circuit MUST NOT bypass
+    // the upgrade in this case — caller's carrier must be poisoned.
+    //
+    //   callee(p) -> {p}                  # aliases through tuple_init
+    //   caller(v) -> callee(v)            # caller passes v
+    //
+    // Expected: caller's param 0 = AL (aliases), NOT PU.
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Function 0: callee that aliases its param into a tuple.
+    //   [0] param_get  dest=0 index=0
+    //   [1] tuple_init dest=1 elements=[0]
+    //   [2] ret         value=1
+    const tuple_elems = try arena.alloc(ir.LocalId, 1);
+    tuple_elems[0] = 0;
+    const callee_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .tuple_init = .{ .dest = 1, .elements = tuple_elems } },
+        .{ .ret = .{ .value = 1 } },
+    };
+    var callee_func = try buildTestFunction(
+        arena,
+        "tuple_wrap",
+        &callee_instrs,
+        2,
+        &[_]ir.ParamConvention{.borrowed},
+        .owned,
+    );
+    callee_func.id = 0;
+
+    // Function 1: caller forwarding its param into the aliasing callee.
+    //   [0] param_get  dest=0 index=0
+    //   [1] call_named dest=1 name="tuple_wrap" args=[0]
+    //   [2] ret         value=1
+    const caller_call_args = try arena.alloc(ir.LocalId, 1);
+    caller_call_args[0] = 0;
+    const caller_call_arg_modes = try arena.alloc(ir.ValueMode, 1);
+    caller_call_arg_modes[0] = .share;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .call_named = .{
+            .dest = 1,
+            .name = "tuple_wrap",
+            .args = caller_call_args,
+            .arg_modes = caller_call_arg_modes,
+        } },
+        .{ .ret = .{ .value = 1 } },
+    };
+    var caller_func = try buildTestFunction(
+        arena,
+        "forward",
+        &caller_instrs,
+        2,
+        &[_]ir.ParamConvention{.owned},
+        .owned,
+    );
+    caller_func.id = 1;
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = callee_func;
+    functions[1] = caller_func;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var sigs = try computeSignatures(testing.allocator, &program);
+    defer sigs.deinit(testing.allocator);
+
+    // Callee aliases its param via tuple_init: signature = AL.
+    const callee_sig = sigs.forFunction(0).?;
+    try testing.expectEqual(UniquenessClass.aliases, callee_sig.params[0].class);
+
+    // Caller's param 0 must inherit AL — the short-circuit must NOT
+    // bypass the aliases upgrade.
+    const caller_sig = sigs.forFunction(1).?;
+    try testing.expectEqual(UniquenessClass.aliases, caller_sig.params[0].class);
 }
