@@ -4117,6 +4117,20 @@ pub const IrBuilder = struct {
             if (param_type != .any) {
                 try self.known_local_types.put(tuple_local, param_type);
             }
+            // Resolve the element's HIR type from the parent tuple's
+            // HIR type so `emitArcRetainOnAggregateExtract` can detect
+            // an ARC-managed extraction. The clause's declared parameter
+            // type is authoritative after monomorphization.
+            if (binding.param_index < clause.params.len) {
+                const param_hir_type = clause.params[binding.param_index].type_id;
+                if (self.type_store) |ts| {
+                    const tuple_type = ts.getType(param_hir_type);
+                    if (tuple_type == .tuple and binding.element_index < tuple_type.tuple.elements.len) {
+                        const elem_hir_type = tuple_type.tuple.elements[binding.element_index];
+                        try self.local_hir_types.put(binding.local_index, elem_hir_type);
+                    }
+                }
+            }
             // Extract the element into the binding's local index
             try self.current_instrs.append(self.allocator, .{
                 .index_get = .{
@@ -4125,6 +4139,13 @@ pub const IrBuilder = struct {
                     .index = binding.element_index,
                 },
             });
+            // Retain the extracted ARC value: a tuple is non-ARC and
+            // its `index_get` lowers to `elem_val_imm`, which never
+            // bumps the cell's refcount. Without this retain, multiple
+            // destructures of the same tuple (or of distinct tuples
+            // that share the underlying ARC pointer) would each fire
+            // a scope-exit release against a single +1.
+            try self.emitArcRetainOnAggregateExtract(binding.local_index);
             // Propagate the static element type so downstream lookups (e.g.
             // `Map.get`'s key/value resolution, `<>`'s Concatenable dispatch,
             // numeric widening, generic call-name encoding) see the right
@@ -4152,6 +4173,13 @@ pub const IrBuilder = struct {
             try self.known_local_types.put(struct_local, .{ .struct_ref = struct_name });
             const field_name = self.interner.get(binding.field_name);
             const info = self.fieldZigTypeAndStorage(struct_name, field_name);
+            // Plumb the field's HIR type onto the destructured local so
+            // `emitArcRetainOnAggregateExtract` can detect an ARC-managed
+            // extraction. Mirrors the equivalent plumbing for tuple
+            // bindings.
+            if (self.lookupStructFieldHirType(binding.struct_type, binding.field_name)) |field_hir_type| {
+                try self.local_hir_types.put(binding.local_index, field_hir_type);
+            }
             try self.current_instrs.append(self.allocator, .{
                 .field_get = .{
                     .dest = binding.local_index,
@@ -4160,6 +4188,13 @@ pub const IrBuilder = struct {
                     .struct_type = struct_name,
                 },
             });
+            // Retain the extracted ARC value: a plain struct's
+            // `field_get` lowers to `field_val`, which never bumps the
+            // cell's refcount. Without this retain, multiple struct
+            // destructures of distinct parents that share the same
+            // underlying ARC pointer would each fire a scope-exit
+            // release against a single +1.
+            try self.emitArcRetainOnAggregateExtract(binding.local_index);
             if (info) |i| {
                 try self.known_local_types.put(binding.local_index, i.type_expr);
             }
@@ -5608,6 +5643,28 @@ pub const IrBuilder = struct {
         return self.isArcManagedType(hir_type);
     }
 
+    /// Look up the TypeId of `field_name` on the struct named
+    /// `struct_name_id`. Returns null when the type store is missing,
+    /// the struct cannot be resolved, or the field name is not a
+    /// member. Used by the destructuring helpers (`emitStructBindings`,
+    /// pattern-match field bindings) to plumb the field's HIR type
+    /// onto the destructured local so `isArcManagedLocal` can detect
+    /// ARC-managed extractions.
+    fn lookupStructFieldHirType(
+        self: *const IrBuilder,
+        struct_name_id: ast.StringId,
+        field_name_id: ast.StringId,
+    ) ?hir_mod.TypeId {
+        const ts = self.type_store orelse return null;
+        const struct_type_id = ts.name_to_type.get(struct_name_id) orelse return null;
+        const struct_type = ts.getType(struct_type_id);
+        if (struct_type != .struct_type) return null;
+        for (struct_type.struct_type.fields) |f| {
+            if (f.name == field_name_id) return f.type_id;
+        }
+        return null;
+    }
+
     /// Allocates a `param_conventions` slice sized to `params.len` and
     /// populates each entry from its parameter's HIR type. Phase A of
     /// the Phase 6 redux plan: ARC-managed parameter types default to
@@ -5700,6 +5757,35 @@ pub const IrBuilder = struct {
         if (self.param_backed_locals.contains(source)) {
             try self.param_backed_locals.put(dest, {});
         }
+    }
+
+    /// Emit `.retain {value=dest}` when `dest` holds an ARC-managed
+    /// value extracted from a non-ARC aggregate (tuple, plain struct).
+    /// The aggregate's storage holds a raw pointer to the ARC cell —
+    /// no retain is performed at extraction time by the underlying
+    /// runtime read (`elem_val_imm` / `field_val`). Without an explicit
+    /// retain on `dest`, every owner alias produced by destructuring
+    /// the aggregate would share a single +1 — the producer's original
+    /// ownership transferred into the aggregate by the Phase E.10
+    /// "aggregate-store consumes" rule. Multiple destructures of the
+    /// same aggregate (or of distinct aggregates that share the same
+    /// underlying ARC pointer) would then emit multiple scope-exit
+    /// `release`s against one underlying refcount, double-freeing the
+    /// cell.
+    ///
+    /// `dest`'s HIR type must be recorded in `local_hir_types` before
+    /// this helper is called — `isArcManagedLocal` consults that map.
+    /// Mirrors the retain-on-alias contract codified in `emitLocalGet`
+    /// for `local_get`. ARC-managed aggregates (`Map`, `List`) handle
+    /// their own deep-retain on the runtime side (`Map.get`,
+    /// `List.getHead`, …) and never reach this helper because their
+    /// extractions lower to dedicated IR opcodes (`map_get`,
+    /// `list_head`, …) instead of `index_get` / `field_get`.
+    fn emitArcRetainOnAggregateExtract(self: *IrBuilder, dest: LocalId) !void {
+        if (!self.isArcManagedLocal(dest)) return;
+        try self.current_instrs.append(self.allocator, .{
+            .retain = .{ .value = dest },
+        });
     }
 
     /// Pre-scan HIR block to find error_pipe expressions with
@@ -6731,6 +6817,24 @@ pub const IrBuilder = struct {
                         .struct_type = struct_type,
                     },
                 });
+                // Retain the extracted ARC value: a plain (non-ARC)
+                // struct's `field_get` lowers to `field_val`, which
+                // never bumps the cell's refcount. Mirrors the tuple
+                // `index_get` retain — multiple field reads from
+                // distinct parents that share the underlying ARC
+                // pointer would otherwise share a single +1 and
+                // double-free at scope exit. ARC-managed parent
+                // aggregates (Map, List) extract via dedicated
+                // opcodes (`map_get`, `list_head`, …) whose runtime
+                // helpers retain children internally, so they never
+                // reach this `.field_get` site. Indirect-storage
+                // recursive struct fields are retained in the ZIR
+                // backend (`emitIndirectFieldDeref` →
+                // `retainAnyOpt`) — those types are nominal struct
+                // types, not in `isArcManagedTypeId`'s set, so this
+                // helper is a no-op for them and the two retain
+                // sites do not collide.
+                try self.emitArcRetainOnAggregateExtract(dest);
                 if (struct_type) |sname| {
                     if (self.fieldZigTypeAndStorage(sname, field_name)) |info| {
                         try self.known_local_types.put(dest, info.type_expr);
@@ -6742,6 +6846,19 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{
                     .index_get = .{ .dest = dest, .object = obj, .index = tig.index },
                 });
+                // Retain the extracted ARC value: a tuple is non-ARC
+                // and its `index_get` lowers to `elem_val_imm`, which
+                // never bumps the cell's refcount. Without this retain,
+                // multiple destructures of the same tuple (or of
+                // distinct tuples that share the underlying ARC pointer)
+                // would each fire a scope-exit release against a single
+                // +1, double-freeing the cell. `lowerExpr` set
+                // `local_hir_types[dest] = expr.type_id` on entry, so
+                // `isArcManagedLocal(dest)` consults the element's HIR
+                // type (recorded by `emitDestructureStep` /
+                // `lowerAssignmentDestructure` from the parent tuple's
+                // static element type).
+                try self.emitArcRetainOnAggregateExtract(dest);
                 if (self.type_store) |ts| {
                     const obj_type = ts.getType(tig.object.type_id);
                     if (obj_type == .tuple and tig.index < obj_type.tuple.elements.len) {
@@ -9366,4 +9483,275 @@ test "Phase E.5 Gap 5: arc_managed_locals registers map_init / list_init / call 
     defer ownership.deinit(std.testing.allocator);
 
     try std.testing.expect(ownership.arc_managed_locals.contains(call_dest.?));
+}
+
+test "tuple destructure of ARC-managed value emits retain on extracted local" {
+    // Regression for the heap corruption bug surfaced by Phase 1.3:
+    // when an ARC-managed value (e.g. `VectorI64`, an opaque type, a
+    // Map, a List) is extracted from a tuple via `tuple_index_get`,
+    // the lowering must emit `.retain{value=dest}` immediately
+    // after the `.index_get`. A tuple is non-ARC; its `index_get`
+    // lowers to `elem_val_imm`, which never bumps the cell's
+    // refcount. Without the retain, the Phase E.10 "aggregate-
+    // store consumes" rule transfers the producer's +1 into the
+    // tuple, but every destructure produces a fresh `.owned` alias
+    // whose scope-exit `release` decrements a refcount that was
+    // never incremented. With two destructures of the same tuple
+    // (or of distinct tuples sharing the same ARC pointer) this
+    // fired two scope-exit releases against a single +1 and
+    // double-freed the cell.
+    //
+    // The fix is local to `IrBuilder.lowerExpr`'s `tuple_index_get`
+    // branch and `IrBuilder.emitTupleBindings`, both of which now
+    // call `emitArcRetainOnAggregateExtract` after the
+    // `.index_get`. This pins the let-binding destructure path
+    // (`{a, b} = some_tuple`) which lowers via
+    // `lowerAssignmentDestructure` → `tuple_index_get` expression.
+    //
+    // Uses `opaque Handle = String` rather than `VectorI64` because
+    // unit tests don't bootstrap the `@native_type` scope graph
+    // entries that resolve `VectorI64` to `TypeStore.VECTOR_I64`;
+    // an opaque type is the canonical ARC-managed scalar that the
+    // type checker recognises without `lib/*.zap` plumbing. The bug
+    // and the fix are agnostic to which ARC-managed type appears in
+    // the tuple — `isArcManagedType` returns true for `.opaque_type`,
+    // `.map`, `.list`, and `.vector_type` alike.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  fn pair(h :: Handle) -> {Handle, Bool} { {h, false} }
+        \\
+        \\  pub fn run(h :: Handle) -> Handle {
+        \\    pp = Test.pair(h)
+        \\    {x, _y} = pp
+        \\    x
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    // Find `run` and confirm it contains an `.index_get` whose
+    // dest is the immediately preceding instr's `.value` of a
+    // following `.retain`.
+    var run_func: ?*const Function = null;
+    for (ir_program.functions) |*function| {
+        if (std.mem.indexOf(u8, function.name, "run") != null) {
+            run_func = function;
+            break;
+        }
+    }
+    const func = run_func orelse return error.MissingFunction;
+
+    var saw_index_get_retain_pair = false;
+    for (func.body) |block| {
+        const stream = block.instructions;
+        for (stream, 0..) |instr, idx| {
+            if (instr != .index_get) continue;
+            if (idx + 1 >= stream.len) continue;
+            const next = stream[idx + 1];
+            if (next == .retain and next.retain.value == instr.index_get.dest) {
+                saw_index_get_retain_pair = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_index_get_retain_pair);
+}
+
+test "struct field_get of ARC-managed value emits retain on extracted local" {
+    // Companion regression for the same bug exposed via struct
+    // destructure rather than tuple destructure. Plain (non-ARC)
+    // structs lower `field_get` to `field_val`, which never bumps
+    // the cell's refcount. Without a follow-up `.retain`, two
+    // distinct struct parents that share the underlying ARC
+    // pointer would each fire a scope-exit release against a
+    // single +1 and double-free.
+    //
+    // Pins the let-binding destructure path (`field_get` HIR
+    // expression in `lowerExpr`). Uses an opaque type rather than
+    // `VectorI64` so the unit-test pipeline does not need the
+    // `@native_type` scope-graph plumbing — see the sibling tuple
+    // regression test for the rationale.
+    //
+    // The field access `pair.a` must be an *intermediate* use (not
+    // the function's return value). When `pair.a` is the return,
+    // `arc_drop_insertion`'s retain-on-ret discipline produces the
+    // matching retain at function exit instead. The pre-fix bug
+    // surfaced in benchmarks specifically because every
+    // intermediate field-extraction of an ARC-managed value
+    // shared a single +1 with the parent struct; multiple such
+    // extractions across distinct parents that aliased the same
+    // ARC pointer fired multiple scope-exit releases against one
+    // refcount. We pin the *intermediate* shape here by feeding
+    // the extracted value into another function call before
+    // returning the call's result.
+    const source =
+        \\pub struct HPair {
+        \\  a :: Handle
+        \\  b :: Handle
+        \\}
+        \\
+        \\pub struct Driver {
+        \\  opaque Handle = String
+        \\
+        \\  fn make(h :: Handle) -> HPair { %HPair{a: h, b: h} }
+        \\  fn echo(h :: Handle) -> Handle { h }
+        \\
+        \\  pub fn run(h :: Handle) -> Handle {
+        \\    pair = Driver.make(h)
+        \\    Driver.echo(pair.a)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var run_func: ?*const Function = null;
+    for (ir_program.functions) |*function| {
+        if (std.mem.indexOf(u8, function.name, "run") != null) {
+            run_func = function;
+            break;
+        }
+    }
+    const func = run_func orelse return error.MissingFunction;
+
+    var saw_field_get_retain_pair = false;
+    for (func.body) |block| {
+        const stream = block.instructions;
+        for (stream, 0..) |instr, idx| {
+            if (instr != .field_get) continue;
+            if (idx + 1 >= stream.len) continue;
+            const next = stream[idx + 1];
+            if (next == .retain and next.retain.value == instr.field_get.dest) {
+                saw_field_get_retain_pair = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_field_get_retain_pair);
+}
+
+test "tuple param-binding destructure of ARC-managed value emits retain" {
+    // Pin the parallel pattern-binding path: `emitTupleBindings`
+    // emits `.param_get` + `.index_get` for each tuple binding on
+    // a clause, and that `.index_get` must also receive a follow-
+    // up `.retain` when its dest's HIR type is ARC-managed.
+    //
+    // Source: a clause that pattern-matches a `{Handle, Bool}`
+    // tuple parameter. The first binding's `local_index` extracts
+    // the handle — that extraction is the `index_get` whose dest
+    // must be retained. The second binding extracts a Bool which
+    // is non-ARC and must NOT receive a retain. Uses an opaque
+    // type rather than `VectorI64` for the same unit-test pipeline
+    // reason as the sibling regression tests.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn first({v, _b} :: {Handle, Bool}) -> Handle {
+        \\    v
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var first_func: ?*const Function = null;
+    for (ir_program.functions) |*function| {
+        if (std.mem.indexOf(u8, function.name, "first") != null) {
+            first_func = function;
+            break;
+        }
+    }
+    const func = first_func orelse return error.MissingFunction;
+
+    // Search every nested instruction stream for an `.index_get`
+    // whose dest is followed by `.retain{value=dest}`. The first
+    // tuple binding extracts the ARC-managed VectorI64 and must
+    // emit the retain; the second binding extracts a Bool (non-
+    // ARC) and must NOT.
+    var saw_arc_pair = false;
+    var saw_non_arc_with_retain = false;
+    for (func.body) |block| {
+        const stream = block.instructions;
+        for (stream, 0..) |instr, idx| {
+            if (instr != .index_get) continue;
+            if (idx + 1 >= stream.len) continue;
+            const next = stream[idx + 1];
+            const has_retain = (next == .retain and next.retain.value == instr.index_get.dest);
+            if (instr.index_get.index == 0 and has_retain) saw_arc_pair = true;
+            if (instr.index_get.index == 1 and has_retain) saw_non_arc_with_retain = true;
+        }
+    }
+    try std.testing.expect(saw_arc_pair);
+    try std.testing.expect(!saw_non_arc_with_retain);
 }
