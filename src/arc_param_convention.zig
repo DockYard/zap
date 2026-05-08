@@ -2,6 +2,8 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
 const types_mod = @import("types.zig");
+const v8_signature = @import("v8_signature.zig");
+const v8_fixpoint = @import("v8_fixpoint.zig");
 
 // ============================================================
 // Whole-program parameter-convention inference (Phase E.9).
@@ -166,10 +168,53 @@ pub fn inferConventions(
         try function_index.put(allocator, func.id, func);
     }
 
+    // Phase 1.3 chain-consistency audit (research2.md §1.5).
+    //
+    // Compute the v8_signature fixpoint over the call graph. For each
+    // function-slot pair (F, i), `lift_set` records whether the slot
+    // is safe to promote BEYOND the borrowed-source veto. A slot is
+    // lift-eligible iff:
+    //
+    //   1. `Sig(F, i) ∈ {CU, PU}` per the v8_signature fixpoint.
+    //   2. The local def-use chain at every call site to F-slot-i is
+    //      consume-mode (last-use checks + chain-walk pass).
+    //   3. EVERY call site's chain root, when it terminates at a
+    //      `param_get` of a caller's parameter slot, terminates at a
+    //      slot that is ALSO lift-eligible (the chain consistency
+    //      property — promoting F.i without lifting the chain root
+    //      would produce a double-release at runtime).
+    //
+    // The audit iterates a monotone fixpoint: a slot, once eligible,
+    // stays eligible. Termination is bounded by the program's slot
+    // count.
+    //
+    // This audit STRICTLY widens the existing `inferConventions`: a
+    // slot that is lift-eligible may bypass the borrowed-source veto
+    // (line 855-868) when its alias chain root is a `param_get` of a
+    // caller's `.borrowed` slot — but only when that caller slot is
+    // itself lift-eligible. The chain consistency guarantees that
+    // promoting `(F, i)` to `.owned` will be matched by promoting
+    // every parent slot in lockstep, so the runtime ABI invariant
+    // ("if the callee owns +1, the caller owns a +1 to give") holds.
+    var signatures = try v8_fixpoint.computeSignatures(allocator, program);
+    defer signatures.deinit(allocator);
+
+    var lift_set = try computeLiftSet(
+        allocator,
+        program,
+        &signatures,
+        &sites_by_target,
+        ownerships,
+        &function_index,
+        &name_to_id,
+    );
+    defer lift_set.deinit(allocator);
+
     // Fixpoint iteration: a callee's slot can be promoted only when every
     // caller's source local satisfies the consume gates, including the
     // borrowed-source veto (the chain root must NOT be a `param_get` of
-    // the caller's `.borrowed` parameter). Promoting one function's
+    // the caller's `.borrowed` parameter — UNLESS the audit has marked
+    // that parameter slot as lift-eligible). Promoting one function's
     // slot from `.borrowed` to `.owned` can unlock promotions in the
     // functions that pass through that slot. Iterate until no more
     // promotions occur.
@@ -190,10 +235,237 @@ pub fn inferConventions(
                 &sites_by_target,
                 ownerships,
                 &function_index,
+                &lift_set,
+                &name_to_id,
             );
             const after = countOwnedSlots(function);
             if (after > before) changed = true;
         }
+    }
+}
+
+/// Set of `(FunctionId, slot)` pairs that have passed the chain-
+/// consistency audit and are eligible to bypass the borrowed-source
+/// veto in `siteConsumesSlot`.
+///
+/// Keyed by a packed `u64` of `(function_id << 32) | slot`. This is a
+/// set, not a map — membership is the only signal.
+const LiftSet = std.AutoHashMapUnmanaged(u64, void);
+
+/// Pack a `(FunctionId, slot)` pair into a `u64` key. Slot is stored
+/// in the low 32 bits; function id in the high 32 bits.
+fn liftKey(function_id: ir.FunctionId, slot_index: usize) u64 {
+    return (@as(u64, @intCast(function_id)) << 32) | @as(u64, @intCast(slot_index));
+}
+
+fn liftSetContains(lift_set: *const LiftSet, function_id: ir.FunctionId, slot_index: usize) bool {
+    return lift_set.contains(liftKey(function_id, slot_index));
+}
+
+/// Compute the set of `(FunctionId, slot)` pairs that pass the
+/// chain-consistency audit. The audit iterates a monotone fixpoint —
+/// a slot, once eligible, never gets removed.
+///
+/// The audit's three conditions on `(F, i)`:
+///
+///   1. `Sig(F, i) ∈ {CU, PU}`. Slots whose signature is `aliases`
+///      or `top` cannot be lifted: aliasing means the parameter
+///      escapes the function (a tuple component or closure capture),
+///      top means we can't prove uniqueness. Either way, the runtime
+///      assumption that the cell is uniquely owned would be violated.
+///
+///   2. EVERY call site to F's slot i has a "consume-mode" local
+///      def-use chain in the caller (the same check
+///      `siteConsumesSlot` already performs MINUS the borrowed-source
+///      veto). If any call site's local check fails, F.i can't be
+///      lifted via the chain regardless.
+///
+///   3. EVERY call site's alias-chain root, when it is a `param_get`
+///      of caller `C` slot `j`, has `(C, j)` ALSO in the lift set.
+///      This is the chain-consistency property: promoting `F.i` to
+///      `.owned` adds a callee scope-exit drop for the parameter; if
+///      `(C, j)` is NOT lifted, `C` retains its `.borrowed` ABI and
+///      its retain around the call to `F` is NOT elided — producing
+///      a double release.
+fn computeLiftSet(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    signatures: *const v8_signature.ProgramSignatures,
+    sites_by_target: *const SitesByTarget,
+    ownerships: *const arc_liveness.ProgramArcOwnership,
+    function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
+    name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
+) !LiftSet {
+    var lift_set: LiftSet = .empty;
+    errdefer lift_set.deinit(allocator);
+
+    // Iterate the audit to fixpoint. On each iteration, for each
+    // currently-ineligible (F, i) pair where the signature qualifies
+    // and the local checks pass, check whether every call site's
+    // chain root either does NOT terminate at a borrowed param OR
+    // terminates at a borrowed param whose slot is already in the
+    // lift set. If yes, promote (F, i) to lift-eligible.
+    //
+    // The chain-consistency check is SOUND under monotone fixpoint
+    // semantics: at iteration N, a slot is in the lift set only when
+    // every chain it depends on is also in the lift set. The set
+    // never shrinks, so once a slot is in, every chain it participates
+    // in stays consistent.
+    var changed = true;
+    var iteration: u32 = 0;
+    const max_iterations: u32 = 64;
+    while (changed and iteration < max_iterations) : (iteration += 1) {
+        changed = false;
+        for (program.functions) |*function| {
+            for (function.param_conventions, 0..) |conv, slot_index| {
+                if (conv != .borrowed) continue;
+                if (liftSetContains(&lift_set, function.id, slot_index)) continue;
+                if (!try slotPassesAuditConditions(
+                    function,
+                    slot_index,
+                    signatures,
+                    sites_by_target,
+                    ownerships,
+                    function_index,
+                    &lift_set,
+                    name_to_id,
+                )) continue;
+                try lift_set.put(allocator, liftKey(function.id, slot_index), {});
+                changed = true;
+            }
+        }
+    }
+
+    return lift_set;
+}
+
+/// Single-iteration audit predicate: does `(function, slot_index)`
+/// pass conditions (1)–(3)?
+///
+/// `lift_set` is the *current* state of the audit's eligibility set.
+/// A `param_get` chain root only counts as audit-eligible when its
+/// slot is already in the set — fixpoint iteration ensures we
+/// converge to the largest consistent set.
+fn slotPassesAuditConditions(
+    function: *const ir.Function,
+    slot_index: usize,
+    signatures: *const v8_signature.ProgramSignatures,
+    sites_by_target: *const SitesByTarget,
+    ownerships: *const arc_liveness.ProgramArcOwnership,
+    function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
+    lift_set: *const LiftSet,
+    name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
+) !bool {
+    // Condition (1): signature must be CU or PU.
+    if (!signatures.isCuOrPu(function.id, slot_index)) return false;
+
+    // Condition (2) + (3): every call site's local check passes AND
+    // every chain root either ends at a non-param source or at a
+    // param slot already in the lift set.
+    const sites = sites_by_target.get(function.id);
+    if (sites.len == 0) return false; // No callers — nothing to lift. (Conservative.)
+
+    for (sites) |site| {
+        if (site.args.len <= slot_index) continue;
+        if (!try siteAuditEligible(
+            site,
+            slot_index,
+            ownerships,
+            function_index,
+            lift_set,
+        )) return false;
+    }
+
+    // Condition (4): the slot must satisfy `shouldPromoteSlot`'s
+    // anchor requirement. `shouldPromoteSlot` will only promote a
+    // slot when EITHER the slot has a self-recursive consume site,
+    // OR the body forwards the param into an owned-mutating
+    // builtin's receiver (the Zap-fn-wrapper-around-zig-builtin
+    // pattern), OR — Phase 1.3 extension — the body forwards the
+    // param into a Zap-function call whose corresponding slot is
+    // ALSO in `lift_set`. Without an anchor the slot will not
+    // actually promote in `evaluateFunction`, and adding it to
+    // `lift_set` would surface as an inconsistent chain when
+    // `siteConsumesSlot`'s veto check sees the parent's slot stuck
+    // `.borrowed` post-fixpoint — producing the double-release at
+    // runtime.
+    //
+    // The third anchor case (forward-to-lifted-callee) closes the
+    // gap that fannkuch's `advance_perm` exhibits: it forwards
+    // `count` to `rotate_loop` (a Zap function, not a builtin), so
+    // without the extension `advance_perm`'s `count` slot would
+    // never satisfy the anchor and the chain would freeze at
+    // `advance_perm`. With the extension, `advance_perm`'s
+    // `count`-slot anchor is satisfied as soon as `rotate_loop`'s
+    // matching slot enters `lift_set`.
+    //
+    // We require BOTH the chain consistency AND the matching anchor
+    // because the audit's promise to consumers is "if I add (F, i)
+    // to lift_set, F's slot i WILL be promoted to .owned by the end
+    // of the inferConventions iteration." Without the anchor, that
+    // promise breaks.
+    var has_self_recursive = false;
+    for (sites) |site| {
+        if (site.is_self_recursive) {
+            has_self_recursive = true;
+            break;
+        }
+    }
+    if (!has_self_recursive and !bodyConsumesParamViaOwnedSink(function, slot_index, lift_set, name_to_id)) {
+        return false;
+    }
+
+    return true;
+}
+
+/// Per-call-site audit predicate. Mirrors `siteConsumesSlot`'s local
+/// check but replaces the hard borrowed-source veto with a recursive
+/// chain-eligibility query against the in-progress `lift_set`.
+fn siteAuditEligible(
+    site: CallSite,
+    slot_index: usize,
+    ownerships: *const arc_liveness.ProgramArcOwnership,
+    function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
+    lift_set: *const LiftSet,
+) !bool {
+    switch (site.kind) {
+        .tail_call => {
+            // Self-recursive tail-call args are consumed by definition;
+            // they NEVER terminate at a `param_get` of a different
+            // parameter (they pass the same locals as the caller's),
+            // so the audit succeeds when the call is self-recursive.
+            // Non-self-recursive tail calls would be a Zap-level
+            // surprise — treat conservatively as audit-fail.
+            if (site.is_self_recursive) return true;
+            return false;
+        },
+        .regular => |info| {
+            const source = info.share_sources[slot_index] orelse return false;
+            const share_id = info.share_instr_ids[slot_index].?;
+
+            const fn_ownership = ownerships.get(site.enclosing_function_id) orelse return false;
+            const last_use = fn_ownership.last_use_map.get(source) orelse return false;
+            if (last_use != share_id) return false;
+
+            const caller_func = function_index.get(site.enclosing_function_id) orelse return false;
+            if (!chainIsConsumeMode(caller_func, fn_ownership, source, share_id)) return false;
+
+            const root_local = traceAliasChainToRoot(caller_func, source);
+            if (paramSlotForLocal(caller_func, root_local)) |param_slot| {
+                if (paramSlotIsRefetchedAfter(caller_func, param_slot, root_local, share_id)) return false;
+                // The audit's chain-consistency core: when the chain
+                // root is a `param_get` of a `.borrowed` parameter,
+                // the audit succeeds only when that parameter slot is
+                // ALSO in the lift set. This is the recursive
+                // condition that makes the fixpoint sound.
+                if (param_slot < caller_func.param_conventions.len and
+                    caller_func.param_conventions[param_slot] == .borrowed)
+                {
+                    return liftSetContains(lift_set, caller_func.id, param_slot);
+                }
+            }
+            return true;
+        },
     }
 }
 
@@ -484,6 +756,8 @@ fn evaluateFunction(
     sites_by_target: *const SitesByTarget,
     ownerships: *const arc_liveness.ProgramArcOwnership,
     function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
+    lift_set: *const LiftSet,
+    name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
 ) !void {
     if (function.param_conventions.len == 0) return;
 
@@ -497,7 +771,7 @@ fn evaluateFunction(
     const conventions: MutableConventions = @constCast(function.param_conventions);
     for (conventions, 0..) |*conv_ptr, slot_index| {
         if (conv_ptr.* != .borrowed) continue;
-        if (try shouldPromoteSlot(function, slot_index, sites, ownerships, function_index)) {
+        if (try shouldPromoteSlot(function, slot_index, sites, ownerships, function_index, lift_set, name_to_id)) {
             conv_ptr.* = .owned;
         }
     }
@@ -509,6 +783,8 @@ fn shouldPromoteSlot(
     sites: []const CallSite,
     ownerships: *const arc_liveness.ProgramArcOwnership,
     function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
+    lift_set: *const LiftSet,
+    name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
 ) !bool {
     var has_self_recursive = false;
     for (sites) |site| {
@@ -519,7 +795,7 @@ fn shouldPromoteSlot(
             // Zap functions today have fixed arity).
             continue;
         }
-        const consumes = try siteConsumesSlot(site, slot_index, ownerships, function_index);
+        const consumes = try siteConsumesSlot(site, slot_index, ownerships, function_index, lift_set);
         if (!consumes) return false;
         if (site.is_self_recursive) has_self_recursive = true;
     }
@@ -540,17 +816,38 @@ fn shouldPromoteSlot(
     // receiver enters the runtime with refcount >= 2, and the rc-1
     // fast path never fires — the source of the k-nucleotide perf
     // regression after the dense Map flip.
-    if (!has_self_recursive and !bodyConsumesParamViaOwnedBuiltin(function, slot_index)) {
+    //
+    // Phase 1.3 chain-consistency extension: also accept forwarding
+    // into a Zap function call whose slot is in `lift_set`. The
+    // audit's monotone fixpoint guarantees that ALL slots in
+    // `lift_set` will be promoted to `.owned` together, so a
+    // function whose only anchor is a forward into another
+    // lift-eligible slot still satisfies the consume-side property
+    // when the iteration converges.
+    if (!has_self_recursive and !bodyConsumesParamViaOwnedSink(function, slot_index, lift_set, name_to_id)) {
         return false;
     }
     return true;
 }
 
 /// Does the function's body forward `param_index` into the receiver
-/// slot of an owned-mutating call_builtin? Walks the function's
-/// instruction streams and tracks the SSA chain from `param_get` to
-/// the call_builtin, allowing intermediate `move_value`,
-/// `local_get`, `borrow_value`, and `share_value` aliases.
+/// slot of an owned-mutating call_builtin OR an owned slot of a Zap
+/// function call? Walks the function's instruction streams and tracks
+/// the SSA chain from `param_get` to the call, allowing intermediate
+/// `move_value`, `local_get`, `borrow_value`, and `share_value`
+/// aliases.
+///
+/// `lift_set` and `name_to_id` are optional. When provided, the check
+/// also accepts forwarding into a Zap function call whose
+/// corresponding slot is in `lift_set` — this is the chain-consistency
+/// extension for Phase 1.3 that allows a parameter slot to be
+/// considered "consumed via a downstream owned callee" when the
+/// downstream slot is itself being promoted in lockstep. Without this
+/// extension, a function like fannkuch's `advance_perm` (which only
+/// forwards `count` into `rotate_loop` — not into a call_builtin)
+/// would never satisfy `shouldPromoteSlot`'s anchor requirement, and
+/// the `count` chain through `advance_perm` could not be lifted even
+/// when the rest of the chain is consistent.
 ///
 /// The check is structural — we don't need a full last-use proof
 /// here because the inference's outer condition (every caller passes
@@ -563,6 +860,18 @@ fn shouldPromoteSlot(
 fn bodyConsumesParamViaOwnedBuiltin(
     function: *const ir.Function,
     param_index: usize,
+) bool {
+    return bodyConsumesParamViaOwnedSink(function, param_index, null, null);
+}
+
+/// Extended variant that also accepts forwarding into a Zap-function
+/// call whose corresponding slot is in `lift_set` (or already has a
+/// `.owned` convention).
+fn bodyConsumesParamViaOwnedSink(
+    function: *const ir.Function,
+    param_index: usize,
+    lift_set: ?*const LiftSet,
+    name_to_id: ?*const std.StringHashMapUnmanaged(ir.FunctionId),
 ) bool {
     // Cap the alias-set size to keep the analysis bounded. Map.put,
     // Map.delete, Map.merge wrappers use a single param_get plus a
@@ -591,6 +900,112 @@ fn bodyConsumesParamViaOwnedBuiltin(
     // slot is in `alias_buf[0..alias_len]`.
     for (function.body) |block| {
         if (streamHasOwnedBuiltinConsumingAlias(block.instructions, alias_buf[0..alias_len])) return true;
+    }
+    // Phase 1.3 chain-consistency extension: also check for forwarding
+    // into a Zap function call whose corresponding slot is in the
+    // current `lift_set` (audit prediction) or already promoted to
+    // `.owned`. This is what allows a function like fannkuch's
+    // `advance_perm` (which only forwards `count` into `rotate_loop`)
+    // to satisfy the anchor requirement when the entire chain is being
+    // promoted in lockstep.
+    if (lift_set != null and name_to_id != null) {
+        for (function.body) |block| {
+            if (streamHasOwnedZapCalleeConsumingAlias(
+                block.instructions,
+                alias_buf[0..alias_len],
+                lift_set.?,
+                name_to_id.?,
+            )) return true;
+        }
+    }
+    return false;
+}
+
+/// Scan the stream looking for a `call_named`/`call_direct` to a Zap
+/// function whose corresponding parameter slot is in `lift_set` or
+/// already has a `.borrowed`-superseded `.owned` convention. Mirrors
+/// `streamHasOwnedBuiltinConsumingAlias` but for inter-Zap calls.
+fn streamHasOwnedZapCalleeConsumingAlias(
+    stream: []const ir.Instruction,
+    alias_set: []const ir.LocalId,
+    lift_set: *const LiftSet,
+    name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
+) bool {
+    for (stream) |*instr| {
+        switch (instr.*) {
+            .call_named => |cn| {
+                if (name_to_id.get(cn.name)) |target_id| {
+                    for (cn.args, 0..) |arg, idx| {
+                        if (containsAlias(alias_set, arg) and
+                            liftSetContains(lift_set, target_id, idx)) return true;
+                    }
+                }
+            },
+            .call_direct => |cd| {
+                for (cd.args, 0..) |arg, idx| {
+                    if (containsAlias(alias_set, arg) and
+                        liftSetContains(lift_set, cd.function, idx)) return true;
+                }
+            },
+            .try_call_named => |tcn| {
+                if (name_to_id.get(tcn.name)) |target_id| {
+                    for (tcn.args, 0..) |arg, idx| {
+                        if (containsAlias(alias_set, arg) and
+                            liftSetContains(lift_set, target_id, idx)) return true;
+                    }
+                }
+            },
+            .tail_call => |tc| {
+                if (name_to_id.get(tc.name)) |target_id| {
+                    for (tc.args, 0..) |arg, idx| {
+                        if (containsAlias(alias_set, arg) and
+                            liftSetContains(lift_set, target_id, idx)) return true;
+                    }
+                }
+            },
+            .if_expr => |ie| {
+                if (streamHasOwnedZapCalleeConsumingAlias(ie.then_instrs, alias_set, lift_set, name_to_id)) return true;
+                if (streamHasOwnedZapCalleeConsumingAlias(ie.else_instrs, alias_set, lift_set, name_to_id)) return true;
+            },
+            .case_block => |cb| {
+                if (streamHasOwnedZapCalleeConsumingAlias(cb.pre_instrs, alias_set, lift_set, name_to_id)) return true;
+                for (cb.arms) |arm| {
+                    if (streamHasOwnedZapCalleeConsumingAlias(arm.cond_instrs, alias_set, lift_set, name_to_id)) return true;
+                    if (streamHasOwnedZapCalleeConsumingAlias(arm.body_instrs, alias_set, lift_set, name_to_id)) return true;
+                }
+                if (streamHasOwnedZapCalleeConsumingAlias(cb.default_instrs, alias_set, lift_set, name_to_id)) return true;
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| {
+                    if (streamHasOwnedZapCalleeConsumingAlias(c.body_instrs, alias_set, lift_set, name_to_id)) return true;
+                }
+                if (streamHasOwnedZapCalleeConsumingAlias(sl.default_instrs, alias_set, lift_set, name_to_id)) return true;
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| {
+                    if (streamHasOwnedZapCalleeConsumingAlias(c.body_instrs, alias_set, lift_set, name_to_id)) return true;
+                }
+                if (streamHasOwnedZapCalleeConsumingAlias(sr.default_instrs, alias_set, lift_set, name_to_id)) return true;
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| {
+                    if (streamHasOwnedZapCalleeConsumingAlias(c.body_instrs, alias_set, lift_set, name_to_id)) return true;
+                }
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| {
+                    if (streamHasOwnedZapCalleeConsumingAlias(c.body_instrs, alias_set, lift_set, name_to_id)) return true;
+                }
+            },
+            .guard_block => |gb| {
+                if (streamHasOwnedZapCalleeConsumingAlias(gb.body, alias_set, lift_set, name_to_id)) return true;
+            },
+            .optional_dispatch => |od| {
+                if (streamHasOwnedZapCalleeConsumingAlias(od.nil_instrs, alias_set, lift_set, name_to_id)) return true;
+                if (streamHasOwnedZapCalleeConsumingAlias(od.struct_instrs, alias_set, lift_set, name_to_id)) return true;
+            },
+            else => {},
+        }
     }
     return false;
 }
@@ -760,6 +1175,7 @@ fn siteConsumesSlot(
     slot_index: usize,
     ownerships: *const arc_liveness.ProgramArcOwnership,
     function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
+    lift_set: *const LiftSet,
 ) !bool {
     switch (site.kind) {
         .tail_call => {
@@ -839,23 +1255,35 @@ fn siteConsumesSlot(
             const root_local = traceAliasChainToRoot(caller_func, source);
             if (paramSlotForLocal(caller_func, root_local)) |param_slot| {
                 if (paramSlotIsRefetchedAfter(caller_func, param_slot, root_local, share_id)) return false;
-                // Soundness gate: the caller-side rewrite for an
-                // `.owned` callee slot turns the share_value into a
-                // `move_value`, transferring the caller's +1 to the
-                // callee. The caller must therefore own a +1 to give.
-                // When the alias chain's root is a `param_get` of a
-                // `.borrowed` parameter, the caller does NOT own a
-                // transferable +1 — the parameter's cell is owned by
-                // the caller's caller (the borrow ABI does retain on
-                // entry + release on return; the function is just a
-                // borrower). A move_value rewrite at this site would
+                // Phase 1.3 chain-consistency lift (research2.md §1.5).
+                //
+                // Historical soundness gate: when the alias chain's
+                // root is a `param_get` of a `.borrowed` parameter,
+                // the caller does NOT own a transferable +1 — the
+                // parameter's cell is owned by the caller's caller
+                // (the borrow ABI does retain on entry + release on
+                // return; the function is just a borrower). A
+                // `move_value` rewrite at this site would
                 // double-release the cell: the callee's scope-exit
                 // drop AND the caller's-caller post-call release
-                // both fire on the same cell. Refuse promotion.
+                // both fire on the same cell.
+                //
+                // The chain-consistency audit (`computeLiftSet`)
+                // identifies pairs (caller_func, param_slot) where
+                // the WHOLE chain — every parent slot all the way up
+                // to a fresh allocation or non-borrowed source — can
+                // be promoted in lockstep. When this caller's slot
+                // is in the lift set, promoting the callee here is
+                // sound: the audit guarantees the parent's slot is
+                // ALSO being promoted in this same `inferConventions`
+                // run, so the parent will own +1 and the chain's
+                // ABI invariants line up end-to-end.
                 if (param_slot < caller_func.param_conventions.len and
                     caller_func.param_conventions[param_slot] == .borrowed)
                 {
-                    return false;
+                    if (!liftSetContains(lift_set, caller_func.id, param_slot)) {
+                        return false;
+                    }
                 }
             }
             return true;
