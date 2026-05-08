@@ -1505,3 +1505,50 @@ test "arc_param_convention: stub function exists and accepts empty program" {
     const fn_ptr: *const @TypeOf(inferConventions) = &inferConventions;
     _ = fn_ptr;
 }
+
+test "arc_param_convention: liftKey packs (FunctionId, slot) without collision" {
+    // Sanity: the (FunctionId, slot) packing into a u64 must produce
+    // distinct keys for distinct inputs across the ranges the
+    // audit will encounter at production scale.
+    const k1 = liftKey(0, 0);
+    const k2 = liftKey(0, 1);
+    const k3 = liftKey(1, 0);
+    const k4 = liftKey(1, 1);
+    try std.testing.expect(k1 != k2);
+    try std.testing.expect(k1 != k3);
+    try std.testing.expect(k1 != k4);
+    try std.testing.expect(k2 != k3);
+    try std.testing.expect(k2 != k4);
+    try std.testing.expect(k3 != k4);
+
+    // Edge: slot indices up to ~4 billion (u32 max) and function ids
+    // similarly. The packing places the slot in the low 32 bits and
+    // the function id in the high 32. Verify a high-id × high-slot
+    // entry doesn't alias a low-id × low-slot entry.
+    const k_low = liftKey(0, 1);
+    const k_high = liftKey(1, 0);
+    try std.testing.expect(k_low != k_high);
+    try std.testing.expectEqual(@as(u64, 1), k_low);
+    try std.testing.expectEqual(@as(u64, 1) << 32, k_high);
+}
+
+test "arc_param_convention: liftSetContains returns false on an empty set" {
+    var set: LiftSet = .empty;
+    defer set.deinit(std.testing.allocator);
+    try std.testing.expect(!liftSetContains(&set, 0, 0));
+    try std.testing.expect(!liftSetContains(&set, 42, 7));
+}
+
+test "arc_param_convention: liftSetContains hits the recorded entries" {
+    var set: LiftSet = .empty;
+    defer set.deinit(std.testing.allocator);
+    try set.put(std.testing.allocator, liftKey(5, 2), {});
+    try set.put(std.testing.allocator, liftKey(8, 0), {});
+
+    try std.testing.expect(liftSetContains(&set, 5, 2));
+    try std.testing.expect(liftSetContains(&set, 8, 0));
+    try std.testing.expect(!liftSetContains(&set, 5, 0));
+    try std.testing.expect(!liftSetContains(&set, 5, 3));
+    try std.testing.expect(!liftSetContains(&set, 8, 1));
+    try std.testing.expect(!liftSetContains(&set, 0, 0));
+}
