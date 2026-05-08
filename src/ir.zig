@@ -1189,11 +1189,27 @@ pub fn isArcManagedTypeId(type_store: *const types_mod.TypeStore, type_id: types
     // refcounts, which the IR's `.owned` result convention required;
     // the cell's owner-side deep-release on its zero-transition
     // raced with the caller's release of the same children and
-    // produced double-frees). Phase H.4 — this flip — adds `.list`
-    // to the ARC-managed-type set so List(T) values flow through
-    // the same retain/release ABI as `.map` and `.opaque_type`.
+    // produced double-frees). Phase H.4 added `.list` to the
+    // ARC-managed-type set so List(T) values flow through the same
+    // retain/release ABI as `.map` and `.opaque_type`.
+    //
+    // A2 — flip `.vector_type` to ARC-managed. The runtime's
+    // `Vector(T)` already carries an inline `ArcHeader`, exposes
+    // `retain`/`release` (with deep-element-release on the zero
+    // transition), and the COW-on-share mutators (`set`, `push`,
+    // `pop`, `append`) take the share-clone path at refcount > 1.
+    // Pre-A2, `vector_type` was treated as `.trivial` because
+    // every benchmark used the imperative-aliasing pattern (main
+    // creates a buffer, passes it to a helper, expects in-place
+    // mutations to be visible). That pattern relied on refcount=1
+    // in-place mutation as the implicit ABI. A2 makes Vector
+    // participate in the standard ARC convention so the V8
+    // interprocedural fixpoint can prove uniqueness and the codegen
+    // can rewrite owned-mutating call sites to the unchecked
+    // variants. Callees must return their mutated receiver and
+    // callers must rebind (the accumulator-recursion idiom).
     return switch (type_store.getType(type_id)) {
-        .opaque_type, .map, .list => true,
+        .opaque_type, .map, .list, .vector_type => true,
         else => false,
     };
 }
@@ -5572,10 +5588,12 @@ pub const IrBuilder = struct {
         // allocated cells), continued by H.2's `guard_block`
         // ownership scoping fix in `arc_liveness.zig`, and closed
         // by H.3's `next`/`getHead`/`getTail` retain symmetry in
-        // `runtime.zig`. Keep `isArcManagedTypeId` and this method
-        // in lockstep — both must agree on every type.
+        // `runtime.zig`. A2 flip: `.vector_type` joins them —
+        // see `isArcManagedTypeId` for the full rationale. Keep
+        // `isArcManagedTypeId` and this method in lockstep — both
+        // must agree on every type.
         return switch (store.getType(type_id)) {
-            .opaque_type, .map, .list => true,
+            .opaque_type, .map, .list, .vector_type => true,
             else => false,
         };
     }

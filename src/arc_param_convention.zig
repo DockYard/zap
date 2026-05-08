@@ -153,6 +153,19 @@ pub fn inferConventions(
         );
     }
 
+    // Build a function-id → function-pointer index so the consume
+    // check can resolve a `CallSite.enclosing_function_id` back to
+    // the caller's IR body. The caller's body is needed to verify
+    // the V8 soundness check: a parameter slot that is re-fetched
+    // via a later `param_get` is NOT at last-use at any earlier
+    // share_value site, even if the share's specific source
+    // LocalId happens to be dead afterwards.
+    var function_index: std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function) = .empty;
+    defer function_index.deinit(allocator);
+    for (program.functions) |*func| {
+        try function_index.put(allocator, func.id, func);
+    }
+
     // For each function, evaluate the inference rule on every ARC-
     // managed parameter slot. When all three conditions hold,
     // promote `.borrowed` → `.owned`.
@@ -162,6 +175,7 @@ pub fn inferConventions(
             function,
             &sites_by_target,
             ownerships,
+            &function_index,
         );
     }
 }
@@ -444,6 +458,7 @@ fn evaluateFunction(
     function: *ir.Function,
     sites_by_target: *const SitesByTarget,
     ownerships: *const arc_liveness.ProgramArcOwnership,
+    function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
 ) !void {
     if (function.param_conventions.len == 0) return;
 
@@ -457,7 +472,7 @@ fn evaluateFunction(
     const conventions: MutableConventions = @constCast(function.param_conventions);
     for (conventions, 0..) |*conv_ptr, slot_index| {
         if (conv_ptr.* != .borrowed) continue;
-        if (try shouldPromoteSlot(function, slot_index, sites, ownerships)) {
+        if (try shouldPromoteSlot(function, slot_index, sites, ownerships, function_index)) {
             conv_ptr.* = .owned;
         }
     }
@@ -468,6 +483,7 @@ fn shouldPromoteSlot(
     slot_index: usize,
     sites: []const CallSite,
     ownerships: *const arc_liveness.ProgramArcOwnership,
+    function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
 ) !bool {
     var has_self_recursive = false;
     for (sites) |site| {
@@ -478,7 +494,7 @@ fn shouldPromoteSlot(
             // Zap functions today have fixed arity).
             continue;
         }
-        const consumes = try siteConsumesSlot(site, slot_index, ownerships);
+        const consumes = try siteConsumesSlot(site, slot_index, ownerships, function_index);
         if (!consumes) return false;
         if (site.is_self_recursive) has_self_recursive = true;
     }
@@ -718,6 +734,7 @@ fn siteConsumesSlot(
     site: CallSite,
     slot_index: usize,
     ownerships: *const arc_liveness.ProgramArcOwnership,
+    function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
 ) !bool {
     switch (site.kind) {
         .tail_call => {
@@ -750,9 +767,277 @@ fn siteConsumesSlot(
             // consumed there.
             const fn_ownership = ownerships.get(site.enclosing_function_id) orelse return false;
             const last_use = fn_ownership.last_use_map.get(source) orelse return false;
-            return last_use == share_id;
+            if (last_use != share_id) return false;
+
+            // V8 soundness gate (A2 — Vector(T) ARC promotion):
+            //
+            // The local-level last-use check above is necessary but
+            // NOT sufficient. The `IrBuilder.emitLocalGet` helper
+            // expands every named-binding read into a chain:
+            //
+            //     local_get  dest=A source=B
+            //     retain     value=A      ; emitted when source is ARC-managed
+            //     share_value dest=C source=A mode=retain
+            //     call ... args=[C, ...]
+            //     release    value=C
+            //
+            // The share_value's `source` is `A`, and `A` is at
+            // last-use at the share_value site. But `A` was retained
+            // immediately after `local_get`; aliasing `B`. The
+            // chain is "consume" (no real retain needed) ONLY if `B`
+            // was itself at last-use at the local_get site —
+            // otherwise the local_get/retain pair was emitted because
+            // the named binding has further uses, and rewriting the
+            // share_value into `move_value` (V8's promotion) would
+            // remove a +1 the binding still owns, leading to use-
+            // after-free when the binding is read again post-call.
+            //
+            // The same hazard applies to `param_get` chains: each
+            // parameter reference produces a fresh `param_get
+            // dest=X index=N`. If the parameter SLOT is read again
+            // by another `param_get` later in the body, the slot is
+            // not at last-use here.
+            //
+            // The check: walk the alias chain backward from `source`
+            // through `local_get`, `borrow_value`, `copy_value`,
+            // `move_value`, `share_value`. At each hop, verify the
+            // local being aliased FROM is itself at last-use at the
+            // alias instruction. If any hop fails the check, the
+            // root binding has post-call uses and promotion is
+            // unsound.
+            //
+            // The walk also stops at `param_get` and checks whether
+            // the parameter slot is refetched elsewhere in the body.
+            const caller_func = function_index.get(site.enclosing_function_id) orelse return false;
+            if (!chainIsConsumeMode(caller_func, fn_ownership, source, share_id)) return false;
+
+            const root_local = traceAliasChainToRoot(caller_func, source);
+            if (paramSlotForLocal(caller_func, root_local)) |param_slot| {
+                if (paramSlotIsRefetchedAfter(caller_func, param_slot, root_local, share_id)) return false;
+                // Soundness gate: the caller-side rewrite for an
+                // `.owned` callee slot turns the share_value into a
+                // `move_value`, transferring the caller's +1 to the
+                // callee. The caller must therefore own a +1 to give.
+                // When the alias chain's root is a `param_get` of a
+                // `.borrowed` parameter, the caller does NOT own a
+                // transferable +1 — the parameter's cell is owned by
+                // the caller's caller (the borrow ABI does retain on
+                // entry + release on return; the function is just a
+                // borrower). A move_value rewrite at this site would
+                // double-release the cell: the callee's scope-exit
+                // drop AND the caller's-caller post-call release
+                // both fire on the same cell. Refuse promotion.
+                if (param_slot < caller_func.param_conventions.len and
+                    caller_func.param_conventions[param_slot] == .borrowed)
+                {
+                    return false;
+                }
+            }
+            return true;
         },
     }
+}
+
+/// Walk backward through the IR-builder-emitted alias forms
+/// (`local_get`, `borrow_value`, `copy_value`, `move_value`,
+/// `share_value`) starting from `local_id` and return the deepest
+/// root local that does not have an alias-form definition. Stops at
+/// the first instruction that defines `current_local` whose form is
+/// NOT one of the recognised alias forms (e.g., `param_get`,
+/// `local_set`, `call_named` dest, etc.) — that local is the root.
+///
+/// The walk is bounded by an iteration cap to defend against
+/// pathological IR shapes; in practice the IrBuilder's chains are
+/// shallow (at most 3-4 hops between named binding and call arg).
+fn traceAliasChainToRoot(function: *const ir.Function, local_id: ir.LocalId) ir.LocalId {
+    var current = local_id;
+    const max_hops: usize = 16;
+    var hop: usize = 0;
+    while (hop < max_hops) : (hop += 1) {
+        const next_opt = aliasSourceFor(function, current);
+        if (next_opt) |next_local| {
+            current = next_local;
+        } else {
+            break;
+        }
+    }
+    return current;
+}
+
+/// Return the source local that defined `local_id` via an alias
+/// instruction (`local_get`, `borrow_value`, `copy_value`,
+/// `move_value`, `share_value`), along with the instruction id
+/// of the defining alias instruction. Returns null if `local_id`
+/// is not the dest of any alias instruction (i.e., it's a "root"
+/// produced by `param_get`, `local_set`, a call dest, etc.).
+const AliasStep = struct {
+    source: ir.LocalId,
+    instr_id: arc_liveness.InstructionId,
+};
+
+fn aliasStepFor(
+    function: *const ir.Function,
+    local_id: ir.LocalId,
+) ?AliasStep {
+    const Visitor = struct {
+        target: ir.LocalId,
+        result: ?AliasStep,
+        next_id: arc_liveness.InstructionId,
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            const my_id = self.next_id;
+            self.next_id += 1;
+            if (self.result != null) return;
+            const matched_source: ?ir.LocalId = switch (instr.*) {
+                .local_get => |lg| if (lg.dest == self.target) lg.source else null,
+                .borrow_value => |bv| if (bv.dest == self.target) bv.source else null,
+                .copy_value => |cv| if (cv.dest == self.target) cv.source else null,
+                .move_value => |mv| if (mv.dest == self.target) mv.source else null,
+                .share_value => |sv| if (sv.dest == self.target) sv.source else null,
+                else => null,
+            };
+            if (matched_source) |src| {
+                self.result = .{ .source = src, .instr_id = my_id };
+            }
+        }
+    };
+    var visitor = Visitor{ .target = local_id, .result = null, .next_id = 0 };
+    ir.forEachInstruction(function, &visitor, Visitor.visit);
+    return visitor.result;
+}
+
+/// Convenience: just the source local. Used by `traceAliasChainToRoot`
+/// where the instruction id is not needed.
+fn aliasSourceFor(function: *const ir.Function, local_id: ir.LocalId) ?ir.LocalId {
+    if (aliasStepFor(function, local_id)) |step| return step.source;
+    return null;
+}
+
+/// Walk the alias chain from `source` backward and verify that, at
+/// every hop, the source local is at its last-use at the alias
+/// instruction. The chain starts at the share_value's source (the
+/// caller passes `share_id` as the share's instruction id, which
+/// `last_use_map[source]` is expected to equal at the entry —
+/// already verified by the surrounding caller).
+///
+/// Returns true when every aliased local is at last-use at its
+/// defining alias instruction. Returns false at the first hop
+/// where the source has post-alias uses (i.e., the underlying
+/// binding is alive past the call).
+fn chainIsConsumeMode(
+    function: *const ir.Function,
+    fn_ownership: *const arc_liveness.ArcOwnership,
+    chain_start: ir.LocalId,
+    share_id: arc_liveness.InstructionId,
+) bool {
+    var current = chain_start;
+    var current_consume_id: arc_liveness.InstructionId = share_id;
+    const max_hops: usize = 16;
+    var hop: usize = 0;
+    while (hop < max_hops) : (hop += 1) {
+        // Verify `current` is at its last-use at `current_consume_id`.
+        // For the first iteration this is the share_value site (the
+        // surrounding caller already verified this); subsequent
+        // iterations check at the prior alias instruction.
+        const last_use = fn_ownership.last_use_map.get(current) orelse return false;
+        if (last_use != current_consume_id) return false;
+
+        // Walk one hop further. If `current` was produced by an
+        // alias instruction, the source becomes the new `current`
+        // and the alias instruction's id becomes the new last-use
+        // anchor. If `current` is a root (no alias step), we're done.
+        const step_opt = aliasStepFor(function, current);
+        if (step_opt) |step| {
+            current = step.source;
+            current_consume_id = step.instr_id;
+        } else {
+            break;
+        }
+    }
+    return true;
+}
+
+/// Walk `function`'s body looking for a `param_get` instruction
+/// whose `dest` equals `local_id`. Returns the parameter slot
+/// (`param_get.index`) when found, or null when `local_id` is not
+/// the immediate destination of a `param_get`.
+///
+/// This is the local equivalent of `arc_drop_insertion.paramIndexForLocal`
+/// — duplicated here so the V8 inference doesn't pull in
+/// `arc_drop_insertion` (avoiding a cyclic-import situation; the
+/// drop-insertion pass runs strictly AFTER V8). Both helpers share
+/// the same semantics: find the unique `param_get` dest mapping for
+/// a candidate LocalId.
+fn paramSlotForLocal(function: *const ir.Function, local_id: ir.LocalId) ?u32 {
+    const Visitor = struct {
+        target: ir.LocalId,
+        result: ?u32,
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (instr.* == .param_get and instr.param_get.dest == self.target) {
+                self.result = instr.param_get.index;
+            }
+        }
+    };
+    var visitor = Visitor{ .target = local_id, .result = null };
+    ir.forEachInstruction(function, &visitor, Visitor.visit);
+    return visitor.result;
+}
+
+/// Returns true when `function`'s body contains a `param_get` of
+/// `param_slot` whose dest is NOT `share_source` AND whose
+/// instruction id is strictly greater than `share_id`. In other
+/// words: is the parameter slot fetched AGAIN at any point AFTER
+/// the share_value site?
+///
+/// The position-aware check is essential for the k-nucleotide
+/// `Map.put` accumulator pattern: count_kmers_loop reads `m`
+/// twice — once for `Map.get` (slot is still alive after) and once
+/// for `Map.put` (slot is dead after; the recursive tail_call uses
+/// `Map.put`'s result, not `m`). The first param_get IS visible
+/// from the second's check (a flat "any other param_get" predicate
+/// would reject), but the second IS at slot last-use because no
+/// later instruction reads slot 4. Only post-share_id refetches
+/// matter; pre-share_id reads are bounded by their own share/release
+/// envelopes and don't conflict with the move_value rewrite at the
+/// later site.
+///
+/// Instruction ids are assigned in the same depth-first order
+/// `arc_liveness.flattenInstructions` uses (the V8 `SiteWalker`
+/// mirrors that walk), so id comparison is meaningful.
+fn paramSlotIsRefetchedAfter(
+    function: *const ir.Function,
+    param_slot: u32,
+    share_source: ir.LocalId,
+    share_id: arc_liveness.InstructionId,
+) bool {
+    const Visitor = struct {
+        slot: u32,
+        excluded_dest: ir.LocalId,
+        threshold_id: arc_liveness.InstructionId,
+        next_id: arc_liveness.InstructionId,
+        found: bool,
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            const my_id = self.next_id;
+            self.next_id += 1;
+            if (self.found) return;
+            if (instr.* == .param_get and instr.param_get.index == self.slot) {
+                if (instr.param_get.dest != self.excluded_dest and my_id > self.threshold_id) {
+                    self.found = true;
+                }
+            }
+        }
+    };
+    var visitor = Visitor{
+        .slot = param_slot,
+        .excluded_dest = share_source,
+        .threshold_id = share_id,
+        .next_id = 0,
+        .found = false,
+    };
+    ir.forEachInstruction(function, &visitor, Visitor.visit);
+    return visitor.found;
 }
 
 // ============================================================
