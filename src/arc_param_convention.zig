@@ -1438,10 +1438,13 @@ fn paramSlotForLocal(function: *const ir.Function, local_id: ir.LocalId) ?u32 {
 }
 
 /// Returns true when `function`'s body contains a `param_get` of
-/// `param_slot` whose dest is NOT `share_source` AND whose
-/// instruction id is strictly greater than `share_id`. In other
-/// words: is the parameter slot fetched AGAIN at any point AFTER
-/// the share_value site?
+/// `param_slot` whose dest is NOT `share_source` along a STRUCTURAL
+/// PATH that flows out of the share_value site — i.e. along any
+/// successor of the share within the same stream, then any
+/// successor of every enclosing instruction. Mutually-exclusive
+/// arms (case_block arms, switch_literal cases, if_expr branches,
+/// try_call success/handler) that don't contain the share_value
+/// are pruned: they are unreachable from share's flow path.
 ///
 /// The position-aware check is essential for the k-nucleotide
 /// `Map.put` accumulator pattern: count_kmers_loop reads `m`
@@ -1450,47 +1453,332 @@ fn paramSlotForLocal(function: *const ir.Function, local_id: ir.LocalId) ?u32 {
 /// `Map.put`'s result, not `m`). The first param_get IS visible
 /// from the second's check (a flat "any other param_get" predicate
 /// would reject), but the second IS at slot last-use because no
-/// later instruction reads slot 4. Only post-share_id refetches
-/// matter; pre-share_id reads are bounded by their own share/release
-/// envelopes and don't conflict with the move_value rewrite at the
-/// later site.
+/// later instruction reads slot 4. Only post-share-on-the-share-path
+/// refetches matter; pre-share reads and reads on disjoint arms
+/// don't conflict with the move_value rewrite at the later site.
 ///
-/// Instruction ids are assigned in the same depth-first order
-/// `arc_liveness.flattenInstructions` uses (the V8 `SiteWalker`
-/// mirrors that walk), so id comparison is meaningful.
+/// Earlier versions of this check used flat-id comparison
+/// (`my_id > share_id`), which over-rejected: it counted refetches
+/// in OTHER case arms as "after" the share even though those arms
+/// are mutually exclusive with the share's arm. That over-rejection
+/// blocked promotion of any wrapper whose only caller's body has a
+/// case_block (e.g., the `vector_rc1` example's `fill_in_place`
+/// reads `v` in case[0] for the recursive `set` call and reads `v`
+/// again in case[1] for the base-case return; the two reads are on
+/// disjoint paths, so the case[1] read must not block promotion
+/// of the case[0]-bound share).
 fn paramSlotIsRefetchedAfter(
     function: *const ir.Function,
     param_slot: u32,
     share_source: ir.LocalId,
     share_id: arc_liveness.InstructionId,
 ) bool {
-    const Visitor = struct {
-        slot: u32,
-        excluded_dest: ir.LocalId,
-        threshold_id: arc_liveness.InstructionId,
-        next_id: arc_liveness.InstructionId,
-        found: bool,
-
-        fn visit(self: *@This(), instr: *const ir.Instruction) void {
-            const my_id = self.next_id;
-            self.next_id += 1;
-            if (self.found) return;
-            if (instr.* == .param_get and instr.param_get.index == self.slot) {
-                if (instr.param_get.dest != self.excluded_dest and my_id > self.threshold_id) {
-                    self.found = true;
-                }
-            }
-        }
-    };
-    var visitor = Visitor{
+    var ctx = SuccessorScan{
         .slot = param_slot,
         .excluded_dest = share_source,
-        .threshold_id = share_id,
+        .target_id = share_id,
         .next_id = 0,
         .found = false,
     };
-    ir.forEachInstruction(function, &visitor, Visitor.visit);
-    return visitor.found;
+    for (function.body) |block| {
+        const status = scanStreamSuccessors(block.instructions, &ctx);
+        if (ctx.found) return true;
+        if (status == .target_found_and_done) break;
+    }
+    return ctx.found;
+}
+
+/// State for the structural-successor scan used by
+/// `paramSlotIsRefetchedAfter`. The scan has two modes that toggle
+/// when the share_value at `target_id` is encountered:
+///   * Pre-target: walk every instruction looking for the share id.
+///     Don't record refetches; they're before the share.
+///   * Post-target: record any `param_get index=slot` whose dest is
+///     not the excluded source, and whose id is strictly greater
+///     than the target. Only on the SAME structural path as the
+///     share — sibling arms of the structure that contained the
+///     share are pruned by `scanInstructionChildrenPostTarget`.
+const SuccessorScan = struct {
+    slot: u32,
+    excluded_dest: ir.LocalId,
+    target_id: arc_liveness.InstructionId,
+    /// Running depth-first instruction id. Mirrors `forEachInstruction`'s
+    /// id assignment so target_id comparisons are meaningful.
+    next_id: arc_liveness.InstructionId,
+    /// Once we cross the share, we're in "post-target" mode for the
+    /// remainder of this stream and every enclosing parent stream.
+    found: bool,
+};
+
+/// Stream-walk status: the share_value at `target_id` may live in
+/// this stream, in a child of one of this stream's instructions, or
+/// not be reachable from this stream at all. The status communicates
+/// to the caller (the parent stream) whether it should switch to
+/// post-target mode for sibling instructions that follow this one.
+const StreamStatus = enum {
+    /// Target was not encountered in this stream or any of its
+    /// children. The caller's mode is unchanged.
+    target_not_found,
+    /// Target was encountered in this stream; subsequent instructions
+    /// in the same stream were scanned in post-target mode. The
+    /// caller's mode should switch to post-target after returning,
+    /// because anything after the structure containing the target is
+    /// also "after the share".
+    target_found_and_done,
+};
+
+/// Scan a stream from beginning to end. Within the stream, we either:
+///   * never see the target id (target_not_found),
+///   * or hit it; from that point onward in the same stream we run
+///     post-target mode and visit only successors (no "siblings" —
+///     siblings in the same stream are sequential successors), and
+///     we visit children of those successors fully in post-target
+///     mode.
+fn scanStreamSuccessors(
+    stream: []const ir.Instruction,
+    ctx: *SuccessorScan,
+) StreamStatus {
+    var status: StreamStatus = .target_not_found;
+    var post_target = false;
+    for (stream) |*instr| {
+        const my_id = ctx.next_id;
+        ctx.next_id += 1;
+        if (post_target) {
+            // We're past the share in this stream — every instruction
+            // here and its children are reachable successors.
+            checkParamGet(instr, my_id, ctx);
+            if (ctx.found) return status;
+            scanInstructionChildrenPostTarget(instr, ctx);
+            if (ctx.found) return status;
+        } else {
+            // Pre-target: assign ids to children but only check
+            // refetches if we discover the target inside.
+            const sub_status = scanInstructionChildrenMaybeTarget(instr, my_id, ctx);
+            if (ctx.found) return status;
+            if (sub_status == .target_found_and_done) {
+                post_target = true;
+                status = .target_found_and_done;
+            }
+        }
+    }
+    return status;
+}
+
+/// Pre-target mode: visit `instr`'s children. If we find the target
+/// id (either as `instr` itself or inside a child), switch the
+/// child-walk to post-target for subsequent sibling instructions in
+/// the same stream and propagate the status up.
+fn scanInstructionChildrenMaybeTarget(
+    instr: *const ir.Instruction,
+    instr_id: arc_liveness.InstructionId,
+    ctx: *SuccessorScan,
+) StreamStatus {
+    if (instr_id == ctx.target_id) {
+        // The target instruction itself. No children to check (the
+        // target is a share_value, which has no nested instructions).
+        return .target_found_and_done;
+    }
+    return scanChildStreamsMaybeTarget(instr, ctx);
+}
+
+/// Walk every child stream of `instr` in pre-target mode. If any
+/// child stream contains the target, the remaining sibling streams
+/// are walked in post-target mode (they're successors of the share
+/// once control flow leaves the structure that contained it). Returns
+/// the aggregate status.
+fn scanChildStreamsMaybeTarget(
+    instr: *const ir.Instruction,
+    ctx: *SuccessorScan,
+) StreamStatus {
+    switch (instr.*) {
+        .if_expr => |ie| {
+            const t = scanStreamSuccessors(ie.then_instrs, ctx);
+            if (ctx.found) return .target_not_found;
+            const e = scanStreamSuccessors(ie.else_instrs, ctx);
+            if (ctx.found) return .target_not_found;
+            if (t == .target_found_and_done or e == .target_found_and_done)
+                return .target_found_and_done;
+            return .target_not_found;
+        },
+        .case_block => |cb| {
+            const pre = scanStreamSuccessors(cb.pre_instrs, ctx);
+            if (ctx.found) return .target_not_found;
+            var any_target = pre == .target_found_and_done;
+            for (cb.arms) |arm| {
+                const cond = scanStreamSuccessors(arm.cond_instrs, ctx);
+                if (ctx.found) return .target_not_found;
+                if (cond == .target_found_and_done) any_target = true;
+                const body = scanStreamSuccessors(arm.body_instrs, ctx);
+                if (ctx.found) return .target_not_found;
+                if (body == .target_found_and_done) any_target = true;
+            }
+            const default = scanStreamSuccessors(cb.default_instrs, ctx);
+            if (ctx.found) return .target_not_found;
+            if (default == .target_found_and_done) any_target = true;
+            if (any_target) return .target_found_and_done;
+            return .target_not_found;
+        },
+        .switch_literal => |sl| {
+            var any_target = false;
+            for (sl.cases) |c| {
+                const s = scanStreamSuccessors(c.body_instrs, ctx);
+                if (ctx.found) return .target_not_found;
+                if (s == .target_found_and_done) any_target = true;
+            }
+            const def = scanStreamSuccessors(sl.default_instrs, ctx);
+            if (ctx.found) return .target_not_found;
+            if (def == .target_found_and_done) any_target = true;
+            if (any_target) return .target_found_and_done;
+            return .target_not_found;
+        },
+        .switch_return => |sr| {
+            var any_target = false;
+            for (sr.cases) |c| {
+                const s = scanStreamSuccessors(c.body_instrs, ctx);
+                if (ctx.found) return .target_not_found;
+                if (s == .target_found_and_done) any_target = true;
+            }
+            const def = scanStreamSuccessors(sr.default_instrs, ctx);
+            if (ctx.found) return .target_not_found;
+            if (def == .target_found_and_done) any_target = true;
+            if (any_target) return .target_found_and_done;
+            return .target_not_found;
+        },
+        .union_switch => |us| {
+            var any_target = false;
+            for (us.cases) |c| {
+                const s = scanStreamSuccessors(c.body_instrs, ctx);
+                if (ctx.found) return .target_not_found;
+                if (s == .target_found_and_done) any_target = true;
+            }
+            if (any_target) return .target_found_and_done;
+            return .target_not_found;
+        },
+        .union_switch_return => |usr| {
+            var any_target = false;
+            for (usr.cases) |c| {
+                const s = scanStreamSuccessors(c.body_instrs, ctx);
+                if (ctx.found) return .target_not_found;
+                if (s == .target_found_and_done) any_target = true;
+            }
+            if (any_target) return .target_found_and_done;
+            return .target_not_found;
+        },
+        .try_call_named => |tcn| {
+            const h = scanStreamSuccessors(tcn.handler_instrs, ctx);
+            if (ctx.found) return .target_not_found;
+            const s = scanStreamSuccessors(tcn.success_instrs, ctx);
+            if (ctx.found) return .target_not_found;
+            if (h == .target_found_and_done or s == .target_found_and_done)
+                return .target_found_and_done;
+            return .target_not_found;
+        },
+        .guard_block => |gb| {
+            return scanStreamSuccessors(gb.body, ctx);
+        },
+        .optional_dispatch => |od| {
+            const n = scanStreamSuccessors(od.nil_instrs, ctx);
+            if (ctx.found) return .target_not_found;
+            const s = scanStreamSuccessors(od.struct_instrs, ctx);
+            if (ctx.found) return .target_not_found;
+            if (n == .target_found_and_done or s == .target_found_and_done)
+                return .target_found_and_done;
+            return .target_not_found;
+        },
+        else => return .target_not_found,
+    }
+}
+
+/// Post-target mode: visit every child stream of `instr` and check
+/// every `param_get` for refetches. Every child here is a structural
+/// successor of the share (the share lives in some ancestor stream
+/// that has already been crossed), so all paths matter.
+fn scanInstructionChildrenPostTarget(
+    instr: *const ir.Instruction,
+    ctx: *SuccessorScan,
+) void {
+    switch (instr.*) {
+        .if_expr => |ie| {
+            scanStreamPostTarget(ie.then_instrs, ctx);
+            if (ctx.found) return;
+            scanStreamPostTarget(ie.else_instrs, ctx);
+        },
+        .case_block => |cb| {
+            scanStreamPostTarget(cb.pre_instrs, ctx);
+            if (ctx.found) return;
+            for (cb.arms) |arm| {
+                scanStreamPostTarget(arm.cond_instrs, ctx);
+                if (ctx.found) return;
+                scanStreamPostTarget(arm.body_instrs, ctx);
+                if (ctx.found) return;
+            }
+            scanStreamPostTarget(cb.default_instrs, ctx);
+        },
+        .switch_literal => |sl| {
+            for (sl.cases) |c| {
+                scanStreamPostTarget(c.body_instrs, ctx);
+                if (ctx.found) return;
+            }
+            scanStreamPostTarget(sl.default_instrs, ctx);
+        },
+        .switch_return => |sr| {
+            for (sr.cases) |c| {
+                scanStreamPostTarget(c.body_instrs, ctx);
+                if (ctx.found) return;
+            }
+            scanStreamPostTarget(sr.default_instrs, ctx);
+        },
+        .union_switch => |us| {
+            for (us.cases) |c| {
+                scanStreamPostTarget(c.body_instrs, ctx);
+                if (ctx.found) return;
+            }
+        },
+        .union_switch_return => |usr| {
+            for (usr.cases) |c| {
+                scanStreamPostTarget(c.body_instrs, ctx);
+                if (ctx.found) return;
+            }
+        },
+        .try_call_named => |tcn| {
+            scanStreamPostTarget(tcn.handler_instrs, ctx);
+            if (ctx.found) return;
+            scanStreamPostTarget(tcn.success_instrs, ctx);
+        },
+        .guard_block => |gb| scanStreamPostTarget(gb.body, ctx),
+        .optional_dispatch => |od| {
+            scanStreamPostTarget(od.nil_instrs, ctx);
+            if (ctx.found) return;
+            scanStreamPostTarget(od.struct_instrs, ctx);
+        },
+        else => {},
+    }
+}
+
+fn scanStreamPostTarget(
+    stream: []const ir.Instruction,
+    ctx: *SuccessorScan,
+) void {
+    for (stream) |*instr| {
+        const my_id = ctx.next_id;
+        ctx.next_id += 1;
+        checkParamGet(instr, my_id, ctx);
+        if (ctx.found) return;
+        scanInstructionChildrenPostTarget(instr, ctx);
+        if (ctx.found) return;
+    }
+}
+
+fn checkParamGet(
+    instr: *const ir.Instruction,
+    instr_id: arc_liveness.InstructionId,
+    ctx: *SuccessorScan,
+) void {
+    if (instr.* == .param_get and instr.param_get.index == ctx.slot) {
+        if (instr.param_get.dest != ctx.excluded_dest and instr_id > ctx.target_id) {
+            ctx.found = true;
+        }
+    }
 }
 
 // ============================================================
@@ -1551,4 +1839,159 @@ test "arc_param_convention: liftSetContains hits the recorded entries" {
     try std.testing.expect(!liftSetContains(&set, 5, 3));
     try std.testing.expect(!liftSetContains(&set, 8, 1));
     try std.testing.expect(!liftSetContains(&set, 0, 0));
+}
+
+test "arc_param_convention: paramSlotIsRefetchedAfter ignores refetches in disjoint case arms" {
+    // Build a function shaped like `vector_rc1`'s `fill_in_place`:
+    //
+    //   case scrut {
+    //     true ->
+    //       param_get index=0 dest=L0      -- the share's source
+    //       share_value dest=L1 source=L0  -- target share
+    //       call_named ... args=[L1]       -- consume site
+    //     false ->
+    //       param_get index=0 dest=L17     -- DIFFERENT local; disjoint arm
+    //       ret value=L17
+    //   }
+    //
+    // The structural-successor scan must not flag the case[1] refetch
+    // as a post-share refetch, because case[0] and case[1] are
+    // mutually exclusive on the share's path.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // case[0]: consumes slot 0
+    const case0_body = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } }, // id 4 (after case_block, scrutinee, switch, and arm wiring)
+        .{ .share_value = .{ .dest = 1, .source = 0, .mode = .retain } }, // id 5
+        .{ .ret = .{ .value = 1 } }, // id 6
+    });
+    // case[1]: refetches slot 0 (disjoint arm)
+    const case1_body = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 17, .index = 0 } }, // id 7
+        .{ .ret = .{ .value = 17 } }, // id 8
+    });
+    // The switch_literal/case_block holds both arms.
+    const cases = try arena.alloc(ir.LitCase, 2);
+    cases[0] = .{
+        .value = .{ .bool_val = true },
+        .body_instrs = case0_body,
+        .result = null,
+    };
+    cases[1] = .{
+        .value = .{ .bool_val = false },
+        .body_instrs = case1_body,
+        .result = null,
+    };
+    const default_body = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .match_fail = .{ .message = "unreachable" } },
+    });
+    const top = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 18, .index = 1 } }, // id 0 (scrut prep)
+        .{ .switch_literal = .{
+            .dest = 19,
+            .scrutinee = 18,
+            .cases = cases,
+            .default_instrs = default_body,
+            .default_result = null,
+        } }, // id 1
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = top };
+
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .owned, .owned, .owned, .owned, .owned, .owned,
+        .owned, .owned, .owned, .owned, .owned, .owned, .owned, .owned,
+        .owned, .owned, .owned, .owned,
+    });
+    const param_conventions = try arena.dupe(ir.ParamConvention, &[_]ir.ParamConvention{ .borrowed, .trivial });
+    var function = ir.Function{
+        .id = 100,
+        .name = "test_func",
+        .scope_id = 0,
+        .arity = 2,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 20,
+        .param_conventions = param_conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    // Compute the share_value's instruction id by walking the same
+    // depth-first order. Top-level: param_get (id 0), switch_literal
+    // (id 1). The switch's children: case[0].body[0]=param_get (id 2),
+    // case[0].body[1]=share_value (id 3), case[0].body[2]=ret (id 4),
+    // case[1].body[0]=param_get (id 5), case[1].body[1]=ret (id 6),
+    // default.body[0]=match_fail (id 7).
+    //
+    // share_id is 3, share_source is L0.
+    const share_id: arc_liveness.InstructionId = 3;
+    const share_source: ir.LocalId = 0;
+
+    // The pre-fix flat-id check would return TRUE (id 5's param_get
+    // is > id 3). The new structural-successor check must return
+    // FALSE: case[1] is on a path disjoint from the share.
+    try std.testing.expect(!paramSlotIsRefetchedAfter(&function, 0, share_source, share_id));
+}
+
+test "arc_param_convention: paramSlotIsRefetchedAfter detects refetch on the same flow path" {
+    // Build a function where the same case arm has both a share AND
+    // a later refetch into a different local — the legitimate
+    // k-nucleotide-style shape that the original check was designed
+    // to catch.
+    //
+    //   param_get index=0 dest=L0     -- first fetch
+    //   share_value dest=L1 source=L0 -- target share
+    //   call_named ... args=[L1]      -- first call
+    //   param_get index=0 dest=L2     -- SECOND fetch (same flow path!)
+    //   share_value dest=L3 source=L2 -- second share
+    //   call_named ... args=[L3]      -- second call
+    //
+    // The structural-successor scan MUST flag the second param_get
+    // as post-share (it's on the same straight-line path).
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const top = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } }, // id 0
+        .{ .share_value = .{ .dest = 1, .source = 0, .mode = .retain } }, // id 1
+        .{ .release = .{ .value = 1 } }, // id 2
+        .{ .param_get = .{ .dest = 2, .index = 0 } }, // id 3 — refetch
+        .{ .ret = .{ .value = 2 } }, // id 4
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = top };
+
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .owned, .owned,
+    });
+    const param_conventions = try arena.dupe(ir.ParamConvention, &[_]ir.ParamConvention{.borrowed});
+    var function = ir.Function{
+        .id = 200,
+        .name = "test_refetch",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = param_conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    const share_id: arc_liveness.InstructionId = 1;
+    const share_source: ir.LocalId = 0;
+
+    // The second param_get is on the SAME flow path as the share.
+    // The check must catch it.
+    try std.testing.expect(paramSlotIsRefetchedAfter(&function, 0, share_source, share_id));
 }

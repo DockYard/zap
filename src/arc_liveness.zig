@@ -2344,6 +2344,95 @@ pub fn isUncheckedOwnedMutatingBuiltin(name: []const u8) bool {
     return ownedMutatingBuiltinSlot(name) != null;
 }
 
+/// V8 (Phase 1.4): is `name` a runtime fresh-allocator intrinsic?
+///
+/// A "fresh allocator" is a `call_builtin` whose runtime contract is
+/// "allocates a brand-new ARC-managed cell with refcount = 1." These
+/// are the constructors for our ARC-managed runtime types: `Map.new`,
+/// `Vector.new_filled`/`new_empty`, `MArrayI64.new`/`MArrayF64.new`,
+/// etc. The runtime invariant is that every call returns a refcount=1
+/// owner, so the V8 dataflow can mark the dest as `definitely_unique`
+/// without needing to inspect the body.
+///
+/// Why this predicate exists:
+///
+/// V8 already marks owned-mutating call results unique (the runtime
+/// contract for `Map.put`/`Vector.set`/etc. is also "result is rc=1"),
+/// but constructors are NOT in `ownedMutatingBuiltinSlot` because they
+/// don't consume any input slot. Without this predicate, V8 sees a
+/// call to `VectorI64.new_filled(size, init)` and treats the dest as
+/// "not unique" — even though the runtime physically allocates a fresh
+/// cell. That mistake breaks the V8 chain at every program entry
+/// point: `v = VectorI64.new_filled(...)` produces a "not unique" v,
+/// then `v = VectorI64.set(v, i, x)` (or any owned-mutator) sees a
+/// non-unique receiver, blocks the unchecked rewrite, and the runtime
+/// pays for an rc check on every call.
+///
+/// The Zap-fn-wrapper case (`lib/vector_i64.zap`'s `new_filled`
+/// forwards to `:zig.VectorI64.new_filled`) is handled at the
+/// caller-side as well: when V8 sees a `call_named` to a Zap function
+/// whose `result_convention == .owned` and whose body is a single-call
+/// forward to a fresh-allocator builtin, the call's dest inherits the
+/// unique result. That flow lives in `v8_uniqueness.zig`'s
+/// `applyCalleeEffect`.
+///
+/// Soundness:
+///
+/// The verifier (`arc_verifier.runV8`) re-runs the per-function V8
+/// with this same predicate, so a buggy classification surfaces as
+/// `error.ArcInvariantViolation` at build time, not as a runtime
+/// soundness bug. The conservative default for any unknown name is
+/// `false` — V8 then treats the dest as "not unique" and the unchecked
+/// rewrite stays inactive (the checked variant runs and pays an rc
+/// check). Adding new constructors to the runtime requires extending
+/// this predicate (and its tests), but a missed constructor only
+/// costs a runtime rc check, never soundness.
+pub fn isFreshAllocatorBuiltin(name: []const u8) bool {
+    const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const method_full = name[dot_index + 1 ..];
+    const prefix = name[0..dot_index];
+
+    // Map / MapNested constructors:
+    //   - `Map.new()` and `Map.new_with_capacity(n)` produce fresh
+    //     dense Maps.
+    if (std.mem.eql(u8, method_full, "new") or
+        std.mem.eql(u8, method_full, "new_with_capacity"))
+    {
+        if (std.mem.eql(u8, prefix, "Map") or
+            std.mem.startsWith(u8, prefix, "Map:") or
+            std.mem.startsWith(u8, prefix, "MapNested:"))
+        {
+            return true;
+        }
+    }
+
+    // Vector constructors:
+    //   - `Vector.new_filled(size, init)` and `Vector.new_empty(cap)`.
+    if (std.mem.eql(u8, method_full, "new_filled") or
+        std.mem.eql(u8, method_full, "new_empty"))
+    {
+        if (std.mem.eql(u8, prefix, "Vector") or
+            std.mem.startsWith(u8, prefix, "Vector:") or
+            std.mem.eql(u8, prefix, "VectorI64") or
+            std.mem.eql(u8, prefix, "VectorF64"))
+        {
+            return true;
+        }
+    }
+
+    // MArrayI64 / MArrayF64 constructor:
+    //   - `MArrayI64.new(size, init)` and `MArrayF64.new(size, init)`.
+    if (std.mem.eql(u8, method_full, "new")) {
+        if (std.mem.eql(u8, prefix, "MArrayI64") or
+            std.mem.eql(u8, prefix, "MArrayF64"))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 test "arc_liveness: ownedMutatingBuiltinSlot matches Map.put / delete / merge variants" {
     try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map.put"));
     try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map.delete"));
@@ -2422,6 +2511,44 @@ test "arc_liveness: ownedMutatingBuiltinSlot recognizes Phase 3 unchecked varian
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Map.get_owned_unchecked"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Map.size_owned_unchecked"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorAlt.set_owned_unchecked"));
+}
+
+test "arc_liveness: isFreshAllocatorBuiltin matches Map / Vector / MArray constructors" {
+    // Map constructors.
+    try std.testing.expect(isFreshAllocatorBuiltin("Map.new"));
+    try std.testing.expect(isFreshAllocatorBuiltin("Map.new_with_capacity"));
+    try std.testing.expect(isFreshAllocatorBuiltin("Map:i64:i64.new"));
+    try std.testing.expect(isFreshAllocatorBuiltin("Map:str:i64.new_with_capacity"));
+    try std.testing.expect(isFreshAllocatorBuiltin("MapNested:str:list.new"));
+
+    // Vector constructors.
+    try std.testing.expect(isFreshAllocatorBuiltin("Vector.new_filled"));
+    try std.testing.expect(isFreshAllocatorBuiltin("Vector.new_empty"));
+    try std.testing.expect(isFreshAllocatorBuiltin("Vector:i64.new_filled"));
+    try std.testing.expect(isFreshAllocatorBuiltin("Vector:f64.new_empty"));
+    try std.testing.expect(isFreshAllocatorBuiltin("VectorI64.new_filled"));
+    try std.testing.expect(isFreshAllocatorBuiltin("VectorI64.new_empty"));
+    try std.testing.expect(isFreshAllocatorBuiltin("VectorF64.new_filled"));
+    try std.testing.expect(isFreshAllocatorBuiltin("VectorF64.new_empty"));
+
+    // MArray constructors.
+    try std.testing.expect(isFreshAllocatorBuiltin("MArrayI64.new"));
+    try std.testing.expect(isFreshAllocatorBuiltin("MArrayF64.new"));
+
+    // Negative cases — non-constructor methods.
+    try std.testing.expect(!isFreshAllocatorBuiltin("Map.put"));
+    try std.testing.expect(!isFreshAllocatorBuiltin("Map.get"));
+    try std.testing.expect(!isFreshAllocatorBuiltin("Vector.set"));
+    try std.testing.expect(!isFreshAllocatorBuiltin("VectorI64.set"));
+    try std.testing.expect(!isFreshAllocatorBuiltin("VectorI64.length"));
+    try std.testing.expect(!isFreshAllocatorBuiltin("MArrayI64.set"));
+    // Lookalike receivers must not match.
+    try std.testing.expect(!isFreshAllocatorBuiltin("Foo.new"));
+    try std.testing.expect(!isFreshAllocatorBuiltin("VectorAlt.new_filled"));
+    try std.testing.expect(!isFreshAllocatorBuiltin("Vec.new_empty"));
+    try std.testing.expect(!isFreshAllocatorBuiltin("MArrayInt.new"));
+    try std.testing.expect(!isFreshAllocatorBuiltin("new"));
+    try std.testing.expect(!isFreshAllocatorBuiltin(""));
 }
 
 test "arc_liveness: isUncheckedOwnedMutatingBuiltin distinguishes checked and unchecked variants" {

@@ -4300,22 +4300,23 @@ test "arc_ownership: rewriteUncheckedV8Sites swaps Vector.set, Vector.push, Vect
     const arena = arena_obj.allocator();
 
     // Stream:
-    //   [0] call_builtin "Vector.new_filled" -> %0    -- not classified by V8
+    //   [0] call_builtin "Vector.new_filled" -> %0    -- fresh allocator: unique
     //   [1] move_value %1 <- %0
     //   [2] const_int %2 = 0
     //   [3] const_int %3 = 1
-    //   [4] call_builtin "Vector.set" args=[%1, %2, %3] dest=%4    -- result unique
+    //   [4] call_builtin "Vector.set" args=[%1, %2, %3] dest=%4    -- V8 holds
     //   [5] move_value %5 <- %4
     //   [6] const_int %6 = 9
-    //   [7] call_builtin "Vector.push" args=[%5, %6] dest=%7       -- result unique
+    //   [7] call_builtin "Vector.push" args=[%5, %6] dest=%7       -- V8 holds
     //   [8] move_value %8 <- %7
-    //   [9] call_builtin "Vector.pop" args=[%8] dest=%9             -- result unique
+    //   [9] call_builtin "Vector.pop" args=[%8] dest=%9             -- V8 holds
     //   [10] move_value %10 <- %9
-    //   [11] call_builtin "Vector.append" args=[%10, %10] dest=%11  -- V8 holds
+    //   [11] call_builtin "Vector.append" args=[%10, %10] dest=%11 -- V8 holds
     //
-    // The Vector.set at id 4 fails V8 (Vector.new_filled is not classified as
-    // unique-producer). But ids 7, 9, 11 follow owned-mutating predecessors
-    // and so V8 holds.
+    // Phase 1.4: `Vector.new_filled` is recognised as a fresh allocator
+    // (`isFreshAllocatorBuiltin` returns true for `Vector.new_filled`),
+    // so its dest is classified as unique. Every chained mutator
+    // following the constructor has V8 holding.
     const ctor_args = try arena.alloc(ir.LocalId, 0);
     const ctor_modes = try arena.alloc(ir.ValueMode, 0);
     const set_args = try arena.alloc(ir.LocalId, 3);
@@ -4404,18 +4405,19 @@ test "arc_ownership: rewriteUncheckedV8Sites swaps Vector.set, Vector.push, Vect
 
     var uniqueness = try v8_uniqueness.analyzeUniqueness(arena, &function, null);
     defer uniqueness.deinit(arena);
-    // V8 holds at the chained sites; the first Vector.set may also
-    // be unique because Vector.new_filled is owned-mutating-classified
-    // (it's NOT in ownedMutatingBuiltinSlot, so its result is NOT
-    // classified as unique by the analysis -> Vector.set's V8 fails).
+    // Phase 1.4: V8 now holds at every site in the chain because
+    // `Vector.new_filled` is classified as a fresh allocator (rc=1
+    // by runtime contract) and every owned-mutating step preserves
+    // uniqueness through its result.
+    try std.testing.expect(uniqueness.isUnique(4));
     try std.testing.expect(uniqueness.isUnique(7));
     try std.testing.expect(uniqueness.isUnique(9));
     try std.testing.expect(uniqueness.isUnique(11));
 
     try rewriteUncheckedV8Sites(arena, &function, &uniqueness);
 
-    // Vector.set at id 4 had V8 = false -> name stays.
-    try expectCallBuiltinName(function.body[0].instructions, 4, "Vector.set");
+    // Phase 1.4: every site in the chain rewrites to its unchecked peer.
+    try expectCallBuiltinName(function.body[0].instructions, 4, "Vector.set_owned_unchecked");
     try expectCallBuiltinName(function.body[0].instructions, 7, "Vector.push_owned_unchecked");
     try expectCallBuiltinName(function.body[0].instructions, 9, "Vector.pop_owned_unchecked");
     try expectCallBuiltinName(function.body[0].instructions, 11, "Vector.append_owned_unchecked");

@@ -1,6 +1,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
+const v8_uniqueness = @import("v8_uniqueness.zig");
 
 // ============================================================
 // V8 Interprocedural — whole-program uniqueness fixpoint.
@@ -660,6 +661,8 @@ const ParameterizedAnalyzer = struct {
                         }
                     }
                     try self.unique.put(self.allocator, cb.dest, {});
+                } else if (arc_liveness.isFreshAllocatorBuiltin(cb.name)) {
+                    try self.unique.put(self.allocator, cb.dest, {});
                 } else {
                     _ = self.unique.remove(cb.dest);
                 }
@@ -761,6 +764,10 @@ const ParameterizedAnalyzer = struct {
             try self.unique.put(self.allocator, dest, {});
             return;
         }
+        if (self.calleeIsFreshAllocatorWrapper(name)) {
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
         _ = self.unique.remove(dest);
     }
 
@@ -784,7 +791,20 @@ const ParameterizedAnalyzer = struct {
             try self.unique.put(self.allocator, dest, {});
             return;
         }
+        if (v8_uniqueness.functionIsFreshAllocatorWrapper(function)) {
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
         _ = self.unique.remove(dest);
+    }
+
+    fn calleeIsFreshAllocatorWrapper(self: *const ParameterizedAnalyzer, name: []const u8) bool {
+        for (self.program.functions) |*func| {
+            if (std.mem.eql(u8, func.name, name)) {
+                return v8_uniqueness.functionIsFreshAllocatorWrapper(func);
+            }
+        }
+        return false;
     }
 
     fn snapshot(self: *ParameterizedAnalyzer) error{OutOfMemory}!Snapshot {

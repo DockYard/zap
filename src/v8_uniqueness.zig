@@ -555,6 +555,10 @@ const Analyzer = struct {
                         }
                     }
                     try self.unique.put(self.allocator, cb.dest, {});
+                } else if (arc_liveness.isFreshAllocatorBuiltin(cb.name)) {
+                    // Fresh allocator: runtime contract is rc=1 by
+                    // construction. The dest is unique on every reach.
+                    try self.unique.put(self.allocator, cb.dest, {});
                 } else {
                     // Other call_builtin results: conservatively not
                     // unique (we don't know the runtime's refcount
@@ -679,11 +683,14 @@ const Analyzer = struct {
         }
     }
 
-    /// Apply the per-callee dataflow effect. Recognises two shapes:
+    /// Apply the per-callee dataflow effect. Recognises three shapes:
     ///   1. Builtin-name match (`ownedMutatingBuiltinSlot(name) != null`).
     ///   2. Zap-fn convention match (any `.owned` slot + `.owned` result).
-    /// Both shapes mark the call's dest as unique (the runtime
-    /// contract for owned-mutating returns is rc=1 by construction).
+    ///   3. Zap-fn fresh-allocator wrapper (no `.owned` slots, but body
+    ///      is a thin forward to a fresh-allocator builtin like
+    ///      `VectorI64.new_filled`). The result is unique by the
+    ///      runtime's allocation contract.
+    /// All three shapes mark the call's dest as unique.
     fn applyCalleeEffect(
         self: *Analyzer,
         name: []const u8,
@@ -701,6 +708,10 @@ const Analyzer = struct {
             if (slot < args.len) {
                 _ = self.unique.remove(args[slot]);
             }
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
+        if (self.calleeIsFreshAllocatorWrapper(name)) {
             try self.unique.put(self.allocator, dest, {});
             return;
         }
@@ -728,9 +739,125 @@ const Analyzer = struct {
             try self.unique.put(self.allocator, dest, {});
             return;
         }
+        if (functionIsFreshAllocatorWrapper(function)) {
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
         _ = self.unique.remove(dest);
     }
+
+    /// Look up the callee by name and decide whether it is a thin
+    /// fresh-allocator wrapper. Returns false when the program
+    /// reference is absent (test scaffolding) or the name doesn't
+    /// match.
+    fn calleeIsFreshAllocatorWrapper(self: *const Analyzer, name: []const u8) bool {
+        const program = self.program orelse return false;
+        for (program.functions) |*func| {
+            if (std.mem.eql(u8, func.name, name)) {
+                return functionIsFreshAllocatorWrapper(func);
+            }
+        }
+        return false;
+    }
 };
+
+/// V8 (Phase 1.4): is `function` a thin Zap-fn wrapper around a
+/// runtime fresh-allocator intrinsic? The pattern:
+///
+///     pub fn new_filled(size :: i64, init :: i64) -> VectorI64 {
+///       :zig.VectorI64.new_filled(size, init)
+///     }
+///
+/// lowers to a body containing exactly one owned-bearing call —
+/// `call_builtin name=VectorI64.new_filled` — followed by a `ret`
+/// of that call's dest. Such wrappers inherit the runtime's "fresh
+/// allocation, refcount=1" contract; the V8 dataflow treats their
+/// result as `definitely_unique`.
+///
+/// The check is structural: walk every instruction in the function's
+/// body; if exactly ONE `call_builtin` exists and its name passes
+/// `arc_liveness.isFreshAllocatorBuiltin`, AND the function's
+/// `result_convention == .owned`, the function is a fresh-allocator
+/// wrapper. Multiple call_builtin sites or a body shape that doesn't
+/// terminate in the allocator's dest disqualify the function (the
+/// safe default).
+///
+/// We don't require the ret to literally be `value=allocator_dest`
+/// because the IR builder may emit local_set/move chains between the
+/// call and the ret. The single-call-builtin invariant plus
+/// `result_convention == .owned` is sufficient.
+pub fn functionIsFreshAllocatorWrapper(function: *const ir.Function) bool {
+    if (function.result_convention != .owned) return false;
+    var allocator_count: usize = 0;
+    var other_call_count: usize = 0;
+    var ctx = AllocatorWrapperScan{
+        .allocator_count = &allocator_count,
+        .other_call_count = &other_call_count,
+    };
+    for (function.body) |block| {
+        scanAllocatorWrapperStream(block.instructions, &ctx);
+    }
+    return allocator_count == 1 and other_call_count == 0;
+}
+
+const AllocatorWrapperScan = struct {
+    allocator_count: *usize,
+    other_call_count: *usize,
+};
+
+fn scanAllocatorWrapperStream(
+    stream: []const ir.Instruction,
+    ctx: *AllocatorWrapperScan,
+) void {
+    for (stream) |*instr| {
+        switch (instr.*) {
+            .call_builtin => |cb| {
+                if (arc_liveness.isFreshAllocatorBuiltin(cb.name)) {
+                    ctx.allocator_count.* += 1;
+                } else {
+                    ctx.other_call_count.* += 1;
+                }
+            },
+            // Any other call shape is "other" — the wrapper is no
+            // longer a thin forward.
+            .call_named, .call_direct, .try_call_named, .call_dispatch, .call_closure, .tail_call => {
+                ctx.other_call_count.* += 1;
+            },
+            .if_expr => |ie| {
+                scanAllocatorWrapperStream(ie.then_instrs, ctx);
+                scanAllocatorWrapperStream(ie.else_instrs, ctx);
+            },
+            .case_block => |cb| {
+                scanAllocatorWrapperStream(cb.pre_instrs, ctx);
+                for (cb.arms) |arm| {
+                    scanAllocatorWrapperStream(arm.cond_instrs, ctx);
+                    scanAllocatorWrapperStream(arm.body_instrs, ctx);
+                }
+                scanAllocatorWrapperStream(cb.default_instrs, ctx);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
+                scanAllocatorWrapperStream(sl.default_instrs, ctx);
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
+                scanAllocatorWrapperStream(sr.default_instrs, ctx);
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
+            },
+            .guard_block => |gb| scanAllocatorWrapperStream(gb.body, ctx),
+            .optional_dispatch => |od| {
+                scanAllocatorWrapperStream(od.nil_instrs, ctx);
+                scanAllocatorWrapperStream(od.struct_instrs, ctx);
+            },
+            else => {},
+        }
+    }
+}
 
 /// Return the index of the first `.owned` parameter slot when
 /// `function` has at least one such slot AND `result_convention == .owned`.
