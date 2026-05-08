@@ -451,13 +451,40 @@ fn lookupConventionByName(
     program: *const ir.Program,
     name: []const u8,
 ) ?[]const ir.ParamConvention {
+    // Last-wins for `func.name`: the per-struct → merged compilation
+    // pipeline (`compileStructByStruct`) registers the same function
+    // multiple times — once per per-struct compilation, once for the
+    // merged whole-program IR. Both `arc_param_convention.inferConventions`
+    // and `arc_ownership.ConventionIndex.build` use `put` (last-wins) on
+    // a `StringHashMap` keyed by `func.name`, so the post-merge
+    // `param_conventions` slice is the LATEST registration. The verifier
+    // must agree, otherwise it reads a STALE per-struct convention while
+    // the rewriter applied promotions from the MERGED convention,
+    // surfacing as spurious V7 violations whenever the merged inference
+    // upgrades a slot that the per-struct inference left `.borrowed`.
+    //
+    // First-wins for `local_name` (matching `arc_param_convention` /
+    // `arc_ownership`'s `getOrPut`): a colliding `local_name` between
+    // sibling functions would cost a missed conventional check, never
+    // a wrong one — V7's job here is to validate, not to disambiguate
+    // ambiguous identifiers.
+    var by_name_match: ?[]const ir.ParamConvention = null;
+    var by_local_name_match: ?[]const ir.ParamConvention = null;
     for (program.functions) |func| {
-        if (std.mem.eql(u8, func.name, name)) return func.param_conventions;
+        if (std.mem.eql(u8, func.name, name)) {
+            // Last-wins: keep overwriting so the final iteration's
+            // registration wins.
+            by_name_match = func.param_conventions;
+        }
         if (func.local_name.len != 0 and std.mem.eql(u8, func.local_name, name)) {
-            return func.param_conventions;
+            // First-wins: only set the local-name match once.
+            if (by_local_name_match == null) {
+                by_local_name_match = func.param_conventions;
+            }
         }
     }
-    return null;
+    if (by_name_match) |conv| return conv;
+    return by_local_name_match;
 }
 
 fn lookupConventionById(
@@ -2464,4 +2491,90 @@ test "arc_verifier: V8 accepts unchecked Map.put with fixpoint-proven unique par
     try fixpoint.by_function.put(testing.allocator, function.id, slots);
 
     try verifyWithFixpoint(testing.allocator, &functions[0], &program, &fixpoint);
+}
+
+test "arc_verifier: lookupConventionByName is last-wins for duplicate names" {
+    // Regression: the per-struct → merged compilation pipeline can
+    // register the same function name twice (once per per-struct
+    // pipeline run, once for the merged whole-program IR). The
+    // rewriter (`arc_ownership.ConventionIndex`) and the convention
+    // inference (`arc_param_convention.inferConventions`) both use
+    // last-wins semantics on `func.name`. The verifier MUST agree —
+    // otherwise it reads a STALE per-struct convention while the
+    // rewriter applied promotions from the merged convention,
+    // surfacing as spurious V7 violations whenever the merged
+    // inference upgrades a slot.
+    const allocator = testing.allocator;
+
+    // Two functions with the same `name`. The first registers a
+    // `.borrowed` convention (the pre-merge inference state); the
+    // second registers `.owned` (the post-merge promotion). The
+    // verifier MUST return the second slice's `.owned` convention,
+    // matching the rewriter's view of the world.
+    const stale_convs = try allocator.alloc(ir.ParamConvention, 1);
+    defer allocator.free(stale_convs);
+    stale_convs[0] = .borrowed;
+    const fresh_convs = try allocator.alloc(ir.ParamConvention, 1);
+    defer allocator.free(fresh_convs);
+    fresh_convs[0] = .owned;
+
+    const empty_blocks = try allocator.alloc(ir.Block, 1);
+    defer allocator.free(empty_blocks);
+    const empty_instrs = try allocator.alloc(ir.Instruction, 0);
+    defer allocator.free(empty_instrs);
+    empty_blocks[0] = .{ .label = 0, .instructions = empty_instrs };
+    const empty_ownership = try allocator.alloc(ir.OwnershipClass, 1);
+    defer allocator.free(empty_ownership);
+    empty_ownership[0] = .owned;
+    const params_a = try allocator.alloc(ir.Param, 1);
+    defer allocator.free(params_a);
+    params_a[0] = .{ .name = "x", .type_expr = .void, .type_id = null };
+    const params_b = try allocator.alloc(ir.Param, 1);
+    defer allocator.free(params_b);
+    params_b[0] = .{ .name = "x", .type_expr = .void, .type_id = null };
+
+    const functions = try allocator.alloc(ir.Function, 2);
+    defer allocator.free(functions);
+    functions[0] = ir.Function{
+        .id = 1,
+        .name = "Mod__shared_name__1",
+        .scope_id = 0,
+        .arity = 1,
+        .params = params_a,
+        .return_type = .void,
+        .body = empty_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+        .param_conventions = stale_convs,
+        .local_ownership = empty_ownership,
+        .result_convention = .trivial,
+    };
+    functions[1] = ir.Function{
+        .id = 2,
+        .name = "Mod__shared_name__1",
+        .scope_id = 0,
+        .arity = 1,
+        .params = params_b,
+        .return_type = .void,
+        .body = empty_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+        .param_conventions = fresh_convs,
+        .local_ownership = empty_ownership,
+        .result_convention = .trivial,
+    };
+    const program = ir.Program{
+        .functions = functions,
+        .type_defs = &.{},
+        .entry = null,
+    };
+
+    const looked_up = lookupConventionByName(&program, "Mod__shared_name__1") orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expectEqual(@as(usize, 1), looked_up.len);
+    try testing.expectEqual(ir.ParamConvention.owned, looked_up[0]);
 }
