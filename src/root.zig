@@ -39,6 +39,7 @@ pub const arc_ownership = @import("arc_ownership.zig");
 pub const arc_param_convention = @import("arc_param_convention.zig");
 pub const arc_verifier = @import("arc_verifier.zig");
 pub const arc_drop_insertion = @import("arc_drop_insertion.zig");
+pub const v8_uniqueness = @import("v8_uniqueness.zig");
 pub const runtime = @import("runtime.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const DiagnosticEngine = diagnostics.DiagnosticEngine;
@@ -83,6 +84,7 @@ test {
     _ = @import("arc_liveness.zig");
     _ = @import("arc_param_convention.zig");
     _ = @import("arc_drop_insertion.zig");
+    _ = @import("v8_uniqueness.zig");
     _ = @import("ast_data.zig");
     _ = @import("macro_eval.zig");
     _ = @import("zir_builder.zig");
