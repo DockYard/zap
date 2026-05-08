@@ -11,13 +11,40 @@ const ir = @import("ir.zig");
 //          → v8_fixpoint                      (THIS module's signatures
 //                                              are computed here over an
 //                                              SCC-iterated call graph)
-//             → arc_param_convention          (consults FunctionSig in
-//                                              `siteConsumesSlot` to lift
-//                                              the borrowed-source veto
-//                                              when the enclosing param
-//                                              slot is CU/PU)
+//             → arc_param_convention          (consumer of FunctionSig
+//                                              for the borrowed-source
+//                                              veto lift — Phase 1.3
+//                                              integration deferred,
+//                                              see soundness notes)
 //                → arc_ownership pipeline (V8 rewrite + verifier)
 //                   → arc_drop_insertion
+//
+// Soundness notes for Phase 1.3 (deferred)
+// ----------------------------------------
+//
+// Naively lifting the borrowed-source veto in `siteConsumesSlot`
+// when `Sig(caller, slot) ∈ {CU, PU}` is *unsound* unless the entire
+// chain of conventions can be promoted from `.borrowed` to `.owned`
+// in lockstep. The runtime ABI mechanics are: a `.borrowed` slot in
+// function F has its parent retain (`share_value`) before the call
+// and release after; promoting only the *callee's* slot to `.owned`
+// without also promoting F's slot leaves an extra `release` (the
+// callee's scope-exit drop) without a matching `retain` — producing
+// a use-after-free at the parent's post-call release.
+//
+// fannkuch-redux's `main_loop → advance_perm → rotate_loop` chain
+// surfaces this: `count` is dual-used inside `main_loop` (the
+// `advance_perm` call AND the recursive tail call), so `main_loop`'s
+// retain-around-`advance_perm` cannot be elided. Promoting
+// `rotate_loop`'s slot 1 alone produces the double-release bug
+// described above.
+//
+// A sound Phase 1.3 must therefore include a global consistency
+// pass: lift the veto optimistically, then audit the resulting
+// chain; if any promotion's caller cannot also be promoted, demote
+// the optimistic promotion. The `ProgramSignatures` table this
+// module produces is the input to that future pass, but the audit
+// itself is not yet implemented.
 //
 // Why this module exists:
 //
