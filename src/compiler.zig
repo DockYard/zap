@@ -985,10 +985,15 @@ const Pipeline = struct {
         // `isReleaseSuppressed` filter in `ZirDriver` (consulting
         // `arc_returned_locals` and `arc_share_skipped`) handles
         // elision automatically at ZIR
-        // emission time. Today's stdlib has no `.map`-flagged ARC
-        // type that fires, so the pass is silent in production
-        // codepaths; the infrastructure must still be correct so
-        // future commits can flip the flag without leaks.
+        // emission time.
+        //
+        // This whole-program path retains drop-insertion in place
+        // because it processes the entire program in one pass — there
+        // is no later "merged" stage where the inference must re-run.
+        // The per-struct path (`runIrLoweringWithTryIdSeed`) defers
+        // drop-insertion to `compileStructByStruct`'s Phase 5b so the
+        // post-merge V8 inference sees a clean `last_use_map` (see
+        // the note in `runIrLoweringWithTryIdSeed`).
         runArcDropInsertion(self.alloc, &program, &ownership) catch
             return self.failWith("Error during ARC drop insertion", error.IrFailed);
         return .{ .program = program, .arc_ownership = ownership };
@@ -1025,6 +1030,21 @@ const Pipeline = struct {
         // `arc_ownership` so the classifier sees the refined
         // conventions when deciding whether to emit `move_value` at
         // non-tail call sites.
+        //
+        // NOTE: this per-struct inference necessarily MISSES cross-struct
+        // call sites — its `name_to_id` table only contains the
+        // current struct's functions, so a call from
+        // `VectorTest.fill_loop` to `VectorI64.set` (defined in a
+        // different struct) cannot resolve back to a callee FunctionId
+        // and the call site is never recorded against `VectorI64.set`'s
+        // promotion candidates. The conservative outcome is that
+        // wrappers whose only callers live in OTHER structs stay
+        // `.borrowed`, and the rc-1 fast path never fires for them.
+        //
+        // The post-merge re-run in `compileStructByStruct` (Phase 5b)
+        // closes that gap by running the same inference against the
+        // merged program where every cross-struct call site is
+        // visible.
         zap.arc_param_convention.inferConventions(self.alloc, &program, &ownership, type_store) catch
             return self.failWith("Error during ARC parameter convention inference", error.IrFailed);
         // Phase A of the Phase 6 redux plan: same wiring as
@@ -1032,18 +1052,22 @@ const Pipeline = struct {
         // exercise the identical pass list.
         runArcOwnershipAndVerify(self.alloc, &program, &ownership, type_store) catch
             return self.failWith("Error during ARC ownership classification or verification", error.IrFailed);
-        // Phase E.9: recompute the ARC liveness analysis after the
-        // share→move rewrite so drop insertion's `live_before_ret`
-        // / `last_use_map` reflect the post-rewrite IR shape. Same
-        // rationale as the `runIrLowering` path above.
-        ownership.deinit();
-        ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
-            return self.failWith("Error during ARC ownership analysis (recompute)", error.IrFailed);
-        // Phase 6: see `runIrLowering` for the rationale. Both call
-        // sites must run the drop-insertion pass to keep the per-
-        // struct IR build path identical to the whole-program path.
-        runArcDropInsertion(self.alloc, &program, &ownership) catch
-            return self.failWith("Error during ARC drop insertion", error.IrFailed);
+        // NOTE: drop-insertion is intentionally SKIPPED here so that
+        // the per-struct IR enters the merge with NO scope-exit
+        // releases on parameter locals. This is a soundness
+        // requirement for the post-merge `arc_param_convention` re-run:
+        // drop-insertion adds explicit `release value=L` instructions
+        // before terminators, and `arc_liveness` counts those releases
+        // as "uses" of L, polluting `last_use_map[L]`. The post-merge
+        // V8 inference then sees `last_use_map[share_source] != share_id`
+        // (because the release is now the last use) and refuses to
+        // promote — locking in the per-struct `.borrowed` decision
+        // and defeating the entire point of the merged re-run.
+        //
+        // Drop-insertion is run exactly once in `compileStructByStruct`'s
+        // Phase 5b, AFTER the merged convention inference + ownership
+        // rewrite, so the releases land on top of the final
+        // post-merge convention assignment.
         return .{ .program = program, .arc_ownership = ownership };
     }
 
@@ -1988,6 +2012,66 @@ pub fn compileStructByStruct(
         _ = phase_timer.lapMs();
     }
 
+    // Phase 5b: re-run the ARC convention inference + ownership rewriting
+    // on the merged IR so cross-struct call sites can promote callee
+    // params from `.borrowed` to `.owned`. The per-struct pipeline only
+    // sees its own struct's call sites (the per-struct `name_to_id`
+    // table only contains that struct's functions), so wrappers like
+    // `VectorI64.set` and `Map.put` whose only callers live in OTHER
+    // structs (e.g. user code in `FannkuchRedux`, `KNucleotide`) are
+    // missed by the per-struct inference. This pass runs against the
+    // merged program so EVERY caller is visible.
+    //
+    // Idempotency: every pass in this block is idempotent against
+    // post-per-struct IR — `arc_param_convention` is monotonic
+    // (.borrowed → .owned, never the other way); `rewriteOwnedConsumeBuiltinSites`,
+    // `classifyAndNormalize`, and `rewriteOwnedConsumeSites` look for
+    // pre-rewrite IR shapes that no longer exist after the first run;
+    // `arc_drop_insertion` recomputes liveness against the current IR
+    // and only adds releases for locals genuinely live-before-ret
+    // (existing releases are already "uses" in the recomputed view).
+    //
+    // This wiring fix unblocks the rc-1 fast path for ARC-managed
+    // wrappers whose callers are in other structs — without it, every
+    // `VectorI64.set`/`Map.put`/etc. call from user code enters the
+    // runtime at refcount >= 2 and triggers the COW clone path.
+    {
+        // Recompute ownership against the merged IR so the inference
+        // sees the post-Phase-5 last-use map (contification may have
+        // moved instructions; arc_param_convention reads
+        // `last_use_map` to gate share-source promotions).
+        var merged_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, &merged_ir, shared_store) catch
+            return error.IrFailed;
+        zap.arc_param_convention.inferConventions(alloc, &merged_ir, &merged_ownership, shared_store) catch {
+            merged_ownership.deinit();
+            return error.IrFailed;
+        };
+        runArcOwnershipAndVerify(alloc, &merged_ir, &merged_ownership, shared_store) catch {
+            merged_ownership.deinit();
+            return error.IrFailed;
+        };
+        // Recompute ownership AFTER the rewrites so drop-insertion
+        // sees the post-rewrite liveness shape.
+        merged_ownership.deinit();
+        merged_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, &merged_ir, shared_store) catch
+            return error.IrFailed;
+        runArcDropInsertion(alloc, &merged_ir, &merged_ownership) catch {
+            merged_ownership.deinit();
+            return error.IrFailed;
+        };
+        // Replace the per-struct combined ownership with the
+        // recomputed merged ownership so downstream consumers
+        // (ZIR backend, `arc_share_skipped`, etc.) see the
+        // post-merge analysis.
+        combined_arc_ownership.deinit();
+        combined_arc_ownership = merged_ownership;
+        if (profilingEnabled()) {
+            std.debug.print("\n[stage Phase5b-MergedArcRedux] ms={d}\n", .{phase_timer.lapMs()});
+        } else {
+            _ = phase_timer.lapMs();
+        }
+    }
+
     // Single rendering pass for all per-struct diagnostics. Each
     // sub-pipeline accumulated into the shared engine without flushing,
     // so we emit exactly once here regardless of how many structs
@@ -2181,6 +2265,14 @@ fn dumpStream(stream: []const ir.Instruction, indent: usize) void {
             .call_named => |cn| {
                 std.debug.print(" name={s} dest={d} args=[", .{ cn.name, cn.dest });
                 for (cn.args, 0..) |a, ai| {
+                    if (ai > 0) std.debug.print(",", .{});
+                    std.debug.print("{d}", .{a});
+                }
+                std.debug.print("]", .{});
+            },
+            .call_builtin => |cb| {
+                std.debug.print(" name={s} dest={d} args=[", .{ cb.name, cb.dest });
+                for (cb.args, 0..) |a, ai| {
                     if (ai > 0) std.debug.print(",", .{});
                     std.debug.print("{d}", .{a});
                 }
