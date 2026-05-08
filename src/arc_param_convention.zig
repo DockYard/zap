@@ -166,18 +166,43 @@ pub fn inferConventions(
         try function_index.put(allocator, func.id, func);
     }
 
-    // For each function, evaluate the inference rule on every ARC-
-    // managed parameter slot. When all three conditions hold,
-    // promote `.borrowed` → `.owned`.
-    for (program.functions, 0..) |_, func_index| {
-        const function: *ir.Function = @constCast(&program.functions[func_index]);
-        try evaluateFunction(
-            function,
-            &sites_by_target,
-            ownerships,
-            &function_index,
-        );
+    // Fixpoint iteration: a callee's slot can be promoted only when every
+    // caller's source local satisfies the consume gates, including the
+    // borrowed-source veto (the chain root must NOT be a `param_get` of
+    // the caller's `.borrowed` parameter). Promoting one function's
+    // slot from `.borrowed` to `.owned` can unlock promotions in the
+    // functions that pass through that slot. Iterate until no more
+    // promotions occur.
+    //
+    // The pass never demotes — only `.borrowed` → `.owned`. Termination
+    // is guaranteed by the bounded total number of `.borrowed` slots
+    // across the program.
+    var changed = true;
+    var iteration: u32 = 0;
+    const max_iterations: u32 = 64;
+    while (changed and iteration < max_iterations) : (iteration += 1) {
+        changed = false;
+        for (program.functions, 0..) |_, func_index| {
+            const function: *ir.Function = @constCast(&program.functions[func_index]);
+            const before = countOwnedSlots(function);
+            try evaluateFunction(
+                function,
+                &sites_by_target,
+                ownerships,
+                &function_index,
+            );
+            const after = countOwnedSlots(function);
+            if (after > before) changed = true;
+        }
     }
+}
+
+fn countOwnedSlots(function: *const ir.Function) usize {
+    var count: usize = 0;
+    for (function.param_conventions) |conv| {
+        if (conv == .owned) count += 1;
+    }
+    return count;
 }
 
 /// One call-site entry. The inference rule runs over these.
