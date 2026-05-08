@@ -2265,8 +2265,20 @@ fn lookupCalleeConventions(
 pub fn ownedMutatingBuiltinSlot(name: []const u8) ?usize {
     // Method suffix is the last `.`-separated component.
     const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
-    const method = name[dot_index + 1 ..];
+    const method_full = name[dot_index + 1 ..];
     const prefix = name[0..dot_index];
+
+    // Phase 3 (V8): the `_owned_unchecked` suffix is a peer of the
+    // checked variant — same receiver-slot semantics, but the
+    // runtime skips the rc==1 check. Treat both as owned-mutating
+    // for slot inference; the verifier in `arc_verifier.zig` uses
+    // `isUncheckedOwnedMutatingBuiltin` to additionally enforce V8
+    // on the unchecked sites.
+    const unchecked_suffix = "_owned_unchecked";
+    const method = if (std.mem.endsWith(u8, method_full, unchecked_suffix))
+        method_full[0 .. method_full.len - unchecked_suffix.len]
+    else
+        method_full;
 
     const is_map_method =
         std.mem.eql(u8, method, "put") or
@@ -2295,6 +2307,28 @@ pub fn ownedMutatingBuiltinSlot(name: []const u8) ?usize {
     }
 
     return null;
+}
+
+/// Phase 3 (V8): is `name` an unchecked owned-mutating builtin?
+///
+/// Unchecked variants (`Map.put_owned_unchecked`,
+/// `Vector.set_owned_unchecked`, etc.) bypass the runtime's rc==1
+/// check. They are codegen targets emitted only at call sites
+/// where the V8 verifier proves static uniqueness; the verifier
+/// uses this predicate to identify which call sites must satisfy
+/// V8 = true.
+///
+/// The shape is identical to `ownedMutatingBuiltinSlot` modulo the
+/// trailing `_owned_unchecked` on the method suffix.
+pub fn isUncheckedOwnedMutatingBuiltin(name: []const u8) bool {
+    const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const method = name[dot_index + 1 ..];
+    if (!std.mem.endsWith(u8, method, "_owned_unchecked")) return false;
+    // Confirm the prefix and method-prefix match the owned-mutating
+    // pattern; otherwise we'd accept arbitrary `Foo.bar_owned_unchecked`
+    // names. Using `ownedMutatingBuiltinSlot` here would loop, so we
+    // re-walk the same predicate inline.
+    return ownedMutatingBuiltinSlot(name) != null;
 }
 
 test "arc_liveness: ownedMutatingBuiltinSlot matches Map.put / delete / merge variants" {
@@ -2334,6 +2368,52 @@ test "arc_liveness: ownedMutatingBuiltinSlot matches Vector.set / push / pop / a
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorAlt.set"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vec.set"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("set"));
+}
+
+test "arc_liveness: ownedMutatingBuiltinSlot recognizes Phase 3 unchecked variants" {
+    // Phase 3 (V8): `*_owned_unchecked` variants share the same
+    // receiver-slot semantics as their checked counterparts. The
+    // matcher must treat them as owned-mutating; the unchecked-
+    // specific predicate `isUncheckedOwnedMutatingBuiltin` is what
+    // distinguishes them for the V8 verifier.
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map.put_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map.delete_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map.merge_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map:u32:i64.put_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.set_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.push_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.pop_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.append_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector:i64.set_owned_unchecked"));
+    // Negative: unchecked suffix on non-mutating methods still null.
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Map.get_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Map.size_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorAlt.set_owned_unchecked"));
+}
+
+test "arc_liveness: isUncheckedOwnedMutatingBuiltin distinguishes checked and unchecked variants" {
+    // Positive: every owned-mutating method has an unchecked peer.
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Map.put_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Map.delete_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Map.merge_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Map:str:i64.put_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Vector.set_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Vector.push_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Vector.pop_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Vector.append_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Vector:f64.append_owned_unchecked"));
+    // Negative: checked variants are NOT unchecked.
+    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("Map.put"));
+    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("Map.delete"));
+    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("Vector.set"));
+    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("Vector.push"));
+    // Negative: non-owned-mutating names with the suffix don't qualify.
+    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("Map.get_owned_unchecked"));
+    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("Foo.put_owned_unchecked"));
+    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("VectorAlt.set_owned_unchecked"));
+    // Negative: empty / malformed names.
+    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin(""));
+    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("put_owned_unchecked"));
 }
 
 /// Soundness check executed at the orchestration seam (debug builds

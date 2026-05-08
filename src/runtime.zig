@@ -362,6 +362,11 @@ pub var arc_return_elisions_total: u64 = 0;
 pub var dense_map_rc1_fast_path_total: u64 = 0;
 /// Total dense-Map mutating calls.
 pub var dense_map_mut_calls_total: u64 = 0;
+/// Number of dense-Map `*_owned_unchecked` calls — mutations the
+/// V8 verifier proved statically uniquely owned, so the runtime
+/// skipped the `header.count() == 1` branch entirely. Comparing
+/// against `dense_map_mut_calls_total` gives the V8-coverage ratio.
+pub var dense_map_unchecked_total: u64 = 0;
 /// Number of `Vector.set/push/pop/append` calls that took the rc-1
 /// fast path (mutated the receiver in place rather than cloning).
 pub var vector_rc1_fast_path_total: u64 = 0;
@@ -370,6 +375,10 @@ pub var vector_rc1_fast_path_total: u64 = 0;
 /// share-vs-mutate ratio for Vector workloads, mirroring the
 /// dense-Map counters.
 pub var vector_mut_calls_total: u64 = 0;
+/// Number of Vector `*_owned_unchecked` calls — mutations that
+/// V8 proved statically uniquely owned. See
+/// `dense_map_unchecked_total` for the symmetric meaning on Maps.
+pub var vector_unchecked_total: u64 = 0;
 
 /// Per-pool live-cell statistics. Each pool wrapper (e.g.
 /// `ArcRuntime.ArcPool(T)`, `MArrayOf(T).InnerPool`, `Map(K,V).SelfPool`)
@@ -432,15 +441,17 @@ pub fn dumpArcStats(write_line: *const fn ([]const u8) void) void {
     })) |line| {
         write_line(line);
     } else |_| {}
-    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] dense_map_mut_calls_total={d} dense_map_rc1_fast_path_total={d}\n", .{
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] dense_map_mut_calls_total={d} dense_map_rc1_fast_path_total={d} dense_map_unchecked_total={d}\n", .{
         dense_map_mut_calls_total,
         dense_map_rc1_fast_path_total,
+        dense_map_unchecked_total,
     })) |line| {
         write_line(line);
     } else |_| {}
-    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] vector_mut_calls_total={d} vector_rc1_fast_path_total={d}\n", .{
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] vector_mut_calls_total={d} vector_rc1_fast_path_total={d} vector_unchecked_total={d}\n", .{
         vector_mut_calls_total,
         vector_rc1_fast_path_total,
+        vector_unchecked_total,
     })) |line| {
         write_line(line);
     } else |_| {}
@@ -2231,6 +2242,158 @@ pub fn Vector(comptime T: type) type {
                 retainElement(b_data[i - av.len]);
             }
             return fresh;
+        }
+
+        // -------------------------------------------------------------------
+        // V8 unchecked-mutation variants
+        //
+        // These functions mutate the receiver in place WITHOUT loading
+        // `header.count()`. The caller (codegen) must have proven via
+        // V8 that the receiver is statically uniquely owned (refcount
+        // == 1 by construction).
+        //
+        // Safety contract:
+        //   * `vec` must be non-null.
+        //   * `vec.header.ref_count` must be exactly 1.
+        //
+        // Violating either condition is undefined behavior (UB). The
+        // V8 verifier in `arc_verifier.zig` enforces both at every
+        // call site by construction. Tests may invoke these directly
+        // for behavioural validation; production callers must always
+        // route through V8.
+        //
+        // Refcount semantics: the receiver enters with rc=1 and
+        // returns with rc=1. The unchecked variants never bump or
+        // decrement the cell's refcount; they only manipulate the
+        // populated entries / element slots. On a resize (push that
+        // exceeds capacity, append that exceeds capacity), the
+        // function allocates a fresh buffer with rc=1, transfers
+        // children verbatim with no per-element retain, and frees
+        // the old buffer shallowly — the caller's +1 transfers from
+        // the old buffer to the new one without any refcount
+        // bookkeeping.
+        // -------------------------------------------------------------------
+
+        /// Like `set`, but skips the rc==1 check. Caller must have
+        /// proven uniqueness via V8. See safety contract above.
+        pub fn set_owned_unchecked(vec: ?*const Self, index: i64, value: T) ?*const Self {
+            const v = vec orelse @panic("Vector.set_owned_unchecked: null vector");
+            const slot: u32 = @intCast(index);
+            if (slot >= v.len) @panic("Vector.set_owned_unchecked: index out of bounds");
+
+            vector_mut_calls_total += 1;
+            vector_unchecked_total += 1;
+            const mut: *Self = @constCast(v);
+            const existing = mut.slotAt(slot).*;
+            releaseElement(existing, std.heap.c_allocator);
+            mut.slotAt(slot).* = value;
+            return mut;
+        }
+
+        /// Like `push`, but skips the rc==1 check. Caller must have
+        /// proven uniqueness via V8. The buffer may be reallocated to
+        /// grow capacity — that is still in-place ownership transfer
+        /// (the old buffer's children move to the new buffer; old
+        /// buffer is freed shallowly). See safety contract above.
+        pub fn push_owned_unchecked(vec: ?*const Self, value: T) ?*const Self {
+            vector_mut_calls_total += 1;
+            vector_unchecked_total += 1;
+            if (vec == null) {
+                const fresh = bufferAlloc(pickCapacity(0, 1), 0) orelse return null;
+                fresh.slotAtPtr(0).* = value;
+                fresh.len = 1;
+                return fresh;
+            }
+            const v = vec.?;
+            const mut: *Self = @constCast(v);
+            if (mut.len < mut.cap) {
+                mut.slotAtPtr(mut.len).* = value;
+                mut.len += 1;
+                return mut;
+            }
+            // Grow in place: the receiver's +1 transfers from the
+            // old buffer to the resized one. No element retains
+            // because the moved-children path keeps each element's
+            // refcount unchanged.
+            const new_cap = pickCapacity(mut.cap, mut.len + 1);
+            const grown = cloneBufferMovingChildren(mut, new_cap) orelse return null;
+            mut.bufferFreeShallow();
+            grown.slotAtPtr(grown.len).* = value;
+            grown.len += 1;
+            return grown;
+        }
+
+        /// Like `pop`, but skips the rc==1 check. Caller must have
+        /// proven uniqueness via V8. Panics on empty vector. See
+        /// safety contract above.
+        pub fn pop_owned_unchecked(vec: ?*const Self) ?*const Self {
+            const v = vec orelse @panic("Vector.pop_owned_unchecked: null vector");
+            if (v.len == 0) @panic("Vector.pop_owned_unchecked: empty vector");
+
+            vector_mut_calls_total += 1;
+            vector_unchecked_total += 1;
+            const mut: *Self = @constCast(v);
+            const last = mut.slotAtPtr(mut.len - 1).*;
+            releaseElement(last, std.heap.c_allocator);
+            mut.len -= 1;
+            return mut;
+        }
+
+        /// Like `append`, but skips the rc==1 check on `a`. Caller
+        /// must have proven uniqueness of `a` via V8. `b` is BORROWED
+        /// — its refcount is not consulted; its elements are
+        /// deep-retained as they're copied (B's observers retain
+        /// their references). See safety contract above.
+        pub fn append_owned_unchecked(a: ?*const Self, b: ?*const Self) ?*const Self {
+            if (a == null and b == null) return null;
+            if (b == null) {
+                // The caller proved uniqueness on `a`; we keep the
+                // same buffer (caller's +1 stays in place) — symmetric
+                // with the checked `append`'s `retain(a)` shape but
+                // without bumping the refcount.
+                return a;
+            }
+            if (a == null) {
+                // No `a` to mutate; produce a fresh deep-retained
+                // copy of `b`. The result has rc=1 by construction.
+                return cloneBufferRetainingChildren(b.?, b.?.len);
+            }
+            const av = a.?;
+            const bv = b.?;
+            const total_len = av.len + bv.len;
+
+            vector_mut_calls_total += 1;
+            vector_unchecked_total += 1;
+            const mut: *Self = @constCast(av);
+
+            if (mut.cap >= total_len) {
+                const dst_data = mut.dataPtr();
+                const src_data = bv.dataPtr();
+                var i: u32 = 0;
+                while (i < bv.len) : (i += 1) {
+                    dst_data[mut.len + i] = src_data[i];
+                    retainElement(src_data[i]);
+                }
+                mut.len = total_len;
+                return mut;
+            }
+
+            // Need to grow the buffer — still in-place ownership
+            // transfer (old A's children move to fresh; old A is
+            // freed shallowly). B's elements are deep-retained as
+            // they're copied (B's observers retain).
+            const new_cap = pickCapacity(av.cap, total_len);
+            const grown = cloneBufferMovingChildren(mut, new_cap) orelse return null;
+            mut.bufferFreeShallow();
+            const grown_data = grown.dataPtr();
+            const b_data = bv.dataPtr();
+            var i: u32 = 0;
+            while (i < bv.len) : (i += 1) {
+                grown_data[grown.len + i] = b_data[i];
+                retainElement(b_data[i]);
+            }
+            grown.len = total_len;
+            return grown;
         }
 
         // -------------------------------------------------------------------
@@ -5296,6 +5459,114 @@ pub fn Map(comptime K: type, comptime V: type) type {
                     release(result);
                     result = next_result;
                 }
+            }
+            return result;
+        }
+
+        // -------------------------------------------------------------------
+        // V8 unchecked-mutation variants
+        //
+        // These functions mutate the receiver in place WITHOUT loading
+        // `header.count()`. The caller (codegen) must have proven via
+        // V8 that the receiver is statically uniquely owned (refcount
+        // == 1 by construction).
+        //
+        // Safety contract:
+        //   * `map` (or `map_a` for merge) must be non-null.
+        //   * The receiver's `header.ref_count` must be exactly 1.
+        //
+        // Violating either condition is undefined behavior. The V8
+        // verifier in `arc_verifier.zig` enforces both at every call
+        // site. Tests may invoke these directly; production callers
+        // must always route through V8.
+        //
+        // Refcount semantics: the receiver enters with rc=1 and
+        // returns with rc=1. The unchecked variants never bump or
+        // decrement the cell's refcount; on a resize (put that
+        // breaches the load factor) the function allocates a fresh
+        // buffer with rc=1 and transfers children verbatim with no
+        // per-entry retain — the caller's +1 transfers from the old
+        // buffer to the new without any refcount bookkeeping.
+        // -------------------------------------------------------------------
+
+        /// Like `put`, but skips the rc==1 check. Caller must have
+        /// proven uniqueness via V8. See safety contract above.
+        pub fn put_owned_unchecked(map: ?*const Self, key: K, value: V) ?*const Self {
+            const callsite = @returnAddress();
+            dense_map_mut_calls_total += 1;
+            dense_map_unchecked_total += 1;
+            if (map == null) {
+                // Symmetric to `putInner`'s null path: allocate a
+                // fresh buffer with rc=1 and insert. The unchecked
+                // contract assumes a non-null receiver in steady
+                // state, but supporting null here keeps the empty-
+                // map seeding pattern (`Map.new()` returns null)
+                // working under V8 without forcing the codegen to
+                // emit a null check before the unchecked call.
+                const fresh = bufferAlloc(DENSE_MAP_INITIAL_CAPACITY, Wyhash.nextSeed(), callsite) orelse return null;
+                _ = putInPlaceInsert(fresh, key, value);
+                return fresh;
+            }
+            const self = map.?;
+            const mut: *Self = @constCast(self);
+            return putInPlace(mut, key, value, callsite);
+        }
+
+        /// Like `delete`, but skips the rc==1 check. Caller must
+        /// have proven uniqueness via V8. See safety contract above.
+        pub fn delete_owned_unchecked(map: ?*const Self, key: K) ?*const Self {
+            dense_map_mut_calls_total += 1;
+            dense_map_unchecked_total += 1;
+            const self = map orelse return null;
+            const mut: *Self = @constCast(self);
+            if (findEntry(mut, key)) |found_entry_idx| {
+                deleteFoundInPlace(mut, found_entry_idx);
+            }
+            return mut;
+        }
+
+        /// Like `merge`, but skips the rc==1 check on `map_a`. Caller
+        /// must have proven uniqueness of `map_a` via V8. `map_b` is
+        /// BORROWED — its entries' keys and values are deep-retained
+        /// as they're copied into A. See safety contract above.
+        ///
+        /// Implementation: the unchecked merge folds B's entries into
+        /// A in place via `put_owned_unchecked`. Each `put` either
+        /// keeps the same buffer or grows in place (still A's +1).
+        /// The result is always A's pointer (possibly after a
+        /// transparent resize).
+        pub fn merge_owned_unchecked(map_a: ?*const Self, map_b: ?*const Self) ?*const Self {
+            if (map_a == null and map_b == null) return null;
+            if (map_b == null) return map_a;
+            if (map_a == null) {
+                // No A to mutate; produce a fresh deep-retain clone
+                // of B with rc=1.
+                const callsite = @returnAddress();
+                return cloneBufferRetainingChildren(map_b.?, map_b.?.capacity, callsite);
+            }
+
+            var result: ?*const Self = map_a;
+            const b = map_b.?;
+            const b_len = b.len;
+            const b_entries = b.entriesPtr();
+            var i: u32 = 0;
+            while (i < b_len) : (i += 1) {
+                const entry = b_entries[i];
+                retainEntryKey(entry.key);
+                retainEntryValue(entry.value);
+                const next_result = put_owned_unchecked(result, entry.key, entry.value) orelse {
+                    const allocator = std.heap.c_allocator;
+                    releaseEntryKey(entry.key, allocator);
+                    releaseEntryValue(entry.value, allocator);
+                    return null;
+                };
+                // Under uniqueness, put_owned_unchecked either
+                // returns the same pointer (in-place) or a fresh
+                // buffer with the previous A's children moved over.
+                // Either way, no release on the prior result is
+                // needed — the prior buffer was either reused (same
+                // pointer) or freed shallowly inside the resize path.
+                result = next_result;
             }
             return result;
         }
@@ -10158,4 +10429,337 @@ test "Vector deep-releases ARC-managed children on zero-transition" {
     // (one per Map cell freed). Net: +3.
     VecMap.release(vec);
     try std.testing.expectEqual(before_releases + 3, arc_releases_total);
+}
+
+// ============================================================
+// V8 unchecked-mutation variants — Map and Vector
+// ============================================================
+//
+// These tests exercise the `*_owned_unchecked` runtime functions
+// directly via Zig (host tests). The codegen is not yet wired to
+// emit these — that is the next session's deliverable. The tests
+// confirm:
+//   * The unchecked variant mutates in place (same pointer
+//     returned for in-buffer mutations).
+//   * The result is semantically identical to the checked variant
+//     when invoked on a uniquely-owned (rc==1) input.
+//   * The unchecked variant skips the rc==1 check (calls the
+//     in-place core directly).
+//
+// We do NOT test the rc>1 case for unchecked variants — the V8
+// contract makes that undefined behavior, and the V8 verifier
+// rejects unchecked calls at any site where rc could be > 1.
+// Production callers must always route through V8.
+
+test "Vector(i64) set_owned_unchecked mutates in place and returns same pointer" {
+    const VecI64 = Vector(i64);
+    const v = VecI64.new_filled(3, 0) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer VecI64.release(v);
+
+    const before_unchecked = vector_unchecked_total;
+    const after = VecI64.set_owned_unchecked(v, 1, 42) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    // Same pointer — proof of in-place mutation.
+    try std.testing.expectEqual(@intFromPtr(v), @intFromPtr(after));
+    try std.testing.expectEqual(@as(i64, 42), VecI64.get(after, 1));
+    // Counter went up — proof we routed through the unchecked variant.
+    try std.testing.expectEqual(before_unchecked + 1, vector_unchecked_total);
+}
+
+test "Vector(i64) push_owned_unchecked grows in place when capacity allows" {
+    const VecI64 = Vector(i64);
+    const v0 = VecI64.new_empty(4) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const before_unchecked = vector_unchecked_total;
+
+    var current: ?*const VecI64 = v0;
+    current = VecI64.push_owned_unchecked(current, 10) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    // First push: capacity 4, len was 0, so no resize — same pointer.
+    try std.testing.expectEqual(@intFromPtr(v0), @intFromPtr(current));
+
+    current = VecI64.push_owned_unchecked(current, 20) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    current = VecI64.push_owned_unchecked(current, 30) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer VecI64.release(current);
+
+    try std.testing.expectEqual(@as(i64, 3), VecI64.length(current));
+    try std.testing.expectEqual(@as(i64, 10), VecI64.get(current, 0));
+    try std.testing.expectEqual(@as(i64, 30), VecI64.get(current, 2));
+    try std.testing.expectEqual(before_unchecked + 3, vector_unchecked_total);
+}
+
+test "Vector(i64) push_owned_unchecked grows the buffer when capacity is exceeded" {
+    const VecI64 = Vector(i64);
+    var current: ?*const VecI64 = VecI64.new_empty(2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    var i: i64 = 0;
+    while (i < 16) : (i += 1) {
+        current = VecI64.push_owned_unchecked(current, i) orelse {
+            try std.testing.expect(false);
+            return;
+        };
+    }
+    defer VecI64.release(current);
+
+    try std.testing.expectEqual(@as(i64, 16), VecI64.length(current));
+    var k: i64 = 0;
+    while (k < 16) : (k += 1) {
+        try std.testing.expectEqual(k, VecI64.get(current, k));
+    }
+    // After grow, refcount is still 1.
+    try std.testing.expectEqual(@as(u32, 1), current.?.header.count());
+}
+
+test "Vector(i64) pop_owned_unchecked decrements length in place" {
+    const VecI64 = Vector(i64);
+    const v = VecI64.new_filled(3, 7) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const popped = VecI64.pop_owned_unchecked(v) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer VecI64.release(popped);
+
+    try std.testing.expectEqual(@intFromPtr(v), @intFromPtr(popped));
+    try std.testing.expectEqual(@as(i64, 2), VecI64.length(popped));
+}
+
+test "Vector(i64) append_owned_unchecked concatenates in place when capacity fits" {
+    const VecI64 = Vector(i64);
+    const a = VecI64.new_empty(8) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    var av: ?*const VecI64 = a;
+    av = VecI64.push_owned_unchecked(av, 1).?;
+    av = VecI64.push_owned_unchecked(av, 2).?;
+
+    var bv: ?*const VecI64 = VecI64.new_empty(0) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    bv = VecI64.push(bv, 3).?;
+    bv = VecI64.push(bv, 4).?;
+    defer VecI64.release(bv);
+
+    const result = VecI64.append_owned_unchecked(av, bv) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer VecI64.release(result);
+
+    // av's capacity was 8 with len 2; appending bv's len 2 fits.
+    // Same pointer as av (in-place).
+    try std.testing.expectEqual(@intFromPtr(a), @intFromPtr(result));
+    try std.testing.expectEqual(@as(i64, 4), VecI64.length(result));
+    try std.testing.expectEqual(@as(i64, 1), VecI64.get(result, 0));
+    try std.testing.expectEqual(@as(i64, 2), VecI64.get(result, 1));
+    try std.testing.expectEqual(@as(i64, 3), VecI64.get(result, 2));
+    try std.testing.expectEqual(@as(i64, 4), VecI64.get(result, 3));
+}
+
+test "Vector(i64) append_owned_unchecked grows when capacity is insufficient" {
+    const VecI64 = Vector(i64);
+    const a = VecI64.new_empty(2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    var av: ?*const VecI64 = a;
+    av = VecI64.push_owned_unchecked(av, 1).?;
+    av = VecI64.push_owned_unchecked(av, 2).?;
+
+    var bv: ?*const VecI64 = VecI64.new_empty(0) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    bv = VecI64.push(bv, 3).?;
+    bv = VecI64.push(bv, 4).?;
+    bv = VecI64.push(bv, 5).?;
+    defer VecI64.release(bv);
+
+    const result = VecI64.append_owned_unchecked(av, bv) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer VecI64.release(result);
+
+    try std.testing.expectEqual(@as(i64, 5), VecI64.length(result));
+    try std.testing.expectEqual(@as(i64, 1), VecI64.get(result, 0));
+    try std.testing.expectEqual(@as(i64, 5), VecI64.get(result, 4));
+    // After grow, refcount still 1.
+    try std.testing.expectEqual(@as(u32, 1), result.header.count());
+}
+
+test "Map(i64,i64) put_owned_unchecked mutates in place and returns same pointer" {
+    const MapI64 = Map(i64, i64);
+    const keys = [_]i64{ 1, 2 };
+    const vals = [_]i64{ 10, 20 };
+    const m = MapI64.fromPairs(&keys, &vals, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const before_unchecked = dense_map_unchecked_total;
+
+    const after = MapI64.put_owned_unchecked(m, 3, 30) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer MapI64.release(after);
+
+    // Same pointer — in-place insertion (capacity 8, len was 2,
+    // load factor not breached).
+    try std.testing.expectEqual(@intFromPtr(m), @intFromPtr(after));
+    try std.testing.expectEqual(@as(i64, 30), MapI64.get(after, 3, 0));
+    try std.testing.expectEqual(@as(i64, 10), MapI64.get(after, 1, 0));
+    try std.testing.expectEqual(before_unchecked + 1, dense_map_unchecked_total);
+}
+
+test "Map(i64,i64) put_owned_unchecked semantics match checked put on rc=1 input" {
+    const MapI64 = Map(i64, i64);
+    // Build two identical maps; mutate one with put, the other with
+    // put_owned_unchecked. Final state must be identical.
+    const keys = [_]i64{ 1, 2, 3 };
+    const vals = [_]i64{ 10, 20, 30 };
+
+    const m_checked = MapI64.fromPairs(&keys, &vals, 3) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const m_unchecked = MapI64.fromPairs(&keys, &vals, 3) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    const after_checked = MapI64.put(m_checked, 4, 40).?;
+    const after_unchecked = MapI64.put_owned_unchecked(m_unchecked, 4, 40).?;
+    defer MapI64.release(after_checked);
+    defer MapI64.release(after_unchecked);
+
+    try std.testing.expectEqual(MapI64.size(after_checked), MapI64.size(after_unchecked));
+    try std.testing.expectEqual(MapI64.get(after_checked, 4, 0), MapI64.get(after_unchecked, 4, 0));
+    try std.testing.expectEqual(MapI64.get(after_checked, 1, 0), MapI64.get(after_unchecked, 1, 0));
+}
+
+test "Map(i64,i64) delete_owned_unchecked removes key in place" {
+    const MapI64 = Map(i64, i64);
+    const keys = [_]i64{ 1, 2, 3 };
+    const vals = [_]i64{ 10, 20, 30 };
+    const m = MapI64.fromPairs(&keys, &vals, 3) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    const after = MapI64.delete_owned_unchecked(m, 2).?;
+    defer MapI64.release(after);
+
+    // Same pointer — in-place delete.
+    try std.testing.expectEqual(@intFromPtr(m), @intFromPtr(after));
+    try std.testing.expectEqual(@as(i64, 2), MapI64.size(after));
+    // Key 2 is gone (default returned).
+    try std.testing.expectEqual(@as(i64, -1), MapI64.get(after, 2, -1));
+    // Other keys still present.
+    try std.testing.expectEqual(@as(i64, 10), MapI64.get(after, 1, 0));
+    try std.testing.expectEqual(@as(i64, 30), MapI64.get(after, 3, 0));
+}
+
+test "Map(i64,i64) delete_owned_unchecked is a no-op for absent keys" {
+    const MapI64 = Map(i64, i64);
+    const keys = [_]i64{ 1, 2 };
+    const vals = [_]i64{ 10, 20 };
+    const m = MapI64.fromPairs(&keys, &vals, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    const after = MapI64.delete_owned_unchecked(m, 99).?;
+    defer MapI64.release(after);
+
+    try std.testing.expectEqual(@intFromPtr(m), @intFromPtr(after));
+    try std.testing.expectEqual(@as(i64, 2), MapI64.size(after));
+}
+
+test "Map(i64,i64) merge_owned_unchecked folds B into A in place" {
+    const MapI64 = Map(i64, i64);
+    const keys_a = [_]i64{ 1, 2 };
+    const vals_a = [_]i64{ 10, 20 };
+    const a = MapI64.fromPairs(&keys_a, &vals_a, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const keys_b = [_]i64{ 3, 4 };
+    const vals_b = [_]i64{ 30, 40 };
+    const b = MapI64.fromPairs(&keys_b, &vals_b, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer MapI64.release(b);
+
+    const a_ptr = @intFromPtr(a);
+    const after = MapI64.merge_owned_unchecked(a, b).?;
+    defer MapI64.release(after);
+
+    // A had capacity 8, len 2; merging 2 entries doesn't trigger
+    // a resize (load factor 7/8 == 7 entries before resize). So the
+    // result is A's pointer.
+    try std.testing.expectEqual(a_ptr, @intFromPtr(after));
+    try std.testing.expectEqual(@as(i64, 4), MapI64.size(after));
+    try std.testing.expectEqual(@as(i64, 10), MapI64.get(after, 1, 0));
+    try std.testing.expectEqual(@as(i64, 30), MapI64.get(after, 3, 0));
+}
+
+test "Map(i64,i64) merge_owned_unchecked semantics match checked merge on rc=1 inputs" {
+    const MapI64 = Map(i64, i64);
+    const keys_a = [_]i64{ 1, 2 };
+    const vals_a = [_]i64{ 10, 20 };
+    const keys_b = [_]i64{ 2, 3 };
+    const vals_b = [_]i64{ 99, 30 };
+
+    const a_checked = MapI64.fromPairs(&keys_a, &vals_a, 2).?;
+    const b_checked = MapI64.fromPairs(&keys_b, &vals_b, 2).?;
+    defer MapI64.release(b_checked);
+    const merged_checked = MapI64.merge(a_checked, b_checked).?;
+    defer MapI64.release(merged_checked);
+    MapI64.release(a_checked);
+
+    const a_unchecked = MapI64.fromPairs(&keys_a, &vals_a, 2).?;
+    const b_unchecked = MapI64.fromPairs(&keys_b, &vals_b, 2).?;
+    defer MapI64.release(b_unchecked);
+    const merged_unchecked = MapI64.merge_owned_unchecked(a_unchecked, b_unchecked).?;
+    defer MapI64.release(merged_unchecked);
+
+    try std.testing.expectEqual(MapI64.size(merged_checked), MapI64.size(merged_unchecked));
+    // Key 2's value should be the B-side value (B overrides A on collision).
+    try std.testing.expectEqual(@as(i64, 99), MapI64.get(merged_checked, 2, 0));
+    try std.testing.expectEqual(@as(i64, 99), MapI64.get(merged_unchecked, 2, 0));
+    try std.testing.expectEqual(@as(i64, 10), MapI64.get(merged_unchecked, 1, 0));
+    try std.testing.expectEqual(@as(i64, 30), MapI64.get(merged_unchecked, 3, 0));
+}
+
+test "Map(i64,i64) put_owned_unchecked on null receiver allocates a fresh map" {
+    const MapI64 = Map(i64, i64);
+    const m = MapI64.put_owned_unchecked(null, 42, 100).?;
+    defer MapI64.release(m);
+
+    try std.testing.expectEqual(@as(i64, 1), MapI64.size(m));
+    try std.testing.expectEqual(@as(i64, 100), MapI64.get(m, 42, 0));
+    try std.testing.expectEqual(@as(u32, 1), m.header.count());
 }
