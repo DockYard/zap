@@ -1,5 +1,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
+const arc_liveness = @import("arc_liveness.zig");
+const v8_uniqueness = @import("v8_uniqueness.zig");
 
 // ============================================================
 // ARC ownership verifier.
@@ -124,11 +126,11 @@ pub fn verify(
     function: *const ir.Function,
     program: *const ir.Program,
 ) VerifyError!void {
-    _ = allocator;
     var ctx = VerifyContext{ .function = function, .program = program };
     for (function.body) |block| {
         try verifyStream(&ctx, block.instructions);
     }
+    try runV8(allocator, function, program);
 }
 
 /// Per-verification context. Phase E.9 V7 added the `program`
@@ -888,6 +890,222 @@ fn checkReturnValue(
         );
         return error.ArcInvariantViolation;
     }
+}
+
+// ============================================================
+// V8 — alias safety on owned update.
+// ============================================================
+//
+// V8 is the verifier-side defence for the unchecked-mutator
+// codegen path introduced in Phase 3 of the dense-map plan. Every
+// `*_owned_unchecked` runtime call (`Map.put_owned_unchecked`,
+// `Vector.set_owned_unchecked`, etc. — see `runtime.zig`) assumes
+// the caller has proven the receiver is statically uniquely owned
+// (refcount == 1 by construction). The codegen emits these calls
+// only at sites where the V8 static-uniqueness analysis
+// (`v8_uniqueness.zig`) reports `definitely_unique = true`. V8
+// here verifies the inverse: every unchecked call site MUST have
+// V8 = true. Any unchecked call where uniqueness was NOT proven is
+// a codegen bug that would produce undefined behavior at runtime.
+//
+// The check is per-function. We run the analysis and walk the IR;
+// for every call instruction whose name is an unchecked owned-
+// mutating builtin (per `arc_liveness.isUncheckedOwnedMutatingBuiltin`),
+// we look up the analysis result for that instruction's id and
+// emit a V8 violation if uniqueness was not proven.
+//
+// The walk uses the same depth-first instruction-id assignment
+// `arc_liveness` and `v8_uniqueness` use, so the per-instruction
+// queries align across passes.
+//
+// Diagnostic shape: identifies the function, the unchecked call's
+// instruction id, the receiver LocalId, and the reason — closely
+// mirroring V1-V7's diagnostic surface.
+
+/// Run the V8 invariant on `function`. Walks every owned-mutating
+/// call site that targets an unchecked variant; for each, asserts
+/// the V8 static-uniqueness analysis reports the receiver is
+/// `definitely_unique`. Returns `error.ArcInvariantViolation` on
+/// the first violation.
+fn runV8(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: *const ir.Program,
+) VerifyError!void {
+    // Fast path: scan the function for any unchecked call before
+    // running the analysis. Most functions have no unchecked sites
+    // (Phase 3 codegen hasn't landed yet); skipping the analysis on
+    // those keeps verifier overhead minimal.
+    if (!hasUncheckedCallSite(function)) return;
+
+    var uniqueness = v8_uniqueness.analyzeUniqueness(allocator, function, program) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer uniqueness.deinit(allocator);
+
+    var walker = V8Walker{
+        .function = function,
+        .uniqueness = &uniqueness,
+        .next_id = 0,
+        .err = null,
+    };
+    for (function.body) |block| {
+        try walker.walkStream(block.instructions);
+        if (walker.err) |e| return e;
+    }
+}
+
+/// Quick per-function pre-check: does the function contain ANY
+/// owned-mutating call site to an unchecked variant? Returns
+/// without running the (more expensive) V8 analysis when there
+/// are no unchecked sites.
+fn hasUncheckedCallSite(function: *const ir.Function) bool {
+    var checker = UncheckedCallScanner{ .found = false };
+    ir.forEachInstruction(function, &checker, UncheckedCallScanner.visit);
+    return checker.found;
+}
+
+const UncheckedCallScanner = struct {
+    found: bool,
+
+    fn visit(self: *@This(), instr: *const ir.Instruction) void {
+        if (self.found) return;
+        const name: []const u8 = switch (instr.*) {
+            .call_builtin => |cb| cb.name,
+            .call_named => |cn| cn.name,
+            .try_call_named => |tcn| tcn.name,
+            .call_direct => return,
+            else => return,
+        };
+        if (arc_liveness.isUncheckedOwnedMutatingBuiltin(name)) {
+            self.found = true;
+        }
+    }
+};
+
+const V8Walker = struct {
+    function: *const ir.Function,
+    uniqueness: *const v8_uniqueness.Uniqueness,
+    next_id: arc_liveness.InstructionId,
+    err: ?VerifyError,
+
+    fn walkStream(
+        self: *V8Walker,
+        stream: []const ir.Instruction,
+    ) error{OutOfMemory}!void {
+        for (stream) |*instr| {
+            const my_id = self.next_id;
+            self.next_id += 1;
+            if (self.err != null) return;
+            self.checkUncheckedCallSite(instr, my_id);
+            if (self.err != null) return;
+            try self.walkChildren(instr);
+        }
+    }
+
+    fn walkChildren(
+        self: *V8Walker,
+        instr: *const ir.Instruction,
+    ) error{OutOfMemory}!void {
+        switch (instr.*) {
+            .if_expr => |ie| {
+                try self.walkStream(ie.then_instrs);
+                try self.walkStream(ie.else_instrs);
+            },
+            .case_block => |cb| {
+                try self.walkStream(cb.pre_instrs);
+                for (cb.arms) |arm| {
+                    try self.walkStream(arm.cond_instrs);
+                    try self.walkStream(arm.body_instrs);
+                }
+                try self.walkStream(cb.default_instrs);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| try self.walkStream(c.body_instrs);
+                try self.walkStream(sl.default_instrs);
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| try self.walkStream(c.body_instrs);
+                try self.walkStream(sr.default_instrs);
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| try self.walkStream(c.body_instrs);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| try self.walkStream(c.body_instrs);
+            },
+            .try_call_named => |tcn| {
+                try self.walkStream(tcn.handler_instrs);
+                try self.walkStream(tcn.success_instrs);
+            },
+            .guard_block => |gb| {
+                try self.walkStream(gb.body);
+            },
+            .optional_dispatch => |od| {
+                try self.walkStream(od.nil_instrs);
+                try self.walkStream(od.struct_instrs);
+            },
+            else => {},
+        }
+    }
+
+    fn checkUncheckedCallSite(
+        self: *V8Walker,
+        instr: *const ir.Instruction,
+        my_id: arc_liveness.InstructionId,
+    ) void {
+        const info = uncheckedCallReceiver(instr) orelse return;
+        if (self.uniqueness.isUnique(my_id)) return;
+        emitV8Diagnostic(self.function, my_id, info.name, info.receiver);
+        self.err = error.ArcInvariantViolation;
+    }
+};
+
+const UncheckedCallInfo = struct {
+    name: []const u8,
+    receiver: ir.LocalId,
+};
+
+fn uncheckedCallReceiver(instr: *const ir.Instruction) ?UncheckedCallInfo {
+    switch (instr.*) {
+        .call_builtin => |cb| {
+            if (!arc_liveness.isUncheckedOwnedMutatingBuiltin(cb.name)) return null;
+            const slot = arc_liveness.ownedMutatingBuiltinSlot(cb.name) orelse return null;
+            if (slot >= cb.args.len) return null;
+            return .{ .name = cb.name, .receiver = cb.args[slot] };
+        },
+        .call_named => |cn| {
+            if (!arc_liveness.isUncheckedOwnedMutatingBuiltin(cn.name)) return null;
+            const slot = arc_liveness.ownedMutatingBuiltinSlot(cn.name) orelse return null;
+            if (slot >= cn.args.len) return null;
+            return .{ .name = cn.name, .receiver = cn.args[slot] };
+        },
+        .try_call_named => |tcn| {
+            if (!arc_liveness.isUncheckedOwnedMutatingBuiltin(tcn.name)) return null;
+            const slot = arc_liveness.ownedMutatingBuiltinSlot(tcn.name) orelse return null;
+            if (slot >= tcn.args.len) return null;
+            return .{ .name = tcn.name, .receiver = tcn.args[slot] };
+        },
+        else => return null,
+    }
+}
+
+fn emitV8Diagnostic(
+    function: *const ir.Function,
+    instr_id: arc_liveness.InstructionId,
+    callee_name: []const u8,
+    receiver: ir.LocalId,
+) void {
+    if (suppress_diagnostics) return;
+    std.debug.print(
+        "arc_verifier: function '{s}' violates V8:\n" ++
+            "  unchecked owned-mutating call '{s}' at instruction {d}\n" ++
+            "  receiver local %{d} is NOT statically proven to be uniquely owned\n" ++
+            "  (V8 = false)\n" ++
+            "  the codegen must not emit `*_owned_unchecked` at this site;\n" ++
+            "  routing through the checked variant is the correct fix.\n",
+        .{ function.name, callee_name, instr_id, receiver },
+    );
 }
 
 // ============================================================
@@ -1835,4 +2053,334 @@ test "arc_verifier: V7 accepts share_value into borrowed-convention slot" {
     }
 
     try verify(allocator, &built.functions[1], &built.program);
+}
+
+// ============================================================
+// V8 — alias safety on owned update
+// ============================================================
+//
+// V8 verifies that every `*_owned_unchecked` call site has the V8
+// static-uniqueness analysis (see `v8_uniqueness.zig`) reporting
+// `definitely_unique = true` for the receiver. The negative tests
+// hand-roll IR shapes where the codegen incorrectly emitted an
+// unchecked variant at a site without proven uniqueness — V8 must
+// reject. The positive tests confirm V8 accepts well-formed IR.
+
+test "arc_verifier: V8 accepts unchecked Map.put at fresh-alloc receiver" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Stream:
+    //   [0] map_init %0 = {}                    -- fresh, unique
+    //   [1] const_int %1 = 0
+    //   [2] const_int %2 = 0
+    //   [3] move_value %3 <- %0                  -- transfers uniqueness
+    //   [4] call_builtin "Map.put_owned_unchecked" args=[%3, %1, %2] dest=%4
+    //
+    // Expected: V8 = true at id 4 because %3 was sourced from a
+    // fresh-alloc and move_value preserves uniqueness.
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 3;
+    args[1] = 1;
+    args[2] = 2;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .move_value = .{ .dest = 3, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put_owned_unchecked",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    };
+    const ownership = [_]ir.OwnershipClass{
+        .owned, .trivial, .trivial, .owned, .owned,
+    };
+    var function = try buildTestFunction(
+        testing.allocator,
+        "test_v8_pos_fresh",
+        &instrs,
+        &ownership,
+        &.{},
+        .trivial,
+    );
+    defer freeTestFunction(testing.allocator, &function);
+
+    try verifyFunctionStandalone(testing.allocator, &function);
+}
+
+test "arc_verifier: V8 rejects unchecked Map.put with parameter receiver" {
+    var guard = SuppressDiagnostics.init();
+    defer guard.deinit();
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Stream:
+    //   [0] param_get %0 = param[0]              -- parameter, NOT unique
+    //   [1] const_int %1 = 0
+    //   [2] const_int %2 = 0
+    //   [3] move_value %3 <- %0                  -- move from non-unique source
+    //   [4] call_builtin "Map.put_owned_unchecked" args=[%3, %1, %2] dest=%4
+    //
+    // Expected: V8 rejects — receiver's source is a parameter; the
+    // caller controls the refcount and uniqueness cannot be proven.
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 3;
+    args[1] = 1;
+    args[2] = 2;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .move_value = .{ .dest = 3, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put_owned_unchecked",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    };
+    const ownership = [_]ir.OwnershipClass{
+        .owned, .trivial, .trivial, .owned, .owned,
+    };
+    const conventions = [_]ir.ParamConvention{.owned};
+    var function = try buildTestFunction(
+        testing.allocator,
+        "test_v8_neg_param",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(testing.allocator, &function);
+
+    const result = verifyFunctionStandalone(testing.allocator, &function);
+    try testing.expectError(error.ArcInvariantViolation, result);
+}
+
+test "arc_verifier: V8 rejects unchecked Map.put on parked receiver" {
+    var guard = SuppressDiagnostics.init();
+    defer guard.deinit();
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Stream:
+    //   [0] map_init %0 = {}             -- fresh, unique
+    //   [1] const_nil %1
+    //   [2] list_cons %2 = [%0 | %1]    -- parks %0; %0 no longer unique
+    //   [3] const_int %3 = 0
+    //   [4] const_int %4 = 0
+    //   [5] move_value %5 <- %0
+    //   [6] call_builtin "Map.put_owned_unchecked" args=[%5, %3, %4] dest=%6
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 5;
+    args[1] = 3;
+    args[2] = 4;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .const_nil = 1 },
+        .{ .list_cons = .{ .dest = 2, .head = 0, .tail = 1 } },
+        .{ .const_int = .{ .dest = 3, .value = 0 } },
+        .{ .const_int = .{ .dest = 4, .value = 0 } },
+        .{ .move_value = .{ .dest = 5, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 6,
+            .name = "Map.put_owned_unchecked",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    };
+    const ownership = [_]ir.OwnershipClass{
+        .owned, .trivial, .owned, .trivial, .trivial, .owned, .owned,
+    };
+    var function = try buildTestFunction(
+        testing.allocator,
+        "test_v8_neg_parked",
+        &instrs,
+        &ownership,
+        &.{},
+        .trivial,
+    );
+    defer freeTestFunction(testing.allocator, &function);
+
+    const result = verifyFunctionStandalone(testing.allocator, &function);
+    try testing.expectError(error.ArcInvariantViolation, result);
+}
+
+test "arc_verifier: V8 accepts chained unchecked calls (owned-mutating result is unique)" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Stream:
+    //   [0] map_init %0 = {}
+    //   [1] const_int %1 = 0
+    //   [2] const_int %2 = 0
+    //   [3] move_value %3 <- %0
+    //   [4] call_builtin "Map.put_owned_unchecked" args=[%3, %1, %2] dest=%4
+    //   [5] const_int %5 = 1
+    //   [6] const_int %6 = 1
+    //   [7] move_value %7 <- %4
+    //   [8] call_builtin "Map.put_owned_unchecked" args=[%7, %5, %6] dest=%8
+    //
+    // Expected: V8 holds at BOTH calls. The second call's receiver
+    // is the result of the first owned-mutating call, which is
+    // unique by runtime contract.
+    const args1 = try arena.alloc(ir.LocalId, 3);
+    args1[0] = 3;
+    args1[1] = 1;
+    args1[2] = 2;
+    const arg_modes1 = try arena.alloc(ir.ValueMode, 3);
+    arg_modes1[0] = .move;
+    arg_modes1[1] = .borrow;
+    arg_modes1[2] = .borrow;
+    const args2 = try arena.alloc(ir.LocalId, 3);
+    args2[0] = 7;
+    args2[1] = 5;
+    args2[2] = 6;
+    const arg_modes2 = try arena.alloc(ir.ValueMode, 3);
+    arg_modes2[0] = .move;
+    arg_modes2[1] = .borrow;
+    arg_modes2[2] = .borrow;
+    const instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .move_value = .{ .dest = 3, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put_owned_unchecked",
+            .args = args1,
+            .arg_modes = arg_modes1,
+        } },
+        .{ .const_int = .{ .dest = 5, .value = 1 } },
+        .{ .const_int = .{ .dest = 6, .value = 1 } },
+        .{ .move_value = .{ .dest = 7, .source = 4 } },
+        .{ .call_builtin = .{
+            .dest = 8,
+            .name = "Map.put_owned_unchecked",
+            .args = args2,
+            .arg_modes = arg_modes2,
+        } },
+    };
+    const ownership = [_]ir.OwnershipClass{
+        .owned, .trivial, .trivial, .owned, .owned, .trivial, .trivial, .owned, .owned,
+    };
+    var function = try buildTestFunction(
+        testing.allocator,
+        "test_v8_pos_chain",
+        &instrs,
+        &ownership,
+        &.{},
+        .trivial,
+    );
+    defer freeTestFunction(testing.allocator, &function);
+
+    try verifyFunctionStandalone(testing.allocator, &function);
+}
+
+test "arc_verifier: V8 silent on functions with no unchecked call sites" {
+    // V8 must not crash or false-positive on any function whose
+    // body contains zero unchecked call sites — that includes the
+    // entire pre-Phase-3 corpus.
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const args = try arena.alloc(ir.LocalId, 1);
+    args[0] = 0;
+    const arg_modes = try arena.alloc(ir.ValueMode, 1);
+    arg_modes[0] = .borrow;
+    const instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .call_builtin = .{
+            .dest = 1,
+            .name = "Map.size",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    };
+    const ownership = [_]ir.OwnershipClass{ .owned, .trivial };
+    var function = try buildTestFunction(
+        testing.allocator,
+        "test_v8_silent",
+        &instrs,
+        &ownership,
+        &.{},
+        .trivial,
+    );
+    defer freeTestFunction(testing.allocator, &function);
+
+    try verifyFunctionStandalone(testing.allocator, &function);
+}
+
+test "arc_verifier: V8 rejects unchecked Vector.set on parameter receiver" {
+    var guard = SuppressDiagnostics.init();
+    defer guard.deinit();
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Stream simulating the body of `Vector.set`:
+    //   [0] param_get %0 = param[0]              -- vec parameter
+    //   [1] const_int %1 = 0
+    //   [2] const_int %2 = 42
+    //   [3] move_value %3 <- %0
+    //   [4] call_builtin "Vector.set_owned_unchecked" args=[%3, %1, %2] dest=%4
+    //
+    // V8 must reject — parameter source means uniqueness cannot be
+    // proven from inside the callee.
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 3;
+    args[1] = 1;
+    args[2] = 2;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 42 } },
+        .{ .move_value = .{ .dest = 3, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Vector.set_owned_unchecked",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    };
+    const ownership = [_]ir.OwnershipClass{
+        .owned, .trivial, .trivial, .owned, .owned,
+    };
+    const conventions = [_]ir.ParamConvention{.owned};
+    var function = try buildTestFunction(
+        testing.allocator,
+        "test_v8_neg_vector_param",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(testing.allocator, &function);
+
+    const result = verifyFunctionStandalone(testing.allocator, &function);
+    try testing.expectError(error.ArcInvariantViolation, result);
 }
