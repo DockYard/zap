@@ -211,7 +211,38 @@ pub const ArcOwnership = struct {
 
     /// Diagnostic: per-ARC-local last-use instruction id. Useful
     /// for pretty printers, debug counters, and soundness checks.
+    ///
+    /// This map records ONE last-use instruction per local — the last
+    /// one visited during the depth-first analysis walk. For locals
+    /// whose live-range terminates on multiple disjoint control-flow
+    /// paths (e.g., a binding read in every arm of an `if_expr`/
+    /// `case_block`), only the last-visited site is recorded here.
+    /// Use `last_use_sites` instead when path-sensitive last-use
+    /// detection is needed (the V8 borrow→consume classifier in
+    /// `arc_ownership.shouldMoveIntoOwnedConsume`, the chain-consistency
+    /// audit in `arc_param_convention.siteConsumesSlot`, etc.).
     last_use_map: std.AutoHashMapUnmanaged(ir.LocalId, InstructionId) = .empty,
+
+    /// Path-sensitive last-use record. For every ARC-managed local L
+    /// and every instruction id I where L is at a last-use (live
+    /// before I, dead after I), the pair `(L, I)` is in this set.
+    /// Multiple last-use sites per local are preserved — critical for
+    /// branched control flow, where a binding read in arm A and arm B
+    /// of an `if_expr` is at last-use along both paths.
+    ///
+    /// Used by the V8 borrow→consume classifier
+    /// (`arc_ownership.shouldMoveIntoOwnedConsume`) to decide whether
+    /// a `local_get` is at a last-use of its source on its execution
+    /// path — the binding-read-in-every-arm pattern fails the flat
+    /// `total_use_count == 1` check (count is 2: one per arm) but
+    /// passes this path-sensitive predicate.
+    ///
+    /// Keyed by a packed `u64` of `(local << 32) | id`. Entries are
+    /// added by `classifyLastUses` alongside the legacy `last_use_map`
+    /// puts; both are populated in lock-step. Querying via
+    /// `isLastUseAt(local, id)` returns true iff the pair is in the
+    /// set.
+    last_use_sites: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
     /// For each ret-equivalent terminator instruction id, the set of
     /// ARC-managed local ids that are live immediately before that
@@ -276,6 +307,7 @@ pub const ArcOwnership = struct {
         self.return_source_locals.deinit(allocator);
         self.arc_managed_locals.deinit(allocator);
         self.last_use_map.deinit(allocator);
+        self.last_use_sites.deinit(allocator);
         var live_iter = self.live_before_ret.valueIterator();
         while (live_iter.next()) |set_ptr| {
             set_ptr.deinit(allocator);
@@ -286,6 +318,25 @@ pub const ArcOwnership = struct {
             set_ptr.deinit(allocator);
         }
         self.owned_at_ret.deinit(allocator);
+    }
+
+    /// Pack a `(LocalId, InstructionId)` pair into a `u64` key for
+    /// `last_use_sites` lookups. `local` occupies the high 32 bits;
+    /// `id` the low 32. Mirrors the packing helpers in
+    /// `arc_param_convention` (`liftKey`).
+    fn lastUseKey(local: ir.LocalId, id: InstructionId) u64 {
+        return (@as(u64, @intCast(local)) << 32) | @as(u64, @intCast(id));
+    }
+
+    /// Path-sensitive last-use predicate. Returns true iff `local` was
+    /// alive immediately before instruction `id` and dead immediately
+    /// after — i.e. instruction `id` is one of the (possibly multiple)
+    /// last-use sites for `local`. Unlike `last_use_map[local] == id`
+    /// which only records ONE last-use per local, this predicate
+    /// returns true for EVERY last-use site, including the "binding
+    /// read in every arm of an if/case" pattern.
+    pub fn isLastUseAt(self: *const ArcOwnership, local: ir.LocalId, id: InstructionId) bool {
+        return self.last_use_sites.contains(lastUseKey(local, id));
     }
 };
 
@@ -1196,7 +1247,21 @@ const Analyzer = struct {
                     // afterwards. So this branch fires exactly once
                     // per local, at the truly-last share_value, by
                     // construction.
+                    //
+                    // For branched control flow (`if_expr`, `case_block`,
+                    // …) every arm may end in a last-use of the same
+                    // local. `last_use_map` is single-entry — last write
+                    // wins — so it captures only ONE arm's site. The
+                    // path-sensitive `last_use_sites` records EVERY
+                    // last-use pair `(local, id)`, used by the V8
+                    // borrow→consume classifier and other path-aware
+                    // consumers.
                     try ownership.last_use_map.put(self.allocator, use_local, id);
+                    try ownership.last_use_sites.put(
+                        self.allocator,
+                        ArcOwnership.lastUseKey(use_local, id),
+                        {},
+                    );
                     try self.applySpecialization(rec.instr.*, id, use_local, ownership);
                 }
             }

@@ -126,7 +126,6 @@ pub fn classifyAndNormalizeWithProgram(
     type_store: *const types_mod.TypeStore,
     program: ?*const ir.Program,
 ) !void {
-    _ = ownership;
     _ = type_store;
 
     // Two-pass strategy mirrors `arc_drop_insertion.zig`:
@@ -150,11 +149,13 @@ pub fn classifyAndNormalizeWithProgram(
         .allocator = allocator,
         .function = function,
         .use_summary = &use_summary,
+        .ownership = ownership,
     };
 
     for (function.body, 0..) |_, block_index| {
         const block_ptr: *ir.Block = @constCast(&function.body[block_index]);
         const original = block_ptr.instructions;
+        rewriter.next_id = computeStreamStartIdForBlock(function, block_index);
         const rebuilt = try rewriter.rewriteStream(original);
         if (rebuilt) |new_slice| {
             block_ptr.instructions = new_slice;
@@ -482,11 +483,107 @@ fn lookupCalleeConventionsForCall(
                     return func.param_conventions;
                 }
             }
+            // Cross-struct fallback: when the per-struct
+            // `classifyAndNormalize` runs against an IR that doesn't
+            // contain the callee function (most commonly `VectorI64.set`
+            // and friends — defined in the `VectorI64` struct, called
+            // from any other struct), the lookup above returns null
+            // and the share leading into the call gets treated as a
+            // borrow position. The downstream `rewriteOwnedConsumeSites`
+            // pass on the merged IR DOES rewrite the share to a
+            // `move_value`, but the upstream `local_get` was already
+            // baked into a `borrow_value` by the per-struct classifier
+            // — leaving a `borrow_value -> move_value` chain whose
+            // borrow lacks the +1 ownership the move needs to transfer.
+            //
+            // The fix: recognise the canonical owned-mutating-wrapper
+            // name pattern `<Container>__<method>__<arity>` even when
+            // the function isn't in the per-struct program, and
+            // synthesise conventions where slot 0 is `.owned`. This
+            // matches the convention `arc_param_convention.inferConventions`
+            // will eventually assign to those wrappers on the merged IR.
+            //
+            // Conservative: only triggers for the curated set of
+            // owned-mutating wrappers in `arc_liveness.ownedMutatingBuiltinSlot`'s
+            // namespace (Map.{put,delete,merge}, Vector.{set,push,pop,append}
+            // and their typed peers); other unresolved names continue
+            // to return null.
+            if (calleeConventionsFromOwnedWrapperName(cn.name)) |conv| return conv;
             return null;
         },
         else => return null,
     }
 }
+
+/// Synthesise a `param_conventions` slice for an owned-mutating Zap
+/// thin wrapper based on its name pattern. Returns the static
+/// `OWNED_RECEIVER_CONVENTIONS` slice (slot 0 = `.owned`, rest
+/// `.trivial`) when the name decomposes as
+/// `<Container>__<method>__<arity>` and `<Container>.<method>`
+/// matches `arc_liveness.ownedMutatingBuiltinSlot`. Returns null
+/// otherwise.
+///
+/// This is the per-struct fallback for `lookupCalleeConventionsForCall`
+/// when the cross-struct callee isn't in the local program. The merged-
+/// IR pass will eventually assign these conventions canonically via
+/// `arc_param_convention.inferConventions`; the synthetic slice keeps
+/// the per-struct classifier's `consume_share_dests` collection accurate
+/// in the meantime, so the upstream `local_get` lowers to `.move_value`
+/// instead of the unsound `.borrow_value -> move_value` chain.
+fn calleeConventionsFromOwnedWrapperName(name: []const u8) ?[]const ir.ParamConvention {
+    // Parse `<Container>__<method>__<arity>`. The container can
+    // contain digits / underscores (e.g. `VectorI64`), but the
+    // separator pattern `__<method>__<arity>` is unambiguous: scan
+    // backward for `__`, that delimits arity from method, then scan
+    // backward again for `__` to find the container/method boundary.
+    if (std.mem.lastIndexOf(u8, name, "__")) |arity_sep| {
+        // Validate the arity portion is purely digits.
+        const arity_str = name[arity_sep + 2 ..];
+        if (arity_str.len == 0) return null;
+        for (arity_str) |c| {
+            if (c < '0' or c > '9') return null;
+        }
+        // Walk backward from `arity_sep` to find the `__` delimiting
+        // method from container.
+        if (arity_sep < 2) return null;
+        const before_arity = name[0..arity_sep];
+        if (std.mem.lastIndexOf(u8, before_arity, "__")) |method_sep| {
+            const container = name[0..method_sep];
+            const method = name[method_sep + 2 .. arity_sep];
+            // Recompose as `<Container>.<method>` for the
+            // owned-mutating-builtin name matcher.
+            var dotted_buf: [128]u8 = undefined;
+            const total = container.len + 1 + method.len;
+            if (total >= dotted_buf.len) return null;
+            @memcpy(dotted_buf[0..container.len], container);
+            dotted_buf[container.len] = '.';
+            @memcpy(dotted_buf[container.len + 1 ..][0..method.len], method);
+            const dotted = dotted_buf[0..total];
+            if (arc_liveness.ownedMutatingBuiltinSlot(dotted)) |slot| {
+                if (slot != 0) return null; // we currently only handle slot-0 wrappers
+                return &OWNED_RECEIVER_CONVENTIONS;
+            }
+        }
+    }
+    return null;
+}
+
+/// Pre-allocated convention slice for owned-mutating-wrapper synthesis.
+/// Slot 0 is `.owned` (the receiver consumes its arg); subsequent
+/// slots default to `.trivial`. The slice is sized to cover the
+/// arity of every owned-mutating wrapper currently recognised
+/// (Map.put: 3, Vector.set: 3, Vector.append: 2, etc.) — extending
+/// is safe; the consumer slices into the prefix.
+const OWNED_RECEIVER_CONVENTIONS = [_]ir.ParamConvention{
+    .owned,
+    .trivial,
+    .trivial,
+    .trivial,
+    .trivial,
+    .trivial,
+    .trivial,
+    .trivial,
+};
 
 /// Record every "use" of a local that this instruction performs.
 /// For Phase C the borrowing-position bit is true when the local
@@ -838,8 +935,15 @@ fn shouldMove(
 ///   * source is ARC-managed (`.owned`) too.
 ///   * dest's only use is an owned-consume share
 ///     (`owned_consume_use_count == total_use_count == 1`).
-///   * source's only use is this `.local_get`
-///     (`source.total_use_count == 1`).
+///   * source is at last-use at this `.local_get` along the local_get's
+///     execution path. Path-sensitive — the flat
+///     `total_use_count == 1` check would over-reject when the source
+///     is a binding read in every arm of an `if_expr` / `case_block`
+///     (each arm reads the binding once; total flat count is N, but
+///     along any one execution path it's 1). The path-sensitive
+///     `ArcOwnership.isLastUseAt` predicate answers exactly the
+///     question we need: "is the source dead immediately after this
+///     local_get on this execution path?"
 ///
 /// Mirrors `shouldMoveIntoAggregate` but for the owned-consume share-
 /// value position. Without this rule the classifier picks
@@ -847,11 +951,29 @@ fn shouldMove(
 /// step, the runtime sees refcount >= 2, and the rc-1 fast path
 /// never fires — turning every put into a full buffer copy and
 /// regressing k-nucleotide back into the multi-minute regime.
+///
+/// Phase 1.4 path-sensitive refinement: with the flat use-counter,
+/// an `if_expr` like
+///
+///     if cond { cleared } else { count_kmers_loop(..., cleared) }
+///
+/// records `total_use_count == 2` for the `cleared` binding (one read
+/// per arm), so the conservative `.copy_value` fired in the else
+/// arm even though `cleared` is at last-use along that path. The copy
+/// retains the cell to refcount 2, demoting the receiver's V8
+/// uniqueness on entry to `count_kmers_loop`, which cascades to demote
+/// every owned-consume site reachable through the call. Replacing the
+/// flat source-count check with `ArcOwnership.isLastUseAt` recognises
+/// that `cleared`'s read in the else arm IS its last use on that
+/// path, allowing the move and preserving the chain of unique-on-entry
+/// guarantees through the recursion.
 fn shouldMoveIntoOwnedConsume(
     function: *const ir.Function,
     summary: *const UseSummary,
+    ownership: *const arc_liveness.ArcOwnership,
     dest: ir.LocalId,
     source: ir.LocalId,
+    local_get_id: arc_liveness.InstructionId,
 ) bool {
     if (dest >= function.local_ownership.len) return false;
     if (function.local_ownership[dest] != .owned) return false;
@@ -862,11 +984,18 @@ fn shouldMoveIntoOwnedConsume(
     if (dest_counts.total_use_count != 1) return false;
     if (dest_counts.owned_consume_use_count != 1) return false;
 
-    const source_counts = summary.get(source);
-    if (source_counts.total_use_count != 1) return false;
+    // Path-sensitive: the source must be at last-use here. The
+    // `local_get` instruction's id keys into `last_use_sites`; a hit
+    // means the source is dead immediately after this read on the
+    // local_get's execution path. Multiple last-use sites per source
+    // (one per branch of an if/case where the binding is read in
+    // every arm) all satisfy this predicate independently, mirroring
+    // the live-set dataflow's per-arm answer.
+    if (!ownership.isLastUseAt(source, local_get_id)) return false;
 
     return true;
 }
+
 
 fn shouldMoveIntoAggregate(
     function: *const ir.Function,
@@ -893,6 +1022,19 @@ const StreamRewriter = struct {
     allocator: std.mem.Allocator,
     function: *ir.Function,
     use_summary: *const UseSummary,
+    /// Live-set side table. Used by `shouldMoveIntoOwnedConsume` to
+    /// answer the path-sensitive "is the source at last-use here?"
+    /// question via `ArcOwnership.isLastUseAt`. Without this signal,
+    /// the flat `total_use_count == 1` predicate over-counts uses
+    /// across mutually-exclusive arms (e.g., a binding read in every
+    /// arm of an `if_expr`), forcing the conservative `.copy_value`
+    /// path and defeating V8 at every owned-consume site downstream.
+    ownership: *const arc_liveness.ArcOwnership,
+    /// Running InstructionId mirrored from `arc_liveness`'s depth-
+    /// first traversal. Tracked so per-`local_get` queries against
+    /// `ownership.last_use_sites` use the same id space the analyzer
+    /// recorded.
+    next_id: arc_liveness.InstructionId = 0,
 
     /// Rewrite one instruction stream. Returns `null` when no
     /// rewriting was needed. Otherwise returns a freshly-allocated
@@ -901,15 +1043,24 @@ const StreamRewriter = struct {
         self: *StreamRewriter,
         stream: []const ir.Instruction,
     ) error{OutOfMemory}!?[]const ir.Instruction {
-        // First pass: rebuild children for any instruction that
-        // contains nested streams. Track whether any change is
-        // needed (either at this level or in a sub-stream).
+        // First pass: assign InstructionIds to each top-level entry,
+        // recurse into nested streams, and collect any rebuilt
+        // children. The id assignment mirrors
+        // `arc_liveness.flattenStream`'s DFS traversal so the ids we
+        // record match those used in `ownership.last_use_sites`.
         var rebuilt_children: std.ArrayListUnmanaged(?ir.Instruction) = .empty;
         defer rebuilt_children.deinit(self.allocator);
         try rebuilt_children.ensureTotalCapacity(self.allocator, stream.len);
 
+        var top_level_ids: std.ArrayListUnmanaged(arc_liveness.InstructionId) = .empty;
+        defer top_level_ids.deinit(self.allocator);
+        try top_level_ids.ensureTotalCapacity(self.allocator, stream.len);
+
         var any_change = false;
         for (stream) |*instr| {
+            const id = self.next_id;
+            self.next_id += 1;
+            try top_level_ids.append(self.allocator, id);
             const child = try self.rewriteChildren(instr);
             if (child) |_| any_change = true;
             try rebuilt_children.append(self.allocator, child);
@@ -929,6 +1080,7 @@ const StreamRewriter = struct {
             // child rewrite changed something, otherwise the
             // original.
             const effective = rebuilt_children.items[i] orelse original;
+            const local_get_id = top_level_ids.items[i];
 
             switch (effective) {
                 .local_get => |lg| {
@@ -977,7 +1129,7 @@ const StreamRewriter = struct {
                         try new_instrs.append(self.allocator, .{
                             .move_value = .{ .dest = lg.dest, .source = lg.source },
                         });
-                    } else if (shouldMoveIntoOwnedConsume(self.function, self.use_summary, lg.dest, lg.source)) {
+                    } else if (shouldMoveIntoOwnedConsume(self.function, self.use_summary, self.ownership, lg.dest, lg.source, local_get_id)) {
                         // Phase 4 (dense Map): dest's only use feeds an
                         // owned-mutating call site (call_named/call_direct
                         // with `.owned`-promoted convention via
@@ -1046,11 +1198,15 @@ const StreamRewriter = struct {
                 return ir.Instruction{ .if_expr = copy };
             },
             .case_block => |cb| {
+                // Traversal order MUST match `arc_liveness.flattenStream`:
+                // `pre_instrs` first, then per-arm `cond_instrs` +
+                // `body_instrs`, then `default_instrs`. Any deviation
+                // mis-aligns `next_id` with the analyzer's id space and
+                // breaks downstream `last_use_sites` / `last_use_map`
+                // queries.
                 var any_arm_change = false;
                 const new_pre = try self.rewriteStream(cb.pre_instrs);
                 if (new_pre != null) any_arm_change = true;
-                const new_default = try self.rewriteStream(cb.default_instrs);
-                if (new_default != null) any_arm_change = true;
                 var new_arms = try self.allocator.alloc(ir.IrCaseArm, cb.arms.len);
                 var arms_changed = false;
                 for (cb.arms, 0..) |arm, idx| {
@@ -1067,6 +1223,8 @@ const StreamRewriter = struct {
                     }
                     new_arms[idx] = arm_copy;
                 }
+                const new_default = try self.rewriteStream(cb.default_instrs);
+                if (new_default != null) any_arm_change = true;
                 if (!any_arm_change and !arms_changed) {
                     self.allocator.free(new_arms);
                     return null;
@@ -1082,9 +1240,10 @@ const StreamRewriter = struct {
                 return ir.Instruction{ .case_block = copy };
             },
             .switch_literal => |sl| {
+                // Traversal order MUST match `arc_liveness.flattenStream`:
+                // cases first, then default. See `case_block` above for
+                // why id alignment matters.
                 var any_change = false;
-                const new_default = try self.rewriteStream(sl.default_instrs);
-                if (new_default != null) any_change = true;
                 var new_cases = try self.allocator.alloc(ir.LitCase, sl.cases.len);
                 var cases_changed = false;
                 for (sl.cases, 0..) |c, idx| {
@@ -1096,6 +1255,8 @@ const StreamRewriter = struct {
                     }
                     new_cases[idx] = c_copy;
                 }
+                const new_default = try self.rewriteStream(sl.default_instrs);
+                if (new_default != null) any_change = true;
                 if (!any_change and !cases_changed) {
                     self.allocator.free(new_cases);
                     return null;
@@ -1110,9 +1271,9 @@ const StreamRewriter = struct {
                 return ir.Instruction{ .switch_literal = copy };
             },
             .switch_return => |sr| {
+                // Traversal order MUST match `arc_liveness.flattenStream`:
+                // cases first, then default.
                 var any_change = false;
-                const new_default = try self.rewriteStream(sr.default_instrs);
-                if (new_default != null) any_change = true;
                 var new_cases = try self.allocator.alloc(ir.ReturnCase, sr.cases.len);
                 var cases_changed = false;
                 for (sr.cases, 0..) |c, idx| {
@@ -1124,6 +1285,8 @@ const StreamRewriter = struct {
                     }
                     new_cases[idx] = c_copy;
                 }
+                const new_default = try self.rewriteStream(sr.default_instrs);
+                if (new_default != null) any_change = true;
                 if (!any_change and !cases_changed) {
                     self.allocator.free(new_cases);
                     return null;
