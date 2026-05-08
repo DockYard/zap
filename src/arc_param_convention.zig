@@ -452,7 +452,18 @@ fn siteAuditEligible(
 
             const root_local = traceAliasChainToRoot(caller_func, source);
             if (paramSlotForLocal(caller_func, root_local)) |param_slot| {
-                if (paramSlotIsRefetchedAfter(caller_func, param_slot, root_local, share_id)) return false;
+                // Phase 1.8 item #4 — bounded-borrow refinement. Compute
+                // the consume call's last-use id from the share_value's
+                // dest (= site.args[slot_index]). Refetches whose
+                // lifetime ends at or before this id are bounded
+                // within the consume call's argument-evaluation window
+                // and don't block promotion.
+                const share_dest = site.args[slot_index];
+                const consume_last_use_opt = fn_ownership.last_use_map.get(share_dest);
+                const last_use_map_opt: ?*const std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId) =
+                    if (consume_last_use_opt != null) &fn_ownership.last_use_map else null;
+                const consume_last_use: arc_liveness.InstructionId = consume_last_use_opt orelse 0;
+                if (paramSlotIsRefetchedAfter(caller_func, param_slot, root_local, share_id, last_use_map_opt, consume_last_use)) return false;
                 // The audit's chain-consistency core: when the chain
                 // root is a `param_get` of a `.borrowed` parameter,
                 // the audit succeeds only when that parameter slot is
@@ -1254,7 +1265,18 @@ fn siteConsumesSlot(
 
             const root_local = traceAliasChainToRoot(caller_func, source);
             if (paramSlotForLocal(caller_func, root_local)) |param_slot| {
-                if (paramSlotIsRefetchedAfter(caller_func, param_slot, root_local, share_id)) return false;
+                // Phase 1.8 item #4 — bounded-borrow refinement. Compute
+                // the consume call's last-use id from the share_value's
+                // dest (= site.args[slot_index]). Refetches whose
+                // lifetime ends at or before this id are bounded within
+                // the consume call's argument-evaluation window and
+                // don't block promotion.
+                const share_dest = site.args[slot_index];
+                const consume_last_use_opt = fn_ownership.last_use_map.get(share_dest);
+                const last_use_map_opt: ?*const std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId) =
+                    if (consume_last_use_opt != null) &fn_ownership.last_use_map else null;
+                const consume_last_use: arc_liveness.InstructionId = consume_last_use_opt orelse 0;
+                if (paramSlotIsRefetchedAfter(caller_func, param_slot, root_local, share_id, last_use_map_opt, consume_last_use)) return false;
                 // Phase 1.3 chain-consistency lift (research2.md §1.5).
                 //
                 // Historical soundness gate: when the alias chain's
@@ -1467,11 +1489,32 @@ fn paramSlotForLocal(function: *const ir.Function, local_id: ir.LocalId) ?u32 {
 /// again in case[1] for the base-case return; the two reads are on
 /// disjoint paths, so the case[1] read must not block promotion
 /// of the case[0]-bound share).
+///
+/// Phase 1.8 item #4 — bounded-borrow refinement. When `last_use_map`
+/// is non-null, refetches whose lifetime is fully bounded WITHIN the
+/// consume call's argument-evaluation window are ignored. A `param_get
+/// dest=Q` is bounded iff `last_use_map[Q] <= consume_last_use_id`,
+/// where `consume_last_use_id` is `last_use_map[share_dest]` (the
+/// instruction id at which the consume call ends the share_value
+/// dest's lifetime). The bounded refetch's value is consumed by some
+/// non-mutating sub-call (e.g., `Vector.get`) before the outer consume
+/// fires — it does not extend the parameter slot's live range past
+/// the consume site, so it does not block promotion.
+///
+/// This refinement is essential for fannkuch's
+/// `set(p, i, get(p, i+1))` shape: the inner `get(p, ...)` produces
+/// a fresh `param_get` between the outer `set`'s share_value and
+/// the outer `set` call. Without the refinement, the inner refetch
+/// is treated as a post-share refetch and the audit rejects;
+/// with it, the refetch's bounded lifetime is recognised and
+/// promotion succeeds.
 fn paramSlotIsRefetchedAfter(
     function: *const ir.Function,
     param_slot: u32,
     share_source: ir.LocalId,
     share_id: arc_liveness.InstructionId,
+    last_use_map: ?*const std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
+    consume_last_use_id: arc_liveness.InstructionId,
 ) bool {
     var ctx = SuccessorScan{
         .slot = param_slot,
@@ -1479,6 +1522,8 @@ fn paramSlotIsRefetchedAfter(
         .target_id = share_id,
         .next_id = 0,
         .found = false,
+        .last_use_map = last_use_map,
+        .consume_last_use_id = consume_last_use_id,
     };
     for (function.body) |block| {
         const status = scanStreamSuccessors(block.instructions, &ctx);
@@ -1508,6 +1553,21 @@ const SuccessorScan = struct {
     /// Once we cross the share, we're in "post-target" mode for the
     /// remainder of this stream and every enclosing parent stream.
     found: bool,
+    /// Phase 1.8 item #4 — bounded-borrow refinement. When non-null,
+    /// `checkParamGet` consults `last_use_map[refetch.dest]` and
+    /// suppresses the refetch flag when the dest's last-use id is
+    /// `<= consume_last_use_id`. A bounded refetch is one whose
+    /// value is fully consumed before the share_value's own consume
+    /// call (e.g., a `Vector.get` argument inside the same `Vector.set`
+    /// call's argument-evaluation window). Such refetches don't
+    /// extend the parameter slot's live range past the outer consume
+    /// site and therefore must not block promotion.
+    last_use_map: ?*const std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
+    /// The instruction id at which the consume call ends the
+    /// share_value's dest lifetime. Equals `last_use_map[share_dest]`
+    /// when the caller passes a real bound; meaningless and unread
+    /// when `last_use_map` is null.
+    consume_last_use_id: arc_liveness.InstructionId,
 };
 
 /// Stream-walk status: the share_value at `target_id` may live in
@@ -1774,11 +1834,37 @@ fn checkParamGet(
     instr_id: arc_liveness.InstructionId,
     ctx: *SuccessorScan,
 ) void {
-    if (instr.* == .param_get and instr.param_get.index == ctx.slot) {
-        if (instr.param_get.dest != ctx.excluded_dest and instr_id > ctx.target_id) {
-            ctx.found = true;
+    if (instr.* != .param_get) return;
+    if (instr.param_get.index != ctx.slot) return;
+    if (instr.param_get.dest == ctx.excluded_dest) return;
+    if (instr_id <= ctx.target_id) return;
+
+    // Phase 1.8 item #4 — bounded-borrow refinement. When the refetch's
+    // dest has a last-use that is `<= consume_last_use_id`, the
+    // refetch's lifetime is fully contained within the consume call's
+    // argument-evaluation window. The fresh `param_get` doesn't extend
+    // the parameter slot's live range past the consume site, so it
+    // must not block promotion.
+    //
+    // The fannkuch shape `set(p, i, get(p, i+1))` is the canonical
+    // example: lowering emits the outer set's share_value first,
+    // then a fresh param_get for the inner get's receiver, then the
+    // get-call (which is the refetch's last use), then the outer
+    // set call (which is the share's last use). The refetch's
+    // last-use precedes the consume's last-use, so the refetch is
+    // bounded and safe to ignore.
+    if (ctx.last_use_map) |last_use_map| {
+        if (last_use_map.get(instr.param_get.dest)) |refetch_last_use| {
+            if (refetch_last_use <= ctx.consume_last_use_id) {
+                // Bounded refetch — does not block promotion.
+                return;
+            }
         }
+        // No last-use entry for the refetch dest: conservatively
+        // treat as post-share (we cannot prove the lifetime is
+        // bounded). Falls through to `ctx.found = true`.
     }
+    ctx.found = true;
 }
 
 // ============================================================
@@ -1936,7 +2022,7 @@ test "arc_param_convention: paramSlotIsRefetchedAfter ignores refetches in disjo
     // The pre-fix flat-id check would return TRUE (id 5's param_get
     // is > id 3). The new structural-successor check must return
     // FALSE: case[1] is on a path disjoint from the share.
-    try std.testing.expect(!paramSlotIsRefetchedAfter(&function, 0, share_source, share_id));
+    try std.testing.expect(!paramSlotIsRefetchedAfter(&function, 0, share_source, share_id, null, 0));
 }
 
 test "arc_param_convention: paramSlotIsRefetchedAfter detects refetch on the same flow path" {
@@ -1993,5 +2079,145 @@ test "arc_param_convention: paramSlotIsRefetchedAfter detects refetch on the sam
 
     // The second param_get is on the SAME flow path as the share.
     // The check must catch it.
-    try std.testing.expect(paramSlotIsRefetchedAfter(&function, 0, share_source, share_id));
+    try std.testing.expect(paramSlotIsRefetchedAfter(&function, 0, share_source, share_id, null, 0));
+}
+
+test "arc_param_convention: paramSlotIsRefetchedAfter ignores refetch bounded within consume call's arg eval (Phase 1.8 item #4)" {
+    // Build a function shaped like fannkuch's `set(p, i, get(p, i+1))`:
+    //
+    //   param_get   dest=L0 index=0       -- first fetch (for set's receiver)
+    //   share_value dest=L1 source=L0     -- share for set; target id = 1
+    //   param_get   dest=L2 index=0       -- second fetch (for get's receiver) -- "refetch"
+    //   call_builtin Vector.get args=[L2] -- consumes L2; last_use[L2] = id 3
+    //   call_builtin Vector.set args=[L1] -- consumes L1; last_use[L1] = id 4
+    //   ret value=L1                       -- (or whatever)
+    //
+    // Pre-Phase-1.8 behavior: the structural-successor scan sees the
+    // L2-refetch at id 2 as post-share (id 2 > target id 1) and
+    // flags it as a refetch — over-rejecting.
+    //
+    // Phase 1.8 behavior: the bounded-borrow refinement looks up
+    // last_use[L2] = 3 and last_use[L1] = 4. Since
+    // last_use[L2] (3) <= last_use[L1] (4), the L2 refetch's
+    // lifetime is bounded WITHIN the set call's argument-evaluation
+    // window — it isn't a post-share-and-still-live refetch.
+    // The check returns false and the audit allows promotion.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const top = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } }, // id 0
+        .{ .share_value = .{ .dest = 1, .source = 0, .mode = .retain } }, // id 1 — share_id (target)
+        .{ .param_get = .{ .dest = 2, .index = 0 } }, // id 2 — refetch (post-target)
+        .{ .release = .{ .value = 2 } }, // id 3 — last use of L2 (the get-call analog)
+        .{ .release = .{ .value = 1 } }, // id 4 — last use of L1 (the set-call analog)
+        .{ .ret = .{ .value = 1 } }, // id 5
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = top };
+
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .owned, .owned,
+    });
+    const param_conventions = try arena.dupe(ir.ParamConvention, &[_]ir.ParamConvention{.borrowed});
+    var function = ir.Function{
+        .id = 300,
+        .name = "test_bounded_refetch",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = param_conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    const share_id: arc_liveness.InstructionId = 1;
+    const share_source: ir.LocalId = 0;
+    const consume_last_use_id: arc_liveness.InstructionId = 4;
+
+    // Build a last_use_map asserting:
+    //   last_use[L2] = 3 (refetch ends at the L2-release before the consume)
+    //   last_use[L1] = 4 (consume call's last use of the share_dest)
+    var last_use_map: std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId) = .empty;
+    defer last_use_map.deinit(std.testing.allocator);
+    try last_use_map.put(std.testing.allocator, 1, 4);
+    try last_use_map.put(std.testing.allocator, 2, 3);
+
+    // Without the bounded-borrow refinement (legacy behavior — null
+    // bounded_by) the check returns true.
+    try std.testing.expect(paramSlotIsRefetchedAfter(&function, 0, share_source, share_id, null, 0));
+
+    // With the bounded-borrow refinement: refetch's last-use (3) is
+    // <= consume call's last-use (4), so the refetch is bounded and
+    // ignored.
+    try std.testing.expect(!paramSlotIsRefetchedAfter(&function, 0, share_source, share_id, &last_use_map, consume_last_use_id));
+}
+
+test "arc_param_convention: paramSlotIsRefetchedAfter still detects unbounded refetch even with bounded_by enabled" {
+    // Same shape as the bounded-refetch test, but the second param_get's
+    // last use is AFTER the consume call. The refetch is NOT bounded
+    // and must still be flagged as a post-share refetch.
+    //
+    //   param_get   dest=L0 index=0
+    //   share_value dest=L1 source=L0     -- share_id
+    //   param_get   dest=L2 index=0       -- refetch
+    //   release     value=L1              -- consume of share at id 3
+    //   release     value=L2              -- L2's last use at id 4 (AFTER consume)
+    //   ret
+    //
+    // last_use[L1] = 3 (consume call last-use)
+    // last_use[L2] = 4 (post-consume, NOT bounded)
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const top = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } }, // id 0
+        .{ .share_value = .{ .dest = 1, .source = 0, .mode = .retain } }, // id 1
+        .{ .param_get = .{ .dest = 2, .index = 0 } }, // id 2 — refetch
+        .{ .release = .{ .value = 1 } }, // id 3 — consume call last use
+        .{ .release = .{ .value = 2 } }, // id 4 — refetch's last use (UNBOUNDED!)
+        .{ .ret = .{ .value = 2 } }, // id 5
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = top };
+
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .owned, .owned,
+    });
+    const param_conventions = try arena.dupe(ir.ParamConvention, &[_]ir.ParamConvention{.borrowed});
+    var function = ir.Function{
+        .id = 301,
+        .name = "test_unbounded_refetch",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = param_conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    const share_id: arc_liveness.InstructionId = 1;
+    const share_source: ir.LocalId = 0;
+    const consume_last_use_id: arc_liveness.InstructionId = 3;
+
+    var last_use_map: std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId) = .empty;
+    defer last_use_map.deinit(std.testing.allocator);
+    try last_use_map.put(std.testing.allocator, 1, 3);
+    try last_use_map.put(std.testing.allocator, 2, 4);
+
+    // Refetch's last use (4) is > consume call last use (3), so the
+    // refetch IS still live past the consume call and must be flagged.
+    try std.testing.expect(paramSlotIsRefetchedAfter(&function, 0, share_source, share_id, &last_use_map, consume_last_use_id));
 }
