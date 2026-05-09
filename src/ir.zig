@@ -1122,22 +1122,15 @@ pub const ZigType = union(enum) {
     /// sites wrap via `Term.from(value)` and consumption sites unwrap
     /// via `Term.to(T, term, default)`.
     term,
-    /// `?*const zap_runtime.MArrayOf(i64)` — concrete instantiation of
-    /// the mutable, ARC-managed, pool-backed contiguous array. The
-    /// runtime owns the cell layout (`Inner = { header, len, items }`);
-    /// the source-Arc ABI sees `?*const Inner` everywhere and
-    /// `@constCast`s once at write boundaries. Distinct from
-    /// `marray_f64` because `MArrayOf(i64)` and `MArrayOf(f64)` are
-    /// different Zig generic instantiations.
-    marray_i64,
-    /// `?*const zap_runtime.MArrayOf(f64)` — see `marray_i64`.
-    marray_f64,
-    /// Phase 2: `?*const zap_runtime.Vector(i64)` — flat-buffer
-    /// mutable array with COW. Replaces `marray_i64` in Phase 6.
-    /// Distinct from `vector_f64` for the same nominal-type reason
-    /// MArray's variants are split.
+    /// `?*const zap_runtime.Vector(i64)` — flat-buffer mutable array
+    /// with COW semantics. The runtime owns the cell layout
+    /// (`Self = { header, len, capacity, ... }`); the source-Arc ABI
+    /// sees `?*const Self` everywhere and `@constCast`s once at
+    /// write boundaries. Distinct from `vector_f64` because
+    /// `Vector(i64)` and `Vector(f64)` are different Zig generic
+    /// instantiations.
     vector_i64,
-    /// Phase 2: `?*const zap_runtime.Vector(f64)` — see `vector_i64`.
+    /// `?*const zap_runtime.Vector(f64)` — see `vector_i64`.
     vector_f64,
     tuple: []const ZigType,
     list: *const ZigType,
@@ -2654,12 +2647,9 @@ pub const IrBuilder = struct {
             .atom,
             .never,
             .ptr,
-            // `?*const MArrayOf(T)` and `?*const Vector(T)` are
-            // single pointer-size optionals — Zig passes them in
-            // registers like any other `?*T`, so they satisfy the
-            // by-value requirement for `musttail`.
-            .marray_i64,
-            .marray_f64,
+            // `?*const Vector(T)` is a single pointer-size optional —
+            // Zig passes it in registers like any other `?*T`, so it
+            // satisfies the by-value requirement for `musttail`.
             .vector_i64,
             .vector_f64,
             => true,
@@ -7467,8 +7457,6 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
         types_mod.TypeStore.F16 => .f16,
         types_mod.TypeStore.USIZE => .usize,
         types_mod.TypeStore.ISIZE => .isize,
-        types_mod.TypeStore.MARRAY_I64 => .marray_i64,
-        types_mod.TypeStore.MARRAY_F64 => .marray_f64,
         types_mod.TypeStore.VECTOR_I64 => .vector_i64,
         types_mod.TypeStore.VECTOR_F64 => .vector_f64,
         else => {
@@ -7477,10 +7465,6 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                 if (type_id < ts.types.items.len) {
                     const typ = ts.types.items[type_id];
                     switch (typ) {
-                        .marray_type => |element_kind| return switch (element_kind) {
-                            .i64 => .marray_i64,
-                            .f64 => .marray_f64,
-                        },
                         .vector_type => |element_kind| return switch (element_kind) {
                             .i64 => .vector_i64,
                             .f64 => .vector_f64,
@@ -7622,11 +7606,9 @@ fn zigTypeReachesStruct(t: ZigType, owner_name: []const u8) bool {
         .usize,
         .isize,
         .tagged_union,
-        // MArray and Vector cells are heap-managed runtime values
-        // whose buffers never embed a Zap user struct, so they
-        // cannot reach `owner_name`.
-        .marray_i64,
-        .marray_f64,
+        // Vector cells are heap-managed runtime values whose buffers
+        // never embed a Zap user struct, so they cannot reach
+        // `owner_name`.
         .vector_i64,
         .vector_f64,
         => false,
@@ -7740,11 +7722,9 @@ fn reachesStructInCycleImpl(
         .usize,
         .isize,
         .tagged_union,
-        // MArray and Vector cells are heap-managed runtime types
-        // whose buffers never embed a Zap user struct, so they
-        // can't carry a back-reference to `owner_name`.
-        .marray_i64,
-        .marray_f64,
+        // Vector cells are heap-managed runtime types whose buffers
+        // never embed a Zap user struct, so they can't carry a
+        // back-reference to `owner_name`.
         .vector_i64,
         .vector_f64,
         => false,
@@ -7777,8 +7757,6 @@ fn zigTypeToStr(zig_type: ZigType) []const u8 {
         .string => "[]const u8",
         .atom => "[]const u8",
         .nil => "?void",
-        .marray_i64 => "?*const zap_runtime.MArrayOf(i64)",
-        .marray_f64 => "?*const zap_runtime.MArrayOf(f64)",
         .vector_i64 => "?*const zap_runtime.Vector(i64)",
         .vector_f64 => "?*const zap_runtime.Vector(f64)",
         .struct_ref => |name| name,

@@ -888,8 +888,6 @@ pub const ZirDriver = struct {
             .tuple => self.mapTupleElementType(zig_type),
             .struct_ref => |name| return try self.emitStructTypeRef(name),
             .term => return try self.emitTermTypeRef(),
-            .marray_i64 => return try self.emitMArrayTypeRef(.i64),
-            .marray_f64 => return try self.emitMArrayTypeRef(.f64),
             .vector_i64 => return try self.emitVectorTypeRef(.i64),
             .vector_f64 => return try self.emitVectorTypeRef(.f64),
             .optional => |inner| {
@@ -2301,50 +2299,11 @@ pub const ZirDriver = struct {
         return term_ref;
     }
 
-    /// The element-kind selector for `MArrayOf(T)` instantiations. Each
-    /// variant maps to one runtime alias exported from `zap_runtime`
-    /// (`MArrayI64` for `i64`, `MArrayF64` for `f64`). New variants
-    /// must extend the runtime side first — adding a `pub const
-    /// MArray<X> = MArrayOf(<X>)` alias and the matching native-type
-    /// kind in `scope.zig`.
-    const MArrayElementKind = enum { i64, f64 };
-
-    fn mArrayAliasName(kind: MArrayElementKind) []const u8 {
-        return switch (kind) {
-            .i64 => "MArrayI64",
-            .f64 => "MArrayF64",
-        };
-    }
-
-    /// Emit a ZIR ref for `?*const zap_runtime.MArray<X>` — the
-    /// canonical wire-shape of an MArray cell handle as seen by every
-    /// Zap-source consumer. The runtime's `MArray<X>` alias names the
-    /// `MArrayOf(T)` *struct* (the cell's `Inner`-erased self type),
-    /// so every Zap-visible signature must wrap that with
-    /// `?*const ...` to match the source-Arc ABI shape (the runtime's
-    /// `pub fn new() ?*const Self` and friends). Routes through the
-    /// runtime alias so the `Inner` layout, allocator, and ARC header
-    /// stay encapsulated in the runtime's `MArrayOf(T)` definition.
-    /// Used by parameter and return-type emission for any function
-    /// whose Zap signature names `MArrayI64` or `MArrayF64`.
-    fn emitMArrayTypeRef(self: *ZirDriver, kind: MArrayElementKind) BuildError!u32 {
-        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-        if (rt_import == error_ref) return error.EmitFailed;
-        const alias = mArrayAliasName(kind);
-        const alias_ref = zir_builder_emit_field_val(self.handle, rt_import, alias.ptr, @intCast(alias.len));
-        if (alias_ref == error_ref) return error.EmitFailed;
-        const ptr_ref = zir_builder_emit_single_const_ptr_type(self.handle, alias_ref);
-        if (ptr_ref == error_ref) return error.EmitFailed;
-        const opt_ref = zir_builder_emit_optional_type(self.handle, ptr_ref);
-        if (opt_ref == error_ref) return error.EmitFailed;
-        return opt_ref;
-    }
-
-    /// Phase 2 mirror of `mArrayAliasName`. Each `VectorElementKind`
-    /// maps to a runtime alias (`VectorI64` / `VectorF64`) defined in
-    /// `runtime.zig`. New variants here demand the corresponding
-    /// `pub const Vector<X> = Vector(<X>)` alias and a matching
-    /// `NativeTypeKind` registration.
+    /// The element-kind selector for `Vector(T)` instantiations. Each
+    /// variant maps to a runtime alias (`VectorI64` / `VectorF64`)
+    /// defined in `runtime.zig`. New variants here demand the
+    /// corresponding `pub const Vector<X> = Vector(<X>)` alias and a
+    /// matching `NativeTypeKind` registration.
     const VectorElementKind = enum { i64, f64 };
 
     fn vectorAliasName(kind: VectorElementKind) []const u8 {
@@ -2354,13 +2313,12 @@ pub const ZirDriver = struct {
         };
     }
 
-    /// Emit a ZIR ref for `?*const zap_runtime.Vector<X>`. Phase 2
-    /// counterpart to `emitMArrayTypeRef`. The runtime's
-    /// `Vector<X>` alias names the underlying `Vector(<X>)` struct
-    /// (the cell's `Inner`-equivalent self type), so every Zap-
-    /// visible signature wraps that with `?*const ...` to match the
-    /// source-Arc ABI shape that every runtime Vector helper expects
-    /// (`pub fn new_filled() ?*const Self`, ...).
+    /// Emit a ZIR ref for `?*const zap_runtime.Vector<X>`. The
+    /// runtime's `Vector<X>` alias names the underlying `Vector(<X>)`
+    /// struct (the cell's self type), so every Zap-visible signature
+    /// wraps that with `?*const ...` to match the source-Arc ABI
+    /// shape that every runtime Vector helper expects (`pub fn
+    /// new_filled() ?*const Self`, ...).
     fn emitVectorTypeRef(self: *ZirDriver, kind: VectorElementKind) BuildError!u32 {
         const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
         if (rt_import == error_ref) return error.EmitFailed;
@@ -2958,45 +2916,17 @@ pub const ZirDriver = struct {
             if (ref == error_ref) return error.EmitFailed;
             return ref;
         }
-        // MArray params take their declared concrete runtime type:
-        // `?*const zap_runtime.MArrayOf(<X>)`. The runtime's
-        // `MArray<X>` alias names the underlying *struct* (the
-        // generic instantiation `MArrayOf(<X>)`), so the param-type
-        // body must wrap the imported alias in `single_const_ptr +
-        // optional` to recover the source-Arc ABI shape that every
-        // runtime helper signature expects (`?*const Self`). The
-        // streaming `param_type_body` API lets us emit the import +
-        // pointer + optional sequence inline, captured into the
-        // param's declaration body so Sema resolves every operand
-        // against the same body slice.
-        if (param.type_expr == .marray_i64 or param.type_expr == .marray_f64) {
-            const kind: MArrayElementKind = switch (param.type_expr) {
-                .marray_i64 => .i64,
-                .marray_f64 => .f64,
-                else => unreachable,
-            };
-            var support_inst_indices: std.ArrayListUnmanaged(u32) = .empty;
-            defer support_inst_indices.deinit(self.allocator);
-            const before = zir_builder_get_body_inst_count(self.handle);
-            const opt_ref = try self.emitMArrayTypeRef(kind);
-            try self.captureBodyInsts(before, &support_inst_indices);
-
-            const ref = zir_builder_emit_param_type_body(
-                self.handle,
-                param.name.ptr,
-                @intCast(param.name.len),
-                support_inst_indices.items.ptr,
-                @intCast(support_inst_indices.items.len),
-                opt_ref,
-            );
-            if (ref == error_ref) return error.EmitFailed;
-            return ref;
-        }
-        // Phase 2: Vector params take their declared concrete runtime
-        // type `?*const zap_runtime.Vector(<X>)`. Same emission shape
-        // as MArray params — see the comment above. The two branches
-        // exist because the runtime aliases are different Zig generic
-        // instantiations.
+        // Vector params take their declared concrete runtime type
+        // `?*const zap_runtime.Vector(<X>)`. The runtime's Vector
+        // alias names the underlying *struct* (the generic
+        // instantiation `Vector(<X>)`), so the param-type body must
+        // wrap the imported alias in `single_const_ptr + optional`
+        // to recover the source-Arc ABI shape that every runtime
+        // helper signature expects (`?*const Self`). The streaming
+        // `param_type_body` API lets us emit the import + pointer +
+        // optional sequence inline, captured into the param's
+        // declaration body so Sema resolves every operand against
+        // the same body slice.
         if (param.type_expr == .vector_i64 or param.type_expr == .vector_f64) {
             const kind: VectorElementKind = switch (param.type_expr) {
                 .vector_i64 => .i64,
@@ -3274,8 +3204,8 @@ pub const ZirDriver = struct {
                     return error.EmitFailed;
                 self.current_ret_type = 1;
             },
-            // MArray return types resolve to `?*const
-            // zap_runtime.MArrayOf(<X>)`. The runtime alias names the
+            // Vector return types resolve to `?*const
+            // zap_runtime.Vector(<X>)`. The runtime alias names the
             // underlying *struct*; the source-Arc ABI uses
             // `?*const Self` everywhere, so we wrap the imported
             // alias in `single_const_ptr + optional` and route the
@@ -3283,32 +3213,6 @@ pub const ZirDriver = struct {
             // the body's import / field_val / ptr_type / optional_type
             // instructions land inside the ret_ty body alongside Sema's
             // own break_inline.
-            .marray_i64, .marray_f64 => {
-                const kind: MArrayElementKind = switch (return_type) {
-                    .marray_i64 => .i64,
-                    .marray_f64 => .f64,
-                    else => unreachable,
-                };
-                var support: std.ArrayListUnmanaged(u32) = .empty;
-                defer support.deinit(self.allocator);
-                const before = zir_builder_get_body_inst_count(self.handle);
-                const opt_ref = try self.emitMArrayTypeRef(kind);
-                try self.captureBodyInsts(before, &support);
-                const result_inst = zir_builder_ref_to_inst_index(self.handle, opt_ref);
-                if (result_inst == 0xFFFFFFFF) return error.EmitFailed;
-                if (zir_builder_set_custom_return_type(
-                    self.handle,
-                    support.items.ptr,
-                    @intCast(support.items.len),
-                    result_inst,
-                ) != 0) return error.EmitFailed;
-                self.current_ret_type = 1;
-            },
-            // Phase 2: Vector return types resolve to `?*const
-            // zap_runtime.Vector(<X>)`. Same shape as MArray's branch —
-            // wrap the imported alias in `single_const_ptr + optional`
-            // and route the resulting type ref through
-            // `set_custom_return_type`.
             .vector_i64, .vector_f64 => {
                 const kind: VectorElementKind = switch (return_type) {
                     .vector_i64 => .i64,

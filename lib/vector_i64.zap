@@ -5,14 +5,13 @@
 
   Backed by `Vector(i64)` in the runtime — single-allocation flat
   buffer (`[ ArcHeader | header { len, cap } | data: [cap]i64 ]`)
-  through the system allocator. Designed to replace `MArrayI64`
-  for random-access integer kernels (fannkuch-redux's permutation
-  buffer, spectral-norm-style code paths) while adding refcount-
-  aware in-place mutation: when the caller is the unique owner
-  every `set`, `push`, `pop`, `append` rewrites the live buffer
-  with no allocation; when the receiver is shared the buffer is
-  cloned with deep-retain of every element first, so the original
-  observer stays valid.
+  through the system allocator. Designed for random-access integer
+  kernels (fannkuch-redux's permutation buffer, spectral-norm-style
+  code paths) with refcount-aware in-place mutation: when the
+  caller is the unique owner every `set`, `push`, `pop`, `append`
+  rewrites the live buffer with no allocation; when the receiver
+  is shared the buffer is cloned with deep-retain of every element
+  first, so the original observer stays valid.
 
   ## Examples
 
@@ -27,8 +26,7 @@
 pub struct VectorI64 {
   @doc = """
     Allocate a fresh mutable `i64` vector of `size` slots, with
-    every slot initialised to `init`. Mirrors `MArrayI64.new(size,
-    init)` so existing call sites can be ported one-for-one.
+    every slot initialised to `init`.
 
     ## Examples
 
@@ -58,7 +56,7 @@ pub struct VectorI64 {
 
   @doc = """
     Read the element at zero-based `index`. Panics on out-of-bounds
-    access (matches `MArrayI64.get`'s contract).
+    access.
 
     ## Examples
 

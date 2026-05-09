@@ -6,13 +6,12 @@
   Backed by `Vector(f64)` in the runtime — single-allocation flat
   buffer (`[ ArcHeader | header { len, cap } | data: [cap]f64 ]`)
   through the system allocator. Companion to `VectorI64`; designed
-  to replace `MArrayF64` for floating-point kernels (e.g.
-  spectral-norm's power-iteration `(A · v)`) while adding
-  refcount-aware in-place mutation: when the caller is the unique
-  owner every `set`, `push`, `pop`, `append` rewrites the live
-  buffer with no allocation; when the receiver is shared the buffer
-  is cloned with deep-retain of every element first, so the
-  original observer stays valid.
+  for floating-point kernels (e.g. spectral-norm's power-iteration
+  `(A · v)`) with refcount-aware in-place mutation: when the
+  caller is the unique owner every `set`, `push`, `pop`, `append`
+  rewrites the live buffer with no allocation; when the receiver
+  is shared the buffer is cloned with deep-retain of every element
+  first, so the original observer stays valid.
 
   ## Examples
 
@@ -26,8 +25,7 @@
 pub struct VectorF64 {
   @doc = """
     Allocate a fresh mutable `f64` vector of `size` slots, with
-    every slot initialised to `init`. Mirrors `MArrayF64.new(size,
-    init)` so existing call sites can be ported one-for-one.
+    every slot initialised to `init`.
 
     ## Examples
 
@@ -55,7 +53,7 @@ pub struct VectorF64 {
 
   @doc = """
     Read the element at zero-based `index`. Panics on out-of-bounds
-    access (matches `MArrayF64.get`'s contract).
+    access.
 
     ## Examples
 
