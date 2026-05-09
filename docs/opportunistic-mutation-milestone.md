@@ -140,10 +140,11 @@ Plus benchmark ports in `~/projects/lang-benches/` (separate repo).
 
 ## What changed about Zap as a language
 
-- `Map`, `List`, and `Vector` are the canonical collections. `MArrayI64` and `MArrayF64` are deletable (gated on spectral-norm correctness fix).
+- `Map`, `List`, and `Vector` are the canonical collections. **`MArrayI64` and `MArrayF64` are gone** (deleted in `5693091` — 14 files changed, 143 ins / 865 del). The imperative escape-hatch types are no longer in the language.
 - The functional surface (pure value semantics) is preserved end-to-end. `Vector.set(v, i, x)` returns a new vector; the rc-1 fast path (and unchecked variant when V8 holds) is purely an implementation optimization invisible to the user.
 - Iteration order on `Map` is insertion order modulo the swap-remove on delete (matches Roc).
 - The hash function is wyhash with random per-process seed, providing DoS resistance by default.
+- spectral-norm and fannkuch-redux benchmark sources have been ported (in `~/projects/lang-benches/`) to thread vectors through tuple returns — the idiomatic Zap pattern under value semantics + ARC. Both produce byte-exact output; spectral-norm at ~8.7s (slow but correct), fannkuch n=10 at 2.6s, fannkuch n=11 at 36.4s (the documented perf gap).
 
 ---
 
