@@ -2,6 +2,7 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
 const v8_interprocedural = @import("v8_interprocedural.zig");
+const v8_signature = @import("v8_signature.zig");
 
 // ============================================================
 // V8 — static-uniqueness analysis (Phase 3 of the dense-map plan).
@@ -142,7 +143,7 @@ pub fn analyzeUniqueness(
     function: *const ir.Function,
     program: ?*const ir.Program,
 ) !Uniqueness {
-    return analyzeUniquenessWithFixpoint(allocator, function, program, null);
+    return analyzeUniquenessFull(allocator, function, program, null, null, null);
 }
 
 /// Variant of `analyzeUniqueness` that consults a whole-program
@@ -162,16 +163,57 @@ pub fn analyzeUniquenessWithFixpoint(
     program: ?*const ir.Program,
     fixpoint: ?*const v8_interprocedural.ProgramUniqueness,
 ) !Uniqueness {
+    return analyzeUniquenessFull(allocator, function, program, fixpoint, null, null);
+}
+
+/// Phase 2.5 — full V8 dataflow with the complete set of optional
+/// inputs. Threads the whole-program fixpoint, the v8_signature
+/// `ProgramSignatures` table, and the per-function `ArcOwnership`
+/// table into the dataflow.
+///
+/// `signatures` (when non-null) lets the dataflow synthesize per-
+/// component uniqueness for the dest of a call whose callee returns a
+/// tuple with PU/AL component witnesses. Combined with `ownership`'s
+/// last-use queries, this propagates per-component uniqueness through
+/// the destructure-then-tail-call pattern used by fannkuch's
+/// `count_flips`/`advance_perm`/`rotate_loop` helpers.
+///
+/// `ownership` (when non-null) lets the dataflow recognise the
+/// `index_get(t, i) + retain` destructure idiom as a uniqueness-
+/// preserving move when the parent tuple `t` is at last-use during
+/// the destructure sequence. Without `ownership`, extracted locals
+/// remain conservatively non-unique even when they descend from a
+/// tuple_pending tuple.
+///
+/// All three optional inputs default to "no extra information"; the
+/// pass falls back to the legacy intraprocedural behaviour when each
+/// is null.
+pub fn analyzeUniquenessFull(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: ?*const ir.Program,
+    fixpoint: ?*const v8_interprocedural.ProgramUniqueness,
+    signatures: ?*const v8_signature.ProgramSignatures,
+    ownership: ?*const arc_liveness.ArcOwnership,
+) !Uniqueness {
     var analyzer = Analyzer{
         .allocator = allocator,
         .function = function,
         .program = program,
         .fixpoint = fixpoint,
+        .signatures = signatures,
+        .ownership = ownership,
         .unique = .empty,
+        .tuple_pending = .empty,
+        .extracted = .empty,
         .next_id = 0,
         .result = .{},
     };
-    defer analyzer.unique.deinit(allocator);
+    defer {
+        analyzer.unique.deinit(allocator);
+        analyzer.deinitTuplePending();
+        analyzer.deinitExtracted();
+    }
 
     errdefer analyzer.result.deinit(allocator);
 
@@ -181,6 +223,47 @@ pub fn analyzeUniquenessWithFixpoint(
 
     return analyzer.result;
 }
+
+/// Phase 2.5 — per-tuple deferred classification record. One entry
+/// per `tuple_init` (or call dest synthesized from a callee's
+/// `return_components`) whose components carry per-slot uniqueness
+/// information.
+///
+/// `components_unique[i]` is `true` iff component `i` was definitely-
+/// unique at construction time (the source local was in the
+/// `unique` set when `tuple_init` ran, or the synthesized callee
+/// witness identified an arg that was unique at the call site).
+///
+/// `extracted` records every `(local, component_index)` pair extracted
+/// from this tuple via `index_get` BEFORE the tuple's last-use. When
+/// the tuple's last-use fires, every recorded extracted local
+/// inherits its component's uniqueness — modelling the
+/// `index_get + retain` destructure idiom whose paired retain (on the
+/// extracted local) and implicit release-on-scope-exit (of the parent
+/// tuple) cancel, leaving the extracted local as the sole owner.
+const TuplePendingEntry = struct {
+    components_unique: []bool,
+    extracted: std.ArrayListUnmanaged(ExtractedRef),
+    /// True once a sink/escape has dissolved this entry. Subsequent
+    /// extractions or last-use events are no-ops.
+    escaped: bool = false,
+};
+
+const ExtractedRef = struct {
+    local: ir.LocalId,
+    component_idx: usize,
+};
+
+/// Phase 2.5 — reverse mapping for extracted locals. When an
+/// `index_get(t, i)` adds an entry to `tuple_pending[t].extracted`,
+/// it ALSO adds an entry here: `extracted[L] = (source_tuple = t,
+/// component_idx = i)`. This lets later sinks (e.g. `share_value` on
+/// L, storage of L in another aggregate) trace back to t and dissolve
+/// t's pending entry as appropriate.
+const ExtractedSource = struct {
+    source_tuple: ir.LocalId,
+    component_idx: usize,
+};
 
 const Analyzer = struct {
     allocator: std.mem.Allocator,
@@ -193,10 +276,37 @@ const Analyzer = struct {
     /// downstream owned-mutating calls fed by an alias of that slot
     /// observe the parameter's proven uniqueness.
     fixpoint: ?*const v8_interprocedural.ProgramUniqueness,
+    /// Optional whole-program uniqueness signatures (Phase 2.1). When
+    /// non-null, the dataflow synthesizes a `tuple_pending` entry on
+    /// the dest of any call whose callee's `return_components` table
+    /// records a per-component witness. Each component is classified
+    /// as unique iff the witness arg was unique at the call site.
+    signatures: ?*const v8_signature.ProgramSignatures,
+    /// Optional per-function ARC ownership (last-use side table).
+    /// When non-null, the dataflow uses `isLastUseAt` to decide
+    /// whether an `index_get + retain` destructure can promote the
+    /// extracted local's uniqueness from its parent tuple's pending
+    /// entry. The promotion fires at the parent tuple's last-use
+    /// instruction (typically the LAST `index_get` of the destructure
+    /// sequence — at that point the tuple has no further uses, so
+    /// every previously extracted local takes over the +1 the
+    /// implicit scope-exit release would otherwise reclaim from the
+    /// tuple).
+    ownership: ?*const arc_liveness.ArcOwnership,
     /// Set of LocalIds proven `definitely_unique` at the current
     /// program point. Updated by `applyEffect` as the walker visits
     /// each instruction in depth-first order.
     unique: std.AutoHashMapUnmanaged(ir.LocalId, void),
+    /// Phase 2.5 — per-tuple deferred classification map. Keyed by
+    /// the tuple's dest LocalId; the value records per-component
+    /// uniqueness flags and the list of locals extracted via
+    /// `index_get` from this tuple.
+    tuple_pending: std.AutoHashMapUnmanaged(ir.LocalId, TuplePendingEntry),
+    /// Phase 2.5 — reverse map: extracted LocalId → its source tuple
+    /// and component index. Used by sinks to find the parent tuple
+    /// when an extracted local escapes (e.g., gets stored in another
+    /// aggregate) before its parent tuple's last-use fires.
+    extracted: std.AutoHashMapUnmanaged(ir.LocalId, ExtractedSource),
     /// Running InstructionId, mirrored from the depth-first traversal
     /// order used by `arc_liveness.assignInstructionIds`. Both walks
     /// must agree on id assignment so the verifier and codegen can
@@ -204,6 +314,192 @@ const Analyzer = struct {
     next_id: arc_liveness.InstructionId,
     /// Output table — populated during the walk.
     result: Uniqueness,
+
+    fn deinitTuplePending(self: *Analyzer) void {
+        var iter = self.tuple_pending.valueIterator();
+        while (iter.next()) |entry| {
+            self.allocator.free(entry.components_unique);
+            entry.extracted.deinit(self.allocator);
+        }
+        self.tuple_pending.deinit(self.allocator);
+    }
+
+    fn deinitExtracted(self: *Analyzer) void {
+        self.extracted.deinit(self.allocator);
+    }
+
+    /// Phase 2.5 — drop a pending entry (free its slice and list).
+    fn removePending(self: *Analyzer, tuple_local: ir.LocalId) void {
+        if (self.tuple_pending.fetchRemove(tuple_local)) |kv| {
+            self.allocator.free(kv.value.components_unique);
+            var entry = kv.value;
+            entry.extracted.deinit(self.allocator);
+        }
+    }
+
+    /// Phase 2.5 — mark a tuple_pending entry as escaped. All
+    /// extracted refs lose their backlink (so a later last-use of the
+    /// tuple cannot promote them), and the entry is removed.
+    fn escapePending(self: *Analyzer, tuple_local: ir.LocalId) void {
+        if (self.tuple_pending.getPtr(tuple_local)) |entry| {
+            // Drop reverse-mapping entries for all extracted locals so
+            // their later use doesn't suggest a still-pending source.
+            for (entry.extracted.items) |ref| {
+                _ = self.extracted.remove(ref.local);
+            }
+            // Remove (frees the slice + list).
+            self.removePending(tuple_local);
+        }
+    }
+
+    /// Phase 2.5 — when an extracted local is consumed by a sink (e.g.
+    /// stored in another aggregate, captured into a closure, passed
+    /// to a non-PU call), the parent tuple's pending entry is
+    /// invalidated for promotion: an alias to the same cell now
+    /// exists outside the destructure scope, so the implicit scope-
+    /// exit release of the parent tuple won't restore uniqueness.
+    /// Drop the parent's pending entry and the reverse-mapping for
+    /// every extracted local under it.
+    fn escapeIfExtractedLocal(self: *Analyzer, local: ir.LocalId) void {
+        const src = self.extracted.get(local) orelse return;
+        self.escapePending(src.source_tuple);
+    }
+
+    /// Phase 2.5 — when a tuple_pending tuple's last-use fires (i.e.
+    /// the IR has no further references to the tuple), every
+    /// extracted local takes over the parent's component uniqueness.
+    /// The runtime contract that justifies this:
+    ///
+    ///   1. At `tuple_init`, components with `components_unique[i] ==
+    ///      true` had refcount-1 cells.
+    ///   2. After `tuple_init`, the tuple holds a +1 to each
+    ///      component's cell. The original element local is dead;
+    ///      the cell is still rc=1 (now owned through the tuple).
+    ///   3. `index_get(t, i)` lowers to `elem_val_imm` (a borrow);
+    ///      the paired `retain` after each ARC-managed extraction
+    ///      bumps the cell to rc=2.
+    ///   4. The parent tuple's scope-exit release decrements every
+    ///      component cell back to rc=1 — the extracted local is now
+    ///      the sole owner.
+    ///   5. Since the tuple is at last-use AT the destructure
+    ///      sequence's terminal instruction, the implicit release
+    ///      will fire shortly. Subsequent V8 sites observe rc=1
+    ///      cells, so the extracted local is unique.
+    ///
+    /// Without a per-function `ArcOwnership`, the dataflow can't
+    /// query last-use; this function is a no-op in that case.
+    fn promoteExtractedAt(
+        self: *Analyzer,
+        tuple_local: ir.LocalId,
+        my_id: arc_liveness.InstructionId,
+    ) error{OutOfMemory}!void {
+        const ownership = self.ownership orelse return;
+        const entry = self.tuple_pending.getPtr(tuple_local) orelse return;
+        if (entry.escaped) return;
+        if (!ownership.isLastUseAt(tuple_local, my_id)) return;
+        for (entry.extracted.items) |ref| {
+            if (ref.component_idx < entry.components_unique.len and entry.components_unique[ref.component_idx]) {
+                try self.unique.put(self.allocator, ref.local, {});
+            }
+            _ = self.extracted.remove(ref.local);
+        }
+        self.removePending(tuple_local);
+    }
+
+    /// Phase 2.5 — propagate a `tuple_pending` membership through an
+    /// alias-form instruction. When `source` is a tuple_pending dest,
+    /// the alias's `dest` becomes a new tuple_pending entry pointing
+    /// at the same component table. Pure aliasing does not change
+    /// component uniqueness or resolve the deferred entry — only true
+    /// sinks (last-use, escape) do.
+    ///
+    /// We MOVE ownership of the slice + list from `source` to `dest`:
+    /// the source key is removed and the data is re-keyed under
+    /// `dest`. The reverse-mapping `extracted` entries also rewire to
+    /// point at `dest` (so a later sink on an extracted local resolves
+    /// to the new key).
+    fn propagateTuplePending(self: *Analyzer, dest: ir.LocalId, source: ir.LocalId) error{OutOfMemory}!void {
+        if (dest == source) return;
+        const kv = self.tuple_pending.fetchRemove(source) orelse return;
+        // Remove any prior pending at dest first.
+        self.removePending(dest);
+        try self.tuple_pending.put(self.allocator, dest, kv.value);
+        // Update reverse-mapping for every extracted local.
+        for (kv.value.extracted.items) |ref| {
+            try self.extracted.put(self.allocator, ref.local, .{
+                .source_tuple = dest,
+                .component_idx = ref.component_idx,
+            });
+        }
+    }
+
+    /// Phase 2.5 — `borrow_value` does NOT consume its source: the
+    /// source can have further uses after the borrow. Both source
+    /// and the borrow's dest see the same underlying tuple. We
+    /// therefore COPY the pending entry's component flags into a
+    /// fresh entry under `dest`, preserving the source entry. The
+    /// dest's entry has its own (initially empty) `extracted` list;
+    /// extractions through the borrow append to the dest's list, and
+    /// the parent (the borrow) can be promoted at the borrow's
+    /// last-use independently of the source. Note this is more
+    /// permissive than the source's promotion alone, but soundness
+    /// holds: the runtime contract for an index_get from a borrow
+    /// is identical to an index_get from the source — both lower to
+    /// `elem_val_imm` and the paired retain bumps the cell's
+    /// refcount. The borrow's lifetime is bounded by the source's,
+    /// so the source's eventual scope-exit release fires the
+    /// component cell's refcount decrement that V8 relies on.
+    fn copyTuplePending(self: *Analyzer, dest: ir.LocalId, source: ir.LocalId) error{OutOfMemory}!void {
+        if (dest == source) return;
+        const src_entry = self.tuple_pending.getPtr(source) orelse return;
+        if (src_entry.escaped) return;
+        const flags_copy = try self.allocator.alloc(bool, src_entry.components_unique.len);
+        @memcpy(flags_copy, src_entry.components_unique);
+        // Replace any prior pending at dest first.
+        self.removePending(dest);
+        try self.tuple_pending.put(self.allocator, dest, .{
+            .components_unique = flags_copy,
+            .extracted = .empty,
+        });
+    }
+
+    /// Phase 2.5 — propagate an `extracted` membership through an
+    /// alias-form instruction. When `source` is an extracted local
+    /// (from some pending tuple), the alias's `dest` inherits the
+    /// same parent-tuple linkage. The parent's pending entry's
+    /// `extracted` list is also patched: the original `source` ref
+    /// is replaced with `dest` so the parent's last-use promotion
+    /// finds the renamed local. The original `source` is removed
+    /// from the reverse map so a subsequent operation on `source`
+    /// doesn't incorrectly trigger an escape.
+    ///
+    /// If `source` is not in `extracted`, this is a no-op.
+    fn propagateExtractedAlias(self: *Analyzer, dest: ir.LocalId, source: ir.LocalId) error{OutOfMemory}!void {
+        if (dest == source) return;
+        const kv = self.extracted.fetchRemove(source) orelse return;
+        // Patch the parent's extracted list: replace source with dest.
+        if (self.tuple_pending.getPtr(kv.value.source_tuple)) |entry| {
+            for (entry.extracted.items) |*ref| {
+                if (ref.local == source) {
+                    ref.local = dest;
+                }
+            }
+        }
+        try self.extracted.put(self.allocator, dest, kv.value);
+    }
+
+    /// Phase 2.5 — snapshot per-arg uniqueness at the call site.
+    /// Returns a freshly-allocated bool slice; caller frees.
+    fn snapshotArgUnique(
+        self: *Analyzer,
+        args: []const ir.LocalId,
+    ) error{OutOfMemory}![]bool {
+        const result = try self.allocator.alloc(bool, args.len);
+        for (args, 0..) |arg, i| {
+            result[i] = self.unique.contains(arg);
+        }
+        return result;
+    }
 
     fn walkStream(
         self: *Analyzer,
@@ -213,9 +509,34 @@ const Analyzer = struct {
             const my_id = self.next_id;
             self.next_id += 1;
             try self.classifyCallSiteIfApplicable(instr, my_id);
-            try self.applyEffect(instr);
+            try self.applyEffect(instr, my_id);
+            // Phase 2.5 — after the effect runs, this instruction has
+            // committed any new pending entries / extracted refs.
+            // If the instruction was the LAST USE of a still-pending
+            // tuple, promote every extracted local from that tuple.
+            // We iterate a snapshot of the keys because
+            // `promoteExtractedAt` mutates `tuple_pending`.
+            try self.promoteAtLastUse(my_id);
             try self.walkChildren(instr);
         }
+    }
+
+    /// Phase 2.5 — for every still-pending tuple whose last-use
+    /// fires AT `my_id`, promote its extracted locals' uniqueness.
+    /// Iterates a snapshot of the pending keys because the helper
+    /// mutates the map.
+    fn promoteAtLastUse(
+        self: *Analyzer,
+        my_id: arc_liveness.InstructionId,
+    ) error{OutOfMemory}!void {
+        if (self.ownership == null) return;
+        if (self.tuple_pending.count() == 0) return;
+        // Snapshot keys to avoid invalidation during iteration.
+        var keys = std.ArrayListUnmanaged(ir.LocalId).empty;
+        defer keys.deinit(self.allocator);
+        var it = self.tuple_pending.keyIterator();
+        while (it.next()) |k| try keys.append(self.allocator, k.*);
+        for (keys.items) |k| try self.promoteExtractedAt(k, my_id);
     }
 
     fn walkChildren(
@@ -504,46 +825,109 @@ const Analyzer = struct {
     fn applyEffect(
         self: *Analyzer,
         instr: *const ir.Instruction,
+        my_id: arc_liveness.InstructionId,
     ) error{OutOfMemory}!void {
+        _ = my_id;
         switch (instr.*) {
             // ----- Producers of unique values -----
             .tuple_init => |ti| {
-                // Aggregate INITS produce a fresh aggregate cell
-                // (refcount = 1). However, every operand stored
-                // INTO that aggregate loses uniqueness because the
-                // aggregate holds a permanent retain on it.
-                for (ti.elements) |elem| _ = self.unique.remove(elem);
+                // Phase 2.5 — record per-component uniqueness in a
+                // pending entry instead of unconditionally clearing
+                // every element. The pending entry resolves at the
+                // tuple's last-use (uniqueness flows to extracted
+                // locals) or at any escape sink (uniqueness is
+                // dropped). The element locals themselves DO lose
+                // their `unique` bit here — they're no longer
+                // first-class owners; ownership has transferred to
+                // the new tuple cell.
+                var unique_flags = try self.allocator.alloc(bool, ti.elements.len);
+                for (ti.elements, 0..) |elem, i| {
+                    unique_flags[i] = self.unique.contains(elem);
+                    _ = self.unique.remove(elem);
+                    // If an element is itself an extracted local from
+                    // another tuple_pending, the storage into this
+                    // outer tuple is an escape of the inner pending
+                    // entry — drop the inner pending so a later
+                    // last-use on it doesn't try to promote locals
+                    // that have since aliased into this outer tuple.
+                    self.escapeIfExtractedLocal(elem);
+                    // If an element is itself a pending tuple, that
+                    // entire pending entry escapes (the inner tuple
+                    // is now stored as a component of the outer; its
+                    // own components can no longer be promoted).
+                    self.escapePending(elem);
+                }
+                // Replace any prior pending entry at the dest.
+                self.removePending(ti.dest);
+                try self.tuple_pending.put(self.allocator, ti.dest, .{
+                    .components_unique = unique_flags,
+                    .extracted = .empty,
+                });
                 try self.unique.put(self.allocator, ti.dest, {});
             },
             .list_init => |li| {
-                for (li.elements) |elem| _ = self.unique.remove(elem);
+                for (li.elements) |elem| {
+                    _ = self.unique.remove(elem);
+                    self.escapeIfExtractedLocal(elem);
+                    self.escapePending(elem);
+                }
                 try self.unique.put(self.allocator, li.dest, {});
             },
             .list_cons => |lc| {
                 _ = self.unique.remove(lc.head);
                 _ = self.unique.remove(lc.tail);
+                self.escapeIfExtractedLocal(lc.head);
+                self.escapeIfExtractedLocal(lc.tail);
+                self.escapePending(lc.head);
+                self.escapePending(lc.tail);
                 try self.unique.put(self.allocator, lc.dest, {});
             },
             .map_init => |mi| {
                 for (mi.entries) |entry| {
                     _ = self.unique.remove(entry.key);
                     _ = self.unique.remove(entry.value);
+                    self.escapeIfExtractedLocal(entry.key);
+                    self.escapeIfExtractedLocal(entry.value);
+                    self.escapePending(entry.key);
+                    self.escapePending(entry.value);
                 }
                 try self.unique.put(self.allocator, mi.dest, {});
             },
             .struct_init => |si| {
-                for (si.fields) |f| _ = self.unique.remove(f.value);
+                for (si.fields) |f| {
+                    _ = self.unique.remove(f.value);
+                    self.escapeIfExtractedLocal(f.value);
+                    self.escapePending(f.value);
+                }
                 try self.unique.put(self.allocator, si.dest, {});
             },
             .union_init => |ui| {
                 _ = self.unique.remove(ui.value);
+                self.escapeIfExtractedLocal(ui.value);
+                self.escapePending(ui.value);
                 try self.unique.put(self.allocator, ui.dest, {});
+            },
+            .make_closure => |mc| {
+                // Capturing into a closure is an unconditional
+                // escape — components of any captured tuple_pending
+                // can't be promoted afterwards.
+                for (mc.captures) |cap| {
+                    _ = self.unique.remove(cap);
+                    self.escapeIfExtractedLocal(cap);
+                    self.escapePending(cap);
+                }
             },
 
             // Owned-mutating call results are unique by runtime contract
             // (see top-of-file). Non-mutating calls are conservatively
             // not classified as unique.
             .call_builtin => |cb| {
+                // Phase 2.5 — every arg passed to a builtin escapes the
+                // arg's tuple_pending entry (the builtin may store it).
+                for (cb.args) |arg| {
+                    self.escapeIfExtractedLocal(arg);
+                    self.escapePending(arg);
+                }
                 if (arc_liveness.ownedMutatingBuiltinSlot(cb.name) != null) {
                     if (cb.args.len > 0) {
                         // The receiver was consumed by the move_value
@@ -567,22 +951,66 @@ const Analyzer = struct {
                 }
             },
             .call_named => |cn| {
-                try self.applyCalleeEffect(cn.name, cn.args, cn.dest);
+                const pre = try self.snapshotArgUnique(cn.args);
+                defer self.allocator.free(pre);
+                for (cn.args) |arg| {
+                    self.escapeIfExtractedLocal(arg);
+                    self.escapePending(arg);
+                }
+                try self.applyCalleeEffect(cn.name, cn.args, cn.dest, pre);
             },
             .call_direct => |cd| {
+                const pre = try self.snapshotArgUnique(cd.args);
+                defer self.allocator.free(pre);
+                for (cd.args) |arg| {
+                    self.escapeIfExtractedLocal(arg);
+                    self.escapePending(arg);
+                }
                 const callee = self.lookupFunction(cd.function);
                 if (callee) |func| {
-                    try self.applyCalleeEffectWithFunction(func, cd.args, cd.dest);
+                    try self.applyCalleeEffectWithFunction(func, cd.args, cd.dest, pre);
                 } else {
                     _ = self.unique.remove(cd.dest);
                 }
             },
             .try_call_named => |tcn| {
-                try self.applyCalleeEffect(tcn.name, tcn.args, tcn.dest);
+                const pre = try self.snapshotArgUnique(tcn.args);
+                defer self.allocator.free(pre);
+                for (tcn.args) |arg| {
+                    self.escapeIfExtractedLocal(arg);
+                    self.escapePending(arg);
+                }
+                try self.applyCalleeEffect(tcn.name, tcn.args, tcn.dest, pre);
+            },
+            .tail_call => |tc| {
+                // Tail-calls also consume their args; their pending
+                // entries dissolve.
+                for (tc.args) |arg| {
+                    self.escapeIfExtractedLocal(arg);
+                    self.escapePending(arg);
+                }
+            },
+            .call_closure => |cc| {
+                for (cc.args) |arg| {
+                    self.escapeIfExtractedLocal(arg);
+                    self.escapePending(arg);
+                }
+                _ = self.unique.remove(cc.dest);
+            },
+            .call_dispatch => |cd| {
+                for (cd.args) |arg| {
+                    self.escapeIfExtractedLocal(arg);
+                    self.escapePending(arg);
+                }
+                _ = self.unique.remove(cd.dest);
             },
 
             // ----- Move transfers uniqueness -----
             .move_value => |mv| {
+                // Phase 2.5 — pending propagation: a tuple_pending or
+                // extracted-from-pending alias re-keys to the dest.
+                try self.propagateTuplePending(mv.dest, mv.source);
+                try self.propagateExtractedAlias(mv.dest, mv.source);
                 if (self.unique.contains(mv.source)) {
                     _ = self.unique.remove(mv.source);
                     try self.unique.put(self.allocator, mv.dest, {});
@@ -601,6 +1029,13 @@ const Analyzer = struct {
                 // refcount >= 2 — neither is unique afterwards.
                 _ = self.unique.remove(sv.source);
                 _ = self.unique.remove(sv.dest);
+                // share_value escapes any pending entry on the source —
+                // the source has been retained into another owner
+                // position (the share's dest), so the cell is now rc>=2
+                // and components can no longer be promoted on the
+                // source's last-use.
+                self.escapeIfExtractedLocal(sv.source);
+                self.escapePending(sv.source);
             },
             .copy_value => |cv| {
                 // copy_value: emits a runtime retain on `source`,
@@ -618,10 +1053,20 @@ const Analyzer = struct {
                 // matches the runtime contract.
                 _ = self.unique.remove(cv.source);
                 _ = self.unique.remove(cv.dest);
+                // copy_value escapes the pending entry the same way
+                // share_value does — the cell now exists at >=2 owners.
+                self.escapeIfExtractedLocal(cv.source);
+                self.escapePending(cv.source);
             },
             .borrow_value => |bv| {
                 // borrow_value: dest is a borrow, never an owner.
                 _ = self.unique.remove(bv.dest);
+                // Phase 2.5 — borrow_value does NOT consume its source,
+                // so the pending entry must remain at the source while
+                // also linking dest. Copy semantics (rather than move)
+                // preserves the source's pending so subsequent borrows
+                // and the source's own last-use still see it.
+                try self.copyTuplePending(bv.dest, bv.source);
             },
 
             // ----- Local aliasing transfers uniqueness on the source-
@@ -634,6 +1079,8 @@ const Analyzer = struct {
             // the uniqueness; otherwise the dest is conservatively
             // not classified.
             .local_get => |lg| {
+                try self.propagateTuplePending(lg.dest, lg.source);
+                try self.propagateExtractedAlias(lg.dest, lg.source);
                 if (self.unique.contains(lg.source)) {
                     _ = self.unique.remove(lg.source);
                     try self.unique.put(self.allocator, lg.dest, {});
@@ -642,6 +1089,8 @@ const Analyzer = struct {
                 }
             },
             .local_set => |ls| {
+                try self.propagateTuplePending(ls.dest, ls.value);
+                try self.propagateExtractedAlias(ls.dest, ls.value);
                 if (self.unique.contains(ls.value)) {
                     _ = self.unique.remove(ls.value);
                     try self.unique.put(self.allocator, ls.dest, {});
@@ -670,6 +1119,39 @@ const Analyzer = struct {
                 }
             },
 
+            // ----- Move/share/copy/borrow into a sink local -----
+            // These are handled specifically in arms above; these
+            // arms below handle the alias-form propagation for
+            // tuple_pending.
+
+            // ----- Returns: when the value is a pending tuple,
+            //       leave it alone — Phase 2.1's signature mechanism
+            //       handles cross-function propagation. The dataflow
+            //       does not need to clear the pending entry; the
+            //       function ends here. -----
+
+            // ----- Index_get: project per-component uniqueness from a
+            //       tuple_pending source. The dest is recorded as an
+            //       extracted ref; promotion to `unique` fires at the
+            //       parent tuple's last-use (modelling the
+            //       index_get + retain destructure idiom). -----
+            .index_get => |ig| {
+                _ = self.unique.remove(ig.dest);
+                if (self.tuple_pending.getPtr(ig.object)) |entry| {
+                    if (entry.escaped) return;
+                    if (ig.index < entry.components_unique.len) {
+                        try entry.extracted.append(self.allocator, .{
+                            .local = ig.dest,
+                            .component_idx = ig.index,
+                        });
+                        try self.extracted.put(self.allocator, ig.dest, .{
+                            .source_tuple = ig.object,
+                            .component_idx = ig.index,
+                        });
+                    }
+                }
+            },
+
             // ----- Control flow / non-data-producing instructions -----
             .release,
             .retain,
@@ -682,7 +1164,6 @@ const Analyzer = struct {
             .match_fail,
             .match_error_return,
             .case_break,
-            .tail_call,
             .set_safety,
             => {},
 
@@ -702,17 +1183,28 @@ const Analyzer = struct {
     ///      `VectorI64.new_filled`). The result is unique by the
     ///      runtime's allocation contract.
     /// All three shapes mark the call's dest as unique.
+    ///
+    /// Phase 2.5 — additionally, when `signatures` is non-null and the
+    /// callee resolves to a function whose `return_components` table
+    /// records per-component PU witnesses, synthesise a `tuple_pending`
+    /// entry on `dest`. Each component's `unique` flag is `true` iff
+    /// the witness arg was unique at the call site (queried from
+    /// `pre_arg_unique`). Downstream `index_get(dest, i) + retain`
+    /// destructure idioms can then promote the extracted local at the
+    /// tuple's last-use.
     fn applyCalleeEffect(
         self: *Analyzer,
         name: []const u8,
         args: []const ir.LocalId,
         dest: ir.LocalId,
+        pre_arg_unique: []const bool,
     ) error{OutOfMemory}!void {
         if (arc_liveness.ownedMutatingBuiltinSlot(name)) |slot| {
             if (slot < args.len) {
                 _ = self.unique.remove(args[slot]);
             }
             try self.unique.put(self.allocator, dest, {});
+            try self.synthesizeReturnPendingByName(name, args, dest, pre_arg_unique);
             return;
         }
         if (self.calleeOwnedReceiverSlot(name)) |slot| {
@@ -720,6 +1212,7 @@ const Analyzer = struct {
                 _ = self.unique.remove(args[slot]);
             }
             try self.unique.put(self.allocator, dest, {});
+            try self.synthesizeReturnPendingByName(name, args, dest, pre_arg_unique);
             return;
         }
         if (self.calleeIsFreshAllocatorWrapper(name)) {
@@ -728,6 +1221,7 @@ const Analyzer = struct {
         }
         // Non-mutating call: result not classified.
         _ = self.unique.remove(dest);
+        try self.synthesizeReturnPendingByName(name, args, dest, pre_arg_unique);
     }
 
     fn applyCalleeEffectWithFunction(
@@ -735,12 +1229,14 @@ const Analyzer = struct {
         function: *const ir.Function,
         args: []const ir.LocalId,
         dest: ir.LocalId,
+        pre_arg_unique: []const bool,
     ) error{OutOfMemory}!void {
         if (arc_liveness.ownedMutatingBuiltinSlot(function.name)) |slot| {
             if (slot < args.len) {
                 _ = self.unique.remove(args[slot]);
             }
             try self.unique.put(self.allocator, dest, {});
+            try self.synthesizeReturnPendingByFunction(function.id, args, dest, pre_arg_unique);
             return;
         }
         if (calleeFunctionOwnedReceiverSlot(function)) |slot| {
@@ -748,6 +1244,7 @@ const Analyzer = struct {
                 _ = self.unique.remove(args[slot]);
             }
             try self.unique.put(self.allocator, dest, {});
+            try self.synthesizeReturnPendingByFunction(function.id, args, dest, pre_arg_unique);
             return;
         }
         if (functionIsFreshAllocatorWrapper(function)) {
@@ -755,6 +1252,90 @@ const Analyzer = struct {
             return;
         }
         _ = self.unique.remove(dest);
+        try self.synthesizeReturnPendingByFunction(function.id, args, dest, pre_arg_unique);
+    }
+
+    /// Phase 2.5 — synthesize a `tuple_pending` entry on the call's
+    /// dest using the callee's `return_components` table (when
+    /// available). Each component's witness names a parameter slot of
+    /// the callee whose uniqueness preserves through that component;
+    /// the synthesized component's `unique` flag is the corresponding
+    /// `pre_arg_unique[witness]`.
+    fn synthesizeReturnPendingByName(
+        self: *Analyzer,
+        name: []const u8,
+        args: []const ir.LocalId,
+        dest: ir.LocalId,
+        pre_arg_unique: []const bool,
+    ) error{OutOfMemory}!void {
+        const sigs = self.signatures orelse return;
+        const program = self.program orelse return;
+        const target_id: ir.FunctionId = blk: {
+            for (program.functions) |func| {
+                if (std.mem.eql(u8, func.name, name)) break :blk func.id;
+            }
+            return;
+        };
+        try self.synthesizeReturnPendingFromSig(sigs, target_id, args, dest, pre_arg_unique);
+    }
+
+    fn synthesizeReturnPendingByFunction(
+        self: *Analyzer,
+        function_id: ir.FunctionId,
+        args: []const ir.LocalId,
+        dest: ir.LocalId,
+        pre_arg_unique: []const bool,
+    ) error{OutOfMemory}!void {
+        const sigs = self.signatures orelse return;
+        try self.synthesizeReturnPendingFromSig(sigs, function_id, args, dest, pre_arg_unique);
+    }
+
+    fn synthesizeReturnPendingFromSig(
+        self: *Analyzer,
+        sigs: *const v8_signature.ProgramSignatures,
+        function_id: ir.FunctionId,
+        args: []const ir.LocalId,
+        dest: ir.LocalId,
+        pre_arg_unique: []const bool,
+    ) error{OutOfMemory}!void {
+        const sig = sigs.forFunction(function_id) orelse return;
+        if (sig.return_components.len == 0) return;
+        // Only synthesize if at least one component has a witness.
+        var has_witness = false;
+        for (sig.return_components) |opt| {
+            if (opt != null) {
+                has_witness = true;
+                break;
+            }
+        }
+        if (!has_witness) return;
+        var flags = try self.allocator.alloc(bool, sig.return_components.len);
+        for (sig.return_components, 0..) |opt, i| {
+            flags[i] = false;
+            if (opt) |arg_idx_u8| {
+                const arg_idx: usize = @intCast(arg_idx_u8);
+                if (arg_idx < args.len and arg_idx < pre_arg_unique.len) {
+                    flags[i] = pre_arg_unique[arg_idx];
+                }
+            }
+        }
+        // If no component is actually unique, skip (no payoff).
+        var any_unique = false;
+        for (flags) |f| {
+            if (f) {
+                any_unique = true;
+                break;
+            }
+        }
+        if (!any_unique) {
+            self.allocator.free(flags);
+            return;
+        }
+        self.removePending(dest);
+        try self.tuple_pending.put(self.allocator, dest, .{
+            .components_unique = flags,
+            .extracted = .empty,
+        });
     }
 
     /// Look up the callee by name and decide whether it is a thin
@@ -1354,6 +1935,255 @@ test "v8_uniqueness: non-owned-mutating call sites are absent from the result" {
 
     try testing.expect(!u.isUnique(2));
     try testing.expect(!u.sites.contains(2));
+}
+
+/// Phase 2.5 — synthesize a minimal `ArcOwnership` for tests that
+/// need to drive `isLastUseAt` queries. Records the `(local, id)`
+/// pairs the caller specifies as last-use sites without invoking the
+/// real backward dataflow.
+fn buildSyntheticOwnership(
+    arena: std.mem.Allocator,
+    pairs: []const struct { local: ir.LocalId, id: arc_liveness.InstructionId },
+) !arc_liveness.ArcOwnership {
+    _ = arena;
+    var ownership: arc_liveness.ArcOwnership = .{};
+    for (pairs) |p| {
+        const key = (@as(u64, @intCast(p.local)) << 32) | @as(u64, @intCast(p.id));
+        try ownership.last_use_sites.put(testing.allocator, key, {});
+    }
+    return ownership;
+}
+
+test "v8_uniqueness: tuple element extracted at parent's last-use is unique (Phase 2.5)" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Stream:
+    //   [0] map_init %0 = {}                  -- fresh, unique
+    //   [1] tuple_init %1 = {%0}              -- pending entry: comp[0]=true
+    //   [2] index_get %2 = %1[0]              -- last-use of %1
+    //                                           -> %2 promoted to unique
+    //   [3] const_int %3 = 0
+    //   [4] const_int %4 = 0
+    //   [5] move_value %5 <- %2               -- %2 is unique, transfer
+    //   [6] call_builtin "Map.put" args=[%5,%3,%4] dest=%6
+    //
+    // Expected: V8 holds at id 6.
+    const tuple_elems = try arena.alloc(ir.LocalId, 1);
+    tuple_elems[0] = 0;
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 5;
+    args[1] = 3;
+    args[2] = 4;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .tuple_init = .{ .dest = 1, .elements = tuple_elems } },
+        .{ .index_get = .{ .dest = 2, .object = 1, .index = 0 } },
+        .{ .const_int = .{ .dest = 3, .value = 0 } },
+        .{ .const_int = .{ .dest = 4, .value = 0 } },
+        .{ .move_value = .{ .dest = 5, .source = 2 } },
+        .{ .call_builtin = .{
+            .dest = 6,
+            .name = "Map.put",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    };
+    var function = try buildTestFunction(arena, "tuple_destructure", &instrs, 7);
+
+    // The tuple at %1 has its last-use at instruction id 2 (the index_get).
+    var ownership = try buildSyntheticOwnership(arena, &.{
+        .{ .local = 1, .id = 2 },
+    });
+    defer ownership.deinit(testing.allocator);
+
+    var u = try analyzeUniquenessFull(testing.allocator, &function, null, null, null, &ownership);
+    defer u.deinit(testing.allocator);
+
+    // V8 holds at id 6.
+    try testing.expect(u.isUnique(6));
+}
+
+test "v8_uniqueness: tuple stored in list ALs all components after storage (Phase 2.5)" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Stream:
+    //   [0] map_init %0 = {}                  -- fresh, unique
+    //   [1] tuple_init %1 = {%0}              -- pending entry
+    //   [2] const_nil %2
+    //   [3] list_cons %3 = [%1 | %2]          -- ESCAPES %1's pending
+    //   [4] index_get %4 = %1[0]              -- pending escaped, no promotion
+    //   [5] const_int %5 = 0
+    //   [6] const_int %6 = 0
+    //   [7] move_value %7 <- %4               -- %4 not unique
+    //   [8] call_builtin "Map.put" args=[%7,%5,%6] dest=%8
+    //
+    // Expected: V8 fails at id 8 — the tuple's pending entry was
+    // dissolved at the list_cons; the index_get afterwards extracts
+    // a non-unique component.
+    const tuple_elems = try arena.alloc(ir.LocalId, 1);
+    tuple_elems[0] = 0;
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 7;
+    args[1] = 5;
+    args[2] = 6;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .tuple_init = .{ .dest = 1, .elements = tuple_elems } },
+        .{ .const_nil = 2 },
+        .{ .list_cons = .{ .dest = 3, .head = 1, .tail = 2 } },
+        .{ .index_get = .{ .dest = 4, .object = 1, .index = 0 } },
+        .{ .const_int = .{ .dest = 5, .value = 0 } },
+        .{ .const_int = .{ .dest = 6, .value = 0 } },
+        .{ .move_value = .{ .dest = 7, .source = 4 } },
+        .{ .call_builtin = .{
+            .dest = 8,
+            .name = "Map.put",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    };
+    var function = try buildTestFunction(arena, "tuple_in_list", &instrs, 9);
+
+    // The tuple at %1's "last-use" would be the index_get at id 4 if
+    // it survived; with list_cons-induced escape, last-use info should
+    // not matter. Provide a synthetic ownership where the tuple's
+    // last-use is at the index_get; the test verifies escape wins.
+    var ownership = try buildSyntheticOwnership(arena, &.{
+        .{ .local = 1, .id = 4 },
+    });
+    defer ownership.deinit(testing.allocator);
+
+    var u = try analyzeUniquenessFull(testing.allocator, &function, null, null, null, &ownership);
+    defer u.deinit(testing.allocator);
+
+    try testing.expect(!u.isUnique(8));
+}
+
+test "v8_uniqueness: callee tuple-return per-component uniqueness propagates (Phase 2.5)" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Define a callee `id_pair(p) -> {p}` whose signature has
+    // return_components[0] = some(0). The caller calls it, then
+    // destructures, and uses the extracted local.
+    //
+    // Caller's stream:
+    //   [0] map_init %0 = {}                       -- fresh, unique
+    //   [1] move_value %1 <- %0                    -- transfer to the call arg
+    //   [2] call_named "id_pair" args=[%1] dest=%2 -- call dest synthesizes pending
+    //   [3] index_get %3 = %2[0]                   -- last-use of %2 → %3 unique
+    //   [4] const_int %4 = 0
+    //   [5] const_int %5 = 0
+    //   [6] move_value %6 <- %3                    -- %3 is unique
+    //   [7] call_builtin "Map.put" args=[%6,%4,%5] dest=%7
+    //
+    // Expected: V8 holds at id 7.
+
+    // Build the callee function.
+    const callee_id: ir.FunctionId = 1;
+    const callee_param_conv = try arena.alloc(ir.ParamConvention, 1);
+    callee_param_conv[0] = .owned;
+    const callee_blocks = try arena.alloc(ir.Block, 1);
+    callee_blocks[0] = .{ .label = 0, .instructions = &.{} };
+    const callee_ownership = try arena.alloc(ir.OwnershipClass, 0);
+    const callee_params = try arena.alloc(ir.Param, 1);
+    callee_params[0] = .{ .name = "p", .type_expr = .void };
+    const callee = ir.Function{
+        .id = callee_id,
+        .name = "id_pair",
+        .scope_id = 0,
+        .arity = 1,
+        .params = callee_params,
+        .return_type = .void,
+        .body = callee_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 0,
+        .param_conventions = callee_param_conv,
+        .local_ownership = callee_ownership,
+        .result_convention = .owned,
+    };
+
+    // Build the caller function.
+    const caller_call_args = try arena.alloc(ir.LocalId, 1);
+    caller_call_args[0] = 1;
+    const put_args = try arena.alloc(ir.LocalId, 3);
+    put_args[0] = 6;
+    put_args[1] = 4;
+    put_args[2] = 5;
+    const put_modes = try arena.alloc(ir.ValueMode, 3);
+    put_modes[0] = .move;
+    put_modes[1] = .borrow;
+    put_modes[2] = .borrow;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .move_value = .{ .dest = 1, .source = 0 } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "id_pair",
+            .args = caller_call_args,
+            .arg_modes = &.{},
+        } },
+        .{ .index_get = .{ .dest = 3, .object = 2, .index = 0 } },
+        .{ .const_int = .{ .dest = 4, .value = 0 } },
+        .{ .const_int = .{ .dest = 5, .value = 0 } },
+        .{ .move_value = .{ .dest = 6, .source = 3 } },
+        .{ .call_builtin = .{
+            .dest = 7,
+            .name = "Map.put",
+            .args = put_args,
+            .arg_modes = put_modes,
+        } },
+    };
+    var caller = try buildTestFunction(arena, "caller", &caller_instrs, 8);
+    caller.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = caller;
+    functions[1] = callee;
+    const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    // Build a minimal ProgramSignatures table that records:
+    //   * id_pair's params[0] = preserves_uniqueness with witness 0
+    //   * id_pair's return_components = [some(0)]
+    var signatures = v8_signature.ProgramSignatures.init(testing.allocator);
+    defer signatures.deinit(testing.allocator);
+    {
+        const arena_alloc = signatures.arena.allocator();
+        const params = try arena_alloc.alloc(v8_signature.ParamSig, 1);
+        params[0] = v8_signature.ParamSig.preservesUniqueness(0);
+        const rc = try arena_alloc.alloc(?u8, 1);
+        rc[0] = 0;
+        try signatures.by_function.put(testing.allocator, callee_id, .{
+            .params = params,
+            .return_components = rc,
+        });
+    }
+
+    // The call dest %2's last-use is at the index_get (id 3 in the
+    // caller's instruction stream).
+    var ownership = try buildSyntheticOwnership(arena, &.{
+        .{ .local = 2, .id = 3 },
+    });
+    defer ownership.deinit(testing.allocator);
+
+    var u = try analyzeUniquenessFull(testing.allocator, &caller, &program, null, &signatures, &ownership);
+    defer u.deinit(testing.allocator);
+
+    try testing.expect(u.isUnique(7));
 }
 
 test "v8_uniqueness: param_get becomes unique when fixpoint says unique-on-entry" {

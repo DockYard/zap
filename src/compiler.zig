@@ -2203,13 +2203,42 @@ fn runArcOwnershipAndVerify(
     };
     defer program_uniqueness.deinit(alloc);
 
+    // Phase 2.5: compute v8_signature signatures and recompute per-
+    // function ARC ownership so the V8 dataflow can synthesize
+    // tuple_pending entries for callee tuple-returns and recognise
+    // the `index_get + retain` destructure idiom as a uniqueness-
+    // preserving move at the parent tuple's last-use.
+    //
+    // Signatures are computed against the post-rewrite IR (after
+    // `rewriteOwnedConsumeBuiltinSites`/`classifyAndNormalize`/
+    // `rewriteOwnedConsumeSites`), so the witness propagation
+    // matches the IR shape the V8 dataflow walks.
+    //
+    // ARC ownership is recomputed against the post-rewrite IR so
+    // the `last_use_sites` keys align with the InstructionIds that
+    // the V8 dataflow assigns. Without the recompute, the original
+    // `ownership` carries pre-rewrite ids which `classifyAndNormalize`
+    // shifted by stripping `local_get`/`retain` pairs.
+    var post_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, program, type_store) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer post_ownership.deinit();
+
+    var signatures = zap.v8_fixpoint.computeSignaturesWithOwnership(alloc, program, &post_ownership) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer signatures.deinit(alloc);
+
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
-        var uniqueness = zap.v8_uniqueness.analyzeUniquenessWithFixpoint(
+        const fn_ownership = post_ownership.get(function.id);
+        var uniqueness = zap.v8_uniqueness.analyzeUniquenessFull(
             alloc,
             function,
             program,
             &program_uniqueness,
+            &signatures,
+            fn_ownership,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
         };
