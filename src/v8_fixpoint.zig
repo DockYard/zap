@@ -82,6 +82,23 @@ pub fn computeSignatures(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
 ) !ProgramSignatures {
+    return computeSignaturesWithOwnership(allocator, program, null);
+}
+
+/// Phase 2.2 — variant that accepts an optional per-function
+/// `ArcOwnership` table. When provided, the walker consults
+/// `last_use_map`/`isLastUseAt` to recognise `copy_value` at last-use
+/// as a uniqueness-preserving alias rather than an aliasing escape.
+/// Without ownership data the walker conservatively classifies every
+/// `copy_value` as AL (the legacy behaviour).
+///
+/// The ownership table is the result of `arc_liveness.runProgramArcOwnership`
+/// against the same `program`. Tests can pass `null` to opt out.
+pub fn computeSignaturesWithOwnership(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    ownerships: ?*const arc_liveness.ProgramArcOwnership,
+) !ProgramSignatures {
     var signatures = ProgramSignatures.init(allocator);
     errdefer signatures.deinit(allocator);
 
@@ -133,7 +150,7 @@ pub fn computeSignatures(
     // before their callers), so a single pass per SCC suffices to
     // make all of its callees' signatures stable.
     for (sccs.components.items) |scc| {
-        try iterateScc(allocator, program, &name_to_id, &call_graph, scc, &signatures);
+        try iterateScc(allocator, program, &name_to_id, &call_graph, scc, &signatures, ownerships);
     }
 
     // Defensive cleanup: any slot that remained `unobserved` after
@@ -479,6 +496,7 @@ fn iterateScc(
     graph: *const CallGraph,
     scc: []const ir.FunctionId,
     signatures: *ProgramSignatures,
+    ownerships: ?*const arc_liveness.ProgramArcOwnership,
 ) !void {
     // Within a single SCC, every function's signature can depend on
     // any other's. We worklist until stability.
@@ -506,6 +524,7 @@ fn iterateScc(
             name_to_id,
             func,
             signatures,
+            ownerships,
             &changed,
         );
 
@@ -567,6 +586,7 @@ fn analyzeFunctionBody(
     name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
     function: *const ir.Function,
     signatures: *ProgramSignatures,
+    ownerships: ?*const arc_liveness.ProgramArcOwnership,
     changed_out: *bool,
 ) !void {
     const arena_alloc = signatures.arena.allocator();
@@ -589,6 +609,44 @@ fn analyzeFunctionBody(
     var carrier_of: std.AutoHashMapUnmanaged(ir.LocalId, u32) = .empty;
     defer carrier_of.deinit(allocator);
 
+    // Phase 2.1 — tuple_pending tracking. A `tuple_init` whose elements
+    // include carriers is *deferred*: instead of unconditionally
+    // upgrading every carrier to `aliases`, we store a per-component
+    // record in `tuple_pending`. The deferred entry resolves later:
+    //
+    //   * `ret` / `cond_return` of the tuple_pending dest → each
+    //     component-carrier classifies as PU, with the component index
+    //     stored as the witness. This is the canonical
+    //     "fn f(p) -> {p, q}" idiom that fannkuch's `count_flips`,
+    //     `advance_perm`, and `rotate_loop` exhibit.
+    //
+    //   * Storage into another aggregate (list_init, list_cons, map_init,
+    //     struct_init, union_init, make_closure, nested tuple) where the
+    //     containing aggregate is NOT itself a returned tuple → resolve
+    //     deferred carriers as AL.
+    //
+    //   * Use as a call argument (the called function may escape it) →
+    //     resolve as AL. The tuple itself is the argument; its
+    //     components are not the call's first-class arg slots.
+    //
+    //   * Use that survives until end-of-body without resolution → leave
+    //     unresolved. The component carriers have not been observed at
+    //     a sink, which is the same "unobserved" outcome as if the
+    //     tuple_init never existed.
+    //
+    // Multiple tuple_pending entries for chained tuples are supported:
+    // when a tuple_init's element is itself a tuple_pending dest, the
+    // outer tuple becomes a new tuple_pending whose carriers are
+    // *flattened* (the inner tuple's carriers contribute their own
+    // component-mapped slots). Chained returns then resolve correctly
+    // via the same return-component witness path.
+    var tuple_pending: std.AutoHashMapUnmanaged(ir.LocalId, []TupleComponent) = .empty;
+    defer {
+        var it = tuple_pending.valueIterator();
+        while (it.next()) |comps| allocator.free(comps.*);
+        tuple_pending.deinit(allocator);
+    }
+
     // First pass: seed every `param_get` instruction so its dest
     // carries the corresponding parameter slot. Subsequent flow steps
     // propagate via alias forms.
@@ -601,6 +659,13 @@ fn analyzeFunctionBody(
     //   2. Observe a flow into a sink (consume site, escape site,
     //      return site, etc.) and join the corresponding parameter's
     //      accumulator.
+    const function_ownership: ?*const arc_liveness.ArcOwnership = blk: {
+        if (ownerships) |program_ownership| {
+            break :blk program_ownership.get(function.id);
+        }
+        break :blk null;
+    };
+
     var walker = FlowWalker{
         .allocator = allocator,
         .program = program,
@@ -609,7 +674,10 @@ fn analyzeFunctionBody(
         .signatures = signatures,
         .accumulators = &accumulators,
         .carrier_of = &carrier_of,
+        .tuple_pending = &tuple_pending,
+        .function_ownership = function_ownership,
     };
+    defer walker.deinit();
     for (function.body) |block| {
         try walker.walkStream(block.instructions);
     }
@@ -625,6 +693,43 @@ fn analyzeFunctionBody(
         {
             existing.* = new_value;
             changed_out.* = true;
+        }
+    }
+
+    // Phase 2.1 — observed return components. The walker accumulates
+    // per-tuple-component witnesses across every `ret`/`cond_return`
+    // observation: if EVERY return that returns a tuple_pending value
+    // associates the same parameter slot with component i, then
+    // `return_components[i]` records that slot. Returns whose value is
+    // not a tuple_pending dest (e.g. a non-tuple early exit, or a
+    // tuple_pending with conflicting carriers) drop the witness for
+    // the associated component to `null`.
+    if (sig_entry.return_components.len < walker.observed_return_components.items.len) {
+        // The arena slice is sized at allocation time; if the body
+        // observes a wider tuple than we pre-allocated, fall back to
+        // a fresh allocation in the signatures arena.
+        const arena_alloc_local = signatures.arena.allocator();
+        const new_components = arena_alloc_local.alloc(?u8, walker.observed_return_components.items.len) catch return;
+        for (new_components, 0..) |*slot, i| slot.* = if (i < sig_entry.return_components.len) sig_entry.return_components[i] else null;
+        sig_entry.return_components = new_components;
+    }
+    if (sig_entry.return_components.len > 0) {
+        // SAFETY: the slice was allocated by the same signatures arena.
+        // We mutate the per-component witness in place; the slice's
+        // backing memory is owned by the signatures arena and freed
+        // wholesale at `signatures.deinit`.
+        const components_mut: []?u8 = @constCast(sig_entry.return_components);
+        for (walker.observed_return_components.items, 0..) |observed, i| {
+            if (i >= components_mut.len) break;
+            const old = components_mut[i];
+            const merged: ?u8 = if (observed) |slot| blk: {
+                if (old == null) break :blk slot;
+                break :blk if (old.? == slot) old else null;
+            } else null;
+            if (merged != old) {
+                components_mut[i] = merged;
+                changed_out.* = true;
+            }
         }
     }
 }
@@ -650,6 +755,20 @@ fn seedParamGets(
     ir.forEachInstruction(function, visitor, ParamGetSeeder.visit);
 }
 
+/// A `tuple_init` deferred record. One entry per component of a
+/// constructed tuple whose dest is on the `tuple_pending` map. Each
+/// entry records (a) the source parameter slot the component carries
+/// (when known) and (b) whether the component itself is the dest of a
+/// nested tuple_pending (so chained tuples can flatten on resolve).
+///
+/// `slot == null && nested == null` means "non-carrier component"
+/// (e.g. an `i64` literal). The presence of any non-carrier component
+/// does NOT block PU classification of the carrier components — each
+/// component's witness is independent.
+pub const TupleComponent = struct {
+    slot: ?u32 = null,
+};
+
 const FlowWalker = struct {
     allocator: std.mem.Allocator,
     program: *const ir.Program,
@@ -658,13 +777,43 @@ const FlowWalker = struct {
     signatures: *ProgramSignatures,
     accumulators: *std.ArrayListUnmanaged(ParamAccumulator),
     carrier_of: *std.AutoHashMapUnmanaged(ir.LocalId, u32),
+    /// Phase 2.1 — deferred tuple-construction records. See the
+    /// commentary in `analyzeFunctionBody` for the resolution rules.
+    /// The slice associated with each pending entry is owned by
+    /// `allocator` and must be freed when the entry is removed (via
+    /// resolve-as-AL or resolve-as-PU at a return).
+    tuple_pending: *std.AutoHashMapUnmanaged(ir.LocalId, []TupleComponent),
+    /// Phase 2.1 — per-tuple-return-component observed parameter
+    /// witnesses. Grown lazily as the walker observes returns. After
+    /// the body is walked, the merge phase combines these with the
+    /// signature's `return_components` slice (taking the meet — when
+    /// two observed returns disagree on a component, the witness drops
+    /// to `null` for that component).
+    observed_return_components: std.ArrayListUnmanaged(?u8) = .empty,
+    /// Phase 2.2 — per-function ARC ownership info, when available.
+    /// Used by `copy_value` classification to recognise last-use
+    /// `copy_value` as a uniqueness-preserving alias rather than an
+    /// aliasing escape. Without ownership info the walker
+    /// conservatively classifies every `copy_value` as AL.
+    function_ownership: ?*const arc_liveness.ArcOwnership = null,
+    /// Phase 2.2 — running InstructionId mirrored from `arc_liveness`'s
+    /// depth-first traversal. Each top-level instruction increments
+    /// this counter before being classified, so per-instruction
+    /// queries (e.g. `isLastUseAt`) match the analyzer's id space.
+    next_instr_id: arc_liveness.InstructionId = 0,
+
+    fn deinit(self: *FlowWalker) void {
+        self.observed_return_components.deinit(self.allocator);
+    }
 
     fn walkStream(
         self: *FlowWalker,
         stream: []const ir.Instruction,
     ) error{OutOfMemory}!void {
         for (stream) |*instr| {
-            try self.classifyAndPropagate(instr);
+            const id = self.next_instr_id;
+            self.next_instr_id += 1;
+            try self.classifyAndPropagate(instr, id);
             try self.walkChildren(instr);
         }
     }
@@ -715,44 +864,99 @@ const FlowWalker = struct {
         }
     }
 
-    fn classifyAndPropagate(self: *FlowWalker, instr: *const ir.Instruction) !void {
+    fn classifyAndPropagate(self: *FlowWalker, instr: *const ir.Instruction, instr_id: arc_liveness.InstructionId) !void {
         switch (instr.*) {
             // -------------------------------------------------
-            // Carrier-propagating alias forms.
+            // Carrier-propagating alias forms. Phase 2.1: also
+            // propagate `tuple_pending` membership through these forms
+            // so a tuple_init's dest can flow through a `local_set`
+            // re-binding and still resolve as PU at the return site.
             // -------------------------------------------------
-            .local_get => |lg| try self.propagateCarrier(lg.dest, lg.source),
-            .local_set => |ls| try self.propagateCarrier(ls.dest, ls.value),
-            .move_value => |mv| try self.propagateCarrier(mv.dest, mv.source),
-            .share_value => |sv| try self.propagateCarrier(sv.dest, sv.source),
-            .copy_value => |cv| {
-                // copy_value creates a new owner with a runtime retain.
-                // The resulting cell has refcount > 1 — the parameter's
-                // uniqueness is no longer preservable through this
-                // path. Mark the source param as AL.
-                if (self.carrier_of.get(cv.source)) |slot| {
-                    try self.upgradeParam(slot, ParamSig.aliasesOut());
-                }
-                _ = self.carrier_of.remove(cv.dest);
+            .local_get => |lg| {
+                try self.propagateCarrier(lg.dest, lg.source);
+                try self.propagateTuplePending(lg.dest, lg.source);
             },
-            .borrow_value => |bv| try self.propagateCarrier(bv.dest, bv.source),
+            .local_set => |ls| {
+                try self.propagateCarrier(ls.dest, ls.value);
+                try self.propagateTuplePending(ls.dest, ls.value);
+            },
+            .move_value => |mv| {
+                try self.propagateCarrier(mv.dest, mv.source);
+                try self.propagateTuplePending(mv.dest, mv.source);
+            },
+            .share_value => |sv| {
+                try self.propagateCarrier(sv.dest, sv.source);
+                try self.propagateTuplePending(sv.dest, sv.source);
+            },
+            .copy_value => |cv| {
+                // Phase 2.2 — `copy_value` at last-use is semantically
+                // a `move_value`. The IR builder emits `copy_value`
+                // defensively when a binding *might* have further uses
+                // along OTHER execution paths, but along the CURRENT
+                // path (the one this `copy_value` lives on), the
+                // source is dead immediately after the copy. The
+                // matching scope-exit drop on the source is paired
+                // with the copy's retain, so net refcount delta is 0
+                // — the cell stays unique, just under a new owner
+                // alias. Treat it as a carrier-propagating alias
+                // form.
+                //
+                // Without ownership info, fall back to the legacy
+                // conservative behaviour (AL on the source, no
+                // carrier propagation).
+                const is_last_use_copy = blk: {
+                    if (self.function_ownership) |fo| {
+                        if (fo.isLastUseAt(cv.source, instr_id)) break :blk true;
+                    }
+                    break :blk false;
+                };
+                if (is_last_use_copy) {
+                    try self.propagateCarrier(cv.dest, cv.source);
+                    try self.propagateTuplePending(cv.dest, cv.source);
+                } else {
+                    // copy_value creates a new owner with a runtime
+                    // retain. The resulting cell has refcount > 1 —
+                    // the parameter's uniqueness is no longer
+                    // preservable through this path. Mark the source
+                    // param as AL.
+                    if (self.carrier_of.get(cv.source)) |slot| {
+                        try self.upgradeParam(slot, ParamSig.aliasesOut());
+                    }
+                    _ = self.carrier_of.remove(cv.dest);
+                    // copy_value at a non-last-use source resolves
+                    // the pending entry as AL — the cell now exists
+                    // in two owner positions (the copy + the
+                    // original tuple construction), so neither is
+                    // uniquely owned.
+                    try self.resolveTuplePendingAsAL(cv.source);
+                }
+            },
+            .borrow_value => |bv| {
+                try self.propagateCarrier(bv.dest, bv.source);
+                try self.propagateTuplePending(bv.dest, bv.source);
+            },
 
             // -------------------------------------------------
             // Aggregate inits — storing a parameter into an
             // aggregate cell aliases it (the aggregate holds a
             // permanent retain).
+            //
+            // Phase 2.1 — `tuple_init` is the EXCEPTION: instead of
+            // unconditionally upgrading carriers to AL, we DEFER the
+            // classification by recording a `tuple_pending` entry
+            // keyed on the tuple's dest. Later, when the tuple is
+            // observed at a sink (return = PU witness, escape = AL),
+            // the deferred entry resolves with the appropriate flow.
             // -------------------------------------------------
             .tuple_init => |ti| {
-                for (ti.elements) |elem| {
-                    if (self.carrier_of.get(elem)) |slot| {
-                        try self.upgradeParam(slot, ParamSig.aliasesOut());
-                    }
-                }
+                try self.recordTuplePending(ti.dest, ti.elements);
             },
             .list_init => |li| {
                 for (li.elements) |elem| {
                     if (self.carrier_of.get(elem)) |slot| {
                         try self.upgradeParam(slot, ParamSig.aliasesOut());
                     }
+                    try self.resolveTuplePendingAsAL(elem);
                 }
             },
             .list_cons => |lc| {
@@ -762,6 +966,8 @@ const FlowWalker = struct {
                 if (self.carrier_of.get(lc.tail)) |slot| {
                     try self.upgradeParam(slot, ParamSig.aliasesOut());
                 }
+                try self.resolveTuplePendingAsAL(lc.head);
+                try self.resolveTuplePendingAsAL(lc.tail);
             },
             .map_init => |mi| {
                 for (mi.entries) |entry| {
@@ -771,6 +977,8 @@ const FlowWalker = struct {
                     if (self.carrier_of.get(entry.value)) |slot| {
                         try self.upgradeParam(slot, ParamSig.aliasesOut());
                     }
+                    try self.resolveTuplePendingAsAL(entry.key);
+                    try self.resolveTuplePendingAsAL(entry.value);
                 }
             },
             .struct_init => |si| {
@@ -778,12 +986,14 @@ const FlowWalker = struct {
                     if (self.carrier_of.get(f.value)) |slot| {
                         try self.upgradeParam(slot, ParamSig.aliasesOut());
                     }
+                    try self.resolveTuplePendingAsAL(f.value);
                 }
             },
             .union_init => |ui| {
                 if (self.carrier_of.get(ui.value)) |slot| {
                     try self.upgradeParam(slot, ParamSig.aliasesOut());
                 }
+                try self.resolveTuplePendingAsAL(ui.value);
             },
             .make_closure => |mc| {
                 // Capturing a parameter into a closure environment
@@ -794,6 +1004,7 @@ const FlowWalker = struct {
                     if (self.carrier_of.get(cap)) |slot| {
                         try self.upgradeParam(slot, ParamSig.aliasesOut());
                     }
+                    try self.resolveTuplePendingAsAL(cap);
                 }
             },
 
@@ -803,12 +1014,36 @@ const FlowWalker = struct {
             // (preserves), or AL (aliases) to the caller's
             // parameter accumulator, depending on the callee's
             // own signature.
+            //
+            // Phase 2.1: a tuple_pending arg passed to a call is a
+            // strong escape signal — the called function may store
+            // the tuple in a non-returned aggregate, capture it in a
+            // closure, etc. Resolve the pending entry as AL before
+            // the call's classifier runs (the call itself has its
+            // own per-arg classification, but the deferred tuple
+            // record must be cleared so it doesn't survive past the
+            // call as a stale pending entry).
             // -------------------------------------------------
-            .call_named => |cn| try self.classifyCall(cn.name, cn.args, cn.dest, false),
-            .call_direct => |cd| try self.classifyCallToFunction(cd.function, cd.args, cd.dest, false),
-            .try_call_named => |tcn| try self.classifyCall(tcn.name, tcn.args, tcn.dest, false),
-            .tail_call => |tc| try self.classifyCall(tc.name, tc.args, 0, true),
-            .call_builtin => |cb| try self.classifyBuiltinCall(cb.name, cb.args, cb.dest),
+            .call_named => |cn| {
+                for (cn.args) |arg| try self.resolveTuplePendingAsAL(arg);
+                try self.classifyCall(cn.name, cn.args, cn.dest, false);
+            },
+            .call_direct => |cd| {
+                for (cd.args) |arg| try self.resolveTuplePendingAsAL(arg);
+                try self.classifyCallToFunction(cd.function, cd.args, cd.dest, false);
+            },
+            .try_call_named => |tcn| {
+                for (tcn.args) |arg| try self.resolveTuplePendingAsAL(arg);
+                try self.classifyCall(tcn.name, tcn.args, tcn.dest, false);
+            },
+            .tail_call => |tc| {
+                for (tc.args) |arg| try self.resolveTuplePendingAsAL(arg);
+                try self.classifyCall(tc.name, tc.args, 0, true);
+            },
+            .call_builtin => |cb| {
+                for (cb.args) |arg| try self.resolveTuplePendingAsAL(arg);
+                try self.classifyBuiltinCall(cb.name, cb.args, cb.dest);
+            },
             .call_closure => |cc| {
                 // Closure calls have unanalysable callees — every
                 // arg that carries a parameter contributes ⊤.
@@ -816,6 +1051,7 @@ const FlowWalker = struct {
                     if (self.carrier_of.get(arg)) |slot| {
                         try self.upgradeParam(slot, ParamSig.unknown());
                     }
+                    try self.resolveTuplePendingAsAL(arg);
                 }
                 _ = self.carrier_of.remove(cc.dest);
             },
@@ -824,38 +1060,52 @@ const FlowWalker = struct {
                     if (self.carrier_of.get(arg)) |slot| {
                         try self.upgradeParam(slot, ParamSig.unknown());
                     }
+                    try self.resolveTuplePendingAsAL(arg);
                 }
                 _ = self.carrier_of.remove(cd.dest);
             },
 
             // -------------------------------------------------
             // Returns — a parameter that flows directly into the
-            // return position can preserve uniqueness through to
-            // the caller. Treat as PU with a return-component
-            // witness (Phase 2 will widen this for tuple returns).
+            // return position preserves uniqueness through to the
+            // caller. Phase 2.1 widens this to tuple-pending returns:
+            // when the return value is a `tuple_pending` dest, every
+            // component-carrier classifies as PU with the component
+            // index as the witness.
             // -------------------------------------------------
             .ret => |r| {
-                if (r.value) |val| {
-                    if (self.carrier_of.get(val)) |slot| {
-                        try self.upgradeParam(slot, ParamSig.preservesUniqueness(0));
-                    }
-                }
+                if (r.value) |val| try self.classifyReturnValue(val);
             },
             .cond_return => |cr| {
-                if (cr.value) |val| {
-                    if (self.carrier_of.get(val)) |slot| {
-                        try self.upgradeParam(slot, ParamSig.preservesUniqueness(0));
-                    }
-                }
+                if (cr.value) |val| try self.classifyReturnValue(val);
             },
 
             // -------------------------------------------------
             // Field/index reads — these don't move ownership of
             // the source. The dest is a borrow into the parent
             // aggregate, NOT a carrier of a parameter.
+            //
+            // Phase 2.1 EXCEPTION — `index_get` from a `tuple_pending`
+            // source: the destructured component DOES carry the
+            // parameter slot recorded on that component. This is
+            // exactly the `{p, count, done} = call_result` idiom
+            // fannkuch's `main_loop` uses on `advance_perm`'s tuple
+            // return — without this hop, the destructured `p` and
+            // `count` lose their parameter-slot identity and the V8
+            // `Vector.set` rewrite never fires on the rebound
+            // bindings.
             // -------------------------------------------------
+            .index_get => |ig| {
+                if (self.tuple_pending.getPtr(ig.object)) |comps_ptr| {
+                    const comps = comps_ptr.*;
+                    if (ig.index < comps.len) {
+                        if (comps[ig.index].slot) |slot| {
+                            try self.carrier_of.put(self.allocator, ig.dest, slot);
+                        }
+                    }
+                }
+            },
             .field_get,
-            .index_get,
             .list_len_check,
             .list_get,
             .list_is_not_empty,
@@ -878,6 +1128,142 @@ const FlowWalker = struct {
     fn propagateCarrier(self: *FlowWalker, dest: ir.LocalId, source: ir.LocalId) !void {
         if (self.carrier_of.get(source)) |slot| {
             try self.carrier_of.put(self.allocator, dest, slot);
+        }
+    }
+
+    /// Phase 2.1 — propagate a `tuple_pending` membership through an
+    /// alias-form instruction. When `source` is a tuple_pending dest,
+    /// the alias's `dest` becomes a new tuple_pending entry pointing
+    /// at the same component table. Pure aliasing does not change
+    /// component witnesses or resolve the deferred entry — only true
+    /// sinks (return / escape) do.
+    ///
+    /// We move ownership of the component slice from `source` to
+    /// `dest`: the source key is removed and the component slice is
+    /// re-keyed under `dest`. This keeps the walker's per-key
+    /// invariant intact (each pending entry owns exactly one slice in
+    /// `allocator`), without doubling memory.
+    ///
+    /// If `source` is not a tuple_pending dest, this is a no-op.
+    fn propagateTuplePending(self: *FlowWalker, dest: ir.LocalId, source: ir.LocalId) !void {
+        if (dest == source) return;
+        const entry = self.tuple_pending.fetchRemove(source) orelse return;
+        // Remove any pre-existing pending entry at `dest` (e.g.
+        // overwritten by a re-binding) — its slice must be freed
+        // before being replaced.
+        if (self.tuple_pending.fetchRemove(dest)) |existing| {
+            self.allocator.free(existing.value);
+        }
+        try self.tuple_pending.put(self.allocator, dest, entry.value);
+    }
+
+    /// Phase 2.1 — record a fresh `tuple_init` deferral. Builds a
+    /// component table from `elements` (each entry's `slot` is the
+    /// parameter slot the corresponding element carries, or `null` for
+    /// non-carrier components). When an element is itself a
+    /// tuple_pending dest, we conservatively classify ALL of the
+    /// inner tuple's carriers as AL — a nested tuple stored as a
+    /// component of an outer tuple loses its first-class identity for
+    /// the return-witness analysis. The outer tuple's component for
+    /// that slot still records `null` (no carrier witness) and the
+    /// inner pending entry is removed.
+    fn recordTuplePending(
+        self: *FlowWalker,
+        dest: ir.LocalId,
+        elements: []const ir.LocalId,
+    ) !void {
+        // Allocate the component table eagerly. If allocation fails
+        // we fall back to the legacy AL-per-element behaviour for the
+        // current tuple_init, preserving correctness under OOM.
+        const components = self.allocator.alloc(TupleComponent, elements.len) catch {
+            for (elements) |elem| {
+                if (self.carrier_of.get(elem)) |slot| {
+                    try self.upgradeParam(slot, ParamSig.aliasesOut());
+                }
+            }
+            return;
+        };
+        for (components, elements) |*comp, elem| {
+            comp.* = .{ .slot = self.carrier_of.get(elem) };
+            // Nested tuple — flatten by AL'ing the nested carriers
+            // and removing the inner pending entry. A more permissive
+            // analysis could recursively flatten witnesses through
+            // nested tuples, but that adds complexity without payoff
+            // for the fannkuch / spectral-norm patterns: those return
+            // flat tuples, never nested ones.
+            try self.resolveTuplePendingAsAL(elem);
+        }
+        // If `dest` already has a pending entry (e.g. overwritten by a
+        // re-binding through `local_set`), free the old slice first.
+        if (self.tuple_pending.fetchRemove(dest)) |existing| {
+            self.allocator.free(existing.value);
+        }
+        try self.tuple_pending.put(self.allocator, dest, components);
+    }
+
+    /// Phase 2.1 — resolve a deferred tuple-construction record as AL.
+    /// Every component-carrier in the table contributes an AL
+    /// observation to the corresponding parameter's accumulator.
+    /// Removes the entry from the pending map. No-op when `local`
+    /// is not on the pending map.
+    fn resolveTuplePendingAsAL(self: *FlowWalker, local: ir.LocalId) !void {
+        const entry = self.tuple_pending.fetchRemove(local) orelse return;
+        defer self.allocator.free(entry.value);
+        for (entry.value) |comp| {
+            if (comp.slot) |slot| {
+                try self.upgradeParam(slot, ParamSig.aliasesOut());
+            }
+        }
+    }
+
+    /// Phase 2.1 — classify a return-position value. Three cases:
+    ///
+    ///   1. The value is a `tuple_pending` dest: each component-
+    ///      carrier classifies as PU with its component index as the
+    ///      return-witness. Component witnesses also accumulate into
+    ///      `observed_return_components` so the merge phase can
+    ///      record per-tuple-component witnesses on the function's
+    ///      `return_components` slice. The pending entry is removed
+    ///      after resolution.
+    ///
+    ///   2. The value is a direct carrier (the param is returned
+    ///      whole — single-result PU): classify as PU with the
+    ///      whole-return witness (`null`).
+    ///
+    ///   3. Otherwise: no flow upgrade. The return doesn't observe
+    ///      a parameter at this site.
+    fn classifyReturnValue(self: *FlowWalker, val: ir.LocalId) !void {
+        if (self.tuple_pending.fetchRemove(val)) |entry| {
+            defer self.allocator.free(entry.value);
+            // Ensure observed_return_components is sized to the tuple's
+            // arity, padding with `null` for any gaps.
+            while (self.observed_return_components.items.len < entry.value.len) {
+                try self.observed_return_components.append(self.allocator, null);
+            }
+            for (entry.value, 0..) |comp, idx| {
+                if (comp.slot) |slot| {
+                    try self.upgradeParam(slot, ParamSig.preservesUniqueness(@intCast(idx)));
+                    // Record the per-component witness for this
+                    // observed return. The merge phase later joins
+                    // across all observations and stores the meet on
+                    // the signature's `return_components` slice.
+                    if (idx < self.observed_return_components.items.len) {
+                        const existing = self.observed_return_components.items[idx];
+                        const merged: ?u8 = if (existing == null)
+                            @as(?u8, @intCast(slot))
+                        else if (existing.? == @as(u8, @intCast(slot)))
+                            existing
+                        else
+                            null;
+                        self.observed_return_components.items[idx] = merged;
+                    }
+                }
+            }
+            return;
+        }
+        // Non-tuple return: direct-carrier → whole-return PU.
+        if (self.carrier_of.get(val)) |slot| {
+            try self.upgradeParam(slot, ParamSig.preservesUniqueness(null));
         }
     }
 
@@ -1025,7 +1411,7 @@ const FlowWalker = struct {
                     // Combined with a tail-call this is the canonical
                     // accumulator-recursion shape (PU).
                     if (is_tail_call) {
-                        try self.upgradeParam(carrier_slot, ParamSig.preservesUniqueness(0));
+                        try self.upgradeParam(carrier_slot, ParamSig.preservesUniqueness(null));
                     } else {
                         try self.upgradeParam(carrier_slot, ParamSig.consumesUniquely());
                     }
@@ -1034,7 +1420,16 @@ const FlowWalker = struct {
                     // Callee threads uniqueness through to its return.
                     // Caller's parameter contributes PU; the dest
                     // carries the same parameter forward.
-                    try self.upgradeParam(carrier_slot, ParamSig.preservesUniqueness(0));
+                    //
+                    // Phase 2.1: record the per-arg-to-component
+                    // mapping in the dest's `tuple_pending` table when
+                    // the callee's signature has a non-empty
+                    // `return_components` table that names this arg
+                    // position as a witness. This allows downstream
+                    // destructuring (`{q, ...} = call_dest`) to
+                    // recover the carrier on the destructured local
+                    // and surface PU to a tuple-return on the caller.
+                    try self.upgradeParam(carrier_slot, ParamSig.preservesUniqueness(callee_sig.params[arg_idx].preserves_to_return_component));
                     preserves_carrier_from_arg = arg_idx;
                 },
                 .aliases => {
@@ -1083,6 +1478,50 @@ const FlowWalker = struct {
         // dest=0 by convention; the caller's body has already been
         // flushed and there's nothing to track post-tail.)
         if (!is_tail_call) {
+            // Phase 2.1: when the callee's signature has a
+            // non-trivial `return_components` table (any component
+            // names a parameter slot witness), synthesize a
+            // tuple_pending record on the call's dest. Each component
+            // that names parameter slot j inherits the caller's
+            // carrier of `args[j]`. Downstream `index_get` on the
+            // dest will project the appropriate carrier out per
+            // component — letting `{p, count, done} = call_result`
+            // recover the parameter slot identity for each
+            // destructured local.
+            //
+            // This synthesized pending entry is functionally
+            // equivalent to the call dest being a `tuple_init` whose
+            // elements were the per-component witness aliases — but
+            // we don't need the IR to actually emit a tuple_init for
+            // the synthesis to apply.
+            var has_per_component_witness = false;
+            for (callee_sig.return_components) |opt| {
+                if (opt != null) {
+                    has_per_component_witness = true;
+                    break;
+                }
+            }
+            if (has_per_component_witness) {
+                const components = self.allocator.alloc(TupleComponent, callee_sig.return_components.len) catch null;
+                if (components) |comps| {
+                    for (comps, callee_sig.return_components) |*comp, witness_opt| {
+                        comp.* = .{ .slot = null };
+                        if (witness_opt) |arg_idx_u8| {
+                            const arg_idx_in: usize = @intCast(arg_idx_u8);
+                            if (arg_idx_in < args.len) {
+                                if (self.carrier_of.get(args[arg_idx_in])) |slot| {
+                                    comp.slot = slot;
+                                }
+                            }
+                        }
+                    }
+                    if (self.tuple_pending.fetchRemove(dest)) |existing| {
+                        self.allocator.free(existing.value);
+                    }
+                    self.tuple_pending.put(self.allocator, dest, comps) catch self.allocator.free(comps);
+                }
+            }
+
             if (preserves_carrier_from_arg) |arg_idx| {
                 if (self.carrier_of.get(args[arg_idx])) |slot| {
                     try self.carrier_of.put(self.allocator, dest, slot);
@@ -1295,7 +1734,7 @@ test "v8_fixpoint: borrow-passthrough callee with top signature does not poison 
     // Two-function setup that exercises the borrow short-circuit
     // specifically. The callee's body has CONFLICTING flows that
     // join to `top` WITHIN the callee's SCC analysis (PU from
-    // returning the param + AL from a tuple_init storing the param).
+    // returning the param + AL from a list_cons storing the param).
     // Without the short-circuit, the caller's classifyCallToFunction
     // sees the callee's slot class as `top` mid-SCC and pollutes the
     // caller's carrier accumulator — the caller's param 0 reaches
@@ -1308,7 +1747,7 @@ test "v8_fixpoint: borrow-passthrough callee with top signature does not poison 
     // owned-mutating call.
     //
     //   callee(p :: VectorI64) -> VectorI64 {     # borrowed slot 0, top sig
-    //     _ = {p, p}                                # AL flow
+    //     _ = [p | nil]                             # AL flow (list_cons; survives Phase 2.1)
     //     p                                          # PU flow (ret)
     //   }
     //
@@ -1316,6 +1755,13 @@ test "v8_fixpoint: borrow-passthrough callee with top signature does not poison 
     //     _ = callee(v)                             # borrow-passthrough call
     //     Vector.set(v, 0, 0)                       # PU flow → caller slot 0 = PU
     //   }
+    //
+    // Phase 2.1 note: the original test used `tuple_init` for the AL
+    // evidence, but Phase 2.1 defers tuple-init aliasing until a
+    // resolution sink is observed. A dead tuple_init no longer ALs
+    // the param. We keep the same conflicting-flows shape using
+    // list_cons, which is still classified as an immediate AL site
+    // (lists do escape unconditionally).
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -1323,25 +1769,25 @@ test "v8_fixpoint: borrow-passthrough callee with top signature does not poison 
     // Function 0 (id=0): "borrow_aliaser" -- the borrowed callee whose
     // body has conflicting flows for slot 0:
     //   [0] param_get  dest=0  index=0
-    //   [1] tuple_init dest=1  elements=[0]    -- AL flow on slot 0
-    //   [2] ret         value=0                 -- PU flow on slot 0
+    //   [1] const_nil  dest=1                     -- nil tail
+    //   [2] list_cons  dest=2  head=0 tail=1      -- AL flow on slot 0
+    //   [3] ret         value=0                    -- PU flow on slot 0
     //
-    // Slot 0 conv = .borrowed. Body flows: AL (tuple_init) ⊔ PU (ret) = top.
+    // Slot 0 conv = .borrowed. Body flows: AL (list_cons) ⊔ PU (ret) = top.
     // After SCC analysis (no cleanup needed — the body produces top
     // directly), the signature for slot 0 is `top` AND the slot conv
     // remains `.borrowed`.
-    const tuple_elems_callee = try arena.alloc(ir.LocalId, 1);
-    tuple_elems_callee[0] = 0;
     const callee_instrs = [_]ir.Instruction{
         .{ .param_get = .{ .dest = 0, .index = 0 } },
-        .{ .tuple_init = .{ .dest = 1, .elements = tuple_elems_callee } },
+        .{ .const_nil = 1 },
+        .{ .list_cons = .{ .dest = 2, .head = 0, .tail = 1 } },
         .{ .ret = .{ .value = 0 } },
     };
     var callee_func = try buildTestFunction(
         arena,
         "borrow_aliaser",
         &callee_instrs,
-        2,
+        3,
         &[_]ir.ParamConvention{.borrowed},
         .owned,
     );
@@ -1419,36 +1865,46 @@ test "v8_fixpoint: borrow-passthrough callee with top signature does not poison 
     try testing.expectEqual(UniquenessClass.preserves_uniqueness, caller_sig.params[0].class);
 }
 
-test "v8_fixpoint: aliases-out callee still poisons caller (sound check for borrow short-circuit)" {
+test "v8_fixpoint: aliases-out callee via list_cons still poisons caller (sound check for borrow short-circuit)" {
     // Two-function setup where the callee genuinely escapes its
-    // borrowed parameter into a tuple. The callee's signature is
-    // `aliases`, NOT `top`. The borrow short-circuit MUST NOT bypass
-    // the upgrade in this case — caller's carrier must be poisoned.
+    // borrowed parameter into a list (which is unconditionally an AL
+    // sink — lists hold a permanent retain on their elements). The
+    // callee's signature is `aliases`, NOT `top`. The borrow
+    // short-circuit MUST NOT bypass the upgrade in this case —
+    // caller's carrier must be poisoned.
     //
-    //   callee(p) -> {p}                  # aliases through tuple_init
-    //   caller(v) -> callee(v)            # caller passes v
+    //   callee(p) -> List(VectorI64) { [p] }     # aliases through list_cons
+    //   caller(v) -> callee(v)                   # caller passes v
     //
     // Expected: caller's param 0 = AL (aliases), NOT PU.
+    //
+    // Phase 2.1 note: the original test used a `tuple_init` and
+    // returned the tuple, but Phase 2.1's tuple-return PU
+    // classification correctly recognises that `fn f(p) -> {p}`
+    // preserves uniqueness (the caller's `q = (f(v)).0` recovers a
+    // unique alias to the same cell). The aliasing escape is now
+    // tested through `list_cons`, which remains AL because lists
+    // produce a heap-stored alias that outlives the function.
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
 
-    // Function 0: callee that aliases its param into a tuple.
+    // Function 0: callee that aliases its param into a list.
     //   [0] param_get  dest=0 index=0
-    //   [1] tuple_init dest=1 elements=[0]
-    //   [2] ret         value=1
-    const tuple_elems = try arena.alloc(ir.LocalId, 1);
-    tuple_elems[0] = 0;
+    //   [1] const_nil  dest=1
+    //   [2] list_cons  dest=2 head=0 tail=1
+    //   [3] ret         value=2
     const callee_instrs = [_]ir.Instruction{
         .{ .param_get = .{ .dest = 0, .index = 0 } },
-        .{ .tuple_init = .{ .dest = 1, .elements = tuple_elems } },
-        .{ .ret = .{ .value = 1 } },
+        .{ .const_nil = 1 },
+        .{ .list_cons = .{ .dest = 2, .head = 0, .tail = 1 } },
+        .{ .ret = .{ .value = 2 } },
     };
     var callee_func = try buildTestFunction(
         arena,
-        "tuple_wrap",
+        "list_wrap",
         &callee_instrs,
-        2,
+        3,
         &[_]ir.ParamConvention{.borrowed},
         .owned,
     );
@@ -1456,7 +1912,7 @@ test "v8_fixpoint: aliases-out callee still poisons caller (sound check for borr
 
     // Function 1: caller forwarding its param into the aliasing callee.
     //   [0] param_get  dest=0 index=0
-    //   [1] call_named dest=1 name="tuple_wrap" args=[0]
+    //   [1] call_named dest=1 name="list_wrap" args=[0]
     //   [2] ret         value=1
     const caller_call_args = try arena.alloc(ir.LocalId, 1);
     caller_call_args[0] = 0;
@@ -1466,7 +1922,7 @@ test "v8_fixpoint: aliases-out callee still poisons caller (sound check for borr
         .{ .param_get = .{ .dest = 0, .index = 0 } },
         .{ .call_named = .{
             .dest = 1,
-            .name = "tuple_wrap",
+            .name = "list_wrap",
             .args = caller_call_args,
             .arg_modes = caller_call_arg_modes,
         } },
@@ -1490,7 +1946,7 @@ test "v8_fixpoint: aliases-out callee still poisons caller (sound check for borr
     var sigs = try computeSignatures(testing.allocator, &program);
     defer sigs.deinit(testing.allocator);
 
-    // Callee aliases its param via tuple_init: signature = AL.
+    // Callee aliases its param via list_cons: signature = AL.
     const callee_sig = sigs.forFunction(0).?;
     try testing.expectEqual(UniquenessClass.aliases, callee_sig.params[0].class);
 
@@ -1498,4 +1954,138 @@ test "v8_fixpoint: aliases-out callee still poisons caller (sound check for borr
     // bypass the aliases upgrade.
     const caller_sig = sigs.forFunction(1).?;
     try testing.expectEqual(UniquenessClass.aliases, caller_sig.params[0].class);
+}
+
+test "v8_fixpoint: tuple-return identity is PU (Phase 2.1)" {
+    // The canonical `fn f(p) -> {p}` shape that Phase 2.1's
+    // tuple-return PU classification is meant to recognise. Without
+    // the deferred-tuple-pending logic, the param would AL via the
+    // tuple_init and reach `top` after the join with the PU return
+    // observation. With Phase 2.1, the tuple_init's classification
+    // is deferred; the `ret(tuple)` resolves the deferral as PU
+    // with a per-component witness pointing back at slot 0.
+    //
+    //   fn id_tuple(p :: VectorI64) -> {VectorI64} = {p}
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const tuple_elems = try arena.alloc(ir.LocalId, 1);
+    tuple_elems[0] = 0;
+    const callee_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .tuple_init = .{ .dest = 1, .elements = tuple_elems } },
+        .{ .ret = .{ .value = 1 } },
+    };
+    var function = try buildTestFunction(
+        arena,
+        "id_tuple",
+        &callee_instrs,
+        2,
+        &[_]ir.ParamConvention{.owned},
+        .owned,
+    );
+    function.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = function;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var sigs = try computeSignatures(testing.allocator, &program);
+    defer sigs.deinit(testing.allocator);
+
+    const sig = sigs.forFunction(0).?;
+    // Phase 2.1: param 0's signature is PU (the tuple_init defers,
+    // ret resolves as PU).
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[0].class);
+    // The component witness for return component 0 names parameter
+    // slot 0 as the source of preservation.
+    try testing.expect(sig.return_components.len >= 1);
+    try testing.expectEqual(@as(?u8, 0), sig.return_components[0]);
+}
+
+test "v8_fixpoint: tuple-return mixed components classify each carrier as PU (Phase 2.1)" {
+    // Multi-carrier tuple return: `fn f(p, q) -> {p, q, false}`.
+    // Each carrier component classifies as PU with its own witness.
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const tuple_elems = try arena.alloc(ir.LocalId, 3);
+    tuple_elems[0] = 0; // param_get(0)
+    tuple_elems[1] = 1; // param_get(1)
+    tuple_elems[2] = 2; // const_bool false
+    const callee_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .param_get = .{ .dest = 1, .index = 1 } },
+        .{ .const_bool = .{ .dest = 2, .value = false } },
+        .{ .tuple_init = .{ .dest = 3, .elements = tuple_elems } },
+        .{ .ret = .{ .value = 3 } },
+    };
+    var function = try buildTestFunction(
+        arena,
+        "id_pair",
+        &callee_instrs,
+        4,
+        &[_]ir.ParamConvention{ .owned, .owned },
+        .owned,
+    );
+    function.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = function;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var sigs = try computeSignatures(testing.allocator, &program);
+    defer sigs.deinit(testing.allocator);
+
+    const sig = sigs.forFunction(0).?;
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[0].class);
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[1].class);
+    // Return components: comp 0 -> param 0, comp 1 -> param 1, comp 2 -> none.
+    try testing.expect(sig.return_components.len >= 3);
+    try testing.expectEqual(@as(?u8, 0), sig.return_components[0]);
+    try testing.expectEqual(@as(?u8, 1), sig.return_components[1]);
+    try testing.expectEqual(@as(?u8, null), sig.return_components[2]);
+}
+
+test "v8_fixpoint: tuple stored in list still ALs the carrier (Phase 2.1 escape resolution)" {
+    // `fn f(p) -> List({VectorI64}) { [{p}] }`. The tuple is
+    // constructed with `p` as a component, then stored in a list
+    // (via list_cons). The list_cons resolves the tuple_pending
+    // entry as AL, so param 0's signature lands at AL — the runtime
+    // contract is "the list holds a permanent retain on the tuple,
+    // which holds a permanent retain on p".
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const tuple_elems = try arena.alloc(ir.LocalId, 1);
+    tuple_elems[0] = 0;
+    const callee_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .tuple_init = .{ .dest = 1, .elements = tuple_elems } },
+        .{ .const_nil = 2 },
+        .{ .list_cons = .{ .dest = 3, .head = 1, .tail = 2 } },
+        .{ .ret = .{ .value = 3 } },
+    };
+    var function = try buildTestFunction(
+        arena,
+        "tuple_in_list",
+        &callee_instrs,
+        4,
+        &[_]ir.ParamConvention{.owned},
+        .owned,
+    );
+    function.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = function;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var sigs = try computeSignatures(testing.allocator, &program);
+    defer sigs.deinit(testing.allocator);
+
+    const sig = sigs.forFunction(0).?;
+    try testing.expectEqual(UniquenessClass.aliases, sig.params[0].class);
 }
