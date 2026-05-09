@@ -1000,8 +1000,10 @@ fn shouldMoveIntoOwnedConsume(
 fn shouldMoveIntoAggregate(
     function: *const ir.Function,
     summary: *const UseSummary,
+    ownership: *const arc_liveness.ArcOwnership,
     dest: ir.LocalId,
     source: ir.LocalId,
+    local_get_id: arc_liveness.InstructionId,
 ) bool {
     if (dest >= function.local_ownership.len) return false;
     if (function.local_ownership[dest] != .owned) return false;
@@ -1012,10 +1014,26 @@ fn shouldMoveIntoAggregate(
     if (dest_counts.total_use_count != 1) return false;
     if (dest_counts.aggregate_store_use_count != 1) return false;
 
-    const source_counts = summary.get(source);
-    if (source_counts.total_use_count != 1) return false;
-
-    return true;
+    // Phase 2.2 — path-sensitive last-use check on the source (same
+    // as `shouldMoveIntoOwnedConsume`'s Phase 1.4 refinement). The
+    // flat `total_use_count == 1` over-rejects when the source is a
+    // binding read in every arm of an `if_expr` / `case_block` (each
+    // arm reads the binding once; total flat count is N, but along
+    // any one execution path it's 1). The path-sensitive predicate
+    // matches the same correctness criterion already used by the
+    // owned-consume path: source is dead immediately after this read
+    // along the local_get's execution path.
+    //
+    // Fallback to the flat `total_use_count == 1` check when the
+    // analyzer has no `last_use_sites` populated (typical of unit
+    // tests with hand-rolled IR). The flat check is sound but
+    // strictly weaker; production code paths always provide a
+    // populated ownership table.
+    if (ownership.last_use_sites.count() == 0) {
+        const source_counts = summary.get(source);
+        return source_counts.total_use_count == 1;
+    }
+    return ownership.isLastUseAt(source, local_get_id);
 }
 
 const StreamRewriter = struct {
@@ -1112,7 +1130,7 @@ const StreamRewriter = struct {
                         try new_instrs.append(self.allocator, .{
                             .move_value = .{ .dest = lg.dest, .source = lg.source },
                         });
-                    } else if (shouldMoveIntoAggregate(self.function, self.use_summary, lg.dest, lg.source)) {
+                    } else if (shouldMoveIntoAggregate(self.function, self.use_summary, self.ownership, lg.dest, lg.source, local_get_id)) {
                         // Phase E.10: dest's only use is an aggregate-
                         // init operand AND source's only use is this
                         // read. Aggregate-init operand positions are
@@ -2583,6 +2601,16 @@ const UncheckedV8SiteRewriter = struct {
         self: *UncheckedV8SiteRewriter,
         instr: *const ir.Instruction,
     ) error{OutOfMemory}!?ir.Instruction {
+        // CRITICAL: this walker must visit nested sub-streams in the
+        // EXACT SAME ORDER as `v8_uniqueness.Analyzer.walkChildren`.
+        // The id assignment in the first pass mirrors that traversal,
+        // and the rewriter's site queries against `Uniqueness.sites`
+        // are keyed by id. A mismatched traversal order produces
+        // different ids for the same instruction between the analyzer
+        // and the rewriter — causing the rewrite gate to consult the
+        // wrong site predicate. The verifier then re-runs the analyzer
+        // and (correctly) sees a different id space, surfacing as a
+        // V8 violation diagnostic.
         switch (instr.*) {
             .if_expr => |ie| {
                 const new_then = try self.rewriteStream(ie.then_instrs);
@@ -2594,11 +2622,11 @@ const UncheckedV8SiteRewriter = struct {
                 return ir.Instruction{ .if_expr = copy };
             },
             .case_block => |cb| {
+                // Analyzer order: pre, then arms (cond+body each),
+                // then default. Match that here.
                 var any_change = false;
                 const new_pre = try self.rewriteStream(cb.pre_instrs);
                 if (new_pre != null) any_change = true;
-                const new_default = try self.rewriteStream(cb.default_instrs);
-                if (new_default != null) any_change = true;
                 var new_arms = try self.allocator.alloc(ir.IrCaseArm, cb.arms.len);
                 var arms_changed = false;
                 for (cb.arms, 0..) |arm, idx| {
@@ -2615,6 +2643,8 @@ const UncheckedV8SiteRewriter = struct {
                     }
                     new_arms[idx] = arm_copy;
                 }
+                const new_default = try self.rewriteStream(cb.default_instrs);
+                if (new_default != null) any_change = true;
                 if (!any_change and !arms_changed) {
                     self.allocator.free(new_arms);
                     return null;
@@ -2630,9 +2660,8 @@ const UncheckedV8SiteRewriter = struct {
                 return ir.Instruction{ .case_block = copy };
             },
             .switch_literal => |sl| {
+                // Analyzer order: cases first, then default.
                 var any_change = false;
-                const new_default = try self.rewriteStream(sl.default_instrs);
-                if (new_default != null) any_change = true;
                 var new_cases = try self.allocator.alloc(ir.LitCase, sl.cases.len);
                 var cases_changed = false;
                 for (sl.cases, 0..) |c, idx| {
@@ -2644,6 +2673,8 @@ const UncheckedV8SiteRewriter = struct {
                     }
                     new_cases[idx] = c_copy;
                 }
+                const new_default = try self.rewriteStream(sl.default_instrs);
+                if (new_default != null) any_change = true;
                 if (!any_change and !cases_changed) {
                     self.allocator.free(new_cases);
                     return null;
@@ -2658,9 +2689,8 @@ const UncheckedV8SiteRewriter = struct {
                 return ir.Instruction{ .switch_literal = copy };
             },
             .switch_return => |sr| {
+                // Analyzer order: cases first, then default.
                 var any_change = false;
-                const new_default = try self.rewriteStream(sr.default_instrs);
-                if (new_default != null) any_change = true;
                 var new_cases = try self.allocator.alloc(ir.ReturnCase, sr.cases.len);
                 var cases_changed = false;
                 for (sr.cases, 0..) |c, idx| {
@@ -2672,6 +2702,8 @@ const UncheckedV8SiteRewriter = struct {
                     }
                     new_cases[idx] = c_copy;
                 }
+                const new_default = try self.rewriteStream(sr.default_instrs);
+                if (new_default != null) any_change = true;
                 if (!any_change and !cases_changed) {
                     self.allocator.free(new_cases);
                     return null;

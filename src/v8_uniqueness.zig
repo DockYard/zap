@@ -603,9 +603,20 @@ const Analyzer = struct {
                 _ = self.unique.remove(sv.dest);
             },
             .copy_value => |cv| {
-                // copy_value: source kept (caller's refcount stays);
-                // dest takes a new retain. After this point dest is
-                // observably an alias, not the unique owner.
+                // copy_value: emits a runtime retain on `source`,
+                // bumping the cell's refcount to >= 2. After this
+                // point neither `source` nor `dest` are uniquely
+                // owned — both refer to a cell with multiple owners.
+                //
+                // Phase 2.2 audit: the previous handler removed
+                // ONLY dest, leaving source unique. That was unsound
+                // for V8 — a downstream consume site fed by the
+                // (still-unique-marked) source would emit
+                // `*_owned_unchecked` over a refcount-2 cell, which
+                // panics on the runtime's rc==1 fast path assertion.
+                // Mirroring `share_value`'s "both removed" semantics
+                // matches the runtime contract.
+                _ = self.unique.remove(cv.source);
                 _ = self.unique.remove(cv.dest);
             },
             .borrow_value => |bv| {
