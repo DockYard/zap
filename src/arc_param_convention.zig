@@ -196,7 +196,7 @@ pub fn inferConventions(
     // promoting `(F, i)` to `.owned` will be matched by promoting
     // every parent slot in lockstep, so the runtime ABI invariant
     // ("if the callee owns +1, the caller owns a +1 to give") holds.
-    var signatures = try v8_fixpoint.computeSignatures(allocator, program);
+    var signatures = try v8_fixpoint.computeSignaturesWithOwnership(allocator, program, ownerships);
     defer signatures.deinit(allocator);
 
     var lift_set = try computeLiftSet(
@@ -237,11 +237,13 @@ pub fn inferConventions(
                 &function_index,
                 &lift_set,
                 &name_to_id,
+                program,
             );
             const after = countOwnedSlots(function);
             if (after > before) changed = true;
         }
     }
+
 }
 
 /// Set of `(FunctionId, slot)` pairs that have passed the chain-
@@ -296,21 +298,27 @@ fn computeLiftSet(
     function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
     name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
 ) !LiftSet {
+    // Phase 1.3 chain-consistency audit (conservative monotone-up).
+    // A candidate enters lift_set only when every chain dependency
+    // is already in the set OR ends at a non-borrowed source. This
+    // handles self-recursion and "anchored" slots (those whose body
+    // forwards into an owned-mutating builtin or an already-promoted
+    // Zap callee).
+    //
+    // Mutual recursion is NOT lifted by this scheme — slots whose
+    // anchor depends on each other can't bootstrap because neither
+    // side enters the set first. Phase 2's optimistic-seed extension
+    // was tried but produced V8-unsound promotions: the alias-chain
+    // audit passes but the per-instruction uniqueness verifier
+    // (`arc_verifier::runV8`) rejects, because the promoted slot's
+    // body has copy_value/share_value emissions that demote the
+    // receiver's runtime uniqueness. The conservative monotone-up
+    // is the sound choice; lifting mutual-recursion SCCs requires
+    // a stronger pre-flight check that mimics the V8 verifier's
+    // dataflow at audit time. (Future work.)
     var lift_set: LiftSet = .empty;
     errdefer lift_set.deinit(allocator);
 
-    // Iterate the audit to fixpoint. On each iteration, for each
-    // currently-ineligible (F, i) pair where the signature qualifies
-    // and the local checks pass, check whether every call site's
-    // chain root either does NOT terminate at a borrowed param OR
-    // terminates at a borrowed param whose slot is already in the
-    // lift set. If yes, promote (F, i) to lift-eligible.
-    //
-    // The chain-consistency check is SOUND under monotone fixpoint
-    // semantics: at iteration N, a slot is in the lift set only when
-    // every chain it depends on is also in the lift set. The set
-    // never shrinks, so once a slot is in, every chain it participates
-    // in stays consistent.
     var changed = true;
     var iteration: u32 = 0;
     const max_iterations: u32 = 64;
@@ -329,6 +337,7 @@ fn computeLiftSet(
                     function_index,
                     &lift_set,
                     name_to_id,
+                    program,
                 )) continue;
                 try lift_set.put(allocator, liftKey(function.id, slot_index), {});
                 changed = true;
@@ -355,6 +364,7 @@ fn slotPassesAuditConditions(
     function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
     lift_set: *const LiftSet,
     name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
+    program: ?*const ir.Program,
 ) !bool {
     // Condition (1): signature must be CU or PU.
     if (!signatures.isCuOrPu(function.id, slot_index)) return false;
@@ -367,13 +377,14 @@ fn slotPassesAuditConditions(
 
     for (sites) |site| {
         if (site.args.len <= slot_index) continue;
-        if (!try siteAuditEligible(
+        const eligible = try siteAuditEligible(
             site,
             slot_index,
             ownerships,
             function_index,
             lift_set,
-        )) return false;
+        );
+        if (!eligible) return false;
     }
 
     // Condition (4): the slot must satisfy `shouldPromoteSlot`'s
@@ -411,7 +422,7 @@ fn slotPassesAuditConditions(
             break;
         }
     }
-    if (!has_self_recursive and !bodyConsumesParamViaOwnedSink(function, slot_index, lift_set, name_to_id)) {
+    if (!has_self_recursive and !bodyConsumesParamViaOwnedSinkWithProgram(function, slot_index, lift_set, name_to_id, program)) {
         return false;
     }
 
@@ -769,6 +780,7 @@ fn evaluateFunction(
     function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
     lift_set: *const LiftSet,
     name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
+    program: ?*const ir.Program,
 ) !void {
     if (function.param_conventions.len == 0) return;
 
@@ -782,7 +794,7 @@ fn evaluateFunction(
     const conventions: MutableConventions = @constCast(function.param_conventions);
     for (conventions, 0..) |*conv_ptr, slot_index| {
         if (conv_ptr.* != .borrowed) continue;
-        if (try shouldPromoteSlot(function, slot_index, sites, ownerships, function_index, lift_set, name_to_id)) {
+        if (try shouldPromoteSlot(function, slot_index, sites, ownerships, function_index, lift_set, name_to_id, program)) {
             conv_ptr.* = .owned;
         }
     }
@@ -796,6 +808,7 @@ fn shouldPromoteSlot(
     function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
     lift_set: *const LiftSet,
     name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
+    program: ?*const ir.Program,
 ) !bool {
     var has_self_recursive = false;
     for (sites) |site| {
@@ -835,7 +848,7 @@ fn shouldPromoteSlot(
     // function whose only anchor is a forward into another
     // lift-eligible slot still satisfies the consume-side property
     // when the iteration converges.
-    if (!has_self_recursive and !bodyConsumesParamViaOwnedSink(function, slot_index, lift_set, name_to_id)) {
+    if (!has_self_recursive and !bodyConsumesParamViaOwnedSinkWithProgram(function, slot_index, lift_set, name_to_id, program)) {
         return false;
     }
     return true;
@@ -884,6 +897,25 @@ fn bodyConsumesParamViaOwnedSink(
     lift_set: ?*const LiftSet,
     name_to_id: ?*const std.StringHashMapUnmanaged(ir.FunctionId),
 ) bool {
+    return bodyConsumesParamViaOwnedSinkWithProgram(function, param_index, lift_set, name_to_id, null);
+}
+
+/// Phase 2.3 — variant that also receives the `program` so the
+/// anchor check can resolve the callee's `param_conventions[idx]`
+/// directly. Without the program, the helper relies solely on the
+/// `lift_set` predicate, which under-detects functions that have
+/// ALREADY been promoted to `.owned` by a previous fixpoint
+/// iteration. The previous behaviour blocked the chain at the
+/// VectorI64.set wrapper because the wrapper's slot 0 was never
+/// added to lift_set (its callers were across structs and
+/// per-struct lift_set is empty).
+fn bodyConsumesParamViaOwnedSinkWithProgram(
+    function: *const ir.Function,
+    param_index: usize,
+    lift_set: ?*const LiftSet,
+    name_to_id: ?*const std.StringHashMapUnmanaged(ir.FunctionId),
+    program: ?*const ir.Program,
+) bool {
     // Cap the alias-set size to keep the analysis bounded. Map.put,
     // Map.delete, Map.merge wrappers use a single param_get plus a
     // single share_value, so even nested generic functions stay well
@@ -919,6 +951,11 @@ fn bodyConsumesParamViaOwnedSink(
     // `advance_perm` (which only forwards `count` into `rotate_loop`)
     // to satisfy the anchor requirement when the entire chain is being
     // promoted in lockstep.
+    //
+    // Phase 2.3: also accept callees whose slot is ALREADY `.owned`
+    // in the program's param_conventions. Promotions are sticky once
+    // they fire, so a slot that was promoted in a previous fixpoint
+    // iteration provides a valid anchor for any unpromoted caller.
     if (lift_set != null and name_to_id != null) {
         for (function.body) |block| {
             if (streamHasOwnedZapCalleeConsumingAlias(
@@ -926,6 +963,7 @@ fn bodyConsumesParamViaOwnedSink(
                 alias_buf[0..alias_len],
                 lift_set.?,
                 name_to_id.?,
+                program,
             )) return true;
         }
     }
@@ -933,36 +971,52 @@ fn bodyConsumesParamViaOwnedSink(
 }
 
 /// Scan the stream looking for a `call_named`/`call_direct` to a Zap
-/// function whose corresponding parameter slot is in `lift_set` or
-/// already has a `.borrowed`-superseded `.owned` convention. Mirrors
+/// function whose corresponding parameter slot is in `lift_set` OR
+/// already has a `.owned` convention in the program. Mirrors
 /// `streamHasOwnedBuiltinConsumingAlias` but for inter-Zap calls.
 fn streamHasOwnedZapCalleeConsumingAlias(
     stream: []const ir.Instruction,
     alias_set: []const ir.LocalId,
     lift_set: *const LiftSet,
     name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
+    program: ?*const ir.Program,
 ) bool {
+    const targetSlotIsOwned = struct {
+        fn check(prog: ?*const ir.Program, target_id: ir.FunctionId, slot_idx: usize) bool {
+            const p = prog orelse return false;
+            for (p.functions) |*f| {
+                if (f.id == target_id) {
+                    if (slot_idx >= f.param_conventions.len) return false;
+                    return f.param_conventions[slot_idx] == .owned;
+                }
+            }
+            return false;
+        }
+    }.check;
     for (stream) |*instr| {
         switch (instr.*) {
             .call_named => |cn| {
                 if (name_to_id.get(cn.name)) |target_id| {
                     for (cn.args, 0..) |arg, idx| {
                         if (containsAlias(alias_set, arg) and
-                            liftSetContains(lift_set, target_id, idx)) return true;
+                            (liftSetContains(lift_set, target_id, idx) or
+                                targetSlotIsOwned(program, target_id, idx))) return true;
                     }
                 }
             },
             .call_direct => |cd| {
                 for (cd.args, 0..) |arg, idx| {
                     if (containsAlias(alias_set, arg) and
-                        liftSetContains(lift_set, cd.function, idx)) return true;
+                        (liftSetContains(lift_set, cd.function, idx) or
+                            targetSlotIsOwned(program, cd.function, idx))) return true;
                 }
             },
             .try_call_named => |tcn| {
                 if (name_to_id.get(tcn.name)) |target_id| {
                     for (tcn.args, 0..) |arg, idx| {
                         if (containsAlias(alias_set, arg) and
-                            liftSetContains(lift_set, target_id, idx)) return true;
+                            (liftSetContains(lift_set, target_id, idx) or
+                                targetSlotIsOwned(program, target_id, idx))) return true;
                     }
                 }
             },
@@ -970,50 +1024,51 @@ fn streamHasOwnedZapCalleeConsumingAlias(
                 if (name_to_id.get(tc.name)) |target_id| {
                     for (tc.args, 0..) |arg, idx| {
                         if (containsAlias(alias_set, arg) and
-                            liftSetContains(lift_set, target_id, idx)) return true;
+                            (liftSetContains(lift_set, target_id, idx) or
+                                targetSlotIsOwned(program, target_id, idx))) return true;
                     }
                 }
             },
             .if_expr => |ie| {
-                if (streamHasOwnedZapCalleeConsumingAlias(ie.then_instrs, alias_set, lift_set, name_to_id)) return true;
-                if (streamHasOwnedZapCalleeConsumingAlias(ie.else_instrs, alias_set, lift_set, name_to_id)) return true;
+                if (streamHasOwnedZapCalleeConsumingAlias(ie.then_instrs, alias_set, lift_set, name_to_id, program)) return true;
+                if (streamHasOwnedZapCalleeConsumingAlias(ie.else_instrs, alias_set, lift_set, name_to_id, program)) return true;
             },
             .case_block => |cb| {
-                if (streamHasOwnedZapCalleeConsumingAlias(cb.pre_instrs, alias_set, lift_set, name_to_id)) return true;
+                if (streamHasOwnedZapCalleeConsumingAlias(cb.pre_instrs, alias_set, lift_set, name_to_id, program)) return true;
                 for (cb.arms) |arm| {
-                    if (streamHasOwnedZapCalleeConsumingAlias(arm.cond_instrs, alias_set, lift_set, name_to_id)) return true;
-                    if (streamHasOwnedZapCalleeConsumingAlias(arm.body_instrs, alias_set, lift_set, name_to_id)) return true;
+                    if (streamHasOwnedZapCalleeConsumingAlias(arm.cond_instrs, alias_set, lift_set, name_to_id, program)) return true;
+                    if (streamHasOwnedZapCalleeConsumingAlias(arm.body_instrs, alias_set, lift_set, name_to_id, program)) return true;
                 }
-                if (streamHasOwnedZapCalleeConsumingAlias(cb.default_instrs, alias_set, lift_set, name_to_id)) return true;
+                if (streamHasOwnedZapCalleeConsumingAlias(cb.default_instrs, alias_set, lift_set, name_to_id, program)) return true;
             },
             .switch_literal => |sl| {
                 for (sl.cases) |c| {
-                    if (streamHasOwnedZapCalleeConsumingAlias(c.body_instrs, alias_set, lift_set, name_to_id)) return true;
+                    if (streamHasOwnedZapCalleeConsumingAlias(c.body_instrs, alias_set, lift_set, name_to_id, program)) return true;
                 }
-                if (streamHasOwnedZapCalleeConsumingAlias(sl.default_instrs, alias_set, lift_set, name_to_id)) return true;
+                if (streamHasOwnedZapCalleeConsumingAlias(sl.default_instrs, alias_set, lift_set, name_to_id, program)) return true;
             },
             .switch_return => |sr| {
                 for (sr.cases) |c| {
-                    if (streamHasOwnedZapCalleeConsumingAlias(c.body_instrs, alias_set, lift_set, name_to_id)) return true;
+                    if (streamHasOwnedZapCalleeConsumingAlias(c.body_instrs, alias_set, lift_set, name_to_id, program)) return true;
                 }
-                if (streamHasOwnedZapCalleeConsumingAlias(sr.default_instrs, alias_set, lift_set, name_to_id)) return true;
+                if (streamHasOwnedZapCalleeConsumingAlias(sr.default_instrs, alias_set, lift_set, name_to_id, program)) return true;
             },
             .union_switch => |us| {
                 for (us.cases) |c| {
-                    if (streamHasOwnedZapCalleeConsumingAlias(c.body_instrs, alias_set, lift_set, name_to_id)) return true;
+                    if (streamHasOwnedZapCalleeConsumingAlias(c.body_instrs, alias_set, lift_set, name_to_id, program)) return true;
                 }
             },
             .union_switch_return => |usr| {
                 for (usr.cases) |c| {
-                    if (streamHasOwnedZapCalleeConsumingAlias(c.body_instrs, alias_set, lift_set, name_to_id)) return true;
+                    if (streamHasOwnedZapCalleeConsumingAlias(c.body_instrs, alias_set, lift_set, name_to_id, program)) return true;
                 }
             },
             .guard_block => |gb| {
-                if (streamHasOwnedZapCalleeConsumingAlias(gb.body, alias_set, lift_set, name_to_id)) return true;
+                if (streamHasOwnedZapCalleeConsumingAlias(gb.body, alias_set, lift_set, name_to_id, program)) return true;
             },
             .optional_dispatch => |od| {
-                if (streamHasOwnedZapCalleeConsumingAlias(od.nil_instrs, alias_set, lift_set, name_to_id)) return true;
-                if (streamHasOwnedZapCalleeConsumingAlias(od.struct_instrs, alias_set, lift_set, name_to_id)) return true;
+                if (streamHasOwnedZapCalleeConsumingAlias(od.nil_instrs, alias_set, lift_set, name_to_id, program)) return true;
+                if (streamHasOwnedZapCalleeConsumingAlias(od.struct_instrs, alias_set, lift_set, name_to_id, program)) return true;
             },
             else => {},
         }
@@ -1414,8 +1469,19 @@ fn chainIsConsumeMode(
         // For the first iteration this is the share_value site (the
         // surrounding caller already verified this); subsequent
         // iterations check at the prior alias instruction.
-        const last_use = fn_ownership.last_use_map.get(current) orelse return false;
-        if (last_use != current_consume_id) return false;
+        //
+        // Phase 2.3: prefer the path-sensitive `isLastUseAt` predicate
+        // over the single-entry `last_use_map` to handle the case
+        // where a local is read multiple times across mutually-
+        // exclusive branches. The single-entry map records only the
+        // FINAL last-use (last write wins), so reads on disjoint
+        // branches falsely fail the equality check even though each
+        // is genuinely at last-use along its own path. This is the
+        // exact pattern fannkuch's `advance_perm` exhibits — clause 0
+        // and clause 1 each contain their own param_get + alias chain
+        // for the `p` slot, but the analyzer's `last_use_map` only
+        // records the LAST local_get of slot 1 across both clauses.
+        if (!fn_ownership.isLastUseAt(current, current_consume_id)) return false;
 
         // Walk one hop further. If `current` was produced by an
         // alias instruction, the source becomes the new `current`
