@@ -381,7 +381,7 @@ pub var vector_mut_calls_total: u64 = 0;
 pub var vector_unchecked_total: u64 = 0;
 
 /// Per-pool live-cell statistics. Each pool wrapper (e.g.
-/// `ArcRuntime.ArcPool(T)`, `Vector(T).SelfPool`, `Map(K,V).SelfPool`)
+/// `ArcRuntime.ArcPool(T)`, `FlatList(T).SelfPool`, `Map(K,V).SelfPool`)
 /// owns one of these and registers it with `pool_stats_head` on first
 /// allocation. The registration is idempotent: a `registered` flag
 /// guarantees a pool is linked exactly once even though `note*`
@@ -1334,7 +1334,7 @@ pub const ArcRuntime = struct {
     /// Such types are responsible for their own allocation pool and
     /// destruction (via a `release` or `arcReleaseDeep` method) — typically
     /// because they own variable-length payload buffers (`Map(K, V)`,
-    /// `Vector(T)`).
+    /// `FlatList(T)`).
     fn hasInlineArcHeader(comptime T: type) bool {
         const info = @typeInfo(T);
         if (info != .@"struct") return false;
@@ -1392,7 +1392,7 @@ pub const ArcRuntime = struct {
             return releaseAny(allocator, unwrapped);
         }
         const T = arcPtrChild(@TypeOf(ptr));
-        // Inline-header types (`Map(K, V)`, `Vector(T)`, ...) own
+        // Inline-header types (`Map(K, V)`, `FlatList(T)`, ...) own
         // their own pool and bump `arc_releases_total` inside their
         // dedicated `release` method; if the generic wrapper also
         // bumped, every release routed through `releaseAny` would
@@ -1637,12 +1637,11 @@ pub const ArcRuntime = struct {
 };
 
 // ============================================================
-// Vector(T) — Phase 2 of the dense-Map / flat-Vector implementation
-// plan (`docs/dense-map-implementation-plan.md` §1.3).
+// FlatList(T) — single-allocation flat-buffer sequence.
 //
 // Single-allocation flat-buffer mutable array with COW semantics. The
-// cell pointer (`?*const Vector(T)`) points to the buffer. `null` is
-// the empty-vector sentinel — no allocation until first `new_*`.
+// cell pointer (`?*const FlatList(T)`) points to the buffer. `null` is
+// the empty-list sentinel — no allocation until first `new_*`.
 //
 // Layout (single contiguous allocation through `c_allocator`):
 //
@@ -1665,17 +1664,17 @@ pub const ArcRuntime = struct {
 // allocations efficiently — same choice the dense Map made.
 // ============================================================
 
-/// Concrete Vector(i64) alias used by the `lib/vector_i64.zap`
-/// `@native_type = "vector_i64"` surface. Targets fannkuch-redux's
-/// permutation buffer.
-pub const VectorI64 = Vector(i64);
+/// Concrete Vector(i64) surface alias used by `lib/vector_i64.zap`.
+/// Backed by `FlatList(i64)` during the staged List-unification
+/// migration.
+pub const VectorI64 = FlatList(i64);
 
-/// Concrete Vector(f64) alias used by the `lib/vector_f64.zap`
-/// `@native_type = "vector_f64"` surface. Companion to `VectorI64`;
-/// targets spectral-norm's `u`/`v` flat-buffer kernel.
-pub const VectorF64 = Vector(f64);
+/// Concrete Vector(f64) surface alias used by `lib/vector_f64.zap`.
+/// Backed by `FlatList(f64)` during the staged List-unification
+/// migration.
+pub const VectorF64 = FlatList(f64);
 
-pub fn Vector(comptime T: type) type {
+pub fn FlatList(comptime T: type) type {
     return struct {
         const Self = @This();
 
@@ -1886,7 +1885,7 @@ pub fn Vector(comptime T: type) type {
         /// so we retain `size - 1` additional times. The zero-element
         /// edge case requires the caller's +1 to be dropped.
         pub fn new_filled(size: i64, init: T) ?*const Self {
-            if (size < 0) @panic("Vector.new_filled: negative size");
+            if (size < 0) @panic("FlatList.new_filled: negative size");
             const slot_count: u32 = @intCast(size);
             const fresh = bufferAlloc(slot_count, slot_count) orelse return null;
             const data = fresh.dataPtr();
@@ -1905,10 +1904,10 @@ pub fn Vector(comptime T: type) type {
             return fresh;
         }
 
-        /// Allocate an empty vector with the given reserved capacity.
+        /// Allocate an empty list with the given reserved capacity.
         /// The buffer is allocated but `len == 0`.
         pub fn new_empty(initial_capacity: i64) ?*const Self {
-            if (initial_capacity < 0) @panic("Vector.new_empty: negative capacity");
+            if (initial_capacity < 0) @panic("FlatList.new_empty: negative capacity");
             const cap_arg: u32 = @intCast(initial_capacity);
             const cap_final: u32 = if (cap_arg == 0) 4 else cap_arg;
             return bufferAlloc(cap_final, 0);
@@ -1921,9 +1920,9 @@ pub fn Vector(comptime T: type) type {
         /// Bounds-checked element read. Panics on null vector or
         /// out-of-range index.
         pub fn get(vec: ?*const Self, index: i64) T {
-            const v = vec orelse @panic("Vector.get: null vector");
+            const v = vec orelse @panic("FlatList.get: null list");
             const slot: u32 = @intCast(index);
-            if (slot >= v.len) @panic("Vector.get: index out of bounds");
+            if (slot >= v.len) @panic("FlatList.get: index out of bounds");
             return v.slotAtConst(slot).*;
         }
 
@@ -1932,9 +1931,9 @@ pub fn Vector(comptime T: type) type {
         /// returned; on rc>1 the buffer is deep-retain cloned first so
         /// the original observer stays valid.
         pub fn set(vec: ?*const Self, index: i64, value: T) ?*const Self {
-            const v = vec orelse @panic("Vector.set: null vector");
+            const v = vec orelse @panic("FlatList.set: null list");
             const slot: u32 = @intCast(index);
-            if (slot >= v.len) @panic("Vector.set: index out of bounds");
+            if (slot >= v.len) @panic("FlatList.set: index out of bounds");
 
             vector_mut_calls_total += 1;
             if (v.header.count() == 1) {
@@ -2014,8 +2013,8 @@ pub fn Vector(comptime T: type) type {
         /// (NOT the popped value — mirrors the Roc-style `Dict.delete`
         /// in the dense Map). On an empty vector this panics.
         pub fn pop(vec: ?*const Self) ?*const Self {
-            const v = vec orelse @panic("Vector.pop: null vector");
-            if (v.len == 0) @panic("Vector.pop: empty vector");
+            const v = vec orelse @panic("FlatList.pop: null list");
+            if (v.len == 0) @panic("FlatList.pop: empty list");
 
             vector_mut_calls_total += 1;
             if (v.header.count() == 1) {
@@ -2122,9 +2121,9 @@ pub fn Vector(comptime T: type) type {
         /// Like `set`, but skips the rc==1 check. Caller must have
         /// proven uniqueness via V8. See safety contract above.
         pub fn set_owned_unchecked(vec: ?*const Self, index: i64, value: T) ?*const Self {
-            const v = vec orelse @panic("Vector.set_owned_unchecked: null vector");
+            const v = vec orelse @panic("FlatList.set_owned_unchecked: null list");
             const slot: u32 = @intCast(index);
-            if (slot >= v.len) @panic("Vector.set_owned_unchecked: index out of bounds");
+            if (slot >= v.len) @panic("FlatList.set_owned_unchecked: index out of bounds");
 
             vector_mut_calls_total += 1;
             vector_unchecked_total += 1;
@@ -2172,8 +2171,8 @@ pub fn Vector(comptime T: type) type {
         /// proven uniqueness via V8. Panics on empty vector. See
         /// safety contract above.
         pub fn pop_owned_unchecked(vec: ?*const Self) ?*const Self {
-            const v = vec orelse @panic("Vector.pop_owned_unchecked: null vector");
-            if (v.len == 0) @panic("Vector.pop_owned_unchecked: empty vector");
+            const v = vec orelse @panic("FlatList.pop_owned_unchecked: null list");
+            if (v.len == 0) @panic("FlatList.pop_owned_unchecked: empty list");
 
             vector_mut_calls_total += 1;
             vector_unchecked_total += 1;
@@ -5728,7 +5727,7 @@ pub fn List(comptime T: type) type {
         const Self = @This();
 
         // Phase H.1 — `List(T)` cells are now Arc-headered + pool-
-        // allocated, mirroring `Map(K, V)` and `Vector(T)`. The
+        // allocated, mirroring `Map(K, V)` and `FlatList(T)`. The
         // first field is `ArcHeader` so retain/release lower through
         // the same opaque helpers and the inline-header detection in
         // `ArcRuntime.hasInlineArcHeader` recognises the type.
@@ -9981,11 +9980,11 @@ test "instrumentation: V — shared and post-share-mutated" {
 }
 
 // ============================================================
-// Vector(T) — Phase 2: flat-buffer mutable array
+// FlatList(T) — renamed flat-buffer mutable array
 // ============================================================
 
-test "Vector(i64) new_filled allocates and initialises every slot" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) new_filled allocates and initialises every slot" {
+    const VecI64 = FlatList(i64);
     const v = VecI64.new_filled(5, 7) orelse {
         try std.testing.expect(false);
         return;
@@ -9999,8 +9998,8 @@ test "Vector(i64) new_filled allocates and initialises every slot" {
     }
 }
 
-test "Vector(i64) new_empty allocates with reserved capacity and zero len" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) new_empty allocates with reserved capacity and zero len" {
+    const VecI64 = FlatList(i64);
     const v = VecI64.new_empty(8) orelse {
         try std.testing.expect(false);
         return;
@@ -10011,8 +10010,8 @@ test "Vector(i64) new_empty allocates with reserved capacity and zero len" {
     try std.testing.expect(VecI64.capacity(v) >= 8);
 }
 
-test "Vector(i64) get/set roundtrips on rc==1 vector returns same handle" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) get/set roundtrips on rc==1 buffer returns same handle" {
+    const VecI64 = FlatList(i64);
     const v = VecI64.new_filled(3, 0) orelse {
         try std.testing.expect(false);
         return;
@@ -10028,8 +10027,8 @@ test "Vector(i64) get/set roundtrips on rc==1 vector returns same handle" {
     try std.testing.expectEqual(@as(i64, 42), VecI64.get(after_set, 1));
 }
 
-test "Vector(i64) set on rc>1 vector clones; original stays unchanged" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) set on rc>1 buffer clones; original stays unchanged" {
+    const VecI64 = FlatList(i64);
     const original = VecI64.new_filled(3, 0) orelse {
         try std.testing.expect(false);
         return;
@@ -10053,8 +10052,8 @@ test "Vector(i64) set on rc>1 vector clones; original stays unchanged" {
     try std.testing.expectEqual(@as(i64, 99), VecI64.get(updated, 1));
 }
 
-test "Vector(i64) push grows length and persists value (rc==1)" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) push grows length and persists value (rc==1)" {
+    const VecI64 = FlatList(i64);
     const v0 = VecI64.new_empty(2) orelse {
         try std.testing.expect(false);
         return;
@@ -10080,8 +10079,8 @@ test "Vector(i64) push grows length and persists value (rc==1)" {
     try std.testing.expectEqual(@as(i64, 30), VecI64.get(v3, 2));
 }
 
-test "Vector(i64) push past capacity triggers in-place grow on rc==1" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) push past capacity triggers in-place grow on rc==1" {
+    const VecI64 = FlatList(i64);
     var current: ?*const VecI64 = VecI64.new_empty(2) orelse {
         try std.testing.expect(false);
         return;
@@ -10103,8 +10102,8 @@ test "Vector(i64) push past capacity triggers in-place grow on rc==1" {
     try std.testing.expect(VecI64.capacity(current) >= 16);
 }
 
-test "Vector(i64) pop decrements length on rc==1" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) pop decrements length on rc==1" {
+    const VecI64 = FlatList(i64);
     const v = VecI64.new_filled(3, 7) orelse {
         try std.testing.expect(false);
         return;
@@ -10119,8 +10118,8 @@ test "Vector(i64) pop decrements length on rc==1" {
     try std.testing.expectEqual(@as(i64, 2), VecI64.length(popped));
 }
 
-test "Vector(i64) append concatenates two vectors in correct order" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) append concatenates two buffers in correct order" {
+    const VecI64 = FlatList(i64);
     var a: ?*const VecI64 = VecI64.new_empty(0) orelse {
         try std.testing.expect(false);
         return;
@@ -10161,8 +10160,8 @@ test "Vector(i64) append concatenates two vectors in correct order" {
     try std.testing.expectEqual(@as(i64, 4), VecI64.get(result, 3));
 }
 
-test "Vector(i64) retain/release roundtrips refcount" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) retain/release roundtrips refcount" {
+    const VecI64 = FlatList(i64);
     const v = VecI64.new_filled(2, 99) orelse {
         try std.testing.expect(false);
         return;
@@ -10180,8 +10179,8 @@ test "Vector(i64) retain/release roundtrips refcount" {
     VecI64.release(v);
 }
 
-test "Vector(f64) initialises slots and round-trips writes (rc==1 in place)" {
-    const VecF64 = Vector(f64);
+test "FlatList(f64) initialises slots and round-trips writes (rc==1 in place)" {
+    const VecF64 = FlatList(f64);
     const v = VecF64.new_filled(4, 1.5) orelse {
         try std.testing.expect(false);
         return;
@@ -10198,13 +10197,34 @@ test "Vector(f64) initialises slots and round-trips writes (rc==1 in place)" {
     VecF64.release(after_set);
 }
 
-test "Vector deep-releases ARC-managed children on zero-transition" {
+test "FlatList([]const u8) runtime string slices round-trip" {
+    const StringList = FlatList([]const u8);
+    var strings: ?*const StringList = StringList.new_empty(2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    strings = StringList.push(strings, "hello") orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    strings = StringList.push(strings, "world") orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer StringList.release(strings);
+
+    try std.testing.expectEqual(@as(i64, 2), StringList.length(strings));
+    try std.testing.expectEqualStrings("hello", StringList.get(strings, 0));
+    try std.testing.expectEqualStrings("world", StringList.get(strings, 1));
+}
+
+test "FlatList deep-releases ARC-managed children on zero-transition" {
     // Phase 2: when T is an ARC-managed pointer (e.g. ?*const Map(K, V)),
-    // Vector(T)'s release on the zero-transition must walk every live
+    // FlatList(T)'s release on the zero-transition must walk every live
     // element and deep-release it. We mirror the Map and List
     // regression-test pattern.
     const MapI64 = Map(i64, i64);
-    const VecMap = Vector(?*const MapI64);
+    const VecMap = FlatList(?*const MapI64);
 
     const before_releases = arc_releases_total;
 
@@ -10226,7 +10246,7 @@ test "Vector deep-releases ARC-managed children on zero-transition" {
         return;
     };
     // `push` consumes the value (as the cell's durable owner), so each
-    // pushed Map's +1 transfers into the Vector.
+    // pushed Map's +1 transfers into the FlatList.
     vec = VecMap.push(vec, map_one) orelse {
         try std.testing.expect(false);
         return;
@@ -10236,7 +10256,7 @@ test "Vector deep-releases ARC-managed children on zero-transition" {
         return;
     };
 
-    // Release the vector. The Vector's own `release` bumps
+    // Release the buffer. The FlatList's own `release` bumps
     // `arc_releases_total` once (unconditionally, mirroring Map's
     // pattern). On the zero-transition the deep-release walk fires
     // `release` on each child Map, bumping the counter twice more
@@ -10245,8 +10265,52 @@ test "Vector deep-releases ARC-managed children on zero-transition" {
     try std.testing.expectEqual(before_releases + 3, arc_releases_total);
 }
 
+test "FlatList(T) deep-releases struct elements with ARC-managed fields" {
+    const MapI64 = Map(i64, i64);
+    const Holder = struct {
+        child: ?*const MapI64,
+        label: i64,
+    };
+    const HolderList = FlatList(Holder);
+
+    const before_releases = arc_releases_total;
+
+    const keys_one = [_]i64{ 1, 2 };
+    const vals_one = [_]i64{ 10, 20 };
+    const map_one = MapI64.fromPairs(&keys_one, &vals_one, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const keys_two = [_]i64{ 3, 4 };
+    const vals_two = [_]i64{ 30, 40 };
+    const map_two = MapI64.fromPairs(&keys_two, &vals_two, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    var holders: ?*const HolderList = HolderList.new_empty(2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    holders = HolderList.push(holders, .{ .child = map_one, .label = 1 }) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    holders = HolderList.push(holders, .{ .child = map_two, .label = 2 }) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    try std.testing.expectEqual(@as(i64, 2), HolderList.length(holders));
+    try std.testing.expectEqual(@as(i64, 1), HolderList.get(holders, 0).label);
+    try std.testing.expectEqual(@as(i64, 2), HolderList.get(holders, 1).label);
+
+    HolderList.release(holders);
+    try std.testing.expectEqual(before_releases + 3, arc_releases_total);
+}
+
 // ============================================================
-// V8 unchecked-mutation variants — Map and Vector
+// V8 unchecked-mutation variants — Map and FlatList
 // ============================================================
 //
 // These tests exercise the `*_owned_unchecked` runtime functions
@@ -10265,8 +10329,8 @@ test "Vector deep-releases ARC-managed children on zero-transition" {
 // rejects unchecked calls at any site where rc could be > 1.
 // Production callers must always route through V8.
 
-test "Vector(i64) set_owned_unchecked mutates in place and returns same pointer" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) set_owned_unchecked mutates in place and returns same pointer" {
+    const VecI64 = FlatList(i64);
     const v = VecI64.new_filled(3, 0) orelse {
         try std.testing.expect(false);
         return;
@@ -10285,8 +10349,8 @@ test "Vector(i64) set_owned_unchecked mutates in place and returns same pointer"
     try std.testing.expectEqual(before_unchecked + 1, vector_unchecked_total);
 }
 
-test "Vector(i64) push_owned_unchecked grows in place when capacity allows" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) push_owned_unchecked grows in place when capacity allows" {
+    const VecI64 = FlatList(i64);
     const v0 = VecI64.new_empty(4) orelse {
         try std.testing.expect(false);
         return;
@@ -10317,8 +10381,8 @@ test "Vector(i64) push_owned_unchecked grows in place when capacity allows" {
     try std.testing.expectEqual(before_unchecked + 3, vector_unchecked_total);
 }
 
-test "Vector(i64) push_owned_unchecked grows the buffer when capacity is exceeded" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) push_owned_unchecked grows the buffer when capacity is exceeded" {
+    const VecI64 = FlatList(i64);
     var current: ?*const VecI64 = VecI64.new_empty(2) orelse {
         try std.testing.expect(false);
         return;
@@ -10341,8 +10405,8 @@ test "Vector(i64) push_owned_unchecked grows the buffer when capacity is exceede
     try std.testing.expectEqual(@as(u32, 1), current.?.header.count());
 }
 
-test "Vector(i64) pop_owned_unchecked decrements length in place" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) pop_owned_unchecked decrements length in place" {
+    const VecI64 = FlatList(i64);
     const v = VecI64.new_filled(3, 7) orelse {
         try std.testing.expect(false);
         return;
@@ -10357,8 +10421,8 @@ test "Vector(i64) pop_owned_unchecked decrements length in place" {
     try std.testing.expectEqual(@as(i64, 2), VecI64.length(popped));
 }
 
-test "Vector(i64) append_owned_unchecked concatenates in place when capacity fits" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) append_owned_unchecked concatenates in place when capacity fits" {
+    const VecI64 = FlatList(i64);
     const a = VecI64.new_empty(8) orelse {
         try std.testing.expect(false);
         return;
@@ -10391,8 +10455,8 @@ test "Vector(i64) append_owned_unchecked concatenates in place when capacity fit
     try std.testing.expectEqual(@as(i64, 4), VecI64.get(result, 3));
 }
 
-test "Vector(i64) append_owned_unchecked grows when capacity is insufficient" {
-    const VecI64 = Vector(i64);
+test "FlatList(i64) append_owned_unchecked grows when capacity is insufficient" {
+    const VecI64 = FlatList(i64);
     const a = VecI64.new_empty(2) orelse {
         try std.testing.expect(false);
         return;
