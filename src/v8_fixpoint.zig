@@ -513,7 +513,18 @@ fn iterateScc(
         try in_worklist.put(allocator, fid, {});
     }
 
+    // Phase 2.6.1 — bound the SCC fixpoint iteration count. The
+    // monotone lattice (params: 4 levels each; return_components:
+    // per-component witness lattice with bounded oscillation under
+    // correct merge semantics) guarantees convergence; this cap is
+    // a defensive safety net against future changes that might
+    // accidentally introduce non-monotone observations. Sized at
+    // 32× SCC size + 64 to comfortably absorb any in-SCC cascade.
+    var iter_count: u32 = 0;
+    const max_scc_iter: u32 = @intCast(scc.len * 32 + 64);
     while (worklist.pop()) |fid| {
+        iter_count += 1;
+        if (iter_count > max_scc_iter) break;
         _ = in_worklist.remove(fid);
         const func = lookupFunction(program, fid) orelse continue;
 
@@ -718,14 +729,37 @@ fn analyzeFunctionBody(
         // We mutate the per-component witness in place; the slice's
         // backing memory is owned by the signatures arena and freed
         // wholesale at `signatures.deinit`.
+        //
+        // Phase 2.6.1 fixpoint termination: the merge is monotone-down
+        // ONCE a witness has been recorded. Specifically:
+        //   * old=null, observed=Some(slot) -> upgrade to Some(slot).
+        //     This is the FIRST observation of this component.
+        //   * old=Some(x), observed=Some(x) -> no change (consistent).
+        //   * old=Some(x), observed=Some(y!=x) -> downgrade to null
+        //     (disagreement across observations).
+        //   * old=Some(x), observed=null -> KEEP old. The absence of
+        //     an observation in THIS body walk does NOT downgrade a
+        //     witness recorded in a PREVIOUS iteration. The prior
+        //     walk may have observed witnesses through callee
+        //     signatures that have since stabilised; re-walking
+        //     under those same signatures should not strictly
+        //     reduce the observation set unless the per-arm shape
+        //     changed (which can't happen — the IR is fixed).
+        //     Treating absent-observation as a downgrade caused
+        //     infinite SCC oscillation when callee synthesis
+        //     toggled on/off across SCC iterations.
+        //   * old=null, observed=null -> no change.
         const components_mut: []?u8 = @constCast(sig_entry.return_components);
         for (walker.observed_return_components.items, 0..) |observed, i| {
             if (i >= components_mut.len) break;
             const old = components_mut[i];
-            const merged: ?u8 = if (observed) |slot| blk: {
-                if (old == null) break :blk slot;
-                break :blk if (old.? == slot) old else null;
-            } else null;
+            const observed_slot = observed orelse continue;
+            const merged: ?u8 = if (old == null)
+                @as(?u8, observed_slot)
+            else if (old.? == observed_slot)
+                old
+            else
+                null;
             if (merged != old) {
                 components_mut[i] = merged;
                 changed_out.* = true;
@@ -823,44 +857,171 @@ const FlowWalker = struct {
         instr: *const ir.Instruction,
     ) error{OutOfMemory}!void {
         switch (instr.*) {
+            // -----------------------------------------------------
+            // Phase 2.6.1 — `if_expr` / `case_block` /
+            // `switch_literal` / `try_call_named` aggregate their arm
+            // results via a parent `dest` LocalId. After each arm
+            // body finishes, merge the arm's per-arm result-local's
+            // `tuple_pending` and `carrier_of` records into the
+            // parent's `dest`. A downstream `ret(parent.dest)` then
+            // resolves the merged pending and emits a
+            // (possibly demoted) per-component witness.
+            // -----------------------------------------------------
             .if_expr => |ie| {
                 try self.walkStream(ie.then_instrs);
+                if (ie.then_result) |tr| try self.mergeArmResultIntoDest(ie.dest, tr);
                 try self.walkStream(ie.else_instrs);
+                if (ie.else_result) |er| try self.mergeArmResultIntoDest(ie.dest, er);
             },
             .case_block => |cb| {
                 try self.walkStream(cb.pre_instrs);
                 for (cb.arms) |arm| {
                     try self.walkStream(arm.cond_instrs);
                     try self.walkStream(arm.body_instrs);
+                    if (arm.result) |ar| try self.mergeArmResultIntoDest(cb.dest, ar);
                 }
                 try self.walkStream(cb.default_instrs);
+                if (cb.default_result) |dr| try self.mergeArmResultIntoDest(cb.dest, dr);
             },
             .switch_literal => |sl| {
-                for (sl.cases) |c| try self.walkStream(c.body_instrs);
+                for (sl.cases) |c| {
+                    try self.walkStream(c.body_instrs);
+                    if (c.result) |r| try self.mergeArmResultIntoDest(sl.dest, r);
+                }
                 try self.walkStream(sl.default_instrs);
+                if (sl.default_result) |dr| try self.mergeArmResultIntoDest(sl.dest, dr);
             },
+            // -----------------------------------------------------
+            // Phase 2.6.1 — `switch_return` / `union_switch_return` /
+            // `optional_dispatch` are return-equivalent: every arm's
+            // `return_value` (or `default_result` / arm-result) lowers
+            // to an implicit `ret` at codegen. Trigger the existing
+            // `classifyReturnValue` on each so the per-arm tuple_init
+            // contributions roll up into the function's
+            // `return_components` table. Without this hop, multi-clause
+            // tuple-returning functions (fannkuch's `advance_perm`
+            // dispatched via int-literal first param) lose their per-
+            // component PU witness — the caller's destructure-then-V8
+            // chain never sees the witness propagate through the
+            // tuple to the V8 site.
+            // -----------------------------------------------------
             .switch_return => |sr| {
-                for (sr.cases) |c| try self.walkStream(c.body_instrs);
+                for (sr.cases) |c| {
+                    try self.walkStream(c.body_instrs);
+                    if (c.return_value) |rv| try self.classifyReturnValue(rv);
+                }
                 try self.walkStream(sr.default_instrs);
+                if (sr.default_result) |dr| try self.classifyReturnValue(dr);
             },
             .union_switch => |us| {
-                for (us.cases) |c| try self.walkStream(c.body_instrs);
+                for (us.cases) |c| {
+                    try self.walkStream(c.body_instrs);
+                    if (c.return_value) |rv| try self.mergeArmResultIntoDest(us.dest, rv);
+                }
             },
             .union_switch_return => |usr| {
-                for (usr.cases) |c| try self.walkStream(c.body_instrs);
+                for (usr.cases) |c| {
+                    try self.walkStream(c.body_instrs);
+                    if (c.return_value) |rv| try self.classifyReturnValue(rv);
+                }
             },
             .try_call_named => |tcn| {
                 try self.walkStream(tcn.handler_instrs);
+                if (tcn.handler_result) |hr| try self.mergeArmResultIntoDest(tcn.dest, hr);
                 try self.walkStream(tcn.success_instrs);
+                if (tcn.success_result) |sr_local| try self.mergeArmResultIntoDest(tcn.dest, sr_local);
             },
             .guard_block => |gb| {
                 try self.walkStream(gb.body);
             },
             .optional_dispatch => |od| {
                 try self.walkStream(od.nil_instrs);
+                if (od.nil_result) |nr| try self.classifyReturnValue(nr);
                 try self.walkStream(od.struct_instrs);
+                if (od.struct_result) |sr_local| try self.classifyReturnValue(sr_local);
             },
             else => {},
+        }
+    }
+
+    /// Phase 2.6.1 — propagate an arm's result local into the parent
+    /// aggregating instruction's `dest`. The arm result is whatever
+    /// the arm "produces" (the implicit join value at the arm
+    /// boundary); the parent's `dest` is where that join value lives
+    /// in the post-merge stream.
+    ///
+    /// Two pieces of metadata flow through the join:
+    ///   * `tuple_pending` membership: when the arm result is a
+    ///     pending tuple, the dest inherits the pending entry. If
+    ///     the dest already has an entry from a previous arm, the
+    ///     new entry's per-component witnesses are MEET'd into the
+    ///     existing one (matching slot keeps witness; mismatch
+    ///     demotes to null). This models "every arm's contribution
+    ///     must agree for the witness to survive".
+    ///   * `carrier_of`: when the arm result names a parameter slot
+    ///     directly (whole-return PU, not a tuple), the dest
+    ///     inherits the same slot when ALL arms agree. A
+    ///     disagreement removes the dest's entry.
+    fn mergeArmResultIntoDest(
+        self: *FlowWalker,
+        dest: ir.LocalId,
+        arm_result: ir.LocalId,
+    ) !void {
+        if (dest == arm_result) return;
+
+        // Merge tuple_pending. The arm's pending entry transfers
+        // ownership to the dest; subsequent arms merge into that
+        // shared entry under the per-component meet.
+        if (self.tuple_pending.fetchRemove(arm_result)) |kv| {
+            const arm_components = kv.value;
+            if (self.tuple_pending.getPtr(dest)) |dest_components_ptr| {
+                // Existing entry from a previous arm — apply per-
+                // component meet, then free the arm's slice. Per-
+                // component rule:
+                //   * Both arms agree on slot → keep the slot.
+                //   * Disagree → demote to null.
+                //   * One arm has null → demote to null (the arm
+                //     without a witness contributes "no slot
+                //     known" which dominates the meet).
+                const dest_components = dest_components_ptr.*;
+                const min_len = @min(arm_components.len, dest_components.len);
+                for (dest_components[0..min_len], arm_components[0..min_len]) |*dc, ac| {
+                    if (dc.slot != null and ac.slot != null) {
+                        if (dc.slot.? != ac.slot.?) dc.slot = null;
+                    } else {
+                        dc.slot = null;
+                    }
+                }
+                // Components beyond min_len stay as they were on
+                // the dest. A future arm that exhibits a different
+                // shape would conservatively resolve those as null
+                // since their slots are absent in this arm.
+                self.allocator.free(arm_components);
+            } else {
+                // First arm to contribute — install the arm's slice
+                // directly under dest.
+                try self.tuple_pending.put(self.allocator, dest, arm_components);
+            }
+        }
+
+        // Merge carrier_of. The dest inherits the arm's slot when
+        // the dest had no prior carrier (first arm to contribute)
+        // or all arms agree on the same slot. Disagreement removes
+        // the dest's entry so a downstream classifier sees "no
+        // carrier".
+        if (self.carrier_of.get(arm_result)) |arm_slot| {
+            if (self.carrier_of.get(dest)) |existing_slot| {
+                if (existing_slot != arm_slot) {
+                    _ = self.carrier_of.remove(dest);
+                }
+            } else {
+                try self.carrier_of.put(self.allocator, dest, arm_slot);
+            }
+        } else {
+            // Arm has no carrier — if a previous arm did, demote
+            // the dest by removing the carrier (every arm must
+            // agree).
+            _ = self.carrier_of.remove(dest);
         }
     }
 
@@ -2088,4 +2249,248 @@ test "v8_fixpoint: tuple stored in list still ALs the carrier (Phase 2.1 escape 
 
     const sig = sigs.forFunction(0).?;
     try testing.expectEqual(UniquenessClass.aliases, sig.params[0].class);
+}
+
+// ============================================================
+// Phase 2.6.1 — signature propagation through aggregating
+// control flow. Multi-clause functions whose tuple return flows
+// through `switch_return`, `if_expr`, `case_block`,
+// `switch_literal`, or `optional_dispatch` previously dropped
+// the per-component witness because the walker did not classify
+// the per-arm result locals at the merge point. The fix:
+//
+//   * `switch_return` / `union_switch_return` — every arm's
+//     `return_value` (and the `default_result`) is a return-
+//     equivalent sink. Trigger `classifyReturnValue` on each so
+//     the per-arm tuple_init contributions roll up into the
+//     function's `return_components` table.
+//   * `if_expr` / `case_block` / `switch_literal` /
+//     `try_call_named` — these aggregate via a parent `dest`
+//     LocalId. Merge each arm's result-local `tuple_pending`
+//     entry into the parent dest's entry under per-component
+//     meet semantics so a downstream `ret(parent.dest)` resolves
+//     the merged pending and emits a (possibly demoted) per-
+//     component witness.
+//   * `optional_dispatch` — each arm's result is a return-
+//     equivalent sink at codegen time (the ZIR backend lowers
+//     each arm with an implicit `ret`). Treat both arm results
+//     like `switch_return` arms.
+// ============================================================
+
+test "v8_fixpoint: switch_return per-arm tuple_init records per-component PU witness (Phase 2.6.1)" {
+    // Multi-clause function dispatched on the first param's int
+    // literal, both arms build a tuple from the remaining params
+    // in matching positions. Both arms must record their per-
+    // component PU witnesses on the function's signature.
+    //
+    //   pub fn advance(1, p, q) -> {VectorI64, VectorI64} { {p, q} }
+    //   pub fn advance(_, p, q) -> {VectorI64, VectorI64} { {p, q} }
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Case 1 body: param_get(1) -> p, param_get(2) -> q,
+    //              tuple_init({p, q}) -> t.
+    const case_1_elems = try arena.alloc(ir.LocalId, 2);
+    case_1_elems[0] = 10;
+    case_1_elems[1] = 11;
+    const case_1_body = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 10, .index = 1 } },
+        .{ .param_get = .{ .dest = 11, .index = 2 } },
+        .{ .tuple_init = .{ .dest = 12, .elements = case_1_elems } },
+    });
+
+    // Default body: same shape.
+    const default_elems = try arena.alloc(ir.LocalId, 2);
+    default_elems[0] = 20;
+    default_elems[1] = 21;
+    const default_body = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 20, .index = 1 } },
+        .{ .param_get = .{ .dest = 21, .index = 2 } },
+        .{ .tuple_init = .{ .dest = 22, .elements = default_elems } },
+    });
+
+    const cases = try arena.alloc(ir.ReturnCase, 1);
+    cases[0] = .{
+        .value = .{ .int = 1 },
+        .body_instrs = case_1_body,
+        .return_value = 12,
+    };
+
+    const callee_instrs = [_]ir.Instruction{
+        .{ .switch_return = .{
+            .scrutinee_param = 0,
+            .cases = cases,
+            .default_instrs = default_body,
+            .default_result = 22,
+        } },
+    };
+
+    var function = try buildTestFunction(
+        arena,
+        "advance_same_shape",
+        &callee_instrs,
+        23,
+        &[_]ir.ParamConvention{ .owned, .owned, .owned },
+        .owned,
+    );
+    function.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = function;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var sigs = try computeSignatures(testing.allocator, &program);
+    defer sigs.deinit(testing.allocator);
+
+    const sig = sigs.forFunction(0).?;
+    // params 1 and 2 should both classify as PU (each appears as a
+    // tuple component in every return arm, and both arms agree).
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[1].class);
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[2].class);
+    // return_components: both arms agree on (component 0 -> param 1,
+    // component 1 -> param 2). Witnesses preserve through the meet.
+    try testing.expect(sig.return_components.len >= 2);
+    try testing.expectEqual(@as(?u8, 1), sig.return_components[0]);
+    try testing.expectEqual(@as(?u8, 2), sig.return_components[1]);
+}
+
+test "v8_fixpoint: switch_return disagreeing arms demote witness (Phase 2.6.1)" {
+    // Case-1 returns {p, q}; default returns {q, p}. The per-arm
+    // observations disagree on which slot occupies each component,
+    // so the merge meet demotes both component witnesses to null.
+    // Per-param classification still rolls up to PU because each
+    // param is a tuple-component carrier in some arm.
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const case_1_elems = try arena.alloc(ir.LocalId, 2);
+    case_1_elems[0] = 10; // param 1
+    case_1_elems[1] = 11; // param 2
+    const case_1_body = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 10, .index = 1 } },
+        .{ .param_get = .{ .dest = 11, .index = 2 } },
+        .{ .tuple_init = .{ .dest = 12, .elements = case_1_elems } },
+    });
+
+    const default_elems = try arena.alloc(ir.LocalId, 2);
+    default_elems[0] = 21; // param 2 — flipped
+    default_elems[1] = 20; // param 1
+    const default_body = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 20, .index = 1 } },
+        .{ .param_get = .{ .dest = 21, .index = 2 } },
+        .{ .tuple_init = .{ .dest = 22, .elements = default_elems } },
+    });
+
+    const cases = try arena.alloc(ir.ReturnCase, 1);
+    cases[0] = .{
+        .value = .{ .int = 1 },
+        .body_instrs = case_1_body,
+        .return_value = 12,
+    };
+
+    const callee_instrs = [_]ir.Instruction{
+        .{ .switch_return = .{
+            .scrutinee_param = 0,
+            .cases = cases,
+            .default_instrs = default_body,
+            .default_result = 22,
+        } },
+    };
+
+    var function = try buildTestFunction(
+        arena,
+        "advance_disagree",
+        &callee_instrs,
+        23,
+        &[_]ir.ParamConvention{ .owned, .owned, .owned },
+        .owned,
+    );
+    function.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = function;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var sigs = try computeSignatures(testing.allocator, &program);
+    defer sigs.deinit(testing.allocator);
+
+    const sig = sigs.forFunction(0).?;
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[1].class);
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[2].class);
+    try testing.expect(sig.return_components.len >= 2);
+    try testing.expectEqual(@as(?u8, null), sig.return_components[0]);
+    try testing.expectEqual(@as(?u8, null), sig.return_components[1]);
+}
+
+test "v8_fixpoint: if_expr arm result merges tuple_pending into dest (Phase 2.6.1)" {
+    // Function shape:
+    //   pub fn pick(b, p, q) -> {VectorI64, VectorI64} {
+    //     if b { {p, q} } else { {p, q} }
+    //   }
+    //
+    // The if_expr's `dest` is the merge of the two arm results;
+    // both arms produce a tuple_pending entry whose components map
+    // (p, q). The merged dest should also be a tuple_pending entry,
+    // and the outer `ret` should resolve it as PU with per-component
+    // witnesses pointing at param slots 1 and 2.
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const then_elems = try arena.alloc(ir.LocalId, 2);
+    then_elems[0] = 10;
+    then_elems[1] = 11;
+    const then_body = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 10, .index = 1 } },
+        .{ .param_get = .{ .dest = 11, .index = 2 } },
+        .{ .tuple_init = .{ .dest = 12, .elements = then_elems } },
+    });
+
+    const else_elems = try arena.alloc(ir.LocalId, 2);
+    else_elems[0] = 20;
+    else_elems[1] = 21;
+    const else_body = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 20, .index = 1 } },
+        .{ .param_get = .{ .dest = 21, .index = 2 } },
+        .{ .tuple_init = .{ .dest = 22, .elements = else_elems } },
+    });
+
+    const callee_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .if_expr = .{
+            .dest = 1,
+            .condition = 0,
+            .then_instrs = then_body,
+            .then_result = 12,
+            .else_instrs = else_body,
+            .else_result = 22,
+        } },
+        .{ .ret = .{ .value = 1 } },
+    };
+
+    var function = try buildTestFunction(
+        arena,
+        "pick",
+        &callee_instrs,
+        23,
+        &[_]ir.ParamConvention{ .trivial, .owned, .owned },
+        .owned,
+    );
+    function.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = function;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var sigs = try computeSignatures(testing.allocator, &program);
+    defer sigs.deinit(testing.allocator);
+
+    const sig = sigs.forFunction(0).?;
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[1].class);
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[2].class);
+    try testing.expect(sig.return_components.len >= 2);
+    try testing.expectEqual(@as(?u8, 1), sig.return_components[0]);
+    try testing.expectEqual(@as(?u8, 2), sig.return_components[1]);
 }

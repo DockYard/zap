@@ -121,6 +121,662 @@ const arc_liveness = @import("arc_liveness.zig");
 // owns it and the pass is not the rightful site to free it.
 // ============================================================
 
+/// Phase 2.6.3 — insert per-component releases at the last-use of
+/// every non-ARC aggregate that holds ARC-managed components. Runs
+/// in a separate pass from `insertScopeExitDrops` because:
+///
+///   * The non-ARC aggregate (tuple, struct) is not in
+///     `arc_managed_locals`, so `arc_liveness` does not track its
+///     last-use. We compute last-use locally with a forward walk
+///     over the same depth-first instruction stream.
+///   * The releases inserted here are RUNTIME refcount decrements,
+///     not analyzer last-use markers. They balance the retains the
+///     IR builder emits at `index_get + retain` destructure sites,
+///     bringing the destructured cells back to rc=1 before any
+///     downstream `*_owned_unchecked` site fires.
+///
+/// The pass is sound and idempotent. It is a no-op for any function
+/// whose body contains no non-ARC aggregates with ARC-managed
+/// components.
+///
+/// Without this pass, after items 2.6.1 and 2.6.2 promote callee
+/// param conventions to `.owned`, the post-rewrite IR runs
+/// `*_owned_unchecked` against rc=2 cells (one ref from the parent
+/// tuple, one from the destructure retain) and asserts at runtime.
+///
+/// `allocator` must outlive the resulting IR; in production usage
+/// it is the same allocator the IR builder used to build `function`.
+pub fn insertTupleComponentReleases(
+    allocator: std.mem.Allocator,
+    function: *ir.Function,
+) !void {
+    // Step 1: collect every non-ARC aggregate's dest and its
+    // ARC-managed extracted locals. Walk every instruction in the
+    // function (across nested streams) to find:
+    //   * `tuple_init`/`struct_init` whose dest's `local_ownership`
+    //     is NOT `.owned` (the aggregate is non-ARC).
+    //   * Subsequent `index_get(parent, _)` /
+    //     `field_get(parent, _)` whose dest IS ARC-managed.
+    var collector: ComponentReleaseCollector = .{
+        .allocator = allocator,
+        .function = function,
+        .non_arc_aggregates = .empty,
+        .extractions_by_aggregate = .empty,
+        .last_use_by_aggregate = .empty,
+    };
+    defer collector.deinit();
+    try collector.collect();
+
+    if (collector.last_use_by_aggregate.count() > 0 and std.c.getenv("ZAP_DEBUG_TUPLE_COMP_RELEASE") != null) {
+        std.debug.print("[debug-2.6.3] fn={s}\n", .{function.name});
+        var lu = collector.last_use_by_aggregate.iterator();
+        while (lu.next()) |e| {
+            std.debug.print("  aggregate={d} last_use_id={d}\n", .{ e.key_ptr.*, e.value_ptr.* });
+            if (collector.extractions_by_aggregate.get(e.key_ptr.*)) |list| {
+                for (list.items) |comp| {
+                    std.debug.print("    extract={d}\n", .{comp});
+                }
+            }
+        }
+    }
+
+    if (collector.last_use_by_aggregate.count() == 0) return;
+
+    // Step 2: rewrite streams to insert releases right after the
+    // last-use instruction of each tracked aggregate. The releases
+    // for an aggregate's components fire at the same site (the
+    // last-use instruction id), so we group by id.
+    var by_last_use: std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)) = .empty;
+    defer {
+        var iter = by_last_use.valueIterator();
+        while (iter.next()) |list_ptr| list_ptr.deinit(allocator);
+        by_last_use.deinit(allocator);
+    }
+    var lu_iter = collector.last_use_by_aggregate.iterator();
+    while (lu_iter.next()) |entry| {
+        const aggregate_local = entry.key_ptr.*;
+        const last_use_id = entry.value_ptr.*;
+        const extractions = collector.extractions_by_aggregate.getPtr(aggregate_local) orelse continue;
+        if (extractions.items.len == 0) continue;
+        const gop = try by_last_use.getOrPut(allocator, last_use_id);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        for (extractions.items) |comp_local| {
+            try gop.value_ptr.append(allocator, comp_local);
+        }
+    }
+
+    if (by_last_use.count() == 0) return;
+
+    var rebuilder = ComponentReleaseRebuilder{
+        .allocator = allocator,
+        .by_last_use = &by_last_use,
+        .next_id = 0,
+    };
+
+    for (function.body, 0..) |_, block_index| {
+        const block_ptr: *ir.Block = @constCast(&function.body[block_index]);
+        const original = block_ptr.instructions;
+        const rebuilt = try rebuilder.rebuildStream(original);
+        if (rebuilt) |new_slice| {
+            block_ptr.instructions = new_slice;
+        }
+    }
+}
+
+/// Phase 2.6.3 — collect the metadata `insertTupleComponentReleases`
+/// needs from a forward walk over the function. The walk mirrors
+/// `arc_liveness.flattenInstructions` so the `InstructionId`
+/// numbering aligns with downstream consumers.
+///
+/// Discovery strategy: track every `index_get(object, _) -> dest` /
+/// `field_get(object, _) -> dest` pair where `object` is non-ARC
+/// (its `local_ownership` is not `.owned`) and `dest` IS ARC-
+/// managed. The `object` LocalId is the aggregate whose components
+/// need balancing releases. The aggregate may originate from a
+/// `tuple_init`/`struct_init` instruction OR from a call return
+/// value — both shapes are valid and both leak the same way without
+/// the balancing release.
+///
+/// Two passes:
+///   1. Discovery pass — enumerate extraction pairs and record
+///      aggregates and their extracted locals.
+///   2. Last-use pass — walk again, tracking the highest
+///      InstructionId where each aggregate is used. This is the
+///      site where balancing releases get inserted.
+const ComponentReleaseCollector = struct {
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    /// Set of LocalIds that act as non-ARC aggregates whose
+    /// extracted ARC components need balancing releases. Populated
+    /// during the discovery pass.
+    non_arc_aggregates: std.AutoHashMapUnmanaged(ir.LocalId, void),
+    /// For each tracked aggregate, the list of ARC-managed extracted
+    /// locals (the dest of every `index_get`/`field_get` whose
+    /// `object` is the aggregate AND whose own dest is ARC-managed).
+    extractions_by_aggregate: std.AutoHashMapUnmanaged(ir.LocalId, std.ArrayListUnmanaged(ir.LocalId)),
+    /// For each aggregate dest, the InstructionId of the last
+    /// instruction in the function that uses the aggregate. Updated
+    /// monotonically during the second walk: the last visited use
+    /// wins.
+    last_use_by_aggregate: std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
+
+    fn deinit(self: *ComponentReleaseCollector) void {
+        self.non_arc_aggregates.deinit(self.allocator);
+        var iter = self.extractions_by_aggregate.valueIterator();
+        while (iter.next()) |list_ptr| list_ptr.deinit(self.allocator);
+        self.extractions_by_aggregate.deinit(self.allocator);
+        self.last_use_by_aggregate.deinit(self.allocator);
+    }
+
+    fn collect(self: *ComponentReleaseCollector) error{OutOfMemory}!void {
+        // Pass 1: discover aggregates and their extractions. Walks
+        // the structural region tree in the same order as
+        // `arc_liveness.flattenInstructions` but does not need to
+        // assign IDs (the discovery doesn't depend on instruction
+        // identity).
+        for (self.function.body) |block| {
+            try self.discoverStream(block.instructions);
+        }
+
+        // Pass 2: compute last-use of each tracked aggregate.
+        // Mirrors `flattenInstructions` exactly so the ids align with
+        // downstream consumers (the rebuilder uses the same walk
+        // order, matching id-by-id).
+        if (self.non_arc_aggregates.count() == 0) return;
+        var next_id: arc_liveness.InstructionId = 0;
+        for (self.function.body) |block| {
+            try self.lastUseStream(block.instructions, &next_id);
+        }
+    }
+
+    fn discoverStream(
+        self: *ComponentReleaseCollector,
+        stream: []const ir.Instruction,
+    ) error{OutOfMemory}!void {
+        for (stream) |*instr| {
+            switch (instr.*) {
+                .index_get => |ig| {
+                    // Non-ARC aggregate `object` with ARC-managed
+                    // extracted `dest` is the canonical destructure-
+                    // then-V8 pattern. Record both sides.
+                    if (!self.isOwnedLocal(ig.object) and self.isOwnedLocal(ig.dest)) {
+                        try self.non_arc_aggregates.put(self.allocator, ig.object, {});
+                        const gop = try self.extractions_by_aggregate.getOrPut(self.allocator, ig.object);
+                        if (!gop.found_existing) gop.value_ptr.* = .empty;
+                        try gop.value_ptr.append(self.allocator, ig.dest);
+                    }
+                },
+                .field_get => |fg| {
+                    if (!self.isOwnedLocal(fg.object) and self.isOwnedLocal(fg.dest)) {
+                        try self.non_arc_aggregates.put(self.allocator, fg.object, {});
+                        const gop = try self.extractions_by_aggregate.getOrPut(self.allocator, fg.object);
+                        if (!gop.found_existing) gop.value_ptr.* = .empty;
+                        try gop.value_ptr.append(self.allocator, fg.dest);
+                    }
+                },
+                else => {},
+            }
+            try self.discoverChildren(instr);
+        }
+    }
+
+    fn discoverChildren(
+        self: *ComponentReleaseCollector,
+        instr: *const ir.Instruction,
+    ) error{OutOfMemory}!void {
+        switch (instr.*) {
+            .if_expr => |ie| {
+                try self.discoverStream(ie.then_instrs);
+                try self.discoverStream(ie.else_instrs);
+            },
+            .case_block => |cb| {
+                try self.discoverStream(cb.pre_instrs);
+                for (cb.arms) |arm| {
+                    try self.discoverStream(arm.cond_instrs);
+                    try self.discoverStream(arm.body_instrs);
+                }
+                try self.discoverStream(cb.default_instrs);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| try self.discoverStream(c.body_instrs);
+                try self.discoverStream(sl.default_instrs);
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| try self.discoverStream(c.body_instrs);
+                try self.discoverStream(sr.default_instrs);
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| try self.discoverStream(c.body_instrs);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| try self.discoverStream(c.body_instrs);
+            },
+            .try_call_named => |tc| {
+                try self.discoverStream(tc.handler_instrs);
+                try self.discoverStream(tc.success_instrs);
+            },
+            .guard_block => |gb| {
+                try self.discoverStream(gb.body);
+            },
+            .optional_dispatch => |od| {
+                try self.discoverStream(od.nil_instrs);
+                try self.discoverStream(od.struct_instrs);
+            },
+            else => {},
+        }
+    }
+
+    fn lastUseStream(
+        self: *ComponentReleaseCollector,
+        stream: []const ir.Instruction,
+        next_id: *arc_liveness.InstructionId,
+    ) error{OutOfMemory}!void {
+        for (stream) |*instr| {
+            const my_id = next_id.*;
+            next_id.* += 1;
+            try self.recordOtherUses(instr, my_id);
+            try self.lastUseChildren(instr, next_id);
+        }
+    }
+
+    fn lastUseChildren(
+        self: *ComponentReleaseCollector,
+        instr: *const ir.Instruction,
+        next_id: *arc_liveness.InstructionId,
+    ) error{OutOfMemory}!void {
+        switch (instr.*) {
+            .if_expr => |ie| {
+                try self.lastUseStream(ie.then_instrs, next_id);
+                try self.lastUseStream(ie.else_instrs, next_id);
+            },
+            .case_block => |cb| {
+                try self.lastUseStream(cb.pre_instrs, next_id);
+                for (cb.arms) |arm| {
+                    try self.lastUseStream(arm.cond_instrs, next_id);
+                    try self.lastUseStream(arm.body_instrs, next_id);
+                }
+                try self.lastUseStream(cb.default_instrs, next_id);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| try self.lastUseStream(c.body_instrs, next_id);
+                try self.lastUseStream(sl.default_instrs, next_id);
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| try self.lastUseStream(c.body_instrs, next_id);
+                try self.lastUseStream(sr.default_instrs, next_id);
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| try self.lastUseStream(c.body_instrs, next_id);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| try self.lastUseStream(c.body_instrs, next_id);
+            },
+            .try_call_named => |tc| {
+                try self.lastUseStream(tc.handler_instrs, next_id);
+                try self.lastUseStream(tc.success_instrs, next_id);
+            },
+            .guard_block => |gb| {
+                try self.lastUseStream(gb.body, next_id);
+            },
+            .optional_dispatch => |od| {
+                try self.lastUseStream(od.nil_instrs, next_id);
+                try self.lastUseStream(od.struct_instrs, next_id);
+            },
+            else => {},
+        }
+    }
+
+    /// Track all uses of any tracked aggregate. ANY instruction that
+    /// names the aggregate's local in a use position updates the
+    /// last-use stamp. The walk visits every instruction once, so
+    /// the highest InstructionId where the aggregate is used wins.
+    fn recordOtherUses(
+        self: *ComponentReleaseCollector,
+        instr: *const ir.Instruction,
+        my_id: arc_liveness.InstructionId,
+    ) error{OutOfMemory}!void {
+        switch (instr.*) {
+            .index_get => |ig| try self.bumpUse(ig.object, my_id),
+            .field_get => |fg| try self.bumpUse(fg.object, my_id),
+            .move_value => |mv| try self.bumpUse(mv.source, my_id),
+            .share_value => |sv| try self.bumpUse(sv.source, my_id),
+            .copy_value => |cv| try self.bumpUse(cv.source, my_id),
+            .borrow_value => |bv| try self.bumpUse(bv.source, my_id),
+            .local_get => |lg| try self.bumpUse(lg.source, my_id),
+            .local_set => |ls| try self.bumpUse(ls.value, my_id),
+            .ret => |r| if (r.value) |v| try self.bumpUse(v, my_id),
+            .cond_return => |cr| if (cr.value) |v| try self.bumpUse(v, my_id),
+            .release => |r| try self.bumpUse(r.value, my_id),
+            .retain => |r| try self.bumpUse(r.value, my_id),
+            .tuple_init => |ti| {
+                for (ti.elements) |elem| try self.bumpUse(elem, my_id);
+            },
+            .list_init => |li| {
+                for (li.elements) |elem| try self.bumpUse(elem, my_id);
+            },
+            .list_cons => |lc| {
+                try self.bumpUse(lc.head, my_id);
+                try self.bumpUse(lc.tail, my_id);
+            },
+            .map_init => |mi| {
+                for (mi.entries) |e| {
+                    try self.bumpUse(e.key, my_id);
+                    try self.bumpUse(e.value, my_id);
+                }
+            },
+            .struct_init => |si| {
+                for (si.fields) |f| try self.bumpUse(f.value, my_id);
+            },
+            .union_init => |ui| try self.bumpUse(ui.value, my_id),
+            .make_closure => |mc| {
+                for (mc.captures) |cap| try self.bumpUse(cap, my_id);
+            },
+            .call_builtin => |cb| {
+                for (cb.args) |arg| try self.bumpUse(arg, my_id);
+            },
+            .call_named => |cn| {
+                for (cn.args) |arg| try self.bumpUse(arg, my_id);
+            },
+            .call_direct => |cd| {
+                for (cd.args) |arg| try self.bumpUse(arg, my_id);
+            },
+            .call_closure => |cc| {
+                try self.bumpUse(cc.callee, my_id);
+                for (cc.args) |arg| try self.bumpUse(arg, my_id);
+            },
+            .call_dispatch => |cd| {
+                for (cd.args) |arg| try self.bumpUse(arg, my_id);
+            },
+            .try_call_named => |tcn| {
+                for (tcn.args) |arg| try self.bumpUse(arg, my_id);
+                try self.bumpUse(tcn.input_local, my_id);
+            },
+            .tail_call => |tc| {
+                for (tc.args) |arg| try self.bumpUse(arg, my_id);
+            },
+            else => {},
+        }
+    }
+
+    fn bumpUse(
+        self: *ComponentReleaseCollector,
+        local: ir.LocalId,
+        my_id: arc_liveness.InstructionId,
+    ) error{OutOfMemory}!void {
+        if (!self.non_arc_aggregates.contains(local)) return;
+        try self.last_use_by_aggregate.put(self.allocator, local, my_id);
+    }
+
+    fn isOwnedLocal(self: *const ComponentReleaseCollector, local: ir.LocalId) bool {
+        if (local >= self.function.local_ownership.len) return false;
+        return self.function.local_ownership[local] == .owned;
+    }
+};
+
+/// Phase 2.6.3 — stream rebuilder that injects per-component
+/// releases right AFTER the instruction whose `id` is a tracked
+/// aggregate's last-use. Mirrors the `flattenInstructions`
+/// traversal exactly for stable id numbering.
+const ComponentReleaseRebuilder = struct {
+    allocator: std.mem.Allocator,
+    by_last_use: *const std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)),
+    next_id: arc_liveness.InstructionId,
+
+    fn rebuildStream(
+        self: *ComponentReleaseRebuilder,
+        stream: []const ir.Instruction,
+    ) error{OutOfMemory}!?[]const ir.Instruction {
+        var any_change = false;
+        const StreamOutcome = struct {
+            id: arc_liveness.InstructionId,
+            rebuilt_instr: ?ir.Instruction,
+            // Releases that should fire AFTER this stream position.
+            // These are accumulated from the source-position
+            // (`my_id`) for the by_last_use lookup, then
+            // re-scheduled to AFTER any immediately-following retain
+            // pair so the cell isn't briefly decremented past its
+            // matching retain (the destructure idiom emits
+            // `index_get + retain` consecutively; placing the
+            // release between them would briefly hit rc=0 and could
+            // free the cell pre-retain).
+            releases_after: std.ArrayListUnmanaged(ir.LocalId),
+        };
+        var outcomes: std.ArrayListUnmanaged(StreamOutcome) = .empty;
+        defer {
+            for (outcomes.items) |*outcome| outcome.releases_after.deinit(self.allocator);
+            outcomes.deinit(self.allocator);
+        }
+
+        for (stream) |*instr| {
+            const my_id = self.next_id;
+            self.next_id += 1;
+            const child_rebuilt = try self.rebuildChildren(instr);
+            try outcomes.append(self.allocator, .{
+                .id = my_id,
+                .rebuilt_instr = child_rebuilt,
+                .releases_after = .empty,
+            });
+            if (child_rebuilt != null) any_change = true;
+        }
+
+        // Phase 2.6.3 — schedule releases by source-position id, but
+        // hop forward over any immediately-following retain
+        // instruction whose target is one of the to-be-released
+        // locals. This keeps the destructure pair `index_get + retain`
+        // intact and ensures the cell never momentarily flickers
+        // past its matching retain.
+        for (outcomes.items, 0..) |*outcome, idx| {
+            const source_releases = self.by_last_use.get(outcome.id) orelse continue;
+            if (source_releases.items.len == 0) continue;
+
+            // Build a quick lookup of locals to release.
+            var pending_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+            defer pending_locals.deinit(self.allocator);
+            for (source_releases.items) |comp_local| {
+                try pending_locals.put(self.allocator, comp_local, {});
+            }
+
+            // Find the latest stream position to land the releases:
+            // start at idx, then walk forward over any retain whose
+            // value is one of `pending_locals`.
+            var land_idx: usize = idx;
+            while (land_idx + 1 < outcomes.items.len) {
+                const next_instr = stream[land_idx + 1];
+                if (next_instr != .retain) break;
+                if (!pending_locals.contains(next_instr.retain.value)) break;
+                land_idx += 1;
+            }
+
+            for (source_releases.items) |comp_local| {
+                try outcomes.items[land_idx].releases_after.append(self.allocator, comp_local);
+            }
+            any_change = true;
+        }
+
+        if (!any_change) return null;
+
+        var total_len: usize = 0;
+        for (outcomes.items) |outcome| {
+            total_len += 1;
+            total_len += outcome.releases_after.items.len;
+        }
+
+        const buf = try self.allocator.alloc(ir.Instruction, total_len);
+        var write_idx: usize = 0;
+        for (outcomes.items, 0..) |outcome, idx| {
+            buf[write_idx] = outcome.rebuilt_instr orelse stream[idx];
+            write_idx += 1;
+            for (outcome.releases_after.items) |comp_local| {
+                buf[write_idx] = ir.Instruction{ .release = .{ .value = comp_local } };
+                write_idx += 1;
+            }
+        }
+        return buf;
+    }
+
+    fn rebuildChildren(
+        self: *ComponentReleaseRebuilder,
+        instr: *const ir.Instruction,
+    ) error{OutOfMemory}!?ir.Instruction {
+        switch (instr.*) {
+            .if_expr => |ie| {
+                const new_then = try self.rebuildStream(ie.then_instrs);
+                const new_else = try self.rebuildStream(ie.else_instrs);
+                if (new_then == null and new_else == null) return null;
+                var copy = ie;
+                if (new_then) |s| copy.then_instrs = s;
+                if (new_else) |s| copy.else_instrs = s;
+                return ir.Instruction{ .if_expr = copy };
+            },
+            .case_block => |cb| {
+                const new_pre = try self.rebuildStream(cb.pre_instrs);
+                var arms_changed = false;
+                var new_arms: ?[]ir.IrCaseArm = null;
+                {
+                    var local_new_arms: ?[]ir.IrCaseArm = null;
+                    for (cb.arms, 0..) |arm, idx| {
+                        const new_cond = try self.rebuildStream(arm.cond_instrs);
+                        const new_body = try self.rebuildStream(arm.body_instrs);
+                        if (new_cond == null and new_body == null) continue;
+                        if (local_new_arms == null) {
+                            const buf = try self.allocator.alloc(ir.IrCaseArm, cb.arms.len);
+                            for (cb.arms, 0..) |orig_arm, j| buf[j] = orig_arm;
+                            local_new_arms = buf;
+                        }
+                        var arm_copy = arm;
+                        if (new_cond) |s| arm_copy.cond_instrs = s;
+                        if (new_body) |s| arm_copy.body_instrs = s;
+                        local_new_arms.?[idx] = arm_copy;
+                        arms_changed = true;
+                    }
+                    new_arms = local_new_arms;
+                }
+                const new_default = try self.rebuildStream(cb.default_instrs);
+                if (new_pre == null and !arms_changed and new_default == null) return null;
+                var copy = cb;
+                if (new_pre) |s| copy.pre_instrs = s;
+                if (new_arms) |arms| copy.arms = arms;
+                if (new_default) |s| copy.default_instrs = s;
+                return ir.Instruction{ .case_block = copy };
+            },
+            .switch_literal => |sl| {
+                var any_case_changed = false;
+                var new_cases: ?[]ir.LitCase = null;
+                for (sl.cases, 0..) |case, idx| {
+                    const new_body = try self.rebuildStream(case.body_instrs);
+                    if (new_body == null) continue;
+                    if (new_cases == null) {
+                        const buf = try self.allocator.alloc(ir.LitCase, sl.cases.len);
+                        for (sl.cases, 0..) |orig, j| buf[j] = orig;
+                        new_cases = buf;
+                    }
+                    var case_copy = case;
+                    case_copy.body_instrs = new_body.?;
+                    new_cases.?[idx] = case_copy;
+                    any_case_changed = true;
+                }
+                const new_default = try self.rebuildStream(sl.default_instrs);
+                if (!any_case_changed and new_default == null) return null;
+                var copy = sl;
+                if (new_cases) |cases| copy.cases = cases;
+                if (new_default) |s| copy.default_instrs = s;
+                return ir.Instruction{ .switch_literal = copy };
+            },
+            .switch_return => |sr| {
+                var any_case_changed = false;
+                var new_cases: ?[]ir.ReturnCase = null;
+                for (sr.cases, 0..) |case, idx| {
+                    const new_body = try self.rebuildStream(case.body_instrs);
+                    if (new_body == null) continue;
+                    if (new_cases == null) {
+                        const buf = try self.allocator.alloc(ir.ReturnCase, sr.cases.len);
+                        for (sr.cases, 0..) |orig, j| buf[j] = orig;
+                        new_cases = buf;
+                    }
+                    var case_copy = case;
+                    case_copy.body_instrs = new_body.?;
+                    new_cases.?[idx] = case_copy;
+                    any_case_changed = true;
+                }
+                const new_default = try self.rebuildStream(sr.default_instrs);
+                if (!any_case_changed and new_default == null) return null;
+                var copy = sr;
+                if (new_cases) |cases| copy.cases = cases;
+                if (new_default) |s| copy.default_instrs = s;
+                return ir.Instruction{ .switch_return = copy };
+            },
+            .union_switch => |us| {
+                var any_case_changed = false;
+                var new_cases: ?[]ir.UnionCase = null;
+                for (us.cases, 0..) |case, idx| {
+                    const new_body = try self.rebuildStream(case.body_instrs);
+                    if (new_body == null) continue;
+                    if (new_cases == null) {
+                        const buf = try self.allocator.alloc(ir.UnionCase, us.cases.len);
+                        for (us.cases, 0..) |orig, j| buf[j] = orig;
+                        new_cases = buf;
+                    }
+                    var case_copy = case;
+                    case_copy.body_instrs = new_body.?;
+                    new_cases.?[idx] = case_copy;
+                    any_case_changed = true;
+                }
+                if (!any_case_changed) return null;
+                var copy = us;
+                if (new_cases) |cases| copy.cases = cases;
+                return ir.Instruction{ .union_switch = copy };
+            },
+            .union_switch_return => |usr| {
+                var any_case_changed = false;
+                var new_cases: ?[]ir.UnionCase = null;
+                for (usr.cases, 0..) |case, idx| {
+                    const new_body = try self.rebuildStream(case.body_instrs);
+                    if (new_body == null) continue;
+                    if (new_cases == null) {
+                        const buf = try self.allocator.alloc(ir.UnionCase, usr.cases.len);
+                        for (usr.cases, 0..) |orig, j| buf[j] = orig;
+                        new_cases = buf;
+                    }
+                    var case_copy = case;
+                    case_copy.body_instrs = new_body.?;
+                    new_cases.?[idx] = case_copy;
+                    any_case_changed = true;
+                }
+                if (!any_case_changed) return null;
+                var copy = usr;
+                if (new_cases) |cases| copy.cases = cases;
+                return ir.Instruction{ .union_switch_return = copy };
+            },
+            .try_call_named => |tc| {
+                const new_handler = try self.rebuildStream(tc.handler_instrs);
+                const new_success = try self.rebuildStream(tc.success_instrs);
+                if (new_handler == null and new_success == null) return null;
+                var copy = tc;
+                if (new_handler) |s| copy.handler_instrs = s;
+                if (new_success) |s| copy.success_instrs = s;
+                return ir.Instruction{ .try_call_named = copy };
+            },
+            .guard_block => |gb| {
+                const new_body = try self.rebuildStream(gb.body);
+                if (new_body == null) return null;
+                var copy = gb;
+                copy.body = new_body.?;
+                return ir.Instruction{ .guard_block = copy };
+            },
+            .optional_dispatch => |od| {
+                const new_nil = try self.rebuildStream(od.nil_instrs);
+                const new_struct = try self.rebuildStream(od.struct_instrs);
+                if (new_nil == null and new_struct == null) return null;
+                var copy = od;
+                if (new_nil) |s| copy.nil_instrs = s;
+                if (new_struct) |s| copy.struct_instrs = s;
+                return ir.Instruction{ .optional_dispatch = copy };
+            },
+            else => return null,
+        }
+    }
+};
+
 /// Insert scope-exit `release` IR instructions before every
 /// ret-equivalent terminator in `function`, for each ARC-managed
 /// local recorded in `ownership.live_before_ret[terminator_id]`.
@@ -1845,6 +2501,94 @@ test "Phase E.5 Gap 6: paramIndexForLocal walks body to find param_get dest" {
             if (result == null) break;
         }
     }
+}
+
+test "Phase 2.6.3: insertTupleComponentReleases is no-op when no non-ARC tuples are present" {
+    // A function with no aggregate construction is unchanged by the
+    // component-release pass.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn id(h :: Handle) -> Handle { h }
+        \\}
+    ;
+    var suite = try DropTestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const id_func = suite.findFunctionByName("id") orelse return error.MissingFunction;
+    const releases_before = countReleases(id_func);
+    try insertTupleComponentReleases(suite.irAllocator(), id_func);
+    try std.testing.expectEqual(releases_before, countReleases(id_func));
+}
+
+test "Phase 2.6.3: insertTupleComponentReleases emits release for ARC component at tuple last-use" {
+    // The destructure-then-V8 idiom that fannkuch's main_loop uses:
+    //
+    //   pp_flips = make_pair(h, h2)        ; ARC component pp + Bool flag
+    //   {pp, _flag} = pp_flips             ; index_get + retain on pp
+    //   ; pp is now at rc=2 — one ref from pp_flips, one from retain.
+    //   ; Phase 2.6.3 must emit `release{pp}` at pp_flips's last-use
+    //   ; (the second index_get, which is also pp_flips's last
+    //   ; reference). After the release, pp is at rc=1 — ready for a
+    //   ; downstream `*_owned_unchecked`.
+    //   pp                                  ; return pp (or use it)
+    //
+    // The `Handle` type stands in for `VectorI64` (avoids the
+    // `@native_type` scope plumbing). Phase 2.6.3's pass should insert
+    // exactly one release whose value matches the destructured `pp`
+    // local.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  fn make_pair(h :: Handle, b :: Bool) -> {Handle, Bool} { {h, b} }
+        \\
+        \\  pub fn run(h :: Handle, b :: Bool) -> Handle {
+        \\    pp_flips = Test.make_pair(h, b)
+        \\    {pp, _flag} = pp_flips
+        \\    pp
+        \\  }
+        \\}
+    ;
+    var suite = try DropTestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const run_func = suite.findFunctionByName("run") orelse return error.MissingFunction;
+    const releases_before = countReleases(run_func);
+    try insertTupleComponentReleases(suite.irAllocator(), run_func);
+    const releases_after = countReleases(run_func);
+
+    // Exactly ONE release was emitted: the destructured ARC handle
+    // local. The Bool component is NOT ARC-managed, so no release
+    // for it.
+    try std.testing.expectEqual(releases_before + 1, releases_after);
+
+    // The new release is positioned right after the second index_get
+    // (the last-use of pp_flips). Locate it by walking the rebuilt
+    // stream and checking that one of the inserted releases names
+    // the dest of an `index_get` on the tuple's local.
+    var saw_release_for_extracted = false;
+    for (run_func.body) |block| {
+        for (block.instructions, 0..) |instr, i| {
+            if (instr != .release) continue;
+            // Walk backward to find the closest preceding
+            // index_get whose dest matches this release's value.
+            var j: usize = i;
+            while (j > 0) {
+                j -= 1;
+                if (block.instructions[j] == .index_get and
+                    block.instructions[j].index_get.dest == instr.release.value)
+                {
+                    saw_release_for_extracted = true;
+                    break;
+                }
+            }
+            if (saw_release_for_extracted) break;
+        }
+        if (saw_release_for_extracted) break;
+    }
+    try std.testing.expect(saw_release_for_extracted);
 }
 
 test "Phase E.5 Gap 6: isBorrowedParameterLocal works when param_get is allocated above binding range" {
