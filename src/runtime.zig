@@ -2911,6 +2911,19 @@ pub const Range = struct {
     }
 };
 
+pub const Tuple = struct {
+    pub fn size(tuple: anytype) i64 {
+        const arity = switch (@typeInfo(@TypeOf(tuple))) {
+            .@"struct" => |info| blk: {
+                if (!info.is_tuple) @compileError("Tuple.size expects a tuple value");
+                break :blk info.fields.len;
+            },
+            else => @compileError("Tuple.size expects a tuple value"),
+        };
+        return @intCast(arity);
+    }
+};
+
 pub const Kernel = struct {
     /// Generic string conversion used by string interpolation. Strings
     /// pass through untouched; numbers/bools/enums are formatted via the
@@ -9594,6 +9607,10 @@ test "Arc basic reference counting" {
     try std.testing.expectEqual(@as(u32, 1), arc.refCount());
 
     arc.release(alloc);
+}
+
+test "Tuple.size returns tuple arity" {
+    try std.testing.expectEqual(@as(i64, 3), Tuple.size(.{ 1, "two", true }));
 }
 
 test "ArcRuntime.allocAny creates arc-managed value" {

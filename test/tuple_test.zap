@@ -2,6 +2,42 @@ pub struct TupleTest {
   use Zest.Case
 
   describe("tuples") {
+    test("construct and read compile-time-indexed slots") {
+      tuple = {1, "two", true}
+
+      assert(tuple.0 == 1)
+      assert(tuple.1 == "two")
+      assert(tuple.2 == true)
+    }
+
+    test("Tuple.size returns the fixed arity") {
+      assert(Tuple.size({1, "two", true}) == 3)
+      assert(Tuple.size({:ok, 42}) == 2)
+    }
+
+    test("assignment destructuring extracts tuple slots") {
+      {left, right} = make_pair(20, 22)
+
+      assert(left + right == 42)
+    }
+
+    test("multi-return tuple preserves element types") {
+      {value, ok?} = status(41)
+
+      assert(value == 42)
+      assert(ok? == true)
+    }
+
+    test("nested tuple preserves nested element types") {
+      nested = nested_tuple()
+      inner = nested.1
+
+      assert(nested.0 == 7)
+      assert(inner.0 == "zap")
+      assert(inner.1 == true)
+      assert(Tuple.size(inner) == 2)
+    }
+
     test("extract first element") {
       assert(first({1, 2}) == 1)
     }
@@ -61,6 +97,18 @@ pub struct TupleTest {
     case t {
       {_, b} -> b + b
     }
+  }
+
+  fn make_pair(left :: i64, right :: i64) -> {i64, i64} {
+    {left, right}
+  }
+
+  fn status(value :: i64) -> {i64, Bool} {
+    {value + 1, true}
+  }
+
+  fn nested_tuple() -> {i64, {String, Bool}} {
+    {7, {"zap", true}}
   }
 
   describe("tuple patterns with atom literals") {

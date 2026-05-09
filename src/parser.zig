@@ -2326,11 +2326,14 @@ pub const Parser = struct {
                 });
             } else if (self.check(.dot)) {
                 _ = self.advance();
-                // Accept both lowercase identifiers and capitalized struct names
-                // (e.g., :zig.IO.println or map.field)
+                // Accept lowercase identifiers, capitalized struct names, and
+                // integer tuple-slot fields (e.g., :zig.IO.println, map.field,
+                // tuple.0).
                 const field_tok = if (self.check(.identifier))
                     self.advance()
                 else if (self.check(.type_identifier))
+                    self.advance()
+                else if (self.check(.int_literal))
                     self.advance()
                 else
                     try self.expect(.identifier); // error if neither

@@ -4957,6 +4957,32 @@ pub const HirBuilder = struct {
                 }
                 // Struct field access (e.g. user.name)
                 const object = try self.buildExpr(fa.object);
+                if (object.type_id != types_mod.TypeStore.UNKNOWN) {
+                    const object_type = self.type_store.getType(object.type_id);
+                    if (object_type == .tuple) {
+                        const field_name = self.interner.get(fa.field);
+                        const tuple_index = std.fmt.parseUnsigned(u32, field_name, 10) catch {
+                            return try self.create(Expr, .{
+                                .kind = .{ .field_get = .{
+                                    .object = object,
+                                    .field = fa.field,
+                                } },
+                                .type_id = types_mod.TypeStore.UNKNOWN,
+                                .span = fa.meta.span,
+                            });
+                        };
+                        if (tuple_index < object_type.tuple.elements.len) {
+                            return try self.create(Expr, .{
+                                .kind = .{ .tuple_index_get = .{
+                                    .object = object,
+                                    .index = tuple_index,
+                                } },
+                                .type_id = object_type.tuple.elements[tuple_index],
+                                .span = fa.meta.span,
+                            });
+                        }
+                    }
+                }
                 return try self.create(Expr, .{
                     .kind = .{ .field_get = .{
                         .object = object,
@@ -6016,6 +6042,42 @@ test "HIR build struct" {
 
     try std.testing.expectEqual(@as(usize, 1), hir_program.structs.len);
     try std.testing.expectEqual(@as(usize, 1), hir_program.structs[0].functions.len);
+}
+
+test "HIR lowers numeric tuple field access to tuple_index_get" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn second() -> String {
+        \\    tuple = {1, "two", true}
+        \\    tuple.1
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    defer type_store.deinit();
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const clause = hir_program.structs[0].functions[0].clauses[0];
+    const result_expr = clause.body.stmts[1].expr;
+    try std.testing.expect(result_expr.kind == .tuple_index_get);
+    try std.testing.expectEqual(@as(u32, 1), result_expr.kind.tuple_index_get.index);
+    try std.testing.expectEqual(types_mod.TypeStore.STRING, result_expr.type_id);
 }
 
 test "HIR pattern compilation" {

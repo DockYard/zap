@@ -2535,6 +2535,16 @@ pub const TypeChecker = struct {
                 .map => |mt| {
                     return std.fmt.allocPrint(self.allocator, "%{{{s} => {s}}}", .{ self.typeToString(mt.key), self.typeToString(mt.value) }) catch "{type}";
                 },
+                .tuple => |tt| {
+                    var buf: std.ArrayList(u8) = .empty;
+                    buf.appendSlice(self.allocator, "{") catch return "{type}";
+                    for (tt.elements, 0..) |element, idx| {
+                        if (idx > 0) buf.appendSlice(self.allocator, ", ") catch return "{type}";
+                        buf.appendSlice(self.allocator, self.typeToString(element)) catch return "{type}";
+                    }
+                    buf.appendSlice(self.allocator, "}") catch return "{type}";
+                    return buf.toOwnedSlice(self.allocator) catch return "{type}";
+                },
                 .function => |ft| {
                     var buf: std.ArrayList(u8) = .empty;
                     buf.appendSlice(self.allocator, "(") catch return "{type}";
@@ -4199,6 +4209,23 @@ pub const TypeChecker = struct {
                             if (field.name == fa.field) return field.type_id;
                         }
                     }
+                    if (t == .tuple) {
+                        const field_name = self.interner.get(fa.field);
+                        const tuple_index = std.fmt.parseUnsigned(u32, field_name, 10) catch return TypeStore.UNKNOWN;
+                        if (tuple_index < t.tuple.elements.len) {
+                            return t.tuple.elements[tuple_index];
+                        }
+                        try self.addHardError(
+                            try std.fmt.allocPrint(self.allocator, "tuple index {d} is out of bounds for arity {d}", .{
+                                tuple_index,
+                                t.tuple.elements.len,
+                            }),
+                            fa.meta.span,
+                            "tuple index out of bounds",
+                            null,
+                        );
+                        return TypeStore.UNKNOWN;
+                    }
                 }
                 return TypeStore.UNKNOWN;
             },
@@ -5294,6 +5321,27 @@ test "type store resolve builtin names" {
     try std.testing.expectEqual(TypeStore.BOOL, store.resolveTypeName("Bool").?);
     try std.testing.expectEqual(TypeStore.STRING, store.resolveTypeName("String").?);
     try std.testing.expect(store.resolveTypeName("Nonexistent") == null);
+}
+
+test "typeToString renders tuple element types" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    var graph = scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const elements = try std.testing.allocator.dupe(TypeId, &.{ TypeStore.I64, TypeStore.STRING, TypeStore.BOOL });
+    defer std.testing.allocator.free(elements);
+    const tuple_type = try store.addType(.{ .tuple = .{ .elements = elements } });
+
+    const rendered = checker.typeToString(tuple_type);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings("{i64, String, Bool}", rendered);
 }
 
 fn rerunWithEscapeAnalysis(
