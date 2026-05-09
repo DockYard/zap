@@ -4,6 +4,7 @@ const arc_liveness = @import("arc_liveness.zig");
 const types_mod = @import("types.zig");
 const v8_signature = @import("v8_signature.zig");
 const v8_fixpoint = @import("v8_fixpoint.zig");
+const v8_interprocedural = @import("v8_interprocedural.zig");
 
 // ============================================================
 // Whole-program parameter-convention inference (Phase E.9).
@@ -305,20 +306,43 @@ fn computeLiftSet(
     // forwards into an owned-mutating builtin or an already-promoted
     // Zap callee).
     //
-    // Mutual recursion is NOT lifted by this scheme — slots whose
-    // anchor depends on each other can't bootstrap because neither
-    // side enters the set first. Phase 2's optimistic-seed extension
-    // was tried but produced V8-unsound promotions: the alias-chain
-    // audit passes but the per-instruction uniqueness verifier
-    // (`arc_verifier::runV8`) rejects, because the promoted slot's
-    // body has copy_value/share_value emissions that demote the
-    // receiver's runtime uniqueness. The conservative monotone-up
-    // is the sound choice; lifting mutual-recursion SCCs requires
-    // a stronger pre-flight check that mimics the V8 verifier's
-    // dataflow at audit time. (Future work.)
+    // The conservative pass cannot bootstrap mutually-recursive PU
+    // chains (e.g., fannkuch's advance_perm/2 ↔ rotate_loop/1):
+    // each slot's chain-consistency dependency is on the OTHER, so
+    // neither enters the set first. Phase 2.4 follows the
+    // conservative pass with two additional stages:
+    //
+    //   1. Optimistic SCC-bootstrap: a monotone-DOWN audit that
+    //      starts from "all borrowed ARC slots are candidates" and
+    //      removes those that fail audit conditions under the
+    //      current candidate set. This admits mutual-recursion
+    //      chains because the audit's chain-consistency check
+    //      observes both inter-dependent slots simultaneously in
+    //      the candidate set.
+    //
+    //   2. V8 pre-flight check: tentatively promote the candidate
+    //      set's slots to `.owned` in `program.functions[*].param_conventions`,
+    //      run the program-level V8 fixpoint
+    //      (`v8_interprocedural.analyzeProgram`), and prune any
+    //      candidate whose slot the fixpoint demotes to non-unique.
+    //      This mirrors what `arc_verifier::runV8` will check after
+    //      the rewriter fires; if a candidate's body-level dataflow
+    //      destroys uniqueness (via copy_value, share_value, or any
+    //      other demoting operation the audit doesn't model),
+    //      the V8 fixpoint catches it pre-emptively.
+    //
+    // Pruning a candidate may unblock OR re-block other candidates
+    // (a removed candidate reduces the set used as the SCC anchor;
+    // V8 may demote different slots in the next iteration). Iterate
+    // (1) and (2) until a fixed point: the surviving set is the
+    // V8-verifier-aligned lift_set by construction.
     var lift_set: LiftSet = .empty;
     errdefer lift_set.deinit(allocator);
 
+    // Stage 0: existing conservative monotone-up. Anything this
+    // accepts is unconditionally V8-sound (it always was — the
+    // conservative scheme only ever admits chains whose roots end
+    // at fresh allocations or already-`.owned` parents).
     var changed = true;
     var iteration: u32 = 0;
     const max_iterations: u32 = 64;
@@ -345,7 +369,1356 @@ fn computeLiftSet(
         }
     }
 
+    // Stage 1+2: optimistic SCC-bootstrap + V8 pre-flight pruning.
+    // Iterate the (candidate-generation, V8-prune) pair until the
+    // surviving set is stable.
+    var preflight_iter: u32 = 0;
+    const max_preflight_iter: u32 = 16;
+    while (preflight_iter < max_preflight_iter) : (preflight_iter += 1) {
+        // Generate optimistic candidates by relaxing the bootstrap
+        // constraint: any borrowed ARC slot whose audit conditions
+        // hold UNDER THE CURRENT lift_set is a candidate. SCC
+        // partners enter the set together when they BOTH pass under
+        // the optimistic seeding (every borrowed slot is a candidate
+        // initially; iteratively prune those that fail).
+        var candidates: LiftSet = .empty;
+        defer candidates.deinit(allocator);
+        try seedOptimisticCandidates(allocator, program, &lift_set, &candidates);
+        try pruneOptimisticCandidates(
+            allocator,
+            program,
+            signatures,
+            sites_by_target,
+            ownerships,
+            function_index,
+            name_to_id,
+            &lift_set,
+            &candidates,
+        );
+
+        // No new candidates beyond the conservative set — done.
+        if (candidates.count() == 0) break;
+
+        // V8 pre-flight: tentatively promote candidates' slots to
+        // `.owned` in `param_conventions`, run V8 program-level
+        // fixpoint that simulates the post-rewrite IR (share_value
+        // at owned-arg sites is treated as move_value), restore
+        // conventions, and intersect candidates with surviving
+        // (unique-on-entry) slots.
+        var survivors: LiftSet = .empty;
+        defer survivors.deinit(allocator);
+        try liftSetSurvivesV8Check(allocator, program, &candidates, &survivors);
+
+        // Merge survivors into the main lift_set.
+        const before_count = lift_set.count();
+        var iter = survivors.iterator();
+        while (iter.next()) |entry| {
+            try lift_set.put(allocator, entry.key_ptr.*, {});
+        }
+        const after_count = lift_set.count();
+
+        // Stable: no new survivors added this round.
+        if (after_count == before_count) break;
+    }
+
     return lift_set;
+}
+
+/// Stage 1 (Phase 2.4): seed the optimistic candidate set with every
+/// borrowed ARC parameter slot in the program that ISN'T already in
+/// `lift_set`. The candidate set is the upper bound; subsequent
+/// pruning removes slots that fail the audit conditions.
+fn seedOptimisticCandidates(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    lift_set: *const LiftSet,
+    candidates: *LiftSet,
+) !void {
+    for (program.functions) |*function| {
+        for (function.param_conventions, 0..) |conv, slot_index| {
+            if (conv != .borrowed) continue;
+            if (liftSetContains(lift_set, function.id, slot_index)) continue;
+            try candidates.put(allocator, liftKey(function.id, slot_index), {});
+        }
+    }
+}
+
+/// Stage 1 (Phase 2.4): monotone-DOWN pruning of the optimistic
+/// candidate set. A candidate is removed if `slotPassesAuditConditions`
+/// fails when given (lift_set ∪ candidates) as the eligibility set.
+/// Iterates to fixpoint — removing one candidate may break another's
+/// SCC dependency.
+fn pruneOptimisticCandidates(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    signatures: *const v8_signature.ProgramSignatures,
+    sites_by_target: *const SitesByTarget,
+    ownerships: *const arc_liveness.ProgramArcOwnership,
+    function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
+    name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
+    lift_set: *const LiftSet,
+    candidates: *LiftSet,
+) !void {
+    var changed = true;
+    var iteration: u32 = 0;
+    const max_iterations: u32 = 64;
+    while (changed and iteration < max_iterations) : (iteration += 1) {
+        changed = false;
+
+        // Build the union view: lift_set ∪ candidates. The audit
+        // accepts a borrowed parent slot in the chain-root check
+        // when it's in either set.
+        var union_set: LiftSet = .empty;
+        defer union_set.deinit(allocator);
+        var li = lift_set.iterator();
+        while (li.next()) |entry| {
+            try union_set.put(allocator, entry.key_ptr.*, {});
+        }
+        var ci = candidates.iterator();
+        while (ci.next()) |entry| {
+            try union_set.put(allocator, entry.key_ptr.*, {});
+        }
+
+        // Collect candidates to remove this round (can't mutate while
+        // iterating).
+        var to_remove: std.ArrayListUnmanaged(u64) = .empty;
+        defer to_remove.deinit(allocator);
+
+        var iter = candidates.iterator();
+        while (iter.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const fid: ir.FunctionId = @intCast(key >> 32);
+            const slot: usize = @intCast(key & 0xFFFFFFFF);
+            const function = function_index.get(fid) orelse {
+                try to_remove.append(allocator, key);
+                continue;
+            };
+            if (!try slotPassesAuditConditions(
+                function,
+                slot,
+                signatures,
+                sites_by_target,
+                ownerships,
+                function_index,
+                &union_set,
+                name_to_id,
+                program,
+            )) {
+                try to_remove.append(allocator, key);
+            }
+        }
+
+        if (to_remove.items.len == 0) continue;
+        for (to_remove.items) |key| {
+            _ = candidates.remove(key);
+        }
+        changed = true;
+    }
+}
+
+/// Phase 2.4 V8 pre-flight check.
+///
+/// Given a candidate set of `(FunctionId, slot_index)` pairs that the
+/// chain-consistency audit has accepted (under the optimistic SCC-
+/// bootstrap), run a program-level V8 uniqueness fixpoint UNDER A
+/// TENTATIVE PROMOTION of those slots. Populate `survivors` with the
+/// candidates whose slots remain proven `unique_on_entry` after the
+/// fixpoint converges.
+///
+/// This bridges the disagreement between the audit's alias-chain
+/// consistency check and the V8 verifier's full per-instruction
+/// dataflow. The audit asks: "is the alias chain in consume mode?"
+/// The V8 verifier asks: "is the cell uniquely owned per the
+/// `v8_uniqueness` dataflow at every instruction?" The two ask
+/// different questions: the audit can pass while the verifier fails
+/// because the body's intermediate operations (e.g., a `copy_value`
+/// of a binding with further uses) demote uniqueness in ways the
+/// audit doesn't track.
+///
+/// Mechanism: temporarily flip every candidate slot's
+/// `param_conventions` entry to `.owned`. Run a tentative-rewrite-
+/// aware V8 fixpoint: this simulates the post-rewrite IR shape that
+/// `arc_ownership.rewriteOwnedConsumeSites` would produce after
+/// promotion (each `share_value` whose dest is an `.owned` arg gets
+/// move-style semantics for the V8 dataflow). Restore conventions
+/// afterward. Candidates whose slots the fixpoint LEFT proven
+/// unique-on-entry are V8-sound and join `survivors`.
+///
+/// Why post-rewrite simulation: the V8 verifier runs AFTER
+/// `rewriteOwnedConsumeSites` in the pipeline (compiler.zig). Running
+/// the V8 dataflow on the PRE-rewrite IR would observe `share_value`
+/// at every call site and demote uniqueness — even at sites where the
+/// rewrite is about to turn `share_value` into `move_value`. The
+/// pre-flight has to mirror what the verifier will see, not what's
+/// in the IR right now. The simulator achieves this by pre-computing,
+/// per function, the set of `share_value` instruction ids whose dest
+/// flows into an `.owned` arg slot of a downstream call (under the
+/// tentative conventions); the V8 dataflow then applies move-style
+/// semantics at those sites.
+///
+/// SCC bootstrapping: because all candidates are tentatively promoted
+/// SIMULTANEOUSLY, mutually-recursive PU chains can be validated. The
+/// V8 fixpoint observes every inter-dependent slot at once and demotes
+/// only those whose body actually destroys uniqueness — this is the
+/// stronger guarantee that the conservative monotone-up scheme cannot
+/// give for SCCs.
+///
+/// Soundness: a candidate that V8 demotes is pruned. The post-rewrite
+/// verifier is a final safety net; if the pre-flight has bugs, the
+/// verifier fires hard at compile time (never miscompilation).
+fn liftSetSurvivesV8Check(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    candidates: *const LiftSet,
+    survivors: *LiftSet,
+) !void {
+    if (candidates.count() == 0) return;
+
+    // Save originals and tentatively promote candidate slots.
+    //
+    // The mutation seam matches `evaluateFunction`'s @constCast of
+    // `function.param_conventions` — the slice is `const` to the rest
+    // of the IR but writeable by the inference pass and its sub-passes.
+    var saved: std.AutoHashMapUnmanaged(u64, ir.ParamConvention) = .empty;
+    defer saved.deinit(allocator);
+
+    var iter = candidates.iterator();
+    while (iter.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const fid: ir.FunctionId = @intCast(key >> 32);
+        const slot: usize = @intCast(key & 0xFFFFFFFF);
+        const function = lookupFunctionMut(program, fid) orelse continue;
+        if (slot >= function.param_conventions.len) continue;
+        const original = function.param_conventions[slot];
+        try saved.put(allocator, key, original);
+        const conventions: MutableConventions = @constCast(function.param_conventions);
+        conventions[slot] = .owned;
+    }
+
+    // Restore originals on every exit path.
+    defer {
+        var ri = saved.iterator();
+        while (ri.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const fid: ir.FunctionId = @intCast(key >> 32);
+            const slot: usize = @intCast(key & 0xFFFFFFFF);
+            if (lookupFunctionMut(program, fid)) |function| {
+                if (slot < function.param_conventions.len) {
+                    const conventions: MutableConventions = @constCast(function.param_conventions);
+                    conventions[slot] = entry.value_ptr.*;
+                }
+            }
+        }
+    }
+
+    // Run program-level V8 fixpoint under the tentative state, with
+    // post-rewrite simulation of share_value→move_value conversion at
+    // owned-arg sites.
+    var uniqueness = try analyzeProgramTentative(allocator, program);
+    defer uniqueness.deinit(allocator);
+
+    // Filter candidates by V8 fixpoint result.
+    var ci = candidates.iterator();
+    while (ci.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const fid: ir.FunctionId = @intCast(key >> 32);
+        const slot: usize = @intCast(key & 0xFFFFFFFF);
+        if (uniqueness.isUniqueOnEntry(fid, slot)) {
+            try survivors.put(allocator, key, {});
+        }
+    }
+}
+
+/// Per-function set of `share_value` InstructionIds that should be
+/// treated as `move_value` by the V8 dataflow during the pre-flight
+/// simulation. Computed once per function from the tentative
+/// `param_conventions` state. The set captures every share_value
+/// whose dest is the arg-local at an `.owned` arg slot of a
+/// downstream call in the same stream — exactly the share_value
+/// instances that `arc_ownership.rewriteOwnedConsumeSites` would
+/// rewrite to move_value after promotion.
+const RewrittenShareSet = struct {
+    /// Keyed by (function_id, instruction_id) packed into u64. The
+    /// instruction_id is in the same depth-first id space that
+    /// `v8_uniqueness.Analyzer` and `arc_liveness.assignInstructionIds`
+    /// agree on. Membership means "rewrite this share_value to
+    /// move_value during the V8 dataflow walk".
+    set: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    fn deinit(self: *RewrittenShareSet, allocator: std.mem.Allocator) void {
+        self.set.deinit(allocator);
+    }
+
+    fn key(function_id: ir.FunctionId, instruction_id: arc_liveness.InstructionId) u64 {
+        return (@as(u64, @intCast(function_id)) << 32) | @as(u64, @intCast(instruction_id));
+    }
+
+    fn contains(self: *const RewrittenShareSet, function_id: ir.FunctionId, instruction_id: arc_liveness.InstructionId) bool {
+        return self.set.contains(key(function_id, instruction_id));
+    }
+};
+
+/// Compute the `RewrittenShareSet` for `program` under the current
+/// `param_conventions` (tentatively-promoted state). Walk every
+/// function's body; for each call site, look up the callee's
+/// param_conventions; for every `.owned` arg slot, locate the
+/// preceding `share_value{dest = args[slot]}` in the same stream and
+/// record its InstructionId.
+fn computeRewrittenShareSet(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+) !RewrittenShareSet {
+    var result: RewrittenShareSet = .{};
+    errdefer result.deinit(allocator);
+
+    var by_name: std.StringHashMapUnmanaged([]const ir.ParamConvention) = .empty;
+    defer by_name.deinit(allocator);
+    var by_id: std.AutoHashMapUnmanaged(ir.FunctionId, []const ir.ParamConvention) = .empty;
+    defer by_id.deinit(allocator);
+    for (program.functions) |func| {
+        try by_name.put(allocator, func.name, func.param_conventions);
+        if (func.local_name.len != 0) {
+            const gop = try by_name.getOrPut(allocator, func.local_name);
+            if (!gop.found_existing) gop.value_ptr.* = func.param_conventions;
+        }
+        try by_id.put(allocator, func.id, func.param_conventions);
+    }
+
+    for (program.functions) |*function| {
+        var walker = ShareSetWalker{
+            .allocator = allocator,
+            .function_id = function.id,
+            .by_name = &by_name,
+            .by_id = &by_id,
+            .result = &result,
+            .next_id = 0,
+        };
+        for (function.body) |block| {
+            try walker.walkStream(block.instructions);
+        }
+    }
+
+    return result;
+}
+
+const ShareSetWalker = struct {
+    allocator: std.mem.Allocator,
+    function_id: ir.FunctionId,
+    by_name: *const std.StringHashMapUnmanaged([]const ir.ParamConvention),
+    by_id: *const std.AutoHashMapUnmanaged(ir.FunctionId, []const ir.ParamConvention),
+    result: *RewrittenShareSet,
+    next_id: arc_liveness.InstructionId,
+
+    /// Per-stream side table: dest-LocalId → InstructionId of the
+    /// most-recent share_value in this stream. share_values do not
+    /// cross structural boundaries (the IR builder emits each share
+    /// in the same stream as its consume call), so a per-stream
+    /// table is sufficient.
+    fn walkStream(self: *ShareSetWalker, stream: []const ir.Instruction) error{OutOfMemory}!void {
+        var share_dest_to_id: std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId) = .empty;
+        defer share_dest_to_id.deinit(self.allocator);
+
+        for (stream) |*instr| {
+            const my_id = self.next_id;
+            self.next_id += 1;
+            try self.processInstruction(instr, my_id, &share_dest_to_id);
+            try self.recurseChildren(instr);
+        }
+    }
+
+    fn recurseChildren(self: *ShareSetWalker, instr: *const ir.Instruction) error{OutOfMemory}!void {
+        switch (instr.*) {
+            .if_expr => |ie| {
+                try self.walkStream(ie.then_instrs);
+                try self.walkStream(ie.else_instrs);
+            },
+            .case_block => |cb| {
+                try self.walkStream(cb.pre_instrs);
+                for (cb.arms) |arm| {
+                    try self.walkStream(arm.cond_instrs);
+                    try self.walkStream(arm.body_instrs);
+                }
+                try self.walkStream(cb.default_instrs);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| try self.walkStream(c.body_instrs);
+                try self.walkStream(sl.default_instrs);
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| try self.walkStream(c.body_instrs);
+                try self.walkStream(sr.default_instrs);
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| try self.walkStream(c.body_instrs);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| try self.walkStream(c.body_instrs);
+            },
+            .try_call_named => |tcn| {
+                try self.walkStream(tcn.handler_instrs);
+                try self.walkStream(tcn.success_instrs);
+            },
+            .guard_block => |gb| {
+                try self.walkStream(gb.body);
+            },
+            .optional_dispatch => |od| {
+                try self.walkStream(od.nil_instrs);
+                try self.walkStream(od.struct_instrs);
+            },
+            else => {},
+        }
+    }
+
+    fn processInstruction(
+        self: *ShareSetWalker,
+        instr: *const ir.Instruction,
+        instr_id: arc_liveness.InstructionId,
+        share_dest_to_id: *std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
+    ) error{OutOfMemory}!void {
+        switch (instr.*) {
+            .share_value => |sv| {
+                try share_dest_to_id.put(self.allocator, sv.dest, instr_id);
+            },
+            .call_named => |cn| {
+                if (self.by_name.get(cn.name)) |conventions| {
+                    try self.markOwnedArgShares(cn.args, conventions, share_dest_to_id);
+                }
+            },
+            .try_call_named => |tcn| {
+                if (self.by_name.get(tcn.name)) |conventions| {
+                    try self.markOwnedArgShares(tcn.args, conventions, share_dest_to_id);
+                }
+            },
+            .call_direct => |cd| {
+                if (self.by_id.get(cd.function)) |conventions| {
+                    try self.markOwnedArgShares(cd.args, conventions, share_dest_to_id);
+                }
+            },
+            .call_builtin => |cb| {
+                // Builtin owned-mutating sites: arc_ownership's
+                // rewriteOwnedConsumeBuiltinSites turns share_value
+                // into move_value when arc_liveness's
+                // ownedMutatingBuiltinSlot matches AND the source is
+                // at last-use. For pre-flight purposes, recognise
+                // those slots so the V8 dataflow propagates
+                // uniqueness through the share.
+                if (arc_liveness.ownedMutatingBuiltinSlot(cb.name)) |slot| {
+                    if (slot < cb.args.len) {
+                        if (share_dest_to_id.get(cb.args[slot])) |share_id| {
+                            try self.result.set.put(
+                                self.allocator,
+                                RewrittenShareSet.key(self.function_id, share_id),
+                                {},
+                            );
+                        }
+                    }
+                }
+            },
+            .tail_call => {
+                // Tail calls have their share/release elided by Phase
+                // E.8 already; nothing to do here.
+            },
+            else => {},
+        }
+    }
+
+    fn markOwnedArgShares(
+        self: *ShareSetWalker,
+        args: []const ir.LocalId,
+        conventions: []const ir.ParamConvention,
+        share_dest_to_id: *const std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
+    ) error{OutOfMemory}!void {
+        const max_slot = @min(args.len, conventions.len);
+        var slot: usize = 0;
+        while (slot < max_slot) : (slot += 1) {
+            if (conventions[slot] != .owned) continue;
+            if (share_dest_to_id.get(args[slot])) |share_id| {
+                try self.result.set.put(
+                    self.allocator,
+                    RewrittenShareSet.key(self.function_id, share_id),
+                    {},
+                );
+            }
+        }
+    }
+};
+
+/// Tentative-rewrite-aware program-level V8 fixpoint. Mirrors
+/// `v8_interprocedural.analyzeProgram` but uses
+/// `analyzeFunctionTentative` (a custom intraprocedural pass that
+/// applies move-style semantics to share_value sites in a
+/// `RewrittenShareSet`).
+fn analyzeProgramTentative(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+) !v8_interprocedural.ProgramUniqueness {
+    var result: v8_interprocedural.ProgramUniqueness = .{};
+    errdefer result.deinit(allocator);
+
+    // Pre-compute the set of share_values that should be treated as
+    // move_values by the V8 dataflow under the current (tentative)
+    // conventions.
+    var rewritten = try computeRewrittenShareSet(allocator, program);
+    defer rewritten.deinit(allocator);
+
+    // Initialise per-function uniqueness slices. Optimistic: every
+    // `.owned` slot starts proven unique.
+    for (program.functions) |func| {
+        if (func.param_conventions.len == 0) {
+            try result.by_function.put(allocator, func.id, &.{});
+            continue;
+        }
+        const slots = try allocator.alloc(bool, func.param_conventions.len);
+        for (func.param_conventions, 0..) |conv, idx| {
+            slots[idx] = (conv == .owned);
+        }
+        try result.by_function.put(allocator, func.id, slots);
+    }
+
+    // Build name → id lookup.
+    var name_to_id: std.StringHashMapUnmanaged(ir.FunctionId) = .empty;
+    defer name_to_id.deinit(allocator);
+    for (program.functions) |func| {
+        try name_to_id.put(allocator, func.name, func.id);
+        if (func.local_name.len != 0) {
+            const gop = try name_to_id.getOrPut(allocator, func.local_name);
+            if (!gop.found_existing) gop.value_ptr.* = func.id;
+        }
+    }
+
+    // Build reverse caller map.
+    var callers_of: std.AutoHashMapUnmanaged(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)) = .empty;
+    defer {
+        var iter = callers_of.iterator();
+        while (iter.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+        }
+        callers_of.deinit(allocator);
+    }
+    for (program.functions) |caller_func| {
+        try collectTentativeCalleeFunctionIds(
+            allocator,
+            &caller_func,
+            &name_to_id,
+            &callers_of,
+        );
+    }
+
+    // Worklist fixpoint.
+    var worklist: std.ArrayListUnmanaged(ir.FunctionId) = .empty;
+    defer worklist.deinit(allocator);
+    for (program.functions) |func| {
+        try worklist.append(allocator, func.id);
+    }
+    var in_worklist: std.AutoHashMapUnmanaged(ir.FunctionId, void) = .empty;
+    defer in_worklist.deinit(allocator);
+    for (program.functions) |func| {
+        try in_worklist.put(allocator, func.id, {});
+    }
+
+    while (worklist.pop()) |func_id| {
+        _ = in_worklist.remove(func_id);
+        const caller = lookupTentativeFunction(program, func_id) orelse continue;
+
+        var caller_uniqueness = try analyzeFunctionTentative(
+            allocator,
+            caller,
+            program,
+            &result,
+            &rewritten,
+        );
+        defer caller_uniqueness.deinit(allocator);
+
+        var demote_walker = TentativeDemotionWalker{
+            .allocator = allocator,
+            .caller = caller,
+            .program = program,
+            .name_to_id = &name_to_id,
+            .uniqueness = &caller_uniqueness,
+            .program_uniqueness = &result,
+            .callers_of = &callers_of,
+            .worklist = &worklist,
+            .in_worklist = &in_worklist,
+            .next_id = 0,
+        };
+        for (caller.body) |block| {
+            try demote_walker.walkStream(block.instructions);
+        }
+    }
+
+    return result;
+}
+
+fn lookupTentativeFunction(program: *const ir.Program, function_id: ir.FunctionId) ?*const ir.Function {
+    for (program.functions) |*func| {
+        if (func.id == function_id) return func;
+    }
+    return null;
+}
+
+fn collectTentativeCalleeFunctionIds(
+    allocator: std.mem.Allocator,
+    caller: *const ir.Function,
+    name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
+    callers_of: *std.AutoHashMapUnmanaged(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
+) !void {
+    for (caller.body) |block| {
+        try collectTentativeCalleesIntoStream(allocator, caller.id, block.instructions, name_to_id, callers_of);
+    }
+}
+
+fn collectTentativeCalleesIntoStream(
+    allocator: std.mem.Allocator,
+    caller_id: ir.FunctionId,
+    stream: []const ir.Instruction,
+    name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
+    callers_of: *std.AutoHashMapUnmanaged(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
+) error{OutOfMemory}!void {
+    for (stream) |*instr| {
+        switch (instr.*) {
+            .call_named => |cn| {
+                if (name_to_id.get(cn.name)) |target| {
+                    try recordTentativeEdge(allocator, target, caller_id, callers_of);
+                }
+            },
+            .call_direct => |cd| {
+                try recordTentativeEdge(allocator, cd.function, caller_id, callers_of);
+            },
+            .try_call_named => |tcn| {
+                if (name_to_id.get(tcn.name)) |target| {
+                    try recordTentativeEdge(allocator, target, caller_id, callers_of);
+                }
+            },
+            .tail_call => |tc| {
+                if (name_to_id.get(tc.name)) |target| {
+                    try recordTentativeEdge(allocator, target, caller_id, callers_of);
+                }
+            },
+            .if_expr => |ie| {
+                try collectTentativeCalleesIntoStream(allocator, caller_id, ie.then_instrs, name_to_id, callers_of);
+                try collectTentativeCalleesIntoStream(allocator, caller_id, ie.else_instrs, name_to_id, callers_of);
+            },
+            .case_block => |cb| {
+                try collectTentativeCalleesIntoStream(allocator, caller_id, cb.pre_instrs, name_to_id, callers_of);
+                for (cb.arms) |arm| {
+                    try collectTentativeCalleesIntoStream(allocator, caller_id, arm.cond_instrs, name_to_id, callers_of);
+                    try collectTentativeCalleesIntoStream(allocator, caller_id, arm.body_instrs, name_to_id, callers_of);
+                }
+                try collectTentativeCalleesIntoStream(allocator, caller_id, cb.default_instrs, name_to_id, callers_of);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| try collectTentativeCalleesIntoStream(allocator, caller_id, c.body_instrs, name_to_id, callers_of);
+                try collectTentativeCalleesIntoStream(allocator, caller_id, sl.default_instrs, name_to_id, callers_of);
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| try collectTentativeCalleesIntoStream(allocator, caller_id, c.body_instrs, name_to_id, callers_of);
+                try collectTentativeCalleesIntoStream(allocator, caller_id, sr.default_instrs, name_to_id, callers_of);
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| try collectTentativeCalleesIntoStream(allocator, caller_id, c.body_instrs, name_to_id, callers_of);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| try collectTentativeCalleesIntoStream(allocator, caller_id, c.body_instrs, name_to_id, callers_of);
+            },
+            .guard_block => |gb| {
+                try collectTentativeCalleesIntoStream(allocator, caller_id, gb.body, name_to_id, callers_of);
+            },
+            .optional_dispatch => |od| {
+                try collectTentativeCalleesIntoStream(allocator, caller_id, od.nil_instrs, name_to_id, callers_of);
+                try collectTentativeCalleesIntoStream(allocator, caller_id, od.struct_instrs, name_to_id, callers_of);
+            },
+            else => {},
+        }
+    }
+}
+
+fn recordTentativeEdge(
+    allocator: std.mem.Allocator,
+    target: ir.FunctionId,
+    caller: ir.FunctionId,
+    callers_of: *std.AutoHashMapUnmanaged(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
+) !void {
+    const gop = try callers_of.getOrPut(allocator, target);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    for (gop.value_ptr.items) |existing| {
+        if (existing == caller) return;
+    }
+    try gop.value_ptr.append(allocator, caller);
+}
+
+/// Per-call-site receiver and per-arg uniqueness, mirroring
+/// `v8_interprocedural.FunctionUniqueness` but produced by the
+/// tentative-rewrite-aware analyzer.
+const TentativeFunctionUniqueness = struct {
+    sites: std.AutoHashMapUnmanaged(arc_liveness.InstructionId, bool) = .empty,
+    arg_sites: std.AutoHashMapUnmanaged(arc_liveness.InstructionId, ArgEntry) = .empty,
+
+    const ArgEntry = struct {
+        target: ir.FunctionId,
+        per_arg: []bool,
+    };
+
+    fn deinit(self: *TentativeFunctionUniqueness, allocator: std.mem.Allocator) void {
+        self.sites.deinit(allocator);
+        var iter = self.arg_sites.iterator();
+        while (iter.next()) |entry| {
+            allocator.free(entry.value_ptr.per_arg);
+        }
+        self.arg_sites.deinit(allocator);
+    }
+};
+
+/// Tentative-rewrite-aware intraprocedural V8 dataflow. Mirrors
+/// `v8_interprocedural.ParameterizedAnalyzer` but adds a
+/// `RewrittenShareSet` that adjusts the `share_value` effect: when
+/// the share is in the rewritten set, applies move-value semantics
+/// (transfer uniqueness from source to dest) instead of clearing
+/// both.
+fn analyzeFunctionTentative(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: *const ir.Program,
+    fixpoint: *const v8_interprocedural.ProgramUniqueness,
+    rewritten: *const RewrittenShareSet,
+) !TentativeFunctionUniqueness {
+    var analyzer = TentativeAnalyzer{
+        .allocator = allocator,
+        .function = function,
+        .program = program,
+        .fixpoint = fixpoint,
+        .rewritten = rewritten,
+        .unique = .empty,
+        .next_id = 0,
+        .result = .{},
+    };
+    defer analyzer.unique.deinit(allocator);
+    errdefer analyzer.result.deinit(allocator);
+
+    for (function.body) |block| {
+        try analyzer.walkStream(block.instructions);
+    }
+    return analyzer.result;
+}
+
+const TentativeAnalyzer = struct {
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: *const ir.Program,
+    fixpoint: *const v8_interprocedural.ProgramUniqueness,
+    rewritten: *const RewrittenShareSet,
+    unique: std.AutoHashMapUnmanaged(ir.LocalId, void),
+    next_id: arc_liveness.InstructionId,
+    result: TentativeFunctionUniqueness,
+
+    fn walkStream(self: *TentativeAnalyzer, stream: []const ir.Instruction) error{OutOfMemory}!void {
+        for (stream) |*instr| {
+            const my_id = self.next_id;
+            self.next_id += 1;
+            try self.classifyCallSite(instr, my_id);
+            try self.applyEffect(instr, my_id);
+            try self.walkChildren(instr);
+        }
+    }
+
+    fn walkChildren(self: *TentativeAnalyzer, instr: *const ir.Instruction) error{OutOfMemory}!void {
+        switch (instr.*) {
+            .if_expr => |ie| {
+                const snap = try self.snapshot();
+                defer snap.deinit(self.allocator);
+                try self.walkStream(ie.then_instrs);
+                try self.restore(&snap);
+                try self.walkStream(ie.else_instrs);
+                try self.restore(&snap);
+            },
+            .case_block => |cb| {
+                const snap = try self.snapshot();
+                defer snap.deinit(self.allocator);
+                try self.walkStream(cb.pre_instrs);
+                const post_pre = try self.snapshot();
+                defer post_pre.deinit(self.allocator);
+                for (cb.arms) |arm| {
+                    try self.walkStream(arm.cond_instrs);
+                    try self.walkStream(arm.body_instrs);
+                    try self.restore(&post_pre);
+                }
+                try self.walkStream(cb.default_instrs);
+                try self.restore(&snap);
+            },
+            .switch_literal => |sl| {
+                const snap = try self.snapshot();
+                defer snap.deinit(self.allocator);
+                for (sl.cases) |c| {
+                    try self.walkStream(c.body_instrs);
+                    try self.restore(&snap);
+                }
+                try self.walkStream(sl.default_instrs);
+                try self.restore(&snap);
+            },
+            .switch_return => |sr| {
+                const snap = try self.snapshot();
+                defer snap.deinit(self.allocator);
+                for (sr.cases) |c| {
+                    try self.walkStream(c.body_instrs);
+                    try self.restore(&snap);
+                }
+                try self.walkStream(sr.default_instrs);
+                try self.restore(&snap);
+            },
+            .union_switch => |us| {
+                const snap = try self.snapshot();
+                defer snap.deinit(self.allocator);
+                for (us.cases) |c| {
+                    try self.walkStream(c.body_instrs);
+                    try self.restore(&snap);
+                }
+            },
+            .union_switch_return => |usr| {
+                const snap = try self.snapshot();
+                defer snap.deinit(self.allocator);
+                for (usr.cases) |c| {
+                    try self.walkStream(c.body_instrs);
+                    try self.restore(&snap);
+                }
+            },
+            .try_call_named => |tcn| {
+                const snap = try self.snapshot();
+                defer snap.deinit(self.allocator);
+                try self.walkStream(tcn.handler_instrs);
+                try self.restore(&snap);
+                try self.walkStream(tcn.success_instrs);
+                try self.restore(&snap);
+            },
+            .guard_block => |gb| {
+                const snap = try self.snapshot();
+                defer snap.deinit(self.allocator);
+                try self.walkStream(gb.body);
+                try self.restore(&snap);
+            },
+            .optional_dispatch => |od| {
+                const snap = try self.snapshot();
+                defer snap.deinit(self.allocator);
+                try self.walkStream(od.nil_instrs);
+                try self.restore(&snap);
+                try self.walkStream(od.struct_instrs);
+                try self.restore(&snap);
+            },
+            else => {},
+        }
+    }
+
+    fn classifyCallSite(self: *TentativeAnalyzer, instr: *const ir.Instruction, my_id: arc_liveness.InstructionId) error{OutOfMemory}!void {
+        if (self.callSiteOwnedMutating(instr)) |info| {
+            const is_unique = self.unique.contains(info.receiver);
+            try self.result.sites.put(self.allocator, my_id, is_unique);
+        }
+        if (self.callSiteArgs(instr)) |info| {
+            const per_arg = try self.allocator.alloc(bool, info.args.len);
+            for (info.args, 0..) |arg, idx| {
+                per_arg[idx] = self.unique.contains(arg);
+            }
+            try self.result.arg_sites.put(self.allocator, my_id, .{
+                .target = info.target,
+                .per_arg = per_arg,
+            });
+        }
+    }
+
+    const ReceiverInfo = struct { receiver: ir.LocalId };
+    const ArgsInfo = struct {
+        target: ir.FunctionId,
+        args: []const ir.LocalId,
+    };
+
+    fn callSiteOwnedMutating(self: *TentativeAnalyzer, instr: *const ir.Instruction) ?ReceiverInfo {
+        switch (instr.*) {
+            .call_builtin => |cb| {
+                const slot = arc_liveness.ownedMutatingBuiltinSlot(cb.name) orelse return null;
+                if (slot >= cb.args.len) return null;
+                return .{ .receiver = cb.args[slot] };
+            },
+            .call_named => |cn| {
+                if (arc_liveness.ownedMutatingBuiltinSlot(cn.name)) |slot| {
+                    if (slot >= cn.args.len) return null;
+                    return .{ .receiver = cn.args[slot] };
+                }
+                if (self.calleeOwnedReceiverSlot(cn.name)) |slot| {
+                    if (slot >= cn.args.len) return null;
+                    return .{ .receiver = cn.args[slot] };
+                }
+                return null;
+            },
+            .call_direct => |cd| {
+                const callee = lookupTentativeFunction(self.program, cd.function) orelse return null;
+                if (arc_liveness.ownedMutatingBuiltinSlot(callee.name)) |slot| {
+                    if (slot >= cd.args.len) return null;
+                    return .{ .receiver = cd.args[slot] };
+                }
+                if (calleeFunctionOwnedReceiverSlotByPointer(callee)) |slot| {
+                    if (slot >= cd.args.len) return null;
+                    return .{ .receiver = cd.args[slot] };
+                }
+                return null;
+            },
+            .try_call_named => |tcn| {
+                if (arc_liveness.ownedMutatingBuiltinSlot(tcn.name)) |slot| {
+                    if (slot >= tcn.args.len) return null;
+                    return .{ .receiver = tcn.args[slot] };
+                }
+                if (self.calleeOwnedReceiverSlot(tcn.name)) |slot| {
+                    if (slot >= tcn.args.len) return null;
+                    return .{ .receiver = tcn.args[slot] };
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    fn callSiteArgs(self: *TentativeAnalyzer, instr: *const ir.Instruction) ?ArgsInfo {
+        switch (instr.*) {
+            .call_named => |cn| {
+                const target = self.lookupByName(cn.name) orelse return null;
+                return .{ .target = target, .args = cn.args };
+            },
+            .call_direct => |cd| {
+                return .{ .target = cd.function, .args = cd.args };
+            },
+            .try_call_named => |tcn| {
+                const target = self.lookupByName(tcn.name) orelse return null;
+                return .{ .target = target, .args = tcn.args };
+            },
+            .tail_call => |tc| {
+                const target = self.lookupByName(tc.name) orelse return null;
+                return .{ .target = target, .args = tc.args };
+            },
+            else => return null,
+        }
+    }
+
+    fn lookupByName(self: *const TentativeAnalyzer, name: []const u8) ?ir.FunctionId {
+        for (self.program.functions) |func| {
+            if (std.mem.eql(u8, func.name, name)) return func.id;
+            if (func.local_name.len != 0 and std.mem.eql(u8, func.local_name, name)) return func.id;
+        }
+        return null;
+    }
+
+    fn calleeOwnedReceiverSlot(self: *const TentativeAnalyzer, name: []const u8) ?usize {
+        for (self.program.functions) |*func| {
+            if (std.mem.eql(u8, func.name, name)) {
+                return calleeFunctionOwnedReceiverSlotByPointer(func);
+            }
+        }
+        return null;
+    }
+
+    fn applyEffect(self: *TentativeAnalyzer, instr: *const ir.Instruction, my_id: arc_liveness.InstructionId) error{OutOfMemory}!void {
+        switch (instr.*) {
+            .tuple_init => |ti| {
+                for (ti.elements) |elem| _ = self.unique.remove(elem);
+                try self.unique.put(self.allocator, ti.dest, {});
+            },
+            .list_init => |li| {
+                for (li.elements) |elem| _ = self.unique.remove(elem);
+                try self.unique.put(self.allocator, li.dest, {});
+            },
+            .list_cons => |lc| {
+                _ = self.unique.remove(lc.head);
+                _ = self.unique.remove(lc.tail);
+                try self.unique.put(self.allocator, lc.dest, {});
+            },
+            .map_init => |mi| {
+                for (mi.entries) |entry| {
+                    _ = self.unique.remove(entry.key);
+                    _ = self.unique.remove(entry.value);
+                }
+                try self.unique.put(self.allocator, mi.dest, {});
+            },
+            .struct_init => |si| {
+                for (si.fields) |f| _ = self.unique.remove(f.value);
+                try self.unique.put(self.allocator, si.dest, {});
+            },
+            .union_init => |ui| {
+                _ = self.unique.remove(ui.value);
+                try self.unique.put(self.allocator, ui.dest, {});
+            },
+            .call_builtin => |cb| {
+                if (arc_liveness.ownedMutatingBuiltinSlot(cb.name) != null) {
+                    if (cb.args.len > 0) {
+                        const slot = arc_liveness.ownedMutatingBuiltinSlot(cb.name).?;
+                        if (slot < cb.args.len) {
+                            _ = self.unique.remove(cb.args[slot]);
+                        }
+                    }
+                    try self.unique.put(self.allocator, cb.dest, {});
+                } else if (arc_liveness.isFreshAllocatorBuiltin(cb.name)) {
+                    try self.unique.put(self.allocator, cb.dest, {});
+                } else {
+                    _ = self.unique.remove(cb.dest);
+                }
+            },
+            .call_named => |cn| {
+                try self.applyCalleeEffect(cn.name, cn.args, cn.dest);
+            },
+            .call_direct => |cd| {
+                const callee = lookupTentativeFunction(self.program, cd.function);
+                if (callee) |func| {
+                    try self.applyCalleeEffectWithFunction(func, cd.args, cd.dest);
+                } else {
+                    _ = self.unique.remove(cd.dest);
+                }
+            },
+            .try_call_named => |tcn| {
+                try self.applyCalleeEffect(tcn.name, tcn.args, tcn.dest);
+            },
+            .move_value => |mv| {
+                if (self.unique.contains(mv.source)) {
+                    _ = self.unique.remove(mv.source);
+                    try self.unique.put(self.allocator, mv.dest, {});
+                } else {
+                    _ = self.unique.remove(mv.dest);
+                }
+            },
+            .share_value => |sv| {
+                // Tentative-rewrite-aware effect: when this share's
+                // dest flows into an `.owned` arg slot of a downstream
+                // call (per the pre-computed RewrittenShareSet), the
+                // post-rewrite IR will replace this share with
+                // move_value. The V8 dataflow under the tentative
+                // conventions therefore applies move-style semantics:
+                // transfer uniqueness from source to dest.
+                //
+                // Otherwise apply the original semantics: clear both.
+                if (self.rewritten.contains(self.function.id, my_id)) {
+                    if (self.unique.contains(sv.source)) {
+                        _ = self.unique.remove(sv.source);
+                        try self.unique.put(self.allocator, sv.dest, {});
+                    } else {
+                        _ = self.unique.remove(sv.dest);
+                    }
+                } else {
+                    _ = self.unique.remove(sv.source);
+                    _ = self.unique.remove(sv.dest);
+                }
+            },
+            .copy_value => |cv| {
+                _ = self.unique.remove(cv.source);
+                _ = self.unique.remove(cv.dest);
+            },
+            .borrow_value => |bv| {
+                _ = self.unique.remove(bv.dest);
+            },
+            .local_get => |lg| {
+                if (self.unique.contains(lg.source)) {
+                    _ = self.unique.remove(lg.source);
+                    try self.unique.put(self.allocator, lg.dest, {});
+                } else {
+                    _ = self.unique.remove(lg.dest);
+                }
+            },
+            .local_set => |ls| {
+                if (self.unique.contains(ls.value)) {
+                    _ = self.unique.remove(ls.value);
+                    try self.unique.put(self.allocator, ls.dest, {});
+                } else {
+                    _ = self.unique.remove(ls.dest);
+                }
+            },
+            .param_get => |pg| {
+                if (self.fixpoint.isUniqueOnEntry(self.function.id, pg.index)) {
+                    try self.unique.put(self.allocator, pg.dest, {});
+                } else {
+                    _ = self.unique.remove(pg.dest);
+                }
+            },
+            .release,
+            .retain,
+            .ret,
+            .cond_return,
+            .switch_tag,
+            .branch,
+            .cond_branch,
+            .jump,
+            .match_fail,
+            .match_error_return,
+            .case_break,
+            .tail_call,
+            .set_safety,
+            => {},
+            else => {},
+        }
+    }
+
+    fn applyCalleeEffect(self: *TentativeAnalyzer, name: []const u8, args: []const ir.LocalId, dest: ir.LocalId) error{OutOfMemory}!void {
+        if (arc_liveness.ownedMutatingBuiltinSlot(name)) |slot| {
+            if (slot < args.len) {
+                _ = self.unique.remove(args[slot]);
+            }
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
+        if (self.calleeOwnedReceiverSlot(name)) |slot| {
+            if (slot < args.len) {
+                _ = self.unique.remove(args[slot]);
+            }
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
+        if (self.calleeIsFreshAllocatorWrapper(name)) {
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
+        _ = self.unique.remove(dest);
+    }
+
+    fn applyCalleeEffectWithFunction(self: *TentativeAnalyzer, function: *const ir.Function, args: []const ir.LocalId, dest: ir.LocalId) error{OutOfMemory}!void {
+        if (arc_liveness.ownedMutatingBuiltinSlot(function.name)) |slot| {
+            if (slot < args.len) {
+                _ = self.unique.remove(args[slot]);
+            }
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
+        if (calleeFunctionOwnedReceiverSlotByPointer(function)) |slot| {
+            if (slot < args.len) {
+                _ = self.unique.remove(args[slot]);
+            }
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
+        if (functionIsFreshAllocatorWrapperByPointer(function)) {
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
+        _ = self.unique.remove(dest);
+    }
+
+    fn calleeIsFreshAllocatorWrapper(self: *const TentativeAnalyzer, name: []const u8) bool {
+        for (self.program.functions) |*func| {
+            if (std.mem.eql(u8, func.name, name)) {
+                return functionIsFreshAllocatorWrapperByPointer(func);
+            }
+        }
+        return false;
+    }
+
+    fn snapshot(self: *TentativeAnalyzer) error{OutOfMemory}!TentativeSnapshot {
+        var copy: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+        var iter = self.unique.keyIterator();
+        while (iter.next()) |k| {
+            try copy.put(self.allocator, k.*, {});
+        }
+        return TentativeSnapshot{ .set = copy };
+    }
+
+    fn restore(self: *TentativeAnalyzer, snap: *const TentativeSnapshot) error{OutOfMemory}!void {
+        self.unique.clearRetainingCapacity();
+        var iter = snap.set.keyIterator();
+        while (iter.next()) |k| {
+            try self.unique.put(self.allocator, k.*, {});
+        }
+    }
+};
+
+const TentativeSnapshot = struct {
+    set: std.AutoHashMapUnmanaged(ir.LocalId, void),
+
+    fn deinit(self: *const TentativeSnapshot, allocator: std.mem.Allocator) void {
+        var mut = self.*;
+        mut.set.deinit(allocator);
+    }
+};
+
+fn calleeFunctionOwnedReceiverSlotByPointer(function: *const ir.Function) ?usize {
+    if (function.result_convention != .owned) return null;
+    for (function.param_conventions, 0..) |conv, idx| {
+        if (conv == .owned) return idx;
+    }
+    return null;
+}
+
+/// Mirror of `v8_uniqueness.functionIsFreshAllocatorWrapper` —
+/// duplicated to avoid the import dependency cycle (arc_param_convention
+/// -> v8_uniqueness -> v8_interprocedural -> arc_param_convention would
+/// be a cycle).
+fn functionIsFreshAllocatorWrapperByPointer(function: *const ir.Function) bool {
+    if (function.result_convention != .owned) return false;
+    var allocator_count: usize = 0;
+    var other_call_count: usize = 0;
+    var ctx = AllocatorWrapperScanCtx{
+        .allocator_count = &allocator_count,
+        .other_call_count = &other_call_count,
+    };
+    for (function.body) |block| {
+        scanAllocatorWrapperStream(block.instructions, &ctx);
+    }
+    return allocator_count == 1 and other_call_count == 0;
+}
+
+const AllocatorWrapperScanCtx = struct {
+    allocator_count: *usize,
+    other_call_count: *usize,
+};
+
+fn scanAllocatorWrapperStream(stream: []const ir.Instruction, ctx: *AllocatorWrapperScanCtx) void {
+    for (stream) |*instr| {
+        switch (instr.*) {
+            .call_builtin => |cb| {
+                if (arc_liveness.isFreshAllocatorBuiltin(cb.name)) {
+                    ctx.allocator_count.* += 1;
+                } else {
+                    ctx.other_call_count.* += 1;
+                }
+            },
+            .call_named, .call_direct, .try_call_named, .call_dispatch, .call_closure, .tail_call => {
+                ctx.other_call_count.* += 1;
+            },
+            .if_expr => |ie| {
+                scanAllocatorWrapperStream(ie.then_instrs, ctx);
+                scanAllocatorWrapperStream(ie.else_instrs, ctx);
+            },
+            .case_block => |cb| {
+                scanAllocatorWrapperStream(cb.pre_instrs, ctx);
+                for (cb.arms) |arm| {
+                    scanAllocatorWrapperStream(arm.cond_instrs, ctx);
+                    scanAllocatorWrapperStream(arm.body_instrs, ctx);
+                }
+                scanAllocatorWrapperStream(cb.default_instrs, ctx);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
+                scanAllocatorWrapperStream(sl.default_instrs, ctx);
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
+                scanAllocatorWrapperStream(sr.default_instrs, ctx);
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
+            },
+            .guard_block => |gb| scanAllocatorWrapperStream(gb.body, ctx),
+            .optional_dispatch => |od| {
+                scanAllocatorWrapperStream(od.nil_instrs, ctx);
+                scanAllocatorWrapperStream(od.struct_instrs, ctx);
+            },
+            else => {},
+        }
+    }
+}
+
+const TentativeDemotionWalker = struct {
+    allocator: std.mem.Allocator,
+    caller: *const ir.Function,
+    program: *const ir.Program,
+    name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
+    uniqueness: *const TentativeFunctionUniqueness,
+    program_uniqueness: *v8_interprocedural.ProgramUniqueness,
+    callers_of: *const std.AutoHashMapUnmanaged(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
+    worklist: *std.ArrayListUnmanaged(ir.FunctionId),
+    in_worklist: *std.AutoHashMapUnmanaged(ir.FunctionId, void),
+    next_id: arc_liveness.InstructionId,
+
+    fn walkStream(self: *TentativeDemotionWalker, stream: []const ir.Instruction) error{OutOfMemory}!void {
+        for (stream) |*instr| {
+            const my_id = self.next_id;
+            self.next_id += 1;
+            try self.maybeDemoteCallee(my_id);
+            try self.walkChildren(instr);
+        }
+    }
+
+    fn walkChildren(self: *TentativeDemotionWalker, instr: *const ir.Instruction) error{OutOfMemory}!void {
+        switch (instr.*) {
+            .if_expr => |ie| {
+                try self.walkStream(ie.then_instrs);
+                try self.walkStream(ie.else_instrs);
+            },
+            .case_block => |cb| {
+                try self.walkStream(cb.pre_instrs);
+                for (cb.arms) |arm| {
+                    try self.walkStream(arm.cond_instrs);
+                    try self.walkStream(arm.body_instrs);
+                }
+                try self.walkStream(cb.default_instrs);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| try self.walkStream(c.body_instrs);
+                try self.walkStream(sl.default_instrs);
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| try self.walkStream(c.body_instrs);
+                try self.walkStream(sr.default_instrs);
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| try self.walkStream(c.body_instrs);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| try self.walkStream(c.body_instrs);
+            },
+            .try_call_named => |tcn| {
+                try self.walkStream(tcn.handler_instrs);
+                try self.walkStream(tcn.success_instrs);
+            },
+            .guard_block => |gb| {
+                try self.walkStream(gb.body);
+            },
+            .optional_dispatch => |od| {
+                try self.walkStream(od.nil_instrs);
+                try self.walkStream(od.struct_instrs);
+            },
+            else => {},
+        }
+    }
+
+    fn maybeDemoteCallee(self: *TentativeDemotionWalker, my_id: arc_liveness.InstructionId) error{OutOfMemory}!void {
+        const arg_info = self.uniqueness.arg_sites.get(my_id) orelse return;
+        const callee = lookupTentativeFunction(self.program, arg_info.target) orelse return;
+
+        const callee_slots = self.program_uniqueness.by_function.get(callee.id) orelse return;
+        for (callee.param_conventions, 0..) |conv, slot_idx| {
+            if (slot_idx >= callee_slots.len) break;
+            if (conv != .owned) continue;
+            if (!callee_slots[slot_idx]) continue;
+            if (slot_idx >= arg_info.per_arg.len) {
+                callee_slots[slot_idx] = false;
+                try self.enqueueCallers(callee.id);
+                continue;
+            }
+            if (!arg_info.per_arg[slot_idx]) {
+                callee_slots[slot_idx] = false;
+                try self.enqueueCallers(callee.id);
+            }
+        }
+    }
+
+    fn enqueueCallers(self: *TentativeDemotionWalker, callee_id: ir.FunctionId) error{OutOfMemory}!void {
+        const list = self.callers_of.get(callee_id) orelse return;
+        for (list.items) |caller_id| {
+            if (!self.in_worklist.contains(caller_id)) {
+                try self.worklist.append(self.allocator, caller_id);
+                try self.in_worklist.put(self.allocator, caller_id, {});
+            }
+        }
+        if (!self.in_worklist.contains(callee_id)) {
+            try self.worklist.append(self.allocator, callee_id);
+            try self.in_worklist.put(self.allocator, callee_id, {});
+        }
+    }
+};
+
+/// Look up a function by id and return a mutable pointer (the IR
+/// builder's slice is conceptually const, but the inference pass
+/// mutates `param_conventions` via @constCast at the seam).
+fn lookupFunctionMut(program: *const ir.Program, function_id: ir.FunctionId) ?*ir.Function {
+    for (program.functions, 0..) |func, idx| {
+        if (func.id == function_id) {
+            return @constCast(&program.functions[idx]);
+        }
+    }
+    return null;
 }
 
 /// Single-iteration audit predicate: does `(function, slot_index)`
@@ -2286,4 +3659,280 @@ test "arc_param_convention: paramSlotIsRefetchedAfter still detects unbounded re
     // Refetch's last use (4) is > consume call last use (3), so the
     // refetch IS still live past the consume call and must be flagged.
     try std.testing.expect(paramSlotIsRefetchedAfter(&function, 0, share_source, share_id, &last_use_map, consume_last_use_id));
+}
+
+// ============================================================
+// Phase 2.4 V8 pre-flight check tests
+// ============================================================
+
+test "arc_param_convention: liftSetSurvivesV8Check admits a slot whose body is consume-mode" {
+    // Build a synthetic function that forwards its slot directly into
+    // an owned-mutating builtin and returns the result. Tentatively
+    // promote the slot to .owned and verify the V8 fixpoint says
+    // unique-on-entry.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Body of `set_zero(arr) -> Vector.set(arr, 0, 0)`.
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 3;
+    args[1] = 1;
+    args[2] = 2;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .move_value = .{ .dest = 3, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "VectorI64.set",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+        .{ .ret = .{ .value = 4 } },
+    };
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{
+        .label = 0,
+        .instructions = try arena.dupe(ir.Instruction, &instrs),
+    };
+    const ownership = try arena.alloc(ir.OwnershipClass, 5);
+    for (ownership) |*o| o.* = .owned;
+    const conventions = try arena.alloc(ir.ParamConvention, 1);
+    conventions[0] = .borrowed;
+    const params = try arena.alloc(ir.Param, 1);
+    params[0] = .{ .name = "arr", .type_expr = .void };
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = .{
+        .id = 0,
+        .name = "set_zero",
+        .scope_id = 0,
+        .arity = 1,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = conventions,
+        .local_ownership = ownership,
+        .result_convention = .owned,
+    };
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var candidates: LiftSet = .empty;
+    defer candidates.deinit(std.testing.allocator);
+    try candidates.put(std.testing.allocator, liftKey(0, 0), {});
+
+    var survivors: LiftSet = .empty;
+    defer survivors.deinit(std.testing.allocator);
+    try liftSetSurvivesV8Check(std.testing.allocator, &program, &candidates, &survivors);
+
+    // The slot's body is a thin forward to VectorI64.set — V8 should
+    // see uniqueness preserved through the rewritten share→move and
+    // admit the candidate. Note: this test has no callers, so the
+    // optimistic seeding leaves slot 0 unique-on-entry by default.
+    try std.testing.expect(survivors.count() == 1);
+    try std.testing.expect(liftSetContains(&survivors, 0, 0));
+
+    // Conventions must be restored (the pre-flight is non-mutating).
+    try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[0].param_conventions[0]);
+}
+
+test "arc_param_convention: liftSetSurvivesV8Check rejects when caller passes a copy_value-clobbered receiver" {
+    // The pre-flight's V8 simulation rejects a callee candidate slot
+    // when its caller can't pass a unique value at the call site.
+    // Mirror that pattern: the callee F.0 is the candidate; the
+    // caller G's body does `copy_value` on G's owned slot before the
+    // call to F. Under tentative promotion of F.0, the V8 fixpoint
+    // observes G's call passing a non-unique arg → demotes F.0.
+    //
+    // Both functions are tentatively-promoted candidates here so the
+    // SCC bootstrap mechanic is exercised — the demotion must
+    // actually fire even when both slots start unique-on-entry.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Callee F: forwards slot 0 into VectorI64.set.
+    const callee_args = try arena.alloc(ir.LocalId, 3);
+    callee_args[0] = 3;
+    callee_args[1] = 1;
+    callee_args[2] = 2;
+    const callee_modes = try arena.alloc(ir.ValueMode, 3);
+    callee_modes[0] = .move;
+    callee_modes[1] = .borrow;
+    callee_modes[2] = .borrow;
+    const callee_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .move_value = .{ .dest = 3, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "VectorI64.set",
+            .args = callee_args,
+            .arg_modes = callee_modes,
+        } },
+        .{ .ret = .{ .value = 4 } },
+    };
+    const callee_blocks = try arena.alloc(ir.Block, 1);
+    callee_blocks[0] = .{ .label = 0, .instructions = try arena.dupe(ir.Instruction, &callee_instrs) };
+    const callee_ownership = try arena.alloc(ir.OwnershipClass, 5);
+    for (callee_ownership) |*o| o.* = .owned;
+    const callee_conventions = try arena.alloc(ir.ParamConvention, 1);
+    callee_conventions[0] = .borrowed;
+    const callee_params = try arena.alloc(ir.Param, 1);
+    callee_params[0] = .{ .name = "arr", .type_expr = .void };
+
+    // Caller G: takes one slot, does `copy_value` to clobber it,
+    // then calls F passing the COPY (which V8 says is non-unique).
+    //
+    //   [0] param_get %0 = index 0
+    //   [1] copy_value %1 = %0   -- both cleared from unique
+    //   [2] share_value %2 = %1  -- (in the rewritten set if F.0 .owned)
+    //   [3] call_named name="callee" args=[%2] dest=%3
+    //   [4] ret value=%3
+    const caller_args = try arena.alloc(ir.LocalId, 1);
+    caller_args[0] = 2;
+    const caller_modes = try arena.alloc(ir.ValueMode, 1);
+    caller_modes[0] = .move;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .copy_value = .{ .dest = 1, .source = 0 } },
+        .{ .share_value = .{ .dest = 2, .source = 1, .mode = .retain } },
+        .{ .call_named = .{
+            .dest = 3,
+            .name = "callee",
+            .args = caller_args,
+            .arg_modes = caller_modes,
+        } },
+        .{ .ret = .{ .value = 3 } },
+    };
+    const caller_blocks = try arena.alloc(ir.Block, 1);
+    caller_blocks[0] = .{ .label = 0, .instructions = try arena.dupe(ir.Instruction, &caller_instrs) };
+    const caller_ownership = try arena.alloc(ir.OwnershipClass, 4);
+    for (caller_ownership) |*o| o.* = .owned;
+    const caller_conventions = try arena.alloc(ir.ParamConvention, 1);
+    caller_conventions[0] = .borrowed;
+    const caller_params = try arena.alloc(ir.Param, 1);
+    caller_params[0] = .{ .name = "arr", .type_expr = .void };
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = .{
+        .id = 0,
+        .name = "callee",
+        .scope_id = 0,
+        .arity = 1,
+        .params = callee_params,
+        .return_type = .void,
+        .body = callee_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = callee_conventions,
+        .local_ownership = callee_ownership,
+        .result_convention = .owned,
+    };
+    functions[1] = .{
+        .id = 1,
+        .name = "caller",
+        .scope_id = 0,
+        .arity = 1,
+        .params = caller_params,
+        .return_type = .void,
+        .body = caller_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = caller_conventions,
+        .local_ownership = caller_ownership,
+        .result_convention = .owned,
+    };
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var candidates: LiftSet = .empty;
+    defer candidates.deinit(std.testing.allocator);
+    try candidates.put(std.testing.allocator, liftKey(0, 0), {}); // callee.0
+    try candidates.put(std.testing.allocator, liftKey(1, 0), {}); // caller.0
+
+    var survivors: LiftSet = .empty;
+    defer survivors.deinit(std.testing.allocator);
+    try liftSetSurvivesV8Check(std.testing.allocator, &program, &candidates, &survivors);
+
+    // Caller's body has `copy_value` clobbering uniqueness before the
+    // call to callee. The V8 fixpoint sees the call's arg is non-unique
+    // → demotes callee.0. The pre-flight thus rejects callee.0 from
+    // survivors. (caller.0 has no callers in this synthetic program,
+    // so its unique-on-entry stays true and it survives.)
+    try std.testing.expect(!liftSetContains(&survivors, 0, 0));
+
+    // Conventions must be restored.
+    try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[0].param_conventions[0]);
+    try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[1].param_conventions[0]);
+}
+
+test "arc_param_convention: liftSetSurvivesV8Check restores conventions on every exit path" {
+    // Smoke: when the candidate set is empty, the pre-flight is a
+    // no-op. When non-empty, conventions are flipped, V8 runs, and
+    // they're restored regardless of the result.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = &.{} };
+    const ownership = try arena.alloc(ir.OwnershipClass, 0);
+    const conventions = try arena.alloc(ir.ParamConvention, 1);
+    conventions[0] = .borrowed;
+    const params = try arena.alloc(ir.Param, 1);
+    params[0] = .{ .name = "x", .type_expr = .void };
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = .{
+        .id = 0,
+        .name = "noop",
+        .scope_id = 0,
+        .arity = 1,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 0,
+        .param_conventions = conventions,
+        .local_ownership = ownership,
+        .result_convention = .trivial,
+    };
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    // Empty candidates: no-op.
+    {
+        var candidates: LiftSet = .empty;
+        defer candidates.deinit(std.testing.allocator);
+        var survivors: LiftSet = .empty;
+        defer survivors.deinit(std.testing.allocator);
+        try liftSetSurvivesV8Check(std.testing.allocator, &program, &candidates, &survivors);
+        try std.testing.expectEqual(@as(u32, 0), survivors.count());
+        try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[0].param_conventions[0]);
+    }
+
+    // Non-empty candidates: conventions flipped during the call,
+    // restored after.
+    {
+        var candidates: LiftSet = .empty;
+        defer candidates.deinit(std.testing.allocator);
+        try candidates.put(std.testing.allocator, liftKey(0, 0), {});
+        var survivors: LiftSet = .empty;
+        defer survivors.deinit(std.testing.allocator);
+        try liftSetSurvivesV8Check(std.testing.allocator, &program, &candidates, &survivors);
+        // After the call returns, conventions are back to .borrowed.
+        try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[0].param_conventions[0]);
+    }
 }
