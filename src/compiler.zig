@@ -2023,7 +2023,7 @@ pub fn compileStructByStruct(
         .type_defs = all_type_defs.items,
         .entry = entry_id,
     };
-    const analysis_result = try pipeline.runAnalysisAndContify(&merged_ir);
+    var analysis_result = try pipeline.runAnalysisAndContify(&merged_ir);
     if (profilingEnabled()) {
         std.debug.print("\n[stage Phase5-AnalysisAndContify] ms={d}\n", .{phase_timer.lapMs()});
     } else {
@@ -2077,6 +2077,24 @@ pub fn compileStructByStruct(
             merged_ownership.deinit();
             return error.IrFailed;
         };
+        // Phase 2: materialize the analysis-context records
+        // (arc_ops, drop_specializations) into first-class
+        // `.retain { kind }` / `.release { kind }` IR instructions
+        // inserted directly into the function body. After
+        // materialization, the consumed records are removed from
+        // the analysis context; the ZIR-time helpers
+        // (`emitAnalysisArcOps`, `emitDropSpecializationsForCurrentInstr`)
+        // observe the empty remainder and become no-ops for the
+        // materialized cases. Records targeting nested streams
+        // remain in place for the helpers to handle until follow-up
+        // commits extend the materialization pass's reach.
+        for (merged_ir.functions, 0..) |_, fi| {
+            const function: *ir.Function = @constCast(&merged_ir.functions[fi]);
+            zap.arc_materialize.materializeAnalysisArcOps(alloc, function, &analysis_result.context) catch {
+                merged_ownership.deinit();
+                return error.IrFailed;
+            };
+        }
         // Replace the per-struct combined ownership with the
         // recomputed merged ownership so downstream consumers
         // (ZIR backend, `arc_share_skipped`, etc.) see the

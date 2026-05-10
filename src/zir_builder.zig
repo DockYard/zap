@@ -6777,7 +6777,22 @@ pub const ZirDriver = struct {
                     return;
                 }
                 if (!self.shouldSkipArc(rel.value)) {
-                    // Emit: @import("zap_runtime").ArcRuntime.releaseAny(allocator, value)
+                    // Phase 2 Class B: dispatch on the IR-level kind
+                    // enum so callers control deep vs shallow free
+                    // semantics rather than every release-emission
+                    // site re-deciding between runtime helpers. The
+                    // `.release` kind lowers to `releaseAny` (full
+                    // ARC release: decrement refcount, deep-walk
+                    // children on zero-transition, free); the
+                    // `.free` kind lowers to `freeAny` (shallow free
+                    // when the refcount is statically known to be 1
+                    // and children have already been extracted by
+                    // an inner consumer — destructive-optional
+                    // dispatch).
+                    const helper_name: []const u8 = switch (rel.kind) {
+                        .release => "releaseAny",
+                        .free => "freeAny",
+                    };
                     const val_ref = self.refForLocal(rel.value) catch return;
 
                     const alloc_ref = try self.emitAllocatorRef();
@@ -6786,7 +6801,7 @@ pub const ZirDriver = struct {
                     if (rt_import == error_ref) return error.EmitFailed;
                     const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                     if (arc_runtime == error_ref) return error.EmitFailed;
-                    const release_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "releaseAny", 10);
+                    const release_fn = zir_builder_emit_field_val(self.handle, arc_runtime, helper_name.ptr, @intCast(helper_name.len));
                     if (release_fn == error_ref) return error.EmitFailed;
 
                     const args = [_]u32{ alloc_ref, val_ref };

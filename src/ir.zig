@@ -1111,8 +1111,37 @@ pub const Retain = struct {
     kind: RetainKind = .normal,
 };
 
+/// Flavor of release. Each kind selects a different runtime helper
+/// at ZIR-lowering time. Phase 2 Class B introduces this flavoring
+/// so the analysis-driven `releaseAny` / `freeAny` emissions
+/// (`emitDropSpecializationsForCurrentInstr` at zir_builder.zig:3934)
+/// can become first-class IR instructions consumed by the canonical
+/// `.release` handler. Same architectural rationale as `RetainKind`
+/// (Phase 1 Class A): the IR is the single source of truth for
+/// every retain/release the program executes.
+pub const ReleaseKind = enum {
+    /// Standard ARC release: decrement refcount; if zero, run the
+    /// type's destructor (which deep-releases ARC-managed
+    /// children) and free the allocation. Lowers to
+    /// `ArcRuntime.releaseAny`.
+    release,
+    /// Shallow free: refcount must be statically known to be 1 at
+    /// this point; destroys the parent allocation without walking
+    /// children. Used by destructive-optional-dispatch where
+    /// children were already extracted and consumed by inner
+    /// calls. Lowers to `ArcRuntime.freeAny`.
+    free,
+};
+
 pub const Release = struct {
     value: LocalId,
+    /// Flavor of release. Defaults to `.release` for backward compat
+    /// with existing `.{ .release = .{ .value = x } }` constructions.
+    /// `arc_drop_insertion` and the Phase 2 materialization pass
+    /// emit `.release` (deep) by default; the optimizer / drop-
+    /// specialization pass refines selected releases to `.free`
+    /// when liveness proves the value is statically unique.
+    kind: ReleaseKind = .release,
 };
 
 /// Perceus: if RC=1, make memory available for reuse and return a reuse token.

@@ -3655,15 +3655,20 @@ fn v10CountForbiddenEmissions(source: []const u8, verbose: bool) usize {
 ///   bump), but that is not a forbidden ARC runtime call — pure
 ///   bookkeeping, no refcount effect.
 ///
-/// Total expected: 13. Pre-Phase-1-Class-A baseline was 14
-/// (original `.copy_value` had retainAnyPersistent + `.share_value`
-/// mode=retain had retainAny; both moved to canonical `.retain`
-/// handler dispatch on kind, net -1 because both formerly-violation
-/// sites collapsed into one already-canonical handler that now
-/// dispatches on a kind enum). Phase 2 reduces to 8. Phase 3
-/// reduces to 4 (only canonical handlers remain, including a
-/// fourth for `.reuse_alloc` once introduced).
-const v10_expected_total: usize = 13;
+/// Total expected: 14. Phase 1 Class A migration dropped the count
+/// from 14→13 by collapsing two violations into the canonical
+/// `.retain` handler's kind dispatch. Phase 2 ReleaseKind addition
+/// adds `"freeAny"` to the canonical `.release` handler's kind
+/// dispatch (back to 14). The materialization pass added in Phase
+/// 2 doesn't change the V10 count itself because the helpers
+/// (`emitAnalysisArcOps`, `emitDropSpecializationsForCurrentInstr`,
+/// `emitPerceusResetForCase`) still exist in the source tree —
+/// they just receive empty input lists for top-level records that
+/// the materialization pass consumed. Subsequent commits will
+/// delete the helpers entirely once the materialization pass
+/// covers nested-stream cases too, dropping the V10 count to its
+/// permanent floor.
+const v10_expected_total: usize = 14;
 
 test "V10: zir_builder.zig forbidden ARC emissions match phase-tracked allowlist" {
     const observed = v10CountForbiddenEmissions(v10_zir_builder_source, false);
