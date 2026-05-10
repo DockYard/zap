@@ -1728,13 +1728,29 @@ const StreamRewriter = struct {
                     // Strip the immediately-following
                     // `.retain {value=dest}` if present — it was
                     // emitted by `IrBuilder.emitLocalGet` for ARC
-                    // sources. Both `.borrow_value` (no retain) and
-                    // `.copy_value` (retain emitted by zir_builder
-                    // lowering) supersede it.
+                    // sources. Borrow (no retain) and move (transfers
+                    // ownership) supersede it.
+                    //
+                    // For `.copy_value` rewrites under Phase 1 Class A,
+                    // we re-emit the retain explicitly with
+                    // `kind = .persistent` so the IR carries the
+                    // persistent-retain semantics (long-lived owner
+                    // bookkeeping for Map workload share-event tracking)
+                    // that the ZIR `.copy_value` handler used to emit
+                    // implicitly via `retainAnyPersistent`. Now the
+                    // ZIR `.copy_value` handler is pure dataflow and
+                    // the IR-level retain is the single source of
+                    // truth.
                     if (i + 1 < stream.len) {
                         const peek_original = stream[i + 1];
                         const peek = rebuilt_children.items[i + 1] orelse peek_original;
                         if (peek == .retain and peek.retain.value == lg.dest) {
+                            const last = new_instrs.items[new_instrs.items.len - 1];
+                            if (last == .copy_value) {
+                                try new_instrs.append(self.allocator, .{
+                                    .retain = .{ .value = lg.dest, .kind = .persistent },
+                                });
+                            }
                             i += 1;
                         }
                     }
@@ -1770,6 +1786,17 @@ const StreamRewriter = struct {
                         } else {
                             try new_instrs.append(self.allocator, .{
                                 .copy_value = .{ .dest = bv.dest, .source = bv.source },
+                            });
+                            // Phase 1 Class A: pair the .copy_value
+                            // with an explicit `.retain { kind:
+                            // .persistent }` so the IR carries the
+                            // persistent-retain semantics. The
+                            // .borrow_value → .copy_value rewrite
+                            // produces a fresh persistent owner; the
+                            // matching scope-exit `.release` is
+                            // inserted by `arc_drop_insertion`.
+                            try new_instrs.append(self.allocator, .{
+                                .retain = .{ .value = bv.dest, .kind = .persistent },
                             });
                         }
                     }
@@ -2205,6 +2232,24 @@ const ConsumeSiteRewriter = struct {
                 try new_instrs.append(self.allocator, .{
                     .move_value = .{ .dest = sv.dest, .source = sv.source },
                 });
+                // Phase 1 Class A item 2: the IR builder emits
+                // `.share_value` followed by `.retain { kind: .normal,
+                // value: dest }` to carry the share's retain semantics
+                // explicitly at the IR level. When the consume-site
+                // rewriter converts the `.share_value` to `.move_value`
+                // (because the call site consumes the value), the
+                // following `.retain` is no longer correct — move
+                // transfers ownership without bumping the refcount —
+                // and must be stripped. Without this strip we'd emit
+                // both a move (transfer) and a retain (bump), inflating
+                // the refcount by +1 on every consume site.
+                if (idx + 1 < stream.len) {
+                    const peek_original = stream[idx + 1];
+                    const peek = rebuilt_children.items[idx + 1] orelse peek_original;
+                    if (peek == .retain and peek.retain.value == sv.dest) {
+                        try drop_release.put(self.allocator, idx + 1, {});
+                    }
+                }
             } else {
                 try new_instrs.append(self.allocator, effective);
             }

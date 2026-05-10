@@ -2784,46 +2784,45 @@ fn v10CountForbiddenEmissions(source: []const u8, verbose: bool) usize {
 /// catalogue below in the same commit. A drift between the audit and
 /// the catalogue is a bug.
 ///
-/// Catalogue (audit baseline as of commit 14b3ac0; revise on each
-/// phase advance):
+/// Catalogue (audit baseline post Phase 1 Class A items 1+2 — the
+/// `.copy_value` and `.share_value` mode=retain implicit-retain
+/// emissions have moved into IR-level `.retain { kind }` instructions
+/// emitted by `arc_ownership.zig`):
 ///
-///   Canonical IR-handler sites — these MUST be in the count, removing
-///   them from `zir_builder.zig` means the IR-level retain/release
-///   primitive itself is broken:
+///   Canonical IR-handler sites — these MUST be in the count,
+///   removing them from `zir_builder.zig` means the IR-level
+///   retain/release primitive itself is broken:
 ///
-///     1. `.retain` IR handler: 1 × "retainAny" emission
-///        (zir_builder.zig:6720)
-///     2. `.release` IR handler: 1 × "releaseAny" emission
-///        (zir_builder.zig:6772)
-///     3. `.reset` IR handler: 1 × "resetAny" emission
-///        (zir_builder.zig:6788)
-///
-///   Class A residual violations (Phase 1 follow-up):
-///     4. `.copy_value` lowering: 1 × "retainAnyPersistent"
-///        (zir_builder.zig:4194)
-///     5. `.share_value` mode=retain: 1 × "retainAny"
-///        (zir_builder.zig:4299)
+///     1. `.retain` IR handler `retainAny` branch (kind=.normal):
+///        1 × "retainAny" (zir_builder.zig)
+///     2. `.retain` IR handler `retainAnyPersistent` branch
+///        (kind=.persistent): 1 × "retainAnyPersistent"
+///        (zir_builder.zig — added in Phase 1 Class A item 1)
+///     3. `.release` IR handler: 1 × "releaseAny" emission
+///        (zir_builder.zig)
+///     4. `.reset` IR handler: 1 × "resetAny" emission
+///        (zir_builder.zig)
 ///
 ///   Class B violations (Phase 2):
-///     6. `emitAnalysisArcOps` retain branch: 1 × "retainAny"
+///     5. `emitAnalysisArcOps` retain branch: 1 × "retainAny"
 ///        (zir_builder.zig:3907)
-///     7. `emitAnalysisArcOps` release branch: 1 × "releaseAny"
+///     6. `emitAnalysisArcOps` release branch: 1 × "releaseAny"
 ///        (zir_builder.zig:3922)
-///     8. `emitDropSpecializationsForCurrentInstr` deep arm:
+///     7. `emitDropSpecializationsForCurrentInstr` deep arm:
 ///        1 × "releaseAny" (zir_builder.zig:3962)
-///     9. `emitDropSpecializationsForCurrentInstr` shallow arm:
+///     8. `emitDropSpecializationsForCurrentInstr` shallow arm:
 ///        1 × "freeAny" (zir_builder.zig:3963)
-///    10. `emitPerceusResetForCase`: 1 × "resetAny"
+///     9. `emitPerceusResetForCase`: 1 × "resetAny"
 ///        (zir_builder.zig:3984)
 ///
 ///   Class C violations (Phase 3):
-///    11. early `.struct_init` reuse path: 1 × "reuseAllocByType"
+///    10. early `.struct_init` reuse path: 1 × "reuseAllocByType"
 ///        (zir_builder.zig:5336)
-///    12. `.struct_init` reuse-pair: 1 × "reuseAllocByType"
+///    11. `.struct_init` reuse-pair: 1 × "reuseAllocByType"
 ///        (zir_builder.zig:5573)
-///    13. `.union_init` reuse-pair: 1 × "reuseAllocByType"
+///    12. `.union_init` reuse-pair: 1 × "reuseAllocByType"
 ///        (zir_builder.zig:5917)
-///    14. an additional `reuseAllocByType` emission at line 6804
+///    13. an additional `reuseAllocByType` emission at line 6804
 ///        — provisional categorisation (likely the same Perceus
 ///        reuse class). Verify during Phase 3 implementation.
 ///
@@ -2831,19 +2830,15 @@ fn v10CountForbiddenEmissions(source: []const u8, verbose: bool) usize {
 ///   bump), but that is not a forbidden ARC runtime call — pure
 ///   bookkeeping, no refcount effect.
 ///
-/// Total expected: 14. Phase 1 follow-up reduces to 12. Phase 2
-/// reduces to 7. Phase 3 reduces to 3 (only the canonical
-/// `.retain` / `.release` / `.reset` handlers remain, plus a fourth
-/// for `.reuse_alloc` once introduced).
-///
-/// The audit baseline of 14 was empirically established by running
-/// V10 against zir_builder.zig at commit 14b3ac0 — the predecessor
-/// research briefs (arc1.md / arch2.md) catalogued 7 violations
-/// each, but the actual scan finds 14 (canonical 3 + Class A 2 +
-/// Class B 5 + Class C 4). This discrepancy is exactly why an
-/// automated audit is load-bearing: hand-maintained catalogues
-/// drift, scanners do not.
-const v10_expected_total: usize = 14;
+/// Total expected: 13. Pre-Phase-1-Class-A baseline was 14
+/// (original `.copy_value` had retainAnyPersistent + `.share_value`
+/// mode=retain had retainAny; both moved to canonical `.retain`
+/// handler dispatch on kind, net -1 because both formerly-violation
+/// sites collapsed into one already-canonical handler that now
+/// dispatches on a kind enum). Phase 2 reduces to 8. Phase 3
+/// reduces to 4 (only canonical handlers remain, including a
+/// fourth for `.reuse_alloc` once introduced).
+const v10_expected_total: usize = 13;
 
 test "V10: zir_builder.zig forbidden ARC emissions match phase-tracked allowlist" {
     const observed = v10CountForbiddenEmissions(v10_zir_builder_source, false);

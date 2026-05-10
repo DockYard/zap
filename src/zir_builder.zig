@@ -4176,6 +4176,16 @@ pub const ZirDriver = struct {
             // genuine sharing event because the source's cell is
             // observably held by two long-lived owners simultaneously.
             .copy_value => |cv| {
+                // Phase 1 Class A: `.copy_value` is now pure dataflow.
+                // The persistent retain that previously fired here is
+                // emitted as an explicit `.retain { kind: .persistent }`
+                // IR instruction immediately after the `.copy_value`
+                // by `arc_ownership.zig`. The IR-level retain is
+                // visible to every analysis pass, replacing the
+                // implicit-retain coordination that the V10 audit
+                // flagged. The ZIR-level `.retain` handler dispatches
+                // on the kind enum to pick the right runtime helper
+                // (`retainAny` vs `retainAnyPersistent`).
                 try self.propagateReuseBackedStructLocal(cv.dest, cv.source);
                 try self.propagateReuseBackedUnionLocal(cv.dest, cv.source);
                 try self.propagateReuseBackedTupleLocal(cv.dest, cv.source);
@@ -4185,22 +4195,16 @@ pub const ZirDriver = struct {
                 if (self.local_refs.get(cv.source)) |value_ref| {
                     try self.local_refs.put(self.allocator, cv.dest, value_ref);
 
-                    if (!self.shouldSkipArc(cv.source)) {
-                        const materialized_ref = try self.materializeValueRef(value_ref);
-                        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                        if (rt_import == error_ref) return error.EmitFailed;
-                        const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
-                        if (arc_runtime == error_ref) return error.EmitFailed;
-                        const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAnyPersistent", 19);
-                        if (retain_fn == error_ref) return error.EmitFailed;
-                        const args = [_]u32{materialized_ref};
-                        _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
-                    } else {
+                    if (self.shouldSkipArc(cv.source)) {
                         // Pair the suppression with the eventual
                         // scope-exit `.release` so we don't release a
-                        // cell that was never retained — same
-                        // bookkeeping the share_value retain branch
-                        // uses for stack-eligible sources.
+                        // cell that was never retained. The arc_ownership
+                        // pass still emits an explicit `.retain` IR
+                        // alongside the `.copy_value`; this set tracks
+                        // dests whose retain emission must also be
+                        // skipped at ZIR-time via `shouldSkipArc`. The
+                        // matching `.release` is suppressed by
+                        // `isReleaseSuppressed`.
                         try self.arc_share_skipped.put(self.allocator, cv.dest, {});
                     }
                 }
@@ -4290,26 +4294,29 @@ pub const ZirDriver = struct {
                             _ = zir_builder_emit_call_ref(self.handle, note_consume_fn, &args, 0);
                         },
                         .retain => {
-                            if (!self.shouldSkipArc(sv.source)) {
-                                const materialized_ref = try self.materializeValueRef(value_ref);
-                                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                                if (rt_import == error_ref) return error.EmitFailed;
-                                const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
-                                if (arc_runtime == error_ref) return error.EmitFailed;
-                                const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
-                                if (retain_fn == error_ref) return error.EmitFailed;
-
-                                const args = [_]u32{materialized_ref};
-                                _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
-                            } else {
-                                // Pair the suppression with the eventual `.release`
-                                // IR instruction so we don't emit a release that
-                                // never had a matching retain. Without this, an
-                                // arg whose source local was deemed stack-eligible
-                                // (e.g. a Map literal that doesn't escape) ends
-                                // up double-released: the post-call release fires
-                                // even though no retain was emitted, decrementing
-                                // a refcount that the caller still owns.
+                            // Phase 1 Class A item 2: the retain that
+                            // previously fired here as a direct
+                            // `retainAny` ZIR call is now an explicit
+                            // `.retain { kind: .normal }` IR
+                            // instruction emitted alongside the
+                            // `.share_value` by the IR builder. The
+                            // `.share_value` lowering is pure dataflow
+                            // alias; the retain is the IR-level signal
+                            // visible to every analysis pass.
+                            //
+                            // The skip-arc bookkeeping still fires
+                            // here so the matching post-call `.release`
+                            // is suppressed when the source is stack-
+                            // eligible (e.g., a Map literal that
+                            // doesn't escape). Without this, the
+                            // explicit `.retain` would also be elided
+                            // (via `shouldSkipArc` check in the
+                            // `.retain` handler) but the post-call
+                            // `.release` would still fire,
+                            // double-releasing the cell. The
+                            // `arc_share_skipped` set is consulted by
+                            // `isReleaseSuppressed`.
+                            if (self.shouldSkipArc(sv.source)) {
                                 try self.arc_share_skipped.put(self.allocator, sv.dest, {});
                             }
                         },
@@ -6706,14 +6713,28 @@ pub const ZirDriver = struct {
             // Memory/ARC
             .retain => |ret| {
                 if (!self.shouldSkipArc(ret.value)) {
-                    // Emit: @import("zap_runtime").ArcRuntime.retainAny(value)
+                    // Phase 1 Class A: dispatch on the IR-level kind
+                    // enum so callers control the helper choice
+                    // (normal vs persistent) rather than every retain
+                    // emission site re-deciding between runtime
+                    // helpers. The set of helpers stays the same; only
+                    // the dispatch source moves from ZIR to IR. The
+                    // `.normal` kind lowers to `retainAny`; the
+                    // `.persistent` kind to `retainAnyPersistent`
+                    // (which routes through the type's own `retain`
+                    // method when one exists, enabling the Map
+                    // workload share-event tracking).
+                    const helper_name: []const u8 = switch (ret.kind) {
+                        .normal => "retainAny",
+                        .persistent => "retainAnyPersistent",
+                    };
                     const val_ref = self.refForLocal(ret.value) catch return;
 
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
                     const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                     if (arc_runtime == error_ref) return error.EmitFailed;
-                    const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
+                    const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, helper_name.ptr, @intCast(helper_name.len));
                     if (retain_fn == error_ref) return error.EmitFailed;
 
                     const args = [_]u32{val_ref};

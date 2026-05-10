@@ -1074,8 +1074,41 @@ pub const BinOffset = union(enum) {
     dynamic: LocalId,
 };
 
+/// Flavor of retain. Each kind selects a different runtime helper at
+/// ZIR-lowering time. The kind is set at the IR-build site to encode
+/// the retain's *purpose*, not the value's type — the same value may
+/// be retained `.normal` at a call site (transient borrow) and
+/// `.persistent` at a struct-field-store site (long-lived owner).
+///
+/// Phase 1 Class A: introduced to migrate the implicit retains on
+/// `.copy_value` (persistent) and `.share_value` mode=retain (normal)
+/// from direct ZIR runtime-call emission into explicit `.retain` IR
+/// instructions, so the IR-level analysis pipeline can see every
+/// retain operation. See
+/// `docs/arc-emission-architecture-research-brief.md` §10.1.
+pub const RetainKind = enum {
+    /// Standard transient retain. Lowers to `ArcRuntime.retainAny`.
+    /// This is the canonical retain for call-argument passing,
+    /// indirect-storage field extraction, aggregate construction,
+    /// etc.
+    normal,
+    /// Persistent retain — value is being stashed in long-lived
+    /// container storage (struct field, list element slot, closure
+    /// capture). Lowers to `ArcRuntime.retainAnyPersistent`, which
+    /// routes through the type's own `retain` method when one
+    /// exists so the Map-workload share-event tracking fires.
+    persistent,
+};
+
 pub const Retain = struct {
     value: LocalId,
+    /// Flavor of retain. Defaults to `.normal` so existing
+    /// `Instruction{ .retain = .{ .value = x } }` constructions
+    /// continue to compile after the kind field was added. The IR
+    /// builder's `emitArcRetainOnAggregateExtract` and the call-arg
+    /// share emit `.normal`; `arc_ownership.zig`'s `.copy_value`
+    /// rewrite path emits `.persistent`.
+    kind: RetainKind = .normal,
 };
 
 pub const Release = struct {
@@ -6719,6 +6752,21 @@ pub const IrBuilder = struct {
                                 const shared_local = self.next_local;
                                 self.next_local += 1;
                                 try self.current_instrs.append(self.allocator, .{ .share_value = .{ .dest = shared_local, .source = arg_local } });
+                                // Phase 1 Class A item 2: emit an
+                                // explicit `.retain { kind: .normal }`
+                                // for the share's dest so the IR carries
+                                // the retain semantics that the ZIR
+                                // `.share_value` mode=retain handler
+                                // used to emit implicitly via
+                                // `retainAny`. The `.share_value` is
+                                // now pure dataflow alias; the retain
+                                // is the IR-level signal every analysis
+                                // pass can see. The ConsumeSiteRewriter
+                                // strips this `.retain` when it rewrites
+                                // the `.share_value` to `.move_value`
+                                // (consume mode transfers ownership
+                                // without bumping refcount).
+                                try self.current_instrs.append(self.allocator, .{ .retain = .{ .value = shared_local, .kind = .normal } });
                                 if (self.known_local_types.get(arg_local)) |src_type| {
                                     try self.known_local_types.put(shared_local, src_type);
                                 }
