@@ -338,7 +338,7 @@ The Zig fork exports C-ABI functions that the Zap compiler calls to build ZIR pr
 **Math Builtins:**
 - `zir_builder_emit_sqrt`, `zir_builder_emit_sin`, `zir_builder_emit_cos`, `zir_builder_emit_exp`, `zir_builder_emit_exp2`, `zir_builder_emit_log`, `zir_builder_emit_log2`, `zir_builder_emit_log10`, `zir_builder_emit_abs`, `zir_builder_emit_floor`, `zir_builder_emit_ceil`, `zir_builder_emit_round`, `zir_builder_emit_trunc_float`
 
-**SIMD/Vector (relevant for GPU):**
+**SIMD primitive support (relevant for GPU):**
 - `zir_builder_emit_vector_type(len, elem_type)` → `@Vector(len, T)`
 - `zir_builder_emit_splat(scalar, len)` → broadcast scalar to vector
 - `zir_builder_emit_shuffle(a, b, mask)` → vector shuffle

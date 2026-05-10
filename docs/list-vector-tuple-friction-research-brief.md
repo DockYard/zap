@@ -1,5 +1,12 @@
 # Zap `List` / `Vector` / `Tuple` Friction — Research Brief
 
+**Status note:** Option B from this brief was selected and implemented for the
+Zap surface: `List(T)` is now the flat-buffer sequence type, and the separate
+user-facing `Vector(T)` / `VectorI64` / `VectorF64` surface has been removed.
+The body of this brief is preserved as the design-space analysis that led to
+that decision, so sections describing the old cons-cell List and Vector aliases
+are historical context, not the current API.
+
 **Audience.** A research agent with **zero prior context on Zap**, the Zap fork of the Zig compiler, the lang-benches harness, or the work that has already been done on opportunistic mutation. This document is fully self-contained — after reading it the agent should be able to (a) understand the language and the three collection types in scope, (b) reason about the design space, (c) evaluate the four concrete options laid out in §6, and (d) return a recommendation without needing clarifying questions about what Zap is.
 
 **The question to research.** Should Zap have a separate `Vector(T)` type at all, or can `List(T)` plus a first-class `Tuple` together cover every real use case? The current state has `Map(K, V)`, `List(T)`, `Vector(T)`, and an informal tuple syntax — that's three first-class collections plus one informal one, and the surface for `Vector(T)` is wrong (concrete `VectorI64`/`VectorF64` aliases instead of generic `Vector(T)`). Decide whether the right end-state is three types, two, or two-with-a-different-shape.

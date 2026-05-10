@@ -213,25 +213,26 @@ const error_ref: u32 = 0xFFFFFFFF;
 
 const Zir = std.zig.Zir;
 
-/// Map an IR binary op to its primitive ZIR `Inst.Tag`. Reached only on
-/// the fallback path when no `Arithmetic`/`Comparator` impl matches the
-/// operand type — protocol dispatch (HIR `findImplFor`) lowers
-/// `Float + Float`, `Integer + Integer`, etc. to direct impl calls long
-/// before this function runs. The integer-shaped tags (`addwrap`,
-/// `subwrap`, `mulwrap`, `div_trunc`, `mod_rem`) are correct for that
-/// fallback because the only operand types that miss protocol dispatch
-/// are untyped/UNKNOWN values that lower as i64 in ZIR. Comparison and
-/// equality tags work for both ints and floats.
+/// Map an IR binary op to its primitive ZIR `Inst.Tag`. Arithmetic tags
+/// are type-sensitive: integer Zap arithmetic keeps the existing wrapping
+/// and truncating behavior, while float arithmetic must use Zig's ordinary
+/// float-capable operators. Generic `List(f64)` element reads can bypass
+/// protocol dispatch and reach this primitive fallback directly, so the
+/// IR carries the binary result type for this decision.
 ///
 /// Returns null for operators handled outside of `emit_binop` —
 /// short-circuit booleans, string compare, concat, and membership tests.
-fn mapBinopTag(op: ir.BinaryOp.Op) ?u8 {
+fn mapBinopTag(op: ir.BinaryOp.Op, result_type: ir.ZigType) ?u8 {
+    const is_float = switch (result_type) {
+        .f16, .f32, .f64, .f80, .f128 => true,
+        else => false,
+    };
     return switch (op) {
-        .add => @intFromEnum(Zir.Inst.Tag.addwrap),
-        .sub => @intFromEnum(Zir.Inst.Tag.subwrap),
-        .mul => @intFromEnum(Zir.Inst.Tag.mulwrap),
-        .div => @intFromEnum(Zir.Inst.Tag.div_trunc),
-        .rem_op => @intFromEnum(Zir.Inst.Tag.mod_rem),
+        .add => @intFromEnum(if (is_float) Zir.Inst.Tag.add else Zir.Inst.Tag.addwrap),
+        .sub => @intFromEnum(if (is_float) Zir.Inst.Tag.sub else Zir.Inst.Tag.subwrap),
+        .mul => @intFromEnum(if (is_float) Zir.Inst.Tag.mul else Zir.Inst.Tag.mulwrap),
+        .div => @intFromEnum(if (is_float) Zir.Inst.Tag.div else Zir.Inst.Tag.div_trunc),
+        .rem_op => @intFromEnum(if (is_float) Zir.Inst.Tag.rem else Zir.Inst.Tag.mod_rem),
         .eq => @intFromEnum(Zir.Inst.Tag.cmp_eq),
         .neq => @intFromEnum(Zir.Inst.Tag.cmp_neq),
         .lt => @intFromEnum(Zir.Inst.Tag.cmp_lt),
@@ -443,6 +444,13 @@ pub const ZirDriver = struct {
     tuple_type_stack: std.ArrayListUnmanaged(ir.ZigType) = .empty,
     /// ID of the function currently being emitted (for analysis lookups).
     current_function_id: ir.FunctionId = 0,
+    /// Parameter ownership conventions for the function currently being emitted.
+    current_function_param_conventions: []const ir.ParamConvention = &.{},
+    /// Static Zig-level return type of the function currently being emitted.
+    /// Used for generic constructors whose type variable appears only in
+    /// the return position, so the call instruction itself may not carry
+    /// enough information to recover `List(T)`.
+    current_function_return_type: ir.ZigType = .void,
     /// Label of the current block.
     current_block_label: ir.LabelId = 0,
     /// True when the current function is a closure (has captures).
@@ -505,6 +513,7 @@ pub const ZirDriver = struct {
     cached_list_cell_ref: u32 = 0,
     cached_list_gethead_ref: u32 = 0,
     cached_list_gettail_ref: u32 = 0,
+    cached_list_slicefrom_ref: u32 = 0,
     cached_list_cons_ref: u32 = 0,
     cached_list_length_ref: u32 = 0,
     cached_list_get_ref: u32 = 0,
@@ -637,7 +646,13 @@ pub const ZirDriver = struct {
         const actx = self.analysis_context orelse return;
         const dscrut = actx.destructive_optional_dispatch.get(self.current_function_id) orelse return;
         if (pg.index != dscrut) return;
+        if (self.currentParamConvention(pg.index) != .owned) return;
         try self.destructive_scrutinee_locals.put(self.allocator, pg.dest, {});
+    }
+
+    fn currentParamConvention(self: *const ZirDriver, param_index: u32) ir.ParamConvention {
+        if (param_index >= self.current_function_param_conventions.len) return .trivial;
+        return self.current_function_param_conventions[param_index];
     }
 
     fn shouldSkipArc(self: *const ZirDriver, local: ir.LocalId) bool {
@@ -864,7 +879,7 @@ pub const ZirDriver = struct {
         // Complex types: emit runtime import instructions
         return switch (zig_type) {
             .list => {
-                // Generic container type ref: ListOf(T).empty() → @TypeOf
+                // Generic container type ref: List(T).empty() -> @TypeOf
                 const list_cell = try self.emitListCellRef(getListElementType(zig_type));
                 const empty_fn = zir_builder_emit_field_val(self.handle, list_cell, "empty", 5);
                 if (empty_fn == error_ref) return error.EmitFailed;
@@ -875,7 +890,7 @@ pub const ZirDriver = struct {
                 return ref;
             },
             .map => |mt| {
-                // Generic container type ref: MapOf(K,V).empty() → @TypeOf
+                // Generic container type ref: Map(K, V).empty() -> @TypeOf
                 const map_cell = try self.emitMapCellRef(mt.key.*, mt.value.*);
                 const empty_fn = zir_builder_emit_field_val(self.handle, map_cell, "empty", 5);
                 if (empty_fn == error_ref) return error.EmitFailed;
@@ -888,8 +903,6 @@ pub const ZirDriver = struct {
             .tuple => self.mapTupleElementType(zig_type),
             .struct_ref => |name| return try self.emitStructTypeRef(name),
             .term => return try self.emitTermTypeRef(),
-            .vector_i64 => return try self.emitVectorTypeRef(.i64),
-            .vector_f64 => return try self.emitVectorTypeRef(.f64),
             .optional => |inner| {
                 // `?T` — emit T's ref, then wrap in optional. Used by
                 // the recursive-struct storage strategy to lower a
@@ -943,6 +956,14 @@ pub const ZirDriver = struct {
     fn refForLocal(self: *ZirDriver, local: ir.LocalId) BuildError!u32 {
         const value_ref = self.local_refs.get(local) orelse return error.EmitFailed;
         return self.materializeValueRef(value_ref);
+    }
+
+    fn refForParamIndex(self: *ZirDriver, param_index: u32) BuildError!u32 {
+        if (self.loopify_slots != null and param_index < self.param_refs.items.len) {
+            return try self.loopifyLoadParam(param_index);
+        }
+        if (param_index >= self.param_refs.items.len) return error.EmitFailed;
+        return self.param_refs.items[param_index];
     }
 
     fn materializeValueRef(self: *ZirDriver, value: ValueRef) BuildError!u32 {
@@ -1952,7 +1973,10 @@ pub const ZirDriver = struct {
                     self.reuse_backed_struct_locals.clearRetainingCapacity();
                     self.reuse_backed_union_locals.clearRetainingCapacity();
                     self.reuse_backed_tuple_locals.clearRetainingCapacity();
-                    try self.emitFunction(func);
+                    self.emitFunction(func) catch |err| {
+                        std.log.err("ZIR emit failed for function {s}: {s}", .{ func.name, @errorName(err) });
+                        return err;
+                    };
                 }
 
                 if (zir_builder_inject_struct(mod_handle, c, mod_name_z) != 0) {
@@ -2043,7 +2067,10 @@ pub const ZirDriver = struct {
             self.reuse_backed_struct_locals.clearRetainingCapacity();
             self.reuse_backed_union_locals.clearRetainingCapacity();
             self.reuse_backed_tuple_locals.clearRetainingCapacity();
-            try self.emitFunction(func);
+            self.emitFunction(func) catch |err| {
+                std.log.err("ZIR emit failed for function {s}: {s}", .{ func.name, @errorName(err) });
+                return err;
+            };
         }
 
         // In builder mode, emit a zap_builder_entry function that delegates
@@ -2147,7 +2174,7 @@ pub const ZirDriver = struct {
     const LIST_PARAM_SENTINEL: u32 = 0xFFFFFFFE;
 
     /// Map an ir.ZigType to a ZIR type Ref constant for use as a comptime
-    /// type argument when calling generic constructors (MapOf, ListOf).
+    /// type argument when calling generic constructors (Map, List).
     /// Returns null for complex types (structs, nested containers) that
     /// require dynamic resolution via emitTypeRef.
     fn zigTypeToTypeRef(zig_type: ir.ZigType) ?u32 {
@@ -2200,26 +2227,26 @@ pub const ZirDriver = struct {
                 return null;
             },
             .tagged_union => {
-                // Enums use u32 atom IDs at runtime — use u32 as the element
-                // type for ListOf/MapOf rather than the Zig enum type.
+                // Enums use u32 atom IDs at runtime; use u32 as the element
+                // type for List/Map rather than the Zig enum type.
                 // This ensures enum values from lists are compatible with
                 // Zap's atom-based pattern dispatch.
                 return @intFromEnum(Zir.Inst.Ref.u32_type);
             },
             .list => |inner| {
-                // Nested list: element type is ?*const ListOf(T)
-                // Get the inner ListOf(T) type, call .empty() on it,
+                // Nested list: element type is ?*const List(T)
+                // Get the inner List(T) type, call .empty() on it,
                 // then use @TypeOf to get the optional pointer type.
                 const inner_ref = try self.emitContainerElementTypeRef(inner.*);
                 if (inner_ref) |iref| {
                     const type_args = [_]u32{iref};
                     const inner_list = self.emitGenericContainerRef("List", &type_args) catch return null;
-                    // Call .empty() to get a value of type ?*const ListOf(T)
+                    // Call .empty() to get a value of type ?*const List(T)
                     const empty_fn = zir_builder_emit_field_val(self.handle, inner_list, "empty", 5);
                     if (empty_fn == error_ref) return null;
                     const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
                     if (empty_val == error_ref) return null;
-                    // @TypeOf(empty_val) gives ?*const ListOf(T)
+                    // @TypeOf(empty_val) gives ?*const List(T)
                     const type_ref = zir_builder_emit_typeof(self.handle, empty_val);
                     if (type_ref == error_ref) return null;
                     return type_ref;
@@ -2299,39 +2326,6 @@ pub const ZirDriver = struct {
         return term_ref;
     }
 
-    /// The element-kind selector for `Vector(T)` instantiations. Each
-    /// variant maps to a runtime alias (`VectorI64` / `VectorF64`)
-    /// defined in `runtime.zig`. New variants here demand the
-    /// corresponding `pub const Vector<X> = Vector(<X>)` alias and a
-    /// matching `NativeTypeKind` registration.
-    const VectorElementKind = enum { i64, f64 };
-
-    fn vectorAliasName(kind: VectorElementKind) []const u8 {
-        return switch (kind) {
-            .i64 => "VectorI64",
-            .f64 => "VectorF64",
-        };
-    }
-
-    /// Emit a ZIR ref for `?*const zap_runtime.Vector<X>`. The
-    /// runtime's `Vector<X>` alias names the underlying `Vector(<X>)`
-    /// struct (the cell's self type), so every Zap-visible signature
-    /// wraps that with `?*const ...` to match the source-Arc ABI
-    /// shape that every runtime Vector helper expects (`pub fn
-    /// new_filled() ?*const Self`, ...).
-    fn emitVectorTypeRef(self: *ZirDriver, kind: VectorElementKind) BuildError!u32 {
-        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-        if (rt_import == error_ref) return error.EmitFailed;
-        const alias = vectorAliasName(kind);
-        const alias_ref = zir_builder_emit_field_val(self.handle, rt_import, alias.ptr, @intCast(alias.len));
-        if (alias_ref == error_ref) return error.EmitFailed;
-        const ptr_ref = zir_builder_emit_single_const_ptr_type(self.handle, alias_ref);
-        if (ptr_ref == error_ref) return error.EmitFailed;
-        const opt_ref = zir_builder_emit_optional_type(self.handle, ptr_ref);
-        if (opt_ref == error_ref) return error.EmitFailed;
-        return opt_ref;
-    }
-
     /// Emit `runtime.Term.from(value_ref)` — wraps a concrete value as
     /// a `Term`. Used by collection construction sites whose element
     /// type was promoted to `Term` because the static element types
@@ -2404,12 +2398,12 @@ pub const ZirDriver = struct {
         return ref;
     }
 
-    /// Emit a reference to a `ListOf(T)` type instantiation for any element type.
-    /// Uses comptime generic instantiation via `@import("zap_runtime").ListOf(T)`.
+    /// Emit a reference to a `List(T)` type instantiation for any element type.
+    /// Uses comptime generic instantiation via `@import("zap_runtime").List(T)`.
     fn emitListCellRef(self: *ZirDriver, element_type: ir.ZigType) BuildError!u32 {
         const elem_ref = (try self.emitContainerElementTypeRef(element_type)) orelse
             zigTypeToTypeRef(element_type) orelse
-            @intFromEnum(Zir.Inst.Ref.i64_type);
+            return error.EmitFailed;
         const type_args = [_]u32{elem_ref};
         return self.emitGenericContainerRef("List", &type_args);
     }
@@ -2613,12 +2607,12 @@ pub const ZirDriver = struct {
         if (rt_import == error_ref) return error.EmitFailed;
         try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
 
-        // 2. field_val for generic function (ListOf or MapOf)
+        // 2. field_val for generic constructor (List or Map)
         const generic_fn = zir_builder_emit_field_val(self.handle, rt_import, generic_name.ptr, @intCast(generic_name.len));
         if (generic_fn == error_ref) return error.EmitFailed;
         try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
 
-        // 3. call_ref to instantiate: ListOf(T) or MapOf(K, V)
+        // 3. call_ref to instantiate: List(T) or Map(K, V)
         const instantiated = zir_builder_emit_call_ref(self.handle, generic_fn, type_args.ptr, @intCast(type_args.len));
         if (instantiated == error_ref) return error.EmitFailed;
         try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
@@ -2653,12 +2647,12 @@ pub const ZirDriver = struct {
         if (rt_import == error_ref) return error.EmitFailed;
         try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
 
-        // 2. field_val for generic function (ListOf or MapOf)
+        // 2. field_val for generic constructor (List or Map)
         const generic_fn = zir_builder_emit_field_val(self.handle, rt_import, generic_name.ptr, @intCast(generic_name.len));
         if (generic_fn == error_ref) return error.EmitFailed;
         try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
 
-        // 3. call_ref to instantiate: ListOf(T) or MapOf(K, V)
+        // 3. call_ref to instantiate: List(T) or Map(K, V)
         const instantiated = zir_builder_emit_call_ref(self.handle, generic_fn, type_args.ptr, @intCast(type_args.len));
         if (instantiated == error_ref) return error.EmitFailed;
         try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
@@ -2700,7 +2694,7 @@ pub const ZirDriver = struct {
             if (std.mem.eql(u8, func_name, "put")) return "mapPut";
             if (std.mem.eql(u8, func_name, "delete")) return "mapDelete";
             if (std.mem.eql(u8, func_name, "merge")) return "mapMerge";
-            // Phase H/V8 codegen: unchecked variants share the same
+            // Phase H/uniqueness codegen: unchecked variants share the same
             // Zig signature as the checked peers. The runtime exposes
             // `mapPutOwnedUnchecked`/`mapDeleteOwnedUnchecked`/
             // `mapMergeOwnedUnchecked` helpers that route through
@@ -2721,11 +2715,21 @@ pub const ZirDriver = struct {
             if (std.mem.eql(u8, func_name, "getTail")) return "listGetTail";
             if (std.mem.eql(u8, func_name, "isEmpty")) return "listIsEmpty";
             if (std.mem.eql(u8, func_name, "length")) return "listLength";
+            if (std.mem.eql(u8, func_name, "sliceFrom")) return "listSliceFrom";
+            if (std.mem.eql(u8, func_name, "slice_owned_unchecked")) return "listSliceOwnedUnchecked";
+            if (std.mem.eql(u8, func_name, "capacity")) return "listCapacity";
             if (std.mem.eql(u8, func_name, "get")) return "listGet";
             if (std.mem.eql(u8, func_name, "last")) return "listLast";
             if (std.mem.eql(u8, func_name, "reverse")) return "listReverse";
             if (std.mem.eql(u8, func_name, "concat")) return "listConcat";
+            if (std.mem.eql(u8, func_name, "set")) return "listSet";
+            if (std.mem.eql(u8, func_name, "push")) return "listPush";
+            if (std.mem.eql(u8, func_name, "pop")) return "listPop";
             if (std.mem.eql(u8, func_name, "append")) return "listAppend";
+            if (std.mem.eql(u8, func_name, "set_owned_unchecked")) return "listSetOwnedUnchecked";
+            if (std.mem.eql(u8, func_name, "push_owned_unchecked")) return "listPushOwnedUnchecked";
+            if (std.mem.eql(u8, func_name, "pop_owned_unchecked")) return "listPopOwnedUnchecked";
+            if (std.mem.eql(u8, func_name, "append_owned_unchecked")) return "listAppendOwnedUnchecked";
             if (std.mem.eql(u8, func_name, "contains")) return "listContains";
             if (std.mem.eql(u8, func_name, "take")) return "listTake";
             if (std.mem.eql(u8, func_name, "next")) return "listNext";
@@ -2745,6 +2749,7 @@ pub const ZirDriver = struct {
             if (std.mem.eql(u8, func_name, "flatMapFn")) return "listFlatMapFn";
             if (std.mem.eql(u8, func_name, "maxVal")) return "listMaxVal";
             if (std.mem.eql(u8, func_name, "minVal")) return "listMinVal";
+            if (std.mem.eql(u8, func_name, "sum")) return "listSum";
             return null;
         }
         return null;
@@ -2771,12 +2776,19 @@ pub const ZirDriver = struct {
         return null;
     }
 
-    /// Extract element type from a list ZigType. Returns .i64 as default.
+    fn emitEncodedContainerElementTypeRef(self: *ZirDriver, name: []const u8) BuildError!?u32 {
+        if (encodedNameToTypeRef(name)) |ref| return ref;
+        if (std.mem.eql(u8, name, "Term")) return try self.emitTermTypeRef();
+        return self.emitStructTypeRef(name) catch null;
+    }
+
+    /// Extract element type from a list ZigType. Callers validate the outer
+    /// shape before invoking this helper; a non-list here is a lowering bug.
     fn getListElementType(list_type: ir.ZigType) ir.ZigType {
         if (std.meta.activeTag(list_type) == .list) {
             return list_type.list.*;
         }
-        return .i64;
+        return .any;
     }
 
     fn emitTypedParam(self: *ZirDriver, param: ir.Param) !u32 {
@@ -2901,8 +2913,8 @@ pub const ZirDriver = struct {
         if (std.meta.activeTag(param.type_expr) == .optional) {
             return try self.emitOptionalParam(param, param.type_expr.optional.*);
         }
-        // Map and list params use anytype — generic container types like
-        // ListOf(T) and MapOf(K,V) can't be expressed as named imports.
+        // Map and list params use anytype. Generic container types like
+        // List(T) and Map(K, V) can't be expressed as named imports.
         // Zig infers the correct type from usage.
         if (std.meta.activeTag(param.type_expr) == .map or
             std.meta.activeTag(param.type_expr) == .list)
@@ -2912,40 +2924,6 @@ pub const ZirDriver = struct {
                 param.name.ptr,
                 @intCast(param.name.len),
                 @intFromEnum(Zir.Inst.Ref.none),
-            );
-            if (ref == error_ref) return error.EmitFailed;
-            return ref;
-        }
-        // Vector params take their declared concrete runtime type
-        // `?*const zap_runtime.Vector(<X>)`. The runtime's Vector
-        // alias names the underlying *struct* (the generic
-        // instantiation `Vector(<X>)`), so the param-type body must
-        // wrap the imported alias in `single_const_ptr + optional`
-        // to recover the source-Arc ABI shape that every runtime
-        // helper signature expects (`?*const Self`). The streaming
-        // `param_type_body` API lets us emit the import + pointer +
-        // optional sequence inline, captured into the param's
-        // declaration body so Sema resolves every operand against
-        // the same body slice.
-        if (param.type_expr == .vector_i64 or param.type_expr == .vector_f64) {
-            const kind: VectorElementKind = switch (param.type_expr) {
-                .vector_i64 => .i64,
-                .vector_f64 => .f64,
-                else => unreachable,
-            };
-            var support_inst_indices: std.ArrayListUnmanaged(u32) = .empty;
-            defer support_inst_indices.deinit(self.allocator);
-            const before = zir_builder_get_body_inst_count(self.handle);
-            const opt_ref = try self.emitVectorTypeRef(kind);
-            try self.captureBodyInsts(before, &support_inst_indices);
-
-            const ref = zir_builder_emit_param_type_body(
-                self.handle,
-                param.name.ptr,
-                @intCast(param.name.len),
-                support_inst_indices.items.ptr,
-                @intCast(support_inst_indices.items.len),
-                opt_ref,
             );
             if (ref == error_ref) return error.EmitFailed;
             return ref;
@@ -3204,36 +3182,6 @@ pub const ZirDriver = struct {
                     return error.EmitFailed;
                 self.current_ret_type = 1;
             },
-            // Vector return types resolve to `?*const
-            // zap_runtime.Vector(<X>)`. The runtime alias names the
-            // underlying *struct*; the source-Arc ABI uses
-            // `?*const Self` everywhere, so we wrap the imported
-            // alias in `single_const_ptr + optional` and route the
-            // resulting type ref through `set_custom_return_type` so
-            // the body's import / field_val / ptr_type / optional_type
-            // instructions land inside the ret_ty body alongside Sema's
-            // own break_inline.
-            .vector_i64, .vector_f64 => {
-                const kind: VectorElementKind = switch (return_type) {
-                    .vector_i64 => .i64,
-                    .vector_f64 => .f64,
-                    else => unreachable,
-                };
-                var support: std.ArrayListUnmanaged(u32) = .empty;
-                defer support.deinit(self.allocator);
-                const before = zir_builder_get_body_inst_count(self.handle);
-                const opt_ref = try self.emitVectorTypeRef(kind);
-                try self.captureBodyInsts(before, &support);
-                const result_inst = zir_builder_ref_to_inst_index(self.handle, opt_ref);
-                if (result_inst == 0xFFFFFFFF) return error.EmitFailed;
-                if (zir_builder_set_custom_return_type(
-                    self.handle,
-                    support.items.ptr,
-                    @intCast(support.items.len),
-                    result_inst,
-                ) != 0) return error.EmitFailed;
-                self.current_ret_type = 1;
-            },
             // Primitives are handled by mapReturnType — they never reach here.
             // void/nil have ret_type=0 intentionally — they never reach here.
             .void,
@@ -3319,12 +3267,15 @@ pub const ZirDriver = struct {
         self.cached_list_cell_ref = 0;
         self.cached_list_gethead_ref = 0;
         self.cached_list_gettail_ref = 0;
+        self.cached_list_slicefrom_ref = 0;
         self.cached_list_cons_ref = 0;
         self.cached_list_length_ref = 0;
         self.cached_list_get_ref = 0;
         self.current_closure_env_ref = null;
         self.skip_next_ret_local = null;
         self.current_function_id = func.id;
+        self.current_function_param_conventions = func.param_conventions;
+        self.current_function_return_type = func.return_type;
         self.current_function_is_closure = func.captures.len > 0;
         const closure_lowering = self.getClosureLowering(func.id, func.captures.len);
         var ret_type = if (is_main)
@@ -3395,10 +3346,9 @@ pub const ZirDriver = struct {
             const env_param_ref = try self.emitClosureEnvParam(func.captures);
             self.current_closure_env_ref = env_param_ref;
             for (func.params, 0..) |param, i| {
+                _ = i;
                 const param_ref = try self.emitTypedParam(param);
                 try self.param_refs.append(self.allocator, param_ref);
-                try self.setLocal(@intCast(i), param_ref);
-                try self.markParamDerivedClosureLocal(@intCast(i));
             }
         } else if (is_main and func.params.len == 1) {
             // Inject: const args = @import("zap_runtime").getArgv()
@@ -3410,10 +3360,9 @@ pub const ZirDriver = struct {
             const args_ref = zir_builder_emit_call_ref(self.handle, get_argv_fn, @as([*]const u32, &.{}), 0);
             if (args_ref == error_ref) return error.EmitFailed;
 
-            // Store as the first param's local ref
+            // Store as the first param ref. The `param_get` lowering
+            // materializes it into real IR locals as needed.
             try self.param_refs.append(self.allocator, args_ref);
-            try self.setLocal(0, args_ref);
-            try self.markParamDerivedClosureLocal(0);
         } else {
             // Lambda-lifted closures: captures are passed as prepended
             // ordinary parameters at every call site (see HIR direct-call
@@ -3431,10 +3380,9 @@ pub const ZirDriver = struct {
                 try self.capture_param_refs.append(self.allocator, cap_ref);
             }
             for (func.params, 0..) |param, i| {
+                _ = i;
                 const param_ref = try self.emitTypedParam(param);
                 try self.param_refs.append(self.allocator, param_ref);
-                try self.setLocal(@intCast(i), param_ref);
-                try self.markParamDerivedClosureLocal(@intCast(i));
             }
         }
 
@@ -3445,6 +3393,7 @@ pub const ZirDriver = struct {
             const list_cell = try self.ensureListRef();
             _ = try self.ensureListMethodRef(list_cell, "getHead", &self.cached_list_gethead_ref);
             _ = try self.ensureListMethodRef(list_cell, "getTail", &self.cached_list_gettail_ref);
+            _ = try self.ensureListMethodRef(list_cell, "sliceFrom", &self.cached_list_slicefrom_ref);
             _ = try self.ensureListMethodRef(list_cell, "cons", &self.cached_list_cons_ref);
             _ = try self.ensureListMethodRef(list_cell, "length", &self.cached_list_length_ref);
             _ = try self.ensureListMethodRef(list_cell, "get", &self.cached_list_get_ref);
@@ -3470,7 +3419,13 @@ pub const ZirDriver = struct {
             for (block.instructions, 0..) |instr, instr_idx| {
                 self.current_instr_index = @intCast(instr_idx);
                 try self.emitAnalysisArcOps(true);
-                try self.emitInstruction(instr);
+                self.emitInstruction(instr) catch |err| {
+                    std.log.err(
+                        "ZIR emit failed in function {s} at instruction {d} ({s}): {s}",
+                        .{ func.name, instr_idx, @tagName(instr), @errorName(err) },
+                    );
+                    return err;
+                };
                 try self.emitAnalysisArcOps(false);
             }
         }
@@ -4403,7 +4358,7 @@ pub const ZirDriver = struct {
                     else
                         self.emitBoolBrOr(lhs, &empty_body, rhs) catch return error.EmitFailed;
                     try self.setLocal(bo.dest, ref);
-                } else if (mapBinopTag(bo.op)) |tag| {
+                } else if (mapBinopTag(bo.op, bo.result_type)) |tag| {
                     const lhs = self.refForLocal(bo.lhs) catch return;
                     const rhs = self.refForLocal(bo.rhs) catch return;
                     const ref = zir_builder_emit_binop(self.handle, tag, lhs, rhs);
@@ -4910,18 +4865,9 @@ pub const ZirDriver = struct {
                     if (std.mem.findScalar(u8, after_prefix, '.')) |dot_idx| {
                         const inner_type_name = after_prefix[0..dot_idx];
                         const method_name = after_prefix[dot_idx + 1 ..];
-                        // Resolve the inner element type
-                        const inner_type_ref = if (std.mem.eql(u8, inner_type_name, "i64"))
-                            @intFromEnum(Zir.Inst.Ref.i64_type)
-                        else if (std.mem.eql(u8, inner_type_name, "string"))
-                            @intFromEnum(Zir.Inst.Ref.slice_const_u8_type)
-                        else if (std.mem.eql(u8, inner_type_name, "f64"))
-                            @intFromEnum(Zir.Inst.Ref.f64_type)
-                        else if (std.mem.eql(u8, inner_type_name, "bool_type"))
-                            @intFromEnum(Zir.Inst.Ref.bool_type)
-                        else
-                            @intFromEnum(Zir.Inst.Ref.i64_type);
-                        // Build ListOf(inner), call .empty(), @TypeOf for the pointer type
+                        const inner_type_ref = (try self.emitEncodedContainerElementTypeRef(inner_type_name)) orelse
+                            return error.EmitFailed;
+                        // Build List(inner), call .empty(), @TypeOf for the pointer type
                         const inner_args = [_]u32{inner_type_ref};
                         const inner_list = self.emitGenericContainerRef("List", &inner_args) catch break :blk3 false;
                         const empty_fn = zir_builder_emit_field_val(self.handle, inner_list, "empty", 5);
@@ -4930,7 +4876,7 @@ pub const ZirDriver = struct {
                         if (empty_val == error_ref) break :blk3 false;
                         const elem_type_ref = zir_builder_emit_typeof(self.handle, empty_val);
                         if (elem_type_ref == error_ref) break :blk3 false;
-                        // Now call ListOf(@TypeOf(empty_val)).method
+                        // Now call List(@TypeOf(empty_val)).method
                         const outer_args = [_]u32{elem_type_ref};
                         const outer_list = self.emitGenericContainerRef("List", &outer_args) catch break :blk3 false;
                         const fn_ref = zir_builder_emit_field_val(self.handle, outer_list, method_name.ptr, @intCast(method_name.len));
@@ -5012,27 +4958,59 @@ pub const ZirDriver = struct {
                         // `Map(u32, Term)` — is preserved.
                         const is_generic_container = std.mem.eql(u8, mod_name, "List") or std.mem.eql(u8, mod_name, "Map");
                         if (is_generic_container) {
-                            const helper_name = mapBridgeMethodToHelper(mod_name, func_name) orelse {
-                                // Fall back to the old default (Map(atom,i64) /
-                                // List(i64)) for methods without a type-derived
-                                // helper — these are typically methods that do
-                                // not depend on the element type (e.g. legacy
-                                // utility functions). The set covered by
-                                // `mapBridgeMethodToHelper` includes every
-                                // method exposed via `lib/map.zap` and
-                                // `lib/list.zap`, so reaching this branch means
-                                // a new Zap-side bridge was added without a
-                                // matching helper — surface the omission rather
-                                // than silently miscompiling.
-                                return error.EmitFailed;
-                            };
-                            const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                            if (rt_import == error_ref) return error.EmitFailed;
-                            const fn_ref = zir_builder_emit_field_val(self.handle, rt_import, helper_name.ptr, @intCast(helper_name.len));
-                            if (fn_ref == error_ref) return error.EmitFailed;
-                            const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
-                            if (ref == error_ref) return error.EmitFailed;
-                            try self.setLocal(cb.dest, ref);
+                            if (std.mem.eql(u8, mod_name, "List") and
+                                (std.mem.eql(u8, func_name, "new_empty") or std.mem.eql(u8, func_name, "new_filled")))
+                            {
+                                const result_type = if (std.meta.activeTag(cb.result_type) == .list)
+                                    cb.result_type
+                                else if (std.meta.activeTag(self.current_function_return_type) == .list)
+                                    self.current_function_return_type
+                                else
+                                    ir.ZigType.any;
+                                if (std.meta.activeTag(result_type) != .list) return error.EmitFailed;
+                                const element_type = getListElementType(result_type);
+                                const list_cell = try self.emitListCellRef(element_type);
+                                const fn_ref = zir_builder_emit_field_val(self.handle, list_cell, func_name.ptr, @intCast(func_name.len));
+                                if (fn_ref == error_ref) return error.EmitFailed;
+
+                                var dispatched_args = args.items;
+                                var wrapped_buf: [8]u32 = undefined;
+                                if (std.meta.activeTag(element_type) == .term and
+                                    std.mem.eql(u8, func_name, "new_filled") and
+                                    args.items.len <= wrapped_buf.len and
+                                    args.items.len >= 2)
+                                {
+                                    @memcpy(wrapped_buf[0..args.items.len], args.items);
+                                    wrapped_buf[1] = try self.emitTermWrap(wrapped_buf[1]);
+                                    dispatched_args = wrapped_buf[0..args.items.len];
+                                }
+
+                                const ref = zir_builder_emit_call_ref(self.handle, fn_ref, dispatched_args.ptr, @intCast(dispatched_args.len));
+                                if (ref == error_ref) return error.EmitFailed;
+                                try self.setLocal(cb.dest, ref);
+                            } else {
+                                const helper_name = mapBridgeMethodToHelper(mod_name, func_name) orelse {
+                                    // Fall back to the old default (Map(atom,i64) /
+                                    // List(i64)) for methods without a type-derived
+                                    // helper — these are typically methods that do
+                                    // not depend on the element type (e.g. legacy
+                                    // utility functions). The set covered by
+                                    // `mapBridgeMethodToHelper` includes every
+                                    // method exposed via `lib/map.zap` and
+                                    // `lib/list.zap`, so reaching this branch means
+                                    // a new Zap-side bridge was added without a
+                                    // matching helper — surface the omission rather
+                                    // than silently miscompiling.
+                                    return error.EmitFailed;
+                                };
+                                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                                if (rt_import == error_ref) return error.EmitFailed;
+                                const fn_ref = zir_builder_emit_field_val(self.handle, rt_import, helper_name.ptr, @intCast(helper_name.len));
+                                if (fn_ref == error_ref) return error.EmitFailed;
+                                const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                                if (ref == error_ref) return error.EmitFailed;
+                                try self.setLocal(cb.dest, ref);
+                            }
                         } else {
                             const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                             if (rt_import == error_ref) return error.EmitFailed;
@@ -5391,32 +5369,29 @@ pub const ZirDriver = struct {
             },
             .list_init => |li| {
                 const list_cell = try self.emitListCellRef(li.element_type);
-                const cons_fn = zir_builder_emit_field_val(self.handle, list_cell, "cons", 4);
-                if (cons_fn == error_ref) return error.EmitFailed;
+                const empty_fn = zir_builder_emit_field_val(self.handle, list_cell, "empty", 5);
+                if (empty_fn == error_ref) return error.EmitFailed;
 
                 if (li.elements.len == 0) {
                     // Empty list: List.empty() — typed null
-                    const empty_fn = zir_builder_emit_field_val(self.handle, list_cell, "empty", 5);
-                    if (empty_fn == error_ref) return error.EmitFailed;
                     const ref = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(li.dest, ref);
                 } else {
-                    // Build from right to left, starting with typed null tail
-                    const empty_fn = zir_builder_emit_field_val(self.handle, list_cell, "empty", 5);
-                    if (empty_fn == error_ref) return error.EmitFailed;
+                    // Build left-to-right with List.push so flat-buffer
+                    // literals grow linearly instead of repeatedly
+                    // copying tails through cons.
                     var current: u32 = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
                     if (current == error_ref) return error.EmitFailed;
-
-                    var i: usize = li.elements.len;
-                    while (i > 0) {
-                        i -= 1;
-                        var elem_ref = self.refForLocal(li.elements[i]) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    const push_fn = zir_builder_emit_field_val(self.handle, list_cell, "push", 4);
+                    if (push_fn == error_ref) return error.EmitFailed;
+                    for (li.elements) |element_local| {
+                        var elem_ref = self.refForLocal(element_local) catch @intFromEnum(Zir.Inst.Ref.void_value);
                         if (li.element_type == .term) {
                             elem_ref = try self.emitTermWrap(elem_ref);
                         }
-                        const call_args = [_]u32{ elem_ref, current };
-                        current = zir_builder_emit_call_ref(self.handle, cons_fn, &call_args, 2);
+                        const call_args = [_]u32{ current, elem_ref };
+                        current = zir_builder_emit_call_ref(self.handle, push_fn, &call_args, 2);
                         if (current == error_ref) return error.EmitFailed;
                     }
                     try self.setLocal(li.dest, current);
@@ -5797,7 +5772,7 @@ pub const ZirDriver = struct {
                 if (len_ref == error_ref) return error.EmitFailed;
                 const expected_ref = zir_builder_emit_int(self.handle, @intCast(llc.expected_len));
                 if (expected_ref == error_ref) return error.EmitFailed;
-                const cmp_tag: u8 = @intFromEnum(Zir.Inst.Tag.cmp_eq);
+                const cmp_tag: u8 = @intFromEnum(if (llc.minimum) Zir.Inst.Tag.cmp_gte else Zir.Inst.Tag.cmp_eq);
                 const ref = zir_builder_emit_binop(self.handle, cmp_tag, len_ref, expected_ref);
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(llc.dest, ref);
@@ -5826,9 +5801,26 @@ pub const ZirDriver = struct {
                 try self.setLocal(lg.dest, ref);
             },
             .list_is_not_empty => |lne| {
-                // List non-empty check: list != null  (using is_non_null)
+                // Flat List non-empty check: length(list) != 0.
+                // Allocated zero-length buffers from List.new_empty are
+                // non-null but still empty.
                 const list_ref = self.refForValueLocal(lne.list) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                const ref = zir_builder_emit_is_non_null(self.handle, list_ref);
+                const len_ref = if (lne.via_helper) blk: {
+                    const helper_fn = try self.emitRuntimeHelper("listLength");
+                    const call_args = [_]u32{list_ref};
+                    break :blk zir_builder_emit_call_ref(self.handle, helper_fn, &call_args, 1);
+                } else blk: {
+                    const list_cell = try self.emitListCellRef(lne.element_type);
+                    const len_fn = zir_builder_emit_field_val(self.handle, list_cell, "length", 6);
+                    if (len_fn == error_ref) return error.EmitFailed;
+                    const call_args = [_]u32{list_ref};
+                    break :blk zir_builder_emit_call_ref(self.handle, len_fn, &call_args, 1);
+                };
+                if (len_ref == error_ref) return error.EmitFailed;
+                const zero_ref = zir_builder_emit_int(self.handle, 0);
+                if (zero_ref == error_ref) return error.EmitFailed;
+                const cmp_tag: u8 = @intFromEnum(Zir.Inst.Tag.cmp_neq);
+                const ref = zir_builder_emit_binop(self.handle, cmp_tag, len_ref, zero_ref);
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(lne.dest, ref);
             },
@@ -5852,19 +5844,26 @@ pub const ZirDriver = struct {
                 try self.setLocal(lh.dest, ref);
             },
             .list_tail => |lt| {
-                // List tail extraction. When `via_helper` is set, dispatch
-                // through `listGetTail(anytype)`.
+                // List suffix extraction. Multi-head rest patterns set
+                // `start_index` above one so the rest is materialized by
+                // one indexed slice instead of chained tail clones.
                 const list_ref = self.refForValueLocal(lt.list) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                const start_ref = zir_builder_emit_int(self.handle, @intCast(lt.start_index));
+                if (start_ref == error_ref) return error.EmitFailed;
                 const ref = if (lt.via_helper) blk: {
-                    const helper_fn = try self.emitRuntimeHelper("listGetTail");
-                    const call_args = [_]u32{list_ref};
-                    break :blk zir_builder_emit_call_ref(self.handle, helper_fn, &call_args, 1);
+                    const helper_fn = try self.emitRuntimeHelper(if (lt.consume_source)
+                        "listSliceOwnedUnchecked"
+                    else
+                        "listSliceFrom");
+                    const call_args = [_]u32{ list_ref, start_ref };
+                    break :blk zir_builder_emit_call_ref(self.handle, helper_fn, &call_args, 2);
                 } else blk: {
                     const list_cell = try self.emitListCellRef(lt.element_type);
-                    const fn_ref = zir_builder_emit_field_val(self.handle, list_cell, "getTail", 7);
+                    const method_name = if (lt.consume_source) "slice_owned_unchecked" else "sliceFrom";
+                    const fn_ref = zir_builder_emit_field_val(self.handle, list_cell, method_name.ptr, @intCast(method_name.len));
                     if (fn_ref == error_ref) return error.EmitFailed;
-                    const call_args = [_]u32{list_ref};
-                    break :blk zir_builder_emit_call_ref(self.handle, fn_ref, &call_args, 1);
+                    const call_args = [_]u32{ list_ref, start_ref };
+                    break :blk zir_builder_emit_call_ref(self.handle, fn_ref, &call_args, 2);
                 };
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(lt.dest, ref);
@@ -7839,14 +7838,7 @@ pub const ZirDriver = struct {
     /// Each case compares the scrutinee parameter against the literal value
     /// and the body contains the return instruction.
     fn emitSwitchReturn(self: *ZirDriver, sr: ir.SwitchReturn) BuildError!void {
-        // In loopified functions the dispatcher must scrutinise the
-        // per-iteration value loaded from the slot, not the entry-
-        // scope param ref `refForLocal(scrutinee_param)` would return.
-        const scrutinee_ref = if (self.loopify_slots != null and
-            sr.scrutinee_param < self.param_refs.items.len)
-            try self.loopifyLoadParam(sr.scrutinee_param)
-        else
-            try self.refForLocal(sr.scrutinee_param);
+        const scrutinee_ref = try self.refForParamIndex(sr.scrutinee_param);
 
         if (sr.cases.len == 0) {
             // No cases — just emit the default body
@@ -7949,7 +7941,7 @@ pub const ZirDriver = struct {
     /// Each case checks the active tag via std.meta.activeTag, extracts the
     /// variant payload, binds fields to locals, and returns the result.
     fn emitUnionSwitchReturn(self: *ZirDriver, usr: ir.UnionSwitchReturn) BuildError!void {
-        const scrutinee_ref = try self.refForLocal(usr.scrutinee_param);
+        const scrutinee_ref = try self.refForParamIndex(usr.scrutinee_param);
         const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
 
         if (usr.cases.len == 0) return;
@@ -8106,20 +8098,17 @@ pub const ZirDriver = struct {
         const saved_param_ref = self.param_refs.items[od.scrutinee_param];
         self.param_refs.items[od.scrutinee_param] = payload_ref;
         for (od.struct_instrs) |bi| try self.emitInstruction(bi);
-        // Perceus drop point for the boxed payload. Fired between the
-        // struct branch's body and the ret so:
-        //   * body has finished computing struct_result and any
-        //     children retains it needs;
-        //   * the release sees the source-Arc pointer (`*const T`)
-        //     and deep-releases the entire substructure;
-        //   * the ret then transfers the (possibly primitive,
-        //     possibly retained) result to the caller.
-        // `generateDropSpecialization` skips the drop when the
-        // function returns the payload itself, so this is always
-        // safe: either struct_result lives independent of the
-        // payload's allocation (e.g., an i64 sum) or the function
-        // is forwarding ownership and the spec opted out.
-        try self.emitDropSpecializationsForCurrentInstr(od.payload_local, null);
+        // Perceus drop point for owned optional-dispatch payloads.
+        // Borrowed optional params are an unwrapped view of the
+        // caller-owned `?T`; dropping that payload would decrement the
+        // caller's Arc and poison any subsequent use after this
+        // function returns. Owned optional params, by contrast, have
+        // transferred their refcount unit into this function, so the
+        // payload must be released between the struct branch body and
+        // the ret unless the return-specialization suppresses it.
+        if (self.currentParamConvention(od.scrutinee_param) == .owned) {
+            try self.emitDropSpecializationsForCurrentInstr(od.payload_local, null);
+        }
         if (od.struct_result) |sr| {
             const ret_ref = try self.refForLocal(sr);
             if (zir_builder_emit_ret(self.handle, ret_ref) != 0) {
@@ -8556,6 +8545,12 @@ test "findClosureTargetInInstrs follows local aliases" {
     try std.testing.expectEqual(@as(ir.FunctionId, 9), target.function_id);
     try std.testing.expectEqual(@as(usize, 1), target.captures.len);
     try std.testing.expectEqual(@as(ir.LocalId, 7), target.captures[0]);
+}
+
+test "encoded type-name resolver rejects unknown nested list elements" {
+    try std.testing.expectEqual(@as(?u32, null), ZirDriver.encodedNameToTypeRef("not_a_type"));
+    try std.testing.expect(ZirDriver.encodedNameToTypeRef("i64") != null);
+    try std.testing.expect(ZirDriver.encodedNameToTypeRef("str") != null);
 }
 
 // Runtime function routing is handled by `:zig.Struct.function(args)` calls

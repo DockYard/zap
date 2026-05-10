@@ -67,6 +67,7 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Tuple.html">Tuple</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
@@ -154,7 +155,7 @@ the key is not found.</td></tr>
 <div style="flex:1"></div>
 <a href="#get-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">get</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>lookup_key<span class="sig-separator">::</span><span class="sig-type-pill">key</span><span class="sig-paren">, </span>default<span class="sig-separator">::</span><span class="sig-type-pill">value</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">value</span></code></div>
+<div class="signature"><code><span class="sig-name">get</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">%{key =&gt; value}</span><span class="sig-paren">, </span>lookup_key<span class="sig-separator">::</span><span class="sig-type-pill">key</span><span class="sig-paren">, </span>default<span class="sig-separator">::</span><span class="sig-type-pill">value</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">value</span></code></div>
 <div class="function-doc">
 <p>Returns the value for the given key, or the default if
 the key is not found.</p>
@@ -171,7 +172,7 @@ Map.get(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</span>,
 <div style="flex:1"></div>
 <a href="#has_key?-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">has_key?</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>lookup_key<span class="sig-separator">::</span><span class="sig-type-pill">key</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">has_key?</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">%{key =&gt; value}</span><span class="sig-paren">, </span>lookup_key<span class="sig-separator">::</span><span class="sig-type-pill">key</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <div class="function-doc">
 <p>Returns <code>true</code> if the map contains the given key.</p>
 <h2>Examples</h2>
@@ -187,7 +188,7 @@ Map.has_key?(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</s
 <div style="flex:1"></div>
 <a href="#size-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">size</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">size</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">%{key =&gt; value}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Returns the number of entries in the map.</p>
 <h2>Examples</h2>
@@ -203,7 +204,7 @@ Map.size(%{})                    <span class="hl-comment"># =&gt; 0</span></code
 <div style="flex:1"></div>
 <a href="#empty?-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">empty?</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">empty?</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">%{key =&gt; value}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <div class="function-doc">
 <p>Returns <code>true</code> if the map has no entries.</p>
 <h2>Examples</h2>
@@ -219,7 +220,7 @@ Map.empty?(%{a: <span class="hl-number">1</span>})  <span class="hl-comment"># =
 <div style="flex:1"></div>
 <a href="#put-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">put</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>new_key<span class="sig-separator">::</span><span class="sig-type-pill">key</span><span class="sig-paren">, </span>new_value<span class="sig-separator">::</span><span class="sig-type-pill">value</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">?</span></code></div>
+<div class="signature"><code><span class="sig-name">put</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">%{key =&gt; value}</span><span class="sig-paren">, </span>new_key<span class="sig-separator">::</span><span class="sig-type-pill">key</span><span class="sig-paren">, </span>new_value<span class="sig-separator">::</span><span class="sig-type-pill">value</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">%{key =&gt; value}</span></code></div>
 <div class="function-doc">
 <p>Returns a new map with the key set to the given value.
 If the key already exists, its value is updated.</p>
@@ -236,7 +237,7 @@ Map.put(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:a</span>,
 <div style="flex:1"></div>
 <a href="#delete-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">delete</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>remove_key<span class="sig-separator">::</span><span class="sig-type-pill">key</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">?</span></code></div>
+<div class="signature"><code><span class="sig-name">delete</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">%{key =&gt; value}</span><span class="sig-paren">, </span>remove_key<span class="sig-separator">::</span><span class="sig-type-pill">key</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">%{key =&gt; value}</span></code></div>
 <div class="function-doc">
 <p>Returns a new map with the given key removed.
 Returns the map unchanged if the key doesn't exist.</p>
@@ -253,7 +254,7 @@ Map.delete(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</spa
 <div style="flex:1"></div>
 <a href="#merge-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">merge</span><span class="sig-paren">(</span>map_a<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>map_b<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">?</span></code></div>
+<div class="signature"><code><span class="sig-name">merge</span><span class="sig-paren">(</span>map_a<span class="sig-separator">::</span><span class="sig-type-pill">%{key =&gt; value}</span><span class="sig-paren">, </span>map_b<span class="sig-separator">::</span><span class="sig-type-pill">%{key =&gt; value}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">%{key =&gt; value}</span></code></div>
 <div class="function-doc">
 <p>Merges two maps. Keys from the second map override keys
 from the first.</p>
@@ -270,7 +271,7 @@ from the first.</p>
 <div style="flex:1"></div>
 <a href="#keys-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">keys</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[key]</span></code></div>
+<div class="signature"><code><span class="sig-name">keys</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">%{key =&gt; value}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[key]</span></code></div>
 <div class="function-doc">
 <p>Returns a list of all keys in the map.</p>
 <h2>Examples</h2>
@@ -285,7 +286,7 @@ from the first.</p>
 <div style="flex:1"></div>
 <a href="#values-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">values</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[value]</span></code></div>
+<div class="signature"><code><span class="sig-name">values</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">%{key =&gt; value}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[value]</span></code></div>
 <div class="function-doc">
 <p>Returns a list of all values in the map.</p>
 <h2>Examples</h2>
@@ -300,7 +301,7 @@ from the first.</p>
 <div style="flex:1"></div>
 <a href="#get!-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">get!</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>lookup_key<span class="sig-separator">::</span><span class="sig-type-pill">key</span><span class="sig-paren">, </span>default<span class="sig-separator">::</span><span class="sig-type-pill">value</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">value</span></code></div>
+<div class="signature"><code><span class="sig-name">get!</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">%{key =&gt; value}</span><span class="sig-paren">, </span>lookup_key<span class="sig-separator">::</span><span class="sig-type-pill">key</span><span class="sig-paren">, </span>default<span class="sig-separator">::</span><span class="sig-type-pill">value</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">value</span></code></div>
 <div class="function-doc">
 <p>Returns the value for the given key.
 Raises if the key is not found.</p>

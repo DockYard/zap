@@ -355,7 +355,7 @@ fn recordSourceFile(
     // same struct can land in `file_to_structs` twice and the
     // downstream `compileStructByStruct` pipeline lowers it to two
     // distinct `ir.Function` records with the same name — silently
-    // breaking the chain-consistency invariants that arc/v8 audits
+    // breaking the chain-consistency invariants that arc/uniqueness audits
     // rely on.
     const canonical = canonicalizeFilePath(alloc, file_path) catch return error.OutOfMemory;
     if (graph.canonical_files.contains(canonical)) {

@@ -754,7 +754,7 @@ pub const PerceusAnalyzer = struct {
             .case_block => |cb| {
                 // For each arm, generate a specialized drop for the known constructor
                 for (cb.arms, 0..) |arm, arm_idx| {
-                    const field_drops = try self.extractFieldDropsFromArm(&arm);
+                    const field_drops = try self.extractFieldDropsFromArm(func, &arm);
                     try self.drop_specializations.append(self.allocator, .{
                         .match_site = decon.match_site_id,
                         .constructor_tag = @intCast(arm_idx),
@@ -1094,6 +1094,7 @@ pub const PerceusAnalyzer = struct {
 
     fn extractFieldDropsFromArm(
         self: *PerceusAnalyzer,
+        func: *const ir.Function,
         arm: *const ir.IrCaseArm,
     ) ![]const FieldDrop {
         var drops: std.ArrayList(FieldDrop) = .empty;
@@ -1104,6 +1105,7 @@ pub const PerceusAnalyzer = struct {
         var field_idx: u32 = 0;
         for (arm.cond_instrs) |instr| {
             if (extractFieldDropFromInstr(&instr)) |field_drop| {
+                if (!fieldLocalNeedsDrop(func, field_drop.local)) continue;
                 try drops.append(self.allocator, .{
                     .field_name = field_drop.field_name,
                     .field_index = field_idx,
@@ -1115,6 +1117,7 @@ pub const PerceusAnalyzer = struct {
         }
         for (arm.body_instrs) |instr| {
             if (extractFieldDropFromInstr(&instr)) |field_drop| {
+                if (!fieldLocalNeedsDrop(func, field_drop.local)) continue;
                 try drops.append(self.allocator, .{
                     .field_name = field_drop.field_name,
                     .field_index = field_idx,
@@ -1126,6 +1129,11 @@ pub const PerceusAnalyzer = struct {
         }
 
         return try drops.toOwnedSlice(self.allocator);
+    }
+
+    fn fieldLocalNeedsDrop(func: *const ir.Function, local: ir.LocalId) bool {
+        if (local >= func.local_ownership.len) return true;
+        return func.local_ownership[local] == .owned;
     }
 
     fn extractFieldDropFromInstr(instr: *const ir.Instruction) ?struct { field_name: []const u8, local: ir.LocalId } {
@@ -1166,7 +1174,7 @@ pub const PerceusAnalyzer = struct {
                 return decon_type.num_fields == con_type.num_fields;
             },
             .list_type => {
-                // Lists: always compatible (cons cells are same size)
+                // Lists: same runtime representation regardless of element type.
                 return true;
             },
             .union_type => {
@@ -2148,6 +2156,63 @@ test "drop specialization generates per-field drops" {
     // Both fields need recursive drops (conservative)
     try testing.expect(ds.field_drops[0].needs_recursive_drop);
     try testing.expect(ds.field_drops[1].needs_recursive_drop);
+}
+
+test "drop specialization skips non-ARC field extracts" {
+    const allocator = testing.allocator;
+
+    const cond_instrs = [_]ir.Instruction{
+        .{ .match_type = .{
+            .dest = 10,
+            .scrutinee = 1,
+            .expected_type = .{ .struct_ref = "Pair" },
+            .expected_arity = 2,
+        } },
+        .{ .field_get = .{ .dest = 11, .object = 1, .field = "arc_child" } },
+        .{ .field_get = .{ .dest = 12, .object = 1, .field = "count" } },
+    };
+    const body_instrs = [_]ir.Instruction{
+        .{ .ret = .{ .value = 11 } },
+    };
+    const arms = [_]ir.IrCaseArm{
+        .{
+            .cond_instrs = &cond_instrs,
+            .condition = 10,
+            .body_instrs = &body_instrs,
+            .result = 11,
+        },
+    };
+    const block_instrs = [_]ir.Instruction{
+        .{ .case_block = .{
+            .dest = 30,
+            .pre_instrs = &.{},
+            .arms = &arms,
+            .default_instrs = &.{},
+            .default_result = null,
+        } },
+    };
+    const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
+    var local_ownership = [_]ir.OwnershipClass{.trivial} ** 31;
+    local_ownership[1] = .owned;
+    local_ownership[11] = .owned;
+    local_ownership[12] = .trivial;
+    var function = makeFunction(0, "mixed_pair", &blocks);
+    function.local_ownership = &local_ownership;
+    const functions = [_]ir.Function{function};
+    var program = try makeTestProgram(&functions);
+    _ = &program;
+
+    var analyzer = PerceusAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+
+    const result = try analyzer.analyze();
+    defer result.deinit(allocator);
+
+    try testing.expect(result.drop_specializations.len >= 1);
+    const drop_spec = result.drop_specializations[0];
+    try testing.expectEqual(@as(usize, 1), drop_spec.field_drops.len);
+    try testing.expectEqualStrings("arc_child", drop_spec.field_drops[0].field_name);
+    try testing.expectEqual(@as(?ir.LocalId, 11), drop_spec.field_drops[0].local);
 }
 
 // ============================================================

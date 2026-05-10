@@ -4420,6 +4420,22 @@ pub const Parser = struct {
                     .list = .{ .meta = v.meta, .elements = try elements.toOwnedSlice(self.allocator) },
                 });
             },
+            .list_cons_expr => |v| {
+                var heads: std.ArrayList(*const ast.Pattern) = .empty;
+                var tail_expr: *const ast.Expr = expr;
+                while (tail_expr.* == .list_cons_expr) {
+                    const cons = tail_expr.list_cons_expr;
+                    try heads.append(self.allocator, try self.exprToPattern(cons.head));
+                    tail_expr = cons.tail;
+                }
+                return self.create(ast.Pattern, .{
+                    .list_cons = .{
+                        .meta = v.meta,
+                        .heads = try heads.toOwnedSlice(self.allocator),
+                        .tail = try self.exprToPattern(tail_expr),
+                    },
+                });
+            },
             .atom_literal => |v| {
                 return self.create(ast.Pattern, .{ .literal = .{ .atom = .{ .meta = v.meta, .value = v.value } } });
             },

@@ -72,6 +72,7 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Tuple.html">Tuple</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
@@ -114,18 +115,21 @@
 <main class="content">
 <article class="guide-article structdoc">
 <h1>List</h1>
-<p>A <code>List</code> in Zap is a singly-linked list of homogeneous elements. The literal
-syntax is <code>[1, 2, 3]</code>, and the cons pattern is <code>[head | tail]</code>.</p>
-<p>Because lists are linked, the access patterns are asymmetric: <code>head/1</code> and
-<code>prepend/2</code> are O(1); <code>last/1</code>, <code>append/2</code>, and <code>at/2</code> are O(n). When you
-need fast random access or constant-time append, a different shape (an array
-or a map keyed by index) is the right tool. When you need cheap structural
-sharing and pattern matching, lists are the right tool.</p>
-<h2>Construction and destructuring</h2>
+<p>A <code>List</code> in Zap is a homogeneous sequence backed by a single contiguous
+runtime buffer. The literal syntax is <code>[1, 2, 3]</code>; the generic type spelling is
+<code>List(i64)</code>, <code>List(String)</code>, and so on.</p>
+<p>Zap has one sequence type: indexed reads, append-at-end operations, and list
+literals all use <code>List(T)</code>.</p>
+<h2>Construction and Destructuring</h2>
 <pre><code class="language-zap">xs <span class="hl-op">=</span> [<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>]
-[head <span class="hl-op">|</span> tail] <span class="hl-op">=</span> xs       <span class="hl-comment"># head = 1, tail = [2, 3]</span>
-[]                       <span class="hl-comment"># the empty list</span></code></pre>
-<p>Pattern matching extends to function clauses:</p>
+[]                         <span class="hl-comment"># the empty list</span>
+
+values <span class="hl-op">=</span> List.new_filled(<span class="hl-number">4</span>, <span class="hl-number">0</span> <span class="hl-op">::</span> <span class="hl-type">i64</span>)
+scratch <span class="hl-op">=</span> List.new_empty(<span class="hl-number">32</span>) <span class="hl-op">::</span> List(<span class="hl-type">i64</span>)</code></pre>
+<p><code>new_filled/2</code> allocates a list with a populated length. <code>new_empty/1</code>
+allocates a list with reserved capacity and length <code>0</code>, which is useful when
+you will build the list with <code>push/2</code>.</p>
+<p>Head/tail patterns still describe sequence shape, not storage layout:</p>
 <pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> sum([] <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
   <span class="hl-number">0</span>
 }
@@ -133,69 +137,89 @@ sharing and pattern matching, lists are the right tool.</p>
 <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> sum([head <span class="hl-op">|</span> tail] <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
   head <span class="hl-op">+</span> sum(tail)
 }</code></pre>
-<p>The first clause binds the empty case; the second binds head and tail and
-recurses. Zap's overload resolver picks the right clause without you writing
-a <code>case</code> body.</p>
-<h2>Two shapes of operations</h2>
-<p><code>List</code> exposes the operations that need to know about the linked structure
-of a list — <code>head/1</code>, <code>tail/1</code>, <code>prepend/2</code>, <code>append/2</code>, <code>concat/2</code>, plus
-the bang versions for known-non-empty lists.</p>
-<p><code>Enum</code> exposes the operations that work on any enumerable — <code>map/2</code>,
-<code>filter/2</code>, <code>reduce/3</code>, <code>take/2</code>, <code>drop/2</code>, etc. They work on lists too,
-because <code>List</code> implements <code>Enumerable</code>.</p>
-<p>If a function exists in both modules, prefer the <code>Enum</code> version when you
-might generalize later, and the <code>List</code> version when you specifically want
-the list-shape behavior.</p>
-<h2>Bang versions</h2>
-<p>Functions that fail on the empty list come in pairs:</p>
-<pre><code class="language-zap">List.head([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])     <span class="hl-comment"># =&gt; 1</span>
-List.head([])            <span class="hl-comment"># =&gt; raises</span>
+<p>The first clause binds the empty case; the second binds the first element and
+the remaining list. The runtime representation is still flat-buffer-backed.</p>
+<h2>Indexed Access</h2>
+<pre><code class="language-zap">xs <span class="hl-op">=</span> [<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>]
 
-List.head!([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])    <span class="hl-comment"># =&gt; 1</span>
-List.head!([])           <span class="hl-comment"># =&gt; raises (same)</span></code></pre>
-<p>The convention: a trailing <code>!</code> means &quot;this function trusts you that the
-input meets its precondition; if not, it raises.&quot; Use it when you've just
-checked emptiness or when the type system has narrowed the input. Use the
-non-bang version when you have a sensible default to provide.</p>
-<h2>Building lists efficiently</h2>
-<p>Prepending is cheap (<code>O(1)</code>); appending is expensive (<code>O(n)</code>). Build lists
-by prepending and reverse at the end:</p>
+List.length(xs)            <span class="hl-comment"># =&gt; 3</span>
+List.capacity(xs)          <span class="hl-comment"># reserved slots in the backing buffer</span>
+List.get(xs, <span class="hl-number">1</span>)            <span class="hl-comment"># =&gt; 20</span>
+List.at(xs, <span class="hl-number">2</span>)             <span class="hl-comment"># =&gt; 30</span>
+List.set(xs, <span class="hl-number">1</span>, <span class="hl-number">99</span>)        <span class="hl-comment"># =&gt; [10, 99, 30]</span></code></pre>
+<p><code>get/2</code> and <code>at/2</code> are aliases. <code>at!/2</code> performs the same read after an
+explicit bounds check and raises on an invalid index.</p>
+<h2>Value Semantics and Mutation</h2>
+<p>List operations are value-semantic: <code>set/3</code>, <code>push/2</code>, <code>pop/1</code>, and <code>append/2</code>
+return a list value and do not expose mutation to user code.</p>
+<p>Under the hood, Zap uses copy-on-write. When a list buffer is uniquely owned,
+the runtime may update it in place and return the same handle. When it is
+shared, the runtime clones first so existing observers keep their original
+view.</p>
+<pre><code class="language-zap">values <span class="hl-op">=</span> List.new_filled(<span class="hl-number">3</span>, <span class="hl-number">0</span> <span class="hl-op">::</span> <span class="hl-type">i64</span>)
+values <span class="hl-op">=</span> List.set(values, <span class="hl-number">1</span>, <span class="hl-number">42</span> <span class="hl-op">::</span> <span class="hl-type">i64</span>)
+values <span class="hl-op">=</span> List.push(values, <span class="hl-number">7</span> <span class="hl-op">::</span> <span class="hl-type">i64</span>)
+
+popped <span class="hl-op">=</span> List.pop(values)
+shorter <span class="hl-op">=</span> popped.<span class="hl-number">0</span>
+removed <span class="hl-op">=</span> popped.<span class="hl-number">1</span></code></pre>
+<p>This is the same surface contract for scalar lists, string lists, nested lists,
+and lists containing ARC-managed values.</p>
+<h2>Building Lists Efficiently</h2>
+<p>When you are growing a list in order, prefer <code>new_empty/1</code> plus <code>push/2</code>:</p>
 <pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> collect_evens(xs <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> [<span class="hl-type">i64</span>] {
-  collect_evens_loop(xs, [])
+  collect_evens_loop(xs, <span class="hl-number">0</span>, List.length(xs), List.new_empty(List.length(xs)))
 }
 
-<span class="hl-keyword">fn</span> collect_evens_loop([] <span class="hl-op">::</span> [<span class="hl-type">i64</span>], acc <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> [<span class="hl-type">i64</span>] {
-  List.reverse(acc)
-}
-
-<span class="hl-keyword">fn</span> collect_evens_loop([head <span class="hl-op">|</span> tail] <span class="hl-op">::</span> [<span class="hl-type">i64</span>], acc <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> [<span class="hl-type">i64</span>] {
-  <span class="hl-keyword">if</span> Integer.even?(head) {
-    collect_evens_loop(tail, [head <span class="hl-op">|</span> acc])
+<span class="hl-keyword">fn</span> collect_evens_loop(xs <span class="hl-op">::</span> [<span class="hl-type">i64</span>], index <span class="hl-op">::</span> <span class="hl-type">i64</span>, total <span class="hl-op">::</span> <span class="hl-type">i64</span>, acc <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> [<span class="hl-type">i64</span>] {
+  <span class="hl-keyword">if</span> index <span class="hl-op">&lt;</span> total {
+    value <span class="hl-op">=</span> List.get(xs, index)
+    next_acc <span class="hl-op">=</span> <span class="hl-keyword">if</span> Integer.even?(value) {
+      List.push(acc, value)
+    } <span class="hl-keyword">else</span> {
+      acc
+    }
+    collect_evens_loop(xs, index <span class="hl-op">+</span> <span class="hl-number">1</span>, total, next_acc)
   } <span class="hl-keyword">else</span> {
-    collect_evens_loop(tail, acc)
+    acc
   }
 }</code></pre>
-<p>In practice you'd write that as <code>Enum.filter(xs, &amp;Integer.even?/1)</code>. The
-hand-written version is what <code>Enum.filter</code> becomes after lowering.</p>
+<p>In practice you would usually write that as <code>Enum.filter(xs, &amp;Integer.even?/1)</code>
+or <code>List.filter(xs, &amp;Integer.even?/1)</code>. The explicit version shows the
+flat-buffer-friendly pattern: iterate by index and append to the end.</p>
 <h2>Concatenation</h2>
-<p>Two lists join with <code>concat/2</code> or the <code>&lt;&gt;</code> operator (via <code>Concatenable</code>):</p>
-<pre><code class="language-zap">List.concat([<span class="hl-number">1</span>, <span class="hl-number">2</span>], [<span class="hl-number">3</span>, <span class="hl-number">4</span>])    <span class="hl-comment"># =&gt; [1, 2, 3, 4]</span>
+<p>Two lists join with <code>append/2</code>, <code>concat/2</code>, or the <code>&lt;&gt;</code> operator through
+<code>Concatenable</code>:</p>
+<pre><code class="language-zap">List.append([<span class="hl-number">1</span>, <span class="hl-number">2</span>], [<span class="hl-number">3</span>, <span class="hl-number">4</span>])    <span class="hl-comment"># =&gt; [1, 2, 3, 4]</span>
+List.concat([<span class="hl-number">1</span>, <span class="hl-number">2</span>], [<span class="hl-number">3</span>, <span class="hl-number">4</span>])    <span class="hl-comment"># =&gt; [1, 2, 3, 4]</span>
 [<span class="hl-number">1</span>, <span class="hl-number">2</span>] <span class="hl-op">&lt;&gt;</span> [<span class="hl-number">3</span>, <span class="hl-number">4</span>]               <span class="hl-comment"># =&gt; [1, 2, 3, 4]</span></code></pre>
-<p><code>concat/2</code> walks the left list and prepends each element to the right list,
-so it's <code>O(left)</code>. Don't use it inside an inner loop over the right list.</p>
-<h2>Querying</h2>
-<pre><code class="language-zap">List.length([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])         <span class="hl-comment"># =&gt; 3</span>
-List.empty?([])                <span class="hl-comment"># =&gt; true</span>
+<p><code>append/2</code> can reuse the left buffer when it is uniquely owned and has enough
+capacity. Otherwise it allocates a new buffer and copies the elements.</p>
+<h2>Querying and Slicing</h2>
+<pre><code class="language-zap">List.empty?([])                <span class="hl-comment"># =&gt; true</span>
+List.head([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])           <span class="hl-comment"># =&gt; 1</span>
+List.tail([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])           <span class="hl-comment"># =&gt; [2, 3]</span>
+List.last([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])           <span class="hl-comment"># =&gt; 3</span>
 List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">2</span>)   <span class="hl-comment"># =&gt; true</span>
-List.uniq([<span class="hl-number">1</span>, <span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">2</span>])     <span class="hl-comment"># =&gt; [1, 2, 3]</span>
-List.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])        <span class="hl-comment"># =&gt; [3, 2, 1]</span></code></pre>
-<p><code>length/1</code> walks the whole list — there is no cached length. If you find
-yourself calling <code>length</code> repeatedly in a loop, restructure to count once.</p>
-<h2>See also</h2>
+List.take([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>], <span class="hl-number">2</span>)     <span class="hl-comment"># =&gt; [1, 2]</span>
+List.drop([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>], <span class="hl-number">2</span>)     <span class="hl-comment"># =&gt; [3, 4]</span>
+List.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])        <span class="hl-comment"># =&gt; [3, 2, 1]</span>
+List.uniq([<span class="hl-number">1</span>, <span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">2</span>])     <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
+<p><code>tail/1</code>, <code>take/2</code>, and <code>drop/2</code> return fresh list values containing the
+selected elements.</p>
+<h2>Bang Versions</h2>
+<p>Functions that should only be called with a non-empty or in-bounds list have
+bang variants:</p>
+<pre><code class="language-zap">List.head!([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])          <span class="hl-comment"># =&gt; 1</span>
+List.last!([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])          <span class="hl-comment"># =&gt; 3</span>
+List.at!([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>], <span class="hl-number">1</span>)      <span class="hl-comment"># =&gt; 20</span></code></pre>
+<p>Use them when the precondition has already been established. Otherwise use the
+non-bang versions or make the check explicit.</p>
+<h2>See Also</h2>
 <ul>
 <li><code>Enum</code> — operations that work on every enumerable, including lists</li>
-<li><code>Range</code> — when you want a list-of-integers but don't want to materialize it</li>
-<li><code>Map</code> — when you need keyed access instead of positional</li>
+<li><code>Range</code> — when you want integer iteration without materializing a list</li>
+<li><code>Map</code> — when you need keyed access instead of positional access</li>
 </ul>
 </article>
 </main>

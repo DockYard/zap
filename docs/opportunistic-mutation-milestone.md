@@ -4,7 +4,13 @@
 **Period:** Phase 0 instrumentation through Phase 2.6 (~50 commits).
 **Reference plans:** `docs/dense-map-implementation-plan.md`, `docs/escape-analysis-research-brief.md`, `research1.md`, `research2.md`.
 
-This document captures what was built, what works, what's documented as a gap, and the architectural foundation it leaves in place. It's the close-out for the dense-Map / flat-Vector / opportunistic-mutation project.
+This document captures what was built, what works, what's documented as a gap, and the architectural foundation it leaves in place. It's the close-out for the dense-Map / flat-buffer sequence / opportunistic-mutation project.
+
+**Post-list-unification note:** the flat-buffer sequence surface is now
+`List(T)`. The former `VectorI64` / `VectorF64` surface aliases and the
+separate user-facing `Vector` concept have been removed. Historical commit
+names below still mention Vector because that was the name used when the
+milestone shipped.
 
 ---
 
@@ -15,7 +21,7 @@ A complete redesign of Zap's primary collections plus a static-uniqueness infere
 ### Core data structures
 
 - **Dense `Map(K, V)`** (`src/runtime.zig` + `src/wyhash.zig`) — `ankerl::unordered_dense`-style: single-allocation buffer with header + Robin-Hood-probed bucket array + insertion-order entries array. Roc-style swap-remove on delete. wyhash with random per-process seed. Replaces the previous HAMT entirely.
-- **Flat `Vector(T)`** (`src/runtime.zig`) — single-allocation buffer with header + contiguous data. Specialized as `VectorI64`/`VectorF64` aliases mirroring the prior `MArrayI64`/`MArrayF64` pattern.
+- **Flat `List(T)`** (`src/runtime.zig`) — single-allocation buffer with header + contiguous data. This is the canonical sequence type; the old `VectorI64`/`VectorF64` aliases are gone.
 - **rc-1 fast path** on every mutating operation (`put`, `delete`, `merge`, `set`, `push`, `pop`, `append`): when `header.count() == 1`, mutate in place; otherwise clone-then-mutate.
 - **`*_owned_unchecked` runtime variants** for every owned-mutating operation: skip the rc-check entirely, mutate directly. Emitted by codegen only at sites the V8 verifier proves uniquely owned.
 
@@ -27,7 +33,7 @@ Built on the existing V1–V7 ownership invariants (no double-free, balanced ret
 - **Per-function uniqueness signatures** (`src/v8_signature.zig`, `src/v8_fixpoint.zig`) — 4-element lattice `{CU, PU, AL, ⊤}` with per-return-component witnesses tracking which input parameter (if any) each component preserves uniqueness from. Computed by intraprocedural classification, joined to a least fixpoint over a Tarjan SCC of the call graph.
 - **Chain-consistency audit** (`src/arc_param_convention.zig`) — admits a borrowed-convention parameter slot to the lift set only when all caller chains pass uniqueness AND the V8 verifier-equivalent pre-flight check accepts the resulting promoted state. Phase 2.4's pre-flight makes the audit and verifier agree by construction.
 - **V8 static-uniqueness dataflow** (`src/v8_uniqueness.zig`, `src/v8_interprocedural.zig`) — per-instruction forward dataflow producing `definitely_unique` for every local. Includes tuple_pending tracking for per-component uniqueness propagation through `tuple_init` / `index_get` / returns / escapes.
-- **Codegen integration** — the call-site emission rewriter swaps `Vector.set` to `Vector.set_owned_unchecked` (and equivalents for Map) when V8 holds. Fall-through to the rc-checked path is sound; only the unchecked path gets the perf gain.
+- **Codegen integration** — the call-site emission rewriter swaps `List.set` to `List.set_owned_unchecked` (and equivalents for Map) when V8 holds. Fall-through to the rc-checked path is sound; only the unchecked path gets the perf gain.
 
 ### Phase 0 instrumentation (preserved)
 
@@ -43,7 +49,7 @@ Behind `-Dinstrument-map=true`: per-instance per-lineage records, S/W/V classifi
 | --- | --- | --- |
 | **k-nucleotide** | **1.5s wall**, byte-exact | 100% V8 firing on `Map.put` (8,749,968 unchecked sites out of 8,749,968 total) |
 | **fannkuch n=10** | **2.5s wall**, byte-exact | Was 154s+ pre-Phase-1 (60× improvement) |
-| **vector_rc1 example** | 100/100 unchecked | Confirms V8 + codegen end-to-end on Vector |
+| **list_rc1 example** | 100/100 unchecked | Confirms V8 + codegen end-to-end on List |
 | Differential test suite (`bench/map-workloads/`) | 3/3 PASS | working_dict / versioned / read_mostly classifier signal correct |
 | `zig build test` | 917+/917+ green | All host-side regression tests pass |
 
@@ -58,7 +64,7 @@ Behind `-Dinstrument-map=true`: per-instance per-lineage records, S/W/V classifi
 
 - The ownership IR with V1–V8 invariants is the substrate that Phase 3 (higher-order) will build on.
 - The signature-based interprocedural fixpoint and the chain-consistency audit together provide the standard "uniqueness-with-verifier-safety" architecture used by Roc, Koka, and Lean 4.
-- The dense Map and flat Vector are production-quality replacements for the HAMT and `MArray*` types.
+- The dense Map and flat `List(T)` buffer are production-quality replacements for the HAMT, the old cons-cell list representation, and the `MArray*` types.
 
 ---
 
@@ -67,11 +73,11 @@ Behind `-Dinstrument-map=true`: per-instance per-lineage records, S/W/V classifi
 ### fannkuch-redux n=11 is 17% over its perf gate
 
 - Current: 36.4s wall, byte-exact.
-- Target: ≤ 30s wall (within 5% of MArrayI64 baseline 1.64s — note this gate was overoptimistic given fannkuch's pathological 2.15B Vector.set calls).
+- Target: ≤ 30s wall (within 5% of the old MArrayI64 baseline 1.64s — note this gate was overoptimistic given fannkuch's pathological 2.15B indexed sequence updates).
 - Pre-Phase-1 with HAMT: did not terminate in reasonable time.
 - Pre-Phase-1 with MArrayI64 (the imperative escape hatch we deleted): 1.64s.
 
-**Root cause:** `vector_unchecked_total = 0` on fannkuch — V8 doesn't fire on Vector mutation sites in fannkuch's hot loops. The architectural diagnosis chain converged on this:
+**Root cause:** the unchecked sequence-update counter was zero on fannkuch (`vector_unchecked_total` at the time; `list_unchecked_total` after list unification) — V8 doesn't fire on indexed `List.set` mutation sites in fannkuch's hot loops. The architectural diagnosis chain converged on this:
 
 1. `arc_liveness.ArcOwnership` doesn't track last-use of non-ARC aggregates (tuples) whose components are ARC-managed. Phase 2.5's `tuple_pending` machinery in `v8_uniqueness` queries `isLastUseAt(parent_tuple, ...)` which always returns false for these aggregates, so the destructure-promotion idiom never fires on the canonical fannkuch shape.
 2. With (1) fixed, Phase 2.6.2 (`TentativeAnalyzer` tuple_pending support) and Phase 2.6.3 (`arc_drop_insertion` tuple-component releases) need to come online together. They're committed but gated off behind `ZAP_ENABLE_PHASE_2_6_2`.
@@ -140,11 +146,11 @@ Plus benchmark ports in `~/projects/lang-benches/` (separate repo).
 
 ## What changed about Zap as a language
 
-- `Map`, `List`, and `Vector` are the canonical collections. **`MArrayI64` and `MArrayF64` are gone** (deleted in `5693091` — 14 files changed, 143 ins / 865 del). The imperative escape-hatch types are no longer in the language.
-- The functional surface (pure value semantics) is preserved end-to-end. `Vector.set(v, i, x)` returns a new vector; the rc-1 fast path (and unchecked variant when V8 holds) is purely an implementation optimization invisible to the user.
+- `Map` and `List` are the canonical collections. **`MArrayI64`, `MArrayF64`, `VectorI64`, and `VectorF64` are gone.** The imperative escape-hatch types and the separate vector surface are no longer in the language.
+- The functional surface (pure value semantics) is preserved end-to-end. `List.set(list, i, x)` returns a new list; the rc-1 fast path (and unchecked variant when V8 holds) is purely an implementation optimization invisible to the user.
 - Iteration order on `Map` is insertion order modulo the swap-remove on delete (matches Roc).
 - The hash function is wyhash with random per-process seed, providing DoS resistance by default.
-- spectral-norm and fannkuch-redux benchmark sources have been ported (in `~/projects/lang-benches/`) to thread vectors through tuple returns — the idiomatic Zap pattern under value semantics + ARC. Both produce byte-exact output; spectral-norm at ~8.7s (slow but correct), fannkuch n=10 at 2.6s, fannkuch n=11 at 36.4s (the documented perf gap).
+- spectral-norm and fannkuch-redux benchmark sources should use `List(i64)` / `List(f64)` for indexed sequence storage after list unification. The idiomatic Zap pattern remains threading the list through tuple returns under value semantics + ARC. The previously documented perf gap was fannkuch n=11 at 36.4s.
 
 ---
 
@@ -153,7 +159,7 @@ Plus benchmark ports in `~/projects/lang-benches/` (separate repo).
 **Highest priority** (closes fannkuch n=11 gap):
 1. Resume Phase 2.7: extend `arc_liveness.ArcOwnership` to track last-use of non-ARC aggregates with ARC components.
 2. Ungate Phase 2.6.2 + 2.6.3 (`TentativeAnalyzer` tuple_pending + `arc_drop_insertion` tuple-component releases).
-3. Verify fannkuch n=11 hits 30s gate.
+3. Verify fannkuch n=11 hits the 30s gate with `list_unchecked_total > 0` on the hot `List.set` sites.
 
 **Medium priority:**
 4. Phase 3 — higher-order V8 propagation via lambda-set defunctionalization. Likely needed for production-scale workloads with closures and protocol dispatch.

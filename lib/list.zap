@@ -1,250 +1,271 @@
 @native_type = "list"
 
-@doc = """
-  Functions for working with lists.
+pub struct List {
+  @structdoc = """
+  A flat-buffer sequence of elements.
 
-  Lists in Zap are singly-linked immutable cons cells using
-  nullable pointers. An empty list is `[]` (null), and a
-  non-empty list is a chain of cells each holding a head value
-  and a tail pointer.
-
-  ## Examples
-
-      List.length([1, 2, 3])         # => 3
-      List.head([10, 20, 30])        # => 10
-      List.reverse([1, 2, 3])        # => [3, 2, 1]
+  `List(t)` is backed by the runtime's single-allocation contiguous
+  buffer. Lists support O(1) indexed reads, copy-on-write mutation, and
+  ARC-managed lifetime for elements that own runtime resources.
   """
 
-pub struct List {
-  @doc = """
-    Returns `true` if the list has no elements.
+  @fndoc = """
+  Allocate a list of `size` elements, each initialized to `init`.
+  """
 
-    ## Examples
+  pub fn new_filled(size :: i64, init :: t) -> List(t) {
+    :zig.List.new_filled(size, init)
+  }
 
-        List.empty?([])        # => true
-        List.empty?([1, 2, 3]) # => false
-    """
+  @fndoc = """
+  Allocate an empty list with at least `initial_capacity` reserved slots.
+  """
 
-  pub fn empty?(list :: [element]) -> Bool {
+  pub fn new_empty(initial_capacity :: i64) -> List(t) {
+    :zig.List.new_empty(initial_capacity)
+  }
+
+  @fndoc = """
+  Returns `true` when the list has no elements.
+  """
+
+  pub fn empty?(list :: List(t)) -> Bool {
     :zig.List.isEmpty(list)
   }
 
-  @doc = """
-    Returns the number of elements in the list.
+  @fndoc = """
+  Returns the number of elements in the list.
+  """
 
-    ## Examples
-
-        List.length([1, 2, 3])  # => 3
-        List.length([])         # => 0
-    """
-
-  pub fn length(list :: [element]) -> i64 {
+  pub fn length(list :: List(t)) -> i64 {
     :zig.List.length(list)
   }
 
-  @doc = """
-    Returns the first element of the list.
-    Returns 0 for an empty list.
+  @fndoc = """
+  Returns the list's reserved capacity.
+  """
 
-    ## Examples
-
-        List.head([10, 20, 30])  # => 10
-    """
-
-  pub fn head(list :: [element]) -> element {
-    :zig.List.getHead(list)
+  pub fn capacity(list :: List(t)) -> i64 {
+    :zig.List.capacity(list)
   }
 
-  @doc = """
-    Returns the list without its first element.
+  @fndoc = """
+  Returns the element at `index`.
+  """
 
-    ## Examples
-
-        List.tail([10, 20, 30])  # => [20, 30]
-    """
-
-  pub fn tail(list :: [element]) -> [element] {
-    :zig.List.getTail(list)
-  }
-
-  @doc = """
-    Returns the element at the given zero-based index.
-    Returns 0 if the index is out of bounds.
-
-    ## Examples
-
-        List.at([10, 20, 30], 1)  # => 20
-    """
-
-  pub fn at(list :: [element], index :: i64) -> element {
+  pub fn get(list :: List(t), index :: i64) -> t {
     :zig.List.get(list, index)
   }
 
-  @doc = """
-    Returns the last element of the list.
-    Returns 0 for an empty list.
+  @fndoc = """
+  Returns the element at `index`.
+  """
 
-    ## Examples
-
-        List.last([1, 2, 3])  # => 3
-    """
-
-  pub fn last(list :: [element]) -> element {
-    :zig.List.last(list)
+  pub fn at(list :: List(t), index :: i64) -> t {
+    List.get(list, index)
   }
 
-  @doc = """
-    Returns `true` if the list contains the given value.
+  @fndoc = """
+  Returns a list with `value` stored at `index`.
+  """
 
-    ## Examples
-
-        List.contains?([1, 2, 3], 2)  # => true
-        List.contains?([1, 2, 3], 5)  # => false
-    """
-
-  pub fn contains?(list :: [element], value :: element) -> Bool {
-    :zig.List.contains(list, value)
+  pub fn set(list :: List(t), index :: i64, value :: t) -> List(t) {
+    :zig.List.set(list, index, value)
   }
 
-  @doc = """
-    Reverses the order of elements.
+  @fndoc = """
+  Returns a list with `value` added to the end.
+  """
 
-    ## Examples
-
-        List.reverse([1, 2, 3])  # => [3, 2, 1]
-    """
-
-  pub fn reverse(list :: [element]) -> [element] {
-    :zig.List.reverse(list)
+  pub fn push(list :: List(t), value :: t) -> List(t) {
+    :zig.List.push(list, value)
   }
 
-  @doc = """
-    Prepends a value to the front of a list.
+  @fndoc = """
+  Removes the last element and returns `{list, value}`.
+  """
 
-    ## Examples
+  pub fn pop(list :: List(t)) -> {List(t), t} {
+    value = List.last(list)
+    next = :zig.List.pop(list)
+    {next, value}
+  }
 
-        List.prepend([2, 3], 1)  # => [1, 2, 3]
-    """
+  @fndoc = """
+  Concatenates two lists.
+  """
 
-  pub fn prepend(list :: [element], value :: element) -> [element] {
+  pub fn append(first :: List(t), second :: List(t)) -> List(t) {
+    :zig.List.append(first, second)
+  }
+
+  @fndoc = """
+  Concatenates two lists.
+  """
+
+  pub fn concat(first :: List(t), second :: List(t)) -> List(t) {
+    List.append(first, second)
+  }
+
+  @fndoc = """
+  Returns the first element, or the element type's default for an empty list.
+  """
+
+  pub fn head(list :: List(t)) -> t {
+    :zig.List.getHead(list)
+  }
+
+  @fndoc = """
+  Returns all elements after the first as a new list.
+  """
+
+  pub fn tail(list :: List(t)) -> List(t) {
+    :zig.List.getTail(list)
+  }
+
+  @fndoc = """
+  Returns `value` followed by the contents of `list`.
+  """
+
+  pub fn prepend(list :: List(t), value :: t) -> List(t) {
     :zig.List.cons(value, list)
   }
 
-  @doc = """
-    Appends a value to the end of a list. O(n).
+  @fndoc = """
+  Returns the last element, or the element type's default for an empty list.
+  """
 
-    ## Examples
-
-        List.append([1, 2], 3)  # => [1, 2, 3]
-    """
-
-  pub fn append(list :: [element], value :: element) -> [element] {
-    :zig.List.append(list, value)
+  pub fn last(list :: List(t)) -> t {
+    :zig.List.last(list)
   }
 
-  @doc = """
-    Concatenates two lists.
+  @fndoc = """
+  Returns `true` when `value` is present in the list.
+  """
 
-    ## Examples
-
-        List.concat([1, 2], [3, 4])  # => [1, 2, 3, 4]
-    """
-
-  pub fn concat(first :: [element], second :: [element]) -> [element] {
-    :zig.List.concat(first, second)
+  pub fn contains?(list :: List(t), value :: t) -> Bool {
+    :zig.List.contains(list, value)
   }
 
-  @doc = """
-    Takes the first `count` elements.
+  @fndoc = """
+  Returns a new list with elements in reverse order.
+  """
 
-    ## Examples
+  pub fn reverse(list :: List(t)) -> List(t) {
+    :zig.List.reverse(list)
+  }
 
-        List.take([1, 2, 3, 4, 5], 3)  # => [1, 2, 3]
-    """
+  @fndoc = """
+  Returns the first `count` elements.
+  """
 
-  pub fn take(list :: [element], count :: i64) -> [element] {
+  pub fn take(list :: List(t), count :: i64) -> List(t) {
     :zig.List.take(list, count)
   }
 
-  @doc = """
-    Drops the first `count` elements.
+  @fndoc = """
+  Returns the list after dropping the first `count` elements.
+  """
 
-    ## Examples
-
-        List.drop([1, 2, 3, 4, 5], 2)  # => [3, 4, 5]
-    """
-
-  pub fn drop(list :: [element], count :: i64) -> [element] {
+  pub fn drop(list :: List(t), count :: i64) -> List(t) {
     :zig.List.drop(list, count)
   }
 
-  @doc = """
-    Returns a new list with duplicates removed.
-    Preserves the order of first occurrences.
+  @fndoc = """
+  Returns a list with duplicate values removed.
+  """
 
-    ## Examples
-
-        List.uniq([1, 2, 2, 3, 1])  # => [1, 2, 3]
-    """
-
-  pub fn uniq(list :: [element]) -> [element] {
+  pub fn uniq(list :: List(t)) -> List(t) {
     :zig.List.uniq(list)
   }
 
-  @doc = """
-    Returns the first element of the list.
-    Raises if the list is empty.
+  @fndoc = """
+  Transforms each element with `callback`.
+  """
 
-    ## Examples
+  pub fn map(list :: List(t), callback :: (t -> mapped)) -> List(mapped) {
+    map_walk(list, callback, 0, List.length(list), List.new_empty(List.length(list)))
+  }
 
-        List.head!([10, 20])  # => 10
-        List.head!([])        # raises
-    """
+  @fndoc = """
+  Keeps elements for which `predicate` returns true.
+  """
 
-  pub fn head!(list :: [element]) -> element {
-    is_empty = List.empty?(list)
-    if is_empty {
+  pub fn filter(list :: List(t), predicate :: (t -> Bool)) -> List(t) {
+    filter_walk(list, predicate, 0, List.length(list), List.new_empty(List.length(list)))
+  }
+
+  @fndoc = """
+  Folds the list from left to right.
+  """
+
+  pub fn reduce(list :: List(t), initial :: accumulator, callback :: (accumulator, t -> accumulator)) -> accumulator {
+    reduce_walk(list, callback, 0, List.length(list), initial)
+  }
+
+  @fndoc = """
+  Returns the first element. Raises when the list is empty.
+  """
+
+  pub fn head!(list :: List(t)) -> t {
+    if List.empty?(list) {
       raise("List.head! called on empty list")
     } else {
       List.head(list)
     }
   }
 
-  @doc = """
-    Returns the last element of the list.
-    Raises if the list is empty.
+  @fndoc = """
+  Returns the last element. Raises when the list is empty.
+  """
 
-    ## Examples
-
-        List.last!([1, 2, 3])  # => 3
-        List.last!([])         # raises
-    """
-
-  pub fn last!(list :: [element]) -> element {
-    is_empty = List.empty?(list)
-    if is_empty {
+  pub fn last!(list :: List(t)) -> t {
+    if List.empty?(list) {
       raise("List.last! called on empty list")
     } else {
       List.last(list)
     }
   }
 
-  @doc = """
-    Returns the element at the given zero-based index.
-    Raises if the index is out of bounds.
+  @fndoc = """
+  Returns the element at `index`. Raises when `index` is out of bounds.
+  """
 
-    ## Examples
-
-        List.at!([10, 20, 30], 1)  # => 20
-        List.at!([10, 20], 5)      # raises
-    """
-
-  pub fn at!(list :: [element], index :: i64) -> element {
-    in_bounds = index < List.length(list)
-    if in_bounds {
+  pub fn at!(list :: List(t), index :: i64) -> t {
+    if index >= 0 and index < List.length(list) {
       List.at(list, index)
     } else {
       raise("List.at! index out of bounds")
+    }
+  }
+
+  fn map_walk(list :: List(t), callback :: (t -> mapped), index :: i64, total :: i64, accumulator :: List(mapped)) -> List(mapped) {
+    if index < total {
+      map_walk(list, callback, index + 1, total, List.push(accumulator, callback(List.get(list, index))))
+    } else {
+      accumulator
+    }
+  }
+
+  fn filter_walk(list :: List(t), predicate :: (t -> Bool), index :: i64, total :: i64, accumulator :: List(t)) -> List(t) {
+    if index < total {
+      value = List.get(list, index)
+      next_accumulator = if predicate(value) {
+        List.push(accumulator, value)
+      } else {
+        accumulator
+      }
+      filter_walk(list, predicate, index + 1, total, next_accumulator)
+    } else {
+      accumulator
+    }
+  }
+
+  fn reduce_walk(list :: List(t), callback :: (accumulator, t -> accumulator), index :: i64, total :: i64, current :: accumulator) -> accumulator {
+    if index < total {
+      reduce_walk(list, callback, index + 1, total, callback(current, List.get(list, index)))
+    } else {
+      current
     }
   }
 }

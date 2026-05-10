@@ -771,7 +771,7 @@ pub struct Zap.Doc {
       head = List.head(members)
       tail = List.tail(members)
       if Map.get(head, :module, "") == module_name {
-        filter_members_walk(tail, module_name, List.append(acc, head))
+        filter_members_walk(tail, module_name, List.push(acc, head))
       } else {
         filter_members_walk(tail, module_name, acc)
       }
@@ -807,14 +807,14 @@ pub struct Zap.Doc {
 
   pub fn insert_member_walk(sorted :: [%{Atom => Term}], item :: %{Atom => Term}, prefix :: [%{Atom => Term}]) -> [%{Atom => Term}] {
     if List.empty?(sorted) {
-      List.append(prefix, item)
+      List.push(prefix, item)
     } else {
       head = List.head(sorted)
       tail = List.tail(sorted)
       if member_lt?(item, head) {
-        list_concat_two(List.append(prefix, item), sorted)
+        list_concat_two(List.push(prefix, item), sorted)
       } else {
-        insert_member_walk(tail, item, List.append(prefix, head))
+        insert_member_walk(tail, item, List.push(prefix, head))
       }
     }
   }
@@ -916,7 +916,7 @@ pub struct Zap.Doc {
     if List.empty?(right) {
       left
     } else {
-      list_concat_two(List.append(left, List.head(right)), List.tail(right))
+      list_concat_two(List.push(left, List.head(right)), List.tail(right))
     }
   }
 
@@ -1199,7 +1199,7 @@ pub struct Zap.Doc {
 
   pub fn split_top_level_walk(text :: String, start :: i64, index :: i64, depth :: i64, end_index :: i64, acc :: [String]) -> [String] {
     if index >= end_index {
-      List.append(acc, String.slice(text, start, end_index))
+      List.push(acc, String.slice(text, start, end_index))
     } else {
       ch = String.byte_at(text, index)
       if ch == "(" or ch == "[" or ch == "{" {
@@ -1209,7 +1209,7 @@ pub struct Zap.Doc {
           split_top_level_walk(text, start, index + 1, depth - 1, end_index, acc)
         } else {
           if ch == "," and depth == 0 {
-            split_top_level_walk(text, index + 1, index + 1, depth, end_index, List.append(acc, String.slice(text, start, index)))
+            split_top_level_walk(text, index + 1, index + 1, depth, end_index, List.push(acc, String.slice(text, start, index)))
           } else {
             split_top_level_walk(text, start, index + 1, depth, end_index, acc)
           }
@@ -1458,7 +1458,7 @@ pub struct Zap.Doc {
         if list_contains?(acc, proto_name) {
           collect_implemented_protocols(tail, module_name, acc)
         } else {
-          collect_implemented_protocols(tail, module_name, List.append(acc, proto_name))
+          collect_implemented_protocols(tail, module_name, List.push(acc, proto_name))
         }
       } else {
         collect_implemented_protocols(tail, module_name, acc)
@@ -1561,7 +1561,7 @@ pub struct Zap.Doc {
       if String.length(slug) == 0 {
         collect_guide_slugs(tail, acc)
       } else {
-        collect_guide_slugs(tail, List.append(acc, slug))
+        collect_guide_slugs(tail, List.push(acc, slug))
       }
     }
   }
@@ -1838,14 +1838,14 @@ pub struct Zap.Doc {
 
   pub fn insert_name_alpha(sorted :: [String], item :: String, prefix :: [String]) -> [String] {
     if List.empty?(sorted) {
-      List.append(prefix, item)
+      List.push(prefix, item)
     } else {
       head = List.head(sorted)
       tail = List.tail(sorted)
       if string_lt?(item, head) {
-        list_concat_strings(List.append(prefix, item), sorted)
+        list_concat_strings(List.push(prefix, item), sorted)
       } else {
-        insert_name_alpha(tail, item, List.append(prefix, head))
+        insert_name_alpha(tail, item, List.push(prefix, head))
       }
     }
   }
@@ -1854,7 +1854,7 @@ pub struct Zap.Doc {
     if List.empty?(right) {
       left
     } else {
-      list_concat_strings(List.append(left, List.head(right)), List.tail(right))
+      list_concat_strings(List.push(left, List.head(right)), List.tail(right))
     }
   }
 
@@ -1864,7 +1864,7 @@ pub struct Zap.Doc {
     } else {
       head = List.head(summaries)
       tail = List.tail(summaries)
-      manifest_names(tail, List.append(acc, Map.get(head, :name, "")))
+      manifest_names(tail, List.push(acc, Map.get(head, :name, "")))
     }
   }
 

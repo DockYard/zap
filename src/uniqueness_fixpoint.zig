@@ -1,12 +1,12 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
-const v8_signature = @import("v8_signature.zig");
+const uniqueness_signature = @import("uniqueness_signature.zig");
 
-const ParamSig = v8_signature.ParamSig;
-const UniquenessClass = v8_signature.UniquenessClass;
-const FunctionSig = v8_signature.FunctionSig;
-const ProgramSignatures = v8_signature.ProgramSignatures;
+const ParamSig = uniqueness_signature.ParamSig;
+const UniquenessClass = uniqueness_signature.UniquenessClass;
+const FunctionSig = uniqueness_signature.FunctionSig;
+const ProgramSignatures = uniqueness_signature.ProgramSignatures;
 
 // ============================================================
 // SCC fixpoint over the call graph for Phase 1.2 of the escape-
@@ -15,14 +15,14 @@ const ProgramSignatures = v8_signature.ProgramSignatures;
 // Pipeline placement:
 //
 //     ... → arc_liveness                       (last-use side table)
-//          → v8_fixpoint.computeSignatures     (THIS PASS — computes
+//          → uniqueness_fixpoint.computeSignatures     (THIS PASS — computes
 //                                              `ProgramSignatures` from
 //                                              every monomorphized
 //                                              function body, iterated
 //                                              over Tarjan SCCs)
 //             → arc_param_convention           (consults signatures in
 //                                              the borrowed-source veto)
-//                → arc_ownership pipeline      (V8 rewrite + verifier)
+//                → arc_ownership pipeline      (uniqueness rewrite + verifier)
 //
 // Algorithm overview (research2 §1.2):
 //
@@ -62,7 +62,7 @@ const ProgramSignatures = v8_signature.ProgramSignatures;
 //     symbolically — when `Sig(callee, slot)` is still `unobserved`,
 //     we join `unobserved` (which is the identity), letting the
 //     analysis converge as the SCC is iterated.
-//   - The verifier in `arc_verifier.zig::runV8` re-validates every
+//   - The verifier in `arc_verifier.zig::runUniquenessCheck` re-validates every
 //     emission of `*_owned_unchecked` against the post-fixpoint
 //     signatures. A buggy classification produces compilation
 //     failure, never miscompilation.
@@ -698,7 +698,7 @@ fn analyzeFunctionBody(
     // from a lower lattice element to a strictly higher one.
     const sig_entry = signatures.by_function.getPtr(function.id) orelse return;
     for (sig_entry.params, accumulators.items) |*existing, observed| {
-        const new_value = v8_signature.join(existing.*, observed.sig);
+        const new_value = uniqueness_signature.join(existing.*, observed.sig);
         if (new_value.class != existing.class or
             new_value.preserves_to_return_component != existing.preserves_to_return_component)
         {
@@ -901,9 +901,9 @@ const FlowWalker = struct {
             // `return_components` table. Without this hop, multi-clause
             // tuple-returning functions (fannkuch's `advance_perm`
             // dispatched via int-literal first param) lose their per-
-            // component PU witness — the caller's destructure-then-V8
+            // component PU witness — the caller's destructure-then-uniqueness
             // chain never sees the witness propagate through the
-            // tuple to the V8 site.
+            // tuple to the uniqueness site.
             // -----------------------------------------------------
             .switch_return => |sr| {
                 for (sr.cases) |c| {
@@ -1252,8 +1252,8 @@ const FlowWalker = struct {
             // exactly the `{p, count, done} = call_result` idiom
             // fannkuch's `main_loop` uses on `advance_perm`'s tuple
             // return — without this hop, the destructured `p` and
-            // `count` lose their parameter-slot identity and the V8
-            // `Vector.set` rewrite never fires on the rebound
+            // `count` lose their parameter-slot identity and the uniqueness
+            // `List.set` rewrite never fires on the rebound
             // bindings.
             // -------------------------------------------------
             .index_get => |ig| {
@@ -1429,7 +1429,7 @@ const FlowWalker = struct {
     }
 
     /// Classify a builtin call. Owned-mutating builtins (Map.put,
-    /// Vector.set, etc.) consume their receiver and return a
+    /// List.set, etc.) consume their receiver and return a
     /// fresh-rc=1 cell — so for the receiver slot, the parameter
     /// is consumed. The result carries the same parameter as the
     /// receiver did (the runtime contract guarantees rc=1, so the
@@ -1534,9 +1534,9 @@ const FlowWalker = struct {
         // refcount. Combined with a non-aliasing signature
         // (`unobserved` or `top` — i.e., no observed escape — the only
         // upgrades that fire on the callee body's flows would be the
-        // PU/CU flows the v8_fixpoint already classifies), the call
+        // PU/CU flows the uniqueness_fixpoint already classifies), the call
         // is a "borrow pass-through" and must not poison the caller's
-        // carrier accumulator. The verifier (V8) remains the safety
+        // carrier accumulator. The verifier (uniqueness) remains the safety
         // net: a wrong inference produces a compilation rejection,
         // never a miscompilation.
         //
@@ -1547,10 +1547,10 @@ const FlowWalker = struct {
         //      (no concrete escape observation has been recorded —
         //      `aliases` is excluded by construction).
         //
-        // For example: `VectorI64.get(vec, index)` (a Zap function
+        // For example: `List.get(list, index)` (a Zap function
         // forwarding to a non-mutating runtime builtin) has slot 0
         // `.borrowed` and signature `top` post-cleanup. Without this
-        // guard, every caller's V8 carrier accumulator gets polluted
+        // guard, every caller's uniqueness carrier accumulator gets polluted
         // to ⊤; with it, the caller's accumulator passes through
         // unchanged so downstream PU/CU flows keep firing.
         const callee_func = lookupFunction(self.program, callee_id);
@@ -1611,7 +1611,7 @@ const FlowWalker = struct {
                             // Borrow pass-through: leave the caller's
                             // carrier untouched. Don't upgrade and
                             // don't set `preserves_carrier_from_arg`
-                            // (the call's dest, even if a Vector,
+                            // (the call's dest, even if a List,
                             // doesn't preserve the caller's parameter
                             // chain through this call — borrows
                             // produce a fresh dest unrelated to the
@@ -1700,7 +1700,7 @@ const FlowWalker = struct {
     fn upgradeParam(self: *FlowWalker, slot: u32, new_sig: ParamSig) !void {
         if (slot >= self.accumulators.items.len) return;
         const existing = self.accumulators.items[slot].sig;
-        self.accumulators.items[slot].sig = v8_signature.join(existing, new_sig);
+        self.accumulators.items[slot].sig = uniqueness_signature.join(existing, new_sig);
     }
 };
 
@@ -1748,15 +1748,15 @@ fn buildTestFunction(
     };
 }
 
-test "v8_fixpoint: empty program produces empty signatures" {
+test "uniqueness_fixpoint: empty program produces empty signatures" {
     var program = ir.Program{ .functions = &.{}, .type_defs = &.{}, .entry = null };
     var sigs = try computeSignatures(testing.allocator, &program);
     defer sigs.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), sigs.by_function.count());
 }
 
-test "v8_fixpoint: identity function returning its parameter is PU" {
-    // Function: fn id(p :: VectorI64) -> VectorI64 { p }
+test "uniqueness_fixpoint: identity function returning its parameter is PU" {
+    // Function: fn id(p :: List(i64)) -> List(i64) { p }
     // Body:
     //   [0] param_get  dest=0 index=0
     //   [1] ret         value=0
@@ -1784,7 +1784,7 @@ test "v8_fixpoint: identity function returning its parameter is PU" {
     try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[0].class);
 }
 
-test "v8_fixpoint: function storing param into list_cons is AL" {
+test "uniqueness_fixpoint: function storing param into list_cons is AL" {
     // Body:
     //   [0] param_get   dest=0 index=0
     //   [1] const_nil   1
@@ -1813,16 +1813,16 @@ test "v8_fixpoint: function storing param into list_cons is AL" {
     try testing.expectEqual(UniquenessClass.aliases, sig.params[0].class);
 }
 
-test "v8_fixpoint: function calling owned-mutating builtin on param is PU" {
-    // Body (sketch of `set_zero(arr) -> Vector.set(arr, 0, 0)`):
+test "uniqueness_fixpoint: function calling owned-mutating builtin on param is PU" {
+    // Body (sketch of `set_zero(list) -> List.set(list, 0, 0)`):
     //   [0] param_get   dest=0 index=0
     //   [1] const_int   dest=1 value=0
     //   [2] const_int   dest=2 value=0
     //   [3] move_value  dest=3 source=0
-    //   [4] call_builtin dest=4 name="VectorI64.set" args=[3,1,2]
+    //   [4] call_builtin dest=4 name="List:i64.set" args=[3,1,2]
     //   [5] ret         value=4
     //
-    // The receiver (arg 0 of Vector.set) is owned-mutating, so the
+    // The receiver (arg 0 of List.set) is owned-mutating, so the
     // param's flow is "preserves uniqueness through to the dest"; the
     // dest is then returned.
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1843,7 +1843,7 @@ test "v8_fixpoint: function calling owned-mutating builtin on param is PU" {
         .{ .move_value = .{ .dest = 3, .source = 0 } },
         .{ .call_builtin = .{
             .dest = 4,
-            .name = "VectorI64.set",
+            .name = "List:i64.set",
             .args = args,
             .arg_modes = arg_modes,
         } },
@@ -1863,7 +1863,7 @@ test "v8_fixpoint: function calling owned-mutating builtin on param is PU" {
     try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[0].class);
 }
 
-test "v8_fixpoint: function with no in-scope callers is conservative top when truly unobserved" {
+test "uniqueness_fixpoint: function with no in-scope callers is conservative top when truly unobserved" {
     // Body:
     //   [0] param_get   dest=0 index=0
     //   [1] ret         value=null  (no return value to observe)
@@ -1891,7 +1891,7 @@ test "v8_fixpoint: function with no in-scope callers is conservative top when tr
     try testing.expectEqual(UniquenessClass.top, sig.params[0].class);
 }
 
-test "v8_fixpoint: borrow-passthrough callee with top signature does not poison caller (Phase 1.8 item #5)" {
+test "uniqueness_fixpoint: borrow-passthrough callee with top signature does not poison caller (Phase 1.8 item #5)" {
     // Two-function setup that exercises the borrow short-circuit
     // specifically. The callee's body has CONFLICTING flows that
     // join to `top` WITHIN the callee's SCC analysis (PU from
@@ -1907,14 +1907,14 @@ test "v8_fixpoint: borrow-passthrough callee with top signature does not poison 
     // The caller's param 0 reaches PU via the downstream
     // owned-mutating call.
     //
-    //   callee(p :: VectorI64) -> VectorI64 {     # borrowed slot 0, top sig
+    //   callee(p :: List(i64)) -> List(i64) {     # borrowed slot 0, top sig
     //     _ = [p | nil]                             # AL flow (list_cons; survives Phase 2.1)
     //     p                                          # PU flow (ret)
     //   }
     //
-    //   caller(v :: VectorI64) -> VectorI64 {      # owned slot 0
+    //   caller(v :: List(i64)) -> List(i64) {      # owned slot 0
     //     _ = callee(v)                             # borrow-passthrough call
-    //     Vector.set(v, 0, 0)                       # PU flow → caller slot 0 = PU
+    //     List.set(v, 0, 0)                         # PU flow -> caller slot 0 = PU
     //   }
     //
     // Phase 2.1 note: the original test used `tuple_init` for the AL
@@ -1961,7 +1961,7 @@ test "v8_fixpoint: borrow-passthrough callee with top signature does not poison 
     //   [3] const_int   dest=3  value=0
     //   [4] const_int   dest=4  value=0
     //   [5] move_value  dest=5  source=2
-    //   [6] call_builtin dest=6 name="VectorI64.set" args=[5,3,4]
+    //   [6] call_builtin dest=6 name="List:i64.set" args=[5,3,4]
     //   [7] ret         value=6
     const caller_call_args = try arena.alloc(ir.LocalId, 1);
     caller_call_args[0] = 0;
@@ -1989,7 +1989,7 @@ test "v8_fixpoint: borrow-passthrough callee with top signature does not poison 
         .{ .move_value = .{ .dest = 5, .source = 2 } },
         .{ .call_builtin = .{
             .dest = 6,
-            .name = "VectorI64.set",
+            .name = "List:i64.set",
             .args = set_args,
             .arg_modes = set_arg_modes,
         } },
@@ -2019,14 +2019,14 @@ test "v8_fixpoint: borrow-passthrough callee with top signature does not poison 
     try testing.expectEqual(UniquenessClass.top, callee_sig.params[0].class);
 
     // Phase 1.8 item #5 expectation: caller's param 0 is PU (preserved
-    // through Vector.set). Without the short-circuit, the call to
+    // through List.set). Without the short-circuit, the call to
     // `borrow_aliaser` (callee class top, callee slot 0 .borrowed)
     // would poison caller's slot 0 to top.
     const caller_sig = sigs.forFunction(1).?;
     try testing.expectEqual(UniquenessClass.preserves_uniqueness, caller_sig.params[0].class);
 }
 
-test "v8_fixpoint: aliases-out callee via list_cons still poisons caller (sound check for borrow short-circuit)" {
+test "uniqueness_fixpoint: aliases-out callee via list_cons still poisons caller (sound check for borrow short-circuit)" {
     // Two-function setup where the callee genuinely escapes its
     // borrowed parameter into a list (which is unconditionally an AL
     // sink — lists hold a permanent retain on their elements). The
@@ -2034,7 +2034,7 @@ test "v8_fixpoint: aliases-out callee via list_cons still poisons caller (sound 
     // short-circuit MUST NOT bypass the upgrade in this case —
     // caller's carrier must be poisoned.
     //
-    //   callee(p) -> List(VectorI64) { [p] }     # aliases through list_cons
+    //   callee(p) -> List(List(i64)) { [p] }     # aliases through list_cons
     //   caller(v) -> callee(v)                   # caller passes v
     //
     // Expected: caller's param 0 = AL (aliases), NOT PU.
@@ -2117,7 +2117,7 @@ test "v8_fixpoint: aliases-out callee via list_cons still poisons caller (sound 
     try testing.expectEqual(UniquenessClass.aliases, caller_sig.params[0].class);
 }
 
-test "v8_fixpoint: tuple-return identity is PU (Phase 2.1)" {
+test "uniqueness_fixpoint: tuple-return identity is PU (Phase 2.1)" {
     // The canonical `fn f(p) -> {p}` shape that Phase 2.1's
     // tuple-return PU classification is meant to recognise. Without
     // the deferred-tuple-pending logic, the param would AL via the
@@ -2126,7 +2126,7 @@ test "v8_fixpoint: tuple-return identity is PU (Phase 2.1)" {
     // is deferred; the `ret(tuple)` resolves the deferral as PU
     // with a per-component witness pointing back at slot 0.
     //
-    //   fn id_tuple(p :: VectorI64) -> {VectorI64} = {p}
+    //   fn id_tuple(p :: List(i64)) -> {List(i64)} = {p}
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -2165,7 +2165,7 @@ test "v8_fixpoint: tuple-return identity is PU (Phase 2.1)" {
     try testing.expectEqual(@as(?u8, 0), sig.return_components[0]);
 }
 
-test "v8_fixpoint: tuple-return mixed components classify each carrier as PU (Phase 2.1)" {
+test "uniqueness_fixpoint: tuple-return mixed components classify each carrier as PU (Phase 2.1)" {
     // Multi-carrier tuple return: `fn f(p, q) -> {p, q, false}`.
     // Each carrier component classifies as PU with its own witness.
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2210,8 +2210,8 @@ test "v8_fixpoint: tuple-return mixed components classify each carrier as PU (Ph
     try testing.expectEqual(@as(?u8, null), sig.return_components[2]);
 }
 
-test "v8_fixpoint: tuple stored in list still ALs the carrier (Phase 2.1 escape resolution)" {
-    // `fn f(p) -> List({VectorI64}) { [{p}] }`. The tuple is
+test "uniqueness_fixpoint: tuple stored in list still ALs the carrier (Phase 2.1 escape resolution)" {
+    // `fn f(p) -> List({List(i64)}) { [{p}] }`. The tuple is
     // constructed with `p` as a component, then stored in a list
     // (via list_cons). The list_cons resolves the tuple_pending
     // entry as AL, so param 0's signature lands at AL — the runtime
@@ -2277,14 +2277,14 @@ test "v8_fixpoint: tuple stored in list still ALs the carrier (Phase 2.1 escape 
 //     like `switch_return` arms.
 // ============================================================
 
-test "v8_fixpoint: switch_return per-arm tuple_init records per-component PU witness (Phase 2.6.1)" {
+test "uniqueness_fixpoint: switch_return per-arm tuple_init records per-component PU witness (Phase 2.6.1)" {
     // Multi-clause function dispatched on the first param's int
     // literal, both arms build a tuple from the remaining params
     // in matching positions. Both arms must record their per-
     // component PU witnesses on the function's signature.
     //
-    //   pub fn advance(1, p, q) -> {VectorI64, VectorI64} { {p, q} }
-    //   pub fn advance(_, p, q) -> {VectorI64, VectorI64} { {p, q} }
+    //   pub fn advance(1, p, q) -> {List(i64), List(i64)} { {p, q} }
+    //   pub fn advance(_, p, q) -> {List(i64), List(i64)} { {p, q} }
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -2355,7 +2355,7 @@ test "v8_fixpoint: switch_return per-arm tuple_init records per-component PU wit
     try testing.expectEqual(@as(?u8, 2), sig.return_components[1]);
 }
 
-test "v8_fixpoint: switch_return disagreeing arms demote witness (Phase 2.6.1)" {
+test "uniqueness_fixpoint: switch_return disagreeing arms demote witness (Phase 2.6.1)" {
     // Case-1 returns {p, q}; default returns {q, p}. The per-arm
     // observations disagree on which slot occupies each component,
     // so the merge meet demotes both component witnesses to null.
@@ -2424,9 +2424,9 @@ test "v8_fixpoint: switch_return disagreeing arms demote witness (Phase 2.6.1)" 
     try testing.expectEqual(@as(?u8, null), sig.return_components[1]);
 }
 
-test "v8_fixpoint: if_expr arm result merges tuple_pending into dest (Phase 2.6.1)" {
+test "uniqueness_fixpoint: if_expr arm result merges tuple_pending into dest (Phase 2.6.1)" {
     // Function shape:
-    //   pub fn pick(b, p, q) -> {VectorI64, VectorI64} {
+    //   pub fn pick(b, p, q) -> {List(i64), List(i64)} {
     //     if b { {p, q} } else { {p, q} }
     //   }
     //

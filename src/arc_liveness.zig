@@ -218,7 +218,7 @@ pub const ArcOwnership = struct {
     /// paths (e.g., a binding read in every arm of an `if_expr`/
     /// `case_block`), only the last-visited site is recorded here.
     /// Use `last_use_sites` instead when path-sensitive last-use
-    /// detection is needed (the V8 borrow→consume classifier in
+    /// detection is needed (the uniqueness borrow→consume classifier in
     /// `arc_ownership.shouldMoveIntoOwnedConsume`, the chain-consistency
     /// audit in `arc_param_convention.siteConsumesSlot`, etc.).
     last_use_map: std.AutoHashMapUnmanaged(ir.LocalId, InstructionId) = .empty,
@@ -230,7 +230,7 @@ pub const ArcOwnership = struct {
     /// branched control flow, where a binding read in arm A and arm B
     /// of an `if_expr` is at last-use along both paths.
     ///
-    /// Used by the V8 borrow→consume classifier
+    /// Used by the uniqueness borrow→consume classifier
     /// (`arc_ownership.shouldMoveIntoOwnedConsume`) to decide whether
     /// a `local_get` is at a last-use of its source on its execution
     /// path — the binding-read-in-every-arm pattern fails the flat
@@ -302,6 +302,22 @@ pub const ArcOwnership = struct {
     /// owns-set just before the terminator executes.
     owned_at_ret: std.AutoHashMapUnmanaged(InstructionId, ArcLocalSet) = .empty,
 
+    /// Owned locals that must be released immediately before a
+    /// branch-local `.case_break`. `case_break` is not a function
+    /// return: its value flows into the enclosing `case_block.dest`.
+    /// Any other owned locals created inside the branch do not exist
+    /// in the parent Zig scope, so they must be destroyed inside the
+    /// branch rather than carried into the parent `owned_at_ret`.
+    owned_at_case_break: std.AutoHashMapUnmanaged(InstructionId, ArcLocalSet) = .empty,
+
+    /// Locals produced by `param_get` after the corresponding
+    /// `.owned` parameter slot has already been consumed. These are
+    /// non-owning aliases to the slot's storage, used only for
+    /// bounded reads in the same expression path. They must not be
+    /// released at scope exit even though their local ownership class
+    /// remains `.owned` in the original IR metadata.
+    non_owning_param_refetches: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
+
     pub fn deinit(self: *ArcOwnership, allocator: std.mem.Allocator) void {
         self.consume_share_sites.deinit(allocator);
         self.return_source_locals.deinit(allocator);
@@ -318,6 +334,12 @@ pub const ArcOwnership = struct {
             set_ptr.deinit(allocator);
         }
         self.owned_at_ret.deinit(allocator);
+        var case_break_iter = self.owned_at_case_break.valueIterator();
+        while (case_break_iter.next()) |set_ptr| {
+            set_ptr.deinit(allocator);
+        }
+        self.owned_at_case_break.deinit(allocator);
+        self.non_owning_param_refetches.deinit(allocator);
     }
 
     /// Pack a `(LocalId, InstructionId)` pair into a `u64` key for
@@ -494,6 +516,7 @@ pub fn computeArcOwnershipWithProgram(
     try analyzer.computeLiveAfter();
     analyzer.ownership_in_progress = null;
     try analyzer.classifyLastUses(&ownership);
+    try analyzer.recordNonArcAggregateLastUses(&ownership);
     try analyzer.propagateReturnSourcesThroughAggregates(&ownership);
     try analyzer.computeOwnedAtRet(&ownership);
 
@@ -596,6 +619,13 @@ const Analyzer = struct {
     /// allocator and freed in `deinit`.
     param_alias_group: std.AutoHashMapUnmanaged(ir.LocalId, []const ir.LocalId) = .empty,
 
+    /// Maps each `param_get` dest of an `.owned` parameter slot back
+    /// to that slot. The forward ownership pass uses this to remember
+    /// when the slot's single incoming +1 has been consumed, preventing
+    /// a later refetch of the same parameter from resurrecting an owner
+    /// bit for a value that has already moved.
+    owned_param_slot_by_local: std.AutoHashMapUnmanaged(ir.LocalId, u32) = .empty,
+
     fn deinit(self: *Analyzer) void {
         self.records.deinit(self.allocator);
         self.pointer_to_id.deinit(self.allocator);
@@ -614,6 +644,7 @@ const Analyzer = struct {
             self.allocator.free(slice_ptr.*);
         }
         self.param_alias_group.deinit(self.allocator);
+        self.owned_param_slot_by_local.deinit(self.allocator);
         for (self.live_after.items) |*set| {
             set.deinit(self.allocator);
         }
@@ -777,6 +808,7 @@ const Analyzer = struct {
                             const gop = try owned_param_dests.getOrPut(self.allocator, pg.index);
                             if (!gop.found_existing) gop.value_ptr.* = .empty;
                             try gop.value_ptr.append(self.allocator, pg.dest);
+                            try self.owned_param_slot_by_local.put(self.allocator, pg.dest, pg.index);
                         }
                     }
                 },
@@ -1253,7 +1285,7 @@ const Analyzer = struct {
                     // local. `last_use_map` is single-entry — last write
                     // wins — so it captures only ONE arm's site. The
                     // path-sensitive `last_use_sites` records EVERY
-                    // last-use pair `(local, id)`, used by the V8
+                    // last-use pair `(local, id)`, used by the uniqueness
                     // borrow→consume classifier and other path-aware
                     // consumers.
                     try ownership.last_use_map.put(self.allocator, use_local, id);
@@ -1267,6 +1299,253 @@ const Analyzer = struct {
             }
         }
     }
+
+    fn recordNonArcAggregateLastUses(self: *Analyzer, ownership: *ArcOwnership) !void {
+        var aggregate_to_index: std.AutoHashMapUnmanaged(ir.LocalId, u32) = .empty;
+        defer aggregate_to_index.deinit(self.allocator);
+        var aggregate_locals: std.ArrayListUnmanaged(ir.LocalId) = .empty;
+        defer aggregate_locals.deinit(self.allocator);
+
+        try self.collectNonArcAggregateLastUseCandidates(
+            ownership,
+            &aggregate_to_index,
+            &aggregate_locals,
+        );
+        if (aggregate_locals.items.len == 0) return;
+
+        var tracker = NonArcAggregateLiveness{
+            .analyzer = self,
+            .local_to_index = &aggregate_to_index,
+            .tracked_locals = aggregate_locals.items,
+            .live_after = .empty,
+        };
+        defer tracker.deinit();
+        try tracker.compute();
+        try tracker.recordLastUses(ownership);
+    }
+
+    fn collectNonArcAggregateLastUseCandidates(
+        self: *Analyzer,
+        ownership: *const ArcOwnership,
+        aggregate_to_index: *std.AutoHashMapUnmanaged(ir.LocalId, u32),
+        aggregate_locals: *std.ArrayListUnmanaged(ir.LocalId),
+    ) error{OutOfMemory}!void {
+        for (self.records.items) |rec| {
+            switch (rec.instr.*) {
+                .index_get => |index_get| try self.addNonArcAggregateLastUseCandidate(
+                    ownership,
+                    aggregate_to_index,
+                    aggregate_locals,
+                    index_get.object,
+                    index_get.dest,
+                ),
+                .field_get => |field_get| try self.addNonArcAggregateLastUseCandidate(
+                    ownership,
+                    aggregate_to_index,
+                    aggregate_locals,
+                    field_get.object,
+                    field_get.dest,
+                ),
+                else => {},
+            }
+        }
+    }
+
+    fn addNonArcAggregateLastUseCandidate(
+        self: *Analyzer,
+        ownership: *const ArcOwnership,
+        aggregate_to_index: *std.AutoHashMapUnmanaged(ir.LocalId, u32),
+        aggregate_locals: *std.ArrayListUnmanaged(ir.LocalId),
+        object: ir.LocalId,
+        dest: ir.LocalId,
+    ) error{OutOfMemory}!void {
+        if (ownership.arc_managed_locals.contains(object)) return;
+        if (!ownership.arc_managed_locals.contains(dest)) return;
+        if (aggregate_to_index.contains(object)) return;
+
+        const index: u32 = @intCast(aggregate_locals.items.len);
+        try aggregate_to_index.put(self.allocator, object, index);
+        try aggregate_locals.append(self.allocator, object);
+    }
+
+    const NonArcAggregateLiveness = struct {
+        analyzer: *Analyzer,
+        local_to_index: *const std.AutoHashMapUnmanaged(ir.LocalId, u32),
+        tracked_locals: []const ir.LocalId,
+        live_after: std.ArrayListUnmanaged(LiveSet),
+
+        fn deinit(self: *NonArcAggregateLiveness) void {
+            for (self.live_after.items) |*set| {
+                set.deinit(self.analyzer.allocator);
+            }
+            self.live_after.deinit(self.analyzer.allocator);
+        }
+
+        fn compute(self: *NonArcAggregateLiveness) error{OutOfMemory}!void {
+            const bit_count: u32 = @intCast(self.tracked_locals.len);
+            try self.live_after.resize(self.analyzer.allocator, self.analyzer.records.items.len);
+            for (self.live_after.items) |*set| {
+                set.* = try LiveSet.init(self.analyzer.allocator, bit_count);
+            }
+
+            for (self.analyzer.function.body) |block| {
+                var stream_live_after = try LiveSet.init(self.analyzer.allocator, bit_count);
+                defer stream_live_after.deinit(self.analyzer.allocator);
+                var stream_live_before = try self.processStream(block.instructions, &stream_live_after);
+                defer stream_live_before.deinit(self.analyzer.allocator);
+            }
+        }
+
+        fn recordLastUses(
+            self: *NonArcAggregateLiveness,
+            ownership: *ArcOwnership,
+        ) error{OutOfMemory}!void {
+            for (self.analyzer.records.items, 0..) |rec, idx| {
+                const id: InstructionId = @intCast(idx);
+                var uses = UseList{};
+                defer uses.deinit(std.heap.page_allocator);
+                collectUses(rec.instr.*, &uses);
+                for (uses.slice()) |local| {
+                    const bit_index = self.local_to_index.get(local) orelse continue;
+                    if (self.live_after.items[id].contains(bit_index)) continue;
+                    try ownership.last_use_sites.put(
+                        self.analyzer.allocator,
+                        ArcOwnership.lastUseKey(local, id),
+                        {},
+                    );
+                }
+            }
+        }
+
+        fn processStream(
+            self: *NonArcAggregateLiveness,
+            stream: []const ir.Instruction,
+            stream_live_after: *const LiveSet,
+        ) error{OutOfMemory}!LiveSet {
+            if (stream.len == 0) {
+                return try stream_live_after.clone(self.analyzer.allocator);
+            }
+
+            var current_live = try stream_live_after.clone(self.analyzer.allocator);
+            var instruction_index: usize = stream.len;
+            while (instruction_index > 0) {
+                instruction_index -= 1;
+                const instr = &stream[instruction_index];
+                const id = self.analyzer.idForStreamInstruction(stream, instruction_index);
+
+                if (isTerminator(instr.*)) {
+                    self.live_after.items[id].clear();
+                } else {
+                    self.live_after.items[id].copyFrom(&current_live);
+                }
+
+                try self.recurseChildren(instr, &self.live_after.items[id]);
+
+                var next_live = try self.live_after.items[id].clone(self.analyzer.allocator);
+                self.applyDefs(instr.*, &next_live);
+                self.applyUses(instr.*, &next_live);
+
+                current_live.deinit(self.analyzer.allocator);
+                current_live = next_live;
+            }
+
+            return current_live;
+        }
+
+        fn recurseChildren(
+            self: *NonArcAggregateLiveness,
+            instr: *const ir.Instruction,
+            parent_live_after: *const LiveSet,
+        ) error{OutOfMemory}!void {
+            switch (instr.*) {
+                .if_expr => |if_expr| {
+                    var then_in = try self.processStream(if_expr.then_instrs, parent_live_after);
+                    defer then_in.deinit(self.analyzer.allocator);
+                    var else_in = try self.processStream(if_expr.else_instrs, parent_live_after);
+                    defer else_in.deinit(self.analyzer.allocator);
+                },
+                .case_block => |case_block| {
+                    var pre_in = try self.processStream(case_block.pre_instrs, parent_live_after);
+                    defer pre_in.deinit(self.analyzer.allocator);
+                    for (case_block.arms) |arm| {
+                        var cond_in = try self.processStream(arm.cond_instrs, parent_live_after);
+                        defer cond_in.deinit(self.analyzer.allocator);
+                        var body_in = try self.processStream(arm.body_instrs, parent_live_after);
+                        defer body_in.deinit(self.analyzer.allocator);
+                    }
+                    var default_in = try self.processStream(case_block.default_instrs, parent_live_after);
+                    defer default_in.deinit(self.analyzer.allocator);
+                },
+                .switch_literal => |switch_literal| {
+                    for (switch_literal.cases) |case| {
+                        var body_in = try self.processStream(case.body_instrs, parent_live_after);
+                        defer body_in.deinit(self.analyzer.allocator);
+                    }
+                    var default_in = try self.processStream(switch_literal.default_instrs, parent_live_after);
+                    defer default_in.deinit(self.analyzer.allocator);
+                },
+                .switch_return => |switch_return| {
+                    var empty = try LiveSet.init(self.analyzer.allocator, @intCast(self.tracked_locals.len));
+                    defer empty.deinit(self.analyzer.allocator);
+                    for (switch_return.cases) |case| {
+                        var body_in = try self.processStream(case.body_instrs, &empty);
+                        defer body_in.deinit(self.analyzer.allocator);
+                    }
+                    var default_in = try self.processStream(switch_return.default_instrs, &empty);
+                    defer default_in.deinit(self.analyzer.allocator);
+                },
+                .union_switch => |union_switch| {
+                    for (union_switch.cases) |case| {
+                        var body_in = try self.processStream(case.body_instrs, parent_live_after);
+                        defer body_in.deinit(self.analyzer.allocator);
+                    }
+                },
+                .union_switch_return => |union_switch_return| {
+                    var empty = try LiveSet.init(self.analyzer.allocator, @intCast(self.tracked_locals.len));
+                    defer empty.deinit(self.analyzer.allocator);
+                    for (union_switch_return.cases) |case| {
+                        var body_in = try self.processStream(case.body_instrs, &empty);
+                        defer body_in.deinit(self.analyzer.allocator);
+                    }
+                },
+                .try_call_named => |try_call_named| {
+                    var handler_in = try self.processStream(try_call_named.handler_instrs, parent_live_after);
+                    defer handler_in.deinit(self.analyzer.allocator);
+                    var success_in = try self.processStream(try_call_named.success_instrs, parent_live_after);
+                    defer success_in.deinit(self.analyzer.allocator);
+                },
+                .guard_block => |guard_block| {
+                    var body_in = try self.processStream(guard_block.body, parent_live_after);
+                    defer body_in.deinit(self.analyzer.allocator);
+                },
+                .optional_dispatch => |optional_dispatch| {
+                    var empty = try LiveSet.init(self.analyzer.allocator, @intCast(self.tracked_locals.len));
+                    defer empty.deinit(self.analyzer.allocator);
+                    var nil_in = try self.processStream(optional_dispatch.nil_instrs, &empty);
+                    defer nil_in.deinit(self.analyzer.allocator);
+                    var struct_in = try self.processStream(optional_dispatch.struct_instrs, &empty);
+                    defer struct_in.deinit(self.analyzer.allocator);
+                },
+                else => {},
+            }
+        }
+
+        fn applyDefs(self: *NonArcAggregateLiveness, instr: ir.Instruction, set: *LiveSet) void {
+            const defs = collectDefs(instr);
+            for (defs.slice()) |local| {
+                if (self.local_to_index.get(local)) |bit_index| set.unset(bit_index);
+            }
+        }
+
+        fn applyUses(self: *NonArcAggregateLiveness, instr: ir.Instruction, set: *LiveSet) void {
+            var uses = UseList{};
+            defer uses.deinit(std.heap.page_allocator);
+            collectUses(instr, &uses);
+            for (uses.slice()) |local| {
+                if (self.local_to_index.get(local)) |bit_index| set.set(bit_index);
+            }
+        }
+    };
 
     fn applySpecialization(
         self: *Analyzer,
@@ -1305,7 +1584,7 @@ const Analyzer = struct {
                     // `src/runtime.zig` (Map.put, Map.delete,
                     // Map.get, Map.merge, Map.has_key, Map.size,
                     // Map.iter, List.append, List.cons, List.head,
-                    // String.*, VectorI64/F64.*, etc.) shows that
+                    // String.*, List.*, etc.) shows that
                     // *no* current runtime function consumes its
                     // input. Every runtime builtin borrows: the
                     // caller's ownership unit is observed but never
@@ -1475,9 +1754,11 @@ const Analyzer = struct {
         const arc_count: u32 = @intCast(self.arc_locals.items.len);
         var owns = try LiveSet.init(self.allocator, arc_count);
         defer owns.deinit(self.allocator);
+        var consumed_owned_param_slots = try LiveSet.init(self.allocator, @intCast(self.function.param_conventions.len));
+        defer consumed_owned_param_slots.deinit(self.allocator);
 
         for (self.function.body) |block| {
-            _ = try self.forwardOwnsStream(block.instructions, &owns, ownership);
+            _ = try self.forwardOwnsStream(block.instructions, &owns, &consumed_owned_param_slots, ownership);
         }
     }
 
@@ -1491,6 +1772,7 @@ const Analyzer = struct {
         self: *Analyzer,
         stream: []const ir.Instruction,
         owns: *LiveSet,
+        consumed_owned_param_slots: *LiveSet,
         ownership: *ArcOwnership,
     ) error{OutOfMemory}!void {
         for (stream, 0..) |*instr, k| {
@@ -1499,10 +1781,10 @@ const Analyzer = struct {
             // Recurse into nested regions FIRST. Each sub-stream sees
             // the parent's `owns` as its starting set; the post-region
             // `owns` becomes the intersection of arm-end `owns` sets.
-            try self.forwardOwnsChildren(instr, owns, ownership);
+            try self.forwardOwnsChildren(instr, owns, consumed_owned_param_slots, ownership);
 
             // Apply the instruction's effect on `owns`.
-            try self.applyOwnsEffect(instr.*, owns);
+            try self.applyOwnsEffect(instr.*, owns, consumed_owned_param_slots, ownership);
 
             // Snapshot at ret-equivalent terminators. Note that for
             // multi-arm terminators (switch_return, union_switch_return)
@@ -1528,76 +1810,75 @@ const Analyzer = struct {
         self: *Analyzer,
         instr: *const ir.Instruction,
         owns: *LiveSet,
+        consumed_owned_param_slots: *LiveSet,
         ownership: *ArcOwnership,
     ) error{OutOfMemory}!void {
         switch (instr.*) {
             .if_expr => |x| {
                 var then_owns = try owns.clone(self.allocator);
                 defer then_owns.deinit(self.allocator);
-                try self.forwardOwnsStream(x.then_instrs, &then_owns, ownership);
+                var then_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                defer then_consumed.deinit(self.allocator);
+                try self.forwardOwnsStream(x.then_instrs, &then_owns, &then_consumed, ownership);
                 var else_owns = try owns.clone(self.allocator);
                 defer else_owns.deinit(self.allocator);
-                try self.forwardOwnsStream(x.else_instrs, &else_owns, ownership);
+                var else_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                defer else_consumed.deinit(self.allocator);
+                try self.forwardOwnsStream(x.else_instrs, &else_owns, &else_consumed, ownership);
                 // Join at the merge: a local owns +1 after the if iff
                 // it owns +1 in BOTH arms. Intersection.
                 owns.copyFrom(&then_owns);
                 owns.intersectWith(&else_owns);
+                consumed_owned_param_slots.copyFrom(&then_consumed);
+                consumed_owned_param_slots.unionWith(&else_consumed);
             },
             .case_block => |cb| {
-                try self.forwardOwnsStream(cb.pre_instrs, owns, ownership);
-                if (cb.arms.len == 0 and cb.default_instrs.len == 0) return;
-                var has_join: bool = false;
-                var join: LiveSet = try LiveSet.init(self.allocator, owns.bit_count);
-                defer join.deinit(self.allocator);
-                for (cb.arms) |arm| {
-                    var arm_owns = try owns.clone(self.allocator);
-                    defer arm_owns.deinit(self.allocator);
-                    try self.forwardOwnsStream(arm.body_instrs, &arm_owns, ownership);
-                    if (!has_join) {
-                        join.copyFrom(&arm_owns);
-                        has_join = true;
-                    } else {
-                        join.intersectWith(&arm_owns);
-                    }
-                }
-                if (cb.default_instrs.len > 0) {
-                    var def_owns = try owns.clone(self.allocator);
-                    defer def_owns.deinit(self.allocator);
-                    try self.forwardOwnsStream(cb.default_instrs, &def_owns, ownership);
-                    if (!has_join) {
-                        join.copyFrom(&def_owns);
-                        has_join = true;
-                    } else {
-                        join.intersectWith(&def_owns);
-                    }
-                }
-                if (has_join) owns.copyFrom(&join);
+                try self.forwardOwnsCaseBlock(cb, owns, consumed_owned_param_slots, ownership);
             },
             .switch_literal => |sl| {
                 var has_join: bool = false;
                 var join: LiveSet = try LiveSet.init(self.allocator, owns.bit_count);
                 defer join.deinit(self.allocator);
+                var consumed_join = try LiveSet.init(self.allocator, consumed_owned_param_slots.bit_count);
+                defer consumed_join.deinit(self.allocator);
+                var entry_owns = try owns.clone(self.allocator);
+                defer entry_owns.deinit(self.allocator);
                 for (sl.cases) |case| {
                     var arm_owns = try owns.clone(self.allocator);
                     defer arm_owns.deinit(self.allocator);
-                    try self.forwardOwnsStream(case.body_instrs, &arm_owns, ownership);
+                    var arm_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                    defer arm_consumed.deinit(self.allocator);
+                    try self.forwardOwnsStream(case.body_instrs, &arm_owns, &arm_consumed, ownership);
+                    self.applyAggregateResultTransfer(case.result, sl.dest, &arm_owns);
+                    self.normalizeAggregateExitOwns(&arm_owns, &entry_owns, sl.dest);
                     if (!has_join) {
                         join.copyFrom(&arm_owns);
+                        consumed_join.copyFrom(&arm_consumed);
                         has_join = true;
                     } else {
                         join.intersectWith(&arm_owns);
+                        consumed_join.unionWith(&arm_consumed);
                     }
                 }
                 var def_owns = try owns.clone(self.allocator);
                 defer def_owns.deinit(self.allocator);
-                try self.forwardOwnsStream(sl.default_instrs, &def_owns, ownership);
+                var def_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                defer def_consumed.deinit(self.allocator);
+                try self.forwardOwnsStream(sl.default_instrs, &def_owns, &def_consumed, ownership);
+                self.applyAggregateResultTransfer(sl.default_result, sl.dest, &def_owns);
+                self.normalizeAggregateExitOwns(&def_owns, &entry_owns, sl.dest);
                 if (!has_join) {
                     join.copyFrom(&def_owns);
+                    consumed_join.copyFrom(&def_consumed);
                     has_join = true;
                 } else {
                     join.intersectWith(&def_owns);
+                    consumed_join.unionWith(&def_consumed);
                 }
-                if (has_join) owns.copyFrom(&join);
+                if (has_join) {
+                    owns.copyFrom(&join);
+                    consumed_owned_param_slots.copyFrom(&consumed_join);
+                }
             },
             .switch_return => |sr| {
                 // switch_return is itself a terminator: each arm body
@@ -1607,34 +1888,53 @@ const Analyzer = struct {
                 for (sr.cases) |case| {
                     var arm_owns = try owns.clone(self.allocator);
                     defer arm_owns.deinit(self.allocator);
-                    try self.forwardOwnsStream(case.body_instrs, &arm_owns, ownership);
+                    var arm_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                    defer arm_consumed.deinit(self.allocator);
+                    try self.forwardOwnsStream(case.body_instrs, &arm_owns, &arm_consumed, ownership);
                 }
                 var def_owns = try owns.clone(self.allocator);
                 defer def_owns.deinit(self.allocator);
-                try self.forwardOwnsStream(sr.default_instrs, &def_owns, ownership);
+                var def_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                defer def_consumed.deinit(self.allocator);
+                try self.forwardOwnsStream(sr.default_instrs, &def_owns, &def_consumed, ownership);
             },
             .union_switch => |us| {
                 var has_join: bool = false;
                 var join: LiveSet = try LiveSet.init(self.allocator, owns.bit_count);
                 defer join.deinit(self.allocator);
+                var consumed_join = try LiveSet.init(self.allocator, consumed_owned_param_slots.bit_count);
+                defer consumed_join.deinit(self.allocator);
+                var entry_owns = try owns.clone(self.allocator);
+                defer entry_owns.deinit(self.allocator);
                 for (us.cases) |case| {
                     var arm_owns = try owns.clone(self.allocator);
                     defer arm_owns.deinit(self.allocator);
-                    try self.forwardOwnsStream(case.body_instrs, &arm_owns, ownership);
+                    var arm_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                    defer arm_consumed.deinit(self.allocator);
+                    try self.forwardOwnsStream(case.body_instrs, &arm_owns, &arm_consumed, ownership);
+                    self.applyAggregateResultTransfer(case.return_value, us.dest, &arm_owns);
+                    self.normalizeAggregateExitOwns(&arm_owns, &entry_owns, us.dest);
                     if (!has_join) {
                         join.copyFrom(&arm_owns);
+                        consumed_join.copyFrom(&arm_consumed);
                         has_join = true;
                     } else {
                         join.intersectWith(&arm_owns);
+                        consumed_join.unionWith(&arm_consumed);
                     }
                 }
-                if (has_join) owns.copyFrom(&join);
+                if (has_join) {
+                    owns.copyFrom(&join);
+                    consumed_owned_param_slots.copyFrom(&consumed_join);
+                }
             },
             .union_switch_return => |usr| {
                 for (usr.cases) |case| {
                     var arm_owns = try owns.clone(self.allocator);
                     defer arm_owns.deinit(self.allocator);
-                    try self.forwardOwnsStream(case.body_instrs, &arm_owns, ownership);
+                    var arm_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                    defer arm_consumed.deinit(self.allocator);
+                    try self.forwardOwnsStream(case.body_instrs, &arm_owns, &arm_consumed, ownership);
                 }
             },
             .try_call_named => |tc| {
@@ -1642,16 +1942,22 @@ const Analyzer = struct {
                 // then success_instrs.
                 var handler_owns = try owns.clone(self.allocator);
                 defer handler_owns.deinit(self.allocator);
-                try self.forwardOwnsStream(tc.handler_instrs, &handler_owns, ownership);
+                var handler_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                defer handler_consumed.deinit(self.allocator);
+                try self.forwardOwnsStream(tc.handler_instrs, &handler_owns, &handler_consumed, ownership);
                 var success_owns = try owns.clone(self.allocator);
                 defer success_owns.deinit(self.allocator);
-                try self.forwardOwnsStream(tc.success_instrs, &success_owns, ownership);
+                var success_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                defer success_consumed.deinit(self.allocator);
+                try self.forwardOwnsStream(tc.success_instrs, &success_owns, &success_consumed, ownership);
                 // Both paths can reach the rest of the enclosing
                 // stream after the try_call_named (depending on
                 // whether the called function returned ok or err).
                 // Take the intersection.
                 owns.copyFrom(&handler_owns);
                 owns.intersectWith(&success_owns);
+                consumed_owned_param_slots.copyFrom(&handler_consumed);
+                consumed_owned_param_slots.unionWith(&success_consumed);
             },
             .guard_block => |gb| {
                 // The guard_block's body executes only when the guard
@@ -1673,23 +1979,273 @@ const Analyzer = struct {
                 //   stream's owned_at_ret snapshot.
                 var body_owns = try owns.clone(self.allocator);
                 defer body_owns.deinit(self.allocator);
-                try self.forwardOwnsStream(gb.body, &body_owns, ownership);
+                var body_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                defer body_consumed.deinit(self.allocator);
+                try self.forwardOwnsStream(gb.body, &body_owns, &body_consumed, ownership);
                 if (streamFallsThrough(gb.body)) {
                     owns.intersectWith(&body_owns);
+                    consumed_owned_param_slots.unionWith(&body_consumed);
                 }
             },
             .optional_dispatch => |od| {
                 var nil_owns = try owns.clone(self.allocator);
                 defer nil_owns.deinit(self.allocator);
-                try self.forwardOwnsStream(od.nil_instrs, &nil_owns, ownership);
+                var nil_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                defer nil_consumed.deinit(self.allocator);
+                try self.forwardOwnsStream(od.nil_instrs, &nil_owns, &nil_consumed, ownership);
                 var struct_owns = try owns.clone(self.allocator);
                 defer struct_owns.deinit(self.allocator);
-                try self.forwardOwnsStream(od.struct_instrs, &struct_owns, ownership);
+                var struct_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                defer struct_consumed.deinit(self.allocator);
+                try self.forwardOwnsStream(od.struct_instrs, &struct_owns, &struct_consumed, ownership);
                 owns.copyFrom(&nil_owns);
                 owns.intersectWith(&struct_owns);
+                consumed_owned_param_slots.copyFrom(&nil_consumed);
+                consumed_owned_param_slots.unionWith(&struct_consumed);
             },
             else => {},
         }
+    }
+
+    fn forwardOwnsCaseBlock(
+        self: *Analyzer,
+        cb: ir.CaseBlock,
+        owns: *LiveSet,
+        consumed_owned_param_slots: *LiveSet,
+        ownership: *ArcOwnership,
+    ) error{OutOfMemory}!void {
+        var entry_owns = try owns.clone(self.allocator);
+        defer entry_owns.deinit(self.allocator);
+
+        var join = try AggregateJoin.init(self.allocator, owns.bit_count, consumed_owned_param_slots.bit_count);
+        defer join.deinit(self.allocator);
+
+        var fallthrough_owns = try owns.clone(self.allocator);
+        defer fallthrough_owns.deinit(self.allocator);
+        var fallthrough_consumed = try consumed_owned_param_slots.clone(self.allocator);
+        defer fallthrough_consumed.deinit(self.allocator);
+        const pre_falls_through = try self.forwardCaseExitStream(
+            cb.pre_instrs,
+            &fallthrough_owns,
+            &fallthrough_consumed,
+            &entry_owns,
+            cb.dest,
+            ownership,
+            &join,
+        );
+
+        if (pre_falls_through) {
+            for (cb.arms) |arm| {
+                var arm_owns = try fallthrough_owns.clone(self.allocator);
+                defer arm_owns.deinit(self.allocator);
+                var arm_consumed = try fallthrough_consumed.clone(self.allocator);
+                defer arm_consumed.deinit(self.allocator);
+                const cond_falls_through = try self.forwardCaseExitStream(
+                    arm.cond_instrs,
+                    &arm_owns,
+                    &arm_consumed,
+                    &entry_owns,
+                    cb.dest,
+                    ownership,
+                    &join,
+                );
+                if (!cond_falls_through) continue;
+                const body_falls_through = try self.forwardCaseExitStream(
+                    arm.body_instrs,
+                    &arm_owns,
+                    &arm_consumed,
+                    &entry_owns,
+                    cb.dest,
+                    ownership,
+                    &join,
+                );
+                if (body_falls_through) {
+                    self.applyAggregateResultTransfer(arm.result, cb.dest, &arm_owns);
+                    self.normalizeAggregateExitOwns(&arm_owns, &entry_owns, cb.dest);
+                    join.add(&arm_owns, &arm_consumed);
+                }
+            }
+
+            if (cb.default_instrs.len > 0 or cb.default_result != null) {
+                var default_owns = try fallthrough_owns.clone(self.allocator);
+                defer default_owns.deinit(self.allocator);
+                var default_consumed = try fallthrough_consumed.clone(self.allocator);
+                defer default_consumed.deinit(self.allocator);
+                const default_falls_through = try self.forwardCaseExitStream(
+                    cb.default_instrs,
+                    &default_owns,
+                    &default_consumed,
+                    &entry_owns,
+                    cb.dest,
+                    ownership,
+                    &join,
+                );
+                if (default_falls_through) {
+                    self.applyAggregateResultTransfer(cb.default_result, cb.dest, &default_owns);
+                    self.normalizeAggregateExitOwns(&default_owns, &entry_owns, cb.dest);
+                    join.add(&default_owns, &default_consumed);
+                }
+            }
+        }
+
+        if (join.has_value) {
+            owns.copyFrom(&join.owns);
+            consumed_owned_param_slots.copyFrom(&join.consumed);
+        } else if (pre_falls_through) {
+            owns.copyFrom(&fallthrough_owns);
+            consumed_owned_param_slots.copyFrom(&fallthrough_consumed);
+        }
+    }
+
+    fn forwardCaseExitStream(
+        self: *Analyzer,
+        stream: []const ir.Instruction,
+        owns: *LiveSet,
+        consumed_owned_param_slots: *LiveSet,
+        entry_owns: *const LiveSet,
+        aggregate_dest: ir.LocalId,
+        ownership: *ArcOwnership,
+        join: *AggregateJoin,
+    ) error{OutOfMemory}!bool {
+        for (stream, 0..) |*instr, k| {
+            const id = self.idForStreamInstruction(stream, k);
+            switch (instr.*) {
+                .guard_block => |gb| {
+                    var body_owns = try owns.clone(self.allocator);
+                    defer body_owns.deinit(self.allocator);
+                    var body_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                    defer body_consumed.deinit(self.allocator);
+                    const body_falls_through = try self.forwardCaseExitStream(
+                        gb.body,
+                        &body_owns,
+                        &body_consumed,
+                        entry_owns,
+                        aggregate_dest,
+                        ownership,
+                        join,
+                    );
+                    if (body_falls_through) {
+                        owns.intersectWith(&body_owns);
+                        consumed_owned_param_slots.unionWith(&body_consumed);
+                    }
+                    continue;
+                },
+                .case_break => |case_break| {
+                    try self.snapshotOwnedAtCaseBreak(
+                        ownership,
+                        id,
+                        owns,
+                        entry_owns,
+                        case_break.value,
+                    );
+                    self.applyAggregateResultTransfer(case_break.value, aggregate_dest, owns);
+                    self.normalizeAggregateExitOwns(owns, entry_owns, aggregate_dest);
+                    join.add(owns, consumed_owned_param_slots);
+                    return false;
+                },
+                else => {},
+            }
+
+            try self.forwardOwnsChildren(instr, owns, consumed_owned_param_slots, ownership);
+            try self.applyOwnsEffect(instr.*, owns, consumed_owned_param_slots, ownership);
+            if (isReturnEquivalentTerminator(instr.*)) {
+                try self.snapshotOwnedAtRet(ownership, id, owns);
+            }
+            if (isTerminator(instr.*)) return false;
+        }
+
+        return true;
+    }
+
+    const AggregateJoin = struct {
+        owns: LiveSet,
+        consumed: LiveSet,
+        has_value: bool = false,
+
+        fn init(
+            allocator: std.mem.Allocator,
+            owns_bit_count: u32,
+            consumed_bit_count: u32,
+        ) error{OutOfMemory}!AggregateJoin {
+            return .{
+                .owns = try LiveSet.init(allocator, owns_bit_count),
+                .consumed = try LiveSet.init(allocator, consumed_bit_count),
+            };
+        }
+
+        fn deinit(self: *AggregateJoin, allocator: std.mem.Allocator) void {
+            self.owns.deinit(allocator);
+            self.consumed.deinit(allocator);
+        }
+
+        fn add(self: *AggregateJoin, owns: *const LiveSet, consumed: *const LiveSet) void {
+            if (!self.has_value) {
+                self.owns.copyFrom(owns);
+                self.consumed.copyFrom(consumed);
+                self.has_value = true;
+            } else {
+                self.owns.intersectWith(owns);
+                self.consumed.unionWith(consumed);
+            }
+        }
+    };
+
+    fn applyAggregateResultTransfer(
+        self: *Analyzer,
+        maybe_result: ?ir.LocalId,
+        aggregate_dest: ir.LocalId,
+        owns: *LiveSet,
+    ) void {
+        const result = maybe_result orelse return;
+        self.clearOwnsForLocalAndAliases(result, owns, null);
+        const local_ownership = self.function.local_ownership;
+        if (aggregate_dest >= local_ownership.len) return;
+        if (local_ownership[aggregate_dest] != .owned) return;
+        if (self.local_to_arc_index.get(aggregate_dest)) |idx| owns.set(idx);
+    }
+
+    fn normalizeAggregateExitOwns(
+        self: *Analyzer,
+        owns: *LiveSet,
+        entry_owns: *const LiveSet,
+        aggregate_dest: ir.LocalId,
+    ) void {
+        const dest_was_owned = if (self.local_to_arc_index.get(aggregate_dest)) |idx|
+            owns.contains(idx)
+        else
+            false;
+        owns.intersectWith(entry_owns);
+        if (dest_was_owned) {
+            if (self.local_to_arc_index.get(aggregate_dest)) |idx| owns.set(idx);
+        }
+    }
+
+    fn snapshotOwnedAtCaseBreak(
+        self: *Analyzer,
+        ownership: *ArcOwnership,
+        id: InstructionId,
+        owns: *const LiveSet,
+        entry_owns: *const LiveSet,
+        case_result: ?ir.LocalId,
+    ) error{OutOfMemory}!void {
+        var local_set: ArcLocalSet = .empty;
+        errdefer local_set.deinit(self.allocator);
+        var bit_index: u32 = 0;
+        const bit_count: u32 = @intCast(self.arc_locals.items.len);
+        while (bit_index < bit_count) : (bit_index += 1) {
+            if (!owns.contains(bit_index)) continue;
+            if (entry_owns.contains(bit_index)) continue;
+            const local_id = self.arc_locals.items[bit_index];
+            if (case_result) |result| {
+                if (local_id == result) continue;
+            }
+            try local_set.put(self.allocator, local_id, {});
+        }
+        if (local_set.count() == 0) {
+            local_set.deinit(self.allocator);
+            return;
+        }
+        try ownership.owned_at_case_break.putNoClobber(self.allocator, id, local_set);
     }
 
     /// Apply a single instruction's forward effect on the `owns` set.
@@ -1701,14 +2257,16 @@ const Analyzer = struct {
         self: *Analyzer,
         instr: ir.Instruction,
         owns: *LiveSet,
+        consumed_owned_param_slots: *LiveSet,
+        ownership: *ArcOwnership,
     ) error{OutOfMemory}!void {
         const local_ownership = self.function.local_ownership;
         switch (instr) {
             .release => |r| {
-                self.clearOwnsForLocalAndAliases(r.value, owns);
+                self.clearOwnsForLocalAndAliases(r.value, owns, consumed_owned_param_slots);
             },
             .move_value => |mv| {
-                self.clearOwnsForLocalAndAliases(mv.source, owns);
+                self.clearOwnsForLocalAndAliases(mv.source, owns, consumed_owned_param_slots);
                 if (mv.dest < local_ownership.len and local_ownership[mv.dest] == .owned) {
                     if (self.local_to_arc_index.get(mv.dest)) |idx| owns.set(idx);
                 }
@@ -1728,7 +2286,7 @@ const Analyzer = struct {
                 // cell the dest is about to consume.
                 if (self.local_to_arc_index.get(ls.value)) |src_idx| {
                     if (owns.contains(src_idx)) {
-                        self.clearOwnsForLocalAndAliases(ls.value, owns);
+                        self.clearOwnsForLocalAndAliases(ls.value, owns, consumed_owned_param_slots);
                         if (ls.dest < local_ownership.len and local_ownership[ls.dest] == .owned) {
                             if (self.local_to_arc_index.get(ls.dest)) |dst_idx| owns.set(dst_idx);
                         }
@@ -1744,7 +2302,7 @@ const Analyzer = struct {
             },
             .tail_call => |tc| {
                 for (tc.args) |arg_local| {
-                    self.clearOwnsForLocalAndAliases(arg_local, owns);
+                    self.clearOwnsForLocalAndAliases(arg_local, owns, consumed_owned_param_slots);
                 }
             },
             // Phase E.10: aggregate-init instructions consume their
@@ -1771,7 +2329,7 @@ const Analyzer = struct {
             // for, double-decrementing the cell at scope exit.
             .tuple_init => |ti| {
                 for (ti.elements) |elem| {
-                    self.clearOwnsForLocalAndAliases(elem, owns);
+                    self.clearOwnsForLocalAndAliases(elem, owns, consumed_owned_param_slots);
                 }
                 if (ti.dest < local_ownership.len and local_ownership[ti.dest] == .owned) {
                     if (self.local_to_arc_index.get(ti.dest)) |idx| owns.set(idx);
@@ -1779,29 +2337,29 @@ const Analyzer = struct {
             },
             .list_init => |li| {
                 for (li.elements) |elem| {
-                    self.clearOwnsForLocalAndAliases(elem, owns);
+                    self.clearOwnsForLocalAndAliases(elem, owns, consumed_owned_param_slots);
                 }
                 if (li.dest < local_ownership.len and local_ownership[li.dest] == .owned) {
                     if (self.local_to_arc_index.get(li.dest)) |idx| owns.set(idx);
                 }
             },
             .list_cons => |lc| {
-                self.clearOwnsForLocalAndAliases(lc.head, owns);
-                self.clearOwnsForLocalAndAliases(lc.tail, owns);
+                self.clearOwnsForLocalAndAliases(lc.head, owns, consumed_owned_param_slots);
+                self.clearOwnsForLocalAndAliases(lc.tail, owns, consumed_owned_param_slots);
                 if (lc.dest < local_ownership.len and local_ownership[lc.dest] == .owned) {
                     if (self.local_to_arc_index.get(lc.dest)) |idx| owns.set(idx);
                 }
             },
             .struct_init => |si| {
                 for (si.fields) |field| {
-                    self.clearOwnsForLocalAndAliases(field.value, owns);
+                    self.clearOwnsForLocalAndAliases(field.value, owns, consumed_owned_param_slots);
                 }
                 if (si.dest < local_ownership.len and local_ownership[si.dest] == .owned) {
                     if (self.local_to_arc_index.get(si.dest)) |idx| owns.set(idx);
                 }
             },
             .union_init => |ui| {
-                self.clearOwnsForLocalAndAliases(ui.value, owns);
+                self.clearOwnsForLocalAndAliases(ui.value, owns, consumed_owned_param_slots);
                 if (ui.dest < local_ownership.len and local_ownership[ui.dest] == .owned) {
                     if (self.local_to_arc_index.get(ui.dest)) |idx| owns.set(idx);
                 }
@@ -1829,11 +2387,11 @@ const Analyzer = struct {
             // by checking `defs` directly so the def-local's owns
             // bit gets set when the call returns an `.owned` value.
             .call_direct => |cd| {
-                self.applyCallConsumeEffect(cd.function, null, cd.args, owns);
+                self.applyCallConsumeEffect(cd.function, null, cd.args, owns, consumed_owned_param_slots);
                 self.applyCallDestEffect(cd.dest, owns);
             },
             .call_named => |cn| {
-                self.applyCallConsumeEffect(null, cn.name, cn.args, owns);
+                self.applyCallConsumeEffect(null, cn.name, cn.args, owns, consumed_owned_param_slots);
                 self.applyCallDestEffect(cn.dest, owns);
             },
             .call_dispatch => |cdsp| {
@@ -1863,10 +2421,21 @@ const Analyzer = struct {
             .call_builtin => |cb| {
                 if (ownedMutatingBuiltinSlot(cb.name)) |slot| {
                     if (slot < cb.args.len) {
-                        self.clearOwnsForLocalAndAliases(cb.args[slot], owns);
+                        self.clearOwnsForLocalAndAliases(cb.args[slot], owns, consumed_owned_param_slots);
+                    }
+                }
+                for (cb.args, 0..) |arg, slot| {
+                    if (alwaysConsumingBuiltinArg(cb.name, slot)) {
+                        self.clearOwnsForLocalAndAliases(arg, owns, consumed_owned_param_slots);
                     }
                 }
                 self.applyCallDestEffect(cb.dest, owns);
+            },
+            .list_tail => |lt| {
+                if (lt.consume_source) {
+                    self.clearOwnsForLocalAndAliases(lt.list, owns, consumed_owned_param_slots);
+                }
+                self.applyCallDestEffect(lt.dest, owns);
             },
             // Phase H.6: `param_get` for an `.owned`-convention slot
             // produces an ALIAS to the function's single +1 for that
@@ -1886,7 +2455,7 @@ const Analyzer = struct {
             // then emit one `release` per alias, decrementing the
             // cell N times against its single +1. The observable
             // failure is a use-after-free on the next use of the
-            // parameter, surfacing as `Vector.get/set: index out of
+            // parameter, surfacing as `List.get/set: index out of
             // bounds` (or worse, silent data corruption) when a tail-
             // recursive caller reads the parameter on the next
             // iteration.
@@ -1910,6 +2479,12 @@ const Analyzer = struct {
             .param_get => |pg| {
                 if (pg.dest >= local_ownership.len) return;
                 if (local_ownership[pg.dest] != .owned) return;
+                if (pg.index < consumed_owned_param_slots.bit_count and
+                    consumed_owned_param_slots.contains(pg.index))
+                {
+                    try ownership.non_owning_param_refetches.put(self.allocator, pg.dest, {});
+                    return;
+                }
                 const dest_idx = self.local_to_arc_index.get(pg.dest) orelse return;
                 if (self.param_alias_group.get(pg.dest)) |aliases| {
                     for (aliases) |alias| {
@@ -1953,6 +2528,7 @@ const Analyzer = struct {
         callee_name: ?[]const u8,
         args: []const ir.LocalId,
         owns: *LiveSet,
+        consumed_owned_param_slots: *LiveSet,
     ) void {
         const program = self.program orelse return;
         const conventions = lookupCalleeConventions(program, callee_id, callee_name) orelse return;
@@ -1961,7 +2537,7 @@ const Analyzer = struct {
         while (slot < slot_count) : (slot += 1) {
             if (conventions[slot] != .owned) continue;
             const arg_local = args[slot];
-            self.clearOwnsForLocalAndAliases(arg_local, owns);
+            self.clearOwnsForLocalAndAliases(arg_local, owns, consumed_owned_param_slots);
         }
     }
 
@@ -1976,10 +2552,25 @@ const Analyzer = struct {
     /// other slot-4 alias's bit (e.g. `arc_idx_21` from a sibling
     /// `param_get`). After the move, NO alias contributes a stale
     /// release at the terminator's `owned_at_ret`.
-    fn clearOwnsForLocalAndAliases(self: *Analyzer, local: ir.LocalId, owns: *LiveSet) void {
+    fn clearOwnsForLocalAndAliases(
+        self: *Analyzer,
+        local: ir.LocalId,
+        owns: *LiveSet,
+        consumed_owned_param_slots: ?*LiveSet,
+    ) void {
+        if (consumed_owned_param_slots) |consumed| {
+            if (self.owned_param_slot_by_local.get(local)) |slot| {
+                if (slot < consumed.bit_count) consumed.set(slot);
+            }
+        }
         if (self.local_to_arc_index.get(local)) |idx| owns.unset(idx);
         if (self.param_alias_group.get(local)) |aliases| {
             for (aliases) |alias| {
+                if (consumed_owned_param_slots) |consumed| {
+                    if (self.owned_param_slot_by_local.get(alias)) |slot| {
+                        if (slot < consumed.bit_count) consumed.set(slot);
+                    }
+                }
                 if (self.local_to_arc_index.get(alias)) |idx| owns.unset(idx);
             }
         }
@@ -2362,32 +2953,25 @@ fn lookupCalleeConventions(
 ///     `IrBuilder.buildCall` for concrete `Map(K, V)` instantiations.
 ///   * `MapNested:K:V.put` etc. — encoded name for nested map values
 ///     (`Map(K, Map(K2, V2))` and similar).
-///   * `Vector.set`, `Vector.push`, `Vector.pop`, `Vector.append` —
-///     pre-monomorph generic name. The Phase 2 flat-buffer
-///     `Vector(T)` runtime uses the same rc-1 fast-path pattern as
-///     the dense Map; without slot-0 promotion, callers retain their
-///     receiver to refcount 2 before entering the runtime, the rc-1
-///     branch never fires, and every mutation copies. Receiver is
-///     always slot 0 (`v.set(i, x)` / `v.push(x)` / `v.pop()` /
-///     `a.append(b)`). For `append` only the LHS slot is owned-
-///     mutating; the RHS is a borrowed source whose elements are
-///     deep-retain copied — the codegen treats it through normal
-///     borrowed-receiver share/release plumbing.
-///   * `Vector:T.set` etc. — post-monomorph encoded name.
-///   * `VectorI64.set`, `VectorF64.set`, etc. — concrete-alias names
-///     used by `lib/vector_i64.zap` / `lib/vector_f64.zap`. Each Zap
-///     surface forwards its body through `:zig.VectorI64.set` etc.,
-///     which the IR builder emits as `call_builtin "VectorI64.set"`
-///     verbatim. Without registering these alias prefixes, the Phase
-///     4 / V8 codegen passes never see the call site and every
-///     `VectorI64.set` enters the runtime at refcount >= 2 — the same
-///     buffer-copy regression that motivated the generic registration
-///     in the first place. Recognising them here closes that gap for
-///     fannkuch-redux and any other benchmark that uses the typed
+///   * `List.set`, `List.push`, `List.pop`, `List.append` — generic
+///     native namespace name used by Stage 3's flat-buffer `List(T)`
 ///     surface.
+///   * `List:T.set` etc. — post-monomorph encoded name produced by
+///     `IrBuilder.buildCall` for concrete `List(T)` instantiations.
+///   * `ListNested:T.set` etc. — encoded name for nested list values.
+///
+/// The flat-buffer `List(T)` runtime uses the same rc-1 fast-path
+/// pattern as the dense Map; without slot-0 promotion, callers retain
+/// their receiver to refcount 2 before entering the runtime, the rc-1
+/// branch never fires, and every mutation copies. Receiver is always
+/// slot 0 (`list.set(i, x)` / `list.push(x)` / `list.pop()` /
+/// `a.append(b)`). For `append` only the LHS slot is owned-mutating;
+/// the RHS is a borrowed source whose elements are deep-retain copied
+/// — codegen treats it through normal borrowed-receiver share/release
+/// plumbing.
 ///
 /// All Zap-level callers route through these names via
-/// `lib/map.zap` and `lib/vector.zap`'s thin wrappers. The runtime's
+/// `lib/map.zap` and `lib/list.zap`'s thin wrappers. The runtime's
 /// fast path is independent of the element types — it gates only on
 /// the receiver's refcount — so a single shape predicate covers
 /// every monomorph.
@@ -2397,11 +2981,11 @@ pub fn ownedMutatingBuiltinSlot(name: []const u8) ?usize {
     const method_full = name[dot_index + 1 ..];
     const prefix = name[0..dot_index];
 
-    // Phase 3 (V8): the `_owned_unchecked` suffix is a peer of the
+    // Phase 3 (uniqueness): the `_owned_unchecked` suffix is a peer of the
     // checked variant — same receiver-slot semantics, but the
     // runtime skips the rc==1 check. Treat both as owned-mutating
     // for slot inference; the verifier in `arc_verifier.zig` uses
-    // `isUncheckedOwnedMutatingBuiltin` to additionally enforce V8
+    // `isUncheckedOwnedMutatingBuiltin` to additionally enforce uniqueness
     // on the unchecked sites.
     const unchecked_suffix = "_owned_unchecked";
     const method = if (std.mem.endsWith(u8, method_full, unchecked_suffix))
@@ -2422,32 +3006,97 @@ pub fn ownedMutatingBuiltinSlot(name: []const u8) ?usize {
         return null;
     }
 
-    const is_vector_method =
+    const is_list_method =
         std.mem.eql(u8, method, "set") or
         std.mem.eql(u8, method, "push") or
         std.mem.eql(u8, method, "pop") or
         std.mem.eql(u8, method, "append");
-    if (is_vector_method) {
-        const is_vector_prefix =
-            std.mem.eql(u8, prefix, "Vector") or
-            std.mem.startsWith(u8, prefix, "Vector:") or
-            std.mem.eql(u8, prefix, "VectorI64") or
-            std.mem.eql(u8, prefix, "VectorF64");
-        if (is_vector_prefix) return 0;
+    if (is_list_method) {
+        if (isListBuiltinPrefix(prefix)) return 0;
         return null;
     }
 
     return null;
 }
 
-/// Phase 3 (V8): is `name` an unchecked owned-mutating builtin?
+/// Does `name` consume the argument in `slot` and allow the compiler
+/// to transfer a last-use owner directly into that slot?
+///
+/// This is broader than `ownedMutatingBuiltinSlot`: the receiver slot
+/// of `Map.put` / `List.push` participates in rc1 mutation, while the
+/// element slot of `List.push` / `List.set` is stored directly into the
+/// list buffer and is therefore consumed by the runtime ABI. Map keys
+/// and values are intentionally excluded because `Map.put` retains
+/// them for persistent entry ownership.
+pub fn builtinArgCanMoveAtLastUse(name: []const u8, slot: usize) bool {
+    if (ownedMutatingBuiltinSlot(name)) |owned_slot| {
+        if (owned_slot == slot) return true;
+    }
+    return listElementConsumingBuiltinArg(name, slot);
+}
+
+/// Does `name` consume the argument in `slot` as part of the builtin's
+/// ABI, independent of rc1 uniqueness optimisation?
+///
+/// This is deliberately narrower than `ownedMutatingBuiltinSlot`.
+/// `Map.put` / `List.append` receive a temporary retained receiver
+/// when the source is not at last use; the runtime must see that
+/// refcount and clone rather than consume it. By contrast
+/// `List.cons(head, tail)` stores `head` into a fresh list and releases
+/// the consumed `tail` owner after retaining tail elements. Any
+/// compiler-emitted post-call release for either argument's
+/// `share_value` would double-decrement the temporary owner.
+pub fn alwaysConsumingBuiltinArg(name: []const u8, slot: usize) bool {
+    const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const method_full = name[dot_index + 1 ..];
+    const prefix = name[0..dot_index];
+    const method = stripOwnedUncheckedSuffix(method_full);
+
+    if (std.mem.eql(u8, method, "cons") and isListBuiltinPrefix(prefix)) {
+        return slot == 0 or slot == 1;
+    }
+
+    if (listElementConsumingBuiltinArgWithParts(prefix, method, slot)) return true;
+
+    return false;
+}
+
+fn isListBuiltinPrefix(prefix: []const u8) bool {
+    return std.mem.eql(u8, prefix, "List") or
+        std.mem.startsWith(u8, prefix, "List:") or
+        std.mem.startsWith(u8, prefix, "ListNested:");
+}
+
+fn stripOwnedUncheckedSuffix(method_full: []const u8) []const u8 {
+    const unchecked_suffix = "_owned_unchecked";
+    if (std.mem.endsWith(u8, method_full, unchecked_suffix)) {
+        return method_full[0 .. method_full.len - unchecked_suffix.len];
+    }
+    return method_full;
+}
+
+fn listElementConsumingBuiltinArg(name: []const u8, slot: usize) bool {
+    const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const method = stripOwnedUncheckedSuffix(name[dot_index + 1 ..]);
+    const prefix = name[0..dot_index];
+    return listElementConsumingBuiltinArgWithParts(prefix, method, slot);
+}
+
+fn listElementConsumingBuiltinArgWithParts(prefix: []const u8, method: []const u8, slot: usize) bool {
+    if (!isListBuiltinPrefix(prefix)) return false;
+    if (std.mem.eql(u8, method, "push")) return slot == 1;
+    if (std.mem.eql(u8, method, "set")) return slot == 2;
+    return false;
+}
+
+/// Phase 3 (uniqueness): is `name` an unchecked owned-mutating builtin?
 ///
 /// Unchecked variants (`Map.put_owned_unchecked`,
-/// `Vector.set_owned_unchecked`, etc.) bypass the runtime's rc==1
+/// `List.set_owned_unchecked`, etc.) bypass the runtime's rc==1
 /// check. They are codegen targets emitted only at call sites
-/// where the V8 verifier proves static uniqueness; the verifier
+/// where the uniqueness verifier proves static uniqueness; the verifier
 /// uses this predicate to identify which call sites must satisfy
-/// V8 = true.
+/// uniqueness = true.
 ///
 /// The shape is identical to `ownedMutatingBuiltinSlot` modulo the
 /// trailing `_owned_unchecked` on the method suffix.
@@ -2462,45 +3111,45 @@ pub fn isUncheckedOwnedMutatingBuiltin(name: []const u8) bool {
     return ownedMutatingBuiltinSlot(name) != null;
 }
 
-/// V8 (Phase 1.4): is `name` a runtime fresh-allocator intrinsic?
+/// uniqueness (Phase 1.4): is `name` a runtime fresh-allocator intrinsic?
 ///
 /// A "fresh allocator" is a `call_builtin` whose runtime contract is
 /// "allocates a brand-new ARC-managed cell with refcount = 1." These
 /// are the constructors for our ARC-managed runtime types: `Map.new`,
-/// `Vector.new_filled`/`new_empty`, etc. The runtime invariant is
+/// `List.new_filled`/`new_empty`, etc. The runtime invariant is
 /// that every call returns a refcount=1
-/// owner, so the V8 dataflow can mark the dest as `definitely_unique`
+/// owner, so the uniqueness dataflow can mark the dest as `definitely_unique`
 /// without needing to inspect the body.
 ///
 /// Why this predicate exists:
 ///
-/// V8 already marks owned-mutating call results unique (the runtime
-/// contract for `Map.put`/`Vector.set`/etc. is also "result is rc=1"),
+/// uniqueness already marks owned-mutating call results unique (the runtime
+/// contract for `Map.put`/`List.set`/etc. is also "result is rc=1"),
 /// but constructors are NOT in `ownedMutatingBuiltinSlot` because they
-/// don't consume any input slot. Without this predicate, V8 sees a
-/// call to `VectorI64.new_filled(size, init)` and treats the dest as
+/// don't consume any input slot. Without this predicate, uniqueness sees a
+/// call to `List:i64.new_filled(size, init)` and treats the dest as
 /// "not unique" — even though the runtime physically allocates a fresh
-/// cell. That mistake breaks the V8 chain at every program entry
-/// point: `v = VectorI64.new_filled(...)` produces a "not unique" v,
-/// then `v = VectorI64.set(v, i, x)` (or any owned-mutator) sees a
+/// cell. That mistake breaks the uniqueness chain at every program entry
+/// point: `v = List.new_filled(...)` produces a "not unique" v,
+/// then `v = List.set(v, i, x)` (or any owned-mutator) sees a
 /// non-unique receiver, blocks the unchecked rewrite, and the runtime
 /// pays for an rc check on every call.
 ///
-/// The Zap-fn-wrapper case (`lib/vector_i64.zap`'s `new_filled`
-/// forwards to `:zig.VectorI64.new_filled`) is handled at the
-/// caller-side as well: when V8 sees a `call_named` to a Zap function
+/// The Zap-fn-wrapper case (`lib/list.zap`'s `new_filled`
+/// forwards to `:zig.List.new_filled`) is handled at the
+/// caller-side as well: when uniqueness sees a `call_named` to a Zap function
 /// whose `result_convention == .owned` and whose body is a single-call
 /// forward to a fresh-allocator builtin, the call's dest inherits the
-/// unique result. That flow lives in `v8_uniqueness.zig`'s
+/// unique result. That flow lives in `uniqueness.zig`'s
 /// `applyCalleeEffect`.
 ///
 /// Soundness:
 ///
-/// The verifier (`arc_verifier.runV8`) re-runs the per-function V8
+/// The verifier (`arc_verifier.runUniquenessCheck`) re-runs the per-function uniqueness
 /// with this same predicate, so a buggy classification surfaces as
 /// `error.ArcInvariantViolation` at build time, not as a runtime
 /// soundness bug. The conservative default for any unknown name is
-/// `false` — V8 then treats the dest as "not unique" and the unchecked
+/// `false` — uniqueness then treats the dest as "not unique" and the unchecked
 /// rewrite stays inactive (the checked variant runs and pays an rc
 /// check). Adding new constructors to the runtime requires extending
 /// this predicate (and its tests), but a missed constructor only
@@ -2524,18 +3173,12 @@ pub fn isFreshAllocatorBuiltin(name: []const u8) bool {
         }
     }
 
-    // Vector constructors:
-    //   - `Vector.new_filled(size, init)` and `Vector.new_empty(cap)`.
+    // Flat-buffer List constructors:
+    //   - `List.new_filled(size, init)` and `List.new_empty(cap)`.
     if (std.mem.eql(u8, method_full, "new_filled") or
         std.mem.eql(u8, method_full, "new_empty"))
     {
-        if (std.mem.eql(u8, prefix, "Vector") or
-            std.mem.startsWith(u8, prefix, "Vector:") or
-            std.mem.eql(u8, prefix, "VectorI64") or
-            std.mem.eql(u8, prefix, "VectorF64"))
-        {
-            return true;
-        }
+        if (isListBuiltinPrefix(prefix)) return true;
     }
 
     return false;
@@ -2551,77 +3194,168 @@ test "arc_liveness: ownedMutatingBuiltinSlot matches Map.put / delete / merge va
     // Negative cases.
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Map.get"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Map.size"));
-    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("List.append"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("List.get"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Foo.put"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("MapAlt.put"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("put"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot(""));
 }
 
-test "arc_liveness: ownedMutatingBuiltinSlot matches Vector.set / push / pop / append variants" {
-    // Pre-monomorph generic names (parser writes these before the
-    // type system pins down the element type).
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.set"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.push"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.pop"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.append"));
+test "arc_liveness: ownedMutatingBuiltinSlot matches List.set / push / pop / append variants" {
+    // Pre-monomorph generic names.
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("List.set"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("List.push"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("List.pop"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("List.append"));
     // Post-monomorph encoded names (concrete instantiations).
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector:i64.set"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector:f64.push"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector:str.append"));
-    // VectorI64 / VectorF64 type-aliased prefixes used by
-    // `lib/vector_i64.zap` / `lib/vector_f64.zap`. The Zap surface
-    // forwards through `:zig.VectorI64.set` (a `call_builtin` with
-    // name `VectorI64.set` verbatim), so this prefix MUST match for
-    // the Phase 4 / V8 codegen to fire on benchmarks like fannkuch-redux.
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorI64.set"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorI64.push"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorI64.pop"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorI64.append"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorF64.set"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorF64.push"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorF64.pop"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorF64.append"));
-    // Negative cases — non-mutating Vector methods stay borrowed.
-    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vector.get"));
-    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vector.length"));
-    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vector.capacity"));
-    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vector.new_filled"));
-    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorI64.get"));
-    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorF64.length"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("List:i64.set"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("List:f64.push"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("List:str.append"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("ListNested:i64.append"));
+    // Negative cases — non-mutating List methods stay borrowed.
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("List.get"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("List.length"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("List.capacity"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("List.new_filled"));
     // Lookalike receiver names must not match.
-    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorAlt.set"));
-    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Vec.set"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("ListAlt.set"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("OtherList.set"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("set"));
-    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorI8.set"));
-    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorIntegers.set"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("ListAlias.set"));
+}
+
+test "arc_liveness: alwaysConsumingBuiltinArg recognizes List.cons argument slots" {
+    try std.testing.expect(alwaysConsumingBuiltinArg("List.cons", 0));
+    try std.testing.expect(alwaysConsumingBuiltinArg("List.cons", 1));
+    try std.testing.expect(alwaysConsumingBuiltinArg("List:i64.cons", 0));
+    try std.testing.expect(alwaysConsumingBuiltinArg("List:i64.cons", 1));
+    try std.testing.expect(alwaysConsumingBuiltinArg("ListNested:list.cons", 0));
+    try std.testing.expect(alwaysConsumingBuiltinArg("ListNested:list.cons", 1));
+
+    try std.testing.expect(!alwaysConsumingBuiltinArg("List.cons", 2));
+    try std.testing.expect(!alwaysConsumingBuiltinArg("List.append", 0));
+    try std.testing.expect(!alwaysConsumingBuiltinArg("Map.put", 0));
+    try std.testing.expect(!alwaysConsumingBuiltinArg("ListAlt.cons", 0));
+    try std.testing.expect(!alwaysConsumingBuiltinArg("cons", 0));
+}
+
+test "arc_liveness: List.set and List.push element slots are consumed by builtin ABI" {
+    try std.testing.expect(alwaysConsumingBuiltinArg("List.push", 1));
+    try std.testing.expect(alwaysConsumingBuiltinArg("List.set", 2));
+    try std.testing.expect(alwaysConsumingBuiltinArg("List:i64.push", 1));
+    try std.testing.expect(alwaysConsumingBuiltinArg("ListNested:list.set", 2));
+    try std.testing.expect(alwaysConsumingBuiltinArg("List.push_owned_unchecked", 1));
+    try std.testing.expect(alwaysConsumingBuiltinArg("List:f64.set_owned_unchecked", 2));
+
+    try std.testing.expect(!alwaysConsumingBuiltinArg("List.push", 0));
+    try std.testing.expect(!alwaysConsumingBuiltinArg("List.push", 2));
+    try std.testing.expect(!alwaysConsumingBuiltinArg("List.set", 1));
+    try std.testing.expect(!alwaysConsumingBuiltinArg("List.append", 1));
+    try std.testing.expect(!alwaysConsumingBuiltinArg("Map.put", 2));
+}
+
+test "arc_liveness: builtinArgCanMoveAtLastUse includes receivers and consumed List elements" {
+    try std.testing.expect(builtinArgCanMoveAtLastUse("Map.put", 0));
+    try std.testing.expect(builtinArgCanMoveAtLastUse("List.push", 0));
+    try std.testing.expect(builtinArgCanMoveAtLastUse("List.push", 1));
+    try std.testing.expect(builtinArgCanMoveAtLastUse("List.set_owned_unchecked", 2));
+
+    try std.testing.expect(!builtinArgCanMoveAtLastUse("Map.put", 2));
+    try std.testing.expect(!builtinArgCanMoveAtLastUse("List.append", 1));
+    try std.testing.expect(!builtinArgCanMoveAtLastUse("List.cons", 0));
+    try std.testing.expect(!builtinArgCanMoveAtLastUse("List.get", 0));
+}
+
+test "arc_liveness: List.cons call_builtin clears consumed share owners" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const args = try arena.alloc(ir.LocalId, 2);
+    args[0] = 1;
+    args[1] = 3;
+
+    const arg_modes = try arena.alloc(ir.ValueMode, 2);
+    arg_modes[0] = .share;
+    arg_modes[1] = .share;
+
+    const stream = try arena.alloc(ir.Instruction, 6);
+    stream[0] = .{ .const_string = .{ .dest = 0, .value = "head" } };
+    stream[1] = .{ .share_value = .{ .dest = 1, .source = 0, .mode = .retain } };
+    stream[2] = .{ .const_string = .{ .dest = 2, .value = "tail" } };
+    stream[3] = .{ .share_value = .{ .dest = 3, .source = 2, .mode = .retain } };
+    stream[4] = .{ .call_builtin = .{
+        .dest = 4,
+        .name = "List.cons",
+        .args = args,
+        .arg_modes = arg_modes,
+    } };
+    stream[5] = .{ .ret = .{ .value = 4 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 5);
+    for (local_ownership) |*ownership_class| ownership_class.* = .owned;
+
+    const list_string_element: ir.ZigType = .string;
+    const list_string_type: ir.ZigType = .{ .list = &list_string_element };
+    const function = ir.Function{
+        .id = 0,
+        .name = "list_cons_consume_test",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = list_string_type,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        &function,
+        suite_dummy_type_store_for_h6,
+        arc_managed_for_h6,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    var owned_ret_iter = ownership.owned_at_ret.valueIterator();
+    while (owned_ret_iter.next()) |set_ptr| {
+        try std.testing.expect(!set_ptr.contains(1));
+        try std.testing.expect(!set_ptr.contains(3));
+        try std.testing.expect(set_ptr.contains(4));
+    }
 }
 
 test "arc_liveness: ownedMutatingBuiltinSlot recognizes Phase 3 unchecked variants" {
-    // Phase 3 (V8): `*_owned_unchecked` variants share the same
+    // Phase 3 (uniqueness): `*_owned_unchecked` variants share the same
     // receiver-slot semantics as their checked counterparts. The
     // matcher must treat them as owned-mutating; the unchecked-
     // specific predicate `isUncheckedOwnedMutatingBuiltin` is what
-    // distinguishes them for the V8 verifier.
+    // distinguishes them for the uniqueness verifier.
     try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map.put_owned_unchecked"));
     try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map.delete_owned_unchecked"));
     try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map.merge_owned_unchecked"));
     try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Map:u32:i64.put_owned_unchecked"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.set_owned_unchecked"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.push_owned_unchecked"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.pop_owned_unchecked"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector.append_owned_unchecked"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("Vector:i64.set_owned_unchecked"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorI64.set_owned_unchecked"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorI64.push_owned_unchecked"));
-    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("VectorF64.append_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("List.set_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("List.push_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("List.pop_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("List.append_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("List:i64.set_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), ownedMutatingBuiltinSlot("ListNested:i64.append_owned_unchecked"));
     // Negative: unchecked suffix on non-mutating methods still null.
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Map.get_owned_unchecked"));
     try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("Map.size_owned_unchecked"));
-    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("VectorAlt.set_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("ListAlt.set_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, null), ownedMutatingBuiltinSlot("ListAlias.set_owned_unchecked"));
 }
 
-test "arc_liveness: isFreshAllocatorBuiltin matches Map / Vector constructors" {
+test "arc_liveness: isFreshAllocatorBuiltin matches Map / List constructors" {
     // Map constructors.
     try std.testing.expect(isFreshAllocatorBuiltin("Map.new"));
     try std.testing.expect(isFreshAllocatorBuiltin("Map.new_with_capacity"));
@@ -2629,26 +3363,24 @@ test "arc_liveness: isFreshAllocatorBuiltin matches Map / Vector constructors" {
     try std.testing.expect(isFreshAllocatorBuiltin("Map:str:i64.new_with_capacity"));
     try std.testing.expect(isFreshAllocatorBuiltin("MapNested:str:list.new"));
 
-    // Vector constructors.
-    try std.testing.expect(isFreshAllocatorBuiltin("Vector.new_filled"));
-    try std.testing.expect(isFreshAllocatorBuiltin("Vector.new_empty"));
-    try std.testing.expect(isFreshAllocatorBuiltin("Vector:i64.new_filled"));
-    try std.testing.expect(isFreshAllocatorBuiltin("Vector:f64.new_empty"));
-    try std.testing.expect(isFreshAllocatorBuiltin("VectorI64.new_filled"));
-    try std.testing.expect(isFreshAllocatorBuiltin("VectorI64.new_empty"));
-    try std.testing.expect(isFreshAllocatorBuiltin("VectorF64.new_filled"));
-    try std.testing.expect(isFreshAllocatorBuiltin("VectorF64.new_empty"));
+    // Flat-buffer List constructors.
+    try std.testing.expect(isFreshAllocatorBuiltin("List.new_filled"));
+    try std.testing.expect(isFreshAllocatorBuiltin("List.new_empty"));
+    try std.testing.expect(isFreshAllocatorBuiltin("List:i64.new_filled"));
+    try std.testing.expect(isFreshAllocatorBuiltin("List:f64.new_empty"));
+    try std.testing.expect(isFreshAllocatorBuiltin("List:UserStruct.new_empty"));
+    try std.testing.expect(isFreshAllocatorBuiltin("ListNested:i64.new_filled"));
 
     // Negative cases — non-constructor methods.
     try std.testing.expect(!isFreshAllocatorBuiltin("Map.put"));
     try std.testing.expect(!isFreshAllocatorBuiltin("Map.get"));
-    try std.testing.expect(!isFreshAllocatorBuiltin("Vector.set"));
-    try std.testing.expect(!isFreshAllocatorBuiltin("VectorI64.set"));
-    try std.testing.expect(!isFreshAllocatorBuiltin("VectorI64.length"));
+    try std.testing.expect(!isFreshAllocatorBuiltin("List.set"));
+    try std.testing.expect(!isFreshAllocatorBuiltin("List.length"));
     // Lookalike receivers must not match.
     try std.testing.expect(!isFreshAllocatorBuiltin("Foo.new"));
-    try std.testing.expect(!isFreshAllocatorBuiltin("VectorAlt.new_filled"));
-    try std.testing.expect(!isFreshAllocatorBuiltin("Vec.new_empty"));
+    try std.testing.expect(!isFreshAllocatorBuiltin("ListAlt.new_filled"));
+    try std.testing.expect(!isFreshAllocatorBuiltin("OtherList.new_empty"));
+    try std.testing.expect(!isFreshAllocatorBuiltin("ListAlias.new_filled"));
     try std.testing.expect(!isFreshAllocatorBuiltin("new"));
     try std.testing.expect(!isFreshAllocatorBuiltin(""));
 }
@@ -2659,23 +3391,22 @@ test "arc_liveness: isUncheckedOwnedMutatingBuiltin distinguishes checked and un
     try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Map.delete_owned_unchecked"));
     try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Map.merge_owned_unchecked"));
     try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Map:str:i64.put_owned_unchecked"));
-    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Vector.set_owned_unchecked"));
-    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Vector.push_owned_unchecked"));
-    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Vector.pop_owned_unchecked"));
-    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Vector.append_owned_unchecked"));
-    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("Vector:f64.append_owned_unchecked"));
-    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("VectorI64.set_owned_unchecked"));
-    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("VectorI64.push_owned_unchecked"));
-    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("VectorF64.append_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("List.set_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("List.push_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("List.pop_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("List.append_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("List:f64.append_owned_unchecked"));
+    try std.testing.expect(isUncheckedOwnedMutatingBuiltin("ListNested:f64.append_owned_unchecked"));
     // Negative: checked variants are NOT unchecked.
     try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("Map.put"));
     try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("Map.delete"));
-    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("Vector.set"));
-    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("Vector.push"));
+    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("List.set"));
+    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("List.push"));
     // Negative: non-owned-mutating names with the suffix don't qualify.
     try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("Map.get_owned_unchecked"));
     try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("Foo.put_owned_unchecked"));
-    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("VectorAlt.set_owned_unchecked"));
+    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("ListAlt.set_owned_unchecked"));
+    try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("ListAlias.set_owned_unchecked"));
     // Negative: empty / malformed names.
     try std.testing.expect(!isUncheckedOwnedMutatingBuiltin(""));
     try std.testing.expect(!isUncheckedOwnedMutatingBuiltin("put_owned_unchecked"));
@@ -2783,7 +3514,7 @@ fn streamFallsThrough(stream: []const ir.Instruction) bool {
     return !isTerminator(stream[stream.len - 1]);
 }
 
-fn isTerminator(instr: ir.Instruction) bool {
+pub fn isTerminator(instr: ir.Instruction) bool {
     return switch (instr) {
         .ret,
         .tail_call,
@@ -2831,7 +3562,7 @@ fn isReturnEquivalentTerminator(instr: ir.Instruction) bool {
     };
 }
 
-const UseList = struct {
+pub const UseList = struct {
     buf: [16]ir.LocalId = undefined,
     overflow: std.ArrayListUnmanaged(ir.LocalId) = .empty,
     len: usize = 0,
@@ -2865,7 +3596,7 @@ const UseList = struct {
 /// Sub-streams of nested instructions are NOT included — the
 /// dataflow visits them separately. Only the immediate uses by the
 /// instruction's own opcode are collected.
-fn collectUses(instr: ir.Instruction, buf: *UseList) void {
+pub fn collectUses(instr: ir.Instruction, buf: *UseList) void {
     const allocator = std.heap.page_allocator; // overflow only
     switch (instr) {
         .const_int, .const_float, .const_string, .const_bool, .const_atom => {},
@@ -3059,7 +3790,7 @@ fn collectUses(instr: ir.Instruction, buf: *UseList) void {
     }
 }
 
-const DefList = struct {
+pub const DefList = struct {
     buf: [4]ir.LocalId = undefined,
     len: usize = 0,
 
@@ -3077,7 +3808,7 @@ const DefList = struct {
 
 /// Locals defined (written) by this instruction. Sub-stream defs are
 /// not collected here — the recursive walk visits them.
-fn collectDefs(instr: ir.Instruction) DefList {
+pub fn collectDefs(instr: ir.Instruction) DefList {
     var out: DefList = .{};
     switch (instr) {
         .const_int => |x| out.append(x.dest),
@@ -3349,6 +4080,33 @@ const LiveSet = struct {
                         if (l.isSet(b) and !ol.isSet(b)) l.unset(b);
                     }
                 },
+            },
+        }
+    }
+
+    /// In-place bitwise union. Bits set in `self` after the call are
+    /// those set in either `self` or `other`. Same `bit_count`
+    /// required.
+    pub fn unionWith(self: *LiveSet, other: *const LiveSet) void {
+        std.debug.assert(self.bit_count == other.bit_count);
+        switch (self.storage) {
+            .small => |*v| switch (other.storage) {
+                .small => |ov| v.* |= ov,
+                .large => |ol| {
+                    var b: u32 = 0;
+                    while (b < self.bit_count and b < 64) : (b += 1) {
+                        if (ol.isSet(b)) v.* |= (@as(u64, 1) << @intCast(b));
+                    }
+                },
+            },
+            .large => |*l| switch (other.storage) {
+                .small => |ov| {
+                    var b: u32 = 0;
+                    while (b < self.bit_count and b < 64) : (b += 1) {
+                        if ((ov & (@as(u64, 1) << @intCast(b))) != 0) l.set(b);
+                    }
+                },
+                .large => |ol| l.setUnion(ol),
             },
         }
     }
@@ -4824,8 +5582,8 @@ test "arc_liveness: Phase H.6 — multiple param_get of same .owned slot share o
     // same slot. The terminator's `owned_at_ret` snapshot then carried
     // BOTH alias bits, drop-insertion emitted one `release` per alias,
     // and the runtime double-released the slot's single +1. The next
-    // tail-recursive iteration observed `Vector` cells with garbage
-    // length headers and crashed with `Vector.get/set: index out of
+    // tail-recursive iteration observed list cells with garbage
+    // length headers and crashed with `List.get/set: index out of
     // bounds`.
     //
     // The fix: in `applyOwnsEffect`, treat `param_get` of an `.owned`
@@ -4899,13 +5657,16 @@ test "arc_liveness: Phase H.6 — multiple param_get of same .owned slot share o
     local_ownership[2] = .owned;
     local_ownership[4] = .owned;
 
+    const list_i64_element_type: ir.ZigType = .i64;
+    const list_i64_type: ir.ZigType = .{ .list = &list_i64_element_type };
+
     const params = try arena.alloc(ir.Param, 1);
     // `arc_managed` callback below returns true unconditionally, so any
     // non-null `type_id` here passes the ARC-param filter at
     // `arc_param_indices` construction time. `0` is a valid `TypeId`
     // (TypeStore reserves `BOOL = 0`), so this doesn't conflict with
     // any sentinel.
-    params[0] = .{ .name = "p", .type_expr = .vector_i64, .type_id = 0 };
+    params[0] = .{ .name = "p", .type_expr = list_i64_type, .type_id = 0 };
 
     const param_conventions = try arena.alloc(ir.ParamConvention, 1);
     param_conventions[0] = .owned;
@@ -4916,7 +5677,7 @@ test "arc_liveness: Phase H.6 — multiple param_get of same .owned slot share o
         .scope_id = 0,
         .arity = 1,
         .params = params,
-        .return_type = .vector_i64,
+        .return_type = list_i64_type,
         .body = blocks,
         .is_closure = false,
         .captures = &.{},
@@ -4949,6 +5710,263 @@ test "arc_liveness: Phase H.6 — multiple param_get of same .owned slot share o
         }
     }
     try std.testing.expectEqual(@as(u32, 1), slot0_count);
+}
+
+test "arc_liveness: param_get after owned-slot consume is non-owning" {
+    // Regression: fannkuch's `shift_left` moves an `.owned` List
+    // parameter into `List.set_owned_unchecked`, then refetches the
+    // same parameter slot to read the next element in the set value
+    // expression before tail-recursing with the updated list. The
+    // later `param_get` is a non-owning alias after the slot's single
+    // +1 was consumed by the receiver move; treating it as an owner
+    // lets drop insertion release a stale alias immediately before
+    // the recursive tail jump.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const tail_args = try arena.alloc(ir.LocalId, 1);
+    tail_args[0] = 2;
+
+    const stream = try arena.alloc(ir.Instruction, 6);
+    stream[0] = .{ .param_get = .{ .dest = 1, .index = 0 } };
+    stream[1] = .{ .move_value = .{ .dest = 2, .source = 1 } };
+    stream[2] = .{ .param_get = .{ .dest = 3, .index = 0 } };
+    stream[3] = .{ .share_value = .{ .dest = 4, .source = 3, .mode = .retain } };
+    stream[4] = .{ .release = .{ .value = 4 } };
+    stream[5] = .{ .tail_call = .{ .name = "loop", .args = tail_args } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 5);
+    for (local_ownership) |*o| o.* = .trivial;
+    local_ownership[1] = .owned;
+    local_ownership[2] = .owned;
+    local_ownership[3] = .owned;
+    local_ownership[4] = .owned;
+
+    const list_i64_element_type: ir.ZigType = .i64;
+    const list_i64_type: ir.ZigType = .{ .list = &list_i64_element_type };
+
+    const params = try arena.alloc(ir.Param, 1);
+    params[0] = .{ .name = "p", .type_expr = list_i64_type, .type_id = 0 };
+
+    const param_conventions = try arena.alloc(ir.ParamConvention, 1);
+    param_conventions[0] = .owned;
+
+    const function = ir.Function{
+        .id = 0,
+        .name = "owned_param_refetch_test",
+        .scope_id = 0,
+        .arity = 1,
+        .params = params,
+        .return_type = list_i64_type,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = param_conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        &function,
+        suite_dummy_type_store_for_h6,
+        arc_managed_for_h6,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    try std.testing.expect(ownership.non_owning_param_refetches.contains(3));
+    const tail_owned = ownership.owned_at_ret.get(5) orelse return error.MissingTailSnapshot;
+    try std.testing.expect(!tail_owned.contains(3));
+}
+
+test "arc_liveness: flat case_block keeps branch-owned locals out of outer ret" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const guard_body = try arena.alloc(ir.Instruction, 3);
+    guard_body[0] = .{ .const_string = .{ .dest = 2, .value = "selected" } };
+    guard_body[1] = .{ .const_string = .{ .dest = 3, .value = "temporary" } };
+    guard_body[2] = .{ .case_break = .{ .value = 2 } };
+
+    const pre_instrs = try arena.alloc(ir.Instruction, 4);
+    pre_instrs[0] = .{ .const_bool = .{ .dest = 0, .value = true } };
+    pre_instrs[1] = .{ .guard_block = .{ .condition = 0, .body = guard_body } };
+    pre_instrs[2] = .{ .const_string = .{ .dest = 4, .value = "default" } };
+    pre_instrs[3] = .{ .case_break = .{ .value = 4 } };
+
+    const stream = try arena.alloc(ir.Instruction, 2);
+    stream[0] = .{ .case_block = .{
+        .dest = 1,
+        .pre_instrs = pre_instrs,
+        .arms = &.{},
+        .default_instrs = &.{},
+        .default_result = null,
+    } };
+    stream[1] = .{ .ret = .{ .value = 1 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 5);
+    for (local_ownership) |*ownership_class| ownership_class.* = .trivial;
+    local_ownership[1] = .owned;
+    local_ownership[2] = .owned;
+    local_ownership[3] = .owned;
+    local_ownership[4] = .owned;
+
+    const string_type: ir.ZigType = .string;
+    const function = ir.Function{
+        .id = 0,
+        .name = "flat_case_scope_test",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = string_type,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        &function,
+        suite_dummy_type_store_for_h6,
+        arc_managed_for_h6,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    var outer_ret_has_case_dest = false;
+    var outer_ret_has_branch_local = false;
+    var owned_ret_iter = ownership.owned_at_ret.valueIterator();
+    while (owned_ret_iter.next()) |set_ptr| {
+        if (set_ptr.contains(1)) outer_ret_has_case_dest = true;
+        if (set_ptr.contains(2) or set_ptr.contains(3) or set_ptr.contains(4)) {
+            outer_ret_has_branch_local = true;
+        }
+    }
+    try std.testing.expect(outer_ret_has_case_dest);
+    try std.testing.expect(!outer_ret_has_branch_local);
+
+    var case_break_releases_temp = false;
+    var case_break_releases_result = false;
+    var case_break_iter = ownership.owned_at_case_break.valueIterator();
+    while (case_break_iter.next()) |set_ptr| {
+        if (set_ptr.contains(3)) case_break_releases_temp = true;
+        if (set_ptr.contains(2) or set_ptr.contains(4)) case_break_releases_result = true;
+    }
+    try std.testing.expect(case_break_releases_temp);
+    try std.testing.expect(!case_break_releases_result);
+}
+
+test "arc_liveness: Phase 2.7 records non-ARC aggregate last-use through ARC-managed extraction" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const tuple_elements = try arena.alloc(ir.LocalId, 1);
+    tuple_elements[0] = 0;
+
+    const stream = try arena.alloc(ir.Instruction, 5);
+    stream[0] = .{ .const_string = .{ .dest = 0, .value = "component" } };
+    stream[1] = .{ .tuple_init = .{ .dest = 1, .elements = tuple_elements } };
+    stream[2] = .{ .index_get = .{ .dest = 2, .object = 1, .index = 0 } };
+    stream[3] = .{ .retain = .{ .value = 2 } };
+    stream[4] = .{ .ret = .{ .value = 2 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 3);
+    local_ownership[0] = .owned;
+    local_ownership[1] = .trivial;
+    local_ownership[2] = .borrowed;
+
+    const function = ir.Function{
+        .id = 0,
+        .name = "phase_2_7_non_arc_aggregate",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .string,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        &function,
+        suite_dummy_type_store_for_h6,
+        arc_managed_for_h6,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    try std.testing.expect(!ownership.arc_managed_locals.contains(1));
+    try std.testing.expect(ownership.arc_managed_locals.contains(2));
+    try std.testing.expect(ownership.isLastUseAt(1, 2));
+    try std.testing.expect(!ownership.last_use_map.contains(1));
+}
+
+test "arc_liveness: Phase 2.7 ignores non-ARC aggregate without ARC-managed extraction" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const tuple_elements = try arena.alloc(ir.LocalId, 1);
+    tuple_elements[0] = 0;
+
+    const stream = try arena.alloc(ir.Instruction, 4);
+    stream[0] = .{ .const_int = .{ .dest = 0, .value = 42 } };
+    stream[1] = .{ .tuple_init = .{ .dest = 1, .elements = tuple_elements } };
+    stream[2] = .{ .index_get = .{ .dest = 2, .object = 1, .index = 0 } };
+    stream[3] = .{ .ret = .{ .value = null } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 3);
+    for (local_ownership) |*ownership_class| ownership_class.* = .trivial;
+
+    const function = ir.Function{
+        .id = 0,
+        .name = "phase_2_7_trivial_aggregate",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        &function,
+        suite_dummy_type_store_for_h6,
+        arc_managed_for_h6,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    try std.testing.expect(!ownership.isLastUseAt(1, 2));
+    try std.testing.expectEqual(@as(u32, 0), ownership.last_use_sites.size);
 }
 
 // Stand-in `TypeStore` pointer for the Phase H.6 hand-rolled test.

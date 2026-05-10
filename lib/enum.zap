@@ -166,6 +166,22 @@ pub struct Enum {
   }
 
   @doc = """
+    List fast-path for `sum/1`: walks the flat buffer directly.
+    """
+
+  pub fn sum(list :: List(i64)) -> i64 {
+    :zig.List.sum(list)
+  }
+
+  @doc = """
+    Floating-point List fast-path for `sum/1`: walks the flat buffer directly.
+    """
+
+  pub fn sum(list :: List(f64)) -> f64 {
+    :zig.List.sum(list)
+  }
+
+  @doc = """
     Range fast-path for `sum/1`: closed-form Gauss
     `count * (first + last) / 2`. O(1) versus the O(n) walk the
     generic `Enumerable` implementation performs.

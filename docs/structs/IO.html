@@ -72,6 +72,7 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Tuple.html">Tuple</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
@@ -132,6 +133,8 @@ pipe chains.</p>
 <table class="summary">
 <tr><td class="summary-name"><a href="#puts-1">puts/1</a></td><td class="summary-doc">    Prints a value to standard output followed by a newline.</td></tr>
 <tr><td class="summary-name"><a href="#print_str-1">print_str/1</a></td><td class="summary-doc">Prints a value to standard output without a trailing newline.</td></tr>
+<tr><td class="summary-name"><a href="#write_byte-1">write_byte/1</a></td><td class="summary-doc">Writes a single raw byte to standard output through the buffered
+writer.</td></tr>
 <tr><td class="summary-name"><a href="#gets-0">gets/0</a></td><td class="summary-doc">Reads a line from standard input.</td></tr>
 <tr><td class="summary-name"><a href="#warn-1">warn/1</a></td><td class="summary-doc">Prints a message to standard error followed by a newline.</td></tr>
 <tr><td class="summary-name"><a href="#mode-1">mode/1</a></td><td class="summary-doc">Switches the terminal input mode.</td></tr>
@@ -182,6 +185,29 @@ indicators or prompts.</p>
 </div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L48">Source</a>
 </div>
+<div class="function-detail" id="write_byte-1">
+<div class="function-header">
+<h3>write_byte<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#write_byte-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">write_byte</span><span class="sig-paren">(</span>byte<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Writes a single raw byte to standard output through the buffered
+writer.</p>
+<p>Useful for streaming binary output (PBM bitmaps, bit-packed
+payloads, byte-level protocols) without allocating a <code>String</code>
+per byte. The byte is <code>i64 &amp; 0xff</code>; the buffered writer flushes
+automatically when the buffer fills, when the program reads
+from stdin, when it writes to stderr, and at process exit.</p>
+<p>Returns the byte unchanged so it composes in pipe chains.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-comment"># Write a P4 PBM bitmap row, eight pixels per byte</span>
+IO.write_byte(byte_acc)</code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L71">Source</a>
+</div>
 <div class="function-detail" id="gets-0">
 <div class="function-header">
 <h3>gets<span class="arity">/0</span></h3>
@@ -198,7 +224,7 @@ Returns an empty string on EOF.</p>
 <pre><code class="language-zap">name <span class="hl-op">=</span> IO.gets()
 IO.puts(<span class="hl-string">"Hello, "</span> <span class="hl-op">&lt;&gt;</span> name)</code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L65">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L87">Source</a>
 </div>
 <div class="function-detail" id="warn-1">
 <div class="function-header">
@@ -215,7 +241,7 @@ mix with normal output.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">IO.warn(<span class="hl-string">"something went wrong"</span>)</code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L80">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L102">Source</a>
 </div>
 <div class="function-detail" id="mode-1">
 <div class="function-header">
@@ -232,7 +258,7 @@ mix with normal output.</p>
 key <span class="hl-op">=</span> IO.get_char()
 IO.mode(IO.Mode.Normal)   <span class="hl-comment"># restore line-buffered mode</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L95">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L117">Source</a>
 </div>
 <div class="function-detail" id="mode-2">
 <div class="function-header">
@@ -241,7 +267,7 @@ IO.mode(IO.Mode.Normal)   <span class="hl-comment"># restore line-buffered mode<
 <div style="flex:1"></div>
 <a href="#mode-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">mode</span><span class="sig-paren">(</span>mode_value<span class="sig-separator">::</span><span class="sig-type-pill">IO.Mode</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">() -&gt; result</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">result</span></code></div>
+<div class="signature"><code><span class="sig-name">mode</span><span class="sig-paren">(</span>mode_value<span class="sig-separator">::</span><span class="sig-type-pill">IO.Mode</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">( -&gt; result)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">result</span></code></div>
 <div class="function-doc">
 <p>Switches terminal mode, runs the callback, then restores
 normal mode automatically.</p>
@@ -252,7 +278,7 @@ normal mode automatically.</p>
   <span class="hl-number">0</span>
 })</code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L113">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L135">Source</a>
 </div>
 <div class="function-detail" id="get_char-0">
 <div class="function-header">
@@ -272,7 +298,7 @@ In normal mode, blocks until Enter then returns the first character.</p>
 key <span class="hl-op">=</span> IO.get_char()
 IO.mode(<span class="hl-number">0</span>)</code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L135">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L157">Source</a>
 </div>
 <div class="function-detail" id="try_get_char-0">
 <div class="function-header">
@@ -294,7 +320,7 @@ key <span class="hl-op">=</span> IO.try_get_char()
   IO.puts(<span class="hl-string">"no key pressed"</span>)
 }</code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L155">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L177">Source</a>
 </div>
 </main>
 <aside class="toc">
@@ -303,6 +329,7 @@ key <span class="hl-op">=</span> IO.try_get_char()
 <li class="toc-section">Functions</li>
 <li><a href="#puts-1">puts/1</a></li>
 <li><a href="#print_str-1">print_str/1</a></li>
+<li><a href="#write_byte-1">write_byte/1</a></li>
 <li><a href="#gets-0">gets/0</a></li>
 <li><a href="#warn-1">warn/1</a></li>
 <li><a href="#mode-1">mode/1</a></li>

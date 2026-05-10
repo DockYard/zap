@@ -992,7 +992,7 @@ const Pipeline = struct {
         // is no later "merged" stage where the inference must re-run.
         // The per-struct path (`runIrLoweringWithTryIdSeed`) defers
         // drop-insertion to `compileStructByStruct`'s Phase 5b so the
-        // post-merge V8 inference sees a clean `last_use_map` (see
+        // post-merge uniqueness inference sees a clean `last_use_map` (see
         // the note in `runIrLoweringWithTryIdSeed`).
         runArcDropInsertion(self.alloc, &program, &ownership) catch
             return self.failWith("Error during ARC drop insertion", error.IrFailed);
@@ -1034,9 +1034,9 @@ const Pipeline = struct {
         // NOTE: this per-struct inference necessarily MISSES cross-struct
         // call sites — its `name_to_id` table only contains the
         // current struct's functions, so a call from
-        // `VectorTest.fill_loop` to `VectorI64.set` (defined in a
+        // a flat-list fill loop to `List.set` (defined in a
         // different struct) cannot resolve back to a callee FunctionId
-        // and the call site is never recorded against `VectorI64.set`'s
+        // and the call site is never recorded against `List.set`'s
         // promotion candidates. The conservative outcome is that
         // wrappers whose only callers live in OTHER structs stay
         // `.borrowed`, and the rc-1 fast path never fires for them.
@@ -1059,7 +1059,7 @@ const Pipeline = struct {
         // drop-insertion adds explicit `release value=L` instructions
         // before terminators, and `arc_liveness` counts those releases
         // as "uses" of L, polluting `last_use_map[L]`. The post-merge
-        // V8 inference then sees `last_use_map[share_source] != share_id`
+        // uniqueness inference then sees `last_use_map[share_source] != share_id`
         // (because the release is now the last use) and refuses to
         // promote — locking in the per-struct `.borrowed` decision
         // and defeating the entire point of the merged re-run.
@@ -1875,7 +1875,7 @@ pub fn compileStructByStruct(
     // most once per struct regardless: a second lowering would emit a
     // second `ir.Function` record for every public function with the
     // same name but a different `FunctionId`, which silently breaks
-    // every downstream pass that maps function names to IDs (the v8
+    // every downstream pass that maps function names to IDs (the uniqueness
     // fixpoint signature table, the ARC convention `lift_set`, the
     // chain-consistency audit). Treat upstream duplicates as a bug to
     // surface — once discovery is the single source of truth this
@@ -2035,7 +2035,7 @@ pub fn compileStructByStruct(
     // params from `.borrowed` to `.owned`. The per-struct pipeline only
     // sees its own struct's call sites (the per-struct `name_to_id`
     // table only contains that struct's functions), so wrappers like
-    // `VectorI64.set` and `Map.put` whose only callers live in OTHER
+    // `List.set` and `Map.put` whose only callers live in OTHER
     // structs (e.g. user code in `FannkuchRedux`, `KNucleotide`) are
     // missed by the per-struct inference. This pass runs against the
     // merged program so EVERY caller is visible.
@@ -2051,7 +2051,7 @@ pub fn compileStructByStruct(
     //
     // This wiring fix unblocks the rc-1 fast path for ARC-managed
     // wrappers whose callers are in other structs — without it, every
-    // `VectorI64.set`/`Map.put`/etc. call from user code enters the
+    // `List.set`/`Map.put`/etc. call from user code enters the
     // runtime at refcount >= 2 and triggers the COW clone path.
     {
         // Recompute ownership against the merged IR so the inference
@@ -2177,34 +2177,34 @@ fn runArcOwnershipAndVerify(
         const function: *ir.Function = @constCast(&program.functions[i]);
         zap.arc_ownership.rewriteOwnedConsumeSites(alloc, function, program) catch return error.OutOfMemory;
     }
-    // Phase H/V8 (codegen): for each owned-mutating call site whose
-    // V8 static-uniqueness predicate holds, swap the callee name to
+    // Phase H/uniqueness (codegen): for each owned-mutating call site whose
+    // uniqueness static-uniqueness predicate holds, swap the callee name to
     // its `*_owned_unchecked` peer. This is a strict refinement of
-    // Phase 4's move-on-last-use rewrite — V8 holds only at sites
+    // Phase 4's move-on-last-use rewrite — uniqueness holds only at sites
     // where Phase 4 also fired (and additionally proved that the
     // receiver's cell was never aliased before the call).
     //
     // Runs AFTER `rewriteOwnedConsumeSites` so the IR shape
-    // consumed by V8 matches the post-classification shape, and
-    // BEFORE `arc_verifier.verify` so the V8 invariant in the
+    // consumed by uniqueness matches the post-classification shape, and
+    // BEFORE `arc_verifier.verify` so the uniqueness invariant in the
     // verifier sees this pass's rewrites and catches any mistake.
     //
-    // A1 (interprocedural V8): before the per-function V8, run the
+    // A1 (interprocedural uniqueness): before the per-function uniqueness, run the
     // whole-program fixpoint to compute per-callee per-param
     // unique-on-entry contracts. The per-function pass then consults
     // the fixpoint when classifying `param_get`: a slot proven
     // unique-on-entry across every reachable caller produces a
     // unique dest, propagating into the function's owned-mutating
-    // call sites. This activates V8 on accumulator-recursion patterns
+    // call sites. This activates uniqueness on accumulator-recursion patterns
     // (fannkuch-redux, k-nucleotide) where the receiver is passed
     // through tail-recursive calls.
-    var program_uniqueness = zap.v8_interprocedural.analyzeProgram(alloc, program) catch |err| switch (err) {
+    var program_uniqueness = zap.uniqueness_interprocedural.analyzeProgram(alloc, program) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer program_uniqueness.deinit(alloc);
 
-    // Phase 2.5: compute v8_signature signatures and recompute per-
-    // function ARC ownership so the V8 dataflow can synthesize
+    // Phase 2.5: compute uniqueness_signature signatures and recompute per-
+    // function ARC ownership so the uniqueness dataflow can synthesize
     // tuple_pending entries for callee tuple-returns and recognise
     // the `index_get + retain` destructure idiom as a uniqueness-
     // preserving move at the parent tuple's last-use.
@@ -2212,11 +2212,11 @@ fn runArcOwnershipAndVerify(
     // Signatures are computed against the post-rewrite IR (after
     // `rewriteOwnedConsumeBuiltinSites`/`classifyAndNormalize`/
     // `rewriteOwnedConsumeSites`), so the witness propagation
-    // matches the IR shape the V8 dataflow walks.
+    // matches the IR shape the uniqueness dataflow walks.
     //
     // ARC ownership is recomputed against the post-rewrite IR so
     // the `last_use_sites` keys align with the InstructionIds that
-    // the V8 dataflow assigns. Without the recompute, the original
+    // the uniqueness dataflow assigns. Without the recompute, the original
     // `ownership` carries pre-rewrite ids which `classifyAndNormalize`
     // shifted by stripping `local_get`/`retain` pairs.
     var post_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, program, type_store) catch |err| switch (err) {
@@ -2224,7 +2224,7 @@ fn runArcOwnershipAndVerify(
     };
     defer post_ownership.deinit();
 
-    var signatures = zap.v8_fixpoint.computeSignaturesWithOwnership(alloc, program, &post_ownership) catch |err| switch (err) {
+    var signatures = zap.uniqueness_fixpoint.computeSignaturesWithOwnership(alloc, program, &post_ownership) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer signatures.deinit(alloc);
@@ -2232,7 +2232,7 @@ fn runArcOwnershipAndVerify(
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
         const fn_ownership = post_ownership.get(function.id);
-        var uniqueness = zap.v8_uniqueness.analyzeUniquenessFull(
+        var uniqueness = zap.uniqueness.analyzeUniquenessFull(
             alloc,
             function,
             program,
@@ -2243,7 +2243,26 @@ fn runArcOwnershipAndVerify(
             error.OutOfMemory => return error.OutOfMemory,
         };
         defer uniqueness.deinit(alloc);
-        zap.arc_ownership.rewriteUncheckedV8SitesWithProgram(alloc, function, &uniqueness, program) catch return error.OutOfMemory;
+        if (fn_ownership) |ownership_for_function| {
+            zap.arc_ownership.rewriteUncheckedUniquenessSitesWithOwnership(
+                alloc,
+                function,
+                &uniqueness,
+                program,
+                ownership_for_function,
+            ) catch return error.OutOfMemory;
+        } else {
+            zap.arc_ownership.rewriteUncheckedUniquenessSitesWithProgram(alloc, function, &uniqueness, program) catch return error.OutOfMemory;
+        }
+        // Wrapper bypass can introduce new direct call_builtin sites
+        // after the first consume rewrite has already run. Re-run the
+        // builtin consume rewrite against the post-classification
+        // ownership table so direct `List.push_owned_unchecked` /
+        // `List.set_owned_unchecked` sites drop releases for element
+        // arguments consumed by the runtime ABI.
+        if (fn_ownership) |ownership_for_function| {
+            zap.arc_ownership.rewriteOwnedConsumeBuiltinSites(alloc, function, ownership_for_function) catch return error.OutOfMemory;
+        }
     }
     for (program.functions) |*function| {
         zap.arc_verifier.verifyWithFixpoint(alloc, function, program, &program_uniqueness) catch |err| switch (err) {
@@ -2265,36 +2284,30 @@ fn runArcDropInsertion(
     program: *ir.Program,
     ownership: *const zap.arc_liveness.ProgramArcOwnership,
 ) CompileError!void {
-    // Phase 2.6.3 — `insertTupleComponentReleases` exists as a
-    // standalone pass (see `src/arc_drop_insertion.zig`) but is
-    // intentionally NOT wired into the production pipeline yet.
-    // The pass is correct for the destructure-then-V8 idiom in
-    // isolation (see the unit test
-    // "Phase 2.6.3: insertTupleComponentReleases emits release for
-    // ARC component at tuple last-use"), but enabling it together
-    // with Phase 2.6.1 (signature propagation) and Phase 2.6.2
-    // (TentativeAnalyzer tuple_pending) trips a corner case in the
-    // production rewrite pipeline at fannkuch n>=5 — under that
-    // configuration `arc_ownership.classifyAndNormalize` reclassifies
-    // the destructured local so its `local_ownership[i]` is no
-    // longer `.owned`, which makes Item 2.6.3's collector skip the
-    // release insertion and the resulting IR runs `*_owned_unchecked`
-    // against a refcount=2 cell. Resolving this requires a deeper
-    // architectural change — either rebuilding the local_ownership
-    // classification after the post-Phase-2.6 rewrites, or
-    // threading the pre-rewrite class through to
-    // `insertTupleComponentReleases`. Out of scope for the current
-    // commit; see the Phase 2.6 deferred-work list in the agent
-    // report.
-    //
-    // The unit-test-level pass remains green (917 tests passing,
-    // including the new Phase 2.6 tests), and the full Phase 2.6
-    // infrastructure is in place for a follow-up to land cleanly.
-
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
         const fn_ownership = ownership.get(function.id) orelse continue;
         zap.arc_drop_insertion.insertScopeExitDrops(alloc, function, fn_ownership) catch return error.OutOfMemory;
+        // Phase 2.7: component-release insertion is wired after
+        // scope-exit drops so `insertScopeExitDrops` can consume the
+        // pre-rewrite InstructionIds in `fn_ownership`. The component
+        // pass recomputes aggregate last-use over the current stream
+        // and uses `fn_ownership.arc_managed_locals` only for ARC
+        // classification, which remains stable after the scope-exit
+        // rewrite.
+        zap.arc_drop_insertion.insertTupleComponentReleases(alloc, function, fn_ownership) catch return error.OutOfMemory;
+    }
+
+    var program_uniqueness = zap.uniqueness_interprocedural.analyzeProgram(alloc, program) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer program_uniqueness.deinit(alloc);
+
+    for (program.functions) |*function| {
+        zap.arc_verifier.verifyWithFixpoint(alloc, function, program, &program_uniqueness) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ArcInvariantViolation => return error.IrFailed,
+        };
     }
 
     if (std.c.getenv("ZAP_DUMP_IR_FN")) |raw| {
@@ -2391,6 +2404,7 @@ fn dumpStream(stream: []const ir.Instruction, indent: usize) void {
             .tuple_init => |ti| std.debug.print(" dest={d}", .{ti.dest}),
             .list_init => |li| std.debug.print(" dest={d}", .{li.dest}),
             .list_cons => |lc| std.debug.print(" dest={d} head={d} tail={d}", .{ lc.dest, lc.head, lc.tail }),
+            .optional_dispatch => |od| std.debug.print(" scrutinee_param={d} payload_local={d}", .{ od.scrutinee_param, od.payload_local }),
             else => {},
         }
         std.debug.print("\n", .{});
@@ -2414,6 +2428,8 @@ fn dumpStream(stream: []const ir.Instruction, indent: usize) void {
                     std.debug.print("{s}  case[{d}]:\n", .{ spaces[0..used], ci });
                     dumpStream(c.body_instrs, indent + 4);
                 }
+                std.debug.print("{s}  default:\n", .{(spaces[0..used])});
+                dumpStream(sr.default_instrs, indent + 4);
             },
             .guard_block => |gb| {
                 std.debug.print("{s}  guard_body:\n", .{spaces[0..used]});
@@ -2428,6 +2444,16 @@ fn dumpStream(stream: []const ir.Instruction, indent: usize) void {
                     std.debug.print("{s}  arm[{d}].body:\n", .{ spaces[0..used], ai });
                     dumpStream(arm.body_instrs, indent + 4);
                 }
+            },
+            .optional_dispatch => |od| {
+                std.debug.print("{s}  nil", .{spaces[0..used]});
+                if (od.nil_result) |result| std.debug.print(" result={d}", .{result});
+                std.debug.print(":\n", .{});
+                dumpStream(od.nil_instrs, indent + 4);
+                std.debug.print("{s}  struct", .{spaces[0..used]});
+                if (od.struct_result) |result| std.debug.print(" result={d}", .{result});
+                std.debug.print(":\n", .{});
+                dumpStream(od.struct_instrs, indent + 4);
             },
             else => {},
         }
@@ -4439,7 +4465,7 @@ test "compileStructByStruct dedupes a struct that appears twice in struct_order"
     // the struct twice. A second lowering produces a second
     // `ir.Function` record with the same name but a different
     // `FunctionId`, which silently breaks every downstream pass that
-    // maps function names to ids — most importantly the v8 fixpoint
+    // maps function names to ids — most importantly the uniqueness fixpoint
     // signature table and the ARC-convention `lift_set`. Both keys
     // are `FunctionId`s, so callers reaching the duplicate via name
     // resolution land on a different id than the audit walker does,

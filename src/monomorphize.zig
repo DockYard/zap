@@ -74,16 +74,20 @@ pub fn monomorphize(
         ctx.current_scan_struct_idx = mod_idx;
         for (mod.functions) |*group| {
             for (group.clauses) |clause| {
+                ctx.current_scan_params = clause.params;
                 ctx.local_types.clearRetainingCapacity();
                 try ctx.scanBlock(clause.body);
+                ctx.current_scan_params = null;
             }
         }
     }
     ctx.current_scan_struct_idx = null;
     for (program.top_functions) |*group| {
         for (group.clauses) |clause| {
+            ctx.current_scan_params = clause.params;
             ctx.local_types.clearRetainingCapacity();
             try ctx.scanBlock(clause.body);
+            ctx.current_scan_params = null;
         }
     }
 
@@ -496,7 +500,7 @@ const MonomorphContext = struct {
                 }
                 return true;
             },
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .term_type, .vector_type => true,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .term_type => true,
             .struct_type, .union_type, .tagged_union, .opaque_type => true,
         };
     }
@@ -917,6 +921,21 @@ const MonomorphContext = struct {
                             try self.bindProtocolTypeArgsFromImpl(param.type_id, concrete_protocol_type, &subs);
                         }
                         _ = self.store.unify(param.type_id, arg_type, &subs) catch {};
+                    }
+                }
+
+                // Type variables can appear only in the return type for
+                // constructor-shaped generic functions such as
+                // `List.new_empty(capacity) -> List(t)`. Argument unification
+                // has no way to bind `t` there, but the HIR expression may
+                // already carry a concrete contextual type from `expr :: Type`
+                // or another typed use site. Unify that concrete result type
+                // against the generic return before deciding whether this call
+                // has enough type arguments to specialize.
+                {
+                    const contextual_return = self.effectiveExprType(expr);
+                    if (self.isConcreteRuntimeType(contextual_return)) {
+                        _ = self.store.unify(first_clause.return_type, contextual_return, &subs) catch {};
                     }
                 }
 
@@ -1480,6 +1499,7 @@ const MonomorphContext = struct {
             } },
             .list_tail_get => |ltg| .{ .list_tail_get = .{
                 .list = try self.cloneExpr(ltg.list),
+                .start_index = ltg.start_index,
             } },
             .map_value_get => |mvg| .{ .map_value_get = .{
                 .map = try self.cloneExpr(mvg.map),

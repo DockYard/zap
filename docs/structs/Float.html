@@ -67,6 +67,7 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Tuple.html">Tuple</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
@@ -148,6 +149,8 @@ cannot always be represented exactly in floating-point. Use
 <h2 id="functions">Functions</h2>
 <table class="summary">
 <tr><td class="summary-name"><a href="#to_string-1">to_string/1</a></td><td class="summary-doc">Converts a floating-point number to its string representation.</td></tr>
+<tr><td class="summary-name"><a href="#to_string-2">to_string/2</a></td><td class="summary-doc">Format a float to a fixed number of decimal places, matching
+C's `printf(&quot;%.&lt;n&gt;f&quot;, value)` rounding semantics.</td></tr>
 <tr><td class="summary-name"><a href="#abs-1">abs/1</a></td><td class="summary-doc">Returns the absolute value of a float.</td></tr>
 <tr><td class="summary-name"><a href="#max-2">max/2</a></td><td class="summary-doc">Returns the larger of two floats.</td></tr>
 <tr><td class="summary-name"><a href="#min-2">min/2</a></td><td class="summary-doc">Returns the smaller of two floats.</td></tr>
@@ -177,6 +180,22 @@ cannot always be represented exactly in floating-point. Use
 </div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L33">Source</a>
 </div>
+<div class="function-detail" id="to_string-2">
+<div class="function-header">
+<h3>to_string<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#to_string-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">to_string</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">, </span>decimals<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Format a float to a fixed number of decimal places, matching
+C's <code>printf(&quot;%.&lt;n&gt;f&quot;, value)</code> rounding semantics. Useful for
+numeric output that needs to be byte-identical against
+reference implementations in other languages.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L46">Source</a>
+</div>
 <div class="function-detail" id="abs-1">
 <div class="function-header">
 <h3>abs<span class="arity">/1</span></h3>
@@ -192,7 +211,7 @@ cannot always be represented exactly in floating-point. Use
 <div class="function-doc">
 <p>Returns the absolute value of a float.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L41">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L52">Source</a>
 </div>
 <div class="function-detail" id="max-2">
 <div class="function-header">
@@ -209,7 +228,7 @@ cannot always be represented exactly in floating-point. Use
 <div class="function-doc">
 <p>Returns the larger of two floats.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L49">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L60">Source</a>
 </div>
 <div class="function-detail" id="min-2">
 <div class="function-header">
@@ -226,7 +245,7 @@ cannot always be represented exactly in floating-point. Use
 <div class="function-doc">
 <p>Returns the smaller of two floats.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L57">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L68">Source</a>
 </div>
 <div class="function-detail" id="parse-1">
 <div class="function-header">
@@ -240,7 +259,7 @@ cannot always be represented exactly in floating-point. Use
 <p>Parses a string into a float. Returns 0.0 if the string is not
 a valid float representation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L68">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L79">Source</a>
 </div>
 <div class="function-detail" id="round-1">
 <div class="function-header">
@@ -257,7 +276,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Rounds a float to the nearest integer value, returned as a float.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L74">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L85">Source</a>
 </div>
 <div class="function-detail" id="floor-1">
 <div class="function-header">
@@ -274,7 +293,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Returns the largest integer value less than or equal to the given float.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L82">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L93">Source</a>
 </div>
 <div class="function-detail" id="ceil-1">
 <div class="function-header">
@@ -291,7 +310,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Returns the smallest integer value greater than or equal to the given float.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L90">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L101">Source</a>
 </div>
 <div class="function-detail" id="truncate-1">
 <div class="function-header">
@@ -308,7 +327,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Truncates a float toward zero, removing the fractional part.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L98">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L109">Source</a>
 </div>
 <div class="function-detail" id="to_integer-1">
 <div class="function-header">
@@ -333,7 +352,7 @@ rounding mode:</p>
 Float.ceil(<span class="hl-number">0.2</span>)  <span class="hl-op">|&gt;</span> Float.to_integer()    <span class="hl-comment"># =&gt; 1</span>
 Float.round(<span class="hl-number">0.5</span>) <span class="hl-op">|&gt;</span> Float.to_integer()    <span class="hl-comment"># =&gt; 1</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L117">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L128">Source</a>
 </div>
 <div class="function-detail" id="clamp-3">
 <div class="function-header">
@@ -350,7 +369,7 @@ Float.round(<span class="hl-number">0.5</span>) <span class="hl-op">|&gt;</span>
 <div class="function-doc">
 <p>Clamps a float to be within the given range.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L125">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L136">Source</a>
 </div>
 </main>
 <aside class="toc">
@@ -358,6 +377,7 @@ Float.round(<span class="hl-number">0.5</span>) <span class="hl-op">|&gt;</span>
 <ul>
 <li class="toc-section">Functions</li>
 <li><a href="#to_string-1">to_string/1</a></li>
+<li><a href="#to_string-2">to_string/2</a></li>
 <li><a href="#abs-1">abs/1</a></li>
 <li><a href="#max-2">max/2</a></li>
 <li><a href="#min-2">min/2</a></li>

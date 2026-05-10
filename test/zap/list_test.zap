@@ -14,7 +14,7 @@ pub struct Zap.ListTest {
     test("contains? not found") { reject(List.contains?([1, 2, 3], 5)) }
     test("reverse") { assert(List.head(List.reverse([1, 2, 3])) == 3) }
     test("prepend") { assert(List.head(List.prepend([2, 3], 1)) == 1) }
-    test("append") { assert(List.last(List.append([1, 2], 3)) == 3) }
+    test("push") { assert(List.last(List.push([1, 2], 3)) == 3) }
     test("concat") { assert(List.length(List.concat([1, 2], [3, 4])) == 4) }
     test("take") { assert(List.length(List.take([1, 2, 3, 4, 5], 3)) == 3) }
     test("drop") { assert(List.head(List.drop([1, 2, 3, 4, 5], 2)) == 3) }
@@ -56,6 +56,16 @@ pub struct Zap.ListTest {
     }
   }
 
+  describe("multi-head rest patterns") {
+    test("binds indexed heads and rest") {
+      assert(score_three_head_rest([1, 2, 3, 4, 5]) == 125)
+    }
+
+    test("does not match when there are fewer heads than requested") {
+      assert(score_three_head_rest([1, 2]) == -1)
+    }
+  }
+
   fn nested_list_length() -> i64 {
     nested = [[1, 2, 3], [4, 5]]
     List.length(nested)
@@ -65,6 +75,14 @@ pub struct Zap.ListTest {
     nested = [[1, 2, 3], [4, 5]]
     first = List.head(nested)
     List.head(first)
+  }
+
+  fn score_three_head_rest([a, b, c | rest] :: [i64]) -> i64 {
+    (a * 100) + (b * 10) + c + List.length(rest)
+  }
+
+  fn score_three_head_rest(_ :: [i64]) -> i64 {
+    -1
   }
 
   describe("Bang variants") {

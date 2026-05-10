@@ -1,11 +1,11 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
-const v8_interprocedural = @import("v8_interprocedural.zig");
-const v8_signature = @import("v8_signature.zig");
+const uniqueness_interprocedural = @import("uniqueness_interprocedural.zig");
+const uniqueness_signature = @import("uniqueness_signature.zig");
 
 // ============================================================
-// V8 — static-uniqueness analysis (Phase 3 of the dense-map plan).
+// uniqueness — static-uniqueness analysis (Phase 3 of the dense-map plan).
 //
 // Pipeline placement (per docs/dense-map-implementation-plan.md §1.5):
 //
@@ -14,17 +14,17 @@ const v8_signature = @import("v8_signature.zig");
 //             → arc_ownership.rewriteOwnedConsumeBuiltinSites  (Phase 4)
 //                → arc_ownership.classifyAndNormalize          (borrow/copy)
 //                   → arc_ownership.rewriteOwnedConsumeSites   (Phase E.9.2)
-//                      → v8_uniqueness  (THIS PASS — produces "uniqueness"
+//                      → uniqueness  (THIS PASS — produces "uniqueness"
 //                                       side table for codegen + verifier)
-//                         → arc_verifier  (V1–V8)
+//                         → arc_verifier  (V1–uniqueness)
 //                            → arc_drop_insertion
 //                               → ...
 //
-// Why V8 exists:
+// Why uniqueness exists:
 //
 // Phase 4 (commit 0b41035) made the rc-1 fast path fire on every
 // owned-mutating call to `Map.put`/`.delete`/`.merge` and
-// `Vector.set`/`.push`/`.pop`/`.append` whose receiver is at last
+// `List.set`/`.push`/`.pop`/`.append` whose receiver is at last
 // use. The fast path mutates the buffer in place and avoids the
 // deep-retain clone that the shared (rc>1) path requires. But the
 // runtime still pays a per-call cost: every `Map.put` enters the
@@ -33,25 +33,25 @@ const v8_signature = @import("v8_signature.zig");
 // workloads (fannkuch-redux Phase 6 port), the load+compare+branch
 // adds ~32% to wall time.
 //
-// V8 closes that gap by proving — at the IR level — that a given
-// owned-mutating call site receives a refcount-1 cell. When V8
+// uniqueness closes that gap by proving — at the IR level — that a given
+// owned-mutating call site receives a refcount-1 cell. When uniqueness
 // holds, the codegen can emit a runtime variant that mutates in
 // place WITHOUT loading the refcount: `Map.put_owned_unchecked`,
-// `Vector.set_owned_unchecked`, etc. These are zero-branch, in-place
+// `List.set_owned_unchecked`, etc. These are zero-branch, in-place
 // mutations.
 //
 // Soundness:
 //
-// V8 is a refinement of Phase 4's last-use predicate. Every V8 call
+// uniqueness is a refinement of Phase 4's last-use predicate. Every uniqueness call
 // site is also a last-use site (the receiver is dead after the call,
 // so the move_value fired); the converse does not hold (last use
 // alone does not prove the cell never had its refcount bumped before
 // the call).
 //
-// Concretely, V8 proves `definitely_unique` along a forward dataflow:
+// Concretely, uniqueness proves `definitely_unique` along a forward dataflow:
 //
 //   * A local L is `unique` immediately after:
-//     - A fresh allocation that returns rc=1 (Map.new, Vector.new_*,
+//     - A fresh allocation that returns rc=1 (Map.new, List.new_*,
 //       any owned-mutating call's result, ...).
 //     - A `move_value` from a `unique` source.
 //
@@ -79,14 +79,14 @@ const v8_signature = @import("v8_signature.zig");
 //
 // User code calls `Map.put` (a Zap fn in `lib/map.zap`) which
 // forwards to `:zig.Map.put` (a `call_builtin` to the runtime).
-// V8 must hold at the user's call site OR at the wrapper's
+// uniqueness must hold at the user's call site OR at the wrapper's
 // call_builtin to enable the unchecked variant. Since the analysis
 // is per-function, we report uniqueness at every owned-mutating
 // call site (regardless of whether it's `call_named` or
-// `call_builtin`); the codegen layer that consumes V8 picks the
+// `call_builtin`); the codegen layer that consumes uniqueness picks the
 // site at which to emit the `_owned_unchecked` form.
 //
-// Conservative defaults: when in doubt, V8 is FALSE. A wrong TRUE
+// Conservative defaults: when in doubt, uniqueness is FALSE. A wrong TRUE
 // would produce undefined behavior in the unchecked runtime variant
 // (mutate a shared cell). A wrong FALSE costs only the runtime check
 // (the existing Phase 4 path).
@@ -104,7 +104,7 @@ const v8_signature = @import("v8_signature.zig");
 /// same id space the rest of the ARC pipeline uses.
 ///
 /// Absence from the map means "not an owned-mutating call site" or
-/// "could not be analysed" — both are equivalent to V8 = false (the
+/// "could not be analysed" — both are equivalent to uniqueness = false (the
 /// verifier rejects unchecked variants whose call site is absent;
 /// the codegen falls back to the checked variant).
 pub const Uniqueness = struct {
@@ -126,7 +126,7 @@ pub const Uniqueness = struct {
     }
 };
 
-/// Run the V8 forward dataflow on `function` and produce a per-
+/// Run the uniqueness forward dataflow on `function` and produce a per-
 /// owned-mutating-call uniqueness predicate.
 ///
 /// `program` is consulted only to resolve the callee's
@@ -152,8 +152,8 @@ pub fn analyzeUniqueness(
 /// proven unique-on-entry, the dest of the `param_get` is treated as
 /// `definitely_unique`. Otherwise the conservative default applies.
 ///
-/// This is the integration seam for the interprocedural V8 fixpoint
-/// (see `v8_interprocedural.zig`). The compiler driver runs the
+/// This is the integration seam for the interprocedural uniqueness fixpoint
+/// (see `uniqueness_interprocedural.zig`). The compiler driver runs the
 /// fixpoint once per program, then calls this variant for every
 /// function so each per-function analysis sees the proven entry
 /// uniqueness.
@@ -161,13 +161,13 @@ pub fn analyzeUniquenessWithFixpoint(
     allocator: std.mem.Allocator,
     function: *const ir.Function,
     program: ?*const ir.Program,
-    fixpoint: ?*const v8_interprocedural.ProgramUniqueness,
+    fixpoint: ?*const uniqueness_interprocedural.ProgramUniqueness,
 ) !Uniqueness {
     return analyzeUniquenessFull(allocator, function, program, fixpoint, null, null);
 }
 
-/// Phase 2.5 — full V8 dataflow with the complete set of optional
-/// inputs. Threads the whole-program fixpoint, the v8_signature
+/// Phase 2.5 — full uniqueness dataflow with the complete set of optional
+/// inputs. Threads the whole-program fixpoint, the uniqueness_signature
 /// `ProgramSignatures` table, and the per-function `ArcOwnership`
 /// table into the dataflow.
 ///
@@ -192,8 +192,8 @@ pub fn analyzeUniquenessFull(
     allocator: std.mem.Allocator,
     function: *const ir.Function,
     program: ?*const ir.Program,
-    fixpoint: ?*const v8_interprocedural.ProgramUniqueness,
-    signatures: ?*const v8_signature.ProgramSignatures,
+    fixpoint: ?*const uniqueness_interprocedural.ProgramUniqueness,
+    signatures: ?*const uniqueness_signature.ProgramSignatures,
     ownership: ?*const arc_liveness.ArcOwnership,
 ) !Uniqueness {
     var analyzer = Analyzer{
@@ -275,13 +275,13 @@ const Analyzer = struct {
     /// the `param_get`'s dest to be marked `definitely_unique` so
     /// downstream owned-mutating calls fed by an alias of that slot
     /// observe the parameter's proven uniqueness.
-    fixpoint: ?*const v8_interprocedural.ProgramUniqueness,
+    fixpoint: ?*const uniqueness_interprocedural.ProgramUniqueness,
     /// Optional whole-program uniqueness signatures (Phase 2.1). When
     /// non-null, the dataflow synthesizes a `tuple_pending` entry on
     /// the dest of any call whose callee's `return_components` table
     /// records a per-component witness. Each component is classified
     /// as unique iff the witness arg was unique at the call site.
-    signatures: ?*const v8_signature.ProgramSignatures,
+    signatures: ?*const uniqueness_signature.ProgramSignatures,
     /// Optional per-function ARC ownership (last-use side table).
     /// When non-null, the dataflow uses `isLastUseAt` to decide
     /// whether an `index_get + retain` destructure can promote the
@@ -383,7 +383,7 @@ const Analyzer = struct {
     ///      the sole owner.
     ///   5. Since the tuple is at last-use AT the destructure
     ///      sequence's terminal instruction, the implicit release
-    ///      will fire shortly. Subsequent V8 sites observe rc=1
+    ///      will fire shortly. Subsequent uniqueness sites observe rc=1
     ///      cells, so the extracted local is unique.
     ///
     /// Without a per-function `ArcOwnership`, the dataflow can't
@@ -448,7 +448,7 @@ const Analyzer = struct {
     /// `elem_val_imm` and the paired retain bumps the cell's
     /// refcount. The borrow's lifetime is bounded by the source's,
     /// so the source's eventual scope-exit release fires the
-    /// component cell's refcount decrement that V8 relies on.
+    /// component cell's refcount decrement that uniqueness relies on.
     fn copyTuplePending(self: *Analyzer, dest: ir.LocalId, source: ir.LocalId) error{OutOfMemory}!void {
         if (dest == source) return;
         const src_entry = self.tuple_pending.getPtr(source) orelse return;
@@ -546,7 +546,7 @@ const Analyzer = struct {
         // The forward dataflow inside a structural arm starts from
         // the parent stream's current `unique` set. Different arms of
         // an if/switch can leave different sets; for the purposes of
-        // V8 (which is a per-call-site predicate, not a join-set
+        // uniqueness (which is a per-call-site predicate, not a join-set
         // predicate), we walk every arm but reset the uniqueness set
         // back to the parent's snapshot after each arm so that
         // subsequent instructions in the parent stream observe the
@@ -665,7 +665,7 @@ const Analyzer = struct {
     /// site. If so, snapshot the receiver's uniqueness as observed
     /// in the PRE-call dataflow state and store it in the result map.
     ///
-    /// Why classify pre-effect: V8 asks "was the receiver unique when
+    /// Why classify pre-effect: uniqueness asks "was the receiver unique when
     /// it entered the call?" The call's own effect (consume the
     /// receiver, produce a fresh result) is applied AFTER this
     /// classification; classifying after-effect would describe the
@@ -698,7 +698,7 @@ const Analyzer = struct {
     ///     param_conventions contain at least one `.owned` slot AND
     ///     `result_convention == .owned`. The first `.owned` slot is
     ///     treated as the receiver. This covers:
-    ///       - `lib/vector_i64.zap`'s `VectorI64.set`/`push`/etc.
+    ///       - `lib/list.zap`'s `List.set`/`push`/etc.
     ///         where slot 0 is the receiver
     ///       - `k-nucleotide`'s `count_kmers_loop` where the map
     ///         accumulator is at slot 4 (after seq/n/k/i)
@@ -827,7 +827,6 @@ const Analyzer = struct {
         instr: *const ir.Instruction,
         my_id: arc_liveness.InstructionId,
     ) error{OutOfMemory}!void {
-        _ = my_id;
         switch (instr.*) {
             // ----- Producers of unique values -----
             .tuple_init => |ti| {
@@ -1045,7 +1044,7 @@ const Analyzer = struct {
                 //
                 // Phase 2.2 audit: the previous handler removed
                 // ONLY dest, leaving source unique. That was unsound
-                // for V8 — a downstream consume site fed by the
+                // for uniqueness — a downstream consume site fed by the
                 // (still-unique-marked) source would emit
                 // `*_owned_unchecked` over a refcount-2 cell, which
                 // panics on the runtime's rc==1 fast path assertion.
@@ -1074,7 +1073,7 @@ const Analyzer = struct {
             // as ownership transfers (Phase E.9 step 5: local_set is a
             // move from source to dest; local_get is a fresh alias
             // that the classifier elsewhere upgrades to a move when
-            // the source is at last use). V8 mirrors that contract:
+            // the source is at last use). uniqueness mirrors that contract:
             // when the source is provably unique, the dest takes over
             // the uniqueness; otherwise the dest is conservatively
             // not classified.
@@ -1099,7 +1098,7 @@ const Analyzer = struct {
                 }
             },
             .param_get => |pg| {
-                // Interprocedural V8 (A1): consult the fixpoint when
+                // Interprocedural uniqueness (A1): consult the fixpoint when
                 // available. A slot proven `unique_on_entry` by the
                 // whole-program fixpoint guarantees every reachable
                 // caller passed a refcount=1 cell, so the param's
@@ -1151,6 +1150,14 @@ const Analyzer = struct {
                     }
                 }
             },
+            .list_tail => |lt| {
+                const source_unique = self.unique.contains(lt.list);
+                try self.result.sites.put(self.allocator, my_id, source_unique);
+                if (lt.consume_source) {
+                    _ = self.unique.remove(lt.list);
+                }
+                try self.unique.put(self.allocator, lt.dest, {});
+            },
 
             // ----- Control flow / non-data-producing instructions -----
             .release,
@@ -1180,7 +1187,7 @@ const Analyzer = struct {
     ///   2. Zap-fn convention match (any `.owned` slot + `.owned` result).
     ///   3. Zap-fn fresh-allocator wrapper (no `.owned` slots, but body
     ///      is a thin forward to a fresh-allocator builtin like
-    ///      `VectorI64.new_filled`). The result is unique by the
+    ///      `List:i64.new_filled`). The result is unique by the
     ///      runtime's allocation contract.
     /// All three shapes mark the call's dest as unique.
     ///
@@ -1292,7 +1299,7 @@ const Analyzer = struct {
 
     fn synthesizeReturnPendingFromSig(
         self: *Analyzer,
-        sigs: *const v8_signature.ProgramSignatures,
+        sigs: *const uniqueness_signature.ProgramSignatures,
         function_id: ir.FunctionId,
         args: []const ir.LocalId,
         dest: ir.LocalId,
@@ -1353,17 +1360,17 @@ const Analyzer = struct {
     }
 };
 
-/// V8 (Phase 1.4): is `function` a thin Zap-fn wrapper around a
+/// uniqueness (Phase 1.4): is `function` a thin Zap-fn wrapper around a
 /// runtime fresh-allocator intrinsic? The pattern:
 ///
-///     pub fn new_filled(size :: i64, init :: i64) -> VectorI64 {
-///       :zig.VectorI64.new_filled(size, init)
+///     pub fn new_filled(size :: i64, init :: i64) -> List(i64) {
+///       :zig.List.new_filled(size, init)
 ///     }
 ///
 /// lowers to a body containing exactly one owned-bearing call —
-/// `call_builtin name=VectorI64.new_filled` — followed by a `ret`
+/// `call_builtin name=List:i64.new_filled` — followed by a `ret`
 /// of that call's dest. Such wrappers inherit the runtime's "fresh
-/// allocation, refcount=1" contract; the V8 dataflow treats their
+/// allocation, refcount=1" contract; the uniqueness dataflow treats their
 /// result as `definitely_unique`.
 ///
 /// The check is structural: walk every instruction in the function's
@@ -1481,7 +1488,7 @@ const Snapshot = struct {
 
 const testing = std.testing;
 
-/// Build a minimal `ir.Function` for hand-rolled V8 analysis tests.
+/// Build a minimal `ir.Function` for hand-rolled uniqueness analysis tests.
 /// Caller owns the slices and is responsible for freeing them.
 fn buildTestFunction(
     arena: std.mem.Allocator,
@@ -1513,7 +1520,7 @@ fn buildTestFunction(
     };
 }
 
-test "v8_uniqueness: fresh-alloc receiver immediately mutated is unique" {
+test "uniqueness: fresh-alloc receiver immediately mutated is unique" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -1525,7 +1532,7 @@ test "v8_uniqueness: fresh-alloc receiver immediately mutated is unique" {
     //   [3] move_value %3 <- %0          -- transfer uniqueness
     //   [4] call_builtin "Map.put" args=[%3, %1, %2] dest=%4
     //
-    // Expected: V8 holds at the call_builtin (id 4). Receiver %3 is
+    // Expected: uniqueness holds at the call_builtin (id 4). Receiver %3 is
     // unique because it was move_value'd from a fresh map_init.
     const args = try arena.alloc(ir.LocalId, 3);
     args[0] = 3;
@@ -1556,7 +1563,7 @@ test "v8_uniqueness: fresh-alloc receiver immediately mutated is unique" {
     try testing.expect(u.isUnique(4));
 }
 
-test "v8_uniqueness: receiver parked via list_cons before mutation is NOT unique" {
+test "uniqueness: receiver parked via list_cons before mutation is NOT unique" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -1570,7 +1577,7 @@ test "v8_uniqueness: receiver parked via list_cons before mutation is NOT unique
     //   [5] move_value %5 <- %0          -- but %0 is no longer unique
     //   [6] call_builtin "Map.put" args=[%5, %3, %4] dest=%6
     //
-    // Expected: V8 fails at the call_builtin (id 6). Receiver %5 was
+    // Expected: uniqueness fails at the call_builtin (id 6). Receiver %5 was
     // sourced from %0, which lost uniqueness when stored in the
     // list_cons at id 2.
     const args = try arena.alloc(ir.LocalId, 3);
@@ -1604,7 +1611,7 @@ test "v8_uniqueness: receiver parked via list_cons before mutation is NOT unique
     try testing.expect(!u.isUnique(6));
 }
 
-test "v8_uniqueness: result of owned-mutating call is unique (chains)" {
+test "uniqueness: result of owned-mutating call is unique (chains)" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -1620,7 +1627,7 @@ test "v8_uniqueness: result of owned-mutating call is unique (chains)" {
     //   [7] move_value %7 <- %4
     //   [8] call_builtin "Map.put" args=[%7, %5, %6] dest=%8
     //
-    // Expected: V8 holds at BOTH calls (id 4 and id 8). The second
+    // Expected: uniqueness holds at BOTH calls (id 4 and id 8). The second
     // call's receiver %7 is unique because it was move_value'd from
     // %4, the result of an owned-mutating call (which is unique by
     // runtime contract).
@@ -1670,7 +1677,7 @@ test "v8_uniqueness: result of owned-mutating call is unique (chains)" {
     try testing.expect(u.isUnique(8));
 }
 
-test "v8_uniqueness: function-parameter receiver is NOT unique" {
+test "uniqueness: function-parameter receiver is NOT unique" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -1684,7 +1691,7 @@ test "v8_uniqueness: function-parameter receiver is NOT unique" {
     //   [3] move_value %3 <- %0          -- but %0 is a parameter, not unique
     //   [4] call_builtin ":zig.Map.put" args=[%3, %1, %2] dest=%4
     //
-    // Expected: V8 fails at id 4 — the receiver %3's source is a
+    // Expected: uniqueness fails at id 4 — the receiver %3's source is a
     // parameter, whose refcount the callee cannot prove. The user-
     // facing wrapper's call site must use the checked variant.
     const args = try arena.alloc(ir.LocalId, 3);
@@ -1715,7 +1722,7 @@ test "v8_uniqueness: function-parameter receiver is NOT unique" {
     try testing.expect(!u.isUnique(4));
 }
 
-test "v8_uniqueness: receiver share_value'd to a borrowed call then mutated is NOT unique" {
+test "uniqueness: receiver share_value'd to a borrowed call then mutated is NOT unique" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -1730,7 +1737,7 @@ test "v8_uniqueness: receiver share_value'd to a borrowed call then mutated is N
     //   [6] move_value %5 <- %0               -- %0 was already cleared by share_value
     //   [7] call_builtin "Map.put" args=[%5, %3, %4] dest=%5
     //
-    // Expected: V8 fails at id 7 — %0 lost uniqueness at the share_value.
+    // Expected: uniqueness fails at id 7 — %0 lost uniqueness at the share_value.
     // (Runtime: the share path saw refcount=2, which decreased to 1 after
     // the release at id 3 — but the analysis is conservative and treats
     // the transient bump as "permanently" non-unique.)
@@ -1775,7 +1782,7 @@ test "v8_uniqueness: receiver share_value'd to a borrowed call then mutated is N
     try testing.expect(!u.isUnique(7));
 }
 
-test "v8_uniqueness: copy_value clears uniqueness on dest" {
+test "uniqueness: copy_value clears uniqueness on dest" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -1788,7 +1795,7 @@ test "v8_uniqueness: copy_value clears uniqueness on dest" {
     //   [4] move_value %4 <- %1           -- %1 is not unique
     //   [5] call_builtin "Map.put" args=[%4, %2, %3] dest=%5
     //
-    // Expected: V8 fails at id 5.
+    // Expected: uniqueness fails at id 5.
     const args = try arena.alloc(ir.LocalId, 3);
     args[0] = 4;
     args[1] = 2;
@@ -1818,39 +1825,39 @@ test "v8_uniqueness: copy_value clears uniqueness on dest" {
     try testing.expect(!u.isUnique(5));
 }
 
-test "v8_uniqueness: Vector.set and Vector.push fresh-alloc chain is unique" {
+test "uniqueness: List.set and List.push fresh-alloc chain is unique" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
 
-    // Stream simulating `let mut v = Vector.new(...); Vector.set(v, 0, 42)` after
+    // Stream simulating `let mut list = List.new(...); List.set(list, 0, 42)` after
     // Phase 4's move-on-last-use rewrite:
     //
-    //   [0] call_builtin "Vector.new_filled" -> %0     -- runtime returns rc=1
+    //   [0] call_builtin "List.new_filled" -> %0       -- runtime returns rc=1
     //   [1] const_int %1 = 0
     //   [2] const_int %2 = 42
     //   [3] move_value %3 <- %0
-    //   [4] call_builtin "Vector.set" args=[%3, %1, %2] dest=%4
+    //   [4] call_builtin "List.set" args=[%3, %1, %2] dest=%4
     //
-    // Expected: V8 holds at id 4. Vector.new_filled is not in the
-    // owned-mutating list (it's a constructor), but Vector.new_filled
+    // Expected: uniqueness holds at id 4. List.new_filled is not in the
+    // owned-mutating list (it's a constructor), but List.new_filled
     // returns rc=1 by contract. We ALSO need to recognize allocator-
     // style call_builtin results as unique. For the analysis to be
     // useful in real Zap programs the producer-classification has to
     // be expansive enough to cover these constructors.
     //
-    // For this phase, recognising Vector.new_filled as a unique-result
+    // For this phase, recognising List.new_filled as a unique-result
     // builtin is OPTIONAL — the analysis is conservative and falls
     // back to false. The important contract is: AFTER an owned-
     // mutating call, the result IS unique. So this test focuses on
-    // the chain Vector.set → Vector.push:
+    // the chain List.set -> List.push:
     //
     //   [5] move_value %5 <- %4
     //   [6] const_int %6 = 99
-    //   [7] call_builtin "Vector.push" args=[%5, %6] dest=%7
+    //   [7] call_builtin "List.push" args=[%5, %6] dest=%7
     //
-    // V8 must hold at id 7 (the Vector.push receives the result of
-    // an owned-mutating Vector.set, so V8 holds by chain-reasoning).
+    // uniqueness must hold at id 7 (the List.push receives the result of
+    // an owned-mutating List.set, so uniqueness holds by chain-reasoning).
     const set_args = try arena.alloc(ir.LocalId, 3);
     set_args[0] = 3;
     set_args[1] = 1;
@@ -1870,7 +1877,7 @@ test "v8_uniqueness: Vector.set and Vector.push fresh-alloc chain is unique" {
     const instrs = [_]ir.Instruction{
         .{ .call_builtin = .{
             .dest = 0,
-            .name = "Vector.new_filled",
+            .name = "List.new_filled",
             .args = ctor_args,
             .arg_modes = ctor_modes,
         } },
@@ -1879,7 +1886,7 @@ test "v8_uniqueness: Vector.set and Vector.push fresh-alloc chain is unique" {
         .{ .move_value = .{ .dest = 3, .source = 0 } },
         .{ .call_builtin = .{
             .dest = 4,
-            .name = "Vector.set",
+            .name = "List.set",
             .args = set_args,
             .arg_modes = set_modes,
         } },
@@ -1887,22 +1894,48 @@ test "v8_uniqueness: Vector.set and Vector.push fresh-alloc chain is unique" {
         .{ .const_int = .{ .dest = 6, .value = 99 } },
         .{ .call_builtin = .{
             .dest = 7,
-            .name = "Vector.push",
+            .name = "List.push",
             .args = push_args,
             .arg_modes = push_modes,
         } },
     };
-    var function = try buildTestFunction(arena, "vec_chain", &instrs, 8);
+    var function = try buildTestFunction(arena, "list_chain", &instrs, 8);
 
     var u = try analyzeUniqueness(testing.allocator, &function, null);
     defer u.deinit(testing.allocator);
 
-    // Vector.push at id 7 — V8 holds because its source is the
-    // result of an owned-mutating Vector.set.
+    // List.push at id 7 — uniqueness holds because its source is the
+    // result of an owned-mutating List.set.
     try testing.expect(u.isUnique(7));
 }
 
-test "v8_uniqueness: non-owned-mutating call sites are absent from the result" {
+test "uniqueness: list_tail records unique source and unique suffix" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const instrs = [_]ir.Instruction{
+        .{ .list_init = .{ .dest = 0, .elements = &.{} } },
+        .{ .list_tail = .{ .dest = 1, .list = 0, .element_type = .i64 } },
+        .{ .move_value = .{ .dest = 2, .source = 1 } },
+        .{ .const_int = .{ .dest = 3, .value = 9 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "List.push",
+            .args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{ 2, 3 }),
+            .arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{ .move, .borrow }),
+        } },
+    };
+    var function = try buildTestFunction(arena, "list_tail_unique", &instrs, 5);
+
+    var u = try analyzeUniqueness(testing.allocator, &function, null);
+    defer u.deinit(testing.allocator);
+
+    try testing.expect(u.isUnique(1));
+    try testing.expect(u.isUnique(4));
+}
+
+test "uniqueness: non-owned-mutating call sites are absent from the result" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -1954,7 +1987,7 @@ fn buildSyntheticOwnership(
     return ownership;
 }
 
-test "v8_uniqueness: tuple element extracted at parent's last-use is unique (Phase 2.5)" {
+test "uniqueness: tuple element extracted at parent's last-use is unique (Phase 2.5)" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -1969,7 +2002,7 @@ test "v8_uniqueness: tuple element extracted at parent's last-use is unique (Pha
     //   [5] move_value %5 <- %2               -- %2 is unique, transfer
     //   [6] call_builtin "Map.put" args=[%5,%3,%4] dest=%6
     //
-    // Expected: V8 holds at id 6.
+    // Expected: uniqueness holds at id 6.
     const tuple_elems = try arena.alloc(ir.LocalId, 1);
     tuple_elems[0] = 0;
     const args = try arena.alloc(ir.LocalId, 3);
@@ -2005,11 +2038,11 @@ test "v8_uniqueness: tuple element extracted at parent's last-use is unique (Pha
     var u = try analyzeUniquenessFull(testing.allocator, &function, null, null, null, &ownership);
     defer u.deinit(testing.allocator);
 
-    // V8 holds at id 6.
+    // uniqueness holds at id 6.
     try testing.expect(u.isUnique(6));
 }
 
-test "v8_uniqueness: tuple stored in list ALs all components after storage (Phase 2.5)" {
+test "uniqueness: tuple stored in list ALs all components after storage (Phase 2.5)" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -2025,7 +2058,7 @@ test "v8_uniqueness: tuple stored in list ALs all components after storage (Phas
     //   [7] move_value %7 <- %4               -- %4 not unique
     //   [8] call_builtin "Map.put" args=[%7,%5,%6] dest=%8
     //
-    // Expected: V8 fails at id 8 — the tuple's pending entry was
+    // Expected: uniqueness fails at id 8 — the tuple's pending entry was
     // dissolved at the list_cons; the index_get afterwards extracts
     // a non-unique component.
     const tuple_elems = try arena.alloc(ir.LocalId, 1);
@@ -2071,7 +2104,7 @@ test "v8_uniqueness: tuple stored in list ALs all components after storage (Phas
     try testing.expect(!u.isUnique(8));
 }
 
-test "v8_uniqueness: callee tuple-return per-component uniqueness propagates (Phase 2.5)" {
+test "uniqueness: callee tuple-return per-component uniqueness propagates (Phase 2.5)" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -2090,7 +2123,7 @@ test "v8_uniqueness: callee tuple-return per-component uniqueness propagates (Ph
     //   [6] move_value %6 <- %3                    -- %3 is unique
     //   [7] call_builtin "Map.put" args=[%6,%4,%5] dest=%7
     //
-    // Expected: V8 holds at id 7.
+    // Expected: uniqueness holds at id 7.
 
     // Build the callee function.
     const callee_id: ir.FunctionId = 1;
@@ -2159,12 +2192,12 @@ test "v8_uniqueness: callee tuple-return per-component uniqueness propagates (Ph
     // Build a minimal ProgramSignatures table that records:
     //   * id_pair's params[0] = preserves_uniqueness with witness 0
     //   * id_pair's return_components = [some(0)]
-    var signatures = v8_signature.ProgramSignatures.init(testing.allocator);
+    var signatures = uniqueness_signature.ProgramSignatures.init(testing.allocator);
     defer signatures.deinit(testing.allocator);
     {
         const arena_alloc = signatures.arena.allocator();
-        const params = try arena_alloc.alloc(v8_signature.ParamSig, 1);
-        params[0] = v8_signature.ParamSig.preservesUniqueness(0);
+        const params = try arena_alloc.alloc(uniqueness_signature.ParamSig, 1);
+        params[0] = uniqueness_signature.ParamSig.preservesUniqueness(0);
         const rc = try arena_alloc.alloc(?u8, 1);
         rc[0] = 0;
         try signatures.by_function.put(testing.allocator, callee_id, .{
@@ -2186,7 +2219,7 @@ test "v8_uniqueness: callee tuple-return per-component uniqueness propagates (Ph
     try testing.expect(u.isUnique(7));
 }
 
-test "v8_uniqueness: param_get becomes unique when fixpoint says unique-on-entry" {
+test "uniqueness: param_get becomes unique when fixpoint says unique-on-entry" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -2199,10 +2232,10 @@ test "v8_uniqueness: param_get becomes unique when fixpoint says unique-on-entry
     //   [4] call_builtin "Map.put" args=[%1, %2, %3] dest=%4
     //   [5] ret %4
     //
-    // Without fixpoint: V8 fails at id 4 (param_get clears uniqueness;
+    // Without fixpoint: uniqueness fails at id 4 (param_get clears uniqueness;
     // %1's source is non-unique; the original conservative behaviour).
     //
-    // With fixpoint (slot 0 unique-on-entry): V8 holds at id 4.
+    // With fixpoint (slot 0 unique-on-entry): uniqueness holds at id 4.
     const args = try arena.alloc(ir.LocalId, 3);
     args[0] = 1;
     args[1] = 2;
@@ -2250,16 +2283,16 @@ test "v8_uniqueness: param_get becomes unique when fixpoint says unique-on-entry
         .result_convention = .owned,
     };
 
-    // Without fixpoint: V8 should fail.
+    // Without fixpoint: uniqueness should fail.
     {
         var u = try analyzeUniqueness(testing.allocator, &function, null);
         defer u.deinit(testing.allocator);
         try testing.expect(!u.isUnique(4));
     }
 
-    // With fixpoint that says slot 0 is unique-on-entry: V8 holds.
+    // With fixpoint that says slot 0 is unique-on-entry: uniqueness holds.
     {
-        var fixpoint: v8_interprocedural.ProgramUniqueness = .{};
+        var fixpoint: uniqueness_interprocedural.ProgramUniqueness = .{};
         defer fixpoint.deinit(testing.allocator);
         const slots = try testing.allocator.alloc(bool, 1);
         slots[0] = true;

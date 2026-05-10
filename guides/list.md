@@ -1,23 +1,27 @@
 # List
 
-A `List` in Zap is a singly-linked list of homogeneous elements. The literal
-syntax is `[1, 2, 3]`, and the cons pattern is `[head | tail]`.
+A `List` in Zap is a homogeneous sequence backed by a single contiguous
+runtime buffer. The literal syntax is `[1, 2, 3]`; the generic type spelling is
+`List(i64)`, `List(String)`, and so on.
 
-Because lists are linked, the access patterns are asymmetric: `head/1` and
-`prepend/2` are O(1); `last/1`, `append/2`, and `at/2` are O(n). When you
-need fast random access or constant-time append, a different shape (an array
-or a map keyed by index) is the right tool. When you need cheap structural
-sharing and pattern matching, lists are the right tool.
+Zap has one sequence type: indexed reads, append-at-end operations, and list
+literals all use `List(T)`.
 
-## Construction and destructuring
+## Construction and Destructuring
 
 ```zap
 xs = [1, 2, 3]
-[head | tail] = xs       # head = 1, tail = [2, 3]
-[]                       # the empty list
+[]                         # the empty list
+
+values = List.new_filled(4, 0 :: i64)
+scratch = List.new_empty(32) :: List(i64)
 ```
 
-Pattern matching extends to function clauses:
+`new_filled/2` allocates a list with a populated length. `new_empty/1`
+allocates a list with reserved capacity and length `0`, which is useful when
+you will build the list with `push/2`.
+
+Head/tail patterns still describe sequence shape, not storage layout:
 
 ```zap
 pub fn sum([] :: [i64]) -> i64 {
@@ -29,94 +33,122 @@ pub fn sum([head | tail] :: [i64]) -> i64 {
 }
 ```
 
-The first clause binds the empty case; the second binds head and tail and
-recurses. Zap's overload resolver picks the right clause without you writing
-a `case` body.
+The first clause binds the empty case; the second binds the first element and
+the remaining list. The runtime representation is still flat-buffer-backed.
 
-## Two shapes of operations
-
-`List` exposes the operations that need to know about the linked structure
-of a list — `head/1`, `tail/1`, `prepend/2`, `append/2`, `concat/2`, plus
-the bang versions for known-non-empty lists.
-
-`Enum` exposes the operations that work on any enumerable — `map/2`,
-`filter/2`, `reduce/3`, `take/2`, `drop/2`, etc. They work on lists too,
-because `List` implements `Enumerable`.
-
-If a function exists in both modules, prefer the `Enum` version when you
-might generalize later, and the `List` version when you specifically want
-the list-shape behavior.
-
-## Bang versions
-
-Functions that fail on the empty list come in pairs:
+## Indexed Access
 
 ```zap
-List.head([1, 2, 3])     # => 1
-List.head([])            # => raises
+xs = [10, 20, 30]
 
-List.head!([1, 2, 3])    # => 1
-List.head!([])           # => raises (same)
+List.length(xs)            # => 3
+List.capacity(xs)          # reserved slots in the backing buffer
+List.get(xs, 1)            # => 20
+List.at(xs, 2)             # => 30
+List.set(xs, 1, 99)        # => [10, 99, 30]
 ```
 
-The convention: a trailing `!` means "this function trusts you that the
-input meets its precondition; if not, it raises." Use it when you've just
-checked emptiness or when the type system has narrowed the input. Use the
-non-bang version when you have a sensible default to provide.
+`get/2` and `at/2` are aliases. `at!/2` performs the same read after an
+explicit bounds check and raises on an invalid index.
 
-## Building lists efficiently
+## Value Semantics and Mutation
 
-Prepending is cheap (`O(1)`); appending is expensive (`O(n)`). Build lists
-by prepending and reverse at the end:
+List operations are value-semantic: `set/3`, `push/2`, `pop/1`, and `append/2`
+return a list value and do not expose mutation to user code.
+
+Under the hood, Zap uses copy-on-write. When a list buffer is uniquely owned,
+the runtime may update it in place and return the same handle. When it is
+shared, the runtime clones first so existing observers keep their original
+view.
+
+```zap
+values = List.new_filled(3, 0 :: i64)
+values = List.set(values, 1, 42 :: i64)
+values = List.push(values, 7 :: i64)
+
+popped = List.pop(values)
+shorter = popped.0
+removed = popped.1
+```
+
+This is the same surface contract for scalar lists, string lists, nested lists,
+and lists containing ARC-managed values.
+
+## Building Lists Efficiently
+
+When you are growing a list in order, prefer `new_empty/1` plus `push/2`:
 
 ```zap
 pub fn collect_evens(xs :: [i64]) -> [i64] {
-  collect_evens_loop(xs, [])
+  collect_evens_loop(xs, 0, List.length(xs), List.new_empty(List.length(xs)))
 }
 
-fn collect_evens_loop([] :: [i64], acc :: [i64]) -> [i64] {
-  List.reverse(acc)
-}
-
-fn collect_evens_loop([head | tail] :: [i64], acc :: [i64]) -> [i64] {
-  if Integer.even?(head) {
-    collect_evens_loop(tail, [head | acc])
+fn collect_evens_loop(xs :: [i64], index :: i64, total :: i64, acc :: [i64]) -> [i64] {
+  if index < total {
+    value = List.get(xs, index)
+    next_acc = if Integer.even?(value) {
+      List.push(acc, value)
+    } else {
+      acc
+    }
+    collect_evens_loop(xs, index + 1, total, next_acc)
   } else {
-    collect_evens_loop(tail, acc)
+    acc
   }
 }
 ```
 
-In practice you'd write that as `Enum.filter(xs, &Integer.even?/1)`. The
-hand-written version is what `Enum.filter` becomes after lowering.
+In practice you would usually write that as `Enum.filter(xs, &Integer.even?/1)`
+or `List.filter(xs, &Integer.even?/1)`. The explicit version shows the
+flat-buffer-friendly pattern: iterate by index and append to the end.
 
 ## Concatenation
 
-Two lists join with `concat/2` or the `<>` operator (via `Concatenable`):
+Two lists join with `append/2`, `concat/2`, or the `<>` operator through
+`Concatenable`:
 
 ```zap
+List.append([1, 2], [3, 4])    # => [1, 2, 3, 4]
 List.concat([1, 2], [3, 4])    # => [1, 2, 3, 4]
 [1, 2] <> [3, 4]               # => [1, 2, 3, 4]
 ```
 
-`concat/2` walks the left list and prepends each element to the right list,
-so it's `O(left)`. Don't use it inside an inner loop over the right list.
+`append/2` can reuse the left buffer when it is uniquely owned and has enough
+capacity. Otherwise it allocates a new buffer and copies the elements.
 
-## Querying
+## Querying and Slicing
 
 ```zap
-List.length([1, 2, 3])         # => 3
 List.empty?([])                # => true
+List.head([1, 2, 3])           # => 1
+List.tail([1, 2, 3])           # => [2, 3]
+List.last([1, 2, 3])           # => 3
 List.contains?([1, 2, 3], 2)   # => true
-List.uniq([1, 1, 2, 3, 2])     # => [1, 2, 3]
+List.take([1, 2, 3, 4], 2)     # => [1, 2]
+List.drop([1, 2, 3, 4], 2)     # => [3, 4]
 List.reverse([1, 2, 3])        # => [3, 2, 1]
+List.uniq([1, 1, 2, 3, 2])     # => [1, 2, 3]
 ```
 
-`length/1` walks the whole list — there is no cached length. If you find
-yourself calling `length` repeatedly in a loop, restructure to count once.
+`tail/1`, `take/2`, and `drop/2` return fresh list values containing the
+selected elements.
 
-## See also
+## Bang Versions
+
+Functions that should only be called with a non-empty or in-bounds list have
+bang variants:
+
+```zap
+List.head!([1, 2, 3])          # => 1
+List.last!([1, 2, 3])          # => 3
+List.at!([10, 20, 30], 1)      # => 20
+```
+
+Use them when the precondition has already been established. Otherwise use the
+non-bang versions or make the check explicit.
+
+## See Also
 
 - `Enum` — operations that work on every enumerable, including lists
-- `Range` — when you want a list-of-integers but don't want to materialize it
-- `Map` — when you need keyed access instead of positional
+- `Range` — when you want integer iteration without materializing a list
+- `Map` — when you need keyed access instead of positional access

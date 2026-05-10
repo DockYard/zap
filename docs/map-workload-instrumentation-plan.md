@@ -257,7 +257,7 @@ If the data is genuinely ambiguous, **default to dense COW.** The industrial sig
 Whichever representation the data points to, the next document is `docs/map-redesign-implementation-plan.md` — the unified plan combining:
 
 1. The chosen `Map` representation (from this Phase 0 result).
-2. Flat-buffer `Vector(T)` (prerequisite for `MArrayI64`/`MArrayF64` deletion).
+2. Flat-buffer `List(T)` (the post-unification replacement for the former `Vector(T)` surface and the deleted `MArrayI64`/`MArrayF64` escape hatches).
 3. Opportunistic-mutation IR work — V8 + V9 verifier extensions, owned/borrowed call-site rewriting, runtime rc-1 fast path.
 4. List FBIP traversal reuse for stdlib `map`/`filter`/`reverse`.
 5. `MArrayI64` / `MArrayF64` deletion and benchmark migration.

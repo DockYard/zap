@@ -221,7 +221,7 @@ This means protocol resolution must happen BEFORE or DURING IR lowering, not as 
 | `lib/list/enumerable.zap` | List impl: calls `:zig.List.next` |
 | `lib/range/enumerable.zap` | Range impl: calls `:zig.Range.next` |
 | `lib/map/enumerable.zap` | Map impl: **BROKEN** — defines `reduce` instead of `next` |
-| `src/runtime.zig` | Zig runtime functions. Contains `Range.next`, `ListOf(T).next`. |
+| `src/runtime.zig` | Zig runtime functions. Contains `Range.next`, `List(T).next`. |
 | `~/projects/zig/src/zir_api.zig` | Fork C-ABI surface. |
 | `~/projects/zig/src/zir_builder.zig` | Fork ZIR builder. |
 

@@ -202,7 +202,7 @@ pub fn resetAllocator() void {
 //   - Atom         — interned atom representation
 //   - Closure      — fat pointer for function values
 //   - ZapAllocator — allocator plumbing
-//   - List(T)      — persistent list
+//   - List(T)      — flat-buffer sequence
 //   - Map(K, V)    — persistent map (HAMT-based)
 //   - String       — owned string with length
 // ============================================================
@@ -363,25 +363,25 @@ pub var dense_map_rc1_fast_path_total: u64 = 0;
 /// Total dense-Map mutating calls.
 pub var dense_map_mut_calls_total: u64 = 0;
 /// Number of dense-Map `*_owned_unchecked` calls — mutations the
-/// V8 verifier proved statically uniquely owned, so the runtime
+/// uniqueness verifier proved statically uniquely owned, so the runtime
 /// skipped the `header.count() == 1` branch entirely. Comparing
-/// against `dense_map_mut_calls_total` gives the V8-coverage ratio.
+/// against `dense_map_mut_calls_total` gives the uniqueness-coverage ratio.
 pub var dense_map_unchecked_total: u64 = 0;
-/// Number of `Vector.set/push/pop/append` calls that took the rc-1
+/// Number of `List.set/push/pop/append` calls that took the rc-1
 /// fast path (mutated the receiver in place rather than cloning).
-pub var vector_rc1_fast_path_total: u64 = 0;
-/// Total `Vector.set/push/pop/append` calls. Comparing
-/// `vector_rc1_fast_path_total` against this gives the
-/// share-vs-mutate ratio for Vector workloads, mirroring the
+pub var list_rc1_fast_path_total: u64 = 0;
+/// Total `List.set/push/pop/append` calls. Comparing
+/// `list_rc1_fast_path_total` against this gives the
+/// share-vs-mutate ratio for List workloads, mirroring the
 /// dense-Map counters.
-pub var vector_mut_calls_total: u64 = 0;
-/// Number of Vector `*_owned_unchecked` calls — mutations that
-/// V8 proved statically uniquely owned. See
+pub var list_mut_calls_total: u64 = 0;
+/// Number of List `*_owned_unchecked` calls — mutations that
+/// uniqueness proved statically uniquely owned. See
 /// `dense_map_unchecked_total` for the symmetric meaning on Maps.
-pub var vector_unchecked_total: u64 = 0;
+pub var list_unchecked_total: u64 = 0;
 
 /// Per-pool live-cell statistics. Each pool wrapper (e.g.
-/// `ArcRuntime.ArcPool(T)`, `FlatList(T).SelfPool`, `Map(K,V).SelfPool`)
+/// `ArcRuntime.ArcPool(T)`, `List(T).SelfPool`, `Map(K,V).SelfPool`)
 /// owns one of these and registers it with `pool_stats_head` on first
 /// allocation. The registration is idempotent: a `registered` flag
 /// guarantees a pool is linked exactly once even though `note*`
@@ -448,10 +448,10 @@ pub fn dumpArcStats(write_line: *const fn ([]const u8) void) void {
     })) |line| {
         write_line(line);
     } else |_| {}
-    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] vector_mut_calls_total={d} vector_rc1_fast_path_total={d} vector_unchecked_total={d}\n", .{
-        vector_mut_calls_total,
-        vector_rc1_fast_path_total,
-        vector_unchecked_total,
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] list_mut_calls_total={d} list_rc1_fast_path_total={d} list_unchecked_total={d}\n", .{
+        list_mut_calls_total,
+        list_rc1_fast_path_total,
+        list_unchecked_total,
     })) |line| {
         write_line(line);
     } else |_| {}
@@ -906,21 +906,19 @@ fn writeRecordJsonLine(fd: i32, record: MapInstanceRecord) !void {
         'V' => "V",
         else => "?",
     };
-    const formatted = try std.fmt.bufPrint(&buf,
-        "{{\"instance_id\":{d},\"lineage_id\":{d},\"parent_instance_id\":{d}," ++
+    const formatted = try std.fmt.bufPrint(&buf, "{{\"instance_id\":{d},\"lineage_id\":{d},\"parent_instance_id\":{d}," ++
         "\"alloc_size\":{d},\"creation_callsite\":{d},\"puts\":{d},\"deletes\":{d}," ++
         "\"merges\":{d},\"gets\":{d},\"peak_strong_count\":{d},\"had_share_event\":{},\"had_post_share_mutation\":{}," ++
-        "\"alloc_time_ns\":{d},\"release_time_ns\":{d},\"size_at_release\":{d},\"class\":\"{s}\"}}\n",
-        .{
-            record.instance_id,        record.lineage_id,
-            record.parent_instance_id, record.alloc_size,
-            record.creation_callsite,  record.puts,
-            record.deletes,            record.merges,
-            record.gets,               record.peak_strong_count,
-            record.had_share_event,    record.had_post_share_mutation,
-            record.alloc_time_ns,      record.release_time_ns,
-            record.size_at_release,    class_str,
-        });
+        "\"alloc_time_ns\":{d},\"release_time_ns\":{d},\"size_at_release\":{d},\"class\":\"{s}\"}}\n", .{
+        record.instance_id,        record.lineage_id,
+        record.parent_instance_id, record.alloc_size,
+        record.creation_callsite,  record.puts,
+        record.deletes,            record.merges,
+        record.gets,               record.peak_strong_count,
+        record.had_share_event,    record.had_post_share_mutation,
+        record.alloc_time_ns,      record.release_time_ns,
+        record.size_at_release,    class_str,
+    });
     _ = std.c.write(fd, formatted.ptr, formatted.len);
 }
 
@@ -1334,7 +1332,7 @@ pub const ArcRuntime = struct {
     /// Such types are responsible for their own allocation pool and
     /// destruction (via a `release` or `arcReleaseDeep` method) — typically
     /// because they own variable-length payload buffers (`Map(K, V)`,
-    /// `FlatList(T)`).
+    /// `List(T)`).
     fn hasInlineArcHeader(comptime T: type) bool {
         const info = @typeInfo(T);
         if (info != .@"struct") return false;
@@ -1392,7 +1390,7 @@ pub const ArcRuntime = struct {
             return releaseAny(allocator, unwrapped);
         }
         const T = arcPtrChild(@TypeOf(ptr));
-        // Inline-header types (`Map(K, V)`, `FlatList(T)`, ...) own
+        // Inline-header types (`Map(K, V)`, `List(T)`, ...) own
         // their own pool and bump `arc_releases_total` inside their
         // dedicated `release` method; if the generic wrapper also
         // bumped, every release routed through `releaseAny` would
@@ -1535,8 +1533,8 @@ pub const ArcRuntime = struct {
     /// share-event classifier in particular) deliberately do *not*
     /// fire on this path. Use `retainAnyPersistent` instead when the
     /// retain represents a new long-lived owner — for example a List
-    /// cons cell stashing the value in its head, a Map entry's
-    /// retained value, or a struct field assignment.
+    /// element slot, a Map entry's retained value, or a struct field
+    /// assignment.
     pub fn retainAny(ptr: anytype) void {
         if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
             const unwrapped = ptr orelse return;
@@ -1557,7 +1555,7 @@ pub const ArcRuntime = struct {
 
     /// Retain for *persistent* container ownership: the caller is
     /// stashing the ARC value inside another long-lived owner — a
-    /// List cons cell, a Map entry's value, a struct field. Routes
+    /// List element slot, a Map entry's value, a struct field. Routes
     /// through the type's public `retain` method when one exists so
     /// type-specific bookkeeping fires; in particular this is the
     /// retain path the Map workload instrumentation classifies as a
@@ -1636,11 +1634,54 @@ pub const ArcRuntime = struct {
     }
 };
 
+fn listSumSimdLaneCount(comptime T: type) comptime_int {
+    return switch (@typeInfo(T)) {
+        .int => std.simd.suggestVectorLength(T) orelse 1,
+        else => 1,
+    };
+}
+
+fn listSumScalar(comptime T: type, data: [*]const T, len: u32) T {
+    var total: T = 0;
+    var index: u32 = 0;
+    while (index < len) : (index += 1) {
+        total += data[index];
+    }
+    return total;
+}
+
+fn listSumIntegerSimd(comptime T: type, data: [*]const T, len: u32) T {
+    comptime {
+        if (@typeInfo(T) != .int) {
+            @compileError("listSumIntegerSimd requires integer element type");
+        }
+    }
+
+    const lane_count = comptime listSumSimdLaneCount(T);
+    if (comptime lane_count <= 1) {
+        return listSumScalar(T, data, len);
+    }
+
+    const SimdChunk = @Vector(lane_count, T);
+    var lane_totals: SimdChunk = @splat(0);
+    var index: u32 = 0;
+    while (index + lane_count <= len) : (index += lane_count) {
+        const chunk: SimdChunk = data[index..][0..lane_count].*;
+        lane_totals += chunk;
+    }
+
+    var total: T = @reduce(.Add, lane_totals);
+    while (index < len) : (index += 1) {
+        total += data[index];
+    }
+    return total;
+}
+
 // ============================================================
-// FlatList(T) — single-allocation flat-buffer sequence.
+// List(T) — single-allocation flat-buffer sequence.
 //
 // Single-allocation flat-buffer mutable array with COW semantics. The
-// cell pointer (`?*const FlatList(T)`) points to the buffer. `null` is
+// cell pointer (`?*const List(T)`) points to the buffer. `null` is
 // the empty-list sentinel — no allocation until first `new_*`.
 //
 // Layout (single contiguous allocation through `c_allocator`):
@@ -1658,25 +1699,16 @@ pub const ArcRuntime = struct {
 // pointer; on the shared branch it deep-retain clones first so the
 // original observer keeps a stable view.
 //
-// Why `c_allocator` instead of `page_allocator`: tiny vectors with a
-// few elements would each get a fresh 16 KiB page from
+// Why `c_allocator` instead of `page_allocator`: tiny lists with a few
+// elements would each get a fresh 16 KiB page from
 // `page_allocator`. libc malloc has size classes that pack small
 // allocations efficiently — same choice the dense Map made.
 // ============================================================
 
-/// Concrete Vector(i64) surface alias used by `lib/vector_i64.zap`.
-/// Backed by `FlatList(i64)` during the staged List-unification
-/// migration.
-pub const VectorI64 = FlatList(i64);
-
-/// Concrete Vector(f64) surface alias used by `lib/vector_f64.zap`.
-/// Backed by `FlatList(f64)` during the staged List-unification
-/// migration.
-pub const VectorF64 = FlatList(f64);
-
-pub fn FlatList(comptime T: type) type {
+pub fn List(comptime T: type) type {
     return struct {
         const Self = @This();
+        pub const Element = T;
 
         // Inline buffer header. The cell pointer IS the buffer
         // pointer; `header: ArcHeader` lives at offset 0 so
@@ -1734,7 +1766,7 @@ pub fn FlatList(comptime T: type) type {
         fn bufferAlloc(capacity_arg: u32, len_arg: u32) ?*Self {
             std.debug.assert(len_arg <= capacity_arg);
             // Register the `ZAP_ARC_STATS=1` atexit hook on first
-            // alloc so vector-only programs (no Map, no pool-backed
+            // alloc so list-only programs (no Map, no pool-backed
             // type) still produce the runtime stats dump when the
             // user opts in. Idempotent.
             ensureArcStatsAtexit();
@@ -1848,9 +1880,8 @@ pub fn FlatList(comptime T: type) type {
         // -------------------------------------------------------------------
 
         /// Pick the next power-of-two capacity that fits `target_len`.
-        /// Default initial capacity is 4 (matches typical small-vector
-        /// micro-benchmarks; larger workloads grow exponentially via
-        /// doubling).
+        /// Default initial capacity is 4; larger workloads grow
+        /// exponentially via doubling.
         fn pickCapacity(old_cap: u32, target_len: u32) u32 {
             var cap: u32 = if (old_cap == 0) 4 else old_cap;
             while (cap < target_len) cap *= 2;
@@ -1861,10 +1892,22 @@ pub fn FlatList(comptime T: type) type {
         // Public introspection
         // -------------------------------------------------------------------
 
+        /// Typed empty-list sentinel.
+        pub fn empty() ?*const Self {
+            return null;
+        }
+
         /// Number of populated elements.
         pub fn length(vec: ?*const Self) i64 {
             const v = vec orelse return 0;
             return @intCast(v.len);
+        }
+
+        /// True when the list contains no elements. Both `null` and
+        /// allocated zero-length buffers are empty.
+        pub fn isEmpty(vec: ?*const Self) bool {
+            const v = vec orelse return true;
+            return v.len == 0;
         }
 
         /// Total capacity (number of element slots in the buffer).
@@ -1877,15 +1920,15 @@ pub fn FlatList(comptime T: type) type {
         // Allocation
         // -------------------------------------------------------------------
 
-        /// Allocate a vector of exactly `size` elements, each set to
+        /// Allocate a list of exactly `size` elements, each set to
         /// `init`.
         ///
         /// For ARC-managed `T`: the caller hands one +1 of `init` to
-        /// the vector. We need `size` durable owners (one per slot),
+        /// the list. We need `size` durable owners (one per slot),
         /// so we retain `size - 1` additional times. The zero-element
         /// edge case requires the caller's +1 to be dropped.
         pub fn new_filled(size: i64, init: T) ?*const Self {
-            if (size < 0) @panic("FlatList.new_filled: negative size");
+            if (size < 0) @panic("List.new_filled: negative size");
             const slot_count: u32 = @intCast(size);
             const fresh = bufferAlloc(slot_count, slot_count) orelse return null;
             const data = fresh.dataPtr();
@@ -1907,7 +1950,7 @@ pub fn FlatList(comptime T: type) type {
         /// Allocate an empty list with the given reserved capacity.
         /// The buffer is allocated but `len == 0`.
         pub fn new_empty(initial_capacity: i64) ?*const Self {
-            if (initial_capacity < 0) @panic("FlatList.new_empty: negative capacity");
+            if (initial_capacity < 0) @panic("List.new_empty: negative capacity");
             const cap_arg: u32 = @intCast(initial_capacity);
             const cap_final: u32 = if (cap_arg == 0) 4 else cap_arg;
             return bufferAlloc(cap_final, 0);
@@ -1917,13 +1960,53 @@ pub fn FlatList(comptime T: type) type {
         // Get / set
         // -------------------------------------------------------------------
 
-        /// Bounds-checked element read. Panics on null vector or
+        /// Bounds-checked element read. Panics on null list or
         /// out-of-range index.
         pub fn get(vec: ?*const Self, index: i64) T {
-            const v = vec orelse @panic("FlatList.get: null list");
+            const v = vec orelse @panic("List.get: null list");
             const slot: u32 = @intCast(index);
-            if (slot >= v.len) @panic("FlatList.get: index out of bounds");
-            return v.slotAtConst(slot).*;
+            if (slot >= v.len) @panic("List.get: index out of bounds");
+            const value = v.slotAtConst(slot).*;
+            retainElement(value);
+            return value;
+        }
+
+        /// Return the first element, or the element type's default for
+        /// an empty list. The returned value is a fresh owner when `T`
+        /// carries ARC-managed children.
+        pub fn getHead(vec: ?*const Self) T {
+            const v = vec orelse return defaultElement();
+            if (v.len == 0) return defaultElement();
+            const value = v.slotAtConst(0).*;
+            retainElement(value);
+            return value;
+        }
+
+        /// Return a freshly-owned list containing every element after
+        /// the first. The source list remains valid and unchanged.
+        pub fn getTail(vec: ?*const Self) ?*const Self {
+            return sliceFrom(vec, 1);
+        }
+
+        /// Return a freshly-owned list containing elements starting at
+        /// `start`. The source list remains valid and unchanged.
+        pub fn sliceFrom(vec: ?*const Self, start: i64) ?*const Self {
+            if (start < 0) @panic("List.sliceFrom: negative start");
+            const v = vec orelse return null;
+            const first: u32 = @intCast(start);
+            if (first >= v.len) return null;
+            return cloneRangeRetainingChildren(v, first, v.len - first);
+        }
+
+        /// Return the last element, or the element type's default for
+        /// an empty list. The returned value is a fresh owner when `T`
+        /// carries ARC-managed children.
+        pub fn last(vec: ?*const Self) T {
+            const v = vec orelse return defaultElement();
+            if (v.len == 0) return defaultElement();
+            const value = v.slotAtConst(v.len - 1).*;
+            retainElement(value);
+            return value;
         }
 
         /// Bounds-checked element write. Refcount-aware: on rc==1 the
@@ -1931,13 +2014,13 @@ pub fn FlatList(comptime T: type) type {
         /// returned; on rc>1 the buffer is deep-retain cloned first so
         /// the original observer stays valid.
         pub fn set(vec: ?*const Self, index: i64, value: T) ?*const Self {
-            const v = vec orelse @panic("FlatList.set: null list");
+            const v = vec orelse @panic("List.set: null list");
             const slot: u32 = @intCast(index);
-            if (slot >= v.len) @panic("FlatList.set: index out of bounds");
+            if (slot >= v.len) @panic("List.set: index out of bounds");
 
-            vector_mut_calls_total += 1;
+            list_mut_calls_total += 1;
             if (v.header.count() == 1) {
-                vector_rc1_fast_path_total += 1;
+                list_rc1_fast_path_total += 1;
                 const mut: *Self = @constCast(v);
                 const existing = mut.slotAt(slot).*;
                 releaseElement(existing, std.heap.c_allocator);
@@ -1969,9 +2052,9 @@ pub fn FlatList(comptime T: type) type {
         /// from old-buffer ownership to new-buffer ownership without
         /// touching ARC counts.
         pub fn push(vec: ?*const Self, value: T) ?*const Self {
-            vector_mut_calls_total += 1;
+            list_mut_calls_total += 1;
             if (vec == null) {
-                vector_rc1_fast_path_total += 1;
+                list_rc1_fast_path_total += 1;
                 const fresh = bufferAlloc(pickCapacity(0, 1), 0) orelse return null;
                 fresh.slotAtPtr(0).* = value;
                 fresh.len = 1;
@@ -1980,7 +2063,7 @@ pub fn FlatList(comptime T: type) type {
             const v = vec.?;
 
             if (v.header.count() == 1) {
-                vector_rc1_fast_path_total += 1;
+                list_rc1_fast_path_total += 1;
                 const mut: *Self = @constCast(v);
                 if (mut.len < mut.cap) {
                     mut.slotAtPtr(mut.len).* = value;
@@ -2009,31 +2092,31 @@ pub fn FlatList(comptime T: type) type {
 
         /// Remove the last element. Refcount-aware: on rc==1 the
         /// existing buffer is mutated in place; on rc>1 a deep-retain
-        /// clone is made and pop'd. Returns the resulting vector
+        /// clone is made and pop'd. Returns the resulting list
         /// (NOT the popped value — mirrors the Roc-style `Dict.delete`
-        /// in the dense Map). On an empty vector this panics.
+        /// in the dense Map). On an empty list this panics.
         pub fn pop(vec: ?*const Self) ?*const Self {
-            const v = vec orelse @panic("FlatList.pop: null list");
-            if (v.len == 0) @panic("FlatList.pop: empty list");
+            const v = vec orelse @panic("List.pop: null list");
+            if (v.len == 0) @panic("List.pop: empty list");
 
-            vector_mut_calls_total += 1;
+            list_mut_calls_total += 1;
             if (v.header.count() == 1) {
-                vector_rc1_fast_path_total += 1;
+                list_rc1_fast_path_total += 1;
                 const mut: *Self = @constCast(v);
-                const last = mut.slotAtPtr(mut.len - 1).*;
-                releaseElement(last, std.heap.c_allocator);
+                const removed_value = mut.slotAtPtr(mut.len - 1).*;
+                releaseElement(removed_value, std.heap.c_allocator);
                 mut.len -= 1;
                 return mut;
             }
 
             const clone = cloneBufferRetainingChildren(v, v.cap) orelse return null;
-            const last = clone.slotAtPtr(clone.len - 1).*;
-            releaseElement(last, std.heap.c_allocator);
+            const removed_value = clone.slotAtPtr(clone.len - 1).*;
+            releaseElement(removed_value, std.heap.c_allocator);
             clone.len -= 1;
             return clone;
         }
 
-        /// Concatenate two vectors. The result is logically `a ++ b`.
+        /// Concatenate two lists. The result is logically `a ++ b`.
         /// Refcount-aware: when `rc(a) == 1` and `cap(a) >= len(a) +
         /// len(b)`, append B's elements into A's buffer in place;
         /// otherwise allocate a fresh buffer with adequate capacity
@@ -2052,9 +2135,9 @@ pub fn FlatList(comptime T: type) type {
             const bv = b.?;
             const total_len = av.len + bv.len;
 
-            vector_mut_calls_total += 1;
+            list_mut_calls_total += 1;
             if (av.header.count() == 1 and av.cap >= total_len) {
-                vector_rc1_fast_path_total += 1;
+                list_rc1_fast_path_total += 1;
                 const mut: *Self = @constCast(av);
                 const dst_data = mut.dataPtr();
                 const src_data = bv.dataPtr();
@@ -2067,10 +2150,29 @@ pub fn FlatList(comptime T: type) type {
                 return mut;
             }
 
+            if (av.header.count() == 1) {
+                list_rc1_fast_path_total += 1;
+                const mut: *Self = @constCast(av);
+                const same_buffer = av == bv;
+                const b_len = bv.len;
+                const new_cap = pickCapacity(av.cap, total_len);
+                const grown = cloneBufferMovingChildren(mut, new_cap) orelse return null;
+                mut.bufferFreeShallow();
+                const grown_data = grown.dataPtr();
+                var i: u32 = 0;
+                while (i < b_len) : (i += 1) {
+                    const value = if (same_buffer) grown_data[i] else bv.dataPtr()[i];
+                    grown_data[grown.len + i] = value;
+                    retainElement(value);
+                }
+                grown.len = total_len;
+                return grown;
+            }
+
             // Either A is shared (must clone) OR A's buffer is too
-            // small (must grow). Either way, allocate a fresh buffer
-            // with enough room and deep-retain copy A and B's
-            // elements into it.
+            // small (must grow). The unique-growth case was handled
+            // above; this branch clones A/B and releases the consumed
+            // A owner.
             const new_cap = pickCapacity(av.cap, total_len);
             const fresh = bufferAlloc(new_cap, total_len) orelse return null;
             const fresh_data = fresh.dataPtr();
@@ -2088,12 +2190,307 @@ pub fn FlatList(comptime T: type) type {
             return fresh;
         }
 
+        /// Alias for `append`, kept for the protocol bridge and legacy
+        /// Zap wrapper spelling.
+        pub fn concat(a: ?*const Self, b: ?*const Self) ?*const Self {
+            return append(a, b);
+        }
+
+        /// Construct `head :: tail`, returning a fresh flat buffer.
+        /// `head` and `tail` are consumed. Tail elements are retained
+        /// into the new buffer before the consumed tail owner is
+        /// released.
+        pub fn cons(head: T, tail: ?*const Self) ?*const Self {
+            const tail_len: u32 = if (tail) |t| t.len else 0;
+            const fresh = bufferAlloc(pickCapacity(0, tail_len + 1), tail_len + 1) orelse return null;
+            const data = fresh.dataPtr();
+            data[0] = head;
+            if (tail) |t| {
+                const tail_data = t.dataPtr();
+                var i: u32 = 0;
+                while (i < t.len) : (i += 1) {
+                    data[i + 1] = tail_data[i];
+                    retainElement(tail_data[i]);
+                }
+                release(tail);
+            }
+            return fresh;
+        }
+
+        /// Return a new list with element order reversed.
+        pub fn reverse(vec: ?*const Self) ?*const Self {
+            const v = vec orelse return null;
+            if (v.len == 0) return null;
+            const fresh = bufferAlloc(v.len, v.len) orelse return null;
+            const source = v.dataPtr();
+            const dest = fresh.dataPtr();
+            var i: u32 = 0;
+            while (i < v.len) : (i += 1) {
+                const value = source[v.len - 1 - i];
+                dest[i] = value;
+                retainElement(value);
+            }
+            return fresh;
+        }
+
+        /// Return the first `count` elements as a fresh list.
+        pub fn take(vec: ?*const Self, count: i64) ?*const Self {
+            if (count <= 0) return null;
+            const v = vec orelse return null;
+            const requested: u32 = @intCast(count);
+            const take_len = @min(requested, v.len);
+            if (take_len == 0) return null;
+            return cloneRangeRetainingChildren(v, 0, take_len);
+        }
+
+        /// Return the list after dropping the first `count` elements.
+        pub fn drop(vec: ?*const Self, count: i64) ?*const Self {
+            const v = vec orelse return null;
+            if (count <= 0) return cloneRangeRetainingChildren(v, 0, v.len);
+            const requested: u32 = @intCast(count);
+            if (requested >= v.len) return null;
+            return cloneRangeRetainingChildren(v, requested, v.len - requested);
+        }
+
+        /// True when any element equals `value`.
+        pub fn contains(vec: ?*const Self, value: T) bool {
+            const v = vec orelse return false;
+            const data = v.dataPtr();
+            var i: u32 = 0;
+            while (i < v.len) : (i += 1) {
+                if (elementsEqual(data[i], value)) return true;
+            }
+            return false;
+        }
+
+        /// Return a new list with duplicate elements removed,
+        /// preserving first-occurrence order.
+        pub fn uniq(vec: ?*const Self) ?*const Self {
+            const v = vec orelse return null;
+            var result: ?*const Self = null;
+            const data = v.dataPtr();
+            var i: u32 = 0;
+            while (i < v.len) : (i += 1) {
+                if (!contains(result, data[i])) {
+                    retainElement(data[i]);
+                    result = push(result, data[i]);
+                }
+            }
+            return result;
+        }
+
+        /// Iterator protocol: returns `{tag, value, next_state}` where
+        /// tag is `:cont` for non-empty and `:done` for empty.
+        pub fn next(vec: ?*const Self) std.meta.Tuple(&.{ u32, T, ?*const Self }) {
+            const v = vec orelse return .{ ATOM_DONE, defaultElement(), null };
+            if (v.len == 0) return .{ ATOM_DONE, defaultElement(), null };
+            const head = v.slotAtConst(0).*;
+            retainElement(head);
+            const tail = if (v.len > 1) cloneRangeRetainingChildren(v, 1, v.len - 1) else null;
+            return .{ ATOM_CONT, head, tail };
+        }
+
+        // Higher-order helpers used by protocol bridges.
+        pub fn mapFn(vec: ?*const Self, callback: anytype) ?*const Self {
+            const v = vec orelse return null;
+            var result: ?*const Self = null;
+            const data = v.dataPtr();
+            var i: u32 = 0;
+            while (i < v.len) : (i += 1) {
+                result = push(result, call1WithOwnedElement(callback, data[i]));
+            }
+            return result;
+        }
+
+        pub fn filterFn(vec: ?*const Self, predicate: anytype) ?*const Self {
+            const v = vec orelse return null;
+            var result: ?*const Self = null;
+            const data = v.dataPtr();
+            var i: u32 = 0;
+            while (i < v.len) : (i += 1) {
+                if (call1WithOwnedElement(predicate, data[i])) {
+                    retainElement(data[i]);
+                    result = push(result, data[i]);
+                }
+            }
+            return result;
+        }
+
+        pub fn rejectFn(vec: ?*const Self, predicate: anytype) ?*const Self {
+            const v = vec orelse return null;
+            var result: ?*const Self = null;
+            const data = v.dataPtr();
+            var i: u32 = 0;
+            while (i < v.len) : (i += 1) {
+                if (!call1WithOwnedElement(predicate, data[i])) {
+                    retainElement(data[i]);
+                    result = push(result, data[i]);
+                }
+            }
+            return result;
+        }
+
+        pub fn enumReduceSimple(vec: ?*const Self, initial: T, callback: anytype) T {
+            const v = vec orelse return initial;
+            var acc: T = initial;
+            const data = v.dataPtr();
+            var i: u32 = 0;
+            while (i < v.len) : (i += 1) {
+                acc = call2WithOwnedElement(callback, acc, data[i]);
+            }
+            return acc;
+        }
+
+        pub fn eachFn(vec: ?*const Self, callback: anytype) ?*const Self {
+            const v = vec orelse return null;
+            const data = v.dataPtr();
+            var i: u32 = 0;
+            while (i < v.len) : (i += 1) {
+                const callback_result = call1WithOwnedElement(callback, data[i]);
+                releaseElementShape(@TypeOf(callback_result), callback_result, std.heap.c_allocator);
+            }
+            return vec;
+        }
+
+        pub fn findFn(vec: ?*const Self, default: T, predicate: anytype) T {
+            const v = vec orelse return default;
+            const data = v.dataPtr();
+            var i: u32 = 0;
+            while (i < v.len) : (i += 1) {
+                if (call1WithOwnedElement(predicate, data[i])) {
+                    retainElement(data[i]);
+                    return data[i];
+                }
+            }
+            return default;
+        }
+
+        pub fn anyFn(vec: ?*const Self, predicate: anytype) bool {
+            const v = vec orelse return false;
+            const data = v.dataPtr();
+            var i: u32 = 0;
+            while (i < v.len) : (i += 1) {
+                if (call1WithOwnedElement(predicate, data[i])) return true;
+            }
+            return false;
+        }
+
+        pub fn allFn(vec: ?*const Self, predicate: anytype) bool {
+            const v = vec orelse return true;
+            const data = v.dataPtr();
+            var i: u32 = 0;
+            while (i < v.len) : (i += 1) {
+                if (!call1WithOwnedElement(predicate, data[i])) return false;
+            }
+            return true;
+        }
+
+        pub fn countFn(vec: ?*const Self, predicate: anytype) i64 {
+            const v = vec orelse return 0;
+            var count: i64 = 0;
+            const data = v.dataPtr();
+            var i: u32 = 0;
+            while (i < v.len) : (i += 1) {
+                if (call1WithOwnedElement(predicate, data[i])) count += 1;
+            }
+            return count;
+        }
+
+        pub fn sortFn(vec: ?*const Self, comparator: anytype) ?*const Self {
+            const v = vec orelse return null;
+            if (v.len <= 1) return cloneRangeRetainingChildren(v, 0, v.len);
+            const len: usize = @intCast(v.len);
+            const arr = bumpAllocSlice(T, len);
+            if (arr.len == 0) return null;
+            const data = v.dataPtr();
+            for (0..len) |i| arr[i] = data[i];
+            const Comparator = @TypeOf(comparator);
+            const ComparatorStorage = if (@typeInfo(Comparator) == .@"fn") *const Comparator else Comparator;
+            const comparator_storage: ComparatorStorage = if (@typeInfo(Comparator) == .@"fn") &comparator else comparator;
+            const Ctx = struct {
+                cmp: ComparatorStorage,
+                fn lessThan(ctx: @This(), a: T, b: T) bool {
+                    return Self.call2WithOwnedElements(ctx.cmp, a, b);
+                }
+            };
+            std.sort.pdq(T, arr, Ctx{ .cmp = comparator_storage }, Ctx.lessThan);
+            var result: ?*const Self = null;
+            for (arr) |value| {
+                retainElement(value);
+                result = push(result, value);
+            }
+            return result;
+        }
+
+        pub fn flatMapFn(vec: ?*const Self, callback: anytype) ?*const Self {
+            const v = vec orelse return null;
+            var result: ?*const Self = null;
+            const data = v.dataPtr();
+            var i: u32 = 0;
+            while (i < v.len) : (i += 1) {
+                const inner = call1WithOwnedElement(callback, data[i]);
+                result = append(result, inner);
+                release(inner);
+            }
+            return result;
+        }
+
+        pub fn sum(vec: ?*const Self) T {
+            switch (comptime @typeInfo(T)) {
+                .int, .float => {},
+                else => @compileError("sum requires numeric element type"),
+            }
+            const v = vec orelse return 0;
+            const data = v.dataPtr();
+            return switch (comptime @typeInfo(T)) {
+                .int => listSumIntegerSimd(T, data, v.len),
+                .float => listSumScalar(T, data, v.len),
+                else => unreachable,
+            };
+        }
+
+        pub fn product(vec: ?*const Self) T {
+            if (comptime @typeInfo(T) != .int) @compileError("product requires integer element type");
+            const v = vec orelse return 1;
+            var total: T = 1;
+            const data = v.dataPtr();
+            var i: u32 = 0;
+            while (i < v.len) : (i += 1) total *= data[i];
+            return total;
+        }
+
+        pub fn maxVal(vec: ?*const Self) T {
+            if (comptime @typeInfo(T) != .int) @compileError("maxVal requires integer element type");
+            const v = vec orelse return 0;
+            if (v.len == 0) return 0;
+            const data = v.dataPtr();
+            var result = data[0];
+            var i: u32 = 1;
+            while (i < v.len) : (i += 1) {
+                if (data[i] > result) result = data[i];
+            }
+            return result;
+        }
+
+        pub fn minVal(vec: ?*const Self) T {
+            if (comptime @typeInfo(T) != .int) @compileError("minVal requires integer element type");
+            const v = vec orelse return 0;
+            if (v.len == 0) return 0;
+            const data = v.dataPtr();
+            var result = data[0];
+            var i: u32 = 1;
+            while (i < v.len) : (i += 1) {
+                if (data[i] < result) result = data[i];
+            }
+            return result;
+        }
+
         // -------------------------------------------------------------------
-        // V8 unchecked-mutation variants
+        // uniqueness unchecked-mutation variants
         //
         // These functions mutate the receiver in place WITHOUT loading
         // `header.count()`. The caller (codegen) must have proven via
-        // V8 that the receiver is statically uniquely owned (refcount
+        // uniqueness that the receiver is statically uniquely owned (refcount
         // == 1 by construction).
         //
         // Safety contract:
@@ -2101,10 +2498,10 @@ pub fn FlatList(comptime T: type) type {
         //   * `vec.header.ref_count` must be exactly 1.
         //
         // Violating either condition is undefined behavior (UB). The
-        // V8 verifier in `arc_verifier.zig` enforces both at every
+        // uniqueness verifier in `arc_verifier.zig` enforces both at every
         // call site by construction. Tests may invoke these directly
         // for behavioural validation; production callers must always
-        // route through V8.
+        // route through uniqueness.
         //
         // Refcount semantics: the receiver enters with rc=1 and
         // returns with rc=1. The unchecked variants never bump or
@@ -2119,14 +2516,14 @@ pub fn FlatList(comptime T: type) type {
         // -------------------------------------------------------------------
 
         /// Like `set`, but skips the rc==1 check. Caller must have
-        /// proven uniqueness via V8. See safety contract above.
+        /// proven uniqueness via uniqueness. See safety contract above.
         pub fn set_owned_unchecked(vec: ?*const Self, index: i64, value: T) ?*const Self {
-            const v = vec orelse @panic("FlatList.set_owned_unchecked: null list");
+            const v = vec orelse @panic("List.set_owned_unchecked: null list");
             const slot: u32 = @intCast(index);
-            if (slot >= v.len) @panic("FlatList.set_owned_unchecked: index out of bounds");
+            if (slot >= v.len) @panic("List.set_owned_unchecked: index out of bounds");
 
-            vector_mut_calls_total += 1;
-            vector_unchecked_total += 1;
+            list_mut_calls_total += 1;
+            list_unchecked_total += 1;
             const mut: *Self = @constCast(v);
             const existing = mut.slotAt(slot).*;
             releaseElement(existing, std.heap.c_allocator);
@@ -2134,14 +2531,77 @@ pub fn FlatList(comptime T: type) type {
             return mut;
         }
 
+        /// Like `getHead`, but intended for uniqueness-proven list
+        /// destructuring sites. This still returns a fresh owner for
+        /// ARC-shaped elements; the matching `tail_owned_unchecked` /
+        /// `slice_owned_unchecked` call can then release the skipped
+        /// prefix while the extracted head remains valid.
+        pub fn head_owned_unchecked(vec: ?*const Self) T {
+            const v = vec orelse return defaultElement();
+            if (v.len == 0) return defaultElement();
+            const value = v.slotAtConst(0).*;
+            retainElement(value);
+            return value;
+        }
+
+        /// Like `getTail`, but skips the rc==1 check and consumes the
+        /// receiver's unique ownership. The suffix is shifted into the
+        /// existing buffer; skipped elements are released because their
+        /// list-owned references leave the buffer.
+        pub fn tail_owned_unchecked(vec: ?*const Self) ?*const Self {
+            return slice_owned_unchecked(vec, 1);
+        }
+
+        /// Like `sliceFrom`, but skips the rc==1 check and consumes the
+        /// receiver's unique ownership. A non-empty suffix reuses the
+        /// same allocation by moving elements down; an empty suffix
+        /// releases all remaining elements, frees the buffer, and
+        /// returns the null empty-list sentinel.
+        pub fn slice_owned_unchecked(vec: ?*const Self, start: i64) ?*const Self {
+            if (start < 0) @panic("List.slice_owned_unchecked: negative start");
+            const v = vec orelse return null;
+
+            list_mut_calls_total += 1;
+            list_unchecked_total += 1;
+
+            const first: u32 = @intCast(start);
+            const mut: *Self = @constCast(v);
+            const data = mut.dataPtr();
+
+            if (first >= mut.len) {
+                var index: u32 = 0;
+                while (index < mut.len) : (index += 1) {
+                    releaseElement(data[index], std.heap.c_allocator);
+                }
+                mut.len = 0;
+                mut.bufferFreeShallow();
+                return null;
+            }
+
+            if (first == 0) return mut;
+
+            var dropped_index: u32 = 0;
+            while (dropped_index < first) : (dropped_index += 1) {
+                releaseElement(data[dropped_index], std.heap.c_allocator);
+            }
+
+            const next_len = mut.len - first;
+            var move_index: u32 = 0;
+            while (move_index < next_len) : (move_index += 1) {
+                data[move_index] = data[first + move_index];
+            }
+            mut.len = next_len;
+            return mut;
+        }
+
         /// Like `push`, but skips the rc==1 check. Caller must have
-        /// proven uniqueness via V8. The buffer may be reallocated to
+        /// proven uniqueness via uniqueness. The buffer may be reallocated to
         /// grow capacity — that is still in-place ownership transfer
         /// (the old buffer's children move to the new buffer; old
         /// buffer is freed shallowly). See safety contract above.
         pub fn push_owned_unchecked(vec: ?*const Self, value: T) ?*const Self {
-            vector_mut_calls_total += 1;
-            vector_unchecked_total += 1;
+            list_mut_calls_total += 1;
+            list_unchecked_total += 1;
             if (vec == null) {
                 const fresh = bufferAlloc(pickCapacity(0, 1), 0) orelse return null;
                 fresh.slotAtPtr(0).* = value;
@@ -2168,23 +2628,23 @@ pub fn FlatList(comptime T: type) type {
         }
 
         /// Like `pop`, but skips the rc==1 check. Caller must have
-        /// proven uniqueness via V8. Panics on empty vector. See
+        /// proven uniqueness via uniqueness. Panics on empty list. See
         /// safety contract above.
         pub fn pop_owned_unchecked(vec: ?*const Self) ?*const Self {
-            const v = vec orelse @panic("FlatList.pop_owned_unchecked: null list");
-            if (v.len == 0) @panic("FlatList.pop_owned_unchecked: empty list");
+            const v = vec orelse @panic("List.pop_owned_unchecked: null list");
+            if (v.len == 0) @panic("List.pop_owned_unchecked: empty list");
 
-            vector_mut_calls_total += 1;
-            vector_unchecked_total += 1;
+            list_mut_calls_total += 1;
+            list_unchecked_total += 1;
             const mut: *Self = @constCast(v);
-            const last = mut.slotAtPtr(mut.len - 1).*;
-            releaseElement(last, std.heap.c_allocator);
+            const removed_value = mut.slotAtPtr(mut.len - 1).*;
+            releaseElement(removed_value, std.heap.c_allocator);
             mut.len -= 1;
             return mut;
         }
 
         /// Like `append`, but skips the rc==1 check on `a`. Caller
-        /// must have proven uniqueness of `a` via V8. `b` is BORROWED
+        /// must have proven uniqueness of `a` via uniqueness. `b` is BORROWED
         /// — its refcount is not consulted; its elements are
         /// deep-retained as they're copied (B's observers retain
         /// their references). See safety contract above.
@@ -2206,8 +2666,8 @@ pub fn FlatList(comptime T: type) type {
             const bv = b.?;
             const total_len = av.len + bv.len;
 
-            vector_mut_calls_total += 1;
-            vector_unchecked_total += 1;
+            list_mut_calls_total += 1;
+            list_unchecked_total += 1;
             const mut: *Self = @constCast(av);
 
             if (mut.cap >= total_len) {
@@ -2228,13 +2688,15 @@ pub fn FlatList(comptime T: type) type {
             // they're copied (B's observers retain).
             const new_cap = pickCapacity(av.cap, total_len);
             const grown = cloneBufferMovingChildren(mut, new_cap) orelse return null;
+            const same_buffer = av == bv;
+            const b_len = bv.len;
             mut.bufferFreeShallow();
             const grown_data = grown.dataPtr();
-            const b_data = bv.dataPtr();
             var i: u32 = 0;
-            while (i < bv.len) : (i += 1) {
-                grown_data[grown.len + i] = b_data[i];
-                retainElement(b_data[i]);
+            while (i < b_len) : (i += 1) {
+                const value = if (same_buffer) grown_data[i] else bv.dataPtr()[i];
+                grown_data[grown.len + i] = value;
+                retainElement(value);
             }
             grown.len = total_len;
             return grown;
@@ -2249,6 +2711,32 @@ pub fn FlatList(comptime T: type) type {
             return &self.dataPtr()[idx];
         }
 
+        fn cloneRangeRetainingChildren(self: *const Self, start: u32, count: u32) ?*const Self {
+            if (count == 0) return null;
+            std.debug.assert(start <= self.len);
+            std.debug.assert(start + count <= self.len);
+            const fresh = bufferAlloc(count, count) orelse return null;
+            const source = self.dataPtr();
+            const dest = fresh.dataPtr();
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const value = source[start + i];
+                dest[i] = value;
+                retainElement(value);
+            }
+            return fresh;
+        }
+
+        fn defaultElement() T {
+            return defaultElementOf(T);
+        }
+
+        fn elementsEqual(left: T, right: T) bool {
+            if (T == Term) return Term.eql(left, right);
+            if (T == []const u8) return std.mem.eql(u8, left, right);
+            return std.mem.eql(u8, std.mem.asBytes(&left), std.mem.asBytes(&right));
+        }
+
         // -------------------------------------------------------------------
         // ARC element walkers
         // -------------------------------------------------------------------
@@ -2259,6 +2747,22 @@ pub fn FlatList(comptime T: type) type {
 
         inline fn retainElement(value: T) void {
             retainElementShape(T, value);
+        }
+
+        inline fn call1WithOwnedElement(callback: anytype, value: T) CallableReturn(@TypeOf(callback)) {
+            retainElement(value);
+            return call1(callback, value);
+        }
+
+        inline fn call2WithOwnedElement(callback: anytype, arg0: anytype, value: T) CallableReturn(@TypeOf(callback)) {
+            retainElement(value);
+            return call2(callback, arg0, value);
+        }
+
+        inline fn call2WithOwnedElements(callback: anytype, left: T, right: T) CallableReturn(@TypeOf(callback)) {
+            retainElement(left);
+            retainElement(right);
+            return call2(callback, left, right);
         }
 
         fn releaseElementShape(comptime ElemT: type, value: ElemT, allocator: std.mem.Allocator) void {
@@ -2521,7 +3025,7 @@ test "ArcRuntime.resetAny returns token for unique value" {
     const reused = ArcRuntime.reuseAllocByType(i64, allocator, token);
     reused.* = 7;
     try testing.expectEqual(@as(i64, 7), reused.*);
-    ArcRuntime.releaseAny(allocator, reused);
+    ArcRuntime.releaseArcAny(i64, allocator, reused);
 }
 
 test "ArcRuntime.resetAny releases shared value and yields null token" {
@@ -2798,7 +3302,7 @@ pub const String = struct {
 
     pub fn split_to_list(s: []const u8, delimiter: []const u8) ?*const List([]const u8) {
         if (delimiter.len == 0) {
-            return List([]const u8).cons(s, null);
+            return List([]const u8).push(null, s);
         }
         var result: ?*const List([]const u8) = null;
         var pos: usize = 0;
@@ -2808,7 +3312,7 @@ pub const String = struct {
                 const seg = s[seg_start..pos];
                 const seg_copy = bumpAlloc(seg.len);
                 if (seg_copy.len > 0) @memcpy(seg_copy, seg);
-                result = List([]const u8).cons(seg_copy, result);
+                result = List([]const u8).push(result, seg_copy);
                 pos += delimiter.len;
                 seg_start = pos;
             } else {
@@ -2818,36 +3322,35 @@ pub const String = struct {
         const last_seg = s[seg_start..];
         const last_copy = bumpAlloc(last_seg.len);
         if (last_copy.len > 0) @memcpy(last_copy, last_seg);
-        result = List([]const u8).cons(last_copy, result);
-        return List([]const u8).reverse(result);
+        result = List([]const u8).push(result, last_copy);
+        return result;
     }
 
     pub fn string_join(list: ?*const List([]const u8), separator: []const u8) []const u8 {
         if (list == null) return "";
         var total: usize = 0;
-        var count: usize = 0;
-        var current = list;
-        while (current) |cell| {
-            total += cell.head.len;
-            count += 1;
-            current = cell.tail;
+        const count_i64 = List([]const u8).length(list);
+        if (count_i64 <= 0) return "";
+        const count: usize = @intCast(count_i64);
+        var index: usize = 0;
+        while (index < count) : (index += 1) {
+            total += List([]const u8).get(list, @intCast(index)).len;
         }
-        if (count == 0) return "";
         total += separator.len * (count - 1);
         const result = bumpAlloc(total);
         if (result.len == 0) return "";
         var dst: usize = 0;
         var first = true;
-        current = list;
-        while (current) |cell| {
+        index = 0;
+        while (index < count) : (index += 1) {
+            const segment = List([]const u8).get(list, @intCast(index));
             if (!first and separator.len > 0) {
                 @memcpy(result[dst..][0..separator.len], separator);
                 dst += separator.len;
             }
-            @memcpy(result[dst..][0..cell.head.len], cell.head);
-            dst += cell.head.len;
+            @memcpy(result[dst..][0..segment.len], segment);
+            dst += segment.len;
             first = false;
-            current = cell.tail;
         }
         return result[0..dst];
     }
@@ -4004,10 +4507,7 @@ pub const BinaryHelpers = struct {
 };
 
 // ============================================================
-// List — Concrete cons-cell for pointer-based lists.
-//
-// Lists use nullable pointers: null = empty, non-null = cons cell.
-// This allows runtime empty/non-empty checks that survive ZIR.
+// Callable dispatch helpers.
 // ============================================================
 
 // ---- Callable dispatch helpers ----
@@ -4187,11 +4687,11 @@ pub fn mapMerge(a: anytype, b: anytype) ?*const MapTypeOf(@TypeOf(a)) {
 }
 
 // ---------------------------------------------------------------
-// V8 unchecked-mutation bridge helpers
+// uniqueness unchecked-mutation bridge helpers
 // ---------------------------------------------------------------
 //
-// The codegen rewriter (`arc_ownership.rewriteUncheckedV8Sites`) emits
-// `call_builtin "Map.put_owned_unchecked"` etc. for sites where V8
+// The codegen rewriter (`arc_ownership.rewriteUncheckedUniquenessSites`) emits
+// `call_builtin "Map.put_owned_unchecked"` etc. for sites where uniqueness
 // proves static uniqueness. The ZIR backend's generic-container path
 // (`is_generic_container = mod_name == "Map"`) routes those calls
 // through `mapBridgeMethodToHelper`, which dispatches to these
@@ -4201,7 +4701,7 @@ pub fn mapMerge(a: anytype, b: anytype) ?*const MapTypeOf(@TypeOf(a)) {
 //
 // Soundness contract: see `Map(K, V).put_owned_unchecked` in this
 // module — the receiver MUST have refcount == 1 by construction.
-// V8 enforces that gate at the codegen layer.
+// uniqueness enforces that gate at the codegen layer.
 
 pub fn mapPutOwnedUnchecked(map: anytype, key: anytype, value: anytype) ?*const MapTypeOf(@TypeOf(map)) {
     const M = MapTypeOf(@TypeOf(map));
@@ -4276,6 +4776,16 @@ pub fn listGetTail(list: anytype) @TypeOf(list) {
     return L.getTail(list);
 }
 
+pub fn listSliceFrom(list: anytype, start: i64) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.sliceFrom(list, start);
+}
+
+pub fn listSliceOwnedUnchecked(list: anytype, start: i64) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.slice_owned_unchecked(list, start);
+}
+
 pub fn listIsEmpty(list: anytype) bool {
     const L = ListTypeOf(@TypeOf(list));
     return L.isEmpty(list);
@@ -4284,6 +4794,11 @@ pub fn listIsEmpty(list: anytype) bool {
 pub fn listLength(list: anytype) i64 {
     const L = ListTypeOf(@TypeOf(list));
     return L.length(list);
+}
+
+pub fn listCapacity(list: anytype) i64 {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.capacity(list);
 }
 
 pub fn listGet(list: anytype, index: i64) ListElementOf(@TypeOf(list)) {
@@ -4306,14 +4821,49 @@ pub fn listConcat(a: anytype, b: anytype) @TypeOf(a) {
     return L.concat(a, b);
 }
 
-pub fn listAppend(list: anytype, value: anytype) @TypeOf(list) {
+pub fn listSet(list: anytype, index: i64, value: anytype) @TypeOf(list) {
     const L = ListTypeOf(@TypeOf(list));
-    return L.append(list, value);
+    return L.set(list, index, listElementValue(L.Element, value));
+}
+
+pub fn listPush(list: anytype, value: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.push(list, listElementValue(L.Element, value));
+}
+
+pub fn listPop(list: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.pop(list);
+}
+
+pub fn listAppend(a: anytype, b: anytype) @TypeOf(a) {
+    const L = ListTypeOf(@TypeOf(a));
+    return L.append(a, b);
+}
+
+pub fn listSetOwnedUnchecked(list: anytype, index: i64, value: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.set_owned_unchecked(list, index, listElementValue(L.Element, value));
+}
+
+pub fn listPushOwnedUnchecked(list: anytype, value: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.push_owned_unchecked(list, listElementValue(L.Element, value));
+}
+
+pub fn listPopOwnedUnchecked(list: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.pop_owned_unchecked(list);
+}
+
+pub fn listAppendOwnedUnchecked(a: anytype, b: anytype) @TypeOf(a) {
+    const L = ListTypeOf(@TypeOf(a));
+    return L.append_owned_unchecked(a, b);
 }
 
 pub fn listContains(list: anytype, value: anytype) bool {
     const L = ListTypeOf(@TypeOf(list));
-    return L.contains(list, value);
+    return L.contains(list, listElementValue(L.Element, value));
 }
 
 pub fn listTake(list: anytype, count: i64) @TypeOf(list) {
@@ -4406,9 +4956,21 @@ pub fn listMinVal(list: anytype) ListElementOf(@TypeOf(list)) {
     return L.minVal(list);
 }
 
+pub fn listSum(list: anytype) ListElementOf(@TypeOf(list)) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.sum(list);
+}
+
 fn ListElementOf(comptime ListPtr: type) type {
     const L = ListTypeOf(ListPtr);
-    return @FieldType(L, "head");
+    return L.Element;
+}
+
+fn listElementValue(comptime Element: type, value: anytype) Element {
+    if (Element == Term) {
+        return Term.from(value);
+    }
+    return value;
 }
 
 // ============================================================
@@ -5088,9 +5650,17 @@ pub fn Map(comptime K: type, comptime V: type) type {
             if (map) |m| {
                 if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
             }
-            const self = map orelse return default;
-            const idx = findEntry(self, key) orelse return default;
-            return self.entryAtConst(idx).value;
+            const self = map orelse {
+                retainEntryValue(default);
+                return default;
+            };
+            const idx = findEntry(self, key) orelse {
+                retainEntryValue(default);
+                return default;
+            };
+            const value = self.entryAtConst(idx).value;
+            retainEntryValue(value);
+            return value;
         }
 
         /// Vestigial helper kept for HAMT-era callers that hardcoded a
@@ -5173,9 +5743,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
             if (findEntry(target, key)) |existing_idx| {
                 const allocator = std.heap.c_allocator;
                 const entry = target.entryAt(existing_idx);
+                retainEntryValue(value);
                 releaseEntryValue(entry.value, allocator);
                 entry.value = value;
-                releaseEntryKey(key, allocator);
                 return target;
             }
 
@@ -5209,6 +5779,8 @@ pub fn Map(comptime K: type, comptime V: type) type {
             const new_idx: u32 = dest.len;
             std.debug.assert(new_idx < dest.entry_cap);
             const entries = dest.entriesPtr();
+            retainEntryKey(key);
+            retainEntryValue(value);
             entries[new_idx] = .{ .hash = h, .key = key, .value = value };
             dest.len = new_idx + 1;
             dest.installBucket(h, new_idx);
@@ -5339,12 +5911,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
             var i: u32 = 0;
             while (i < b_len) : (i += 1) {
                 const entry = b_entries[i];
-                retainEntryKey(entry.key);
-                retainEntryValue(entry.value);
                 const next_result = put(result, entry.key, entry.value) orelse {
-                    const allocator = std.heap.c_allocator;
-                    releaseEntryKey(entry.key, allocator);
-                    releaseEntryValue(entry.value, allocator);
                     release(result);
                     return null;
                 };
@@ -5357,21 +5924,21 @@ pub fn Map(comptime K: type, comptime V: type) type {
         }
 
         // -------------------------------------------------------------------
-        // V8 unchecked-mutation variants
+        // uniqueness unchecked-mutation variants
         //
         // These functions mutate the receiver in place WITHOUT loading
         // `header.count()`. The caller (codegen) must have proven via
-        // V8 that the receiver is statically uniquely owned (refcount
+        // uniqueness that the receiver is statically uniquely owned (refcount
         // == 1 by construction).
         //
         // Safety contract:
         //   * `map` (or `map_a` for merge) must be non-null.
         //   * The receiver's `header.ref_count` must be exactly 1.
         //
-        // Violating either condition is undefined behavior. The V8
+        // Violating either condition is undefined behavior. The uniqueness
         // verifier in `arc_verifier.zig` enforces both at every call
         // site. Tests may invoke these directly; production callers
-        // must always route through V8.
+        // must always route through uniqueness.
         //
         // Refcount semantics: the receiver enters with rc=1 and
         // returns with rc=1. The unchecked variants never bump or
@@ -5383,7 +5950,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
         // -------------------------------------------------------------------
 
         /// Like `put`, but skips the rc==1 check. Caller must have
-        /// proven uniqueness via V8. See safety contract above.
+        /// proven uniqueness via uniqueness. See safety contract above.
         pub fn put_owned_unchecked(map: ?*const Self, key: K, value: V) ?*const Self {
             const callsite = @returnAddress();
             dense_map_mut_calls_total += 1;
@@ -5394,7 +5961,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 // contract assumes a non-null receiver in steady
                 // state, but supporting null here keeps the empty-
                 // map seeding pattern (`Map.new()` returns null)
-                // working under V8 without forcing the codegen to
+                // working under uniqueness without forcing the codegen to
                 // emit a null check before the unchecked call.
                 const fresh = bufferAlloc(DENSE_MAP_INITIAL_CAPACITY, Wyhash.nextSeed(), callsite) orelse return null;
                 _ = putInPlaceInsert(fresh, key, value);
@@ -5406,7 +5973,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
         }
 
         /// Like `delete`, but skips the rc==1 check. Caller must
-        /// have proven uniqueness via V8. See safety contract above.
+        /// have proven uniqueness via uniqueness. See safety contract above.
         pub fn delete_owned_unchecked(map: ?*const Self, key: K) ?*const Self {
             dense_map_mut_calls_total += 1;
             dense_map_unchecked_total += 1;
@@ -5419,7 +5986,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
         }
 
         /// Like `merge`, but skips the rc==1 check on `map_a`. Caller
-        /// must have proven uniqueness of `map_a` via V8. `map_b` is
+        /// must have proven uniqueness of `map_a` via uniqueness. `map_b` is
         /// BORROWED — its entries' keys and values are deep-retained
         /// as they're copied into A. See safety contract above.
         ///
@@ -5445,12 +6012,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
             var i: u32 = 0;
             while (i < b_len) : (i += 1) {
                 const entry = b_entries[i];
-                retainEntryKey(entry.key);
-                retainEntryValue(entry.value);
                 const next_result = put_owned_unchecked(result, entry.key, entry.value) orelse {
-                    const allocator = std.heap.c_allocator;
-                    releaseEntryKey(entry.key, allocator);
-                    releaseEntryValue(entry.value, allocator);
                     return null;
                 };
                 // Under uniqueness, put_owned_unchecked either
@@ -5612,11 +6174,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
             if (len == 0) return null;
             const entries = self.entriesPtr();
             var result: ?*const List(K) = null;
-            var i: usize = len;
-            while (i > 0) {
-                i -= 1;
+            var i: usize = 0;
+            while (i < len) : (i += 1) {
                 retainEntryKey(entries[i].key);
-                result = List(K).cons(entries[i].key, result);
+                result = List(K).push(result, entries[i].key);
             }
             return result;
         }
@@ -5628,11 +6189,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
             if (len == 0) return null;
             const entries = self.entriesPtr();
             var result: ?*const List(V) = null;
-            var i: usize = len;
-            while (i > 0) {
-                i -= 1;
+            var i: usize = 0;
+            while (i < len) : (i += 1) {
                 retainEntryValue(entries[i].value);
-                result = List(V).cons(entries[i].value, result);
+                result = List(V).push(result, entries[i].value);
             }
             return result;
         }
@@ -5733,623 +6293,6 @@ fn defaultElementOf(comptime T: type) T {
         .optional => return null,
         else => return std.mem.zeroes(T),
     }
-}
-
-pub fn List(comptime T: type) type {
-    return struct {
-        const Self = @This();
-
-        // Phase H.1 — `List(T)` cells are now Arc-headered + pool-
-        // allocated, mirroring `Map(K, V)` and `FlatList(T)`. The
-        // first field is `ArcHeader` so retain/release lower through
-        // the same opaque helpers and the inline-header detection in
-        // `ArcRuntime.hasInlineArcHeader` recognises the type.
-        //
-        // Memory model: every `cons` allocates a fresh cell with
-        // `refcount = 1` from a thread-local `MemoryPool(Self)`. The
-        // caller-side share/release ABI keeps refcounts honest:
-        //   * `cons(head, tail)` consumes its arguments — the cell
-        //     stores `head`/`tail` as durable owners. Sharing is the
-        //     caller's responsibility (Phase E.10's aggregate-store
-        //     consume classification handles this in IR).
-        //   * `retain(list)` bumps the refcount on the head cell only
-        //     (the spine is not touched — every cell already has its
-        //     own count).
-        //   * `release(list)` decrements; on the zero-transition the
-        //     cell's `head` is deep-released (if `T` carries Arc-
-        //     managed children) and the `tail` pointer is released
-        //     recursively before the cell returns to its pool.
-        //
-        // Persistent semantics are preserved: `cons` never mutates an
-        // existing cell, and shared tails carry their own refcounts.
-        header: ArcHeader,
-        head: T,
-        tail: ?*const Self,
-
-        /// Per-(T) thread-local MemoryPool for List cells. Mirrors
-        /// `Map(K, V).SelfPool`: hot-path allocation becomes a free-list
-        /// pop, reclamation becomes a free-list push. OS page commit
-        /// happens once per pool growth instead of per-allocation.
-        /// Single-threaded Zap programs share the pool across all
-        /// `List(T)` operations.
-        const SelfPool = struct {
-            const PoolT = std.heap.MemoryPool(Self);
-            threadlocal var pool: PoolT = .empty;
-            threadlocal var stats: PoolStats = .{ .name = "List(" ++ @typeName(T) ++ ").Self" };
-
-            fn create() *Self {
-                ensureArcStatsAtexit();
-                stats.noteAllocation();
-                return pool.create(std.heap.page_allocator) catch
-                    @panic("List cell pool: out of memory");
-            }
-
-            fn destroy(cell: *Self) void {
-                stats.noteDeallocation();
-                pool.destroy(cell);
-            }
-        };
-
-        /// Default-initialised value of `T` for empty-list returns.
-        /// Tagged unions (notably `Term`) cannot use `std.mem.zeroes`.
-        /// Plain `Term` returns the `.nil` variant. For nested aggregates
-        /// (tuples or structs whose components include `Term`), build a
-        /// per-field default so heterogeneous keyword-list element types
-        /// like `tuple{Atom, Term}` work as `List` element types.
-        fn defaultElement() T {
-            return defaultElementOf(T);
-        }
-
-        pub fn empty() ?*const Self {
-            return null;
-        }
-
-        /// Construct a new list cell with `head` and `tail`. The cell's
-        /// refcount starts at 1; the caller becomes the sole owner.
-        ///
-        /// Ownership semantics for ARC-managed `T`: `head` and `tail`
-        /// are **consumed** — the cell stores them as durable owners,
-        /// and the caller must NOT release them after `cons` returns.
-        /// Phase E.10's classifier emits `move_value` for `local_get`
-        /// uses whose only consumption is a `list_cons.head/tail`
-        /// position, so the caller-side IR transfers ownership cleanly.
-        ///
-        /// When the cell's refcount later hits zero, `release` will
-        /// deep-release the stored `head` (if `T` carries ARC children)
-        /// and recurse into `tail`.
-        pub fn cons(head: T, tail: ?*const Self) ?*const Self {
-            const cell = SelfPool.create();
-            cell.* = .{
-                .header = ArcHeader.init(),
-                .head = head,
-                .tail = tail,
-            };
-            return cell;
-        }
-
-        /// Increment the refcount of a list cell and return the same
-        /// handle. Null lists (the empty-list sentinel) are a no-op.
-        /// Mirrors `Map.retain`. Only the head cell's refcount is
-        /// bumped; the spine is shared by-pointer and each tail cell
-        /// has its own count.
-        pub fn retain(list: ?*const Self) ?*const Self {
-            if (list) |cell| {
-                const mut: *Self = @constCast(cell);
-                mut.header.retain();
-                arc_retains_total += 1;
-            }
-            return list;
-        }
-
-        /// Decrement the refcount of a list cell. On the zero-
-        /// transition, deep-release the head (if `T` carries ARC
-        /// children), iteratively walk the tail spine releasing each
-        /// cell whose refcount also hits zero, and return reclaimed
-        /// cells to the SelfPool.
-        ///
-        /// The walk is bounded by the actual ownership graph: every
-        /// shared tail has its own refcount > 1, so the loop stops at
-        /// the first cell whose decrement leaves a survivor count,
-        /// leaving the rest of the spine alive for any other owner.
-        ///
-        /// Iteration (vs. recursion) is required because long lists
-        /// would otherwise blow the call stack on teardown — the spine
-        /// can be arbitrarily deep, but the work per cell is fixed, so
-        /// a tight loop replaces the recursive call cleanly.
-        pub fn release(list: ?*const Self) void {
-            var current = list;
-            while (current) |cell| {
-                const mut: *Self = @constCast(cell);
-                arc_releases_total += 1;
-                if (!mut.header.release()) {
-                    // Refcount survived — another owner still holds the
-                    // remaining spine. Stop here.
-                    return;
-                }
-                // Final owner of this cell — tear down owned children.
-                // The walk dispatches on `T`'s shape:
-                //   * If `T` is itself an ARC-managed pointer (e.g.
-                //     `?*const Map(K, V)`), release the pointer
-                //     directly via `releaseFieldChildAny`.
-                //   * If `T` is a struct/tuple, walk its fields via
-                //     `releaseChildrenAny` to deep-release any
-                //     ARC-managed children inside.
-                //   * Otherwise (i64, bool, ...), this compiles to
-                //     nothing.
-                releaseHeadChildren(cell.head);
-                const next_tail = cell.tail;
-                SelfPool.destroy(mut);
-                current = next_tail;
-            }
-        }
-
-        /// Codegen-side deep-release entry point. Invoked by
-        /// `ArcRuntime.releaseArcAny` when the Zap-emitted release path
-        /// dispatches on a `List(T)` value pointer. Mirrors `release`
-        /// but takes the value-pointer shape that codegen produces.
-        pub fn arcReleaseDeep(allocator: std.mem.Allocator, ptr: *const Self) void {
-            _ = allocator;
-            release(@as(?*const Self, ptr));
-        }
-
-        /// Deep-release the head value of a list cell. Dispatches on
-        /// `T`'s shape: optional/pointer heads are released directly
-        /// (mirroring how struct fields of the same shape are walked
-        /// in `ArcRuntime.releaseFieldChildAny`); aggregate heads
-        /// (structs, tuples) recurse through their fields; primitive
-        /// heads (i64, bool, ...) compile to nothing.
-        ///
-        /// Inlined into `release` so the comptime dispatch happens at
-        /// the list-monomorphization site, not inside an opaque
-        /// helper.
-        fn releaseHeadChildren(head_value: T) void {
-            const allocator = std.heap.c_allocator;
-            switch (@typeInfo(T)) {
-                .optional => |opt| {
-                    if (head_value) |inner| {
-                        releaseFieldShape(opt.child, allocator, inner);
-                    }
-                },
-                .pointer => |p| {
-                    if (p.size == .one) {
-                        ArcRuntime.releaseArcAny(p.child, allocator, @constCast(head_value));
-                    }
-                },
-                .@"struct" => {
-                    ArcRuntime.releaseChildrenAny(T, allocator, head_value);
-                },
-                else => {},
-            }
-        }
-
-        /// Helper for `releaseHeadChildren`'s optional branch — walks
-        /// one level deeper into an unwrapped optional payload. Mirrors
-        /// `ArcRuntime.releaseFieldChildAny`'s semantics but stays in
-        /// this file so the recursion bottoms out cleanly at the
-        /// pointer / struct cases.
-        fn releaseFieldShape(comptime FieldType: type, allocator: std.mem.Allocator, value: FieldType) void {
-            switch (@typeInfo(FieldType)) {
-                .optional => |opt| {
-                    if (value) |inner| releaseFieldShape(opt.child, allocator, inner);
-                },
-                .pointer => |p| {
-                    if (p.size == .one) {
-                        ArcRuntime.releaseArcAny(p.child, allocator, @constCast(value));
-                    }
-                },
-                .@"struct" => {
-                    ArcRuntime.releaseChildrenAny(FieldType, allocator, value);
-                },
-                else => {},
-            }
-        }
-
-        /// Inverse of `releaseHeadChildren`: deep-retain every
-        /// ARC-managed child carried inside the head value. Used by
-        /// `next` (and any other site that hands a cell-owned head out
-        /// as a fresh owner without removing it from the cell). The
-        /// switch arms exactly mirror `releaseHeadChildren` so retain
-        /// and release stay in lockstep — drift between the two would
-        /// produce one-sided refcount adjustments that leak or
-        /// double-free.
-        fn retainHeadChildren(head_value: T) void {
-            switch (@typeInfo(T)) {
-                .optional => |opt| {
-                    if (head_value) |inner| {
-                        retainFieldShape(opt.child, inner);
-                    }
-                },
-                .pointer => |p| {
-                    if (p.size == .one) {
-                        // List cons cells are persistent containers
-                        // — the head value remains owned by the cell
-                        // for as long as the cell lives. Use the
-                        // persistent retain path so type-specific
-                        // share-event instrumentation fires.
-                        ArcRuntime.retainAnyPersistent(@as(*const p.child, @constCast(head_value)));
-                    }
-                },
-                .@"struct" => {
-                    ArcRuntime.retainChildrenAny(T, head_value);
-                },
-                else => {},
-            }
-        }
-
-        /// Helper for `retainHeadChildren`'s optional branch — mirror
-        /// of `releaseFieldShape`, walks one level deeper into an
-        /// unwrapped optional payload and bumps refcounts at the
-        /// pointer / struct cases.
-        fn retainFieldShape(comptime FieldType: type, value: FieldType) void {
-            switch (@typeInfo(FieldType)) {
-                .optional => |opt| {
-                    if (value) |inner| retainFieldShape(opt.child, inner);
-                },
-                .pointer => |p| {
-                    if (p.size == .one) {
-                        ArcRuntime.retainAnyPersistent(@as(*const p.child, @constCast(value)));
-                    }
-                },
-                .@"struct" => {
-                    ArcRuntime.retainChildrenAny(FieldType, value);
-                },
-                else => {},
-            }
-        }
-
-        /// Returns a fresh owner of the cell's head value. The cell
-        /// continues to own its copy too — `releaseHeadChildren` runs
-        /// on the cell's zero-transition. To keep the two owners in
-        /// balance, deep-retain the head's ARC children before handing
-        /// the value out. This matches the IR's "list_head produces an
-        /// owner" model used by `arc_drop_insertion`. Without the
-        /// retain, the cell's deep-release and the caller's release
-        /// race on the same children and produce double-frees once
-        /// `.list` joins the ARC-managed set.
-        pub fn getHead(list: ?*const Self) T {
-            if (list) |cell| {
-                retainHeadChildren(cell.head);
-                return cell.head;
-            }
-            return defaultElement();
-        }
-
-        /// Returns a fresh owner of the cell's tail spine. Bumps the
-        /// head cell of `cell.tail` (the spine's first cell) so the
-        /// cell's own owner-side deep-release stays balanced with the
-        /// caller's eventual release. Mirrors `getHead`.
-        pub fn getTail(list: ?*const Self) ?*const Self {
-            if (list) |cell| {
-                _ = retain(cell.tail);
-                return cell.tail;
-            }
-            return null;
-        }
-
-        pub fn isEmpty(list: ?*const Self) bool {
-            return list == null;
-        }
-
-        pub fn length(list: ?*const Self) i64 {
-            var current = list;
-            var count: i64 = 0;
-            while (current) |cell| {
-                count += 1;
-                current = cell.tail;
-            }
-            return count;
-        }
-
-        pub fn get(list: ?*const Self, index: i64) T {
-            var current = list;
-            var i: i64 = 0;
-            while (current) |cell| {
-                if (i == index) return cell.head;
-                current = cell.tail;
-                i += 1;
-            }
-            return defaultElement();
-        }
-
-        pub fn last(list: ?*const Self) T {
-            var current = list;
-            var result: T = defaultElement();
-            while (current) |cell| {
-                result = cell.head;
-                current = cell.tail;
-            }
-            return result;
-        }
-
-        pub fn reverse(list: ?*const Self) ?*const Self {
-            var current = list;
-            var result: ?*const Self = null;
-            while (current) |cell| {
-                result = cons(cell.head, result);
-                current = cell.tail;
-            }
-            return result;
-        }
-
-        /// Iterator protocol: returns {atom, value, next_state}.
-        /// :cont (5) with head and tail for non-empty, :done (7) for empty.
-        ///
-        /// Ownership semantics for ARC-managed `T`: the returned tuple's
-        /// `head` and `next_state` are fresh **owners** — the caller's
-        /// `result_convention` for this protocol-dispatched call sees
-        /// every ARC-managed return slot as `.owned`. Because `cell.head`
-        /// and `cell.tail` are still owned by `cell` after we read them,
-        /// `next` must deep-retain `head` (recursively bumping the
-        /// refcount of every ARC-managed child carried inside `T`) and
-        /// retain `tail` (bumping the head cell of the tail spine, since
-        /// the original list still references it). Without this, the
-        /// caller's eventual release of the returned values would race
-        /// with the cell's own deep-release on its zero-transition,
-        /// producing double-frees for ARC-typed elements (the corruption
-        /// surfaced by k-nucleotide once `.list` joins `.opaque_type`,
-        /// `.map` in `isArcManagedTypeId`).
-        /// See module-level note on Phase H ARC ABI: `next` returns
-        /// fresh owners of `head` and `tail`, so we must deep-retain
-        /// the head's ARC children and bump the tail spine's head-cell
-        /// refcount before handing the values out. The cell itself
-        /// still owns its copies — the symmetric deep-release fires on
-        /// the cell's eventual zero-transition in `release`.
-        pub fn next(list: ?*const Self) std.meta.Tuple(&.{ u32, T, ?*const Self }) {
-            if (list) |cell| {
-                retainHeadChildren(cell.head);
-                _ = retain(cell.tail);
-                return .{ ATOM_CONT, cell.head, cell.tail };
-            }
-            return .{ ATOM_DONE, defaultElement(), null };
-        }
-
-        pub fn contains(list: ?*const Self, value: T) bool {
-            var current = list;
-            while (current) |cell| {
-                if (T == Term) {
-                    if (Term.eql(cell.head, value)) return true;
-                } else {
-                    if (std.mem.eql(u8, std.mem.asBytes(&cell.head), std.mem.asBytes(&value))) return true;
-                }
-                current = cell.tail;
-            }
-            return false;
-        }
-
-        pub fn append(list: ?*const Self, value: T) ?*const Self {
-            return reverse(cons(value, reverse(list)));
-        }
-
-        pub fn concat(first: ?*const Self, second: ?*const Self) ?*const Self {
-            if (first == null) return second;
-            var reversed_first = reverse(first);
-            var result = second;
-            while (reversed_first) |cell| {
-                result = cons(cell.head, result);
-                reversed_first = cell.tail;
-            }
-            return result;
-        }
-
-        pub fn take(list: ?*const Self, count: i64) ?*const Self {
-            if (count <= 0 or list == null) return null;
-            var current = list;
-            var collected: ?*const Self = null;
-            var remaining: i64 = count;
-            while (current) |cell| {
-                if (remaining <= 0) break;
-                collected = cons(cell.head, collected);
-                current = cell.tail;
-                remaining -= 1;
-            }
-            return reverse(collected);
-        }
-
-        pub fn drop(list: ?*const Self, count: i64) ?*const Self {
-            if (count <= 0) return list;
-            var current = list;
-            var remaining: i64 = count;
-            while (current) |cell| {
-                if (remaining <= 0) return current;
-                current = cell.tail;
-                remaining -= 1;
-            }
-            return null;
-        }
-
-        pub fn uniq(list: ?*const Self) ?*const Self {
-            var current = list;
-            var result: ?*const Self = null;
-            while (current) |cell| {
-                if (!contains(result, cell.head)) {
-                    result = cons(cell.head, result);
-                }
-                current = cell.tail;
-            }
-            return reverse(result);
-        }
-
-        // Higher-order functions
-        pub fn mapFn(list: ?*const Self, callback: anytype) ?*const Self {
-            var current = list;
-            var result: ?*const Self = null;
-            while (current) |cell| {
-                result = cons(call1(callback, cell.head), result);
-                current = cell.tail;
-            }
-            return reverse(result);
-        }
-
-        pub fn filterFn(list: ?*const Self, predicate: anytype) ?*const Self {
-            var current = list;
-            var result: ?*const Self = null;
-            while (current) |cell| {
-                if (call1(predicate, cell.head)) {
-                    result = cons(cell.head, result);
-                }
-                current = cell.tail;
-            }
-            return reverse(result);
-        }
-
-        pub fn rejectFn(list: ?*const Self, predicate: anytype) ?*const Self {
-            var current = list;
-            var result: ?*const Self = null;
-            while (current) |cell| {
-                if (!call1(predicate, cell.head)) {
-                    result = cons(cell.head, result);
-                }
-                current = cell.tail;
-            }
-            return reverse(result);
-        }
-
-        pub fn enumReduceSimple(list: ?*const Self, initial: T, callback: anytype) T {
-            var current = list;
-            var acc: T = initial;
-            while (current) |cell| {
-                acc = call2(callback, acc, cell.head);
-                current = cell.tail;
-            }
-            return acc;
-        }
-
-        pub fn eachFn(list: ?*const Self, callback: anytype) ?*const Self {
-            var current = list;
-            while (current) |cell| {
-                _ = call1(callback, cell.head);
-                current = cell.tail;
-            }
-            return list;
-        }
-
-        pub fn findFn(list: ?*const Self, default: T, predicate: anytype) T {
-            var current = list;
-            while (current) |cell| {
-                if (call1(predicate, cell.head)) return cell.head;
-                current = cell.tail;
-            }
-            return default;
-        }
-
-        pub fn anyFn(list: ?*const Self, predicate: anytype) bool {
-            var current = list;
-            while (current) |cell| {
-                if (call1(predicate, cell.head)) return true;
-                current = cell.tail;
-            }
-            return false;
-        }
-
-        pub fn allFn(list: ?*const Self, predicate: anytype) bool {
-            var current = list;
-            while (current) |cell| {
-                if (!call1(predicate, cell.head)) return false;
-                current = cell.tail;
-            }
-            return true;
-        }
-
-        pub fn countFn(list: ?*const Self, predicate: anytype) i64 {
-            var current = list;
-            var count: i64 = 0;
-            while (current) |cell| {
-                if (call1(predicate, cell.head)) count += 1;
-                current = cell.tail;
-            }
-            return count;
-        }
-
-        pub fn sortFn(list: ?*const Self, comparator: anytype) ?*const Self {
-            const len_val = length(list);
-            if (len_val <= 1) return list;
-            const len: usize = @intCast(len_val);
-            const arr = bumpAllocSlice(T, len);
-            if (arr.len == 0) return list;
-            var current = list;
-            var i: usize = 0;
-            while (current) |cell| {
-                if (i < len) arr[i] = cell.head;
-                current = cell.tail;
-                i += 1;
-            }
-            const Ctx = struct {
-                cmp: @TypeOf(comparator),
-                fn lessThan(ctx: @This(), a: T, b: T) bool {
-                    return call2(ctx.cmp, a, b);
-                }
-            };
-            std.sort.pdq(T, arr, Ctx{ .cmp = comparator }, Ctx.lessThan);
-            var result: ?*const Self = null;
-            var ri: usize = len;
-            while (ri > 0) {
-                ri -= 1;
-                result = cons(arr[ri], result);
-            }
-            return result;
-        }
-
-        pub fn flatMapFn(list: ?*const Self, callback: anytype) ?*const Self {
-            var current = list;
-            var result: ?*const Self = null;
-            while (current) |cell| {
-                var inner = call1(callback, cell.head);
-                while (inner) |inner_cell| {
-                    result = cons(inner_cell.head, result);
-                    inner = inner_cell.tail;
-                }
-                current = cell.tail;
-            }
-            return reverse(result);
-        }
-
-        // Numeric-only methods (only instantiated when T is an integer type)
-        pub fn sum(list: ?*const Self) T {
-            if (comptime @typeInfo(T) != .int) @compileError("sum requires integer element type");
-            var current = list;
-            var total: T = 0;
-            while (current) |cell| {
-                total += cell.head;
-                current = cell.tail;
-            }
-            return total;
-        }
-
-        pub fn product(list: ?*const Self) T {
-            if (comptime @typeInfo(T) != .int) @compileError("product requires integer element type");
-            var current = list;
-            var total: T = 1;
-            while (current) |cell| {
-                total *= cell.head;
-                current = cell.tail;
-            }
-            return total;
-        }
-
-        pub fn maxVal(list: ?*const Self) T {
-            if (comptime @typeInfo(T) != .int) @compileError("maxVal requires integer element type");
-            if (list == null) return 0;
-            var current = list;
-            var result: T = list.?.head;
-            while (current) |cell| {
-                if (cell.head > result) result = cell.head;
-                current = cell.tail;
-            }
-            return result;
-        }
-
-        pub fn minVal(list: ?*const Self) T {
-            if (comptime @typeInfo(T) != .int) @compileError("minVal requires integer element type");
-            if (list == null) return 0;
-            var current = list;
-            var result: T = list.?.head;
-            while (current) |cell| {
-                if (cell.head < result) result = cell.head;
-                current = cell.tail;
-            }
-            return result;
-        }
-    };
 }
 
 // ============================================================
@@ -9288,12 +9231,11 @@ pub const Prim = struct {
         }
 
         var result: ?*const List([]const u8) = null;
-        var index = matches.len;
-        while (index > 0) {
-            index -= 1;
+        var index: usize = 0;
+        while (index < matches.len) : (index += 1) {
             const copied_path = bumpCopy(matches[index]);
             if (copied_path.len == 0 and matches[index].len != 0) return null;
-            result = List([]const u8).cons(copied_path, result);
+            result = List([]const u8).push(result, copied_path);
         }
         return result;
     }
@@ -9706,128 +9648,6 @@ test "releaseChildrenAny releases ?*const Map(K, V) field" {
     try std.testing.expectEqual(before_releases + 1, arc_releases_total);
 }
 
-test "List(i64) cons + retain + release with refcount semantics" {
-    // Phase H.1: every `cons` allocates a fresh Arc-headered cell from
-    // the per-(T) MemoryPool. Refcount starts at 1; `retain` bumps,
-    // `release` decrements. The cell is returned to the pool only on
-    // the zero-transition.
-    const ListI64 = List(i64);
-    const before_retains = arc_retains_total;
-    const before_releases = arc_releases_total;
-
-    const cell_a = ListI64.cons(1, null) orelse {
-        try std.testing.expect(false);
-        return;
-    };
-    const cell_b = ListI64.cons(2, cell_a) orelse {
-        try std.testing.expect(false);
-        return;
-    };
-    try std.testing.expectEqual(@as(i64, 2), ListI64.getHead(cell_b));
-    try std.testing.expectEqual(@as(i64, 2), ListI64.length(cell_b));
-
-    // Retain bumps the head cell only.
-    _ = ListI64.retain(cell_b);
-    try std.testing.expectEqual(before_retains + 1, arc_retains_total);
-
-    // Release once — refcount drops to 1, cell stays alive.
-    ListI64.release(cell_b);
-    try std.testing.expectEqual(before_releases + 1, arc_releases_total);
-
-    // Final release — cell_b's refcount hits zero, head is shallow
-    // (i64), tail recurse into cell_a which also drops to zero.
-    // Two cells freed, two release ticks.
-    ListI64.release(cell_b);
-    try std.testing.expectEqual(before_releases + 3, arc_releases_total);
-}
-
-test "releaseChildrenAny releases ?*const List(T) field" {
-    // Phase H.1 regression test mirroring the Phase F Map-field test:
-    // when a struct holds a `?*const List(T)` child field,
-    // `releaseChildrenAny` must walk the field via
-    // `releaseFieldChildAny` -> `releaseArcAny` and dispatch into the
-    // List's inline-header `release` method (via `arcReleaseDeep`).
-    // Now that List carries an inline `ArcHeader`, the runtime helper
-    // must recognize the inline-header path and avoid the `Arc(T)`-
-    // wrapper double-counting that would arise from
-    // `prepareReleaseAny`.
-    const ListI64 = List(i64);
-
-    const before_releases = arc_releases_total;
-
-    const cell_a = ListI64.cons(10, null) orelse {
-        try std.testing.expect(false);
-        return;
-    };
-    const cell_b = ListI64.cons(20, cell_a) orelse {
-        try std.testing.expect(false);
-        return;
-    };
-
-    // Wrap the list pointer inside a struct, mimicking the codegen-
-    // emitted shape for an aggregate that owns a List child via an
-    // indirect-storage optional pointer field.
-    const Holder = struct {
-        list_field: ?*const ListI64,
-        scalar: i64,
-    };
-    const holder = Holder{ .list_field = cell_b, .scalar = 7 };
-
-    // releaseChildrenAny must traverse `list_field` and invoke the
-    // List's inline-header `release` (not the generic Arc(T) path).
-    // The non-arc `scalar` field must be skipped without compile error.
-    ArcRuntime.releaseChildrenAny(Holder, std.testing.allocator, holder);
-
-    // The List's `release` bumps `arc_releases_total` once per cell
-    // freed (two cells in this spine), and the generic wrapper short-
-    // circuits its own bump for inline-header types.
-    try std.testing.expectEqual(before_releases + 2, arc_releases_total);
-}
-
-test "List(?*const Map) deep-releases Map heads on cell teardown" {
-    // Phase H.1 keystone: a list of ARC-managed values (here, Map
-    // pointers) must release each head when the cell is reclaimed.
-    // Without this, the doc-runner fails — `compose_member_detail`
-    // builds a list whose heads are Maps, the comptime store consumes
-    // the +1, then the cell drops with a stale Map pointer that gets
-    // reused.
-    const MapI64 = Map(i64, i64);
-    const ListMap = List(?*const MapI64);
-
-    const before_releases = arc_releases_total;
-
-    const keys_one = [_]i64{ 1, 2 };
-    const vals_one = [_]i64{ 10, 20 };
-    const map_one = MapI64.fromPairs(&keys_one, &vals_one, 2) orelse {
-        try std.testing.expect(false);
-        return;
-    };
-    const keys_two = [_]i64{ 3, 4 };
-    const vals_two = [_]i64{ 30, 40 };
-    const map_two = MapI64.fromPairs(&keys_two, &vals_two, 2) orelse {
-        try std.testing.expect(false);
-        return;
-    };
-
-    // Build [map_one, map_two] — `cons` consumes its arguments, so
-    // the list now owns the +1 on each Map.
-    const cell_a = ListMap.cons(map_two, null) orelse {
-        try std.testing.expect(false);
-        return;
-    };
-    const cell_b = ListMap.cons(map_one, cell_a) orelse {
-        try std.testing.expect(false);
-        return;
-    };
-
-    // Releasing the list's head cell tears down the entire spine and
-    // each cell deep-releases its head Map. Expect:
-    //   * 2 List cells freed (2 release ticks from List.release).
-    //   * 2 Map cells freed (2 release ticks from Map.release).
-    ListMap.release(cell_b);
-    try std.testing.expectEqual(before_releases + 4, arc_releases_total);
-}
-
 test "Atom well-known values" {
     try std.testing.expectEqual(@as(u32, 0), Atom.nil.id);
     try std.testing.expectEqual(@as(u32, 1), Atom.true.id);
@@ -9868,6 +9688,23 @@ test "String operations" {
 
 test "String concat" {
     try std.testing.expectEqualStrings("hello world", String.concat("hello", " world"));
+}
+
+test "List(i64) sliceFrom returns indexed suffix" {
+    const ListI64 = List(i64);
+    var list = ListI64.new_empty(0) orelse @panic("test list allocation failed");
+    list = ListI64.push(list, 10) orelse @panic("push failed");
+    list = ListI64.push(list, 20) orelse @panic("push failed");
+    list = ListI64.push(list, 30) orelse @panic("push failed");
+    list = ListI64.push(list, 40) orelse @panic("push failed");
+    defer ListI64.release(list);
+
+    const suffix = ListI64.sliceFrom(list, 2) orelse @panic("sliceFrom returned null");
+    defer ListI64.release(suffix);
+    try std.testing.expectEqual(@as(i64, 2), ListI64.length(suffix));
+    try std.testing.expectEqual(@as(i64, 30), ListI64.get(suffix, 0));
+
+    try std.testing.expect(ListI64.sliceFrom(list, 4) == null);
 }
 
 // ============================================================
@@ -9997,225 +9834,304 @@ test "instrumentation: V — shared and post-share-mutated" {
 }
 
 // ============================================================
-// FlatList(T) — renamed flat-buffer mutable array
+// List(T) — renamed flat-buffer mutable array
 // ============================================================
 
-test "FlatList(i64) new_filled allocates and initialises every slot" {
-    const VecI64 = FlatList(i64);
-    const v = VecI64.new_filled(5, 7) orelse {
+test "List(i64) new_filled allocates and initialises every slot" {
+    const ListI64 = List(i64);
+    const v = ListI64.new_filled(5, 7) orelse {
         try std.testing.expect(false);
         return;
     };
-    defer VecI64.release(v);
+    defer ListI64.release(v);
 
-    try std.testing.expectEqual(@as(i64, 5), VecI64.length(v));
+    try std.testing.expectEqual(@as(i64, 5), ListI64.length(v));
     var i: i64 = 0;
     while (i < 5) : (i += 1) {
-        try std.testing.expectEqual(@as(i64, 7), VecI64.get(v, i));
+        try std.testing.expectEqual(@as(i64, 7), ListI64.get(v, i));
     }
 }
 
-test "FlatList(i64) new_empty allocates with reserved capacity and zero len" {
-    const VecI64 = FlatList(i64);
-    const v = VecI64.new_empty(8) orelse {
+test "List(i64) new_empty allocates with reserved capacity and zero len" {
+    const ListI64 = List(i64);
+    const v = ListI64.new_empty(8) orelse {
         try std.testing.expect(false);
         return;
     };
-    defer VecI64.release(v);
+    defer ListI64.release(v);
 
-    try std.testing.expectEqual(@as(i64, 0), VecI64.length(v));
-    try std.testing.expect(VecI64.capacity(v) >= 8);
+    try std.testing.expectEqual(@as(i64, 0), ListI64.length(v));
+    try std.testing.expect(ListI64.capacity(v) >= 8);
 }
 
-test "FlatList(i64) get/set roundtrips on rc==1 buffer returns same handle" {
-    const VecI64 = FlatList(i64);
-    const v = VecI64.new_filled(3, 0) orelse {
+test "List(i64) get/set roundtrips on rc==1 buffer returns same handle" {
+    const ListI64 = List(i64);
+    const v = ListI64.new_filled(3, 0) orelse {
         try std.testing.expect(false);
         return;
     };
-    defer VecI64.release(v);
+    defer ListI64.release(v);
 
-    const after_set = VecI64.set(v, 1, 42) orelse {
+    const after_set = ListI64.set(v, 1, 42) orelse {
         try std.testing.expect(false);
         return;
     };
     // rc==1 fast path: same handle returned, in-place mutation.
     try std.testing.expectEqual(@intFromPtr(v), @intFromPtr(after_set));
-    try std.testing.expectEqual(@as(i64, 42), VecI64.get(after_set, 1));
+    try std.testing.expectEqual(@as(i64, 42), ListI64.get(after_set, 1));
 }
 
-test "FlatList(i64) set on rc>1 buffer clones; original stays unchanged" {
-    const VecI64 = FlatList(i64);
-    const original = VecI64.new_filled(3, 0) orelse {
+test "List(i64) set on rc>1 buffer clones; original stays unchanged" {
+    const ListI64 = List(i64);
+    const original = ListI64.new_filled(3, 0) orelse {
         try std.testing.expect(false);
         return;
     };
-    defer VecI64.release(original);
+    defer ListI64.release(original);
 
     // Bump refcount; now `set` must COW.
-    const shared = VecI64.retain(original);
-    defer VecI64.release(shared);
+    const shared = ListI64.retain(original);
+    defer ListI64.release(shared);
 
-    const updated = VecI64.set(original, 1, 99) orelse {
+    const updated = ListI64.set(original, 1, 99) orelse {
         try std.testing.expect(false);
         return;
     };
-    defer VecI64.release(updated);
+    defer ListI64.release(updated);
 
     try std.testing.expect(@intFromPtr(updated) != @intFromPtr(original));
     // Original unchanged.
-    try std.testing.expectEqual(@as(i64, 0), VecI64.get(original, 1));
+    try std.testing.expectEqual(@as(i64, 0), ListI64.get(original, 1));
     // Updated has the new value.
-    try std.testing.expectEqual(@as(i64, 99), VecI64.get(updated, 1));
+    try std.testing.expectEqual(@as(i64, 99), ListI64.get(updated, 1));
 }
 
-test "FlatList(i64) push grows length and persists value (rc==1)" {
-    const VecI64 = FlatList(i64);
-    const v0 = VecI64.new_empty(2) orelse {
+test "List(i64) push grows length and persists value (rc==1)" {
+    const ListI64 = List(i64);
+    const v0 = ListI64.new_empty(2) orelse {
         try std.testing.expect(false);
         return;
     };
-    const v1 = VecI64.push(v0, 10) orelse {
+    const v1 = ListI64.push(v0, 10) orelse {
         try std.testing.expect(false);
         return;
     };
-    const v2 = VecI64.push(v1, 20) orelse {
+    const v2 = ListI64.push(v1, 20) orelse {
         try std.testing.expect(false);
         return;
     };
     // rc==1: each push reuses buffer (until capacity is exceeded).
-    const v3 = VecI64.push(v2, 30) orelse {
+    const v3 = ListI64.push(v2, 30) orelse {
         try std.testing.expect(false);
         return;
     };
-    defer VecI64.release(v3);
+    defer ListI64.release(v3);
 
-    try std.testing.expectEqual(@as(i64, 3), VecI64.length(v3));
-    try std.testing.expectEqual(@as(i64, 10), VecI64.get(v3, 0));
-    try std.testing.expectEqual(@as(i64, 20), VecI64.get(v3, 1));
-    try std.testing.expectEqual(@as(i64, 30), VecI64.get(v3, 2));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.length(v3));
+    try std.testing.expectEqual(@as(i64, 10), ListI64.get(v3, 0));
+    try std.testing.expectEqual(@as(i64, 20), ListI64.get(v3, 1));
+    try std.testing.expectEqual(@as(i64, 30), ListI64.get(v3, 2));
 }
 
-test "FlatList(i64) push past capacity triggers in-place grow on rc==1" {
-    const VecI64 = FlatList(i64);
-    var current: ?*const VecI64 = VecI64.new_empty(2) orelse {
+test "List(i64) push past capacity triggers in-place grow on rc==1" {
+    const ListI64 = List(i64);
+    var current: ?*const ListI64 = ListI64.new_empty(2) orelse {
         try std.testing.expect(false);
         return;
     };
     var i: i64 = 0;
     while (i < 16) : (i += 1) {
-        current = VecI64.push(current, i) orelse {
+        current = ListI64.push(current, i) orelse {
             try std.testing.expect(false);
             return;
         };
     }
-    defer VecI64.release(current);
+    defer ListI64.release(current);
 
-    try std.testing.expectEqual(@as(i64, 16), VecI64.length(current));
+    try std.testing.expectEqual(@as(i64, 16), ListI64.length(current));
     var k: i64 = 0;
     while (k < 16) : (k += 1) {
-        try std.testing.expectEqual(k, VecI64.get(current, k));
+        try std.testing.expectEqual(k, ListI64.get(current, k));
     }
-    try std.testing.expect(VecI64.capacity(current) >= 16);
+    try std.testing.expect(ListI64.capacity(current) >= 16);
 }
 
-test "FlatList(i64) pop decrements length on rc==1" {
-    const VecI64 = FlatList(i64);
-    const v = VecI64.new_filled(3, 7) orelse {
+test "List(i64) pop decrements length on rc==1" {
+    const ListI64 = List(i64);
+    const v = ListI64.new_filled(3, 7) orelse {
         try std.testing.expect(false);
         return;
     };
-    const popped = VecI64.pop(v) orelse {
+    const popped = ListI64.pop(v) orelse {
         try std.testing.expect(false);
         return;
     };
-    defer VecI64.release(popped);
+    defer ListI64.release(popped);
 
     try std.testing.expectEqual(@intFromPtr(v), @intFromPtr(popped));
-    try std.testing.expectEqual(@as(i64, 2), VecI64.length(popped));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.length(popped));
 }
 
-test "FlatList(i64) append concatenates two buffers in correct order" {
-    const VecI64 = FlatList(i64);
-    var a: ?*const VecI64 = VecI64.new_empty(0) orelse {
+test "List(i64) append concatenates two buffers in correct order" {
+    const ListI64 = List(i64);
+    var a: ?*const ListI64 = ListI64.new_empty(0) orelse {
         try std.testing.expect(false);
         return;
     };
-    a = VecI64.push(a, 1) orelse {
+    a = ListI64.push(a, 1) orelse {
         try std.testing.expect(false);
         return;
     };
-    a = VecI64.push(a, 2) orelse {
-        try std.testing.expect(false);
-        return;
-    };
-
-    var b: ?*const VecI64 = VecI64.new_empty(0) orelse {
-        try std.testing.expect(false);
-        return;
-    };
-    b = VecI64.push(b, 3) orelse {
-        try std.testing.expect(false);
-        return;
-    };
-    b = VecI64.push(b, 4) orelse {
+    a = ListI64.push(a, 2) orelse {
         try std.testing.expect(false);
         return;
     };
 
-    const result = VecI64.append(a, b) orelse {
+    var b: ?*const ListI64 = ListI64.new_empty(0) orelse {
         try std.testing.expect(false);
         return;
     };
-    defer VecI64.release(result);
-    defer VecI64.release(b);
+    b = ListI64.push(b, 3) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    b = ListI64.push(b, 4) orelse {
+        try std.testing.expect(false);
+        return;
+    };
 
-    try std.testing.expectEqual(@as(i64, 4), VecI64.length(result));
-    try std.testing.expectEqual(@as(i64, 1), VecI64.get(result, 0));
-    try std.testing.expectEqual(@as(i64, 2), VecI64.get(result, 1));
-    try std.testing.expectEqual(@as(i64, 3), VecI64.get(result, 2));
-    try std.testing.expectEqual(@as(i64, 4), VecI64.get(result, 3));
+    const result = ListI64.append(a, b) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer ListI64.release(result);
+    defer ListI64.release(b);
+
+    try std.testing.expectEqual(@as(i64, 4), ListI64.length(result));
+    try std.testing.expectEqual(@as(i64, 1), ListI64.get(result, 0));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.get(result, 1));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.get(result, 2));
+    try std.testing.expectEqual(@as(i64, 4), ListI64.get(result, 3));
 }
 
-test "FlatList(i64) retain/release roundtrips refcount" {
-    const VecI64 = FlatList(i64);
-    const v = VecI64.new_filled(2, 99) orelse {
+test "List(i64) append self grows without reading freed storage" {
+    const ListI64 = List(i64);
+    var values: ?*const ListI64 = ListI64.new_empty(2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    values = ListI64.push(values, 1) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    values = ListI64.push(values, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    const result = ListI64.append(values, values) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer ListI64.release(result);
+
+    try std.testing.expectEqual(@as(i64, 4), ListI64.length(result));
+    try std.testing.expectEqual(@as(i64, 1), ListI64.get(result, 0));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.get(result, 1));
+    try std.testing.expectEqual(@as(i64, 1), ListI64.get(result, 2));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.get(result, 3));
+}
+
+test "listSum bridge dispatches to concrete List(i64) sum" {
+    const ListI64 = List(i64);
+    var values: ?*const ListI64 = ListI64.new_empty(4) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 10) orelse return error.OutOfMemory;
+    values = ListI64.push(values, -3) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 25) orelse return error.OutOfMemory;
+    defer ListI64.release(values);
+
+    try std.testing.expectEqual(@as(i64, 32), listSum(values));
+    try std.testing.expectEqual(@as(i64, 0), listSum(@as(?*const ListI64, null)));
+}
+
+test "listSum bridge supports concrete List(f64) sum" {
+    const ListF64 = List(f64);
+    var values: ?*const ListF64 = ListF64.new_empty(3) orelse return error.OutOfMemory;
+    values = ListF64.push(values, 1.5) orelse return error.OutOfMemory;
+    values = ListF64.push(values, -2.25) orelse return error.OutOfMemory;
+    values = ListF64.push(values, 5.75) orelse return error.OutOfMemory;
+    defer ListF64.release(values);
+
+    try std.testing.expectEqual(@as(f64, 5.0), listSum(values));
+    try std.testing.expectEqual(@as(f64, 0.0), listSum(@as(?*const ListF64, null)));
+}
+
+test "listSum bridge uses SIMD lane width for integer lists when target exposes one" {
+    const lane_count = listSumSimdLaneCount(i64);
+    if (std.simd.suggestVectorLength(i64)) |suggested_lane_count| {
+        try std.testing.expectEqual(@as(comptime_int, suggested_lane_count), lane_count);
+        try std.testing.expect(lane_count > 1);
+    } else {
+        try std.testing.expectEqual(@as(comptime_int, 1), lane_count);
+    }
+}
+
+test "listSum bridge handles SIMD chunks and scalar tail for List(i64)" {
+    const ListI64 = List(i64);
+    const lane_count = listSumSimdLaneCount(i64);
+    const item_count = lane_count * 3 + 5;
+    var values: ?*const ListI64 = ListI64.new_empty(item_count) orelse return error.OutOfMemory;
+    var expected: i64 = 0;
+    var index: i64 = 0;
+    while (index < item_count) : (index += 1) {
+        const value = if (@mod(index, 2) == 0) index else -index;
+        expected += value;
+        values = ListI64.push(values, value) orelse return error.OutOfMemory;
+    }
+    defer ListI64.release(values);
+
+    try std.testing.expectEqual(expected, listSum(values));
+}
+
+test "List(i64) retain/release roundtrips refcount" {
+    const ListI64 = List(i64);
+    const v = ListI64.new_filled(2, 99) orelse {
         try std.testing.expect(false);
         return;
     };
     try std.testing.expectEqual(@as(u32, 1), v.header.count());
 
-    const second = VecI64.retain(v);
+    const second = ListI64.retain(v);
     try std.testing.expectEqual(@as(u32, 2), v.header.count());
 
     // First release: count drops to 1, buffer alive.
-    VecI64.release(second);
+    ListI64.release(second);
     try std.testing.expectEqual(@as(u32, 1), v.header.count());
 
     // Final release: buffer freed.
-    VecI64.release(v);
+    ListI64.release(v);
 }
 
-test "FlatList(f64) initialises slots and round-trips writes (rc==1 in place)" {
-    const VecF64 = FlatList(f64);
-    const v = VecF64.new_filled(4, 1.5) orelse {
+test "List(f64) initialises slots and round-trips writes (rc==1 in place)" {
+    const ListF64 = List(f64);
+    const v = ListF64.new_filled(4, 1.5) orelse {
         try std.testing.expect(false);
         return;
     };
-    try std.testing.expectEqual(@as(i64, 4), VecF64.length(v));
-    try std.testing.expectEqual(@as(f64, 1.5), VecF64.get(v, 2));
+    try std.testing.expectEqual(@as(i64, 4), ListF64.length(v));
+    try std.testing.expectEqual(@as(f64, 1.5), ListF64.get(v, 2));
 
-    const after_set = VecF64.set(v, 2, 2.75) orelse {
+    const after_set = ListF64.set(v, 2, 2.75) orelse {
         try std.testing.expect(false);
         return;
     };
     try std.testing.expectEqual(@intFromPtr(v), @intFromPtr(after_set));
-    try std.testing.expectEqual(@as(f64, 2.75), VecF64.get(after_set, 2));
-    VecF64.release(after_set);
+    try std.testing.expectEqual(@as(f64, 2.75), ListF64.get(after_set, 2));
+    ListF64.release(after_set);
 }
 
-test "FlatList([]const u8) runtime string slices round-trip" {
-    const StringList = FlatList([]const u8);
+test "List([]const u8) runtime string slices round-trip" {
+    const StringList = List([]const u8);
     var strings: ?*const StringList = StringList.new_empty(2) orelse {
         try std.testing.expect(false);
         return;
@@ -10235,13 +10151,13 @@ test "FlatList([]const u8) runtime string slices round-trip" {
     try std.testing.expectEqualStrings("world", StringList.get(strings, 1));
 }
 
-test "FlatList deep-releases ARC-managed children on zero-transition" {
+test "List deep-releases ARC-managed children on zero-transition" {
     // Phase 2: when T is an ARC-managed pointer (e.g. ?*const Map(K, V)),
-    // FlatList(T)'s release on the zero-transition must walk every live
+    // List(T)'s release on the zero-transition must walk every live
     // element and deep-release it. We mirror the Map and List
     // regression-test pattern.
     const MapI64 = Map(i64, i64);
-    const VecMap = FlatList(?*const MapI64);
+    const ListMap = List(?*const MapI64);
 
     const before_releases = arc_releases_total;
 
@@ -10258,37 +10174,37 @@ test "FlatList deep-releases ARC-managed children on zero-transition" {
         return;
     };
 
-    var vec: ?*const VecMap = VecMap.new_empty(2) orelse {
+    var vec: ?*const ListMap = ListMap.new_empty(2) orelse {
         try std.testing.expect(false);
         return;
     };
     // `push` consumes the value (as the cell's durable owner), so each
-    // pushed Map's +1 transfers into the FlatList.
-    vec = VecMap.push(vec, map_one) orelse {
+    // pushed Map's +1 transfers into the List.
+    vec = ListMap.push(vec, map_one) orelse {
         try std.testing.expect(false);
         return;
     };
-    vec = VecMap.push(vec, map_two) orelse {
+    vec = ListMap.push(vec, map_two) orelse {
         try std.testing.expect(false);
         return;
     };
 
-    // Release the buffer. The FlatList's own `release` bumps
+    // Release the buffer. The List's own `release` bumps
     // `arc_releases_total` once (unconditionally, mirroring Map's
     // pattern). On the zero-transition the deep-release walk fires
     // `release` on each child Map, bumping the counter twice more
     // (one per Map cell freed). Net: +3.
-    VecMap.release(vec);
+    ListMap.release(vec);
     try std.testing.expectEqual(before_releases + 3, arc_releases_total);
 }
 
-test "FlatList(T) deep-releases struct elements with ARC-managed fields" {
+test "List(T) deep-releases struct elements with ARC-managed fields" {
     const MapI64 = Map(i64, i64);
     const Holder = struct {
         child: ?*const MapI64,
         label: i64,
     };
-    const HolderList = FlatList(Holder);
+    const HolderList = List(Holder);
 
     const before_releases = arc_releases_total;
 
@@ -10319,15 +10235,239 @@ test "FlatList(T) deep-releases struct elements with ARC-managed fields" {
     };
 
     try std.testing.expectEqual(@as(i64, 2), HolderList.length(holders));
-    try std.testing.expectEqual(@as(i64, 1), HolderList.get(holders, 0).label);
-    try std.testing.expectEqual(@as(i64, 2), HolderList.get(holders, 1).label);
+    const first_holder = HolderList.get(holders, 0);
+    defer MapI64.release(first_holder.child);
+    const second_holder = HolderList.get(holders, 1);
+    defer MapI64.release(second_holder.child);
+    try std.testing.expectEqual(@as(i64, 1), first_holder.label);
+    try std.testing.expectEqual(@as(i64, 2), second_holder.label);
 
     HolderList.release(holders);
     try std.testing.expectEqual(before_releases + 3, arc_releases_total);
 }
 
+test "List(?*const Map) set on shared buffer preserves original ARC elements" {
+    const Helpers = struct {
+        const MapI64 = Map(i64, i64);
+        const ListMap = List(?*const MapI64);
+
+        fn newMap(seed: i64) ?*const MapI64 {
+            const keys = [_]i64{seed};
+            const values = [_]i64{seed * 10};
+            return MapI64.fromPairs(&keys, &values, 1);
+        }
+
+        fn expectSlot(list: ?*const ListMap, index: i64, expected: *const MapI64) !void {
+            const actual = ListMap.get(list, index) orelse @panic("expected map element");
+            defer MapI64.release(actual);
+            try std.testing.expectEqual(@intFromPtr(expected), @intFromPtr(actual));
+        }
+    };
+
+    const before_releases = arc_releases_total;
+
+    const map_one = Helpers.newMap(1) orelse @panic("test map allocation failed");
+    const map_two = Helpers.newMap(2) orelse @panic("test map allocation failed");
+    const replacement = Helpers.newMap(9) orelse @panic("test map allocation failed");
+
+    var original: ?*const Helpers.ListMap = Helpers.ListMap.new_empty(2) orelse @panic("test list allocation failed");
+    defer if (original) |list| Helpers.ListMap.release(list);
+
+    original = Helpers.ListMap.push(original, map_one) orelse @panic("test list push failed");
+    original = Helpers.ListMap.push(original, map_two) orelse @panic("test list push failed");
+
+    var shared: ?*const Helpers.ListMap = Helpers.ListMap.retain(original);
+    defer if (shared) |list| Helpers.ListMap.release(list);
+
+    var updated: ?*const Helpers.ListMap = Helpers.ListMap.set(original, 0, replacement) orelse @panic("test list set failed");
+    defer if (updated) |list| Helpers.ListMap.release(list);
+
+    try std.testing.expect(@intFromPtr(updated.?) != @intFromPtr(original.?));
+    try Helpers.expectSlot(original, 0, map_one);
+    try Helpers.expectSlot(original, 1, map_two);
+    try Helpers.expectSlot(updated, 0, replacement);
+    try Helpers.expectSlot(updated, 1, map_two);
+
+    Helpers.ListMap.release(original);
+    original = null;
+    Helpers.ListMap.release(shared);
+    shared = null;
+    Helpers.ListMap.release(updated);
+    updated = null;
+
+    try std.testing.expectEqual(before_releases + 12, arc_releases_total);
+}
+
+test "List higher-order helpers pass owned ARC elements to callbacks" {
+    const Helpers = struct {
+        const MapI64 = Map(i64, i64);
+        const ListMap = List(?*const MapI64);
+
+        fn newMap(seed: i64) ?*const MapI64 {
+            const keys = [_]i64{seed};
+            const values = [_]i64{seed * 10};
+            return MapI64.fromPairs(&keys, &values, 1);
+        }
+
+        fn newSizedMap(seed: i64, size: usize) ?*const MapI64 {
+            var keys: [3]i64 = undefined;
+            var values: [3]i64 = undefined;
+            var index: usize = 0;
+            while (index < size) : (index += 1) {
+                keys[index] = seed + @as(i64, @intCast(index));
+                values[index] = (seed + @as(i64, @intCast(index))) * 10;
+            }
+            return MapI64.fromPairs(&keys, &values, @intCast(size));
+        }
+
+        fn newList() ?*const ListMap {
+            var list: ?*const ListMap = ListMap.new_empty(2) orelse @panic("test list allocation failed");
+            list = ListMap.push(list, newMap(1) orelse @panic("test map allocation failed")) orelse @panic("test list push failed");
+            list = ListMap.push(list, newMap(2) orelse @panic("test map allocation failed")) orelse @panic("test list push failed");
+            return list;
+        }
+
+        fn newSortableList() ?*const ListMap {
+            var list: ?*const ListMap = ListMap.new_empty(2) orelse @panic("test list allocation failed");
+            list = ListMap.push(list, newSizedMap(10, 2) orelse @panic("test map allocation failed")) orelse @panic("test list push failed");
+            list = ListMap.push(list, newSizedMap(20, 1) orelse @panic("test map allocation failed")) orelse @panic("test list push failed");
+            return list;
+        }
+
+        fn expectOwned(map: ?*const MapI64) void {
+            const ptr = map orelse @panic("expected map");
+            std.debug.assert(ptr.header.count() >= 2);
+        }
+
+        fn releaseMapReturnReplacement(map: ?*const MapI64) ?*const MapI64 {
+            expectOwned(map);
+            MapI64.release(map);
+            return newMap(100) orelse @panic("test map allocation failed");
+        }
+
+        fn releaseMapTrue(map: ?*const MapI64) bool {
+            expectOwned(map);
+            MapI64.release(map);
+            return true;
+        }
+
+        fn releaseMapFalse(map: ?*const MapI64) bool {
+            expectOwned(map);
+            MapI64.release(map);
+            return false;
+        }
+
+        fn reduceKeepAccumulator(accumulator: ?*const MapI64, map: ?*const MapI64) ?*const MapI64 {
+            expectOwned(map);
+            MapI64.release(map);
+            return accumulator;
+        }
+
+        fn compareBySize(left: ?*const MapI64, right: ?*const MapI64) bool {
+            expectOwned(left);
+            expectOwned(right);
+            const ordered = MapI64.size(left) < MapI64.size(right);
+            MapI64.release(left);
+            MapI64.release(right);
+            return ordered;
+        }
+
+        fn releaseMapReturnSingletonList(map: ?*const MapI64) ?*const ListMap {
+            expectOwned(map);
+            MapI64.release(map);
+            var list: ?*const ListMap = ListMap.new_empty(1) orelse @panic("test list allocation failed");
+            list = ListMap.push(list, newMap(200) orelse @panic("test map allocation failed")) orelse @panic("test list push failed");
+            return list;
+        }
+    };
+
+    {
+        const list = Helpers.newList() orelse @panic("test list allocation failed");
+        const mapped = Helpers.ListMap.mapFn(list, Helpers.releaseMapReturnReplacement) orelse @panic("mapFn returned null");
+        try std.testing.expectEqual(@as(i64, 2), Helpers.ListMap.length(mapped));
+        Helpers.ListMap.release(list);
+        Helpers.ListMap.release(mapped);
+    }
+
+    {
+        const list = Helpers.newList() orelse @panic("test list allocation failed");
+        const filtered = Helpers.ListMap.filterFn(list, Helpers.releaseMapTrue) orelse @panic("filterFn returned null");
+        try std.testing.expectEqual(@as(i64, 2), Helpers.ListMap.length(filtered));
+        Helpers.ListMap.release(list);
+        Helpers.ListMap.release(filtered);
+    }
+
+    {
+        const list = Helpers.newList() orelse @panic("test list allocation failed");
+        const rejected = Helpers.ListMap.rejectFn(list, Helpers.releaseMapFalse) orelse @panic("rejectFn returned null");
+        try std.testing.expectEqual(@as(i64, 2), Helpers.ListMap.length(rejected));
+        Helpers.ListMap.release(list);
+        Helpers.ListMap.release(rejected);
+    }
+
+    {
+        const list = Helpers.newList() orelse @panic("test list allocation failed");
+        const accumulator = Helpers.newMap(90) orelse @panic("test map allocation failed");
+        const result = Helpers.ListMap.enumReduceSimple(list, accumulator, Helpers.reduceKeepAccumulator);
+        try std.testing.expectEqual(@intFromPtr(accumulator), @intFromPtr(result));
+        Helpers.ListMap.release(list);
+        Helpers.MapI64.release(result);
+    }
+
+    {
+        const list = Helpers.newList() orelse @panic("test list allocation failed");
+        const before_releases = arc_releases_total;
+        const returned = Helpers.ListMap.eachFn(list, Helpers.releaseMapReturnReplacement);
+        try std.testing.expectEqual(@intFromPtr(list), @intFromPtr(returned));
+        Helpers.ListMap.release(list);
+        try std.testing.expectEqual(before_releases + 7, arc_releases_total);
+    }
+
+    {
+        const list = Helpers.newList() orelse @panic("test list allocation failed");
+        const found = Helpers.ListMap.findFn(list, null, Helpers.releaseMapTrue);
+        try std.testing.expect(found != null);
+        Helpers.ListMap.release(list);
+        Helpers.MapI64.release(found);
+    }
+
+    {
+        const list = Helpers.newList() orelse @panic("test list allocation failed");
+        try std.testing.expect(Helpers.ListMap.anyFn(list, Helpers.releaseMapTrue));
+        Helpers.ListMap.release(list);
+    }
+
+    {
+        const list = Helpers.newList() orelse @panic("test list allocation failed");
+        try std.testing.expect(Helpers.ListMap.allFn(list, Helpers.releaseMapTrue));
+        Helpers.ListMap.release(list);
+    }
+
+    {
+        const list = Helpers.newList() orelse @panic("test list allocation failed");
+        try std.testing.expectEqual(@as(i64, 2), Helpers.ListMap.countFn(list, Helpers.releaseMapTrue));
+        Helpers.ListMap.release(list);
+    }
+
+    {
+        const list = Helpers.newSortableList() orelse @panic("test list allocation failed");
+        const sorted = Helpers.ListMap.sortFn(list, Helpers.compareBySize) orelse @panic("sortFn returned null");
+        try std.testing.expectEqual(@as(i64, 2), Helpers.ListMap.length(sorted));
+        Helpers.ListMap.release(list);
+        Helpers.ListMap.release(sorted);
+    }
+
+    {
+        const list = Helpers.newList() orelse @panic("test list allocation failed");
+        const flattened = Helpers.ListMap.flatMapFn(list, Helpers.releaseMapReturnSingletonList) orelse @panic("flatMapFn returned null");
+        try std.testing.expectEqual(@as(i64, 2), Helpers.ListMap.length(flattened));
+        Helpers.ListMap.release(list);
+        Helpers.ListMap.release(flattened);
+    }
+}
+
 // ============================================================
-// V8 unchecked-mutation variants — Map and FlatList
+// uniqueness unchecked-mutation variants — Map and List
 // ============================================================
 //
 // These tests exercise the `*_owned_unchecked` runtime functions
@@ -10341,167 +10481,456 @@ test "FlatList(T) deep-releases struct elements with ARC-managed fields" {
 //   * The unchecked variant skips the rc==1 check (calls the
 //     in-place core directly).
 //
-// We do NOT test the rc>1 case for unchecked variants — the V8
-// contract makes that undefined behavior, and the V8 verifier
+// We do NOT test the rc>1 case for unchecked variants — the uniqueness
+// contract makes that undefined behavior, and the uniqueness verifier
 // rejects unchecked calls at any site where rc could be > 1.
-// Production callers must always route through V8.
+// Production callers must always route through uniqueness.
 
-test "FlatList(i64) set_owned_unchecked mutates in place and returns same pointer" {
-    const VecI64 = FlatList(i64);
-    const v = VecI64.new_filled(3, 0) orelse {
+test "List(i64) set_owned_unchecked mutates in place and returns same pointer" {
+    const ListI64 = List(i64);
+    const v = ListI64.new_filled(3, 0) orelse {
         try std.testing.expect(false);
         return;
     };
-    defer VecI64.release(v);
+    defer ListI64.release(v);
 
-    const before_unchecked = vector_unchecked_total;
-    const after = VecI64.set_owned_unchecked(v, 1, 42) orelse {
+    const before_unchecked = list_unchecked_total;
+    const after = ListI64.set_owned_unchecked(v, 1, 42) orelse {
         try std.testing.expect(false);
         return;
     };
     // Same pointer — proof of in-place mutation.
     try std.testing.expectEqual(@intFromPtr(v), @intFromPtr(after));
-    try std.testing.expectEqual(@as(i64, 42), VecI64.get(after, 1));
+    try std.testing.expectEqual(@as(i64, 42), ListI64.get(after, 1));
     // Counter went up — proof we routed through the unchecked variant.
-    try std.testing.expectEqual(before_unchecked + 1, vector_unchecked_total);
+    try std.testing.expectEqual(before_unchecked + 1, list_unchecked_total);
 }
 
-test "FlatList(i64) push_owned_unchecked grows in place when capacity allows" {
-    const VecI64 = FlatList(i64);
-    const v0 = VecI64.new_empty(4) orelse {
+test "List(i64) push_owned_unchecked grows in place when capacity allows" {
+    const ListI64 = List(i64);
+    const v0 = ListI64.new_empty(4) orelse {
         try std.testing.expect(false);
         return;
     };
-    const before_unchecked = vector_unchecked_total;
+    const before_unchecked = list_unchecked_total;
 
-    var current: ?*const VecI64 = v0;
-    current = VecI64.push_owned_unchecked(current, 10) orelse {
+    var current: ?*const ListI64 = v0;
+    current = ListI64.push_owned_unchecked(current, 10) orelse {
         try std.testing.expect(false);
         return;
     };
     // First push: capacity 4, len was 0, so no resize — same pointer.
     try std.testing.expectEqual(@intFromPtr(v0), @intFromPtr(current));
 
-    current = VecI64.push_owned_unchecked(current, 20) orelse {
+    current = ListI64.push_owned_unchecked(current, 20) orelse {
         try std.testing.expect(false);
         return;
     };
-    current = VecI64.push_owned_unchecked(current, 30) orelse {
+    current = ListI64.push_owned_unchecked(current, 30) orelse {
         try std.testing.expect(false);
         return;
     };
-    defer VecI64.release(current);
+    defer ListI64.release(current);
 
-    try std.testing.expectEqual(@as(i64, 3), VecI64.length(current));
-    try std.testing.expectEqual(@as(i64, 10), VecI64.get(current, 0));
-    try std.testing.expectEqual(@as(i64, 30), VecI64.get(current, 2));
-    try std.testing.expectEqual(before_unchecked + 3, vector_unchecked_total);
+    try std.testing.expectEqual(@as(i64, 3), ListI64.length(current));
+    try std.testing.expectEqual(@as(i64, 10), ListI64.get(current, 0));
+    try std.testing.expectEqual(@as(i64, 30), ListI64.get(current, 2));
+    try std.testing.expectEqual(before_unchecked + 3, list_unchecked_total);
 }
 
-test "FlatList(i64) push_owned_unchecked grows the buffer when capacity is exceeded" {
-    const VecI64 = FlatList(i64);
-    var current: ?*const VecI64 = VecI64.new_empty(2) orelse {
+test "List(i64) push_owned_unchecked grows the buffer when capacity is exceeded" {
+    const ListI64 = List(i64);
+    var current: ?*const ListI64 = ListI64.new_empty(2) orelse {
         try std.testing.expect(false);
         return;
     };
     var i: i64 = 0;
     while (i < 16) : (i += 1) {
-        current = VecI64.push_owned_unchecked(current, i) orelse {
+        current = ListI64.push_owned_unchecked(current, i) orelse {
             try std.testing.expect(false);
             return;
         };
     }
-    defer VecI64.release(current);
+    defer ListI64.release(current);
 
-    try std.testing.expectEqual(@as(i64, 16), VecI64.length(current));
+    try std.testing.expectEqual(@as(i64, 16), ListI64.length(current));
     var k: i64 = 0;
     while (k < 16) : (k += 1) {
-        try std.testing.expectEqual(k, VecI64.get(current, k));
+        try std.testing.expectEqual(k, ListI64.get(current, k));
     }
     // After grow, refcount is still 1.
     try std.testing.expectEqual(@as(u32, 1), current.?.header.count());
 }
 
-test "FlatList(i64) pop_owned_unchecked decrements length in place" {
-    const VecI64 = FlatList(i64);
-    const v = VecI64.new_filled(3, 7) orelse {
+test "List(i64) pop_owned_unchecked decrements length in place" {
+    const ListI64 = List(i64);
+    const v = ListI64.new_filled(3, 7) orelse {
         try std.testing.expect(false);
         return;
     };
-    const popped = VecI64.pop_owned_unchecked(v) orelse {
+    const popped = ListI64.pop_owned_unchecked(v) orelse {
         try std.testing.expect(false);
         return;
     };
-    defer VecI64.release(popped);
+    defer ListI64.release(popped);
 
     try std.testing.expectEqual(@intFromPtr(v), @intFromPtr(popped));
-    try std.testing.expectEqual(@as(i64, 2), VecI64.length(popped));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.length(popped));
 }
 
-test "FlatList(i64) append_owned_unchecked concatenates in place when capacity fits" {
-    const VecI64 = FlatList(i64);
-    const a = VecI64.new_empty(8) orelse {
+test "List(i64) append_owned_unchecked concatenates in place when capacity fits" {
+    const ListI64 = List(i64);
+    const a = ListI64.new_empty(8) orelse {
         try std.testing.expect(false);
         return;
     };
-    var av: ?*const VecI64 = a;
-    av = VecI64.push_owned_unchecked(av, 1).?;
-    av = VecI64.push_owned_unchecked(av, 2).?;
+    var av: ?*const ListI64 = a;
+    av = ListI64.push_owned_unchecked(av, 1).?;
+    av = ListI64.push_owned_unchecked(av, 2).?;
 
-    var bv: ?*const VecI64 = VecI64.new_empty(0) orelse {
+    var bv: ?*const ListI64 = ListI64.new_empty(0) orelse {
         try std.testing.expect(false);
         return;
     };
-    bv = VecI64.push(bv, 3).?;
-    bv = VecI64.push(bv, 4).?;
-    defer VecI64.release(bv);
+    bv = ListI64.push(bv, 3).?;
+    bv = ListI64.push(bv, 4).?;
+    defer ListI64.release(bv);
 
-    const result = VecI64.append_owned_unchecked(av, bv) orelse {
+    const result = ListI64.append_owned_unchecked(av, bv) orelse {
         try std.testing.expect(false);
         return;
     };
-    defer VecI64.release(result);
+    defer ListI64.release(result);
 
     // av's capacity was 8 with len 2; appending bv's len 2 fits.
     // Same pointer as av (in-place).
     try std.testing.expectEqual(@intFromPtr(a), @intFromPtr(result));
-    try std.testing.expectEqual(@as(i64, 4), VecI64.length(result));
-    try std.testing.expectEqual(@as(i64, 1), VecI64.get(result, 0));
-    try std.testing.expectEqual(@as(i64, 2), VecI64.get(result, 1));
-    try std.testing.expectEqual(@as(i64, 3), VecI64.get(result, 2));
-    try std.testing.expectEqual(@as(i64, 4), VecI64.get(result, 3));
+    try std.testing.expectEqual(@as(i64, 4), ListI64.length(result));
+    try std.testing.expectEqual(@as(i64, 1), ListI64.get(result, 0));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.get(result, 1));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.get(result, 2));
+    try std.testing.expectEqual(@as(i64, 4), ListI64.get(result, 3));
 }
 
-test "FlatList(i64) append_owned_unchecked grows when capacity is insufficient" {
-    const VecI64 = FlatList(i64);
-    const a = VecI64.new_empty(2) orelse {
+test "List(i64) append_owned_unchecked grows when capacity is insufficient" {
+    const ListI64 = List(i64);
+    const a = ListI64.new_empty(2) orelse {
         try std.testing.expect(false);
         return;
     };
-    var av: ?*const VecI64 = a;
-    av = VecI64.push_owned_unchecked(av, 1).?;
-    av = VecI64.push_owned_unchecked(av, 2).?;
+    var av: ?*const ListI64 = a;
+    av = ListI64.push_owned_unchecked(av, 1).?;
+    av = ListI64.push_owned_unchecked(av, 2).?;
 
-    var bv: ?*const VecI64 = VecI64.new_empty(0) orelse {
+    var bv: ?*const ListI64 = ListI64.new_empty(0) orelse {
         try std.testing.expect(false);
         return;
     };
-    bv = VecI64.push(bv, 3).?;
-    bv = VecI64.push(bv, 4).?;
-    bv = VecI64.push(bv, 5).?;
-    defer VecI64.release(bv);
+    bv = ListI64.push(bv, 3).?;
+    bv = ListI64.push(bv, 4).?;
+    bv = ListI64.push(bv, 5).?;
+    defer ListI64.release(bv);
 
-    const result = VecI64.append_owned_unchecked(av, bv) orelse {
+    const result = ListI64.append_owned_unchecked(av, bv) orelse {
         try std.testing.expect(false);
         return;
     };
-    defer VecI64.release(result);
+    defer ListI64.release(result);
 
-    try std.testing.expectEqual(@as(i64, 5), VecI64.length(result));
-    try std.testing.expectEqual(@as(i64, 1), VecI64.get(result, 0));
-    try std.testing.expectEqual(@as(i64, 5), VecI64.get(result, 4));
+    try std.testing.expectEqual(@as(i64, 5), ListI64.length(result));
+    try std.testing.expectEqual(@as(i64, 1), ListI64.get(result, 0));
+    try std.testing.expectEqual(@as(i64, 5), ListI64.get(result, 4));
     // After grow, refcount still 1.
     try std.testing.expectEqual(@as(u32, 1), result.header.count());
+}
+
+test "List(i64) append_owned_unchecked self grows without reading freed storage" {
+    const ListI64 = List(i64);
+    var values: ?*const ListI64 = ListI64.new_empty(2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    values = ListI64.push_owned_unchecked(values, 1) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    values = ListI64.push_owned_unchecked(values, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    const result = ListI64.append_owned_unchecked(values, values) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer ListI64.release(result);
+
+    try std.testing.expectEqual(@as(i64, 4), ListI64.length(result));
+    try std.testing.expectEqual(@as(i64, 1), ListI64.get(result, 0));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.get(result, 1));
+    try std.testing.expectEqual(@as(i64, 1), ListI64.get(result, 2));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.get(result, 3));
+    try std.testing.expectEqual(@as(u32, 1), result.header.count());
+}
+
+test "List(i64) head_owned_unchecked returns the first element" {
+    const ListI64 = List(i64);
+    var values: ?*const ListI64 = ListI64.new_empty(3) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    values = ListI64.push_owned_unchecked(values, 10) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    values = ListI64.push_owned_unchecked(values, 20) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer ListI64.release(values);
+
+    try std.testing.expectEqual(@as(i64, 10), ListI64.head_owned_unchecked(values));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.length(values));
+}
+
+test "List(i64) tail_owned_unchecked shifts the suffix in place" {
+    const ListI64 = List(i64);
+    var values: ?*const ListI64 = ListI64.new_empty(4) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    values = ListI64.push_owned_unchecked(values, 10) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    values = ListI64.push_owned_unchecked(values, 20) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    values = ListI64.push_owned_unchecked(values, 30) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const original = values.?;
+    const before_unchecked = list_unchecked_total;
+
+    values = ListI64.tail_owned_unchecked(values) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer ListI64.release(values);
+
+    try std.testing.expectEqual(@intFromPtr(original), @intFromPtr(values.?));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.length(values));
+    try std.testing.expectEqual(@as(i64, 20), ListI64.get(values, 0));
+    try std.testing.expectEqual(@as(i64, 30), ListI64.get(values, 1));
+    try std.testing.expectEqual(@as(u32, 1), values.?.header.count());
+    try std.testing.expectEqual(before_unchecked + 1, list_unchecked_total);
+}
+
+test "List(i64) slice_owned_unchecked shifts an indexed suffix in place" {
+    const ListI64 = List(i64);
+    var values: ?*const ListI64 = ListI64.new_empty(5) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    values = ListI64.push_owned_unchecked(values, 10) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    values = ListI64.push_owned_unchecked(values, 20) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    values = ListI64.push_owned_unchecked(values, 30) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    values = ListI64.push_owned_unchecked(values, 40) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const original = values.?;
+    const before_unchecked = list_unchecked_total;
+
+    values = ListI64.slice_owned_unchecked(values, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer ListI64.release(values);
+
+    try std.testing.expectEqual(@intFromPtr(original), @intFromPtr(values.?));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.length(values));
+    try std.testing.expectEqual(@as(i64, 30), ListI64.get(values, 0));
+    try std.testing.expectEqual(@as(i64, 40), ListI64.get(values, 1));
+    try std.testing.expectEqual(@as(u32, 1), values.?.header.count());
+    try std.testing.expectEqual(before_unchecked + 1, list_unchecked_total);
+}
+
+test "List(?*const Map) owned-unchecked head and slice balance element lifetimes" {
+    const MapI64 = Map(i64, i64);
+    const ListMap = List(?*const MapI64);
+
+    const map_one = MapI64.put_owned_unchecked(null, 1, 10) orelse @panic("test map allocation failed");
+    const map_two = MapI64.put_owned_unchecked(null, 2, 20) orelse @panic("test map allocation failed");
+    const map_three = MapI64.put_owned_unchecked(null, 3, 30) orelse @panic("test map allocation failed");
+
+    var values: ?*const ListMap = ListMap.new_empty(3) orelse @panic("test list allocation failed");
+    values = ListMap.push_owned_unchecked(values, map_one) orelse @panic("test push failed");
+    values = ListMap.push_owned_unchecked(values, map_two) orelse @panic("test push failed");
+    values = ListMap.push_owned_unchecked(values, map_three) orelse @panic("test push failed");
+
+    const head = ListMap.head_owned_unchecked(values) orelse @panic("test head missing");
+    try std.testing.expectEqual(@intFromPtr(map_one), @intFromPtr(head));
+    try std.testing.expectEqual(@as(u32, 2), map_one.header.count());
+
+    values = ListMap.slice_owned_unchecked(values, 1) orelse @panic("test slice failed");
+    defer ListMap.release(values);
+    defer MapI64.release(head);
+
+    try std.testing.expectEqual(@as(u32, 1), map_one.header.count());
+    try std.testing.expectEqual(@as(i64, 2), ListMap.length(values));
+
+    const first_tail = ListMap.get(values, 0) orelse @panic("test tail slot missing");
+    defer MapI64.release(first_tail);
+    const second_tail = ListMap.get(values, 1) orelse @panic("test tail slot missing");
+    defer MapI64.release(second_tail);
+
+    try std.testing.expectEqual(@intFromPtr(map_two), @intFromPtr(first_tail));
+    try std.testing.expectEqual(@intFromPtr(map_three), @intFromPtr(second_tail));
+}
+
+test "List(?*const Map) owned-unchecked mutators balance ARC element lifetimes" {
+    const Helpers = struct {
+        const MapI64 = Map(i64, i64);
+        const ListMap = List(?*const MapI64);
+
+        fn newMap(seed: i64) ?*const MapI64 {
+            const keys = [_]i64{seed};
+            const values = [_]i64{seed * 10};
+            return MapI64.fromPairs(&keys, &values, 1);
+        }
+
+        fn expectSlot(list: ?*const ListMap, index: i64, expected: *const MapI64) !void {
+            const actual = ListMap.get(list, index) orelse @panic("expected map element");
+            defer MapI64.release(actual);
+            try std.testing.expectEqual(@intFromPtr(expected), @intFromPtr(actual));
+        }
+    };
+
+    const before_releases = arc_releases_total;
+
+    const map_one = Helpers.newMap(1) orelse @panic("test map allocation failed");
+    const map_two = Helpers.newMap(2) orelse @panic("test map allocation failed");
+    const map_three = Helpers.newMap(3) orelse @panic("test map allocation failed");
+    const replacement = Helpers.newMap(20) orelse @panic("test map allocation failed");
+    const map_four = Helpers.newMap(4) orelse @panic("test map allocation failed");
+    const map_five = Helpers.newMap(5) orelse @panic("test map allocation failed");
+
+    var left: ?*const Helpers.ListMap = Helpers.ListMap.new_empty(2) orelse @panic("test left list allocation failed");
+    defer if (left) |list| Helpers.ListMap.release(list);
+    left = Helpers.ListMap.push_owned_unchecked(left, map_one) orelse @panic("test left push failed");
+    left = Helpers.ListMap.push_owned_unchecked(left, map_two) orelse @panic("test left push failed");
+    left = Helpers.ListMap.push_owned_unchecked(left, map_three) orelse @panic("test left grow failed");
+
+    const after_set = Helpers.ListMap.set_owned_unchecked(left, 1, replacement) orelse @panic("test set failed");
+    try std.testing.expectEqual(@intFromPtr(left.?), @intFromPtr(after_set));
+    left = after_set;
+
+    var right: ?*const Helpers.ListMap = Helpers.ListMap.new_empty(2) orelse @panic("test right list allocation failed");
+    defer if (right) |list| Helpers.ListMap.release(list);
+    right = Helpers.ListMap.push_owned_unchecked(right, map_four) orelse @panic("test right push failed");
+    right = Helpers.ListMap.push_owned_unchecked(right, map_five) orelse @panic("test right push failed");
+
+    var appended: ?*const Helpers.ListMap = Helpers.ListMap.append_owned_unchecked(left, right) orelse @panic("test append failed");
+    defer if (appended) |list| Helpers.ListMap.release(list);
+    left = null;
+
+    try std.testing.expectEqual(@as(i64, 5), Helpers.ListMap.length(appended));
+    try Helpers.expectSlot(appended, 0, map_one);
+    try Helpers.expectSlot(appended, 1, replacement);
+    try Helpers.expectSlot(appended, 2, map_three);
+    try Helpers.expectSlot(appended, 3, map_four);
+    try Helpers.expectSlot(appended, 4, map_five);
+    try std.testing.expectEqual(@as(u32, 1), appended.?.header.count());
+
+    Helpers.ListMap.release(right);
+    right = null;
+    Helpers.ListMap.release(appended);
+    appended = null;
+
+    try std.testing.expectEqual(before_releases + 15, arc_releases_total);
+}
+
+test "List(?*const Map(u32, Term)) releases generated manifest-shaped maps once" {
+    const SummaryMap = Map(u32, Term);
+    const SummaryList = List(?*const SummaryMap);
+
+    var summaries: ?*const SummaryList = SummaryList.empty();
+    defer SummaryList.release(summaries);
+
+    var index: u32 = 0;
+    while (index < 512) : (index += 1) {
+        var summary: ?*const SummaryMap = SummaryMap.empty();
+        summary = SummaryMap.put(summary, 1, Term.from("Atom")) orelse @panic("summary module insert failed");
+        summary = SummaryMap.put(summary, 2, Term.from("to_string")) orelse @panic("summary name insert failed");
+        summary = SummaryMap.put(summary, 3, Term.from(@as(i64, 1))) orelse @panic("summary arity insert failed");
+        summary = SummaryMap.put(summary, 4, Term.from("Converts an atom.")) orelse @panic("summary doc insert failed");
+        summary = SummaryMap.put(summary, 5, Term.from("lib/atom.zap")) orelse @panic("summary source file insert failed");
+        summary = SummaryMap.put(summary, 6, Term.from(@as(i64, 29))) orelse @panic("summary source line insert failed");
+        summary = SummaryMap.put(summary, 7, Term.from("to_string(atom :: Atom) -> String")) orelse @panic("summary signature insert failed");
+
+        summaries = SummaryList.push(summaries, summary) orelse @panic("summary list push failed");
+    }
+
+    try std.testing.expectEqual(@as(i64, 512), SummaryList.length(summaries));
+}
+
+test "Map retains nested map values inserted through checked put" {
+    const InnerMap = Map(u32, i64);
+    const OuterMap = Map(u32, ?*const InnerMap);
+
+    const inner_keys = [_]u32{2};
+    const inner_values = [_]i64{42};
+    const inner = InnerMap.fromPairs(&inner_keys, &inner_values, 1) orelse @panic("inner map allocation failed");
+
+    var outer: ?*const OuterMap = OuterMap.put(null, 1, inner) orelse @panic("outer map allocation failed");
+    try std.testing.expectEqual(@as(u32, 2), inner.header.count());
+
+    InnerMap.release(inner);
+
+    const fetched = OuterMap.get(outer, 1, null) orelse @panic("nested map missing");
+    defer InnerMap.release(fetched);
+
+    try std.testing.expectEqual(@as(i64, 42), InnerMap.get(fetched, 2, 0));
+    try std.testing.expectEqual(@as(u32, 2), fetched.header.count());
+
+    OuterMap.release(outer);
+    outer = null;
+}
+
+test "Map.fromPairs retains nested map values" {
+    const InnerMap = Map(u32, i64);
+    const OuterMap = Map(u32, ?*const InnerMap);
+
+    const inner_keys = [_]u32{7};
+    const inner_values = [_]i64{70};
+    const inner = InnerMap.fromPairs(&inner_keys, &inner_values, 1) orelse @panic("inner map allocation failed");
+
+    const outer_keys = [_]u32{1};
+    const outer_values = [_]?*const InnerMap{inner};
+    const outer = OuterMap.fromPairs(&outer_keys, &outer_values, 1) orelse @panic("outer map allocation failed");
+    try std.testing.expectEqual(@as(u32, 2), inner.header.count());
+
+    InnerMap.release(inner);
+
+    const fetched = OuterMap.get(outer, 1, null) orelse @panic("nested map missing");
+    defer InnerMap.release(fetched);
+
+    try std.testing.expectEqual(@as(i64, 70), InnerMap.get(fetched, 7, 0));
+    try std.testing.expectEqual(@as(u32, 2), fetched.header.count());
+
+    OuterMap.release(outer);
 }
 
 test "Map(i64,i64) put_owned_unchecked mutates in place and returns same pointer" {

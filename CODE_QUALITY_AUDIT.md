@@ -318,7 +318,7 @@ Other top issues:
 - Pipeline `@constCast` of `[]const ParamSummary` to back-propagate Perceus into interprocedural results
 - 3 (or 4) ad-hoc cycle-prevention strategies: magic-32 depth, hashed visited set, no guard at all
 - Perceus reinvents type inference from instruction shapes (`countStructFieldsInInstrs`, hardcoded `[32][]const u8` field arrays that silently truncate)
-- Perceus assumes `list_type` is always reuse-compatible — hardcoded knowledge of cons-cell layout
+- Perceus assumes `list_type` is always reuse-compatible — hardcoded representation knowledge that must be derived from collection metadata now that `List(T)` is a flat-buffer sequence
 - Duplicate `name_to_id` maps built independently by interprocedural and lambda_sets
 - Three "is closure call-local" classifiers (lambda_sets, analysis_pipeline, dead escape_analysis)
 

@@ -1,5 +1,12 @@
 # Unified Implementation Plan — Dense Map / Flat Vector / Opportunistic Mutation
 
+**Status note:** this plan predates list unification. The dense Map and
+opportunistic-mutation substrate remain relevant, but the flat-buffer sequence
+surface is now `List(T)`, not `Vector(T)`, and the `VectorI64`/`VectorF64`
+aliases have been removed. Treat Vector references below as historical names
+for the flat-buffer sequence work unless the text explicitly discusses Zig's
+internal SIMD `@Vector` primitive.
+
 **Reference briefs:**
 - `docs/roc-style-opportunistic-mutation-research-brief.md` — broad direction
 - `docs/zap-map-representation-research-brief.md` — narrow Map question
@@ -202,12 +209,12 @@ Six phases. Each phase has TDD (failing tests first), CLBG benchmark byte-exact 
 ### Phase 4: Codegen integration
 
 **Files:**
-- `src/zir_builder.zig` — emit owned vs borrowed variants of Map/Vector intrinsics based on call-site convention (already inferred by `arc_param_convention.zig`).
+- `src/zir_builder.zig` — emit owned vs borrowed variants of Map/List intrinsics based on call-site convention (already inferred by `arc_param_convention.zig`).
 - `src/runtime.zig` — split each mutator into `_owned` and `_borrowed` variants where the IR consumes them.
-- `lib/map.zap`, `lib/vector.zap` — surface API stays the same; the user calls `Map.put` and the compiler picks the variant.
+- `lib/map.zap`, `lib/list.zap` — surface API stays the same; the user calls `Map.put` / `List.set` and the compiler picks the variant.
 
 **Sub-deliverables:**
-- 4.1 IR rewriter wiring: at every Map/Vector mutation call, emit the owned variant when receiver is dead-on-all-successors per liveness, else emit the borrowed variant.
+- 4.1 IR rewriter wiring: at every Map/List mutation call, emit the owned variant when receiver is dead-on-all-successors per liveness, else emit the borrowed variant.
 - 4.2 Runtime owned/borrowed implementations exposed and named per the IR's intrinsic table.
 - 4.3 Verifier (V8/V9) clears the rewritten code on every existing test program.
 
@@ -219,12 +226,12 @@ Six phases. Each phase has TDD (failing tests first), CLBG benchmark byte-exact 
 ### Phase 5: List FBIP traversals
 
 **Files:**
-- `src/runtime.zig` — `List(T).map`, `List(T).filter`, `List(T).reverse` get rc-1 fast paths that reuse cons cells in place when uniquely owned.
+- `src/runtime.zig` — `List(T).map`, `List(T).filter`, `List(T).reverse`, and related traversal helpers build or reuse flat buffers when uniqueness makes that sound.
 - `lib/list/enumerable.zap`, `lib/list.zap` — surface API unchanged.
 
 **Sub-deliverables:**
-- 5.1 `List.map` reuse: if input refcount is 1, mutate the existing cons cells (replace head value, return the same cell). Else allocate fresh cells.
-- 5.2 Same for `filter` and `reverse`.
+- 5.1 `List.map` reuse: if input refcount is 1 and the result element type permits reuse, update the existing flat buffer in place. Else allocate a fresh buffer.
+- 5.2 Same shape of analysis for `filter` and `reverse`, with fresh allocation when the output length or element type makes in-place reuse unsound.
 
 **Verification gates:**
 - `zig build test` green.

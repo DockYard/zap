@@ -893,6 +893,7 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(std.mem.asBytes(&v.scrutinee));
             hasher.update(std.mem.asBytes(&v.expected_len));
+            hasher.update(std.mem.asBytes(&v.minimum));
         },
         .list_get => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
@@ -906,6 +907,7 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
         .list_head, .list_tail => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(std.mem.asBytes(&v.list));
+            hasher.update(std.mem.asBytes(&v.start_index));
         },
         .map_has_key => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
@@ -1666,7 +1668,7 @@ pub const Interpreter = struct {
                     },
                     .tuple => |t| {
                         if (t.elems.len == 0) {
-                            try self.emitError(.index_out_of_bounds, "list_head on empty cons cell");
+                            try self.emitError(.index_out_of_bounds, "list_head on empty tuple-backed list cell");
                             return error.CtfeFailure;
                         }
                         frame.setLocal(lh.dest, t.elems[0]);
@@ -1682,21 +1684,18 @@ pub const Interpreter = struct {
                 const list_val = try self.readLocal(frame, lt.list);
                 switch (list_val) {
                     .list => |l| {
-                        if (l.elems.len == 0) {
-                            try self.emitError(.index_out_of_bounds, "list_tail on empty list");
-                            return error.CtfeFailure;
-                        }
-                        if (l.elems.len == 1) {
+                        const start: usize = lt.start_index;
+                        if (start >= l.elems.len) {
                             frame.setLocal(lt.dest, .nil);
                         } else {
-                            const tail_elems = try self.allocator.alloc(CtValue, l.elems.len - 1);
-                            @memcpy(tail_elems, l.elems[1..]);
+                            const tail_elems = try self.allocator.alloc(CtValue, l.elems.len - start);
+                            @memcpy(tail_elems, l.elems[start..]);
                             frame.setLocal(lt.dest, .{ .list = .{ .alloc_id = l.alloc_id, .elems = tail_elems } });
                         }
                     },
                     .tuple => |t| {
                         if (t.elems.len < 2) {
-                            try self.emitError(.index_out_of_bounds, "list_tail on cons cell with no tail");
+                            try self.emitError(.index_out_of_bounds, "list_tail on tuple-backed list cell with no tail");
                             return error.CtfeFailure;
                         }
                         frame.setLocal(lt.dest, t.elems[1]);
@@ -1757,8 +1756,8 @@ pub const Interpreter = struct {
             .list_len_check => |lc| {
                 const obj = try self.readLocal(frame, lc.scrutinee);
                 const result: bool = switch (obj) {
-                    .list => |l| l.elems.len == lc.expected_len,
-                    .tuple => |t| t.elems.len == lc.expected_len,
+                    .list => |l| if (lc.minimum) l.elems.len >= lc.expected_len else l.elems.len == lc.expected_len,
+                    .tuple => |t| if (lc.minimum) t.elems.len >= lc.expected_len else t.elems.len == lc.expected_len,
                     else => false,
                 };
                 frame.setLocal(lc.dest, .{ .bool_val = result });

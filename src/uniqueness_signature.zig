@@ -8,7 +8,7 @@ const ir = @import("ir.zig");
 // Pipeline placement:
 //
 //     ... → arc_liveness                      (last-use side table)
-//          → v8_fixpoint                      (THIS module's signatures
+//          → uniqueness_fixpoint                      (THIS module's signatures
 //                                              are computed here over an
 //                                              SCC-iterated call graph)
 //             → arc_param_convention          (consumer of FunctionSig
@@ -16,7 +16,7 @@ const ir = @import("ir.zig");
 //                                              veto lift — Phase 1.3
 //                                              integration deferred,
 //                                              see soundness notes)
-//                → arc_ownership pipeline (V8 rewrite + verifier)
+//                → arc_ownership pipeline (uniqueness rewrite + verifier)
 //                   → arc_drop_insertion
 //
 // Soundness notes for Phase 1.3 (deferred)
@@ -48,12 +48,12 @@ const ir = @import("ir.zig");
 //
 // Why this module exists:
 //
-// The current Boolean `unique_on_entry` lattice in `v8_interprocedural`
+// The current Boolean `unique_on_entry` lattice in `uniqueness_interprocedural`
 // is too coarse to capture the accumulator-recursion patterns at the
 // heart of fannkuch-redux. Specifically, when a caller passes a
 // uniquely-owned `pp` to `count_flips(pp, flips)` and `count_flips`
 // recursively forwards `pp` through `reverse_range`, intraprocedural
-// V8 cannot tell whether `count_flips` *preserves* uniqueness through
+// uniqueness cannot tell whether `count_flips` *preserves* uniqueness through
 // the call (PU) or *consumes* it (CU). Both are required to lift the
 // borrowed-source veto safely.
 //
@@ -72,7 +72,7 @@ const ir = @import("ir.zig");
 // Plus a per-return-component witness `preserves_to_return_component`
 // pointing back to the source parameter (if any) whose uniqueness
 // the result inherits — needed for tuple returns like
-// `count_flips(pp, flips) -> {VectorI64, i64}`.
+// `count_flips(pp, flips) -> {List(i64), i64}`.
 //
 // Ordering and join semantics
 // ---------------------------
@@ -98,7 +98,7 @@ const ir = @import("ir.zig");
 // Soundness
 // ---------
 //
-// The verifier (`arc_verifier.zig::runV8`) re-validates every
+// The verifier (`arc_verifier.zig::runUniquenessCheck`) re-validates every
 // emission of `*_owned_unchecked` against the post-fixpoint
 // signatures. A buggy inference therefore surfaces as a compilation
 // failure (verifier rejection), never a miscompilation.
@@ -292,21 +292,21 @@ pub fn join(a: ParamSig, b: ParamSig) ParamSig {
 
 const testing = std.testing;
 
-test "v8_signature: join with unobserved returns the other element" {
+test "uniqueness_signature: join with unobserved returns the other element" {
     const u = ParamSig.initial();
     const cu = ParamSig.consumesUniquely();
     try testing.expectEqual(UniquenessClass.consumes_uniquely, join(u, cu).class);
     try testing.expectEqual(UniquenessClass.consumes_uniquely, join(cu, u).class);
 }
 
-test "v8_signature: join with top yields top" {
+test "uniqueness_signature: join with top yields top" {
     const t = ParamSig.unknown();
     const cu = ParamSig.consumesUniquely();
     try testing.expectEqual(UniquenessClass.top, join(t, cu).class);
     try testing.expectEqual(UniquenessClass.top, join(cu, t).class);
 }
 
-test "v8_signature: join of identical class preserves class" {
+test "uniqueness_signature: join of identical class preserves class" {
     const cu_a = ParamSig.consumesUniquely();
     const cu_b = ParamSig.consumesUniquely();
     try testing.expectEqual(UniquenessClass.consumes_uniquely, join(cu_a, cu_b).class);
@@ -316,7 +316,7 @@ test "v8_signature: join of identical class preserves class" {
     try testing.expectEqual(UniquenessClass.aliases, join(al_a, al_b).class);
 }
 
-test "v8_signature: join of distinct non-trivial classes yields top" {
+test "uniqueness_signature: join of distinct non-trivial classes yields top" {
     const cu = ParamSig.consumesUniquely();
     const al = ParamSig.aliasesOut();
     const pu = ParamSig.preservesUniqueness(null);
@@ -325,7 +325,7 @@ test "v8_signature: join of distinct non-trivial classes yields top" {
     try testing.expectEqual(UniquenessClass.top, join(pu, al).class);
 }
 
-test "v8_signature: join of PU with same component preserves component" {
+test "uniqueness_signature: join of PU with same component preserves component" {
     const pu_a = ParamSig.preservesUniqueness(0);
     const pu_b = ParamSig.preservesUniqueness(0);
     const result = join(pu_a, pu_b);
@@ -333,7 +333,7 @@ test "v8_signature: join of PU with same component preserves component" {
     try testing.expectEqual(@as(?u8, 0), result.preserves_to_return_component);
 }
 
-test "v8_signature: join of PU with different components drops component witness" {
+test "uniqueness_signature: join of PU with different components drops component witness" {
     const pu_a = ParamSig.preservesUniqueness(0);
     const pu_b = ParamSig.preservesUniqueness(1);
     const result = join(pu_a, pu_b);
@@ -341,7 +341,7 @@ test "v8_signature: join of PU with different components drops component witness
     try testing.expectEqual(@as(?u8, null), result.preserves_to_return_component);
 }
 
-test "v8_signature: ProgramSignatures default lookups return top class" {
+test "uniqueness_signature: ProgramSignatures default lookups return top class" {
     var allocator_buffer: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buffer);
     var sigs = ProgramSignatures.init(fba.allocator());

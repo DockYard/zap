@@ -69,11 +69,6 @@ pub const Type = union(enum) {
     /// disagree. Construction sites lower to `Term.from(value)`;
     /// consumers unwrap via `Term.to(T, default)`.
     term_type,
-    /// Flat-buffer mutable Vector(T) with COW semantics. Concrete
-    /// element variants are enumerated rather than parameterised, so
-    /// each `VectorI64`, `VectorF64` is a distinct nominal type at
-    /// the Zig ABI level.
-    vector_type: VectorElementKind,
 
     // Compound types
     tuple: TupleType,
@@ -108,13 +103,6 @@ pub const Type = union(enum) {
     pub const FloatType = struct {
         bits: u16,
     };
-
-    /// The concrete element type of a `Vector(T)` instantiation.
-    /// Each variant maps to a distinct runtime alias (`VectorI64`
-    /// for `i64`, `VectorF64` for `f64`). New variants here demand
-    /// the corresponding wiring chain — well-known TypeId,
-    /// NativeTypeKind, ZigType, ZIR builder rules.
-    pub const VectorElementKind = enum { i64, f64 };
 
     pub const TupleType = struct {
         elements: []const TypeId,
@@ -230,8 +218,6 @@ pub const TypeStore = struct {
     pub const U128: TypeId = 22;
     pub const F80: TypeId = 23;
     pub const F128: TypeId = 24;
-    pub const VECTOR_I64: TypeId = 25;
-    pub const VECTOR_F64: TypeId = 26;
     pub const VOID: TypeId = NIL;
 
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner) TypeStore {
@@ -280,8 +266,6 @@ pub const TypeStore = struct {
         try self.types.append(self.allocator, .{ .int = .{ .signedness = .unsigned, .bits = 128 } }); // 22 - u128
         try self.types.append(self.allocator, .{ .float = .{ .bits = 80 } }); // 23 - f80
         try self.types.append(self.allocator, .{ .float = .{ .bits = 128 } }); // 24 - f128
-        try self.types.append(self.allocator, .{ .vector_type = .i64 }); // 25 - VectorI64
-        try self.types.append(self.allocator, .{ .vector_type = .f64 }); // 26 - VectorF64
     }
 
     pub fn addType(self: *TypeStore, typ: Type) !TypeId {
@@ -307,7 +291,6 @@ pub const TypeStore = struct {
             .int => |i| i.signedness == b.int.signedness and i.bits == b.int.bits,
             .float => |f| f.bits == b.float.bits,
             .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => true,
-            .vector_type => |element_kind| element_kind == b.vector_type,
             .type_var => false,
             .list => |l| l.element == b.list.element,
             .tuple => |t| std.mem.eql(TypeId, t.elements, b.tuple.elements),
@@ -429,10 +412,6 @@ pub const TypeStore = struct {
             .atom_type => "Atom",
             .tuple => "Tuple",
             .function => "Function",
-            .vector_type => |element_kind| switch (element_kind) {
-                .i64 => "VectorI64",
-                .f64 => "VectorF64",
-            },
             else => null,
         };
     }
@@ -623,7 +602,7 @@ pub const TypeStore = struct {
                 return false;
             },
             // Primitives and non-compound types cannot contain type variables
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .vector_type => false,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => false,
             .struct_type, .union_type, .tagged_union, .opaque_type => false,
         };
     }
@@ -672,7 +651,7 @@ pub const TypeStore = struct {
                 return false;
             },
             // Primitives and non-compound types cannot contain type variables
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .vector_type => false,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => false,
             .struct_type, .union_type, .tagged_union, .opaque_type => false,
         };
     }
@@ -943,7 +922,7 @@ pub const SubstitutionMap = struct {
                 } }) catch type_id;
             },
             // Primitives and other types pass through unchanged
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .vector_type => type_id,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => type_id,
             .struct_type, .union_type, .tagged_union, .opaque_type, .applied => type_id,
         };
     }
@@ -1046,7 +1025,7 @@ pub const SubstitutionMap = struct {
                     .type_params = new_params,
                 } }) catch type_id;
             },
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type, .vector_type => type_id,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => type_id,
             .struct_type, .union_type, .tagged_union, .opaque_type, .applied => type_id,
         };
     }
@@ -1882,6 +1861,7 @@ pub const TypeChecker = struct {
         var best_signature: ?FunctionSignature = null;
         var best_clause_index: u32 = 0;
         var best_cost: u32 = std.math.maxInt(u32);
+        var best_rank: u32 = std.math.maxInt(u32);
 
         for (family.clauses.items, 0..) |clause_ref, family_clause_index| {
             const signature = (try self.resolveClauseSignature(name, arity, resolved.declared_arity, clause_ref)) orelse continue;
@@ -1890,7 +1870,14 @@ pub const TypeChecker = struct {
                 best_signature = signature;
                 best_clause_index = @intCast(family_clause_index);
                 best_cost = cost;
-                if (cost == 0) break;
+                best_rank = self.signatureCanonicalParamRank(signature, arg_types);
+            } else if (cost == best_cost) {
+                const rank = self.signatureCanonicalParamRank(signature, arg_types);
+                if (rank < best_rank) {
+                    best_signature = signature;
+                    best_clause_index = @intCast(family_clause_index);
+                    best_rank = rank;
+                }
             }
         }
 
@@ -1920,6 +1907,34 @@ pub const TypeChecker = struct {
         return total;
     }
 
+    fn signatureCanonicalParamRank(self: *const TypeChecker, signature: FunctionSignature, arg_types: []const TypeId) u32 {
+        var total: u32 = 0;
+        const count = @min(signature.params.len, arg_types.len);
+        for (arg_types[0..count], signature.params[0..count]) |arg_type, expected| {
+            if (arg_type != TypeStore.UNKNOWN) continue;
+            total +|= self.canonicalTypeRank(expected);
+        }
+        return total;
+    }
+
+    fn canonicalTypeRank(self: *const TypeChecker, type_id: TypeId) u32 {
+        const typ = self.store.getType(type_id);
+        return switch (typ) {
+            .int => |int_info| blk: {
+                const bits = @as(i32, int_info.bits);
+                const dist: u32 = @intCast(if (bits >= 64) bits - 64 else 64 - bits);
+                const sign_penalty: u32 = if (int_info.signedness == .signed) 0 else 1;
+                break :blk dist * 2 + sign_penalty;
+            },
+            .float => |float_info| blk: {
+                const bits = @as(i32, float_info.bits);
+                const dist: u32 = @intCast(if (bits >= 64) bits - 64 else 64 - bits);
+                break :blk @as(u32, 256) + dist;
+            },
+            else => 1024,
+        };
+    }
+
     fn callMatchCost(self: *const TypeChecker, actual: TypeId, expected: TypeId) ?u32 {
         if (expected == TypeStore.UNKNOWN or actual == TypeStore.UNKNOWN or actual == TypeStore.ERROR) return 0;
 
@@ -1944,6 +1959,28 @@ pub const TypeChecker = struct {
         if (expected_type == .type_var or actual_type == .type_var) return 0;
 
         return self.store.callMatchCost(actual, expected);
+    }
+
+    fn isTypeVar(self: *const TypeChecker, type_id: TypeId) bool {
+        if (type_id >= self.store.types.items.len) return false;
+        return self.store.getType(type_id) == .type_var;
+    }
+
+    fn isConcreteNumeric(self: *const TypeChecker, type_id: TypeId) bool {
+        if (type_id >= self.store.types.items.len) return false;
+        return switch (self.store.getType(type_id)) {
+            .int, .float => true,
+            else => false,
+        };
+    }
+
+    fn arithmeticResultForTypeVarOperand(self: *const TypeChecker, lhs: TypeId, rhs: TypeId) ?TypeId {
+        const lhs_is_var = self.isTypeVar(lhs);
+        const rhs_is_var = self.isTypeVar(rhs);
+        if (lhs_is_var and rhs_is_var) return lhs;
+        if (lhs_is_var and self.isConcreteNumeric(rhs)) return rhs;
+        if (rhs_is_var and self.isConcreteNumeric(lhs)) return lhs;
+        return null;
     }
 
     fn inferCallArgTypes(self: *TypeChecker, args: []const *const ast.Expr) ![]const TypeId {
@@ -2518,8 +2555,6 @@ pub const TypeChecker = struct {
         if (type_id == TypeStore.F16) return "f16";
         if (type_id == TypeStore.USIZE) return "usize";
         if (type_id == TypeStore.ISIZE) return "isize";
-        if (type_id == TypeStore.VECTOR_I64) return "VectorI64";
-        if (type_id == TypeStore.VECTOR_F64) return "VectorF64";
         if (type_id == TypeStore.UNKNOWN) return "{unknown}";
         if (type_id == TypeStore.ERROR) return "{error}";
         if (type_id == TypeStore.TERM) return "Term";
@@ -4550,6 +4585,7 @@ pub const TypeChecker = struct {
                 // Cascading suppression: if either operand is ERROR, propagate silently
                 if (lhs == TypeStore.ERROR or rhs == TypeStore.ERROR) return TypeStore.ERROR;
                 if (lhs == TypeStore.UNKNOWN or rhs == TypeStore.UNKNOWN) return if (lhs != TypeStore.UNKNOWN) lhs else rhs;
+                if (self.arithmeticResultForTypeVarOperand(lhs, rhs)) |resolved| return resolved;
                 if (!self.store.typeEquals(lhs, rhs)) {
                     const lhs_name = self.typeToString(lhs);
                     const rhs_name = self.typeToString(rhs);
@@ -5061,18 +5097,6 @@ pub const TypeChecker = struct {
                     }
                 }
 
-                // Native Vector instantiations resolve to their fixed
-                // well-known TypeIds. The `@native_type` registry on
-                // `ScopeGraph` answers "is this Zap struct the
-                // user-visible alias for `runtime.VectorI64`?". When
-                // the answer is yes, the type system collapses the
-                // type to the precomputed slot so downstream IR/ZIR
-                // consumers see one canonical TypeId per element kind.
-                if (tn.args.len == 0) {
-                    if (self.isNativeTypeName(.vector_i64, tn.name)) return TypeStore.VECTOR_I64;
-                    if (self.isNativeTypeName(.vector_f64, tn.name)) return TypeStore.VECTOR_F64;
-                }
-
                 if (self.store.resolveTypeName(name)) |tid| {
                     if (tn.args.len > 0) {
                         // Generic type application
@@ -5307,6 +5331,15 @@ test "type store builtin types" {
     try std.testing.expect(store.getType(TypeStore.NEVER) == .never);
 }
 
+test "type store builtin types stop before removed nominal aliases" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    try std.testing.expectEqual(TypeStore.F128 + 1, store.types.items.len);
+}
+
 test "type store resolve builtin names" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
@@ -5321,6 +5354,21 @@ test "type store resolve builtin names" {
     try std.testing.expectEqual(TypeStore.BOOL, store.resolveTypeName("Bool").?);
     try std.testing.expectEqual(TypeStore.STRING, store.resolveTypeName("String").?);
     try std.testing.expect(store.resolveTypeName("Nonexistent") == null);
+}
+
+test "type store represents numeric lists structurally" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    const i64_list = try store.addType(.{ .list = .{ .element = TypeStore.I64 } });
+    const f64_list = try store.addType(.{ .list = .{ .element = TypeStore.F64 } });
+
+    try std.testing.expect(store.getType(i64_list) == .list);
+    try std.testing.expectEqual(TypeStore.I64, store.getType(i64_list).list.element);
+    try std.testing.expect(store.getType(f64_list) == .list);
+    try std.testing.expectEqual(TypeStore.F64, store.getType(f64_list).list.element);
 }
 
 test "typeToString renders tuple element types" {

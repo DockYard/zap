@@ -126,6 +126,7 @@ pub const ListBinding = struct {
 pub const ConsTailBinding = struct {
     name: ast.StringId,
     param_index: u32,
+    start_index: u32,
     local_index: u32,
 };
 
@@ -325,6 +326,7 @@ pub const ListHeadGetExpr = struct {
 
 pub const ListTailGetExpr = struct {
     list: *const Expr,
+    start_index: u32 = 1,
 };
 
 pub const MapValueGetExpr = struct {
@@ -2307,7 +2309,7 @@ pub const HirBuilder = struct {
         // so the most recent rebinding wins over any earlier ones.
         // This must mirror `buildBindingReference`'s ordering — both
         // must agree on which binding `name` resolves to. See that
-        // function for the full rationale (Vector(T) ARC, etc.).
+        // function for the full rationale (COW ARC containers, etc.).
         var assignment_idx = self.current_assignment_bindings.items.len;
         while (assignment_idx > 0) {
             assignment_idx -= 1;
@@ -2992,13 +2994,11 @@ pub const HirBuilder = struct {
         // Reverse iteration of `current_assignment_bindings` picks the
         // most recently appended binding, which is the most recent
         // assignment in the lexical sequence of the current block.
-        // This is critical once `Vector(T)` (and other COW-mutable
-        // ARC types) become ARC-managed: an in-place pattern such as
-        // `arr = VectorI64.set(arr, i, v)` retains the receiver
-        // (refcount=2), so the call's COW path produces a NEW buffer
-        // bound to a fresh local. Without most-recent-wins resolution,
-        // every subsequent `arr` reference would silently observe the
-        // pre-call parameter, yielding stale reads from the original
+        // This is critical for COW-mutable ARC types: an in-place
+        // rebinding retains the receiver, so the COW path produces a
+        // new buffer bound to a fresh local. Without most-recent-wins
+        // resolution, every subsequent reference would silently observe
+        // the pre-call parameter, yielding stale reads from the original
         // buffer.
         var assignment_idx = self.current_assignment_bindings.items.len;
         while (assignment_idx > 0) {
@@ -3798,6 +3798,7 @@ pub const HirBuilder = struct {
                         try self.current_cons_tail_bindings.append(self.allocator, .{
                             .name = pat.list_cons.tail.bind,
                             .param_index = @intCast(param_idx),
+                            .start_index = @intCast(pat.list_cons.heads.len),
                             .local_index = tail_local_idx,
                         });
                     }
@@ -4793,8 +4794,8 @@ pub const HirBuilder = struct {
             .list_cons_expr => |lce| {
                 const head_expr = try self.buildExpr(lce.head);
                 const tail_expr = try self.buildExpr(lce.tail);
-                // Infer the cons cell's list type from the head's type
-                // when known. Without this, downstream IR/ZIR
+                // Infer the list expression's element type from the
+                // head's type when known. Without this, downstream IR/ZIR
                 // monomorphisation defaults the element type to i64,
                 // which breaks `[String | rest]` (and any other non-i64
                 // element) emitted by the for-comp desugarer.
@@ -5324,22 +5325,6 @@ pub const HirBuilder = struct {
                     }
                 }
 
-                // Native Vector instantiations resolve to their fixed
-                // well-known TypeIds. Mirrors the type checker's
-                // resolveTypeExpr branch — both the type checker and
-                // the HIR builder must agree on the canonical TypeId
-                // for `VectorI64`/`VectorF64` so monomorphization,
-                // call-site binding, and IR emission all see the same
-                // `.vector_type` slot. Without this branch the HIR
-                // builder falls through to the user-type lookup and
-                // stores `UNKNOWN` for the return type, which IR then
-                // widens to `.any` and ZIR emits a void-shaped function
-                // — the original failure mode.
-                if (n.args.len == 0) {
-                    if (self.isNativeTypeName(.vector_i64, n.name)) return types_mod.TypeStore.VECTOR_I64;
-                    if (self.isNativeTypeName(.vector_f64, n.name)) return types_mod.TypeStore.VECTOR_F64;
-                }
-
                 // First check builtins
                 if (self.type_store.resolveTypeName(name_str)) |id| return id;
                 // Then check user-defined types (struct/enum) from scope graph
@@ -5829,23 +5814,21 @@ pub const HirBuilder = struct {
             .list_cons => |lc| {
                 const parent_typ = self.type_store.getType(parent_type);
                 const elem_type = if (parent_typ == .list) parent_typ.list.element else types_mod.TypeStore.UNKNOWN;
-                var current_list_local = parent_local;
-                var current_list_type = parent_type;
-                for (lc.heads) |head_pat| {
+                for (lc.heads, 0..) |head_pat, head_index| {
                     if (!(head_pat.* == .wildcard or head_pat.* == .literal)) {
-                        const head_local = try self.emitDestructureStep(.{ .list_head = .{
-                            .list = try self.create(Expr, .{ .kind = .{ .local_get = current_list_local }, .type_id = current_list_type, .span = span }),
+                        const head_local = try self.emitDestructureStep(.{ .list_at = .{
+                            .list = try self.create(Expr, .{ .kind = .{ .local_get = parent_local }, .type_id = parent_type, .span = span }),
+                            .index = @intCast(head_index),
                         } }, elem_type, span, out_stmts);
                         try self.lowerAssignmentDestructure(head_pat, head_local, elem_type, span, out_stmts);
                     }
-                    const tail_local = try self.emitDestructureStep(.{ .list_tail = .{
-                        .list = try self.create(Expr, .{ .kind = .{ .local_get = current_list_local }, .type_id = current_list_type, .span = span }),
-                    } }, parent_type, span, out_stmts);
-                    current_list_local = tail_local;
-                    current_list_type = parent_type;
                 }
                 if (!(lc.tail.* == .wildcard or lc.tail.* == .literal)) {
-                    try self.lowerAssignmentDestructure(lc.tail, current_list_local, current_list_type, span, out_stmts);
+                    const tail_local = try self.emitDestructureStep(.{ .list_tail = .{
+                        .list = try self.create(Expr, .{ .kind = .{ .local_get = parent_local }, .type_id = parent_type, .span = span }),
+                        .start_index = @intCast(lc.heads.len),
+                    } }, parent_type, span, out_stmts);
+                    try self.lowerAssignmentDestructure(lc.tail, tail_local, parent_type, span, out_stmts);
                 }
             },
             .struct_pattern => |sp| {
@@ -6042,6 +6025,65 @@ test "HIR build struct" {
 
     try std.testing.expectEqual(@as(usize, 1), hir_program.structs.len);
     try std.testing.expectEqual(@as(usize, 1), hir_program.structs[0].functions.len);
+}
+
+test "HIR resolves numeric List applications structurally" {
+    const source =
+        \\@native_type = "list"
+        \\
+        \\pub struct List {
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn ints(values :: List(i64)) -> List(i64) {
+        \\    values
+        \\  }
+        \\
+        \\  pub fn floats(values :: List(f64)) -> List(f64) {
+        \\    values
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    defer type_store.deinit();
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 2), hir_program.structs.len);
+
+    const test_struct = hir_program.structs[1];
+    try std.testing.expectEqual(@as(usize, 2), test_struct.functions.len);
+
+    const ints_clause = test_struct.functions[0].clauses[0];
+    const ints_param_type = type_store.getType(ints_clause.params[0].type_id);
+    const ints_return_type = type_store.getType(ints_clause.return_type);
+    try std.testing.expect(ints_param_type == .list);
+    try std.testing.expectEqual(types_mod.TypeStore.I64, ints_param_type.list.element);
+    try std.testing.expect(ints_return_type == .list);
+    try std.testing.expectEqual(types_mod.TypeStore.I64, ints_return_type.list.element);
+
+    const floats_clause = test_struct.functions[1].clauses[0];
+    const floats_param_type = type_store.getType(floats_clause.params[0].type_id);
+    const floats_return_type = type_store.getType(floats_clause.return_type);
+    try std.testing.expect(floats_param_type == .list);
+    try std.testing.expectEqual(types_mod.TypeStore.F64, floats_param_type.list.element);
+    try std.testing.expect(floats_return_type == .list);
+    try std.testing.expectEqual(types_mod.TypeStore.F64, floats_return_type.list.element);
 }
 
 test "HIR lowers numeric tuple field access to tuple_index_get" {
@@ -6458,8 +6500,8 @@ test "HIR assignment rebinding shadows parameter (Elixir-style scope)" {
     // checked parameters BEFORE assignment bindings, so a rebind
     // (`x = expr`) would silently leave every later `x` reference
     // pointing at the original `param_get` rather than the new
-    // `local_get`. Once Vector(T) (and any other COW-mutable
-    // ARC-managed type) joins the ARC-managed set, the IR retains
+    // `local_get`. Once COW-mutable ARC-managed containers join
+    // the ARC-managed set, the IR retains
     // the receiver across the call, the runtime's COW path produces
     // a fresh buffer, and that fresh buffer flows into a new local —
     // the rebinding. Without this fix every later read of `x` would

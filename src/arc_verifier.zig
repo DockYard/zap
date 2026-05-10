@@ -1,8 +1,8 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
-const v8_uniqueness = @import("v8_uniqueness.zig");
-const v8_interprocedural = @import("v8_interprocedural.zig");
+const uniqueness_analysis = @import("uniqueness.zig");
+const uniqueness_interprocedural = @import("uniqueness_interprocedural.zig");
 
 // ============================================================
 // ARC ownership verifier.
@@ -80,6 +80,11 @@ const v8_interprocedural = @import("v8_interprocedural.zig");
 //       a +1 retain that the caller is responsible for releasing;
 //       returning a borrow would let the caller release a value
 //       the callee was lending out.
+//   V6. `.move_value{source=s}` MUST consume an `.owned` source.
+//       Moving from a borrowed local is a pass bug: borrowed aliases
+//       do not carry a +1 reference to transfer, and treating them as
+//       consumable lets aggregate-store rewrites park dangling
+//       pointers while the real owner is still released later.
 //
 // On any violation, `verify` emits a Swift-OSSA-style diagnostic
 // via `std.log.err` and returns `error.ArcInvariantViolation`. The
@@ -131,23 +136,23 @@ pub fn verify(
 }
 
 /// Variant of `verify` that consults a whole-program uniqueness
-/// fixpoint when running V8. The fixpoint feeds through to the
-/// per-function V8 analysis so `param_get` for slots proven
+/// fixpoint when running uniqueness. The fixpoint feeds through to the
+/// per-function uniqueness analysis so `param_get` for slots proven
 /// unique-on-entry is treated as definitely unique. Required when
 /// the codegen used the same fixpoint to emit `*_owned_unchecked`
-/// calls — the verifier must agree on which sites pass V8 or it
+/// calls — the verifier must agree on which sites pass uniqueness or it
 /// will reject codegen's output.
 pub fn verifyWithFixpoint(
     allocator: std.mem.Allocator,
     function: *const ir.Function,
     program: *const ir.Program,
-    fixpoint: ?*const v8_interprocedural.ProgramUniqueness,
+    fixpoint: ?*const uniqueness_interprocedural.ProgramUniqueness,
 ) VerifyError!void {
     var ctx = VerifyContext{ .function = function, .program = program };
     for (function.body) |block| {
         try verifyStream(&ctx, block.instructions);
     }
-    try runV8(allocator, function, program, fixpoint);
+    try runUniquenessCheck(allocator, function, program, fixpoint);
 }
 
 /// Per-verification context. Phase E.9 V7 added the `program`
@@ -835,6 +840,20 @@ fn verifyInstruction(
             }
         },
 
+        // V6: move_value transfers an existing +1 from source to dest.
+        .move_value => |mv| {
+            if (ownershipOf(function, mv.source) != .owned) {
+                emitDiagnostic(
+                    function,
+                    "V6",
+                    "move_value source must be .owned; borrowed/trivial locals have no ownership unit to transfer",
+                    mv.source,
+                    "move_value",
+                );
+                return error.ArcInvariantViolation;
+            }
+        },
+
         // V3: borrows must not escape into aggregate storage.
         .struct_init => |si| {
             for (si.fields) |field| {
@@ -937,45 +956,45 @@ fn checkReturnValue(
 }
 
 // ============================================================
-// V8 — alias safety on owned update.
+// uniqueness — alias safety on owned update.
 // ============================================================
 //
-// V8 is the verifier-side defence for the unchecked-mutator
+// uniqueness is the verifier-side defence for the unchecked-mutator
 // codegen path introduced in Phase 3 of the dense-map plan. Every
 // `*_owned_unchecked` runtime call (`Map.put_owned_unchecked`,
-// `Vector.set_owned_unchecked`, etc. — see `runtime.zig`) assumes
+// `List.set_owned_unchecked`, etc. — see `runtime.zig`) assumes
 // the caller has proven the receiver is statically uniquely owned
 // (refcount == 1 by construction). The codegen emits these calls
-// only at sites where the V8 static-uniqueness analysis
-// (`v8_uniqueness.zig`) reports `definitely_unique = true`. V8
+// only at sites where the uniqueness static-uniqueness analysis
+// (`uniqueness.zig`) reports `definitely_unique = true`. uniqueness
 // here verifies the inverse: every unchecked call site MUST have
-// V8 = true. Any unchecked call where uniqueness was NOT proven is
+// uniqueness = true. Any unchecked call where uniqueness was NOT proven is
 // a codegen bug that would produce undefined behavior at runtime.
 //
 // The check is per-function. We run the analysis and walk the IR;
 // for every call instruction whose name is an unchecked owned-
 // mutating builtin (per `arc_liveness.isUncheckedOwnedMutatingBuiltin`),
 // we look up the analysis result for that instruction's id and
-// emit a V8 violation if uniqueness was not proven.
+// emit a uniqueness violation if uniqueness was not proven.
 //
 // The walk uses the same depth-first instruction-id assignment
-// `arc_liveness` and `v8_uniqueness` use, so the per-instruction
+// `arc_liveness` and `uniqueness` use, so the per-instruction
 // queries align across passes.
 //
 // Diagnostic shape: identifies the function, the unchecked call's
 // instruction id, the receiver LocalId, and the reason — closely
 // mirroring V1-V7's diagnostic surface.
 
-/// Run the V8 invariant on `function`. Walks every owned-mutating
+/// Run the uniqueness invariant on `function`. Walks every owned-mutating
 /// call site that targets an unchecked variant; for each, asserts
-/// the V8 static-uniqueness analysis reports the receiver is
+/// the uniqueness static-uniqueness analysis reports the receiver is
 /// `definitely_unique`. Returns `error.ArcInvariantViolation` on
 /// the first violation.
-fn runV8(
+fn runUniquenessCheck(
     allocator: std.mem.Allocator,
     function: *const ir.Function,
     program: *const ir.Program,
-    fixpoint: ?*const v8_interprocedural.ProgramUniqueness,
+    fixpoint: ?*const uniqueness_interprocedural.ProgramUniqueness,
 ) VerifyError!void {
     // Fast path: scan the function for any unchecked call before
     // running the analysis. Most functions have no unchecked sites
@@ -983,12 +1002,12 @@ fn runV8(
     // those keeps verifier overhead minimal.
     if (!hasUncheckedCallSite(function)) return;
 
-    var uniqueness = v8_uniqueness.analyzeUniquenessWithFixpoint(allocator, function, program, fixpoint) catch |err| switch (err) {
+    var uniqueness = uniqueness_analysis.analyzeUniquenessWithFixpoint(allocator, function, program, fixpoint) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer uniqueness.deinit(allocator);
 
-    var walker = V8Walker{
+    var walker = UniquenessCheckWalker{
         .function = function,
         .uniqueness = &uniqueness,
         .next_id = 0,
@@ -1002,7 +1021,7 @@ fn runV8(
 
 /// Quick per-function pre-check: does the function contain ANY
 /// owned-mutating call site to an unchecked variant? Returns
-/// without running the (more expensive) V8 analysis when there
+/// without running the (more expensive) uniqueness analysis when there
 /// are no unchecked sites.
 fn hasUncheckedCallSite(function: *const ir.Function) bool {
     var checker = UncheckedCallScanner{ .found = false };
@@ -1019,6 +1038,10 @@ const UncheckedCallScanner = struct {
             .call_builtin => |cb| cb.name,
             .call_named => |cn| cn.name,
             .try_call_named => |tcn| tcn.name,
+            .list_tail => |lt| {
+                if (lt.consume_source) self.found = true;
+                return;
+            },
             .call_direct => return,
             else => return,
         };
@@ -1028,14 +1051,14 @@ const UncheckedCallScanner = struct {
     }
 };
 
-const V8Walker = struct {
+const UniquenessCheckWalker = struct {
     function: *const ir.Function,
-    uniqueness: *const v8_uniqueness.Uniqueness,
+    uniqueness: *const uniqueness_analysis.Uniqueness,
     next_id: arc_liveness.InstructionId,
     err: ?VerifyError,
 
     fn walkStream(
-        self: *V8Walker,
+        self: *UniquenessCheckWalker,
         stream: []const ir.Instruction,
     ) error{OutOfMemory}!void {
         for (stream) |*instr| {
@@ -1049,7 +1072,7 @@ const V8Walker = struct {
     }
 
     fn walkChildren(
-        self: *V8Walker,
+        self: *UniquenessCheckWalker,
         instr: *const ir.Instruction,
     ) error{OutOfMemory}!void {
         switch (instr.*) {
@@ -1095,13 +1118,13 @@ const V8Walker = struct {
     }
 
     fn checkUncheckedCallSite(
-        self: *V8Walker,
+        self: *UniquenessCheckWalker,
         instr: *const ir.Instruction,
         my_id: arc_liveness.InstructionId,
     ) void {
         const info = uncheckedCallReceiver(instr) orelse return;
         if (self.uniqueness.isUnique(my_id)) return;
-        emitV8Diagnostic(self.function, my_id, info.name, info.receiver);
+        emitUniquenessDiagnostic(self.function, my_id, info.name, info.receiver);
         self.err = error.ArcInvariantViolation;
     }
 };
@@ -1131,11 +1154,15 @@ fn uncheckedCallReceiver(instr: *const ir.Instruction) ?UncheckedCallInfo {
             if (slot >= tcn.args.len) return null;
             return .{ .name = tcn.name, .receiver = tcn.args[slot] };
         },
+        .list_tail => |lt| {
+            if (!lt.consume_source) return null;
+            return .{ .name = "List.slice_owned_unchecked", .receiver = lt.list };
+        },
         else => return null,
     }
 }
 
-fn emitV8Diagnostic(
+fn emitUniquenessDiagnostic(
     function: *const ir.Function,
     instr_id: arc_liveness.InstructionId,
     callee_name: []const u8,
@@ -1143,10 +1170,10 @@ fn emitV8Diagnostic(
 ) void {
     if (suppress_diagnostics) return;
     std.debug.print(
-        "arc_verifier: function '{s}' violates V8:\n" ++
+        "arc_verifier: function '{s}' violates uniqueness:\n" ++
             "  unchecked owned-mutating call '{s}' at instruction {d}\n" ++
             "  receiver local %{d} is NOT statically proven to be uniquely owned\n" ++
-            "  (V8 = false)\n" ++
+            "  (uniqueness = false)\n" ++
             "  the codegen must not emit `*_owned_unchecked` at this site;\n" ++
             "  routing through the checked variant is the correct fix.\n",
         .{ function.name, callee_name, instr_id, receiver },
@@ -1347,6 +1374,30 @@ test "arc_verifier: rejects borrowed local stored into struct_init (V3)" {
     var function = try buildTestFunction(
         allocator,
         "test_v3",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(allocator, &function);
+
+    const result = verifyFunctionStandalone(allocator, &function);
+    try testing.expectError(error.ArcInvariantViolation, result);
+}
+
+test "arc_verifier: rejects move_value from borrowed local (V6)" {
+    var guard = SuppressDiagnostics.init();
+    defer guard.deinit();
+
+    const allocator = testing.allocator;
+    const ownership = [_]ir.OwnershipClass{ .borrowed, .owned };
+    const conventions = [_]ir.ParamConvention{};
+    const instrs = [_]ir.Instruction{
+        .{ .move_value = .{ .dest = 1, .source = 0 } },
+    };
+    var function = try buildTestFunction(
+        allocator,
+        "test_v6_move_from_borrow",
         &instrs,
         &ownership,
         &conventions,
@@ -2101,17 +2152,17 @@ test "arc_verifier: V7 accepts share_value into borrowed-convention slot" {
 }
 
 // ============================================================
-// V8 — alias safety on owned update
+// uniqueness — alias safety on owned update
 // ============================================================
 //
-// V8 verifies that every `*_owned_unchecked` call site has the V8
-// static-uniqueness analysis (see `v8_uniqueness.zig`) reporting
+// uniqueness verifies that every `*_owned_unchecked` call site has the uniqueness
+// static-uniqueness analysis (see `uniqueness.zig`) reporting
 // `definitely_unique = true` for the receiver. The negative tests
 // hand-roll IR shapes where the codegen incorrectly emitted an
-// unchecked variant at a site without proven uniqueness — V8 must
-// reject. The positive tests confirm V8 accepts well-formed IR.
+// unchecked variant at a site without proven uniqueness — uniqueness must
+// reject. The positive tests confirm uniqueness accepts well-formed IR.
 
-test "arc_verifier: V8 accepts unchecked Map.put at fresh-alloc receiver" {
+test "arc_verifier: uniqueness accepts unchecked Map.put at fresh-alloc receiver" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -2123,7 +2174,7 @@ test "arc_verifier: V8 accepts unchecked Map.put at fresh-alloc receiver" {
     //   [3] move_value %3 <- %0                  -- transfers uniqueness
     //   [4] call_builtin "Map.put_owned_unchecked" args=[%3, %1, %2] dest=%4
     //
-    // Expected: V8 = true at id 4 because %3 was sourced from a
+    // Expected: uniqueness = true at id 4 because %3 was sourced from a
     // fresh-alloc and move_value preserves uniqueness.
     const args = try arena.alloc(ir.LocalId, 3);
     args[0] = 3;
@@ -2150,7 +2201,7 @@ test "arc_verifier: V8 accepts unchecked Map.put at fresh-alloc receiver" {
     };
     var function = try buildTestFunction(
         testing.allocator,
-        "test_v8_pos_fresh",
+        "test_uniqueness_pos_fresh",
         &instrs,
         &ownership,
         &.{},
@@ -2161,7 +2212,7 @@ test "arc_verifier: V8 accepts unchecked Map.put at fresh-alloc receiver" {
     try verifyFunctionStandalone(testing.allocator, &function);
 }
 
-test "arc_verifier: V8 rejects unchecked Map.put with parameter receiver" {
+test "arc_verifier: uniqueness rejects unchecked Map.put with parameter receiver" {
     var guard = SuppressDiagnostics.init();
     defer guard.deinit();
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2175,7 +2226,7 @@ test "arc_verifier: V8 rejects unchecked Map.put with parameter receiver" {
     //   [3] move_value %3 <- %0                  -- move from non-unique source
     //   [4] call_builtin "Map.put_owned_unchecked" args=[%3, %1, %2] dest=%4
     //
-    // Expected: V8 rejects — receiver's source is a parameter; the
+    // Expected: uniqueness rejects — receiver's source is a parameter; the
     // caller controls the refcount and uniqueness cannot be proven.
     const args = try arena.alloc(ir.LocalId, 3);
     args[0] = 3;
@@ -2203,7 +2254,7 @@ test "arc_verifier: V8 rejects unchecked Map.put with parameter receiver" {
     const conventions = [_]ir.ParamConvention{.owned};
     var function = try buildTestFunction(
         testing.allocator,
-        "test_v8_neg_param",
+        "test_uniqueness_neg_param",
         &instrs,
         &ownership,
         &conventions,
@@ -2215,7 +2266,7 @@ test "arc_verifier: V8 rejects unchecked Map.put with parameter receiver" {
     try testing.expectError(error.ArcInvariantViolation, result);
 }
 
-test "arc_verifier: V8 rejects unchecked Map.put on parked receiver" {
+test "arc_verifier: uniqueness rejects unchecked Map.put on parked receiver" {
     var guard = SuppressDiagnostics.init();
     defer guard.deinit();
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2257,7 +2308,7 @@ test "arc_verifier: V8 rejects unchecked Map.put on parked receiver" {
     };
     var function = try buildTestFunction(
         testing.allocator,
-        "test_v8_neg_parked",
+        "test_uniqueness_neg_parked",
         &instrs,
         &ownership,
         &.{},
@@ -2269,7 +2320,7 @@ test "arc_verifier: V8 rejects unchecked Map.put on parked receiver" {
     try testing.expectError(error.ArcInvariantViolation, result);
 }
 
-test "arc_verifier: V8 accepts chained unchecked calls (owned-mutating result is unique)" {
+test "arc_verifier: uniqueness accepts chained unchecked calls (owned-mutating result is unique)" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -2285,7 +2336,7 @@ test "arc_verifier: V8 accepts chained unchecked calls (owned-mutating result is
     //   [7] move_value %7 <- %4
     //   [8] call_builtin "Map.put_owned_unchecked" args=[%7, %5, %6] dest=%8
     //
-    // Expected: V8 holds at BOTH calls. The second call's receiver
+    // Expected: uniqueness holds at BOTH calls. The second call's receiver
     // is the result of the first owned-mutating call, which is
     // unique by runtime contract.
     const args1 = try arena.alloc(ir.LocalId, 3);
@@ -2330,7 +2381,7 @@ test "arc_verifier: V8 accepts chained unchecked calls (owned-mutating result is
     };
     var function = try buildTestFunction(
         testing.allocator,
-        "test_v8_pos_chain",
+        "test_uniqueness_pos_chain",
         &instrs,
         &ownership,
         &.{},
@@ -2341,8 +2392,8 @@ test "arc_verifier: V8 accepts chained unchecked calls (owned-mutating result is
     try verifyFunctionStandalone(testing.allocator, &function);
 }
 
-test "arc_verifier: V8 silent on functions with no unchecked call sites" {
-    // V8 must not crash or false-positive on any function whose
+test "arc_verifier: uniqueness silent on functions with no unchecked call sites" {
+    // uniqueness must not crash or false-positive on any function whose
     // body contains zero unchecked call sites — that includes the
     // entire pre-Phase-3 corpus.
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2365,7 +2416,7 @@ test "arc_verifier: V8 silent on functions with no unchecked call sites" {
     const ownership = [_]ir.OwnershipClass{ .owned, .trivial };
     var function = try buildTestFunction(
         testing.allocator,
-        "test_v8_silent",
+        "test_uniqueness_silent",
         &instrs,
         &ownership,
         &.{},
@@ -2376,21 +2427,21 @@ test "arc_verifier: V8 silent on functions with no unchecked call sites" {
     try verifyFunctionStandalone(testing.allocator, &function);
 }
 
-test "arc_verifier: V8 rejects unchecked Vector.set on parameter receiver" {
+test "arc_verifier: uniqueness rejects unchecked List.set on parameter receiver" {
     var guard = SuppressDiagnostics.init();
     defer guard.deinit();
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
 
-    // Stream simulating the body of `Vector.set`:
+    // Stream simulating the body of `List.set`:
     //   [0] param_get %0 = param[0]              -- vec parameter
     //   [1] const_int %1 = 0
     //   [2] const_int %2 = 42
     //   [3] move_value %3 <- %0
-    //   [4] call_builtin "Vector.set_owned_unchecked" args=[%3, %1, %2] dest=%4
+    //   [4] call_builtin "List.set_owned_unchecked" args=[%3, %1, %2] dest=%4
     //
-    // V8 must reject — parameter source means uniqueness cannot be
+    // uniqueness must reject — parameter source means uniqueness cannot be
     // proven from inside the callee.
     const args = try arena.alloc(ir.LocalId, 3);
     args[0] = 3;
@@ -2407,7 +2458,7 @@ test "arc_verifier: V8 rejects unchecked Vector.set on parameter receiver" {
         .{ .move_value = .{ .dest = 3, .source = 0 } },
         .{ .call_builtin = .{
             .dest = 4,
-            .name = "Vector.set_owned_unchecked",
+            .name = "List.set_owned_unchecked",
             .args = args,
             .arg_modes = arg_modes,
         } },
@@ -2418,7 +2469,7 @@ test "arc_verifier: V8 rejects unchecked Vector.set on parameter receiver" {
     const conventions = [_]ir.ParamConvention{.owned};
     var function = try buildTestFunction(
         testing.allocator,
-        "test_v8_neg_vector_param",
+        "test_uniqueness_neg_list_param",
         &instrs,
         &ownership,
         &conventions,
@@ -2430,11 +2481,54 @@ test "arc_verifier: V8 rejects unchecked Vector.set on parameter receiver" {
     try testing.expectError(error.ArcInvariantViolation, result);
 }
 
-test "arc_verifier: V8 accepts unchecked Map.put with fixpoint-proven unique parameter" {
-    // Companion to "V8 rejects unchecked Map.put with parameter receiver":
-    // when the interprocedural V8 fixpoint proves the parameter slot is
+test "arc_verifier: uniqueness accepts consuming list_tail at fresh unique source" {
+    const instrs = [_]ir.Instruction{
+        .{ .list_init = .{ .dest = 0, .elements = &.{} } },
+        .{ .list_tail = .{ .dest = 1, .list = 0, .element_type = .i64, .consume_source = true } },
+    };
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned };
+    var function = try buildTestFunction(
+        testing.allocator,
+        "test_uniqueness_pos_list_tail",
+        &instrs,
+        &ownership,
+        &.{},
+        .owned,
+    );
+    defer freeTestFunction(testing.allocator, &function);
+
+    try verifyFunctionStandalone(testing.allocator, &function);
+}
+
+test "arc_verifier: uniqueness rejects consuming list_tail on parameter receiver" {
+    var guard = SuppressDiagnostics.init();
+    defer guard.deinit();
+
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .list_tail = .{ .dest = 1, .list = 0, .element_type = .i64, .consume_source = true } },
+    };
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned };
+    const conventions = [_]ir.ParamConvention{.owned};
+    var function = try buildTestFunction(
+        testing.allocator,
+        "test_uniqueness_neg_list_tail_param",
+        &instrs,
+        &ownership,
+        &conventions,
+        .owned,
+    );
+    defer freeTestFunction(testing.allocator, &function);
+
+    const result = verifyFunctionStandalone(testing.allocator, &function);
+    try testing.expectError(error.ArcInvariantViolation, result);
+}
+
+test "arc_verifier: uniqueness accepts unchecked Map.put with fixpoint-proven unique parameter" {
+    // Companion to "uniqueness rejects unchecked Map.put with parameter receiver":
+    // when the interprocedural uniqueness fixpoint proves the parameter slot is
     // unique-on-entry, the verifier accepts the unchecked call site.
-    // This is the integration seam that activates V8 on accumulator-
+    // This is the integration seam that activates uniqueness on accumulator-
     // recursion patterns where the receiver is a parameter.
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
@@ -2468,7 +2562,7 @@ test "arc_verifier: V8 accepts unchecked Map.put with fixpoint-proven unique par
     const conventions = [_]ir.ParamConvention{.owned};
     var function = try buildTestFunction(
         testing.allocator,
-        "test_v8_pos_param_with_fixpoint",
+        "test_uniqueness_pos_param_with_fixpoint",
         &instrs,
         &ownership,
         &conventions,
@@ -2484,7 +2578,7 @@ test "arc_verifier: V8 accepts unchecked Map.put with fixpoint-proven unique par
     };
 
     // Build a fixpoint that says slot 0 is unique-on-entry.
-    var fixpoint: v8_interprocedural.ProgramUniqueness = .{};
+    var fixpoint: uniqueness_interprocedural.ProgramUniqueness = .{};
     defer fixpoint.deinit(testing.allocator);
     const slots = try testing.allocator.alloc(bool, 1);
     slots[0] = true;

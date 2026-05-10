@@ -51,7 +51,7 @@ The 7,499,921 HAMT node clones across 8.75M instances give a baseline cost: roug
 
 ### versioned (synthetic, deliberately exercising the V path)
 
-Designed to park a Map in a List cons cell (a persistent container) before deriving a new version via `Map.put`. The classifier correctly identifies 200 V instances out of 480 (41.67%) — confirming that when persistent containers do hold Map references, the post-share-mutation detection works.
+Designed to park a Map in a persistent sequence container before deriving a new version via `Map.put`. At the time this used the old cons-cell `List`; after list unification the equivalent container is the flat-buffer `List(T)`. The classifier correctly identifies 200 V instances out of 480 (41.67%) — confirming that when persistent containers do hold Map references, the post-share-mutation detection works.
 
 This workload is the only one in the harvest that produces meaningful V signal. It's a synthetic test, not a real-world workload.
 
@@ -89,7 +89,7 @@ The data shows:
 **Aligned plan of work** (per `docs/zap-map-representation-research-brief.md` §B and `docs/roc-style-opportunistic-mutation-research-brief.md`):
 
 1. **Dense Map redesign** with insertion-ordered open-addressed layout, modern seeded hash (replacing FNV-1a), and refcount-aware in-place mutation under unique ownership.
-2. **Vector(T) flat-buffer** with the same COW pattern. Prerequisite for `MArrayI64` / `MArrayF64` deletion.
+2. **Flat-buffer `List(T)`** with the same COW pattern. This is the post-unification replacement for the former `Vector(T)` surface and the deleted `MArrayI64` / `MArrayF64` escape hatches.
 3. **V8/V9 verifier extensions** for alias safety (already designed in `docs/roc-style-opportunistic-mutation-research-brief.md`).
 4. **List FBIP** consuming traversals (`map`/`filter`/`reverse`).
 5. **`MArrayI64` / `MArrayF64` deletion** after step 2 lands and the CLBG benchmarks confirm parity.
@@ -120,7 +120,7 @@ All preserved in-repo:
 
 The classifier itself uses a put-time refcount sample combined with `mapInstrumentationOnRetain` hooks split by retain semantics:
 - Transient retains (IR `share_value mode=retain`) bypass instrumentation.
-- Persistent retains (List cons heads, struct field assignments, `copy_value` IR ops) flow through the type's `retain` method and update the per-cell `peak_strong_count` and `had_share_event` flags.
+- Persistent retains (list elements, struct field assignments, `copy_value` IR ops) flow through the type's `retain` method and update the per-cell `peak_strong_count` and `had_share_event` flags.
 - A post-share mutation is recorded only when (a) the input had a share event and (b) the put produced a distinct output cell.
 
 This design avoids both the false-positive (every owned-arg retain looks like sharing) and false-negative (container retains invisible) modes that earlier iterations of the classifier produced.
@@ -131,7 +131,7 @@ This design avoids both the false-positive (every owned-arg retain looks like sh
 
 2. **If approved**, the unified implementation plan combines:
    - Dense Map redesign (per `docs/zap-map-representation-research-brief.md`)
-   - Vector(T) flat-buffer + COW
+   - Flat-buffer `List(T)` + COW
    - Opportunistic-mutation IR work (V8/V9 verifier extensions, owned/borrowed call-site rewriting)
    - List FBIP traversal reuse
    - `MArrayI64` / `MArrayF64` deletion

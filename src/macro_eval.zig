@@ -2172,9 +2172,9 @@ fn structFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtV
         // listing every protocol operator alongside their own functions.
         if (family.scope_id != struct_scope_id) continue;
         const name = ctx.interner.get(family.name);
-        const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes) orelse "";
+        const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes, "fndoc") orelse "";
         const loc = declSourceLocation(ctx.graph, family.clauses.items[0].decl.meta);
-        const signatures = signature.buildClauseSignatures(env.alloc, name, family.clauses.items, ctx.interner, ctx.graph);
+        const signatures = buildReflectionClauseSignatures(env.alloc, name, family.clauses.items, ctx.interner, ctx.graph);
         try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, family.visibility, doc_text, loc.path, loc.line, signatures));
     }
 
@@ -2439,9 +2439,9 @@ fn structMacrosIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValu
         if (visibility != .public) continue;
         const name = ctx.interner.get(family.name);
         if (std.mem.startsWith(u8, name, "__")) continue;
-        const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes) orelse "";
+        const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes, "fndoc") orelse "";
         const loc = declSourceLocation(ctx.graph, family.clauses.items[0].decl.meta);
-        const signatures = signature.buildClauseSignatures(env.alloc, name, family.clauses.items, ctx.interner, ctx.graph);
+        const signatures = buildReflectionClauseSignatures(env.alloc, name, family.clauses.items, ctx.interner, ctx.graph);
         try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, visibility, doc_text, loc.path, loc.line, signatures));
     }
 
@@ -2474,7 +2474,8 @@ fn structInfoIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue 
     // from the source-graph reflection intrinsics are interchangeable.
     for (ctx.graph.structs.items) |entry| {
         if (!structNameMatches(ctx.interner, entry.name, struct_name)) continue;
-        return makeDeclInfoMap(env, ctx, struct_name, entry.decl.meta, entry.decl.is_private, entry.attributes);
+        const doc_text = extractStructDocAttributeText(env.alloc, ctx.interner, entry.decl.items, entry.attributes) orelse "";
+        return makeDeclInfoMapWithDoc(env, ctx, struct_name, entry.decl.meta, entry.decl.is_private, doc_text);
     }
     for (ctx.graph.protocols.items) |entry| {
         if (!structNameMatches(ctx.interner, entry.name, struct_name)) continue;
@@ -2500,9 +2501,21 @@ fn makeDeclInfoMap(
     is_private: bool,
     attributes: std.ArrayListUnmanaged(scope.Attribute),
 ) !CtValue {
+    const doc_text = extractDocAttributeText(env.alloc, ctx.interner, attributes, "structdoc") orelse "";
+
+    return makeDeclInfoMapWithDoc(env, ctx, name, meta, is_private, doc_text);
+}
+
+fn makeDeclInfoMapWithDoc(
+    env: *Env,
+    ctx: StructContext,
+    name: []const u8,
+    meta: ast.NodeMeta,
+    is_private: bool,
+    doc_text: []const u8,
+) !CtValue {
     const source_id = meta.span.source_id orelse 0;
     const source_path = ctx.graph.sourcePathById(source_id) orelse "";
-    const doc_text = extractDocAttributeText(env.alloc, ctx.interner, attributes) orelse "";
 
     const entries = try env.alloc.alloc(CtValue.CtMapEntry, 4);
     entries[0] = .{ .key = .{ .atom = ":name" }, .value = .{ .string = env.alloc.dupe(u8, name) catch name } };
@@ -2661,18 +2674,249 @@ fn declSourceLocation(graph: *const scope.ScopeGraph, meta: ast.NodeMeta) struct
     return .{ .path = path, .line = lineNumberFromOffset(source, meta.span.start) };
 }
 
-/// Extract the value of an `@doc = "..."` attribute on a declaration, or
-/// return null when there is no doc attribute. The string is heredoc-stripped
-/// (common leading whitespace removed) so multi-line `@doc = """ ... """`
-/// values round-trip cleanly into runtime literal strings.
+fn buildReflectionClauseSignatures(
+    alloc: Allocator,
+    function_name: []const u8,
+    clauses: []const scope.FunctionClauseRef,
+    interner: *const ast.StringInterner,
+    graph: *const scope.ScopeGraph,
+) []const []const u8 {
+    var signatures: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (clauses) |clause_ref| {
+        if (clause_ref.clause_index >= clause_ref.decl.clauses.len) continue;
+        const clause = clause_ref.decl.clauses[clause_ref.clause_index];
+        signatures.append(alloc, buildReflectionClauseSignature(alloc, function_name, clause, interner, graph)) catch {};
+    }
+    if (signatures.items.len == 0) {
+        signatures.append(alloc, std.fmt.allocPrint(alloc, "{s}()", .{function_name}) catch function_name) catch {};
+    }
+    return signatures.toOwnedSlice(alloc) catch &.{};
+}
+
+fn buildReflectionClauseSignature(
+    alloc: Allocator,
+    function_name: []const u8,
+    clause: ast.FunctionClause,
+    interner: *const ast.StringInterner,
+    graph: *const scope.ScopeGraph,
+) []const u8 {
+    var buf = signature.Buffer.init(alloc);
+    buf.str(function_name);
+    buf.char('(');
+    for (clause.params, 0..) |param, index| {
+        if (index > 0) buf.str(", ");
+        signature.appendPattern(&buf, param.pattern, interner, graph);
+        if (param.type_annotation) |type_annotation| {
+            buf.str(" :: ");
+            appendReflectionTypeExpr(&buf, type_annotation, interner, graph);
+        }
+        if (param.default) |default_expr| {
+            buf.str(" = ");
+            signature.appendExpr(&buf, default_expr, interner, graph);
+        }
+    }
+    buf.char(')');
+    if (clause.return_type) |return_type| {
+        buf.str(" -> ");
+        appendReflectionTypeExpr(&buf, return_type, interner, graph);
+    }
+    if (clause.refinement) |refinement| {
+        buf.str(" if ");
+        signature.appendExpr(&buf, refinement, interner, graph);
+    }
+    return buf.list.toOwnedSlice(alloc) catch buf.toSlice();
+}
+
+fn appendReflectionTypeExpr(
+    buf: *signature.Buffer,
+    type_expr: *const ast.TypeExpr,
+    interner: *const ast.StringInterner,
+    graph: *const scope.ScopeGraph,
+) void {
+    if (sourceSlice(type_expr.getMeta(), graph)) |text| {
+        buf.str(text);
+        return;
+    }
+
+    switch (type_expr.*) {
+        .name => |name_expr| {
+            buf.str(interner.get(name_expr.name));
+            appendReflectionTypeArgs(buf, name_expr.args, interner, graph);
+        },
+        .variable => |variable| buf.str(interner.get(variable.name)),
+        .list => |list| {
+            buf.char('[');
+            appendReflectionTypeExpr(buf, list.element, interner, graph);
+            buf.char(']');
+        },
+        .tuple => |tuple| {
+            buf.char('{');
+            for (tuple.elements, 0..) |element, index| {
+                if (index > 0) buf.str(", ");
+                appendReflectionTypeExpr(buf, element, interner, graph);
+            }
+            buf.char('}');
+        },
+        .map => |map| {
+            buf.str("%{");
+            for (map.fields, 0..) |field, index| {
+                if (index > 0) buf.str(", ");
+                appendReflectionTypeExpr(buf, field.key, interner, graph);
+                buf.str(" => ");
+                appendReflectionTypeExpr(buf, field.value, interner, graph);
+            }
+            buf.char('}');
+        },
+        .struct_type => |struct_type| {
+            buf.char('%');
+            signature.appendStructName(buf, struct_type.struct_name, interner);
+            buf.char('{');
+            for (struct_type.fields, 0..) |field, index| {
+                if (index > 0) buf.str(", ");
+                buf.str(interner.get(field.name));
+                buf.str(" :: ");
+                appendReflectionTypeExpr(buf, field.type_expr, interner, graph);
+            }
+            buf.char('}');
+        },
+        .union_type => |union_type| {
+            for (union_type.members, 0..) |member, index| {
+                if (index > 0) buf.str(" | ");
+                appendReflectionTypeExpr(buf, member, interner, graph);
+            }
+        },
+        .function => |function_type| {
+            buf.char('(');
+            for (function_type.params, 0..) |param, index| {
+                if (index > 0) buf.str(", ");
+                appendReflectionTypeExpr(buf, param, interner, graph);
+            }
+            buf.str(") -> ");
+            appendReflectionTypeExpr(buf, function_type.return_type, interner, graph);
+        },
+        .literal => |literal| appendReflectionTypeLiteral(buf, literal.value, interner),
+        .never => buf.str("Never"),
+        .paren => |paren| {
+            buf.char('(');
+            appendReflectionTypeExpr(buf, paren.inner, interner, graph);
+            buf.char(')');
+        },
+    }
+}
+
+fn appendReflectionTypeArgs(
+    buf: *signature.Buffer,
+    args: []const *const ast.TypeExpr,
+    interner: *const ast.StringInterner,
+    graph: *const scope.ScopeGraph,
+) void {
+    if (args.len == 0) return;
+    buf.char('(');
+    for (args, 0..) |arg, index| {
+        if (index > 0) buf.str(", ");
+        appendReflectionTypeExpr(buf, arg, interner, graph);
+    }
+    buf.char(')');
+}
+
+fn appendReflectionTypeLiteral(
+    buf: *signature.Buffer,
+    value: ast.TypeLiteralExpr.LiteralValue,
+    interner: *const ast.StringInterner,
+) void {
+    switch (value) {
+        .int => |int_value| buf.fmt("{d}", .{int_value}),
+        .string => |string_id| appendReflectionStringLiteral(buf, interner.get(string_id)),
+        .bool_val => |bool_value| buf.str(if (bool_value) "true" else "false"),
+        .nil => buf.str("nil"),
+    }
+}
+
+fn appendReflectionStringLiteral(buf: *signature.Buffer, value: []const u8) void {
+    buf.char('"');
+    for (value) |c| {
+        switch (c) {
+            '\\' => buf.str("\\\\"),
+            '"' => buf.str("\\\""),
+            '\n' => buf.str("\\n"),
+            '\r' => buf.str("\\r"),
+            '\t' => buf.str("\\t"),
+            else => buf.char(c),
+        }
+    }
+    buf.char('"');
+}
+
+fn sourceSlice(meta: ast.NodeMeta, graph: *const scope.ScopeGraph) ?[]const u8 {
+    const source_id = meta.span.source_id orelse return null;
+    const source = graph.sourceContentById(source_id);
+    if (source.len == 0) return null;
+    if (meta.span.start >= meta.span.end) return null;
+    if (meta.span.end > source.len) return null;
+    return std.mem.trim(u8, source[meta.span.start..meta.span.end], " \t\r\n");
+}
+
+/// Extract a documentation attribute from a declaration. `preferred_name`
+/// selects the modern docs attribute (`structdoc` for type pages, `fndoc` for
+/// functions and macros); legacy `doc` remains a fallback for existing code.
+/// The string is heredoc-stripped (common leading whitespace removed) so
+/// multi-line docs round-trip cleanly into runtime literal strings.
 fn extractDocAttributeText(
     alloc: Allocator,
     interner: *ast.StringInterner,
     attributes: std.ArrayListUnmanaged(scope.Attribute),
+    preferred_name: []const u8,
+) ?[]const u8 {
+    if (extractNamedDocAttributeText(alloc, interner, attributes, preferred_name)) |text| {
+        return text;
+    }
+    if (!std.mem.eql(u8, preferred_name, "doc")) {
+        return extractNamedDocAttributeText(alloc, interner, attributes, "doc");
+    }
+    return null;
+}
+
+fn extractNamedDocAttributeText(
+    alloc: Allocator,
+    interner: *ast.StringInterner,
+    attributes: std.ArrayListUnmanaged(scope.Attribute),
+    wanted_name: []const u8,
 ) ?[]const u8 {
     for (attributes.items) |attr| {
         const name = interner.get(attr.name);
-        if (!std.mem.eql(u8, name, "doc")) continue;
+        if (!std.mem.eql(u8, name, wanted_name)) continue;
+        const expr = attr.value orelse return null;
+        if (expr.* != .string_literal) return null;
+        const raw = interner.get(expr.string_literal.value);
+        return stripHeredocCommonIndent(alloc, raw);
+    }
+    return null;
+}
+
+fn extractStructDocAttributeText(
+    alloc: Allocator,
+    interner: *ast.StringInterner,
+    items: []const ast.StructItem,
+    attributes: std.ArrayListUnmanaged(scope.Attribute),
+) ?[]const u8 {
+    if (extractStructBodyDocAttributeText(alloc, interner, items)) |text| {
+        return text;
+    }
+    return extractDocAttributeText(alloc, interner, attributes, "structdoc");
+}
+
+fn extractStructBodyDocAttributeText(
+    alloc: Allocator,
+    interner: *ast.StringInterner,
+    items: []const ast.StructItem,
+) ?[]const u8 {
+    for (items) |item| {
+        const attr = switch (item) {
+            .attribute => |attribute| attribute,
+            else => continue,
+        };
+        const name = interner.get(attr.name);
+        if (!std.mem.eql(u8, name, "structdoc")) continue;
         const expr = attr.value orelse return null;
         if (expr.* != .string_literal) return null;
         const raw = interner.get(expr.string_literal.value);
@@ -3012,6 +3256,96 @@ test "eval: map_get returns matching value or default" {
     const missing_result = try eval(&env, missing_call);
     try std.testing.expect(missing_result == .int);
     try std.testing.expectEqual(@as(i64, -1), missing_result.int);
+}
+
+test "docs-reflection: preferred doc attributes are reflected before legacy doc" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    const preferred_text = ast.Expr{ .string_literal = .{
+        .meta = .{ .span = .{ .start = 0, .end = 0 } },
+        .value = try interner.intern("Function docs."),
+    } };
+    const legacy_text = ast.Expr{ .string_literal = .{
+        .meta = .{ .span = .{ .start = 0, .end = 0 } },
+        .value = try interner.intern("Legacy docs."),
+    } };
+
+    var attributes: std.ArrayListUnmanaged(scope.Attribute) = .empty;
+    defer attributes.deinit(std.testing.allocator);
+    try attributes.append(std.testing.allocator, .{
+        .name = try interner.intern("doc"),
+        .value = &legacy_text,
+    });
+    try attributes.append(std.testing.allocator, .{
+        .name = try interner.intern("fndoc"),
+        .value = &preferred_text,
+    });
+
+    const text = extractDocAttributeText(std.testing.allocator, &interner, attributes, "fndoc") orelse "";
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Function docs.", text);
+}
+
+test "docs-reflection: structdoc inside a struct body is reflected as type docs" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    const doc_expr = ast.Expr{ .string_literal = .{
+        .meta = .{ .span = .{ .start = 0, .end = 0 } },
+        .value = try interner.intern("Struct docs."),
+    } };
+    const attr_decl = ast.AttributeDecl{
+        .meta = .{ .span = .{ .start = 0, .end = 0 } },
+        .name = try interner.intern("structdoc"),
+        .value = &doc_expr,
+    };
+    const items = [_]ast.StructItem{.{ .attribute = &attr_decl }};
+    var attributes: std.ArrayListUnmanaged(scope.Attribute) = .empty;
+    defer attributes.deinit(std.testing.allocator);
+
+    const text = extractStructDocAttributeText(std.testing.allocator, &interner, &items, attributes) orelse "";
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Struct docs.", text);
+}
+
+test "docs-reflection: generic type arguments are retained in signatures" {
+    const allocator = std.testing.allocator;
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+    var graph = scope.ScopeGraph.init(allocator);
+    defer graph.deinit();
+
+    const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+    const type_parameter = ast.TypeExpr{ .variable = .{
+        .meta = meta,
+        .name = try interner.intern("t"),
+    } };
+    const list_type_args = [_]*const ast.TypeExpr{&type_parameter};
+    const list_type = ast.TypeExpr{ .name = .{
+        .meta = meta,
+        .name = try interner.intern("List"),
+        .args = &list_type_args,
+    } };
+    const pattern = ast.Pattern{ .bind = .{
+        .meta = meta,
+        .name = try interner.intern("list"),
+    } };
+    const params = [_]ast.Param{.{
+        .meta = meta,
+        .pattern = &pattern,
+        .type_annotation = &list_type,
+    }};
+    const clause = ast.FunctionClause{
+        .meta = meta,
+        .params = &params,
+        .return_type = &list_type,
+        .refinement = null,
+    };
+
+    const rendered = buildReflectionClauseSignature(allocator, "identity", clause, &interner, &graph);
+    defer allocator.free(rendered);
+    try std.testing.expectEqualStrings("identity(list :: List(t)) -> List(t)", rendered);
 }
 
 test "source path filters treat leading dot slash as equivalent" {

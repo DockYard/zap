@@ -9,6 +9,54 @@ approval_mode = "approve"
 [mcp_servers.cog.tools.code_explore]
 approval_mode = "approve"
 
+[mcp_servers.cog.tools.debug_launch]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_breakpoint]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_capabilities]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_run]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_poll_events]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_stacktrace]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_inspect]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_restart]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_breakpoint_locations]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_stop]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_threads]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_attach]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_exception_info]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_sessions]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_registers]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_modules]
+approval_mode = "approve"
+
 [agents.cog-code-query]
 description = "Explore code structure using the Cog SCIP index"
 developer_instructions = """

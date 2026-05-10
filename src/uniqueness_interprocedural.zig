@@ -1,38 +1,38 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
-const v8_uniqueness = @import("v8_uniqueness.zig");
+const uniqueness = @import("uniqueness.zig");
 
 // ============================================================
-// V8 Interprocedural — whole-program uniqueness fixpoint.
+// uniqueness Interprocedural — whole-program uniqueness fixpoint.
 //
 // Pipeline placement (per docs/dense-map-implementation-plan.md §1.5
-// extended for interprocedural V8):
+// extended for interprocedural uniqueness):
 //
 //     ... → arc_liveness                        (last-use side table)
 //          → arc_param_convention               (.borrowed → .owned)
 //             → arc_ownership.rewriteOwnedConsumeBuiltinSites
 //                → arc_ownership.classifyAndNormalize
 //                   → arc_ownership.rewriteOwnedConsumeSites
-//                      → v8_interprocedural     (THIS PASS — produces
+//                      → uniqueness_interprocedural     (THIS PASS — produces
 //                                                per-callee per-param
 //                                                "unique-on-entry" map)
-//                         → v8_uniqueness       (per-function, consults
+//                         → uniqueness       (per-function, consults
 //                                                this pass's result on
 //                                                `param_get`)
-//                            → arc_ownership.rewriteUncheckedV8Sites
+//                            → arc_ownership.rewriteUncheckedUniquenessSites
 //                               → arc_verifier
 //                                  → ...
 //
 // Why this pass exists:
 //
-// The intraprocedural V8 in `v8_uniqueness.zig` is conservative on
+// The intraprocedural uniqueness in `uniqueness.zig` is conservative on
 // `param_get`: it cannot know whether the caller transferred a unique
 // value, so it treats every parameter as potentially shared. The
 // codegen agent's report identified this as the limiting factor for
 // fannkuch-redux and k-nucleotide: their hot loops are accumulator-
 // recursion patterns where the receiver is passed as a parameter
-// through tail-recursive calls. Intraprocedural V8 stops at the
+// through tail-recursive calls. Intraprocedural uniqueness stops at the
 // callee's `param_get`, so the unchecked rewrite never fires.
 //
 // Lean 4 / Koka / Roc all close this gap with an interprocedural
@@ -53,7 +53,7 @@ const v8_uniqueness = @import("v8_uniqueness.zig");
 //   3. For each call site `f(a0, a1, ..., aN)` inside some caller C,
 //      slot i of f is unique-on-entry only if `ai` is provably unique
 //      AT THE CALL SITE in C. "Provably unique at call site" is
-//      computed by running the intraprocedural V8 forward dataflow on
+//      computed by running the intraprocedural uniqueness forward dataflow on
 //      C, where `param_get` for any of C's slots consults the CURRENT
 //      fixpoint state for C — i.e., the analysis is parameterised on
 //      the fixpoint result.
@@ -84,8 +84,8 @@ const v8_uniqueness = @import("v8_uniqueness.zig");
 // every slot marked `false` had at least one call site where the
 // argument's uniqueness could not be proven.
 //
-// The verifier (`arc_verifier.runV8`) is the safety net: it re-runs
-// the per-function V8 with the fixpoint result and rejects any
+// The verifier (`arc_verifier.runUniquenessCheck`) is the safety net: it re-runs
+// the per-function uniqueness with the fixpoint result and rejects any
 // `*_owned_unchecked` site whose receiver isn't proven unique. A wrong
 // `true` here would surface as an `error.ArcInvariantViolation` at
 // build time, not as runtime undefined behaviour.
@@ -148,7 +148,7 @@ pub const ProgramUniqueness = struct {
     }
 };
 
-/// Run the interprocedural V8 fixpoint across `program`. Returns a
+/// Run the interprocedural uniqueness fixpoint across `program`. Returns a
 /// per-function per-slot `unique_on_entry` map. Caller owns the
 /// returned struct and must call `deinit`.
 ///
@@ -159,14 +159,14 @@ pub const ProgramUniqueness = struct {
 ///   2. Worklist seeded with every function.
 ///   3. While worklist non-empty:
 ///      - Pop function F.
-///      - Run intraprocedural V8 on F, parameterised by the CURRENT
+///      - Run intraprocedural uniqueness on F, parameterised by the CURRENT
 ///        fixpoint state (so `param_get` of slot i of F is treated as
 ///        unique iff `unique_on_entry[F][i] == true`). The analysis
 ///        produces per-call-site uniqueness for owned-mutating sites
 ///        AND per-arg uniqueness for any callee-bound arguments.
 ///      - For each call site in F that targets a known function G:
 ///          For each arg slot j in G that has `unique_on_entry[G][j] == true`:
-///            If F's intraprocedural V8 says the arg is NOT unique at
+///            If F's intraprocedural uniqueness says the arg is NOT unique at
 ///            this call site, demote `unique_on_entry[G][j] = false`
 ///            and enqueue every caller of G.
 ///   4. Return when worklist drains.
@@ -215,10 +215,10 @@ pub fn analyzeProgram(
     // Step 3: build reverse caller map. When slot j of function G
     // demotes, we need to re-process every caller of G — not because
     // their slots demote directly (callers are independent of G's
-    // signature), but because their intraprocedural V8 result for the
+    // signature), but because their intraprocedural uniqueness result for the
     // call site at G might change, which can cascade to OTHER callees.
     //
-    // Conceptually: re-running F's intraprocedural V8 after a callee's
+    // Conceptually: re-running F's intraprocedural uniqueness after a callee's
     // signature changes can change F's per-call-site uniqueness, which
     // can in turn change demotions on F's other callees.
     var callers_of: std.AutoHashMapUnmanaged(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)) = .empty;
@@ -258,7 +258,7 @@ pub fn analyzeProgram(
         _ = in_worklist.remove(func_id);
         const caller = lookupFunction(program, func_id) orelse continue;
 
-        // Run intraprocedural V8 on `caller`, parameterised by the
+        // Run intraprocedural uniqueness on `caller`, parameterised by the
         // current fixpoint state. This produces a call-site→bool map
         // AND, via the extended interface, an arg-level uniqueness
         // query at every call site.
@@ -301,8 +301,8 @@ fn lookupFunction(program: *const ir.Program, function_id: ir.FunctionId) ?*cons
     return null;
 }
 
-/// Per-function intraprocedural V8 parameterised by the fixpoint
-/// state. Re-implements the dataflow walk from `v8_uniqueness.zig`
+/// Per-function intraprocedural uniqueness parameterised by the fixpoint
+/// state. Re-implements the dataflow walk from `uniqueness.zig`
 /// but with an extended interface:
 ///
 ///   - On `param_get`: if the fixpoint says the slot is unique-on-
@@ -318,8 +318,8 @@ fn lookupFunction(program: *const ir.Program, function_id: ir.FunctionId) ?*cons
 /// a slice of `bool` matching the call's `args.len`. Each entry is
 /// `true` iff that arg is provably unique at the call site.
 pub const FunctionUniqueness = struct {
-    /// Per-call-site receiver uniqueness, mirroring the existing V8
-    /// `Uniqueness.sites` field. A `true` value means V8 holds for the
+    /// Per-call-site receiver uniqueness, mirroring the existing uniqueness
+    /// `Uniqueness.sites` field. A `true` value means uniqueness holds for the
     /// owned-mutating call's receiver.
     sites: std.AutoHashMapUnmanaged(arc_liveness.InstructionId, bool) = .empty,
 
@@ -694,6 +694,7 @@ const ParameterizedAnalyzer = struct {
                 _ = self.unique.remove(sv.dest);
             },
             .copy_value => |cv| {
+                _ = self.unique.remove(cv.source);
                 _ = self.unique.remove(cv.dest);
             },
             .borrow_value => |bv| {
@@ -791,7 +792,7 @@ const ParameterizedAnalyzer = struct {
             try self.unique.put(self.allocator, dest, {});
             return;
         }
-        if (v8_uniqueness.functionIsFreshAllocatorWrapper(function)) {
+        if (uniqueness.functionIsFreshAllocatorWrapper(function)) {
             try self.unique.put(self.allocator, dest, {});
             return;
         }
@@ -801,7 +802,7 @@ const ParameterizedAnalyzer = struct {
     fn calleeIsFreshAllocatorWrapper(self: *const ParameterizedAnalyzer, name: []const u8) bool {
         for (self.program.functions) |*func| {
             if (std.mem.eql(u8, func.name, name)) {
-                return v8_uniqueness.functionIsFreshAllocatorWrapper(func);
+                return uniqueness.functionIsFreshAllocatorWrapper(func);
             }
         }
         return false;
@@ -1041,7 +1042,7 @@ const DemotionWalker = struct {
     ) error{OutOfMemory}!void {
         const list = self.callers_of.get(callee_id) orelse return;
         for (list.items) |caller_id| {
-            // Re-enqueue the caller so its intraprocedural V8 is
+            // Re-enqueue the caller so its intraprocedural uniqueness is
             // recomputed under the demoted state. The callee itself is
             // also enqueued so subsequent demotions cascade.
             if (!self.in_worklist.contains(caller_id)) {
@@ -1124,7 +1125,7 @@ fn buildFunction(
     };
 }
 
-test "v8_interprocedural: empty program produces empty fixpoint" {
+test "uniqueness_interprocedural: empty program produces empty fixpoint" {
     var p = TestProgram.init(testing.allocator);
     defer p.deinit();
 
@@ -1134,7 +1135,7 @@ test "v8_interprocedural: empty program produces empty fixpoint" {
     try testing.expect(u.by_function.count() == 0);
 }
 
-test "v8_interprocedural: function with no .owned params has all-false slots" {
+test "uniqueness_interprocedural: function with no .owned params has all-false slots" {
     var p = TestProgram.init(testing.allocator);
     defer p.deinit();
     const arena = p.allocator();
@@ -1162,10 +1163,10 @@ test "v8_interprocedural: function with no .owned params has all-false slots" {
     try testing.expect(!slots[1]);
 }
 
-test "v8_interprocedural: leaf function with .owned param starts unique-on-entry" {
+test "uniqueness_interprocedural: leaf function with .owned param starts unique-on-entry" {
     // A leaf function (no callers visible in the program) with an
     // `.owned` param is OPTIMISTICALLY assumed unique-on-entry. The
-    // assumption is sound because the verifier (`runV8`) catches any
+    // assumption is sound because the verifier (`runUniquenessCheck`) catches any
     // erroneous unchecked rewrite if the caller is outside the
     // visible program (it isn't, in this test).
     var p = TestProgram.init(testing.allocator);
@@ -1197,7 +1198,7 @@ test "v8_interprocedural: leaf function with .owned param starts unique-on-entry
     try testing.expect(slots[0]); // optimistic — proven unique
 }
 
-test "v8_interprocedural: caller passes fresh map -> wrapper's param is unique-on-entry" {
+test "uniqueness_interprocedural: caller passes fresh map -> wrapper's param is unique-on-entry" {
     // Caller body:
     //   [0] map_init %0
     //   [1] move_value %1 <- %0
@@ -1287,7 +1288,7 @@ test "v8_interprocedural: caller passes fresh map -> wrapper's param is unique-o
     try testing.expect(u.isUniqueOnEntry(0, 0));
 }
 
-test "v8_interprocedural: parked-then-passed caller demotes wrapper's slot" {
+test "uniqueness_interprocedural: parked-then-passed caller demotes wrapper's slot" {
     // Caller body:
     //   [0] map_init %0
     //   [1] const_nil %1
@@ -1372,7 +1373,90 @@ test "v8_interprocedural: parked-then-passed caller demotes wrapper's slot" {
     try testing.expect(!u.isUniqueOnEntry(0, 0));
 }
 
-test "v8_interprocedural: tail-recursive accumulator stays unique-on-entry" {
+test "uniqueness_interprocedural: copy-then-passed caller demotes wrapper's slot" {
+    // Caller body:
+    //   [0] map_init %0
+    //   [1] copy_value %1 <- %0        -- retains an alias of %0
+    //   [2] move_value %2 <- %0        -- source is no longer unique
+    //   [3] call_named "wrapper" args=[%2] dest=%3
+    //
+    // Expected: wrapper's slot 0 demoted to false because a copied
+    // value increments the source's runtime refcount before the call.
+    var p = TestProgram.init(testing.allocator);
+    defer p.deinit();
+    const arena = p.allocator();
+
+    const wrapper_conventions = [_]ir.ParamConvention{.owned};
+    const put_args = try arena.alloc(ir.LocalId, 3);
+    put_args[0] = 1;
+    put_args[1] = 2;
+    put_args[2] = 3;
+    const put_modes = try arena.alloc(ir.ValueMode, 3);
+    put_modes[0] = .move;
+    put_modes[1] = .borrow;
+    put_modes[2] = .borrow;
+    const wrapper_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .move_value = .{ .dest = 1, .source = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .const_int = .{ .dest = 3, .value = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put",
+            .args = put_args,
+            .arg_modes = put_modes,
+        } },
+        .{ .ret = .{ .value = 4 } },
+    };
+    const wrapper = try buildFunction(
+        arena,
+        0,
+        "wrapper",
+        &wrapper_instrs,
+        5,
+        &wrapper_conventions,
+        .owned,
+    );
+
+    const call_args = try arena.alloc(ir.LocalId, 1);
+    call_args[0] = 2;
+    const call_modes = try arena.alloc(ir.ValueMode, 1);
+    call_modes[0] = .move;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .copy_value = .{ .dest = 1, .source = 0 } },
+        .{ .move_value = .{ .dest = 2, .source = 0 } },
+        .{ .call_named = .{
+            .dest = 3,
+            .name = "wrapper",
+            .args = call_args,
+            .arg_modes = call_modes,
+        } },
+        .{ .ret = .{ .value = 3 } },
+    };
+    const caller_conventions = [_]ir.ParamConvention{};
+    const caller = try buildFunction(
+        arena,
+        1,
+        "caller",
+        &caller_instrs,
+        4,
+        &caller_conventions,
+        .owned,
+    );
+
+    const funcs = try arena.alloc(ir.Function, 2);
+    funcs[0] = wrapper;
+    funcs[1] = caller;
+    p.program.functions = funcs;
+
+    var u = try analyzeProgram(testing.allocator, &p.program);
+    defer u.deinit(testing.allocator);
+
+    try testing.expect(!u.isUniqueOnEntry(0, 0));
+}
+
+test "uniqueness_interprocedural: tail-recursive accumulator stays unique-on-entry" {
     // Pattern: count_flips(arr, ...). The function calls itself
     // recursively, passing the result of an owned-mutating call as
     // the receiver. After Phase 4's move-on-last-use rewrite, the
@@ -1441,7 +1525,7 @@ test "v8_interprocedural: tail-recursive accumulator stays unique-on-entry" {
     try testing.expect(u.isUniqueOnEntry(0, 0));
 }
 
-test "v8_interprocedural: mixed callers — one shared, slot demotes" {
+test "uniqueness_interprocedural: mixed callers — one shared, slot demotes" {
     // wrapper has slot 0 .owned. Two callers:
     //   caller_unique: passes a fresh map (unique).
     //   caller_shared: parks the map in a list, then passes the

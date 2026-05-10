@@ -2,9 +2,9 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
 const types_mod = @import("types.zig");
-const v8_signature = @import("v8_signature.zig");
-const v8_fixpoint = @import("v8_fixpoint.zig");
-const v8_interprocedural = @import("v8_interprocedural.zig");
+const uniqueness_signature = @import("uniqueness_signature.zig");
+const uniqueness_fixpoint = @import("uniqueness_fixpoint.zig");
+const uniqueness_interprocedural = @import("uniqueness_interprocedural.zig");
 
 // ============================================================
 // Whole-program parameter-convention inference (Phase E.9).
@@ -159,7 +159,7 @@ pub fn inferConventions(
     // Build a function-id → function-pointer index so the consume
     // check can resolve a `CallSite.enclosing_function_id` back to
     // the caller's IR body. The caller's body is needed to verify
-    // the V8 soundness check: a parameter slot that is re-fetched
+    // the uniqueness soundness check: a parameter slot that is re-fetched
     // via a later `param_get` is NOT at last-use at any earlier
     // share_value site, even if the share's specific source
     // LocalId happens to be dead afterwards.
@@ -171,12 +171,12 @@ pub fn inferConventions(
 
     // Phase 1.3 chain-consistency audit (research2.md §1.5).
     //
-    // Compute the v8_signature fixpoint over the call graph. For each
+    // Compute the uniqueness_signature fixpoint over the call graph. For each
     // function-slot pair (F, i), `lift_set` records whether the slot
     // is safe to promote BEYOND the borrowed-source veto. A slot is
     // lift-eligible iff:
     //
-    //   1. `Sig(F, i) ∈ {CU, PU}` per the v8_signature fixpoint.
+    //   1. `Sig(F, i) ∈ {CU, PU}` per the uniqueness_signature fixpoint.
     //   2. The local def-use chain at every call site to F-slot-i is
     //      consume-mode (last-use checks + chain-walk pass).
     //   3. EVERY call site's chain root, when it terminates at a
@@ -197,7 +197,7 @@ pub fn inferConventions(
     // promoting `(F, i)` to `.owned` will be matched by promoting
     // every parent slot in lockstep, so the runtime ABI invariant
     // ("if the callee owns +1, the caller owns a +1 to give") holds.
-    var signatures = try v8_fixpoint.computeSignaturesWithOwnership(allocator, program, ownerships);
+    var signatures = try uniqueness_fixpoint.computeSignaturesWithOwnership(allocator, program, ownerships);
     defer signatures.deinit(allocator);
 
     var lift_set = try computeLiftSet(
@@ -244,7 +244,6 @@ pub fn inferConventions(
             if (after > before) changed = true;
         }
     }
-
 }
 
 /// Set of `(FunctionId, slot)` pairs that have passed the chain-
@@ -293,7 +292,7 @@ fn liftSetContains(lift_set: *const LiftSet, function_id: ir.FunctionId, slot_in
 fn computeLiftSet(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
-    signatures: *const v8_signature.ProgramSignatures,
+    signatures: *const uniqueness_signature.ProgramSignatures,
     sites_by_target: *const SitesByTarget,
     ownerships: *const arc_liveness.ProgramArcOwnership,
     function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
@@ -320,27 +319,27 @@ fn computeLiftSet(
     //      observes both inter-dependent slots simultaneously in
     //      the candidate set.
     //
-    //   2. V8 pre-flight check: tentatively promote the candidate
+    //   2. uniqueness pre-flight check: tentatively promote the candidate
     //      set's slots to `.owned` in `program.functions[*].param_conventions`,
-    //      run the program-level V8 fixpoint
-    //      (`v8_interprocedural.analyzeProgram`), and prune any
+    //      run the program-level uniqueness fixpoint
+    //      (`uniqueness_interprocedural.analyzeProgram`), and prune any
     //      candidate whose slot the fixpoint demotes to non-unique.
-    //      This mirrors what `arc_verifier::runV8` will check after
+    //      This mirrors what `arc_verifier::runUniquenessCheck` will check after
     //      the rewriter fires; if a candidate's body-level dataflow
     //      destroys uniqueness (via copy_value, share_value, or any
     //      other demoting operation the audit doesn't model),
-    //      the V8 fixpoint catches it pre-emptively.
+    //      the uniqueness fixpoint catches it pre-emptively.
     //
     // Pruning a candidate may unblock OR re-block other candidates
     // (a removed candidate reduces the set used as the SCC anchor;
-    // V8 may demote different slots in the next iteration). Iterate
+    // uniqueness may demote different slots in the next iteration). Iterate
     // (1) and (2) until a fixed point: the surviving set is the
-    // V8-verifier-aligned lift_set by construction.
+    // uniqueness-verifier-aligned lift_set by construction.
     var lift_set: LiftSet = .empty;
     errdefer lift_set.deinit(allocator);
 
     // Stage 0: existing conservative monotone-up. Anything this
-    // accepts is unconditionally V8-sound (it always was — the
+    // accepts is unconditionally uniqueness-sound (it always was — the
     // conservative scheme only ever admits chains whose roots end
     // at fresh allocations or already-`.owned` parents).
     var changed = true;
@@ -369,8 +368,8 @@ fn computeLiftSet(
         }
     }
 
-    // Stage 1+2: optimistic SCC-bootstrap + V8 pre-flight pruning.
-    // Iterate the (candidate-generation, V8-prune) pair until the
+    // Stage 1+2: optimistic SCC-bootstrap + uniqueness pre-flight pruning.
+    // Iterate the (candidate-generation, uniqueness-prune) pair until the
     // surviving set is stable.
     var preflight_iter: u32 = 0;
     const max_preflight_iter: u32 = 16;
@@ -399,15 +398,15 @@ fn computeLiftSet(
         // No new candidates beyond the conservative set — done.
         if (candidates.count() == 0) break;
 
-        // V8 pre-flight: tentatively promote candidates' slots to
-        // `.owned` in `param_conventions`, run V8 program-level
+        // uniqueness pre-flight: tentatively promote candidates' slots to
+        // `.owned` in `param_conventions`, run uniqueness program-level
         // fixpoint that simulates the post-rewrite IR (share_value
         // at owned-arg sites is treated as move_value), restore
         // conventions, and intersect candidates with surviving
         // (unique-on-entry) slots.
         var survivors: LiftSet = .empty;
         defer survivors.deinit(allocator);
-        try liftSetSurvivesV8Check(allocator, program, signatures, ownerships, &candidates, &survivors);
+        try liftSetSurvivesUniquenessCheck(allocator, program, signatures, ownerships, &candidates, &survivors);
 
         // Merge survivors into the main lift_set.
         const before_count = lift_set.count();
@@ -451,7 +450,7 @@ fn seedOptimisticCandidates(
 fn pruneOptimisticCandidates(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
-    signatures: *const v8_signature.ProgramSignatures,
+    signatures: *const uniqueness_signature.ProgramSignatures,
     sites_by_target: *const SitesByTarget,
     ownerships: *const arc_liveness.ProgramArcOwnership,
     function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
@@ -516,20 +515,20 @@ fn pruneOptimisticCandidates(
     }
 }
 
-/// Phase 2.4 V8 pre-flight check.
+/// Phase 2.4 uniqueness pre-flight check.
 ///
 /// Given a candidate set of `(FunctionId, slot_index)` pairs that the
 /// chain-consistency audit has accepted (under the optimistic SCC-
-/// bootstrap), run a program-level V8 uniqueness fixpoint UNDER A
+/// bootstrap), run a program-level uniqueness fixpoint UNDER A
 /// TENTATIVE PROMOTION of those slots. Populate `survivors` with the
 /// candidates whose slots remain proven `unique_on_entry` after the
 /// fixpoint converges.
 ///
 /// This bridges the disagreement between the audit's alias-chain
-/// consistency check and the V8 verifier's full per-instruction
+/// consistency check and the uniqueness verifier's full per-instruction
 /// dataflow. The audit asks: "is the alias chain in consume mode?"
-/// The V8 verifier asks: "is the cell uniquely owned per the
-/// `v8_uniqueness` dataflow at every instruction?" The two ask
+/// The uniqueness verifier asks: "is the cell uniquely owned per the
+/// `uniqueness` dataflow at every instruction?" The two ask
 /// different questions: the audit can pass while the verifier fails
 /// because the body's intermediate operations (e.g., a `copy_value`
 /// of a binding with further uses) demote uniqueness in ways the
@@ -537,39 +536,39 @@ fn pruneOptimisticCandidates(
 ///
 /// Mechanism: temporarily flip every candidate slot's
 /// `param_conventions` entry to `.owned`. Run a tentative-rewrite-
-/// aware V8 fixpoint: this simulates the post-rewrite IR shape that
+/// aware uniqueness fixpoint: this simulates the post-rewrite IR shape that
 /// `arc_ownership.rewriteOwnedConsumeSites` would produce after
 /// promotion (each `share_value` whose dest is an `.owned` arg gets
-/// move-style semantics for the V8 dataflow). Restore conventions
+/// move-style semantics for the uniqueness dataflow). Restore conventions
 /// afterward. Candidates whose slots the fixpoint LEFT proven
-/// unique-on-entry are V8-sound and join `survivors`.
+/// unique-on-entry are uniqueness-sound and join `survivors`.
 ///
-/// Why post-rewrite simulation: the V8 verifier runs AFTER
+/// Why post-rewrite simulation: the uniqueness verifier runs AFTER
 /// `rewriteOwnedConsumeSites` in the pipeline (compiler.zig). Running
-/// the V8 dataflow on the PRE-rewrite IR would observe `share_value`
+/// the uniqueness dataflow on the PRE-rewrite IR would observe `share_value`
 /// at every call site and demote uniqueness — even at sites where the
 /// rewrite is about to turn `share_value` into `move_value`. The
 /// pre-flight has to mirror what the verifier will see, not what's
 /// in the IR right now. The simulator achieves this by pre-computing,
 /// per function, the set of `share_value` instruction ids whose dest
 /// flows into an `.owned` arg slot of a downstream call (under the
-/// tentative conventions); the V8 dataflow then applies move-style
+/// tentative conventions); the uniqueness dataflow then applies move-style
 /// semantics at those sites.
 ///
 /// SCC bootstrapping: because all candidates are tentatively promoted
 /// SIMULTANEOUSLY, mutually-recursive PU chains can be validated. The
-/// V8 fixpoint observes every inter-dependent slot at once and demotes
+/// uniqueness fixpoint observes every inter-dependent slot at once and demotes
 /// only those whose body actually destroys uniqueness — this is the
 /// stronger guarantee that the conservative monotone-up scheme cannot
 /// give for SCCs.
 ///
-/// Soundness: a candidate that V8 demotes is pruned. The post-rewrite
+/// Soundness: a candidate that uniqueness demotes is pruned. The post-rewrite
 /// verifier is a final safety net; if the pre-flight has bugs, the
 /// verifier fires hard at compile time (never miscompilation).
-fn liftSetSurvivesV8Check(
+fn liftSetSurvivesUniquenessCheck(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
-    signatures: *const v8_signature.ProgramSignatures,
+    signatures: *const uniqueness_signature.ProgramSignatures,
     ownerships: *const arc_liveness.ProgramArcOwnership,
     candidates: *const LiftSet,
     survivors: *LiftSet,
@@ -613,46 +612,17 @@ fn liftSetSurvivesV8Check(
         }
     }
 
-    // Run program-level V8 fixpoint under the tentative state, with
+    // Run program-level uniqueness fixpoint under the tentative state, with
     // post-rewrite simulation of share_value→move_value conversion at
-    // owned-arg sites. Phase 2.6.2 — `signatures` and `ownerships`
-    // are threaded through to `TentativeAnalyzer` so it can mirror
-    // `v8_uniqueness.Analyzer`'s `tuple_pending` propagation.
-    //
-    // Phase 2.6.2 is currently DISABLED in production. Enabling
-    // tuple_pending propagation in the TentativeAnalyzer admits SCC
-    // candidates that depend on destructure-then-owned-mutating-call
-    // shapes (e.g. fannkuch's `main_loop` ↔ `count_flips` /
-    // `advance_perm` SCC). When those candidates promote to `.owned`,
-    // the post-rewrite IR runs `*_owned_unchecked` against cells
-    // still referenced by the parent tuple's slot — crashing the
-    // runtime with "Vector.get: index out of bounds" at fannkuch
-    // n>=5. Fixing this requires Phase 2.6.3
-    // (`insertTupleComponentReleases`) to fire reliably across all
-    // post-rewrite IR shapes, which has its own architectural
-    // blocker: `arc_ownership.classifyAndNormalize` reclassifies the
-    // destructured local out of `.owned` after Phase 2.6.2 promotes,
-    // breaking Phase 2.6.3's collector. Out of scope for the
-    // current commit; see the Phase 2.6 deferred-work list in the
-    // agent report. The unit test
-    // `arc_param_convention: TentativeAnalyzer tuple_pending
-    // preserves witness through tuple_init+ret (Phase 2.6.2)` covers
-    // the synthesis path — it relies on
-    // `analyzeProgramTentative`'s args being threaded through.
-    //
-    // Set ZAP_ENABLE_PHASE_2_6_2=1 to reactivate the new behaviour
-    // for diagnostic runs; do NOT use in production builds.
-    const phase_2_6_2_enabled = std.c.getenv("ZAP_ENABLE_PHASE_2_6_2") != null;
-    var empty_signatures = v8_signature.ProgramSignatures.init(allocator);
-    defer empty_signatures.deinit(allocator);
-    var empty_ownerships = arc_liveness.ProgramArcOwnership.init(allocator);
-    defer empty_ownerships.deinit();
-    const effective_signatures: *const v8_signature.ProgramSignatures = if (phase_2_6_2_enabled) signatures else &empty_signatures;
-    const effective_ownerships: *const arc_liveness.ProgramArcOwnership = if (phase_2_6_2_enabled) ownerships else &empty_ownerships;
-    var uniqueness = try analyzeProgramTentative(allocator, program, effective_signatures, effective_ownerships);
+    // owned-arg sites. `signatures` and `ownerships` are threaded
+    // through to `TentativeAnalyzer` so it mirrors
+    // `uniqueness.Analyzer`'s tuple_pending propagation, including
+    // Phase 2.7 last-use entries for non-ARC aggregates that hold
+    // ARC-managed components.
+    var uniqueness = try analyzeProgramTentative(allocator, program, signatures, ownerships);
     defer uniqueness.deinit(allocator);
 
-    // Filter candidates by V8 fixpoint result.
+    // Filter candidates by uniqueness fixpoint result.
     var ci = candidates.iterator();
     while (ci.next()) |entry| {
         const key = entry.key_ptr.*;
@@ -665,7 +635,7 @@ fn liftSetSurvivesV8Check(
 }
 
 /// Per-function set of `share_value` InstructionIds that should be
-/// treated as `move_value` by the V8 dataflow during the pre-flight
+/// treated as `move_value` by the uniqueness dataflow during the pre-flight
 /// simulation. Computed once per function from the tentative
 /// `param_conventions` state. The set captures every share_value
 /// whose dest is the arg-local at an `.owned` arg slot of a
@@ -675,9 +645,9 @@ fn liftSetSurvivesV8Check(
 const RewrittenShareSet = struct {
     /// Keyed by (function_id, instruction_id) packed into u64. The
     /// instruction_id is in the same depth-first id space that
-    /// `v8_uniqueness.Analyzer` and `arc_liveness.assignInstructionIds`
+    /// `uniqueness.Analyzer` and `arc_liveness.assignInstructionIds`
     /// agree on. Membership means "rewrite this share_value to
-    /// move_value during the V8 dataflow walk".
+    /// move_value during the uniqueness dataflow walk".
     set: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
     fn deinit(self: *RewrittenShareSet, allocator: std.mem.Allocator) void {
@@ -833,19 +803,18 @@ const ShareSetWalker = struct {
                 // Builtin owned-mutating sites: arc_ownership's
                 // rewriteOwnedConsumeBuiltinSites turns share_value
                 // into move_value when arc_liveness's
-                // ownedMutatingBuiltinSlot matches AND the source is
-                // at last-use. For pre-flight purposes, recognise
-                // those slots so the V8 dataflow propagates
+                // builtinArgCanMoveAtLastUse matches AND the source
+                // is at last-use. For pre-flight purposes, recognise
+                // those slots so the uniqueness dataflow propagates
                 // uniqueness through the share.
-                if (arc_liveness.ownedMutatingBuiltinSlot(cb.name)) |slot| {
-                    if (slot < cb.args.len) {
-                        if (share_dest_to_id.get(cb.args[slot])) |share_id| {
-                            try self.result.set.put(
-                                self.allocator,
-                                RewrittenShareSet.key(self.function_id, share_id),
-                                {},
-                            );
-                        }
+                for (cb.args, 0..) |arg, slot| {
+                    if (!arc_liveness.builtinArgCanMoveAtLastUse(cb.name, slot)) continue;
+                    if (share_dest_to_id.get(arg)) |share_id| {
+                        try self.result.set.put(
+                            self.allocator,
+                            RewrittenShareSet.key(self.function_id, share_id),
+                            {},
+                        );
                     }
                 }
             },
@@ -878,15 +847,15 @@ const ShareSetWalker = struct {
     }
 };
 
-/// Tentative-rewrite-aware program-level V8 fixpoint. Mirrors
-/// `v8_interprocedural.analyzeProgram` but uses
+/// Tentative-rewrite-aware program-level uniqueness fixpoint. Mirrors
+/// `uniqueness_interprocedural.analyzeProgram` but uses
 /// `analyzeFunctionTentative` (a custom intraprocedural pass that
 /// applies move-style semantics to share_value sites in a
 /// `RewrittenShareSet`).
 ///
 /// Phase 2.6.2 — `signatures` and `ownerships` are threaded through
 /// to `TentativeAnalyzer` so it can mirror
-/// `v8_uniqueness.Analyzer`'s `tuple_pending` propagation. The
+/// `uniqueness.Analyzer`'s `tuple_pending` propagation. The
 /// per-function `ArcOwnership` is looked up by id at each function
 /// dispatch and passed to `analyzeFunctionTentative`; `null` is
 /// permitted (the analyzer falls back to the legacy intraprocedural
@@ -894,14 +863,14 @@ const ShareSetWalker = struct {
 fn analyzeProgramTentative(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
-    signatures: *const v8_signature.ProgramSignatures,
+    signatures: *const uniqueness_signature.ProgramSignatures,
     ownerships: *const arc_liveness.ProgramArcOwnership,
-) !v8_interprocedural.ProgramUniqueness {
-    var result: v8_interprocedural.ProgramUniqueness = .{};
+) !uniqueness_interprocedural.ProgramUniqueness {
+    var result: uniqueness_interprocedural.ProgramUniqueness = .{};
     errdefer result.deinit(allocator);
 
     // Pre-compute the set of share_values that should be treated as
-    // move_values by the V8 dataflow under the current (tentative)
+    // move_values by the uniqueness dataflow under the current (tentative)
     // conventions.
     var rewritten = try computeRewrittenShareSet(allocator, program);
     defer rewritten.deinit(allocator);
@@ -1101,7 +1070,7 @@ fn recordTentativeEdge(
 }
 
 /// Per-call-site receiver and per-arg uniqueness, mirroring
-/// `v8_interprocedural.FunctionUniqueness` but produced by the
+/// `uniqueness_interprocedural.FunctionUniqueness` but produced by the
 /// tentative-rewrite-aware analyzer.
 const TentativeFunctionUniqueness = struct {
     sites: std.AutoHashMapUnmanaged(arc_liveness.InstructionId, bool) = .empty,
@@ -1122,52 +1091,38 @@ const TentativeFunctionUniqueness = struct {
     }
 };
 
-/// Tentative-rewrite-aware intraprocedural V8 dataflow. Mirrors
-/// `v8_interprocedural.ParameterizedAnalyzer` but adds a
+/// Tentative-rewrite-aware intraprocedural uniqueness dataflow. Mirrors
+/// `uniqueness_interprocedural.ParameterizedAnalyzer` but adds a
 /// `RewrittenShareSet` that adjusts the `share_value` effect: when
 /// the share is in the rewritten set, applies move-value semantics
 /// (transfer uniqueness from source to dest) instead of clearing
 /// both.
 ///
 /// Phase 2.6.2 — accepts `signatures` and `ownership` to mirror
-/// `v8_uniqueness.analyzeUniquenessFull`'s tuple_pending tracking.
+/// `uniqueness.analyzeUniquenessFull`'s tuple_pending tracking.
 /// Without these, the analyzer falls back to the legacy
 /// intraprocedural behaviour: no per-component witness propagation
 /// on call dests, no destructure-promotion-at-last-use. With them,
 /// SCC candidates whose chain crosses a tuple-returning callee
-/// followed by a destructure are admitted under the V8 pre-flight
+/// followed by a destructure are admitted under the uniqueness pre-flight
 /// — exactly the fannkuch `main_loop` ↔ `count_flips` /
 /// `advance_perm` shape.
 ///
-/// Phase 2.6.2 architectural fix: `arc_liveness.ArcOwnership` only
-/// records last-use for ARC-managed locals; non-ARC aggregates
-/// (`{VectorI64, i64}` tuples, plain structs) holding ARC-managed
-/// components are NOT in `arc_managed_locals`, so
-/// `ownership.isLastUseAt(aggregate_local, id)` always returns
-/// false for them. This blocks `promoteExtractedAt` from ever
-/// firing on the fannkuch `main_loop` destructure idiom (where the
-/// parent tuple is non-ARC but its components are `VectorI64`).
-/// To work around this, the analyzer pre-computes a per-function
-/// last-use map for non-ARC aggregates with ARC-managed
-/// extractions and consults that map alongside (or instead of)
-/// `ownership.isLastUseAt`.
+/// Phase 2.7 extends `arc_liveness.ArcOwnership` so
+/// `ownership.isLastUseAt(aggregate_local, id)` also answers for
+/// non-ARC aggregates that hold ARC-managed components. That keeps
+/// the tentative uniqueness analyzer on the same last-use source of truth as
+/// production uniqueness and avoids a second aggregate-specific liveness map
+/// in this pass.
 fn analyzeFunctionTentative(
     allocator: std.mem.Allocator,
     function: *const ir.Function,
     program: *const ir.Program,
-    fixpoint: *const v8_interprocedural.ProgramUniqueness,
+    fixpoint: *const uniqueness_interprocedural.ProgramUniqueness,
     rewritten: *const RewrittenShareSet,
-    signatures: *const v8_signature.ProgramSignatures,
+    signatures: *const uniqueness_signature.ProgramSignatures,
     ownership: ?*const arc_liveness.ArcOwnership,
 ) !TentativeFunctionUniqueness {
-    // Phase 2.6.2 — compute the non-ARC aggregate last-use map
-    // before the main walk. The map is keyed by (LocalId →
-    // InstructionId) and records the last instruction id where the
-    // aggregate is read (its "last use" in the linear stream sense).
-    var non_arc_last_use: std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId) = .empty;
-    defer non_arc_last_use.deinit(allocator);
-    try computeNonArcAggregateLastUse(allocator, function, &non_arc_last_use);
-
     var analyzer = TentativeAnalyzer{
         .allocator = allocator,
         .function = function,
@@ -1176,7 +1131,6 @@ fn analyzeFunctionTentative(
         .rewritten = rewritten,
         .signatures = signatures,
         .ownership = ownership,
-        .non_arc_last_use = &non_arc_last_use,
         .unique = .empty,
         .tuple_pending = .empty,
         .extracted = .empty,
@@ -1196,278 +1150,8 @@ fn analyzeFunctionTentative(
     return analyzer.result;
 }
 
-/// Phase 2.6.2 — populate a per-function map of (non-ARC aggregate
-/// LocalId → last-use InstructionId). The map is consulted by
-/// `TentativeAnalyzer.promoteExtractedAt` when
-/// `ownership.isLastUseAt` returns false (ARC-managed last-use info
-/// is unavailable for non-ARC aggregate locals because
-/// `arc_liveness.identifyArcLocals` excludes them from
-/// `arc_managed_locals`). The result is keyed by every local that
-/// `tuple_pending` tracking might install a pending entry on, so
-/// the analyzer can promote extracted locals when the parent
-/// aggregate dies.
-///
-/// This walk visits every instruction in the function tree, mirrors
-/// `arc_liveness.flattenInstructions` so InstructionId numbering
-/// aligns with downstream consumers, and updates `last_use` to
-/// the highest id where each candidate aggregate is named in a use
-/// position. The candidate set is "every LocalId that is the
-/// `object` of an `index_get`/`field_get` whose dest is ARC-managed
-/// AND whose own ownership class is non-`.owned` (i.e. non-ARC)".
-fn computeNonArcAggregateLastUse(
-    allocator: std.mem.Allocator,
-    function: *const ir.Function,
-    out: *std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
-) error{OutOfMemory}!void {
-    // Pass 1: identify the aggregates we care about (non-ARC objects
-    // with at least one ARC-managed extraction).
-    var aggregates: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
-    defer aggregates.deinit(allocator);
-    try identifyNonArcAggregates(allocator, function, &aggregates);
-    if (aggregates.count() == 0) return;
-
-    // Pass 2: compute last-use by walking forward and overwriting on
-    // each subsequent use of any tracked aggregate.
-    var next_id: arc_liveness.InstructionId = 0;
-    for (function.body) |block| {
-        try recordAggregateUsesStream(allocator, block.instructions, &next_id, &aggregates, out);
-    }
-}
-
-fn identifyNonArcAggregates(
-    allocator: std.mem.Allocator,
-    function: *const ir.Function,
-    out: *std.AutoHashMapUnmanaged(ir.LocalId, void),
-) error{OutOfMemory}!void {
-    for (function.body) |block| {
-        try identifyNonArcAggregatesStream(allocator, function, block.instructions, out);
-    }
-}
-
-fn identifyNonArcAggregatesStream(
-    allocator: std.mem.Allocator,
-    function: *const ir.Function,
-    stream: []const ir.Instruction,
-    out: *std.AutoHashMapUnmanaged(ir.LocalId, void),
-) error{OutOfMemory}!void {
-    for (stream) |*instr| {
-        switch (instr.*) {
-            .index_get => |ig| {
-                if (!isOwnedClass(function, ig.object) and isOwnedClass(function, ig.dest)) {
-                    try out.put(allocator, ig.object, {});
-                }
-            },
-            .field_get => |fg| {
-                if (!isOwnedClass(function, fg.object) and isOwnedClass(function, fg.dest)) {
-                    try out.put(allocator, fg.object, {});
-                }
-            },
-            else => {},
-        }
-        try identifyNonArcAggregatesChildren(allocator, function, instr, out);
-    }
-}
-
-fn identifyNonArcAggregatesChildren(
-    allocator: std.mem.Allocator,
-    function: *const ir.Function,
-    instr: *const ir.Instruction,
-    out: *std.AutoHashMapUnmanaged(ir.LocalId, void),
-) error{OutOfMemory}!void {
-    switch (instr.*) {
-        .if_expr => |ie| {
-            try identifyNonArcAggregatesStream(allocator, function, ie.then_instrs, out);
-            try identifyNonArcAggregatesStream(allocator, function, ie.else_instrs, out);
-        },
-        .case_block => |cb| {
-            try identifyNonArcAggregatesStream(allocator, function, cb.pre_instrs, out);
-            for (cb.arms) |arm| {
-                try identifyNonArcAggregatesStream(allocator, function, arm.cond_instrs, out);
-                try identifyNonArcAggregatesStream(allocator, function, arm.body_instrs, out);
-            }
-            try identifyNonArcAggregatesStream(allocator, function, cb.default_instrs, out);
-        },
-        .switch_literal => |sl| {
-            for (sl.cases) |c| try identifyNonArcAggregatesStream(allocator, function, c.body_instrs, out);
-            try identifyNonArcAggregatesStream(allocator, function, sl.default_instrs, out);
-        },
-        .switch_return => |sr| {
-            for (sr.cases) |c| try identifyNonArcAggregatesStream(allocator, function, c.body_instrs, out);
-            try identifyNonArcAggregatesStream(allocator, function, sr.default_instrs, out);
-        },
-        .union_switch => |us| {
-            for (us.cases) |c| try identifyNonArcAggregatesStream(allocator, function, c.body_instrs, out);
-        },
-        .union_switch_return => |usr| {
-            for (usr.cases) |c| try identifyNonArcAggregatesStream(allocator, function, c.body_instrs, out);
-        },
-        .try_call_named => |tc| {
-            try identifyNonArcAggregatesStream(allocator, function, tc.handler_instrs, out);
-            try identifyNonArcAggregatesStream(allocator, function, tc.success_instrs, out);
-        },
-        .guard_block => |gb| {
-            try identifyNonArcAggregatesStream(allocator, function, gb.body, out);
-        },
-        .optional_dispatch => |od| {
-            try identifyNonArcAggregatesStream(allocator, function, od.nil_instrs, out);
-            try identifyNonArcAggregatesStream(allocator, function, od.struct_instrs, out);
-        },
-        else => {},
-    }
-}
-
-fn recordAggregateUsesStream(
-    allocator: std.mem.Allocator,
-    stream: []const ir.Instruction,
-    next_id: *arc_liveness.InstructionId,
-    aggregates: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
-    out: *std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
-) error{OutOfMemory}!void {
-    for (stream) |*instr| {
-        const my_id = next_id.*;
-        next_id.* += 1;
-        try recordAggregateUseSites(allocator, instr, my_id, aggregates, out);
-        try recordAggregateUsesChildren(allocator, instr, next_id, aggregates, out);
-    }
-}
-
-fn recordAggregateUsesChildren(
-    allocator: std.mem.Allocator,
-    instr: *const ir.Instruction,
-    next_id: *arc_liveness.InstructionId,
-    aggregates: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
-    out: *std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
-) error{OutOfMemory}!void {
-    switch (instr.*) {
-        .if_expr => |ie| {
-            try recordAggregateUsesStream(allocator, ie.then_instrs, next_id, aggregates, out);
-            try recordAggregateUsesStream(allocator, ie.else_instrs, next_id, aggregates, out);
-        },
-        .case_block => |cb| {
-            try recordAggregateUsesStream(allocator, cb.pre_instrs, next_id, aggregates, out);
-            for (cb.arms) |arm| {
-                try recordAggregateUsesStream(allocator, arm.cond_instrs, next_id, aggregates, out);
-                try recordAggregateUsesStream(allocator, arm.body_instrs, next_id, aggregates, out);
-            }
-            try recordAggregateUsesStream(allocator, cb.default_instrs, next_id, aggregates, out);
-        },
-        .switch_literal => |sl| {
-            for (sl.cases) |c| try recordAggregateUsesStream(allocator, c.body_instrs, next_id, aggregates, out);
-            try recordAggregateUsesStream(allocator, sl.default_instrs, next_id, aggregates, out);
-        },
-        .switch_return => |sr| {
-            for (sr.cases) |c| try recordAggregateUsesStream(allocator, c.body_instrs, next_id, aggregates, out);
-            try recordAggregateUsesStream(allocator, sr.default_instrs, next_id, aggregates, out);
-        },
-        .union_switch => |us| {
-            for (us.cases) |c| try recordAggregateUsesStream(allocator, c.body_instrs, next_id, aggregates, out);
-        },
-        .union_switch_return => |usr| {
-            for (usr.cases) |c| try recordAggregateUsesStream(allocator, c.body_instrs, next_id, aggregates, out);
-        },
-        .try_call_named => |tc| {
-            try recordAggregateUsesStream(allocator, tc.handler_instrs, next_id, aggregates, out);
-            try recordAggregateUsesStream(allocator, tc.success_instrs, next_id, aggregates, out);
-        },
-        .guard_block => |gb| {
-            try recordAggregateUsesStream(allocator, gb.body, next_id, aggregates, out);
-        },
-        .optional_dispatch => |od| {
-            try recordAggregateUsesStream(allocator, od.nil_instrs, next_id, aggregates, out);
-            try recordAggregateUsesStream(allocator, od.struct_instrs, next_id, aggregates, out);
-        },
-        else => {},
-    }
-}
-
-fn recordAggregateUseSites(
-    allocator: std.mem.Allocator,
-    instr: *const ir.Instruction,
-    my_id: arc_liveness.InstructionId,
-    aggregates: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
-    out: *std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
-) error{OutOfMemory}!void {
-    switch (instr.*) {
-        .index_get => |ig| try bumpUseIfTracked(allocator, ig.object, my_id, aggregates, out),
-        .field_get => |fg| try bumpUseIfTracked(allocator, fg.object, my_id, aggregates, out),
-        .move_value => |mv| try bumpUseIfTracked(allocator, mv.source, my_id, aggregates, out),
-        .share_value => |sv| try bumpUseIfTracked(allocator, sv.source, my_id, aggregates, out),
-        .copy_value => |cv| try bumpUseIfTracked(allocator, cv.source, my_id, aggregates, out),
-        .borrow_value => |bv| try bumpUseIfTracked(allocator, bv.source, my_id, aggregates, out),
-        .local_get => |lg| try bumpUseIfTracked(allocator, lg.source, my_id, aggregates, out),
-        .local_set => |ls| try bumpUseIfTracked(allocator, ls.value, my_id, aggregates, out),
-        .ret => |r| if (r.value) |v| try bumpUseIfTracked(allocator, v, my_id, aggregates, out),
-        .cond_return => |cr| if (cr.value) |v| try bumpUseIfTracked(allocator, v, my_id, aggregates, out),
-        .release => |r| try bumpUseIfTracked(allocator, r.value, my_id, aggregates, out),
-        .retain => |r| try bumpUseIfTracked(allocator, r.value, my_id, aggregates, out),
-        .tuple_init => |ti| {
-            for (ti.elements) |elem| try bumpUseIfTracked(allocator, elem, my_id, aggregates, out);
-        },
-        .list_init => |li| {
-            for (li.elements) |elem| try bumpUseIfTracked(allocator, elem, my_id, aggregates, out);
-        },
-        .list_cons => |lc| {
-            try bumpUseIfTracked(allocator, lc.head, my_id, aggregates, out);
-            try bumpUseIfTracked(allocator, lc.tail, my_id, aggregates, out);
-        },
-        .map_init => |mi| {
-            for (mi.entries) |e| {
-                try bumpUseIfTracked(allocator, e.key, my_id, aggregates, out);
-                try bumpUseIfTracked(allocator, e.value, my_id, aggregates, out);
-            }
-        },
-        .struct_init => |si| {
-            for (si.fields) |f| try bumpUseIfTracked(allocator, f.value, my_id, aggregates, out);
-        },
-        .union_init => |ui| try bumpUseIfTracked(allocator, ui.value, my_id, aggregates, out),
-        .make_closure => |mc| {
-            for (mc.captures) |cap| try bumpUseIfTracked(allocator, cap, my_id, aggregates, out);
-        },
-        .call_builtin => |cb| {
-            for (cb.args) |arg| try bumpUseIfTracked(allocator, arg, my_id, aggregates, out);
-        },
-        .call_named => |cn| {
-            for (cn.args) |arg| try bumpUseIfTracked(allocator, arg, my_id, aggregates, out);
-        },
-        .call_direct => |cd| {
-            for (cd.args) |arg| try bumpUseIfTracked(allocator, arg, my_id, aggregates, out);
-        },
-        .call_closure => |cc| {
-            try bumpUseIfTracked(allocator, cc.callee, my_id, aggregates, out);
-            for (cc.args) |arg| try bumpUseIfTracked(allocator, arg, my_id, aggregates, out);
-        },
-        .call_dispatch => |cd| {
-            for (cd.args) |arg| try bumpUseIfTracked(allocator, arg, my_id, aggregates, out);
-        },
-        .try_call_named => |tcn| {
-            for (tcn.args) |arg| try bumpUseIfTracked(allocator, arg, my_id, aggregates, out);
-            try bumpUseIfTracked(allocator, tcn.input_local, my_id, aggregates, out);
-        },
-        .tail_call => |tc| {
-            for (tc.args) |arg| try bumpUseIfTracked(allocator, arg, my_id, aggregates, out);
-        },
-        else => {},
-    }
-}
-
-fn bumpUseIfTracked(
-    allocator: std.mem.Allocator,
-    local: ir.LocalId,
-    my_id: arc_liveness.InstructionId,
-    aggregates: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
-    out: *std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
-) error{OutOfMemory}!void {
-    if (!aggregates.contains(local)) return;
-    try out.put(allocator, local, my_id);
-}
-
-fn isOwnedClass(function: *const ir.Function, local: ir.LocalId) bool {
-    if (local >= function.local_ownership.len) return false;
-    return function.local_ownership[local] == .owned;
-}
-
 /// Phase 2.6.2 — per-tuple deferred classification record. Mirrors
-/// `v8_uniqueness.TuplePendingEntry`. One entry per `tuple_init` (or
+/// `uniqueness.TuplePendingEntry`. One entry per `tuple_init` (or
 /// per call dest synthesized from a callee's `return_components`)
 /// whose components carry per-slot uniqueness information.
 ///
@@ -1504,12 +1188,12 @@ const TentativeAnalyzer = struct {
     allocator: std.mem.Allocator,
     function: *const ir.Function,
     program: *const ir.Program,
-    fixpoint: *const v8_interprocedural.ProgramUniqueness,
+    fixpoint: *const uniqueness_interprocedural.ProgramUniqueness,
     rewritten: *const RewrittenShareSet,
     /// Phase 2.6.2 — whole-program signatures. Used to synthesize
     /// per-component `tuple_pending` entries on call dests when the
     /// callee's `return_components` table records per-slot witnesses.
-    signatures: *const v8_signature.ProgramSignatures,
+    signatures: *const uniqueness_signature.ProgramSignatures,
     /// Phase 2.6.2 — per-function ARC ownership info, or null for
     /// functions with no ARC-managed locals. When non-null, the
     /// analyzer queries `isLastUseAt` to decide when an
@@ -1518,16 +1202,6 @@ const TentativeAnalyzer = struct {
     /// implicit scope-exit release decrements the cell back to
     /// rc=1 immediately after the destructure's last index_get).
     ownership: ?*const arc_liveness.ArcOwnership,
-    /// Phase 2.6.2 — per-function last-use map for non-ARC
-    /// aggregates that hold ARC-managed components.
-    /// `arc_liveness.ArcOwnership.isLastUseAt` only records
-    /// last-use for ARC-managed locals; non-ARC aggregates are
-    /// invisible to it. Without this fallback map, the destructure-
-    /// promotion path would never fire for the canonical fannkuch
-    /// shape (`{VectorI64, i64}` tuple destructured into a
-    /// `VectorI64` consumed by an `.owned` callee). Computed
-    /// before the main walk by `computeNonArcAggregateLastUse`.
-    non_arc_last_use: *const std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
     unique: std.AutoHashMapUnmanaged(ir.LocalId, void),
     /// Phase 2.6.2 — per-tuple deferred classification map.
     tuple_pending: std.AutoHashMapUnmanaged(ir.LocalId, TentativeTuplePendingEntry),
@@ -1563,7 +1237,7 @@ const TentativeAnalyzer = struct {
     /// Phase 2.6.2 — escape a pending entry. Drops the parent's
     /// reverse-map entries for every extracted local (so a later
     /// sink doesn't try to trace back), then removes the parent
-    /// entry. Mirrors `v8_uniqueness.Analyzer.escapePending`.
+    /// entry. Mirrors `uniqueness.Analyzer.escapePending`.
     fn escapePending(self: *TentativeAnalyzer, tuple_local: ir.LocalId) void {
         if (self.tuple_pending.getPtr(tuple_local)) |entry| {
             for (entry.extracted.items) |ref| {
@@ -1595,13 +1269,10 @@ const TentativeAnalyzer = struct {
     ///      rc=1 — the extracted local is now the sole owner.
     ///   5. Subsequent `_owned_unchecked` sites observe rc=1 cells.
     ///
-    /// Last-use detection: Phase 2.6.2 first consults
-    /// `ArcOwnership.isLastUseAt` (the standard last-use predicate
-    /// for ARC-managed locals). For non-ARC aggregates the standard
-    /// predicate always returns false, so the analyzer falls back
-    /// to the locally-computed `non_arc_last_use` map, which records
-    /// the last instruction id where each tracked aggregate is
-    /// named in a use position.
+    /// Last-use detection: `ArcOwnership.isLastUseAt` is the single
+    /// source of truth. Phase 2.7 records entries there for non-ARC
+    /// aggregates that hold ARC-managed components, while preserving
+    /// `arc_managed_locals` as ARC-only.
     fn promoteExtractedAt(
         self: *TentativeAnalyzer,
         tuple_local: ir.LocalId,
@@ -1609,15 +1280,11 @@ const TentativeAnalyzer = struct {
     ) error{OutOfMemory}!void {
         const entry = self.tuple_pending.getPtr(tuple_local) orelse return;
         if (entry.escaped) return;
-        const arc_last_use = blk: {
+        const at_last_use = blk: {
             const ownership = self.ownership orelse break :blk false;
             break :blk ownership.isLastUseAt(tuple_local, my_id);
         };
-        const non_arc_last_use = blk: {
-            const recorded = self.non_arc_last_use.get(tuple_local) orelse break :blk false;
-            break :blk recorded == my_id;
-        };
-        if (!arc_last_use and !non_arc_last_use) return;
+        if (!at_last_use) return;
         for (entry.extracted.items) |ref| {
             if (ref.component_idx < entry.components_unique.len and entry.components_unique[ref.component_idx]) {
                 try self.unique.put(self.allocator, ref.local, {});
@@ -2137,7 +1804,7 @@ const TentativeAnalyzer = struct {
                 // dest flows into an `.owned` arg slot of a downstream
                 // call (per the pre-computed RewrittenShareSet), the
                 // post-rewrite IR will replace this share with
-                // move_value. The V8 dataflow under the tentative
+                // move_value. The uniqueness dataflow under the tentative
                 // conventions therefore applies move-style semantics:
                 // transfer uniqueness from source to dest.
                 //
@@ -2334,9 +2001,9 @@ fn calleeFunctionOwnedReceiverSlotByPointer(function: *const ir.Function) ?usize
     return null;
 }
 
-/// Mirror of `v8_uniqueness.functionIsFreshAllocatorWrapper` —
+/// Mirror of `uniqueness.functionIsFreshAllocatorWrapper` —
 /// duplicated to avoid the import dependency cycle (arc_param_convention
-/// -> v8_uniqueness -> v8_interprocedural -> arc_param_convention would
+/// -> uniqueness -> uniqueness_interprocedural -> arc_param_convention would
 /// be a cycle).
 fn functionIsFreshAllocatorWrapperByPointer(function: *const ir.Function) bool {
     if (function.result_convention != .owned) return false;
@@ -2412,7 +2079,7 @@ const TentativeDemotionWalker = struct {
     program: *const ir.Program,
     name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
     uniqueness: *const TentativeFunctionUniqueness,
-    program_uniqueness: *v8_interprocedural.ProgramUniqueness,
+    program_uniqueness: *uniqueness_interprocedural.ProgramUniqueness,
     callers_of: *const std.AutoHashMapUnmanaged(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
     worklist: *std.ArrayListUnmanaged(ir.FunctionId),
     in_worklist: *std.AutoHashMapUnmanaged(ir.FunctionId, void),
@@ -2528,7 +2195,7 @@ fn lookupFunctionMut(program: *const ir.Program, function_id: ir.FunctionId) ?*i
 fn slotPassesAuditConditions(
     function: *const ir.Function,
     slot_index: usize,
-    signatures: *const v8_signature.ProgramSignatures,
+    signatures: *const uniqueness_signature.ProgramSignatures,
     sites_by_target: *const SitesByTarget,
     ownerships: *const arc_liveness.ProgramArcOwnership,
     function_index: *const std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function),
@@ -2998,12 +2665,12 @@ fn shouldPromoteSlot(
     // call site, which is the canonical k-nucleotide accumulator
     // pattern. Phase 4 (dense Map) of the implementation plan adds a
     // second anchor: the function body forwards `slot_index` directly
-    // into an owned-mutating call_builtin (`Map.put`/`.delete`/
-    // `.merge`). This covers `lib/map.zap`'s thin `Map.put` Zap-fn
-    // wrapper, which simply forwards the receiver to
-    // `:zig.Map.put(...)` — the runtime's rc-1 fast path consumes the
-    // receiver, so the wrapper's slot 0 is semantically equivalent to
-    // a self-recursive consumer for inference purposes.
+    // into a consuming call_builtin slot. This covers `lib/map.zap`'s
+    // thin `Map.put` Zap-fn wrapper, which simply forwards the receiver
+    // to `:zig.Map.put(...)`, and `lib/list.zap`'s element-writing
+    // wrappers, whose value parameter is stored directly into the list
+    // buffer. These runtime ABI consume sites are semantically
+    // equivalent to a self-recursive consumer for inference purposes.
     //
     // Without this extension the wrapper stays `.borrowed`, every
     // caller of `Map.put` emits a retain around the call, the
@@ -3024,9 +2691,9 @@ fn shouldPromoteSlot(
     return true;
 }
 
-/// Does the function's body forward `param_index` into the receiver
-/// slot of an owned-mutating call_builtin OR an owned slot of a Zap
-/// function call? Walks the function's instruction streams and tracks
+/// Does the function's body forward `param_index` into a consuming
+/// call_builtin slot OR an owned slot of a Zap function call? Walks
+/// the function's instruction streams and tracks
 /// the SSA chain from `param_get` to the call, allowing intermediate
 /// `move_value`, `local_get`, `borrow_value`, and `share_value`
 /// aliases.
@@ -3076,7 +2743,7 @@ fn bodyConsumesParamViaOwnedSink(
 /// `lift_set` predicate, which under-detects functions that have
 /// ALREADY been promoted to `.owned` by a previous fixpoint
 /// iteration. The previous behaviour blocked the chain at the
-/// VectorI64.set wrapper because the wrapper's slot 0 was never
+/// List.set wrapper because the wrapper's slot 0 was never
 /// added to lift_set (its callers were across structs and
 /// per-struct lift_set is empty).
 fn bodyConsumesParamViaOwnedSinkWithProgram(
@@ -3109,8 +2776,8 @@ fn bodyConsumesParamViaOwnedSinkWithProgram(
     }
     if (alias_len == 0) return false;
 
-    // Now scan for any owned-mutating call_builtin whose receiver
-    // slot is in `alias_buf[0..alias_len]`.
+    // Now scan for any builtin consuming slot that can accept a
+    // last-use owner and whose argument is in `alias_buf[0..alias_len]`.
     for (function.body) |block| {
         if (streamHasOwnedBuiltinConsumingAlias(block.instructions, alias_buf[0..alias_len])) return true;
     }
@@ -3349,8 +3016,12 @@ fn streamHasOwnedBuiltinConsumingAlias(
     for (stream) |*instr| {
         switch (instr.*) {
             .call_builtin => |cb| {
-                if (arc_liveness.ownedMutatingBuiltinSlot(cb.name)) |slot| {
-                    if (slot < cb.args.len and containsAlias(alias_set, cb.args[slot])) return true;
+                for (cb.args, 0..) |arg, slot| {
+                    if (arc_liveness.builtinArgCanMoveAtLastUse(cb.name, slot) and
+                        containsAlias(alias_set, arg))
+                    {
+                        return true;
+                    }
                 }
             },
             .if_expr => |ie| {
@@ -3446,7 +3117,7 @@ fn siteConsumesSlot(
             const last_use = fn_ownership.last_use_map.get(source) orelse return false;
             if (last_use != share_id) return false;
 
-            // V8 soundness gate (A2 — Vector(T) ARC promotion):
+            // uniqueness soundness gate (A2 — List(T) ARC promotion):
             //
             // The local-level last-use check above is necessary but
             // NOT sufficient. The `IrBuilder.emitLocalGet` helper
@@ -3465,7 +3136,7 @@ fn siteConsumesSlot(
             // was itself at last-use at the local_get site —
             // otherwise the local_get/retain pair was emitted because
             // the named binding has further uses, and rewriting the
-            // share_value into `move_value` (V8's promotion) would
+            // share_value into `move_value` (uniqueness's promotion) would
             // remove a +1 the binding still owns, leading to use-
             // after-free when the binding is read again post-call.
             //
@@ -3674,9 +3345,9 @@ fn chainIsConsumeMode(
 /// the immediate destination of a `param_get`.
 ///
 /// This is the local equivalent of `arc_drop_insertion.paramIndexForLocal`
-/// — duplicated here so the V8 inference doesn't pull in
+/// — duplicated here so the uniqueness inference doesn't pull in
 /// `arc_drop_insertion` (avoiding a cyclic-import situation; the
-/// drop-insertion pass runs strictly AFTER V8). Both helpers share
+/// drop-insertion pass runs strictly AFTER uniqueness). Both helpers share
 /// the same semantics: find the unique `param_get` dest mapping for
 /// a candidate LocalId.
 fn paramSlotForLocal(function: *const ir.Function, local_id: ir.LocalId) ?u32 {
@@ -3720,7 +3391,7 @@ fn paramSlotForLocal(function: *const ir.Function, local_id: ir.LocalId) ?u32 {
 /// in OTHER case arms as "after" the share even though those arms
 /// are mutually exclusive with the share's arm. That over-rejection
 /// blocked promotion of any wrapper whose only caller's body has a
-/// case_block (e.g., the `vector_rc1` example's `fill_in_place`
+/// case_block (e.g., a flat-list `fill_in_place`
 /// reads `v` in case[0] for the recursive `set` call and reads `v`
 /// again in case[1] for the base-case return; the two reads are on
 /// disjoint paths, so the case[1] read must not block promotion
@@ -3733,7 +3404,7 @@ fn paramSlotForLocal(function: *const ir.Function, local_id: ir.LocalId) ?u32 {
 /// where `consume_last_use_id` is `last_use_map[share_dest]` (the
 /// instruction id at which the consume call ends the share_value
 /// dest's lifetime). The bounded refetch's value is consumed by some
-/// non-mutating sub-call (e.g., `Vector.get`) before the outer consume
+/// non-mutating sub-call (e.g., `List.get`) before the outer consume
 /// fires — it does not extend the parameter slot's live range past
 /// the consume site, so it does not block promotion.
 ///
@@ -3794,7 +3465,7 @@ const SuccessorScan = struct {
     /// suppresses the refetch flag when the dest's last-use id is
     /// `<= consume_last_use_id`. A bounded refetch is one whose
     /// value is fully consumed before the share_value's own consume
-    /// call (e.g., a `Vector.get` argument inside the same `Vector.set`
+    /// call (e.g., a `List.get` argument inside the same `List.set`
     /// call's argument-evaluation window). Such refetches don't
     /// extend the parameter slot's live range past the outer consume
     /// site and therefore must not block promotion.
@@ -4164,7 +3835,7 @@ test "arc_param_convention: liftSetContains hits the recorded entries" {
 }
 
 test "arc_param_convention: paramSlotIsRefetchedAfter ignores refetches in disjoint case arms" {
-    // Build a function shaped like `vector_rc1`'s `fill_in_place`:
+    // Build a function shaped like flat-list `fill_in_place`:
     //
     //   case scrut {
     //     true ->
@@ -4324,8 +3995,8 @@ test "arc_param_convention: paramSlotIsRefetchedAfter ignores refetch bounded wi
     //   param_get   dest=L0 index=0       -- first fetch (for set's receiver)
     //   share_value dest=L1 source=L0     -- share for set; target id = 1
     //   param_get   dest=L2 index=0       -- second fetch (for get's receiver) -- "refetch"
-    //   call_builtin Vector.get args=[L2] -- consumes L2; last_use[L2] = id 3
-    //   call_builtin Vector.set args=[L1] -- consumes L1; last_use[L1] = id 4
+    //   call_builtin List.get args=[L2] -- consumes L2; last_use[L2] = id 3
+    //   call_builtin List.set args=[L1] -- consumes L1; last_use[L1] = id 4
     //   ret value=L1                       -- (or whatever)
     //
     // Pre-Phase-1.8 behavior: the structural-successor scan sees the
@@ -4459,19 +4130,19 @@ test "arc_param_convention: paramSlotIsRefetchedAfter still detects unbounded re
 }
 
 // ============================================================
-// Phase 2.4 V8 pre-flight check tests
+// Phase 2.4 uniqueness pre-flight check tests
 // ============================================================
 
-test "arc_param_convention: liftSetSurvivesV8Check admits a slot whose body is consume-mode" {
+test "arc_param_convention: liftSetSurvivesUniquenessCheck admits a slot whose body is consume-mode" {
     // Build a synthetic function that forwards its slot directly into
     // an owned-mutating builtin and returns the result. Tentatively
-    // promote the slot to .owned and verify the V8 fixpoint says
+    // promote the slot to .owned and verify the uniqueness fixpoint says
     // unique-on-entry.
     var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
 
-    // Body of `set_zero(arr) -> Vector.set(arr, 0, 0)`.
+    // Body of `set_zero(list) -> List.set(list, 0, 0)`.
     const args = try arena.alloc(ir.LocalId, 3);
     args[0] = 3;
     args[1] = 1;
@@ -4487,7 +4158,7 @@ test "arc_param_convention: liftSetSurvivesV8Check admits a slot whose body is c
         .{ .move_value = .{ .dest = 3, .source = 0 } },
         .{ .call_builtin = .{
             .dest = 4,
-            .name = "VectorI64.set",
+            .name = "List:i64.set",
             .args = args,
             .arg_modes = arg_modes,
         } },
@@ -4529,13 +4200,13 @@ test "arc_param_convention: liftSetSurvivesV8Check admits a slot whose body is c
 
     var survivors: LiftSet = .empty;
     defer survivors.deinit(std.testing.allocator);
-    var test_signatures = try v8_fixpoint.computeSignatures(std.testing.allocator, &program);
+    var test_signatures = try uniqueness_fixpoint.computeSignatures(std.testing.allocator, &program);
     defer test_signatures.deinit(std.testing.allocator);
     var test_ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
     defer test_ownerships.deinit();
-    try liftSetSurvivesV8Check(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
+    try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
 
-    // The slot's body is a thin forward to VectorI64.set — V8 should
+    // The slot's body is a thin forward to List.set — uniqueness should
     // see uniqueness preserved through the rewritten share→move and
     // admit the candidate. Note: this test has no callers, so the
     // optimistic seeding leaves slot 0 unique-on-entry by default.
@@ -4546,12 +4217,12 @@ test "arc_param_convention: liftSetSurvivesV8Check admits a slot whose body is c
     try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[0].param_conventions[0]);
 }
 
-test "arc_param_convention: liftSetSurvivesV8Check rejects when caller passes a copy_value-clobbered receiver" {
-    // The pre-flight's V8 simulation rejects a callee candidate slot
+test "arc_param_convention: liftSetSurvivesUniquenessCheck rejects when caller passes a copy_value-clobbered receiver" {
+    // The pre-flight's uniqueness simulation rejects a callee candidate slot
     // when its caller can't pass a unique value at the call site.
     // Mirror that pattern: the callee F.0 is the candidate; the
     // caller G's body does `copy_value` on G's owned slot before the
-    // call to F. Under tentative promotion of F.0, the V8 fixpoint
+    // call to F. Under tentative promotion of F.0, the uniqueness fixpoint
     // observes G's call passing a non-unique arg → demotes F.0.
     //
     // Both functions are tentatively-promoted candidates here so the
@@ -4561,7 +4232,7 @@ test "arc_param_convention: liftSetSurvivesV8Check rejects when caller passes a 
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
 
-    // Callee F: forwards slot 0 into VectorI64.set.
+    // Callee F: forwards slot 0 into List.set.
     const callee_args = try arena.alloc(ir.LocalId, 3);
     callee_args[0] = 3;
     callee_args[1] = 1;
@@ -4577,7 +4248,7 @@ test "arc_param_convention: liftSetSurvivesV8Check rejects when caller passes a 
         .{ .move_value = .{ .dest = 3, .source = 0 } },
         .{ .call_builtin = .{
             .dest = 4,
-            .name = "VectorI64.set",
+            .name = "List:i64.set",
             .args = callee_args,
             .arg_modes = callee_modes,
         } },
@@ -4593,7 +4264,7 @@ test "arc_param_convention: liftSetSurvivesV8Check rejects when caller passes a 
     callee_params[0] = .{ .name = "arr", .type_expr = .void };
 
     // Caller G: takes one slot, does `copy_value` to clobber it,
-    // then calls F passing the COPY (which V8 says is non-unique).
+    // then calls F passing the COPY (which uniqueness says is non-unique).
     //
     //   [0] param_get %0 = index 0
     //   [1] copy_value %1 = %0   -- both cleared from unique
@@ -4665,14 +4336,14 @@ test "arc_param_convention: liftSetSurvivesV8Check rejects when caller passes a 
 
     var survivors: LiftSet = .empty;
     defer survivors.deinit(std.testing.allocator);
-    var test_signatures = try v8_fixpoint.computeSignatures(std.testing.allocator, &program);
+    var test_signatures = try uniqueness_fixpoint.computeSignatures(std.testing.allocator, &program);
     defer test_signatures.deinit(std.testing.allocator);
     var test_ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
     defer test_ownerships.deinit();
-    try liftSetSurvivesV8Check(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
+    try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
 
     // Caller's body has `copy_value` clobbering uniqueness before the
-    // call to callee. The V8 fixpoint sees the call's arg is non-unique
+    // call to callee. The uniqueness fixpoint sees the call's arg is non-unique
     // → demotes callee.0. The pre-flight thus rejects callee.0 from
     // survivors. (caller.0 has no callers in this synthetic program,
     // so its unique-on-entry stays true and it survives.)
@@ -4683,9 +4354,9 @@ test "arc_param_convention: liftSetSurvivesV8Check rejects when caller passes a 
     try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[1].param_conventions[0]);
 }
 
-test "arc_param_convention: liftSetSurvivesV8Check restores conventions on every exit path" {
+test "arc_param_convention: liftSetSurvivesUniquenessCheck restores conventions on every exit path" {
     // Smoke: when the candidate set is empty, the pre-flight is a
-    // no-op. When non-empty, conventions are flipped, V8 runs, and
+    // no-op. When non-empty, conventions are flipped, uniqueness runs, and
     // they're restored regardless of the result.
     var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_obj.deinit();
@@ -4717,7 +4388,7 @@ test "arc_param_convention: liftSetSurvivesV8Check restores conventions on every
     };
     var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
 
-    var test_signatures = try v8_fixpoint.computeSignatures(std.testing.allocator, &program);
+    var test_signatures = try uniqueness_fixpoint.computeSignatures(std.testing.allocator, &program);
     defer test_signatures.deinit(std.testing.allocator);
     var test_ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
     defer test_ownerships.deinit();
@@ -4728,7 +4399,7 @@ test "arc_param_convention: liftSetSurvivesV8Check restores conventions on every
         defer candidates.deinit(std.testing.allocator);
         var survivors: LiftSet = .empty;
         defer survivors.deinit(std.testing.allocator);
-        try liftSetSurvivesV8Check(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
+        try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
         try std.testing.expectEqual(@as(u32, 0), survivors.count());
         try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[0].param_conventions[0]);
     }
@@ -4741,7 +4412,7 @@ test "arc_param_convention: liftSetSurvivesV8Check restores conventions on every
         try candidates.put(std.testing.allocator, liftKey(0, 0), {});
         var survivors: LiftSet = .empty;
         defer survivors.deinit(std.testing.allocator);
-        try liftSetSurvivesV8Check(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
+        try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
         // After the call returns, conventions are back to .borrowed.
         try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[0].param_conventions[0]);
     }
@@ -4749,7 +4420,7 @@ test "arc_param_convention: liftSetSurvivesV8Check restores conventions on every
 
 test "arc_param_convention: TentativeAnalyzer tuple_pending preserves witness through tuple_init+ret (Phase 2.6.2)" {
     // Build a function whose body constructs a tuple from a unique-on-
-    // entry param and returns it. The V8 pre-flight should observe the
+    // entry param and returns it. The uniqueness pre-flight should observe the
     // param as PU through the return-component witness mechanism: the
     // tuple_init goes onto `tuple_pending`, the `ret` resolves it as
     // PU. Tentative promotion of slot 0 to .owned should survive
@@ -4757,10 +4428,10 @@ test "arc_param_convention: TentativeAnalyzer tuple_pending preserves witness th
     //
     // Without Phase 2.6.2's tuple_pending in the TentativeAnalyzer,
     // the `tuple_init` would have unconditionally cleared the param's
-    // unique bit, and a downstream V8 site fed by an extracted local
+    // unique bit, and a downstream uniqueness site fed by an extracted local
     // would see non-unique → reject the candidate.
     //
-    //   pub fn id_tuple(v :: VectorI64) -> {VectorI64} { {v} }
+    //   pub fn id_tuple(v :: List(i64)) -> {List(i64)} { {v} }
     var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -4798,7 +4469,7 @@ test "arc_param_convention: TentativeAnalyzer tuple_pending preserves witness th
     };
     var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
 
-    var test_signatures = try v8_fixpoint.computeSignatures(std.testing.allocator, &program);
+    var test_signatures = try uniqueness_fixpoint.computeSignatures(std.testing.allocator, &program);
     defer test_signatures.deinit(std.testing.allocator);
     var test_ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
     defer test_ownerships.deinit();
@@ -4808,10 +4479,10 @@ test "arc_param_convention: TentativeAnalyzer tuple_pending preserves witness th
     try candidates.put(std.testing.allocator, liftKey(0, 0), {});
     var survivors: LiftSet = .empty;
     defer survivors.deinit(std.testing.allocator);
-    try liftSetSurvivesV8Check(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
+    try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
 
     // The body has no demoting operations on the param's flow. With
-    // tentative promotion to .owned, the V8 pre-flight should see
+    // tentative promotion to .owned, the uniqueness pre-flight should see
     // unique-on-entry preserved.
     try std.testing.expect(survivors.count() == 1);
     try std.testing.expect(liftSetContains(&survivors, 0, 0));
@@ -4822,14 +4493,14 @@ test "arc_param_convention: TentativeAnalyzer synthesizes return pending from ca
     // Caller g calls callee f, where f's signature has
     // return_components[0] = 0 (component 0 carries param slot 0).
     // The call's dest is then index_get(0) → v', which g uses as the
-    // receiver of an owned-mutating builtin and returns. The V8 pre-
+    // receiver of an owned-mutating builtin and returns. The uniqueness pre-
     // flight must:
     //   1. Synthesize a tuple_pending entry on the call dest using
     //      f's return_components witness.
     //   2. Record an extracted ref on index_get from that pending.
     //   3. (For destructure-promotion at last-use, ArcOwnership is
     //      required — this test omits it to keep the scaffold small.
-    //      The unique-flag still propagates through to the V8 site
+    //      The unique-flag still propagates through to the uniqueness site
     //      via the receiver's pre-extract pending state.)
     //
     // For this test we simplify: we verify Phase 2.6.2's synthesis
@@ -4849,7 +4520,7 @@ test "arc_param_convention: TentativeAnalyzer synthesizes return pending from ca
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
 
-    // Callee f: takes a Vector slot, returns {v}.
+    // Callee f: takes a List slot, returns {v}.
     const callee_tuple_elems = try arena.alloc(ir.LocalId, 1);
     callee_tuple_elems[0] = 0;
     const callee_instrs = [_]ir.Instruction{
@@ -4866,7 +4537,7 @@ test "arc_param_convention: TentativeAnalyzer synthesizes return pending from ca
     const callee_params = try arena.alloc(ir.Param, 1);
     callee_params[0] = .{ .name = "v", .type_expr = .void };
 
-    // Caller g: takes a Vector slot, calls f, destructures, returns.
+    // Caller g: takes a List slot, calls f, destructures, returns.
     //   t = f(v0)
     //   v' = t[0]
     //   ret v'
@@ -4927,7 +4598,7 @@ test "arc_param_convention: TentativeAnalyzer synthesizes return pending from ca
     };
     var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
 
-    var test_signatures = try v8_fixpoint.computeSignatures(std.testing.allocator, &program);
+    var test_signatures = try uniqueness_fixpoint.computeSignatures(std.testing.allocator, &program);
     defer test_signatures.deinit(std.testing.allocator);
     var test_ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
     defer test_ownerships.deinit();
@@ -4944,7 +4615,7 @@ test "arc_param_convention: TentativeAnalyzer synthesizes return pending from ca
     try candidates.put(std.testing.allocator, liftKey(1, 0), {});
     var survivors: LiftSet = .empty;
     defer survivors.deinit(std.testing.allocator);
-    try liftSetSurvivesV8Check(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
+    try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
 
     // Both slots survive: callee.0 because its body is a clean
     // tuple_init+ret; caller.0 because (with Phase 2.6.2 plumbing)
@@ -4952,7 +4623,7 @@ test "arc_param_convention: TentativeAnalyzer synthesizes return pending from ca
     // the index_get of component 0 is recorded as an extracted ref.
     // The current scaffolding (no ArcOwnership) prevents
     // last-use-promotion from firing on the destructured local; this
-    // test still validates that NO regression occurs at the V8 site
+    // test still validates that NO regression occurs at the uniqueness site
     // — the candidate must continue surviving as it did before
     // Phase 2.6.2 (synthesis is an OPTIONAL upgrade path; without
     // ArcOwnership, the dataflow falls back to the legacy behaviour

@@ -257,6 +257,12 @@ pub const Param = struct {
     type_id: ?types_mod.TypeId = null,
 };
 
+const OptionalDispatchCandidate = struct {
+    struct_name: []const u8,
+    struct_type_id: types_mod.TypeId,
+    optional_type_id: ?types_mod.TypeId,
+};
+
 pub const Capture = struct {
     name: []const u8,
     type_expr: ZigType,
@@ -598,6 +604,7 @@ pub const ListLenCheck = struct {
     dest: LocalId,
     scrutinee: LocalId,
     expected_len: u32,
+    minimum: bool = false,
     element_type: ZigType = .i64,
     /// Route through `listLength(anytype)` helper instead of
     /// `List(element_type).length(...)`. Set when `scrutinee` is
@@ -635,10 +642,20 @@ pub const ListHeadTail = struct {
     dest: LocalId,
     list: LocalId,
     element_type: ZigType = .i64,
+    /// For `.list_tail`, the zero-based start offset for the returned
+    /// suffix. Defaults to one for ordinary tail access; multi-head
+    /// list patterns set this to the number of heads so the rest is
+    /// materialized by one slice instead of chained tail clones.
+    start_index: u32 = 1,
     /// Route through `listGetHead(anytype)` / `listGetTail(anytype)`
     /// helper instead of the typed `List(element_type)` method.
     /// Set when `list` is param-backed (see ListGet.via_helper).
     via_helper: bool = false,
+    /// For `.list_tail`, consume a proven-unique source list by
+    /// lowering to `slice_owned_unchecked` instead of cloning the
+    /// suffix. Set only by the ARC/uniqueness rewrite after last-use
+    /// and uniqueness checks pass.
+    consume_source: bool = false,
 };
 
 pub const MapHasKey = struct {
@@ -700,6 +717,7 @@ pub const BinaryOp = struct {
     op: Op,
     lhs: LocalId,
     rhs: LocalId,
+    result_type: ZigType = .any,
 
     pub const Op = enum {
         add,
@@ -774,6 +792,7 @@ pub const CallBuiltin = struct {
     name: []const u8,
     args: []const LocalId,
     arg_modes: []const ValueMode,
+    result_type: ZigType = .any,
 };
 
 /// Call a __try function variant. The result is an error union:
@@ -1122,16 +1141,6 @@ pub const ZigType = union(enum) {
     /// sites wrap via `Term.from(value)` and consumption sites unwrap
     /// via `Term.to(T, term, default)`.
     term,
-    /// `?*const zap_runtime.Vector(i64)` — flat-buffer mutable array
-    /// with COW semantics. The runtime owns the cell layout
-    /// (`Self = { header, len, capacity, ... }`); the source-Arc ABI
-    /// sees `?*const Self` everywhere and `@constCast`s once at
-    /// write boundaries. Distinct from `vector_f64` because
-    /// `Vector(i64)` and `Vector(f64)` are different Zig generic
-    /// instantiations.
-    vector_i64,
-    /// `?*const zap_runtime.Vector(f64)` — see `vector_i64`.
-    vector_f64,
     tuple: []const ZigType,
     list: *const ZigType,
     map: MapType,
@@ -1186,25 +1195,103 @@ pub fn isArcManagedTypeId(type_store: *const types_mod.TypeStore, type_id: types
     // ARC-managed-type set so List(T) values flow through the same
     // retain/release ABI as `.map` and `.opaque_type`.
     //
-    // A2 — flip `.vector_type` to ARC-managed. The runtime's
-    // `Vector(T)` already carries an inline `ArcHeader`, exposes
-    // `retain`/`release` (with deep-element-release on the zero
-    // transition), and the COW-on-share mutators (`set`, `push`,
-    // `pop`, `append`) take the share-clone path at refcount > 1.
-    // Pre-A2, `vector_type` was treated as `.trivial` because
-    // every benchmark used the imperative-aliasing pattern (main
-    // creates a buffer, passes it to a helper, expects in-place
-    // mutations to be visible). That pattern relied on refcount=1
-    // in-place mutation as the implicit ABI. A2 makes Vector
-    // participate in the standard ARC convention so the V8
-    // interprocedural fixpoint can prove uniqueness and the codegen
-    // can rewrite owned-mutating call sites to the unchecked
-    // variants. Callees must return their mutated receiver and
-    // callers must rebind (the accumulator-recursion idiom).
     return switch (type_store.getType(type_id)) {
-        .opaque_type, .map, .list, .vector_type => true,
+        .opaque_type, .map, .list => true,
+        .struct_type => structTypeUsesRecursiveBoxing(type_store, type_id),
+        .union_type => |union_type| blk: {
+            for (union_type.members) |member_type_id| {
+                if (isArcManagedTypeId(type_store, member_type_id)) break :blk true;
+            }
+            break :blk false;
+        },
         else => false,
     };
+}
+
+fn structTypeUsesRecursiveBoxing(type_store: *const types_mod.TypeStore, type_id: types_mod.TypeId) bool {
+    if (type_id >= type_store.types.items.len) return false;
+    if (type_store.getType(type_id) != .struct_type) return false;
+    const struct_type = type_store.getType(type_id).struct_type;
+    for (struct_type.fields) |field| {
+        if (typeReferencesTargetStruct(type_store, field.type_id, type_id, 0)) return true;
+    }
+    return false;
+}
+
+fn typeReferencesTargetStruct(
+    type_store: *const types_mod.TypeStore,
+    current_type_id: types_mod.TypeId,
+    target_type_id: types_mod.TypeId,
+    depth: usize,
+) bool {
+    if (current_type_id >= type_store.types.items.len) return false;
+    if (depth > type_store.types.items.len) return false;
+
+    return switch (type_store.getType(current_type_id)) {
+        .struct_type => |struct_type| blk: {
+            if (current_type_id == target_type_id) break :blk true;
+            for (struct_type.fields) |field| {
+                if (typeReferencesTargetStruct(type_store, field.type_id, target_type_id, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .union_type => |union_type| blk: {
+            for (union_type.members) |member_type_id| {
+                if (typeReferencesTargetStruct(type_store, member_type_id, target_type_id, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .tagged_union => |tagged_union| blk: {
+            for (tagged_union.variants) |variant| {
+                const payload_type_id = variant.type_id orelse continue;
+                if (typeReferencesTargetStruct(type_store, payload_type_id, target_type_id, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .tuple => |tuple_type| blk: {
+            for (tuple_type.elements) |element_type_id| {
+                if (typeReferencesTargetStruct(type_store, element_type_id, target_type_id, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .list => |list_type| typeReferencesTargetStruct(type_store, list_type.element, target_type_id, depth + 1),
+        .map => |map_type| typeReferencesTargetStruct(type_store, map_type.key, target_type_id, depth + 1) or
+            typeReferencesTargetStruct(type_store, map_type.value, target_type_id, depth + 1),
+        .function => |function_type| blk: {
+            for (function_type.params) |param_type_id| {
+                if (typeReferencesTargetStruct(type_store, param_type_id, target_type_id, depth + 1)) break :blk true;
+            }
+            break :blk typeReferencesTargetStruct(type_store, function_type.return_type, target_type_id, depth + 1);
+        },
+        .applied => |applied_type| blk: {
+            if (typeReferencesTargetStruct(type_store, applied_type.base, target_type_id, depth + 1)) break :blk true;
+            for (applied_type.args) |arg_type_id| {
+                if (typeReferencesTargetStruct(type_store, arg_type_id, target_type_id, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn findOptionalUnionTypeId(type_store: *const types_mod.TypeStore, payload_type_id: types_mod.TypeId) ?types_mod.TypeId {
+    for (type_store.types.items, 0..) |candidate_type, candidate_index| {
+        if (candidate_type != .union_type) continue;
+        const union_type = candidate_type.union_type;
+        if (union_type.members.len != 2) continue;
+
+        var saw_payload = false;
+        var saw_nil = false;
+        for (union_type.members) |member_type_id| {
+            if (member_type_id == types_mod.TypeStore.NIL) {
+                saw_nil = true;
+            } else if (type_store.typeEquals(member_type_id, payload_type_id)) {
+                saw_payload = true;
+            }
+        }
+        if (saw_payload and saw_nil) return @intCast(candidate_index);
+    }
+    return null;
 }
 
 /// Default `ParamConvention` for a parameter of HIR type `type_id`.
@@ -1516,20 +1603,134 @@ pub const IrBuilder = struct {
         return group.clauses[0].params[arg_index].type_id;
     }
 
+    fn callTargetReturnType(self: *const IrBuilder, target: hir_mod.CallTarget, arg_count: usize) ?types_mod.TypeId {
+        const group = switch (target) {
+            .direct => |direct| self.hirFunctionGroupById(direct.function_group_id) orelse return null,
+            .dispatch => |dispatch| self.hirFunctionGroupById(dispatch.function_group_id) orelse return null,
+            .named => |named| self.resolveNamedHirGroup(named, @intCast(arg_count)) orelse return null,
+            else => return null,
+        };
+        if (group.clauses.len == 0) return null;
+        return group.clauses[0].return_type;
+    }
+
+    fn callTargetClause(
+        self: *IrBuilder,
+        target: hir_mod.CallTarget,
+        arg_count: usize,
+        args: []const hir_mod.CallArg,
+    ) ?*const hir_mod.Clause {
+        const group = switch (target) {
+            .direct => |direct| blk: {
+                const group = self.hirFunctionGroupById(direct.function_group_id) orelse return null;
+                if (direct.clause_index) |clause_index| {
+                    const index: usize = @intCast(clause_index);
+                    if (index < group.clauses.len) return &group.clauses[index];
+                }
+                break :blk group;
+            },
+            .dispatch => |dispatch| self.hirFunctionGroupById(dispatch.function_group_id) orelse return null,
+            .named => |named| blk: {
+                const group = self.resolveNamedHirGroup(named, @intCast(arg_count)) orelse return null;
+                if (named.struct_name) |struct_name| {
+                    if (self.selectTypeOnlyNamedClause(struct_name, named.name, arg_count, args, named.clause_index)) |selected| {
+                        const index: usize = @intCast(selected.clause_index);
+                        if (index < group.clauses.len) return &group.clauses[index];
+                    }
+                }
+                if (named.clause_index) |clause_index| {
+                    const index: usize = @intCast(clause_index);
+                    if (index < group.clauses.len) return &group.clauses[index];
+                }
+                break :blk group;
+            },
+            else => return null,
+        };
+
+        if (group.clauses.len == 0) return null;
+        return &group.clauses[0];
+    }
+
+    fn resolvedCallReturnType(
+        self: *IrBuilder,
+        target: hir_mod.CallTarget,
+        args: []const hir_mod.CallArg,
+    ) ?types_mod.TypeId {
+        const store_const = self.type_store orelse return self.callTargetReturnType(target, args.len);
+        const clause = self.callTargetClause(target, args.len, args) orelse return null;
+        const return_type = clause.return_type;
+        if (!containsTypeVarInStore(store_const, return_type)) return return_type;
+
+        var substitutions = types_mod.SubstitutionMap.init(self.allocator);
+        defer substitutions.deinit();
+
+        const param_count = @min(clause.params.len, args.len);
+        for (clause.params[0..param_count], args[0..param_count]) |param, arg| {
+            const actual_type = self.typeOnlyArgType(arg);
+            if (actual_type == types_mod.TypeStore.UNKNOWN or actual_type == types_mod.TypeStore.ERROR) continue;
+            const matched = store_const.unify(param.type_id, actual_type, &substitutions) catch false;
+            if (!matched) return return_type;
+        }
+
+        // `applyToReturnType` may intern a compound instantiated type
+        // such as `List(f64)`. IR owns the same TypeStore used by
+        // type-checking and monomorphization, so extending it here
+        // keeps later ownership/ZIR decisions on concrete TypeIds
+        // instead of stale bare type variables.
+        return substitutions.applyToReturnType(@constCast(store_const), return_type);
+    }
+
+    fn trackCallResultType(self: *IrBuilder, dest: LocalId, return_type: ?types_mod.TypeId) !void {
+        const type_id = return_type orelse return;
+        _ = self.usableContextType(type_id) orelse return;
+        try self.local_hir_types.put(dest, type_id);
+        const zig_type = typeIdToZigTypeWithStore(type_id, self.type_store);
+        if (zig_type != .any and zig_type != .void) {
+            try self.known_local_types.put(dest, zig_type);
+        }
+    }
+
+    fn binaryResultZigType(
+        self: *const IrBuilder,
+        result_type_id: types_mod.TypeId,
+        lhs: LocalId,
+        rhs: LocalId,
+    ) ZigType {
+        const result_type = typeIdToZigTypeWithStore(result_type_id, self.type_store);
+        if (result_type != .any) return result_type;
+        if (self.known_local_types.get(lhs)) |lhs_type| {
+            if (lhs_type != .any) return lhs_type;
+        }
+        if (self.known_local_types.get(rhs)) |rhs_type| {
+            if (rhs_type != .any) return rhs_type;
+        }
+        return .any;
+    }
+
+    fn binaryResultHirType(
+        self: *const IrBuilder,
+        result_type_id: types_mod.TypeId,
+        lhs: LocalId,
+        rhs: LocalId,
+    ) types_mod.TypeId {
+        if (self.usableContextType(result_type_id)) |type_id| return type_id;
+        if (self.local_hir_types.get(lhs)) |lhs_type| {
+            if (self.usableContextType(lhs_type)) |type_id| return type_id;
+        }
+        if (self.local_hir_types.get(rhs)) |rhs_type| {
+            if (self.usableContextType(rhs_type)) |type_id| return type_id;
+        }
+        return result_type_id;
+    }
+
     fn listElementTypeFromHirMaybe(self: *const IrBuilder, type_id: types_mod.TypeId) ?ZigType {
-        const ts = self.type_store orelse return .i64;
-        if (type_id >= ts.types.items.len) return .i64;
+        const ts = self.type_store orelse return null;
+        if (type_id >= ts.types.items.len) return null;
         const typ = ts.types.items[type_id];
         return switch (typ) {
             .list => |lt| typeIdToZigTypeWithStore(lt.element, self.type_store),
             else => null,
         };
-    }
-
-    /// Extract the list element ZigType from an HIR expression's type_id.
-    /// Returns .i64 as default when type info is unavailable or not a list type.
-    fn listElementTypeFromHir(self: *const IrBuilder, type_id: types_mod.TypeId) ZigType {
-        return self.listElementTypeFromHirMaybe(type_id) orelse .i64;
     }
 
     fn listTypeFromElement(self: *const IrBuilder, element_type: ZigType) !ZigType {
@@ -1577,6 +1778,41 @@ pub const IrBuilder = struct {
         return null;
     }
 
+    fn usableContextType(self: *const IrBuilder, type_id: types_mod.TypeId) ?types_mod.TypeId {
+        if (type_id == types_mod.TypeStore.UNKNOWN or type_id == types_mod.TypeStore.ERROR) return null;
+        if (self.type_store) |store| {
+            if (containsTypeVarInStore(store, type_id)) return null;
+        }
+        const resolved = typeIdToZigTypeWithStore(type_id, self.type_store);
+        if (resolved == .any) return null;
+        return type_id;
+    }
+
+    fn shouldPreferContextType(self: *const IrBuilder, fallback: types_mod.TypeId, context: types_mod.TypeId) bool {
+        _ = self.usableContextType(context) orelse return false;
+        if (fallback == types_mod.TypeStore.UNKNOWN or fallback == types_mod.TypeStore.ERROR) return true;
+        const fallback_resolved = typeIdToZigTypeWithStore(fallback, self.type_store);
+        if (fallback_resolved == .any) return true;
+        if (self.type_store) |store| {
+            if (containsTypeVarInStore(store, fallback)) return true;
+        }
+        return false;
+    }
+
+    fn effectiveTrackedHirType(self: *IrBuilder, expr: *const hir_mod.Expr) types_mod.TypeId {
+        var fallback = expr.type_id;
+        if (expr.kind == .call) {
+            const call = expr.kind.call;
+            if (self.resolvedCallReturnType(call.target, call.args)) |return_type| {
+                if (self.usableContextType(return_type) != null) fallback = return_type;
+            }
+        }
+        if (self.current_expected_type) |context| {
+            if (self.shouldPreferContextType(fallback, context)) return context;
+        }
+        return fallback;
+    }
+
     fn listElementTypeFromTailLocal(self: *const IrBuilder, tail: LocalId) ?ZigType {
         if (self.known_local_types.get(tail)) |tail_type| {
             if (tail_type == .list) {
@@ -1598,12 +1834,13 @@ pub const IrBuilder = struct {
     }
 
     /// Extract the list element ZigType from a local's known type.
-    /// Falls back to .i64 when the local's type is unknown or not a list.
-    fn listElementTypeForLocal(self: *const IrBuilder, local: LocalId) ZigType {
-        const known = self.known_local_types.get(local) orelse return .i64;
+    /// Returns null when the local's type is unknown or not a list; callers
+    /// must choose an explicit default only at syntactic empty-list sites.
+    fn listElementTypeForLocal(self: *const IrBuilder, local: LocalId) ?ZigType {
+        const known = self.known_local_types.get(local) orelse return null;
         return switch (std.meta.activeTag(known)) {
             .list => known.list.*,
-            else => .i64,
+            else => null,
         };
     }
 
@@ -1882,6 +2119,22 @@ pub const IrBuilder = struct {
         return false;
     }
 
+    fn typeOnlyArgType(self: *const IrBuilder, arg: hir_mod.CallArg) hir_mod.TypeId {
+        switch (arg.expr.kind) {
+            .local_get => |local| {
+                if (self.local_hir_types.get(local)) |tracked_type| return tracked_type;
+            },
+            .param_get => |param_index| {
+                if (param_index < self.current_param_hir_types.items.len) {
+                    return self.current_param_hir_types.items[param_index];
+                }
+            },
+            else => {},
+        }
+
+        return arg.expr.type_id;
+    }
+
     fn typeOnlyClauseMatchCost(self: *const IrBuilder, clause: *const hir_mod.Clause, call_arity: usize, args: []const hir_mod.CallArg) ?u32 {
         const ts = self.type_store orelse return null;
         if (args.len < call_arity) return null;
@@ -1889,10 +2142,40 @@ pub const IrBuilder = struct {
 
         var total: u32 = 0;
         for (args[0..call_arity], clause.params[0..call_arity]) |arg, param| {
-            const cost = ts.callMatchCost(arg.expr.type_id, param.type_id) orelse return null;
+            const cost = ts.callMatchCost(self.typeOnlyArgType(arg), param.type_id) orelse return null;
             total +|= cost;
         }
         return total;
+    }
+
+    fn typeOnlyClauseCanonicalRank(self: *const IrBuilder, clause: *const hir_mod.Clause, call_arity: usize, args: []const hir_mod.CallArg) u32 {
+        if (args.len < call_arity or clause.params.len < call_arity) return std.math.maxInt(u32);
+
+        var total: u32 = 0;
+        for (args[0..call_arity], clause.params[0..call_arity]) |arg, param| {
+            if (self.typeOnlyArgType(arg) != types_mod.TypeStore.UNKNOWN) continue;
+            total +|= self.canonicalTypeRank(param.type_id);
+        }
+        return total;
+    }
+
+    fn canonicalTypeRank(self: *const IrBuilder, type_id: types_mod.TypeId) u32 {
+        const ts = self.type_store orelse return 1024;
+        const typ = ts.getType(type_id);
+        return switch (typ) {
+            .int => |int_info| blk: {
+                const bits = @as(i32, int_info.bits);
+                const dist: u32 = @intCast(if (bits >= 64) bits - 64 else 64 - bits);
+                const sign_penalty: u32 = if (int_info.signedness == .signed) 0 else 1;
+                break :blk dist * 2 + sign_penalty;
+            },
+            .float => |float_info| blk: {
+                const bits = @as(i32, float_info.bits);
+                const dist: u32 = @intCast(if (bits >= 64) bits - 64 else 64 - bits);
+                break :blk @as(u32, 256) + dist;
+            },
+            else => 1024,
+        };
     }
 
     fn selectTypeOnlyNamedClause(
@@ -1908,6 +2191,7 @@ pub const IrBuilder = struct {
 
         var best: ?TypedClauseResolution = null;
         var best_cost: u32 = std.math.maxInt(u32);
+        var best_rank: u32 = std.math.maxInt(u32);
 
         for (program.structs) |candidate_struct| {
             const candidate_prefix = self.structNameToPrefix(candidate_struct.name);
@@ -1920,16 +2204,7 @@ pub const IrBuilder = struct {
                 if (declared_arity > call_arity + 4) continue;
                 if (!self.isTypeOnlyOverloadGroup(&function_group)) continue;
 
-                if (requested_clause_index) |clause_index| {
-                    const clause_index_usize: usize = @intCast(clause_index);
-                    if (clause_index_usize >= function_group.clauses.len) continue;
-                    const clause = &function_group.clauses[clause_index_usize];
-                    _ = self.typeOnlyClauseMatchCost(clause, call_arity, args) orelse continue;
-                    return .{
-                        .declared_arity = function_group.arity,
-                        .clause_index = clause_index,
-                    };
-                }
+                _ = requested_clause_index;
 
                 for (function_group.clauses, 0..) |*clause, clause_index| {
                     const cost = self.typeOnlyClauseMatchCost(clause, call_arity, args) orelse continue;
@@ -1939,7 +2214,16 @@ pub const IrBuilder = struct {
                             .clause_index = @intCast(clause_index),
                         };
                         best_cost = cost;
-                        if (cost == 0) return best;
+                        best_rank = self.typeOnlyClauseCanonicalRank(clause, call_arity, args);
+                    } else if (cost == best_cost) {
+                        const rank = self.typeOnlyClauseCanonicalRank(clause, call_arity, args);
+                        if (rank < best_rank) {
+                            best = .{
+                                .declared_arity = function_group.arity,
+                                .clause_index = @intCast(clause_index),
+                            };
+                            best_rank = rank;
+                        }
                     }
                 }
             }
@@ -1990,7 +2274,7 @@ pub const IrBuilder = struct {
         try self.emitStructBindings(clause);
         try self.emitBinaryBindings(clause);
         try self.emitMapBindings(clause);
-        const result_local = try self.lowerBlock(clause.body);
+        const result_local = try self.lowerBlockExpecting(clause.body, clause.return_type);
         try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
         const entry_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
 
@@ -2085,6 +2369,7 @@ pub const IrBuilder = struct {
         for (first_clause.params, 0..) |param, i| {
             const name = try std.fmt.allocPrint(self.allocator, "__arg_{d}", .{i});
             var resolved_type = typeIdToZigTypeWithStore(param.type_id, self.type_store);
+            var resolved_type_id: ?types_mod.TypeId = param.type_id;
             if (group.clauses.len > 1) {
                 for (group.clauses[1..]) |clause| {
                     if (i < clause.params.len) {
@@ -2099,18 +2384,21 @@ pub const IrBuilder = struct {
                             // Check if this is a union synthesis candidate
                             if (try self.canUnionDispatch(group, @intCast(i))) |union_type_name| {
                                 resolved_type = .{ .struct_ref = union_type_name };
+                                resolved_type_id = null;
                                 union_param_idx = @intCast(i);
-                            } else if (self.canOptionalDispatch(group, @intCast(i))) |sname| {
+                            } else if (self.canOptionalDispatch(group, @intCast(i))) |optional_candidate| {
                                 // f(nil) / f(t :: T) shape — unify the
                                 // param to `?T` and route via
                                 // optional_dispatch IR.
                                 const inner_ptr = try self.allocator.create(ZigType);
-                                inner_ptr.* = .{ .struct_ref = sname };
+                                inner_ptr.* = .{ .struct_ref = optional_candidate.struct_name };
                                 resolved_type = .{ .optional = inner_ptr };
+                                resolved_type_id = optional_candidate.optional_type_id;
                                 optional_param_idx = @intCast(i);
-                                optional_struct_name = sname;
+                                optional_struct_name = optional_candidate.struct_name;
                             } else {
                                 resolved_type = .any;
+                                resolved_type_id = null;
                             }
                             break;
                         }
@@ -2120,10 +2408,10 @@ pub const IrBuilder = struct {
             try params.append(self.allocator, .{
                 .name = name,
                 .type_expr = resolved_type,
-                .type_id = param.type_id,
+                .type_id = resolved_type_id,
             });
             try self.current_param_types.append(self.allocator, resolved_type);
-            try self.current_param_hir_types.append(self.allocator, param.type_id);
+            try self.current_param_hir_types.append(self.allocator, resolved_type_id orelse param.type_id);
         }
 
         // Reserve local indices used by destructure bindings across all clauses.
@@ -2140,7 +2428,7 @@ pub const IrBuilder = struct {
             try self.emitStructBindings(first_clause);
             try self.emitBinaryBindings(first_clause);
             try self.emitMapBindings(first_clause);
-            const result_local = try self.lowerBlock(first_clause.body);
+            const result_local = try self.lowerBlockExpecting(first_clause.body, first_clause.return_type);
             try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
         } else if (self.canSwitchDispatch(group)) |switch_param| {
             // Emit switch_return for integer literal dispatch
@@ -2157,7 +2445,7 @@ pub const IrBuilder = struct {
                     self.current_instrs = .empty;
                     try self.emitTupleBindings(&clause);
                     try self.emitStructBindings(&clause);
-                    const result_local = try self.lowerBlock(clause.body);
+                    const result_local = try self.lowerBlockExpecting(clause.body, clause.return_type);
                     default_instrs_result = try self.current_instrs.toOwnedSlice(self.allocator);
                     default_result = result_local;
                     self.current_instrs = saved;
@@ -2171,7 +2459,7 @@ pub const IrBuilder = struct {
 
                     const saved = self.current_instrs;
                     self.current_instrs = .empty;
-                    const body_result = try self.lowerBlock(clause.body);
+                    const body_result = try self.lowerBlockExpecting(clause.body, clause.return_type);
                     const body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                     self.current_instrs = saved;
 
@@ -2221,7 +2509,7 @@ pub const IrBuilder = struct {
                 // Lower body
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
-                const body_result = try self.lowerBlock(clause.body);
+                const body_result = try self.lowerBlockExpecting(clause.body, clause.return_type);
                 const body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved;
 
@@ -2284,7 +2572,7 @@ pub const IrBuilder = struct {
                     try self.emitBinaryBindings(&clause);
                     try self.emitMapBindings(&clause);
                 }
-                const body_result = try self.lowerBlock(clause.body);
+                const body_result = try self.lowerBlockExpecting(clause.body, clause.return_type);
                 const body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved;
 
@@ -2647,11 +2935,6 @@ pub const IrBuilder = struct {
             .atom,
             .never,
             .ptr,
-            // `?*const Vector(T)` is a single pointer-size optional —
-            // Zig passes it in registers like any other `?*T`, so it
-            // satisfies the by-value requirement for `musttail`.
-            .vector_i64,
-            .vector_f64,
             => true,
             // Anything routed through Zig's by-ref ABI is unsafe for
             // `musttail`. Strings (slices), structs, tuples, lists,
@@ -3474,16 +3757,15 @@ pub const IrBuilder = struct {
         };
     }
 
-    /// Check if all clauses have distinct named struct types for a given param position.
-    /// Returns the synthesized union type name if eligible, null otherwise.
     /// Detect the multi-clause `f(nil) / f(t :: T)` shape where every
     /// clause for `param_idx` is either the `nil` literal pattern or a
     /// non-nil pattern (typed bind / struct match) over the same nominal
     /// struct. The unified parameter type is `?T` so the call site can
     /// pass either `nil` or a `T` value, and the dispatcher routes on
-    /// is-null. Returns the single struct name on success — caller
-    /// promotes the param's `ZigType` to `optional(struct_ref T)` and
-    /// emits an `optional_dispatch` IR.
+    /// is-null. Returns the single struct type on success — caller
+    /// promotes the param's `ZigType` to `optional(struct_ref T)`,
+    /// preserves the optional union TypeId when one already exists in
+    /// the TypeStore, and emits an `optional_dispatch` IR.
     ///
     /// Reasons to return null:
     ///  - fewer than two clauses
@@ -3491,11 +3773,12 @@ pub const IrBuilder = struct {
     ///  - any clause has a non-nil / non-struct type for this param
     ///  - more than one distinct struct type among the non-nil clauses
     ///  - all clauses are nil (degenerate) or all struct (no optional)
-    fn canOptionalDispatch(self: *IrBuilder, group: *const hir_mod.FunctionGroup, param_idx: u32) ?[]const u8 {
+    fn canOptionalDispatch(self: *IrBuilder, group: *const hir_mod.FunctionGroup, param_idx: u32) ?OptionalDispatchCandidate {
         if (group.clauses.len < 2) return null;
         const ts = self.type_store orelse return null;
 
         var struct_name: ?[]const u8 = null;
+        var struct_type_id: ?types_mod.TypeId = null;
         var saw_nil = false;
         var saw_struct = false;
 
@@ -3527,8 +3810,10 @@ pub const IrBuilder = struct {
                     const sname = self.interner.get(st.name);
                     if (struct_name) |existing| {
                         if (!std.mem.eql(u8, existing, sname)) return null;
+                        if (struct_type_id != tid) return null;
                     } else {
                         struct_name = sname;
+                        struct_type_id = tid;
                     }
                     saw_struct = true;
                 },
@@ -3537,7 +3822,11 @@ pub const IrBuilder = struct {
         }
 
         if (!saw_nil or !saw_struct) return null;
-        return struct_name;
+        return .{
+            .struct_name = struct_name.?,
+            .struct_type_id = struct_type_id.?,
+            .optional_type_id = findOptionalUnionTypeId(ts, struct_type_id.?),
+        };
     }
 
     fn canUnionDispatch(self: *IrBuilder, group: *const hir_mod.FunctionGroup, param_idx: u32) !?[]const u8 {
@@ -4382,7 +4671,10 @@ pub const IrBuilder = struct {
         self.next_local += 1;
 
         // Lower scrutinee (also after reservation)
+        const saved_expected_type = self.current_expected_type;
+        self.current_expected_type = null;
         const scrutinee_local = try self.lowerExpr(case_data.scrutinee);
+        self.current_expected_type = saved_expected_type;
 
         try self.lowerCaseExprBody(dest, scrutinee_local, case_data);
         return dest;
@@ -4679,7 +4971,6 @@ pub const IrBuilder = struct {
             },
             .check_list => |cl| {
                 const scrutinee_local = self.resolveScrutinee(cl.scrutinee, scrutinee_map);
-                const elem_type = self.listElementTypeForLocal(scrutinee_local);
                 // When the scrutinee comes from a param, the runtime element
                 // type may diverge from the declared one (e.g. heterogeneous
                 // keyword list `[name: "x", age: 42]` passed to a function
@@ -4688,6 +4979,8 @@ pub const IrBuilder = struct {
                 // is read from `@TypeOf(list)` instead of the stale declared
                 // element type.
                 const dispatch_via_helper = self.localBackedByParam(scrutinee_local);
+                const elem_type = self.listElementTypeForLocal(scrutinee_local) orelse
+                    if (dispatch_via_helper) ZigType.any else return error.ListElementTypeUnavailable;
                 const len_check_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
@@ -4733,26 +5026,33 @@ pub const IrBuilder = struct {
             },
             .check_list_cons => |clc| {
                 const scrutinee_local = self.resolveScrutinee(clc.scrutinee, scrutinee_map);
-                const elem_type = self.listElementTypeForLocal(scrutinee_local);
                 const scrutinee_list_type = self.known_local_types.get(scrutinee_local) orelse .any;
                 // Same param-backed dispatch shim as check_list — route
                 // through the type-derived list helpers when the scrutinee
                 // came from a param so the runtime element type is honored.
                 const dispatch_via_helper = self.localBackedByParam(scrutinee_local);
-                const not_empty_local = self.next_local;
+                const elem_type = self.listElementTypeForLocal(scrutinee_local) orelse
+                    if (dispatch_via_helper) ZigType.any else return error.ListElementTypeUnavailable;
+                const len_check_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .list_is_not_empty = .{ .dest = not_empty_local, .list = scrutinee_local, .element_type = elem_type, .via_helper = dispatch_via_helper },
+                    .list_len_check = .{
+                        .dest = len_check_local,
+                        .scrutinee = scrutinee_local,
+                        .expected_len = clc.head_count,
+                        .minimum = true,
+                        .element_type = elem_type,
+                        .via_helper = dispatch_via_helper,
+                    },
                 });
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
                 var i: u32 = 0;
-                var current_list = scrutinee_local;
                 while (i < clc.head_count) : (i += 1) {
                     const head_local = self.next_local;
                     self.next_local += 1;
                     try self.current_instrs.append(self.allocator, .{
-                        .list_head = .{ .dest = head_local, .list = current_list, .element_type = elem_type, .via_helper = dispatch_via_helper },
+                        .list_get = .{ .dest = head_local, .list = scrutinee_local, .index = i, .element_type = elem_type, .via_helper = dispatch_via_helper },
                     });
                     try self.known_local_types.put(head_local, elem_type);
                     // Phase H.1: propagate the HIR element type so any
@@ -4762,35 +5062,22 @@ pub const IrBuilder = struct {
                     // chain falls back to `.trivial` and the verifier's
                     // V2 invariant rejects the matching post-call
                     // release once `.list` joins the ARC-managed set.
-                    try self.recordListChildHirType(current_list, head_local, .element);
+                    try self.recordListChildHirType(scrutinee_local, head_local, .element);
                     try scrutinee_map.put(clc.head_scrutinee_ids[i], head_local);
-                    if (i + 1 < clc.head_count) {
-                        const next_list = self.next_local;
-                        self.next_local += 1;
-                        try self.current_instrs.append(self.allocator, .{
-                            .list_tail = .{ .dest = next_list, .list = current_list, .element_type = elem_type, .via_helper = dispatch_via_helper },
-                        });
-                        try self.known_local_types.put(next_list, scrutinee_list_type);
-                        // Same propagation for intermediate tail locals
-                        // (multi-head pattern unfolds chain into a series
-                        // of list_tails feeding into the next list_head).
-                        try self.recordListChildHirType(current_list, next_list, .list);
-                        current_list = next_list;
-                    }
                 }
                 const tail_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .list_tail = .{ .dest = tail_local, .list = current_list, .element_type = elem_type, .via_helper = dispatch_via_helper },
+                    .list_tail = .{ .dest = tail_local, .list = scrutinee_local, .element_type = elem_type, .start_index = clc.head_count, .via_helper = dispatch_via_helper },
                 });
                 try self.known_local_types.put(tail_local, scrutinee_list_type);
-                try self.recordListChildHirType(current_list, tail_local, .list);
+                try self.recordListChildHirType(scrutinee_local, tail_local, .list);
                 try scrutinee_map.put(clc.tail_scrutinee_id, tail_local);
                 try self.lowerDecisionTreeForCase(clc.success, case_arms, scrutinee_map, 0);
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved;
                 try self.current_instrs.append(self.allocator, .{
-                    .guard_block = .{ .condition = not_empty_local, .body = success_body },
+                    .guard_block = .{ .condition = len_check_local, .body = success_body },
                 });
                 try self.lowerDecisionTreeForCase(clc.failure, case_arms, scrutinee_map, 0);
             },
@@ -4938,6 +5225,7 @@ pub const IrBuilder = struct {
                 }
                 // Emit list element bindings
                 for (clause.list_bindings) |binding| {
+                    if (self.known_local_types.contains(binding.local_index)) continue;
                     const list_local = scrutinee_map.get(binding.param_index) orelse blk: {
                         const pl = self.next_local;
                         self.next_local += 1;
@@ -4961,7 +5249,8 @@ pub const IrBuilder = struct {
                         }
                         break :blk pl;
                     };
-                    const list_elem_type = self.listElementTypeForLocal(list_local);
+                    const list_elem_type = self.listElementTypeForLocal(list_local) orelse
+                        return error.ListElementTypeUnavailable;
                     try self.current_instrs.append(self.allocator, .{
                         .list_get = .{
                             .dest = binding.local_index,
@@ -4984,6 +5273,7 @@ pub const IrBuilder = struct {
                 }
                 // Emit cons tail bindings: copy decision tree tail locals to binding locals
                 for (clause.cons_tail_bindings) |binding| {
+                    if (self.known_local_types.contains(binding.local_index)) continue;
                     // The tail was extracted by check_list_cons and stored in scrutinee_map.
                     // Find the tail local and copy it to the binding's local_index.
                     // The scrutinee_map maps scrutinee IDs → locals, but we need to find
@@ -4992,10 +5282,11 @@ pub const IrBuilder = struct {
                     // The tail is the list local itself (after head extraction, the remaining
                     // scrutinee entries represent tails). Search for a tail scrutinee.
                     // For simplicity, use list_tail on the original list to get the tail.
-                    const list_elem_type = self.listElementTypeForLocal(list_local);
+                    const list_elem_type = self.listElementTypeForLocal(list_local) orelse
+                        return error.ListElementTypeUnavailable;
                     const scrutinee_list_type = self.known_local_types.get(list_local) orelse .any;
                     try self.current_instrs.append(self.allocator, .{
-                        .list_tail = .{ .dest = binding.local_index, .list = list_local, .element_type = list_elem_type },
+                        .list_tail = .{ .dest = binding.local_index, .list = list_local, .element_type = list_elem_type, .start_index = binding.start_index },
                     });
                     try self.known_local_types.put(binding.local_index, scrutinee_list_type);
                     // Phase H.1: propagate the HIR list type onto the
@@ -5014,7 +5305,7 @@ pub const IrBuilder = struct {
                 // Emit binary/struct bindings
                 try self.emitBinaryBindings(clause);
                 try self.emitStructBindings(clause);
-                const result_local = try self.lowerBlock(clause.body);
+                const result_local = try self.lowerBlockExpecting(clause.body, clause.return_type);
                 try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
             },
             .failure => {
@@ -5115,7 +5406,8 @@ pub const IrBuilder = struct {
             },
             .check_list => |cl| {
                 const scrutinee_local = self.resolveScrutinee(cl.scrutinee, scrutinee_map);
-                const elem_type = self.listElementTypeForLocal(scrutinee_local);
+                const elem_type = self.listElementTypeForLocal(scrutinee_local) orelse
+                    return error.ListElementTypeUnavailable;
                 // Emit: __local_N = scrutinee.len == expected_length
                 const len_check_local = self.next_local;
                 self.next_local += 1;
@@ -5146,54 +5438,47 @@ pub const IrBuilder = struct {
             },
             .check_list_cons => |clc| {
                 const scrutinee_local = self.resolveScrutinee(clc.scrutinee, scrutinee_map);
-                const elem_type = self.listElementTypeForLocal(scrutinee_local);
+                const elem_type = self.listElementTypeForLocal(scrutinee_local) orelse
+                    return error.ListElementTypeUnavailable;
                 const scrutinee_list_type = self.known_local_types.get(scrutinee_local) orelse .any;
-                // Emit non-empty check: List.isEmpty(list) == false
-                const not_empty_local = self.next_local;
+                const len_check_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .list_is_not_empty = .{ .dest = not_empty_local, .list = scrutinee_local, .element_type = elem_type },
+                    .list_len_check = .{
+                        .dest = len_check_local,
+                        .scrutinee = scrutinee_local,
+                        .expected_len = clc.head_count,
+                        .minimum = true,
+                        .element_type = elem_type,
+                    },
                 });
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
-                // Extract head elements
                 var i: u32 = 0;
-                var current_list = scrutinee_local;
                 while (i < clc.head_count) : (i += 1) {
                     const head_local = self.next_local;
                     self.next_local += 1;
                     try self.current_instrs.append(self.allocator, .{
-                        .list_head = .{ .dest = head_local, .list = current_list, .element_type = elem_type },
+                        .list_get = .{ .dest = head_local, .list = scrutinee_local, .index = i, .element_type = elem_type },
                     });
                     try self.known_local_types.put(head_local, elem_type);
-                    try self.recordListChildHirType(current_list, head_local, .element);
+                    try self.recordListChildHirType(scrutinee_local, head_local, .element);
                     try scrutinee_map.put(clc.head_scrutinee_ids[i], head_local);
-                    if (i + 1 < clc.head_count) {
-                        const next_list = self.next_local;
-                        self.next_local += 1;
-                        try self.current_instrs.append(self.allocator, .{
-                            .list_tail = .{ .dest = next_list, .list = current_list, .element_type = elem_type },
-                        });
-                        try self.known_local_types.put(next_list, scrutinee_list_type);
-                        try self.recordListChildHirType(current_list, next_list, .list);
-                        current_list = next_list;
-                    }
                 }
-                // Extract tail
                 const tail_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .list_tail = .{ .dest = tail_local, .list = current_list, .element_type = elem_type },
+                    .list_tail = .{ .dest = tail_local, .list = scrutinee_local, .element_type = elem_type, .start_index = clc.head_count },
                 });
                 try self.known_local_types.put(tail_local, scrutinee_list_type);
-                try self.recordListChildHirType(current_list, tail_local, .list);
+                try self.recordListChildHirType(scrutinee_local, tail_local, .list);
                 try scrutinee_map.put(clc.tail_scrutinee_id, tail_local);
 
                 try self.lowerDecisionTreeForDispatch(clc.success, clauses, scrutinee_map);
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved;
                 try self.current_instrs.append(self.allocator, .{
-                    .guard_block = .{ .condition = not_empty_local, .body = success_body },
+                    .guard_block = .{ .condition = len_check_local, .body = success_body },
                 });
                 try self.lowerDecisionTreeForDispatch(clc.failure, clauses, scrutinee_map);
             },
@@ -5228,7 +5513,7 @@ pub const IrBuilder = struct {
                         const inner_saved = self.current_instrs;
                         self.current_instrs = .empty;
                         try self.emitBinaryBindings(&clause);
-                        const result_local = try self.lowerBlock(clause.body);
+                        const result_local = try self.lowerBlockExpecting(clause.body, clause.return_type);
                         try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
                         const all_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                         self.current_instrs = inner_saved;
@@ -5308,6 +5593,21 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForDispatch(cb.failure, clauses, scrutinee_map);
             },
             .bind => |bind_node| {
+                const scrutinee_local = self.resolveScrutinee(bind_node.source, scrutinee_map);
+                for (clauses) |clause| {
+                    for (clause.list_bindings) |binding| {
+                        if (binding.name == bind_node.name) {
+                            try self.emitLocalGet(binding.local_index, scrutinee_local);
+                            break;
+                        }
+                    }
+                    for (clause.cons_tail_bindings) |binding| {
+                        if (binding.name == bind_node.name) {
+                            try self.emitLocalGet(binding.local_index, scrutinee_local);
+                            break;
+                        }
+                    }
+                }
                 try self.lowerDecisionTreeForDispatch(bind_node.next, clauses, scrutinee_map);
             },
             .extract_struct => |es| {
@@ -5436,7 +5736,13 @@ pub const IrBuilder = struct {
                     },
                 };
                 try self.current_instrs.append(self.allocator, .{
-                    .binary_op = .{ .dest = dest, .op = ir_op, .lhs = lhs, .rhs = rhs },
+                    .binary_op = .{
+                        .dest = dest,
+                        .op = ir_op,
+                        .lhs = lhs,
+                        .rhs = rhs,
+                        .result_type = self.binaryResultZigType(expr.type_id, lhs, rhs),
+                    },
                 });
                 return dest;
             },
@@ -5515,9 +5821,18 @@ pub const IrBuilder = struct {
 
     fn lowerBlock(self: *IrBuilder, block: *const hir_mod.Block) anyerror!?LocalId {
         var last_local: ?LocalId = null;
-        for (block.stmts) |stmt| {
+        for (block.stmts, 0..) |stmt, stmt_index| {
             switch (stmt) {
-                .expr => |expr| last_local = try self.lowerExpr(expr),
+                .expr => |expr| {
+                    const saved_expected_type = self.current_expected_type;
+                    if (stmt_index + 1 == block.stmts.len) {
+                        if (self.usableContextType(block.result_type)) |block_result_type| {
+                            self.current_expected_type = block_result_type;
+                        }
+                    }
+                    defer self.current_expected_type = saved_expected_type;
+                    last_local = try self.lowerExpr(expr);
+                },
                 .local_set => |ls| {
                     const val = try self.lowerExpr(ls.value);
                     // Skip redundant self-assignment (e.g., struct init already in the right local)
@@ -5559,6 +5874,21 @@ pub const IrBuilder = struct {
             }
         }
         return last_local;
+    }
+
+    fn lowerBlockExpecting(
+        self: *IrBuilder,
+        block: *const hir_mod.Block,
+        expected_type: ?types_mod.TypeId,
+    ) anyerror!?LocalId {
+        const saved_expected_type = self.current_expected_type;
+        if (expected_type) |type_id| {
+            if (self.usableContextType(type_id)) |usable_type_id| {
+                self.current_expected_type = usable_type_id;
+            }
+        }
+        defer self.current_expected_type = saved_expected_type;
+        return try self.lowerBlock(block);
     }
 
     /// Phase H.1: kind of HIR-type relationship between a list local
@@ -5613,14 +5943,10 @@ pub const IrBuilder = struct {
         // allocated cells), continued by H.2's `guard_block`
         // ownership scoping fix in `arc_liveness.zig`, and closed
         // by H.3's `next`/`getHead`/`getTail` retain symmetry in
-        // `runtime.zig`. A2 flip: `.vector_type` joins them —
-        // see `isArcManagedTypeId` for the full rationale. Keep
+        // `runtime.zig`. Keep
         // `isArcManagedTypeId` and this method in lockstep — both
         // must agree on every type.
-        return switch (store.getType(type_id)) {
-            .opaque_type, .map, .list, .vector_type => true,
-            else => false,
-        };
+        return isArcManagedTypeId(store, type_id);
     }
 
     /// Returns whether the value held in `local` is ARC-managed at the
@@ -5663,9 +5989,42 @@ pub const IrBuilder = struct {
     fn computeParamConventions(self: *IrBuilder, params: []const Param) ![]ParamConvention {
         const out = try self.allocator.alloc(ParamConvention, params.len);
         for (params, 0..) |param, i| {
-            out[i] = defaultParamConvention(self.type_store, param.type_id);
+            out[i] = self.defaultParamConventionForParam(param);
         }
         return out;
+    }
+
+    fn defaultParamConventionForParam(self: *const IrBuilder, param: Param) ParamConvention {
+        const hir_convention = defaultParamConvention(self.type_store, param.type_id);
+        if (hir_convention != .trivial) return hir_convention;
+        return if (self.isArcManagedZigType(param.type_expr)) .borrowed else .trivial;
+    }
+
+    fn isArcManagedZigType(self: *const IrBuilder, type_expr: ZigType) bool {
+        return switch (type_expr) {
+            .list, .map => true,
+            .optional => |inner| self.isArcManagedZigType(inner.*),
+            .ptr => |pointee| self.isArcManagedZigType(pointee.*),
+            .struct_ref => |type_name| blk: {
+                const type_id = self.resolveNominalTypeId(type_name) orelse break :blk false;
+                break :blk self.isArcManagedType(type_id);
+            },
+            else => false,
+        };
+    }
+
+    fn resolveNominalTypeId(self: *const IrBuilder, type_name: []const u8) ?types_mod.TypeId {
+        const store = self.type_store orelse return null;
+        for (store.types.items, 0..) |candidate_type, candidate_index| {
+            const candidate_name = switch (candidate_type) {
+                .struct_type => |struct_type| store.interner.get(struct_type.name),
+                .tagged_union => |tagged_union| store.interner.get(tagged_union.name),
+                .opaque_type => |opaque_type| store.interner.get(opaque_type.name),
+                else => continue,
+            };
+            if (std.mem.eql(u8, candidate_name, type_name)) return @intCast(candidate_index);
+        }
+        return null;
     }
 
     /// Allocates a `local_ownership` slice sized to `local_count` and
@@ -6003,10 +6362,18 @@ pub const IrBuilder = struct {
     }
 
     fn lowerExpr(self: *IrBuilder, expr: *const hir_mod.Expr) anyerror!LocalId {
+        const tracked_hir_type = self.effectiveTrackedHirType(expr);
+
         // Case expressions need binding locals reserved before dest allocation
         // to avoid shadowing conflicts in the generated Zig.
         if (expr.kind == .case) {
-            return self.lowerCaseExpr(expr.kind.case);
+            const case_dest = try self.lowerCaseExpr(expr.kind.case);
+            try self.local_hir_types.put(case_dest, tracked_hir_type);
+            const case_result_type = typeIdToZigTypeWithStore(tracked_hir_type, self.type_store);
+            if (case_result_type != .any and case_result_type != .void) {
+                try self.known_local_types.put(case_dest, case_result_type);
+            }
+            return case_dest;
         }
 
         const dest = self.next_local;
@@ -6022,7 +6389,7 @@ pub const IrBuilder = struct {
         // is acceptable because `isArcManagedType(UNKNOWN)` returns
         // false and conservative non-retain is correct for unknown
         // types (they cannot be ARC-managed as far as the IR knows).
-        try self.local_hir_types.put(dest, expr.type_id);
+        try self.local_hir_types.put(dest, tracked_hir_type);
 
         switch (expr.kind) {
             .int_lit => |v| {
@@ -6117,6 +6484,7 @@ pub const IrBuilder = struct {
             .binary => |bin| {
                 const lhs = try self.lowerExpr(bin.lhs);
                 const rhs = try self.lowerExpr(bin.rhs);
+                try self.local_hir_types.put(dest, self.binaryResultHirType(expr.type_id, lhs, rhs));
                 // Detect string comparison — Zig needs std.mem.eql, not ==
                 const lhs_is_string = if (self.known_local_types.get(lhs)) |t| t == .string else (bin.lhs.type_id == types_mod.TypeStore.STRING);
                 const rhs_is_string = if (self.known_local_types.get(rhs)) |t| t == .string else (bin.rhs.type_id == types_mod.TypeStore.STRING);
@@ -6153,7 +6521,13 @@ pub const IrBuilder = struct {
                     },
                 };
                 try self.current_instrs.append(self.allocator, .{
-                    .binary_op = .{ .dest = dest, .op = ir_op, .lhs = lhs, .rhs = rhs },
+                    .binary_op = .{
+                        .dest = dest,
+                        .op = ir_op,
+                        .lhs = lhs,
+                        .rhs = rhs,
+                        .result_type = self.binaryResultZigType(expr.type_id, lhs, rhs),
+                    },
                 });
             },
             .unary => |un| {
@@ -6171,6 +6545,7 @@ pub const IrBuilder = struct {
                 var arg_modes: std.ArrayList(ValueMode) = .empty;
                 var shared_release_locals: std.ArrayList(LocalId) = .empty;
                 for (call.args, 0..) |arg, arg_index| {
+                    const arg_ownership_type = self.typeOnlyArgType(arg);
                     const arg_local = blk: {
                         const saved_expected_type = self.current_expected_type;
                         const target_expected_type = self.callTargetExpectedType(call.target, call.args.len, arg_index) orelse arg.expected_type;
@@ -6193,7 +6568,14 @@ pub const IrBuilder = struct {
                             break :blk moved_local;
                         },
                         .share => blk: {
-                            if (self.isArcManagedType(arg.expr.type_id)) {
+                            const has_arg_ownership_type = arg_ownership_type != types_mod.TypeStore.UNKNOWN and
+                                arg_ownership_type != types_mod.TypeStore.ERROR;
+                            const share_hir_source = if (has_arg_ownership_type) arg_ownership_type else arg.expr.type_id;
+                            const should_share_arc = if (has_arg_ownership_type)
+                                self.isArcManagedType(arg_ownership_type)
+                            else
+                                self.isArcManagedType(arg.expr.type_id);
+                            if (should_share_arc) {
                                 const shared_local = self.next_local;
                                 self.next_local += 1;
                                 try self.current_instrs.append(self.allocator, .{ .share_value = .{ .dest = shared_local, .source = arg_local } });
@@ -6228,9 +6610,9 @@ pub const IrBuilder = struct {
                                 // the branch on exactly that).
                                 const tracked_hir = self.local_hir_types.get(arg_local);
                                 const shared_hir_type: hir_mod.TypeId = if (tracked_hir) |tid|
-                                    (if (self.isArcManagedType(tid)) tid else arg.expr.type_id)
+                                    (if (self.isArcManagedType(tid)) tid else share_hir_source)
                                 else
-                                    arg.expr.type_id;
+                                    share_hir_source;
                                 try self.local_hir_types.put(shared_local, shared_hir_type);
                                 // Propagate param-backed marker so dispatch
                                 // encoders that fall back to runtime type-
@@ -6263,7 +6645,7 @@ pub const IrBuilder = struct {
                         if (i >= args.items.len) break;
                         const expected = arg.expected_type;
                         if (expected == types_mod.TypeStore.UNKNOWN) continue;
-                        const actual = arg.expr.type_id;
+                        const actual = self.typeOnlyArgType(arg);
                         if (actual == types_mod.TypeStore.UNKNOWN) continue;
                         if (ts.canWidenTo(actual, expected)) {
                             const widened_local = self.next_local;
@@ -6293,6 +6675,7 @@ pub const IrBuilder = struct {
                         try self.current_instrs.append(self.allocator, .{
                             .call_direct = .{ .dest = dest, .function = dc.function_group_id, .clause_index = dc.clause_index, .args = lowered_args, .arg_modes = lowered_modes },
                         });
+                        try self.trackCallResultType(dest, tracked_hir_type);
                     },
                     .named => |nc| {
                         const call_arity = call.args.len;
@@ -6376,6 +6759,7 @@ pub const IrBuilder = struct {
                                 .call_named = .{ .dest = dest, .name = resolved_name, .args = lowered_args, .arg_modes = lowered_modes },
                             });
                         }
+                        try self.trackCallResultType(dest, tracked_hir_type);
                     },
                     .closure => |callee| {
                         const callee_local = try self.lowerExpr(callee);
@@ -6395,6 +6779,7 @@ pub const IrBuilder = struct {
                         try self.current_instrs.append(self.allocator, .{
                             .call_dispatch = .{ .dest = dest, .group_id = dc.function_group_id, .args = lowered_args, .arg_modes = lowered_modes },
                         });
+                        try self.trackCallResultType(dest, tracked_hir_type);
                     },
                     .builtin => |name| {
                         const lowered_args = try args.toOwnedSlice(self.allocator);
@@ -6462,7 +6847,7 @@ pub const IrBuilder = struct {
                                     break :blk try std.fmt.allocPrint(self.allocator, "MapNested:{s}:{s}.{s}", .{ key_name, @tagName(std.meta.activeTag(val_zig)), method });
                                 }
                                 const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
-                                const val_name = zigTypeToEncodedName(val_zig);
+                                const val_name = zigTypeToEncodedName(val_zig) orelse break :blk name;
                                 break :blk try std.fmt.allocPrint(self.allocator, "Map:{s}:{s}.{s}", .{ key_name, val_name, method });
                             }
                             break :blk name;
@@ -6511,24 +6896,36 @@ pub const IrBuilder = struct {
                                     }
                                 }
                                 if (std.meta.activeTag(elem_zig) == .list) {
-                                    // Nested list: ListOf(?*const ListOf(T))
+                                    // Nested list: List(?*const List(T))
                                     // Use "ListNested:inner_type.method" encoding
-                                    break :blk try std.fmt.allocPrint(self.allocator, "ListNested:{s}.{s}", .{ @tagName(elem_zig.list.*), method });
+                                    const inner_elem_name = zigTypeToEncodedName(elem_zig.list.*) orelse break :blk map_resolved;
+                                    break :blk try std.fmt.allocPrint(self.allocator, "ListNested:{s}.{s}", .{ inner_elem_name, method });
                                 }
-                                const elem_name = zigTypeToEncodedName(elem_zig);
+                                const elem_name = zigTypeToEncodedName(elem_zig) orelse break :blk map_resolved;
                                 break :blk try std.fmt.allocPrint(self.allocator, "List:{s}.{s}", .{ elem_name, method });
                             }
                             break :blk map_resolved;
                         } else map_resolved;
+
+                        // Track the call result's type from the HIR expression.
+                        // The ZIR backend also consumes this metadata for
+                        // constructor-style generic runtime calls such as
+                        // `List.new_empty(capacity)`, where there is no receiver
+                        // argument to recover `List(T)` from.
+                        const call_result_type = typeIdToZigTypeWithStore(tracked_hir_type, self.type_store);
                         try self.current_instrs.append(self.allocator, .{
-                            .call_builtin = .{ .dest = dest, .name = resolved_name, .args = lowered_args, .arg_modes = lowered_modes },
+                            .call_builtin = .{
+                                .dest = dest,
+                                .name = resolved_name,
+                                .args = lowered_args,
+                                .arg_modes = lowered_modes,
+                                .result_type = call_result_type,
+                            },
                         });
+                        if (call_result_type != .any and call_result_type != .void) {
+                            try self.known_local_types.put(dest, call_result_type);
+                        }
                     },
-                }
-                // Track the call result's type from the HIR expression
-                const call_result_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
-                if (call_result_type != .any and call_result_type != .void) {
-                    try self.known_local_types.put(dest, call_result_type);
                 }
                 for (shared_release_locals.items) |shared_local| {
                     try self.current_instrs.append(self.allocator, .{ .release = .{ .value = shared_local } });
@@ -6582,13 +6979,14 @@ pub const IrBuilder = struct {
                     try locals.append(self.allocator, try self.lowerExpr(elem));
                 }
                 const elements = try locals.toOwnedSlice(self.allocator);
-                const fallback_elem_type: ZigType = blk: {
+                const fallback_elem_type: ?ZigType = blk: {
                     if (elements.len > 0) {
-                        break :blk self.listElementTypeFromLocal(elements[0]) orelse .i64;
+                        break :blk self.listElementTypeFromLocal(elements[0]);
                     }
                     break :blk ZigType.i64;
                 };
-                const elem_type = self.chooseListElementType(expr.type_id, fallback_elem_type);
+                const elem_type = self.chooseListElementType(expr.type_id, fallback_elem_type orelse .any);
+                if (elem_type == .any and fallback_elem_type == null) return error.ListElementTypeUnavailable;
                 try self.current_instrs.append(self.allocator, .{
                     .list_init = .{ .dest = dest, .elements = elements, .element_type = elem_type },
                 });
@@ -6599,9 +6997,9 @@ pub const IrBuilder = struct {
                 const head = try self.lowerExpr(lc.head);
                 const tail = try self.lowerExpr(lc.tail);
                 const fallback_elem_type = self.listElementTypeFromTailLocal(tail) orelse
-                    self.listElementTypeFromLocal(head) orelse
-                    ZigType.i64;
-                const elem_type = self.chooseListElementType(expr.type_id, fallback_elem_type);
+                    self.listElementTypeFromLocal(head);
+                const elem_type = self.chooseListElementType(expr.type_id, fallback_elem_type orelse .any);
+                if (elem_type == .any and fallback_elem_type == null) return error.ListElementTypeUnavailable;
                 try self.current_instrs.append(self.allocator, .{
                     .list_cons = .{ .dest = dest, .head = head, .tail = tail, .element_type = elem_type },
                 });
@@ -6858,7 +7256,8 @@ pub const IrBuilder = struct {
             },
             .list_index_get => |lig| {
                 const list_local = try self.lowerExpr(lig.list);
-                const elem_type = self.listElementTypeForLocal(list_local);
+                const elem_type = self.listElementTypeForLocal(list_local) orelse
+                    return error.ListElementTypeUnavailable;
                 try self.current_instrs.append(self.allocator, .{
                     .list_get = .{ .dest = dest, .list = list_local, .index = lig.index, .element_type = elem_type },
                 });
@@ -6866,7 +7265,8 @@ pub const IrBuilder = struct {
             },
             .list_head_get => |lhg| {
                 const list_local = try self.lowerExpr(lhg.list);
-                const elem_type = self.listElementTypeForLocal(list_local);
+                const elem_type = self.listElementTypeForLocal(list_local) orelse
+                    return error.ListElementTypeUnavailable;
                 try self.current_instrs.append(self.allocator, .{
                     .list_head = .{ .dest = dest, .list = list_local, .element_type = elem_type },
                 });
@@ -6874,9 +7274,10 @@ pub const IrBuilder = struct {
             },
             .list_tail_get => |ltg| {
                 const list_local = try self.lowerExpr(ltg.list);
-                const elem_type = self.listElementTypeForLocal(list_local);
+                const elem_type = self.listElementTypeForLocal(list_local) orelse
+                    return error.ListElementTypeUnavailable;
                 try self.current_instrs.append(self.allocator, .{
-                    .list_tail = .{ .dest = dest, .list = list_local, .element_type = elem_type },
+                    .list_tail = .{ .dest = dest, .list = list_local, .element_type = elem_type, .start_index = ltg.start_index },
                 });
                 if (self.known_local_types.get(list_local)) |list_type| {
                     try self.known_local_types.put(dest, list_type);
@@ -7178,7 +7579,7 @@ fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u
 
 /// Map a ZigType to a canonical short name for generic container encoding.
 /// Used in call_builtin name encoding: "List:i64.method", "Map:u32:str.method".
-fn zigTypeToEncodedName(zig_type: ZigType) []const u8 {
+fn zigTypeToEncodedName(zig_type: ZigType) ?[]const u8 {
     return switch (std.meta.activeTag(zig_type)) {
         .i64 => "i64",
         .i128 => "i128",
@@ -7201,7 +7602,7 @@ fn zigTypeToEncodedName(zig_type: ZigType) []const u8 {
         .term => "Term",
         .struct_ref => zig_type.struct_ref,
         .tagged_union => zig_type.tagged_union,
-        else => "i64",
+        else => null,
     };
 }
 
@@ -7457,18 +7858,12 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
         types_mod.TypeStore.F16 => .f16,
         types_mod.TypeStore.USIZE => .usize,
         types_mod.TypeStore.ISIZE => .isize,
-        types_mod.TypeStore.VECTOR_I64 => .vector_i64,
-        types_mod.TypeStore.VECTOR_F64 => .vector_f64,
         else => {
             // Try to resolve user-defined struct/enum/union types
             if (type_store) |ts| {
                 if (type_id < ts.types.items.len) {
                     const typ = ts.types.items[type_id];
                     switch (typ) {
-                        .vector_type => |element_kind| return switch (element_kind) {
-                            .i64 => .vector_i64,
-                            .f64 => .vector_f64,
-                        },
                         .struct_type => |st| {
                             return .{ .struct_ref = ts.interner.get(st.name) };
                         },
@@ -7606,11 +8001,6 @@ fn zigTypeReachesStruct(t: ZigType, owner_name: []const u8) bool {
         .usize,
         .isize,
         .tagged_union,
-        // Vector cells are heap-managed runtime values whose buffers
-        // never embed a Zap user struct, so they cannot reach
-        // `owner_name`.
-        .vector_i64,
-        .vector_f64,
         => false,
     };
 }
@@ -7722,11 +8112,6 @@ fn reachesStructInCycleImpl(
         .usize,
         .isize,
         .tagged_union,
-        // Vector cells are heap-managed runtime types whose buffers
-        // never embed a Zap user struct, so they can't carry a
-        // back-reference to `owner_name`.
-        .vector_i64,
-        .vector_f64,
         => false,
     };
 }
@@ -7757,8 +8142,11 @@ fn zigTypeToStr(zig_type: ZigType) []const u8 {
         .string => "[]const u8",
         .atom => "[]const u8",
         .nil => "?void",
-        .vector_i64 => "?*const zap_runtime.Vector(i64)",
-        .vector_f64 => "?*const zap_runtime.Vector(f64)",
+        .list => |element_type| switch (element_type.*) {
+            .i64 => "?*const zap_runtime.List(i64)",
+            .f64 => "?*const zap_runtime.List(f64)",
+            else => "anytype",
+        },
         .struct_ref => |name| name,
         .tagged_union => |name| name,
         .function => "zap_runtime.DynClosure",
@@ -7781,6 +8169,40 @@ fn typeIdToZigTypeStrWithStore(type_id: types_mod.TypeId, type_store: ?*const ty
 
 const Parser = @import("parser.zig").Parser;
 const Collector = @import("collector.zig").Collector;
+
+test "numeric list ZigType strings use runtime List target" {
+    const i64_element_type: ZigType = .i64;
+    const i64_list_type: ZigType = .{ .list = &i64_element_type };
+    try std.testing.expectEqualStrings(
+        "?*const zap_runtime.List(i64)",
+        zigTypeToStr(i64_list_type),
+    );
+
+    const f64_element_type: ZigType = .f64;
+    const f64_list_type: ZigType = .{ .list = &f64_element_type };
+    try std.testing.expectEqualStrings(
+        "?*const zap_runtime.List(f64)",
+        zigTypeToStr(f64_list_type),
+    );
+}
+
+test "list element type lookup does not default unknowns to i64" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var builder = IrBuilder.init(std.testing.allocator, &interner);
+    defer builder.deinit();
+
+    try std.testing.expect(builder.listElementTypeFromHirMaybe(types_mod.TypeStore.I64) == null);
+    try std.testing.expect(builder.listElementTypeForLocal(42) == null);
+
+    try builder.known_local_types.put(7, .i64);
+    try std.testing.expect(builder.listElementTypeForLocal(7) == null);
+
+    const element_type: ZigType = .f64;
+    try builder.known_local_types.put(8, .{ .list = &element_type });
+    try std.testing.expectEqual(ZigType.f64, builder.listElementTypeForLocal(8).?);
+}
 
 test "IR build simple function" {
     const source =
@@ -8922,6 +9344,257 @@ test "IR pattern-binding local_get of ARC-managed scrutinee emits retain" {
     try std.testing.expect(walker.found_pair);
 }
 
+test "IR case expression records ARC-managed result ownership" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn choose(xs :: [i64]) -> [i64] {
+        \\    case xs {
+        \\      [] -> []
+        \\      [head | tail] -> xs
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    const func = blk: {
+        for (ir_program.functions) |candidate| {
+            if (std.mem.indexOf(u8, candidate.name, "choose") != null) break :blk candidate;
+        }
+        return error.MissingChooseFunction;
+    };
+    try std.testing.expectEqual(ResultConvention.owned, func.result_convention);
+
+    const Finder = struct {
+        case_dest: ?LocalId = null,
+
+        fn visit(self: *@This(), stream: []const Instruction) void {
+            for (stream) |instr| {
+                switch (instr) {
+                    .case_block => |cb| {
+                        if (self.case_dest == null) self.case_dest = cb.dest;
+                        self.visit(cb.pre_instrs);
+                        for (cb.arms) |arm| {
+                            self.visit(arm.cond_instrs);
+                            self.visit(arm.body_instrs);
+                        }
+                        self.visit(cb.default_instrs);
+                    },
+                    .if_expr => |ie| {
+                        self.visit(ie.then_instrs);
+                        self.visit(ie.else_instrs);
+                    },
+                    .guard_block => |gb| self.visit(gb.body),
+                    .switch_literal => |sw| {
+                        for (sw.cases) |c| self.visit(c.body_instrs);
+                        self.visit(sw.default_instrs);
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+
+    var finder = Finder{};
+    for (func.body) |block| {
+        finder.visit(block.instructions);
+    }
+
+    const dest = finder.case_dest orelse return error.MissingCaseBlock;
+    try std.testing.expect(dest < func.local_ownership.len);
+    try std.testing.expectEqual(OwnershipClass.owned, func.local_ownership[dest]);
+}
+
+test "IR list cons pattern with multiple heads uses indexed gets and one suffix slice" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn score(xs :: [i64]) -> i64 {
+        \\    case xs {
+        \\      [a, b, c | rest] -> (a * 100) + (b * 10) + c + List.length(rest)
+        \\      _ -> -1
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    const func = blk: {
+        for (ir_program.functions) |candidate| {
+            if (std.mem.indexOf(u8, candidate.name, "score") != null) break :blk candidate;
+        }
+        return error.MissingScoreFunction;
+    };
+
+    const Finder = struct {
+        min_len_checks: u32 = 0,
+        indexed_heads: [3]bool = .{ false, false, false },
+        suffix_slices: u32 = 0,
+        unit_tails: u32 = 0,
+
+        fn visit(self: *@This(), stream: []const Instruction) void {
+            for (stream) |instr| {
+                switch (instr) {
+                    .list_len_check => |check| {
+                        if (check.minimum and check.expected_len == 3) self.min_len_checks += 1;
+                    },
+                    .list_get => |get| {
+                        if (get.index < self.indexed_heads.len) self.indexed_heads[get.index] = true;
+                    },
+                    .list_tail => |tail| {
+                        if (tail.start_index == 3) self.suffix_slices += 1;
+                        if (tail.start_index == 1) self.unit_tails += 1;
+                    },
+                    .case_block => |cb| {
+                        self.visit(cb.pre_instrs);
+                        for (cb.arms) |arm| {
+                            self.visit(arm.cond_instrs);
+                            self.visit(arm.body_instrs);
+                        }
+                        self.visit(cb.default_instrs);
+                    },
+                    .if_expr => |ie| {
+                        self.visit(ie.then_instrs);
+                        self.visit(ie.else_instrs);
+                    },
+                    .guard_block => |gb| self.visit(gb.body),
+                    .switch_literal => |sw| {
+                        for (sw.cases) |c| self.visit(c.body_instrs);
+                        self.visit(sw.default_instrs);
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+
+    var finder = Finder{};
+    for (func.body) |block| {
+        finder.visit(block.instructions);
+    }
+
+    try std.testing.expectEqual(@as(u32, 1), finder.min_len_checks);
+    try std.testing.expect(finder.indexed_heads[0]);
+    try std.testing.expect(finder.indexed_heads[1]);
+    try std.testing.expect(finder.indexed_heads[2]);
+    try std.testing.expectEqual(@as(u32, 1), finder.suffix_slices);
+    try std.testing.expectEqual(@as(u32, 0), finder.unit_tails);
+}
+
+test "IR list assignment destructure with multiple heads uses indexed gets and one suffix slice" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn score(xs :: [i64]) -> i64 {
+        \\    [a, b, c | rest] = xs
+        \\    (a * 100) + (b * 10) + c + List.length(rest)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    const func = blk: {
+        for (ir_program.functions) |candidate| {
+            if (std.mem.indexOf(u8, candidate.name, "score") != null) break :blk candidate;
+        }
+        return error.MissingScoreFunction;
+    };
+
+    var indexed_heads = [_]bool{ false, false, false };
+    var suffix_slices: u32 = 0;
+    var unit_tails: u32 = 0;
+    for (func.body) |block| {
+        for (block.instructions) |instr| {
+            switch (instr) {
+                .list_get => |get| {
+                    if (get.index < indexed_heads.len) indexed_heads[get.index] = true;
+                },
+                .list_tail => |tail| {
+                    if (tail.start_index == 3) suffix_slices += 1;
+                    if (tail.start_index == 1) unit_tails += 1;
+                },
+                else => {},
+            }
+        }
+    }
+
+    try std.testing.expect(indexed_heads[0]);
+    try std.testing.expect(indexed_heads[1]);
+    try std.testing.expect(indexed_heads[2]);
+    try std.testing.expectEqual(@as(u32, 1), suffix_slices);
+    try std.testing.expectEqual(@as(u32, 0), unit_tails);
+}
+
 test "Instruction.share_value carries the mode field through union storage" {
     // Phase 3: confirm an Instruction value built with a `.consume`-
     // mode `ShareValue` round-trips through the tagged-union storage
@@ -8985,7 +9658,7 @@ test "ownership metadata: ARC-managed identity function gets borrowed param + ow
 
     var found_id_func: ?*const Function = null;
     for (ir_program.functions) |*function| {
-        if (std.mem.indexOf(u8, function.name, "id") != null) {
+        if (std.mem.indexOf(u8, function.name, "Test__id") != null) {
             found_id_func = function;
             break;
         }
@@ -9089,6 +9762,112 @@ test "ownership metadata: defaultParamConvention and defaultResultConvention agr
     try std.testing.expectEqual(ResultConvention.trivial, defaultResultConvention(null, null));
     try std.testing.expectEqual(ParamConvention.trivial, defaultParamConvention(null, 0));
     try std.testing.expectEqual(ResultConvention.trivial, defaultResultConvention(null, 0));
+}
+
+test "ownership metadata: ARC predicate recognizes recursive boxed structs" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var store = types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    const node_name = try interner.intern("Node");
+    const value_name = try interner.intern("value");
+    const next_name = try interner.intern("next");
+
+    const node_type_id = try store.addType(.{ .struct_type = .{
+        .name = node_name,
+        .fields = &.{},
+    } });
+    try store.name_to_type.put(node_name, node_type_id);
+
+    const optional_members = try std.testing.allocator.alloc(types_mod.TypeId, 2);
+    defer std.testing.allocator.free(optional_members);
+    optional_members[0] = node_type_id;
+    optional_members[1] = types_mod.TypeStore.NIL;
+    const optional_node_type_id = try store.addType(.{ .union_type = .{
+        .members = optional_members,
+    } });
+
+    const fields = try std.testing.allocator.alloc(types_mod.Type.StructField, 2);
+    defer std.testing.allocator.free(fields);
+    fields[0] = .{ .name = value_name, .type_id = types_mod.TypeStore.I64 };
+    fields[1] = .{ .name = next_name, .type_id = optional_node_type_id };
+    store.types.items[node_type_id] = .{ .struct_type = .{
+        .name = node_name,
+        .fields = fields,
+    } };
+
+    try std.testing.expect(isArcManagedTypeId(&store, node_type_id));
+    try std.testing.expect(isArcManagedTypeId(&store, optional_node_type_id));
+    try std.testing.expectEqual(ParamConvention.borrowed, defaultParamConvention(&store, node_type_id));
+    try std.testing.expectEqual(ParamConvention.borrowed, defaultParamConvention(&store, optional_node_type_id));
+    try std.testing.expectEqual(ResultConvention.owned, defaultResultConvention(&store, node_type_id));
+    try std.testing.expectEqual(ResultConvention.owned, defaultResultConvention(&store, optional_node_type_id));
+}
+
+test "ownership metadata: synthetic optional recursive params use borrowed convention" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var store = types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    const node_name = try interner.intern("LinkedNode");
+    const value_name = try interner.intern("value");
+    const next_name = try interner.intern("next");
+
+    const node_type_id = try store.addType(.{ .struct_type = .{
+        .name = node_name,
+        .fields = &.{},
+    } });
+    try store.name_to_type.put(node_name, node_type_id);
+
+    const optional_members = try std.testing.allocator.alloc(types_mod.TypeId, 2);
+    defer std.testing.allocator.free(optional_members);
+    optional_members[0] = node_type_id;
+    optional_members[1] = types_mod.TypeStore.NIL;
+    const optional_node_type_id = try store.addType(.{ .union_type = .{
+        .members = optional_members,
+    } });
+
+    const fields = try std.testing.allocator.alloc(types_mod.Type.StructField, 2);
+    defer std.testing.allocator.free(fields);
+    fields[0] = .{ .name = value_name, .type_id = types_mod.TypeStore.I64 };
+    fields[1] = .{ .name = next_name, .type_id = optional_node_type_id };
+    store.types.items[node_type_id] = .{ .struct_type = .{
+        .name = node_name,
+        .fields = fields,
+    } };
+
+    var ir_builder = IrBuilder.init(std.testing.allocator, &interner);
+    ir_builder.type_store = &store;
+    defer ir_builder.deinit();
+
+    const inner_type = try std.testing.allocator.create(ZigType);
+    defer std.testing.allocator.destroy(inner_type);
+    inner_type.* = .{ .struct_ref = "LinkedNode" };
+    const optional_type = ZigType{ .optional = inner_type };
+
+    const param_with_type_id = Param{
+        .name = "__arg_0",
+        .type_expr = optional_type,
+        .type_id = optional_node_type_id,
+    };
+    const param_without_type_id = Param{
+        .name = "__arg_0",
+        .type_expr = optional_type,
+        .type_id = null,
+    };
+
+    const conventions_with_type_id = try ir_builder.computeParamConventions(&.{param_with_type_id});
+    defer std.testing.allocator.free(conventions_with_type_id);
+    const conventions_without_type_id = try ir_builder.computeParamConventions(&.{param_without_type_id});
+    defer std.testing.allocator.free(conventions_without_type_id);
+
+    try std.testing.expectEqual(optional_node_type_id, findOptionalUnionTypeId(&store, node_type_id).?);
+    try std.testing.expectEqual(ParamConvention.borrowed, conventions_with_type_id[0]);
+    try std.testing.expectEqual(ParamConvention.borrowed, conventions_without_type_id[0]);
 }
 
 test "Phase E.5 Gap 1: share_value shared_local has ARC-managed local_ownership" {
@@ -9465,8 +10244,8 @@ test "Phase E.5 Gap 5: arc_managed_locals registers map_init / list_init / call 
 
 test "tuple destructure of ARC-managed value emits retain on extracted local" {
     // Regression for the heap corruption bug surfaced by Phase 1.3:
-    // when an ARC-managed value (e.g. `VectorI64`, an opaque type, a
-    // Map, a List) is extracted from a tuple via `tuple_index_get`,
+    // when an ARC-managed value (e.g. an opaque type, a Map, or a
+    // List) is extracted from a tuple via `tuple_index_get`,
     // the lowering must emit `.retain{value=dest}` immediately
     // after the `.index_get`. A tuple is non-ARC; its `index_get`
     // lowers to `elem_val_imm`, which never bumps the cell's
@@ -9486,14 +10265,12 @@ test "tuple destructure of ARC-managed value emits retain on extracted local" {
     // (`{a, b} = some_tuple`) which lowers via
     // `lowerAssignmentDestructure` → `tuple_index_get` expression.
     //
-    // Uses `opaque Handle = String` rather than `VectorI64` because
-    // unit tests don't bootstrap the `@native_type` scope graph
-    // entries that resolve `VectorI64` to `TypeStore.VECTOR_I64`;
-    // an opaque type is the canonical ARC-managed scalar that the
-    // type checker recognises without `lib/*.zap` plumbing. The bug
-    // and the fix are agnostic to which ARC-managed type appears in
-    // the tuple — `isArcManagedType` returns true for `.opaque_type`,
-    // `.map`, `.list`, and `.vector_type` alike.
+    // Uses `opaque Handle = String` because an opaque type is the
+    // canonical ARC-managed scalar that the type checker recognises
+    // without `lib/*.zap` plumbing. The bug and the fix are agnostic
+    // to which ARC-managed type appears in the tuple —
+    // `isArcManagedType` returns true for `.opaque_type`, `.map`,
+    // and `.list` alike.
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -9571,7 +10348,7 @@ test "struct field_get of ARC-managed value emits retain on extracted local" {
     //
     // Pins the let-binding destructure path (`field_get` HIR
     // expression in `lowerExpr`). Uses an opaque type rather than
-    // `VectorI64` so the unit-test pipeline does not need the
+    // a concrete native list so the unit-test pipeline does not need the
     // `@native_type` scope-graph plumbing — see the sibling tuple
     // regression test for the rationale.
     //
@@ -9666,7 +10443,7 @@ test "tuple param-binding destructure of ARC-managed value emits retain" {
     // the handle — that extraction is the `index_get` whose dest
     // must be retained. The second binding extracts a Bool which
     // is non-ARC and must NOT receive a retain. Uses an opaque
-    // type rather than `VectorI64` for the same unit-test pipeline
+    // type rather than a concrete native list for the same unit-test pipeline
     // reason as the sibling regression tests.
     const source =
         \\pub struct Test {
@@ -9714,7 +10491,7 @@ test "tuple param-binding destructure of ARC-managed value emits retain" {
 
     // Search every nested instruction stream for an `.index_get`
     // whose dest is followed by `.retain{value=dest}`. The first
-    // tuple binding extracts the ARC-managed VectorI64 and must
+    // tuple binding extracts the ARC-managed handle and must
     // emit the retain; the second binding extracts a Bool (non-
     // ARC) and must NOT.
     var saw_arc_pair = false;

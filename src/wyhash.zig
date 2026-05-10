@@ -167,8 +167,8 @@ const testing = std.testing;
 // These are the same vectors Zig's stdlib uses; we reaffirm them here so
 // regressions in our wrapper are caught locally.
 test "wyhash reference test vectors" {
-    const Vector = struct { seed: u64, input: []const u8, expected: u64 };
-    const vectors = [_]Vector{
+    const TestCase = struct { seed: u64, input: []const u8, expected: u64 };
+    const test_cases = [_]TestCase{
         .{ .seed = 0, .input = "", .expected = 0x409638ee2bde459 },
         .{ .seed = 1, .input = "a", .expected = 0xa8412d091b5fe0a9 },
         .{ .seed = 2, .input = "abc", .expected = 0x32dd92e4b2915153 },
@@ -177,8 +177,8 @@ test "wyhash reference test vectors" {
         .{ .seed = 5, .input = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", .expected = 0xff42329b90e50d58 },
         .{ .seed = 6, .input = "12345678901234567890123456789012345678901234567890123456789012345678901234567890", .expected = 0xc39cab13b115aad3 },
     };
-    for (vectors) |v| {
-        try testing.expectEqual(v.expected, hashBytes(v.seed, v.input));
+    for (test_cases) |test_case| {
+        try testing.expectEqual(test_case.expected, hashBytes(test_case.seed, test_case.input));
     }
 }
 

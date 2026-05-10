@@ -33,8 +33,8 @@ pub struct FunctionTest {
     test("assignment shadows parameter with rebind") {
       ## Elixir-style shadowing: `x = expr` rebinds the name `x` so
       ## every later reference resolves to the new value, not the
-      ## parameter slot. Without this, `arr = VectorI64.set(arr, ...)`
-      ## patterns silently miscompile once `Vector(T)` becomes
+      ## parameter slot. Without this, `values = List.set(values, ...)`
+      ## patterns silently miscompile once `List(T)` becomes
       ## ARC-managed (the COW clone path produces a new buffer for
       ## the rebinding while every later use of `arr` still observes
       ## the pre-call parameter).

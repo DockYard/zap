@@ -3,7 +3,7 @@
 **Reference docs (read these first if context is needed):**
 - `docs/list-vector-tuple-friction-research-brief.md` — design space and four options.
 - `docs/dense-map-implementation-plan.md` — sister implementation plan for the dense-Map work, voice + format mirror.
-- `docs/opportunistic-mutation-milestone.md` — close-out of the V8 / opportunistic-mutation work that this plan builds on.
+- `docs/opportunistic-mutation-milestone.md` — close-out of the uniqueness / opportunistic-mutation work that this plan builds on.
 - `docs/roc-style-opportunistic-mutation-research-brief.md` — broader rationale for the rc-1 mutation model.
 - `docs/zap-map-representation-research-brief.md` — Map-specific design discussion.
 
@@ -42,7 +42,7 @@ defmodule Counter {
 }
 ```
 
-`Map.put` returns a new map semantically; under the hood the rc-1 fast path mutates in place when the V8 verifier proves uniqueness. The user does not see this distinction.
+`Map.put` returns a new map semantically; under the hood the rc-1 fast path mutates in place when the uniqueness verifier proves uniqueness. The user does not see this distinction.
 
 ### Compilation pipeline
 
@@ -61,7 +61,7 @@ Typed AST
   ▼ src/hir.zig
 HIR (high-level IR)
   │
-  ▼ src/ir.zig    ← ARC ownership inference + V8 uniqueness inference happen here
+  ▼ src/ir.zig    ← ARC ownership inference + uniqueness inference happen here
 IR (ownership-typed)
   │
   ▼ src/zir_builder.zig
@@ -102,10 +102,10 @@ Plain integers/floats/bools/atoms are *trivial* — no retain/release. `Map`, `L
 - **Native type registry (NativeTypeKind):** `src/scope.zig` line 479.
 - **ZIR emission (the only codegen path):** `src/zir_builder.zig`, `src/zir_backend.zig`.
 - **Ownership pipeline:** `src/arc_ownership.zig`, `src/arc_param_convention.zig`, `src/arc_liveness.zig`, `src/arc_drop_insertion.zig`, `src/arc_verifier.zig`, `src/arc_optimizer.zig`.
-- **V8 uniqueness inference:** `src/v8_uniqueness.zig`, `src/v8_signature.zig`, `src/v8_fixpoint.zig`, `src/v8_interprocedural.zig`.
+- **uniqueness inference:** `src/uniqueness.zig`, `src/uniqueness_signature.zig`, `src/uniqueness_fixpoint.zig`, `src/uniqueness_interprocedural.zig`.
 - **Zap standard library:** `lib/*.zap` — `kernel.zap`, `map.zap`, `list.zap`, `vector_i64.zap`, `vector_f64.zap`, etc.
 - **Forked Zig compiler:** `~/projects/zig/` — `src/zir_api.zig` exposes the C-ABI; `@Vector` SIMD primitive is at `src/zir_builder.zig:3320` in the fork.
-- **CLBG benchmark suite (separate repo):** `~/projects/lang-benches/zap/`.
+- **CLBG benchmark suite (separate repo):** `~/projects/lang-benches/`.
 - **Map workload instrumentation (still in repo, behind `-Dinstrument-map=true`):** `bench/map-workloads/`.
 
 ---
@@ -121,22 +121,22 @@ The user has been through a multi-month effort building toward this point. The c
 - **`Vector(T)`** (`src/runtime.zig:1678`): flat-buffer mutable contiguous array `{ ArcHeader, len: u32, cap: u32 }` followed by `[cap]T`. Generic at the runtime level (`pub fn Vector(comptime T: type) type`). Currently exposed at the language level only as concrete aliases `VectorI64` (`src/runtime.zig:1671`) / `VectorF64` (`src/runtime.zig:1676`) in `lib/vector_i64.zap` / `lib/vector_f64.zap`. **This is what Option B unifies into List.**
 - **Tuple syntax `{a, b, c}`**: structural anonymous shapes with `tuple_init` (`src/ir.zig:308`) and `index_get` (`src/ir.zig:317`) IR opcodes. Used heavily for `{:error, "reason"}` patterns and multi-return shapes like `{VectorI64, Bool}`. Compile-time indexing only. **Not first-class as a type yet — Stage 7 of this plan addresses that.**
 
-### 2.2 Existing V1–V8 ownership IR
+### 2.2 Existing V1–uniqueness ownership IR
 
 Built incrementally over many phases. `src/arc_verifier.zig` enforces the suite of invariants post-rewrite:
 
 - **V1–V7**: existing ownership invariants (no double-free, balanced retains, parameter conventions obeyed at every call site, return-value conventions match, ownership transfers across `if`/`switch` arms balance, drops at scope exit cover exactly the live-but-not-consumed set).
-- **V8**: alias safety on owned update — a mutator may return its receiver's pointer (rc-1 in-place mutation) only if the receiver is provably uniquely owned at the call site. Verifier check in `src/arc_verifier.zig::runV8`.
+- **uniqueness**: alias safety on owned update — a mutator may return its receiver's pointer (rc-1 in-place mutation) only if the receiver is provably uniquely owned at the call site. Verifier check in `src/arc_verifier.zig::runUniquenessCheck`.
 
 Static analysis pipeline:
-- `src/v8_uniqueness.zig` (~2,272 lines): per-instruction forward dataflow producing `definitely_unique` for every local. Includes `tuple_pending` tracking for per-component uniqueness propagation through `tuple_init` / `index_get` / returns / escapes.
-- `src/v8_signature.zig` (~352 lines): per-function uniqueness signatures using a 4-element lattice `{CU, PU, AL, ⊤}` with per-return-component witnesses tracking which input parameter (if any) each component preserves uniqueness from.
-- `src/v8_fixpoint.zig` (~2,496 lines): joins per-function signatures to a least fixpoint over a Tarjan SCC of the call graph.
-- `src/v8_interprocedural.zig` (~1,554 lines): propagates uniqueness across function boundaries.
+- `src/uniqueness.zig` (~2,272 lines): per-instruction forward dataflow producing `definitely_unique` for every local. Includes `tuple_pending` tracking for per-component uniqueness propagation through `tuple_init` / `index_get` / returns / escapes.
+- `src/uniqueness_signature.zig` (~352 lines): per-function uniqueness signatures using a 4-element lattice `{CU, PU, AL, ⊤}` with per-return-component witnesses tracking which input parameter (if any) each component preserves uniqueness from.
+- `src/uniqueness_fixpoint.zig` (~2,496 lines): joins per-function signatures to a least fixpoint over a Tarjan SCC of the call graph.
+- `src/uniqueness_interprocedural.zig` (~1,554 lines): propagates uniqueness across function boundaries.
 
 Codegen integration: `src/arc_ownership.zig` rewrites `Vector.set` → `Vector.set_owned_unchecked` (and equivalents for Map) at provably-safe sites, eliding the runtime rc-check entirely.
 
-Chain-consistency audit: `src/arc_param_convention.zig::computeLiftSet` (line 293) admits a `.borrowed` slot to the lift set when audit + V8 pre-flight both accept.
+Chain-consistency audit: `src/arc_param_convention.zig::computeLiftSet` (line 293) admits a `.borrowed` slot to the lift set when audit + uniqueness pre-flight both accept.
 
 ### 2.3 Recent commit chain (last ~30 commits)
 
@@ -154,25 +154,25 @@ de47ed5 fix(arc_liveness): scope guard_block body ownership to its execution pat
 5693091 feat(runtime,lib): delete MArrayI64/MArrayF64 — replaced by VectorI64/VectorF64 (Phase 6)
 af2f3da docs: opportunistic-mutation milestone close-out
 d833233 feat(v8,arc): Phase 2.6 infrastructure for SCC tuple-pending promotions
-72cb556 feat(v8_uniqueness): tuple_pending tracking for per-component uniqueness propagation (Phase 2.5)
-9ac58eb feat(arc): V8-uniqueness pre-flight check in chain-consistency audit (Phase 2.4)
+72cb556 feat(uniqueness): tuple_pending tracking for per-component uniqueness propagation (Phase 2.5)
+9ac58eb feat(arc): uniqueness-uniqueness pre-flight check in chain-consistency audit (Phase 2.4)
 c73f9f1 fix(arc_param_convention): path-sensitive chain-consistency + cross-module-aware anchor (Phase 2.3)
-d64a1ad feat(arc_ownership): path-sensitive aggregate-store move + V8 rewriter id-order fix (Phase 2.2)
-39bdeb8 feat(v8_fixpoint): tuple-return PU classification (Phase 2.1)
-eb88c7b feat(v8_fixpoint): borrow-passthrough short-circuit on top-signature .borrowed callees (Phase 1.8 #5)
+d64a1ad feat(arc_ownership): path-sensitive aggregate-store move + uniqueness rewriter id-order fix (Phase 2.2)
+39bdeb8 feat(uniqueness_fixpoint): tuple-return PU classification (Phase 2.1)
+eb88c7b feat(uniqueness_fixpoint): borrow-passthrough short-circuit on top-signature .borrowed callees (Phase 1.8 #5)
 c18eb54 feat(arc): bounded-borrow refinement in paramSlotIsRefetchedAfter (Phase 1.8 #4)
 694804b fix(compiler): dedupe merged-IR functions when struct is processed both as module and entry-point
 0f60bf3 fix(arc): correct ARC discipline for borrow-then-consume sequences
-9cef28d fix(arc): close k-nucleotide V8 gaps via path-sensitive last-use + cross-struct convention fallback
+9cef28d fix(arc): close k-nucleotide uniqueness gaps via path-sensitive last-use + cross-struct convention fallback
 2d3d174 fix(ir): retain ARC values extracted from non-ARC tuples and structs
 1919e98 test(arc_param_convention): add LiftSet packing/lookup unit tests
 fa0dd0e feat(arc): chain-consistency audit before lifting borrowed-source veto
 e7aac3e fix(arc_verifier): make convention name lookup last-wins to match rewriter and inference passes
-0c5d5b0 docs(v8_signature): document deferred Phase 1.3 integration with soundness notes
+0c5d5b0 docs(uniqueness_signature): document deferred Phase 1.3 integration with soundness notes
 d0983c8 feat(arc): per-function uniqueness signatures + SCC fixpoint (Phase 1.1+1.2)
 5c53d7b feat(arc): make Vector(T) ARC-managed in IR (A2)
 7bc783c fix(hir): assignment bindings shadow parameters per Elixir scope rules
-7021d9d feat(arc): interprocedural V8 uniqueness fixpoint (A1)
+7021d9d feat(arc): interprocedural uniqueness uniqueness fixpoint (A1)
 ```
 
 ### 2.4 Current benchmark numbers (lang-benches)
@@ -181,12 +181,12 @@ Trust these. Don't re-run benchmarks to verify them.
 
 | Benchmark | Current Zap | Best baseline | Status |
 | --- | --- | --- | --- |
-| **k-nucleotide** | 1.5s, byte-exact | C ~60ms | 100% V8 firing on `Map.put` (8.75M unchecked / 8.75M total) |
+| **k-nucleotide** | 1.5s, byte-exact | C ~60ms | 100% uniqueness firing on `Map.put` (8.75M unchecked / 8.75M total) |
 | **nbody** | 103ms | (fastest of 7 tested) | No collections used |
 | **mandelbrot** | 2.044s | Competitive with C/Rust | No collections used |
 | **binarytrees** | 5.49s | Beats C/Rust/Go | No collections used |
 | **fannkuch-redux n=10** | 2.6s, byte-exact | — | Was 154s+ pre-Phase-1 (60× improvement) |
-| **fannkuch-redux n=11** | 36.4s, byte-exact | C 1.55s | Over 30s gate. `vector_unchecked_total = 0` — V8 doesn't fire. Documented gap. |
+| **fannkuch-redux n=11** | 36.4s, byte-exact | C 1.55s | Over 30s gate. `vector_unchecked_total = 0` — uniqueness doesn't fire. Documented gap. |
 | **spectral-norm** | 1.86s, byte-exact | Rust 156ms | Was NaN through ~10 phases |
 
 ### 2.5 Stashed WIP from deferred work
@@ -219,13 +219,13 @@ const phase_2_6_2_enabled = std.c.getenv("ZAP_ENABLE_PHASE_2_6_2") != null;
 - **Never run `zig build zir-test`.** This is forbidden across the project. zir-test takes 6+ minutes per invocation and previous agents have been killed for running it. Verification uses only: `zig build`, `zig build test`, `zig build test -Dinstrument-map=true`, `bench/map-workloads/run-differential-tests.sh`, and direct CLBG benchmark invocation.
 - **No special-casing.** No hardcoded function names, no benchmark-specific heuristics in compiler logic. Zap is a general-purpose language; the compiler is a general-purpose tool.
 - **No hardcoded Zap struct names in the compiler.** If you find yourself writing a Zap struct name as a string literal in Zig source, you are doing it wrong. Find the Zap-level solution.
-- **Soundness over speed.** The V8 verifier is the post-rewrite safety net. Wrong inference produces compilation failure, never miscompilation.
+- **Soundness over speed.** The uniqueness verifier is the post-rewrite safety net. Wrong inference produces compilation failure, never miscompilation.
 - **No workarounds, no hacks.** Production-grade fixes only. If a proper fix requires deep architectural changes across multiple files, that is the fix. If it requires changes to the Zig fork, make those changes.
 - **TDD.** Failing test first, then implementation. Run `zig build test` and confirm green before committing.
 - **Frequent commits.** Don't allow projects to run on with work uncommitted. One commit per sub-deliverable where reasonable.
 - **No top-level functions in Zap.** Every `def`/`fn` must live inside `defmodule`/`pub struct`.
 - **All public Zap functions need `@fndoc`.** Heredoc strings. Blank line after every closing `"""`.
-- **Functional surface semantics.** Whatever the implementation, every collection operation returns a new value semantically. Mutation is invisible to the user. The opportunistic-mutation pattern (V8) is the safety substrate for any "in-place" optimization.
+- **Functional surface semantics.** Whatever the implementation, every collection operation returns a new value semantically. Mutation is invisible to the user. The opportunistic-mutation pattern (uniqueness) is the safety substrate for any "in-place" optimization.
 
 ---
 
@@ -235,7 +235,7 @@ The user has chosen Option B from `docs/list-vector-tuple-friction-research-brie
 
 **Roc is the closest precedent to Zap.** Roc, like Zap, is ARC-managed, native-compiled, statically-typed, and functional-first. Roc has only `List T` — flat-buffer, no separate cons-cell list. Roc handles `[head, ..rest]` pattern syntax over the flat-buffer representation through specific lowering rules: head is a slot read, rest is a slice or clone (depending on uniqueness).
 
-**ARC + Perceus-style reuse analysis closes the persistence gap.** The most-cited drawback of flat-buffer-only is "you lose persistent suffix-sharing across versions." But under ARC + the V8 uniqueness substrate that Zap already has, the compiler reuses the same buffer across versions when there is exactly one live reference; allocates a new buffer only when there is fanout. Lean 4's `Array α` proves this works in practice for the workloads where it matters.
+**ARC + Perceus-style reuse analysis closes the persistence gap.** The most-cited drawback of flat-buffer-only is "you lose persistent suffix-sharing across versions." But under ARC + the uniqueness substrate that Zap already has, the compiler reuses the same buffer across versions when there is exactly one live reference; allocates a new buffer only when there is fanout. Lean 4's `Array α` proves this works in practice for the workloads where it matters.
 
 **The Elixir surface is preserved — it's destructuring, not representation.** `[h | t]` and `[a, b, c | rest]` are pattern-match syntax. They lower to head-extract + tail-slice. The user code reads the same; the underlying representation is flat. Roc's experience is that this is invisible to nearly all client code.
 
@@ -243,7 +243,7 @@ The user has chosen Option B from `docs/list-vector-tuple-friction-research-brie
 
 **Most FP languages have both List and Vector for Lisp-legacy reasons.** OCaml, Haskell, Standard ML, Scala, Clojure, Lean 4, Idris 2 all maintain both. The historical cause is that cons-cell list was THE list before flat-buffer mutable arrays were the default in functional languages. The dual-collection design has stuck around as accumulated convention. It is not actively right.
 
-**The friction in §5 of the friction brief is concentrated entirely on Vector.** Every Zap benchmark that does NOT use `Vector` is competitive with C/Rust. Both benchmarks that DO use Vector (fannkuch, spectral-norm) are the worst-case Zap performers. Vector's theoretical advantage (cache-friendly contiguous storage, O(1) indexed access) hasn't translated to delivered perf because the hot-loop V8 firing requires non-ARC-aggregate-with-ARC-component last-use tracking (Phase 2.7) that's still unfinished. Option B does not eliminate this work — it relocates it to the unified `List(T)`. But the unification removes a duplicate type in the surface and aligns the language identity with Roc.
+**The friction in §5 of the friction brief is concentrated entirely on Vector.** Every Zap benchmark that does NOT use `Vector` is competitive with C/Rust. Both benchmarks that DO use Vector (fannkuch, spectral-norm) are the worst-case Zap performers. Vector's theoretical advantage (cache-friendly contiguous storage, O(1) indexed access) hasn't translated to delivered perf because the hot-loop uniqueness firing requires non-ARC-aggregate-with-ARC-component last-use tracking (Phase 2.7) that's still unfinished. Option B does not eliminate this work — it relocates it to the unified `List(T)`. But the unification removes a duplicate type in the surface and aligns the language identity with Roc.
 
 **The user has zero production users.** This is the right time to make breaking surface changes. The agent should not constrain the recommendation by fear of breakage.
 
@@ -406,7 +406,7 @@ pub struct List {
 - 3.1 `lib/list.zap` exposes the canonical generic API with `@fndoc` heredocs on every public function.
 - 3.2 ZIR emit for `List(t)` works for arbitrary `t`: `i64`, `f64`, ARC-managed (`String`), generic struct, nested `List(List(i64))`.
 - 3.3 Test programs in `test/` cover: `let l = List.new_filled(10, 0 :: i64)`, `List.set(l, 5, 99)`, `List.length(l)`, `List.append`, `List.map`, `List.filter`, `List.reduce`, `List.push`, `List.pop`.
-- 3.4 The V8 unchecked rewrite continues to fire on `List.set` exactly as it fired on `Vector.set` pre-rename. Confirm by inspecting `vector_unchecked_total` (which should be renamed to `list_unchecked_total` as part of this stage — search-replace in `src/runtime.zig`).
+- 3.4 The uniqueness unchecked rewrite continues to fire on `List.set` exactly as it fired on `Vector.set` pre-rename. Confirm by inspecting `vector_unchecked_total` (which should be renamed to `list_unchecked_total` as part of this stage — search-replace in `src/runtime.zig`).
 
 **Verification gates:**
 - `zig build test` green with the new test programs.
@@ -438,7 +438,7 @@ The pattern `[h | t]` lowers to:
 %t = List.tail(%list)            # rest of the list as a new List(T)
 ```
 
-Under V8 uniqueness, `List.tail` becomes `List.tail_owned_unchecked` and reuses the parent buffer in place by shifting elements down. Under non-uniqueness, it allocates a fresh buffer.
+Under uniqueness inference, `List.tail` becomes `List.tail_owned_unchecked` and reuses the parent buffer in place by shifting elements down. Under non-uniqueness, it allocates a fresh buffer.
 
 For richer patterns like `[a, b, c | rest]`, the lowering is:
 
@@ -454,7 +454,7 @@ For tail-only patterns like `[]` (empty match), the lowering is `length(%list) =
 **Deliverables:**
 - 4.1 New / repurposed IR opcodes for flat-buffer head/tail/slice. Existing `list_head` / `list_tail` opcodes either repurposed or replaced with new opcodes that take a flat-buffer `List(T)` and produce a `T` (head) or `List(T)` (slice).
 - 4.2 Runtime support: `List.head_owned_unchecked`, `List.tail_owned_unchecked`, `List.slice_owned_unchecked` variants exposed on the rc-1 fast path.
-- 4.3 V8 verifier extension: the slice/tail operations participate in the V8 lattice. A slice-from-uniquely-owned-list returns a uniquely-owned list slot (aliasing analysis must understand that the slice IS the original buffer, just with a shifted base pointer + new len).
+- 4.3 uniqueness verifier extension: the slice/tail operations participate in the uniqueness lattice. A slice-from-uniquely-owned-list returns a uniquely-owned list slot (aliasing analysis must understand that the slice IS the original buffer, just with a shifted base pointer + new len).
 - 4.4 All existing `lib/*.zap` code that uses `[h | t]` patterns continues to work.
 - 4.5 Test programs cover: list pattern matching, recursive functions over lists (`def length(list)` matching `[_ | rest]`), Erlang-style `def reverse(list)` accumulator pattern.
 
@@ -475,8 +475,8 @@ For tail-only patterns like `[]` (empty match), the lowering is `length(%list) =
 **Files modified:**
 - All `lib/*.zap` files: search for any references to `ConsList` (renamed cons-cell list from Stage 2). Convert each to the new flat-buffer `List(T)` API. Most existing code should "just work" since the flat-buffer List exposes the same operations as cons-cell List (`length`, `prepend`, `head`, `tail`, `map`, `filter`, `reduce`, etc.) — only the implementation differs.
 - `lib/list/concatenable.zap`, `lib/list/enumerable.zap`, `lib/list/membership.zap` — protocol implementations may need their `@native_type` updates and any cons-cell-specific implementation details ripped out.
-- `~/projects/lang-benches/zap/fannkuch-redux/` — benchmark source uses `VectorI64` today. Replace with `List(i64)`.
-- `~/projects/lang-benches/zap/spectral-norm/` — benchmark source uses `VectorF64`. Replace with `List(f64)`.
+- `~/projects/lang-benches/fannkuch-redux/` — benchmark source uses `VectorI64` today. Replace with `List(i64)`.
+- `~/projects/lang-benches/spectral-norm/` — benchmark source uses `VectorF64`. Replace with `List(f64)`.
 
 **Audit checklist:**
 - Every `lib/*.zap` reviewed for `ConsList` references → converted to `List`.
@@ -599,7 +599,7 @@ pub struct Tuple {
 
 **Background.** From `docs/opportunistic-mutation-milestone.md` §"What's documented as a gap":
 
-> `arc_liveness.ArcOwnership` doesn't track last-use of non-ARC aggregates (tuples) whose components are ARC-managed. Phase 2.5's `tuple_pending` machinery in `v8_uniqueness` queries `isLastUseAt(parent_tuple, ...)` which always returns false for these aggregates, so the destructure-promotion idiom never fires on the canonical fannkuch shape.
+> `arc_liveness.ArcOwnership` doesn't track last-use of non-ARC aggregates (tuples) whose components are ARC-managed. Phase 2.5's `tuple_pending` machinery in `uniqueness` queries `isLastUseAt(parent_tuple, ...)` which always returns false for these aggregates, so the destructure-promotion idiom never fires on the canonical fannkuch shape.
 
 > With (1) fixed, Phase 2.6.2 (`TentativeAnalyzer` tuple_pending support) and Phase 2.6.3 (`arc_drop_insertion` tuple-component releases) need to come online together. They're committed but gated off behind `ZAP_ENABLE_PHASE_2_6_2`.
 
@@ -607,7 +607,7 @@ After Stage 6, `Vector` is gone — so the canonical fannkuch shape is now `(Lis
 
 **Files modified:**
 - `src/arc_liveness.zig` (~4,972 lines) — extend `ArcOwnership` to track last-use of non-ARC aggregates. The aggregate's last use is the final program point where it (or any of its component projections) is referenced. Cite the existing `ArcOwnership` analysis and add aggregate-tracking as a parallel structure.
-- `src/v8_uniqueness.zig` — verify that `tuple_pending` queries to `isLastUseAt(parent_tuple, ...)` now return correct results for the canonical fannkuch shape. The previous machinery (commit `72cb556`) is in place; it just wasn't getting useful answers because the upstream tracking was missing.
+- `src/uniqueness.zig` — verify that `tuple_pending` queries to `isLastUseAt(parent_tuple, ...)` now return correct results for the canonical fannkuch shape. The previous machinery (commit `72cb556`) is in place; it just wasn't getting useful answers because the upstream tracking was missing.
 - `src/arc_param_convention.zig` — remove the `ZAP_ENABLE_PHASE_2_6_2` env var gate at line 643:
   ```zig
   // Set ZAP_ENABLE_PHASE_2_6_2=1 to reactivate the new behaviour
@@ -624,8 +624,8 @@ After Stage 6, `Vector` is gone — so the canonical fannkuch shape is now `(Lis
 **Deliverables:**
 - 8.1 `arc_liveness.ArcOwnership` extended to track last-use of non-ARC aggregates with ARC-managed components.
 - 8.2 The `ZAP_ENABLE_PHASE_2_6_2` gate at `src/arc_param_convention.zig:643` is removed; Phase 2.6.2 and Phase 2.6.3 are unconditionally enabled.
-- 8.3 V8 firing on `List.set` in fannkuch's hot loops: `list_unchecked_total > 0` (renamed from `vector_unchecked_total` in Stage 3).
-- 8.4 Verifier still rejects unsound experiments — V8 is the post-rewrite safety net.
+- 8.3 uniqueness firing on `List.set` in fannkuch's hot loops: `list_unchecked_total > 0` (renamed from `vector_unchecked_total` in Stage 3).
+- 8.4 Verifier still rejects unsound experiments — uniqueness is the post-rewrite safety net.
 
 **Verification gates:**
 - `zig build test` green.
@@ -633,7 +633,7 @@ After Stage 6, `Vector` is gone — so the canonical fannkuch shape is now `(Lis
 - **fannkuch n=11 byte-exact + ≤ 30s wall.** This is the gate.
 - fannkuch n=10 still byte-exact and within noise of 2.6s.
 - spectral-norm still byte-exact.
-- k-nucleotide still 100% V8 firing on `Map.put`.
+- k-nucleotide still 100% uniqueness firing on `Map.put`.
 - No regressions on other benchmarks.
 
 **Done criteria:**
@@ -652,7 +652,7 @@ After Stage 6, `Vector` is gone — so the canonical fannkuch shape is now `(Lis
 The work in this stage is recognizing the IR pattern (`List.map`, `List.reduce`, etc. over uniquely-owned numeric buffers) and emitting the right C-ABI calls.
 
 **Files modified:**
-- `src/zir_builder.zig` — add a SIMD lowering path. When the IR opcode is a List traversal AND the element type is primitive numeric (`i8/i16/i32/i64/f32/f64`) AND V8 proves the receiver uniquely owned AND the operation is closed over a primitive operation (add, mul, etc.), emit:
+- `src/zir_builder.zig` — add a SIMD lowering path. When the IR opcode is a List traversal AND the element type is primitive numeric (`i8/i16/i32/i64/f32/f64`) AND uniqueness proves the receiver uniquely owned AND the operation is closed over a primitive operation (add, mul, etc.), emit:
   ```
   %vec_ty = @Vector(N, T)        # via zap_vector_type C-ABI
   %loaded = load %vec_ty from buffer
@@ -667,7 +667,7 @@ The work in this stage is recognizing the IR pattern (`List.map`, `List.reduce`,
 **Eligibility conditions (compile-time checks):**
 1. Receiver is `List(T)`.
 2. `T` is one of: `i8`, `i16`, `i32`, `i64`, `f32`, `f64`. (Bool, Atom, String, struct types, ARC-managed types are NOT eligible.)
-3. V8 verifier proves the receiver is uniquely owned at the call site (the existing `set_owned_unchecked` rewrite condition).
+3. uniqueness verifier proves the receiver is uniquely owned at the call site (the existing `set_owned_unchecked` rewrite condition).
 4. The operation is a known SIMD-friendly traversal: `map(fn(x) -> x + k)`, `map(fn(x) -> x * k)`, `reduce(0, fn(a, x) -> a + x)`, `zipWith(other, fn(a, b) -> a + b)`, `zipWith(other, fn(a, b) -> a * b)`, dot product, scaled add (FMA), etc. The closure body must be a single primitive operation; complex closures fall back to scalar codegen.
 
 **Critical guardrails:**
@@ -696,28 +696,34 @@ The work in this stage is recognizing the IR pattern (`List.map`, `List.reduce`,
 - The word "Vector" appears in the codebase only inside `src/zir_builder.zig` (as a reference to the LLVM SIMD primitive) and in `~/projects/zig/` (as the Zig builder).
 - Commit chain: one commit per SIMD-friendly operation pattern enabled.
 
-### Stage 10: V8 rename (cleanup, can defer indefinitely)
+### Stage 10: Legacy uniqueness-analysis terminology cleanup (done)
 
-**Goal:** rename "V8" terminology everywhere because it collides with V8 the JavaScript engine. Pure cleanup; no behavior change.
+**Goal:** finish the terminology cleanup for the uniqueness analysis. Pure cleanup; no behavior change.
 
-**Background.** From `~/.claude/projects/-Users-bcardarella-projects-zap/memory/project_v8_rename_pending.md` and `docs/opportunistic-mutation-milestone.md` §"Future work" #6.
+**Background.** From the legacy uniqueness-analysis rename memory and `docs/opportunistic-mutation-milestone.md` §"Future work" #6.
 
 **Files renamed:**
-- `src/v8_uniqueness.zig` → suggested `src/uniqueness.zig` or `src/alias_safety.zig`.
-- `src/v8_signature.zig` → e.g., `src/uniqueness_signature.zig`.
-- `src/v8_fixpoint.zig` → e.g., `src/uniqueness_fixpoint.zig`.
-- `src/v8_interprocedural.zig` → e.g., `src/uniqueness_interprocedural.zig`.
+- `src/uniqueness.zig` is the per-instruction uniqueness analysis module.
+- `src/uniqueness_signature.zig` is the per-function uniqueness signature module.
+- `src/uniqueness_fixpoint.zig` is the SCC fixpoint module.
+- `src/uniqueness_interprocedural.zig` is the cross-function propagation module.
 
 **Symbols renamed:**
-- All internal types, functions, and variables containing "V8" or "v8" → consistent new naming.
+- All internal types, functions, and variables use consistent uniqueness naming.
 - Public-facing IR opcode names (e.g., `set_owned_unchecked`) stay — they describe semantics, not the analysis.
 - `vector_unchecked_total` was renamed `list_unchecked_total` in Stage 3; no further change here.
-- Verifier check name `runV8` → `runUniquenessCheck` (or chosen equivalent).
+- Verifier check name is `runUniquenessCheck`.
 
 **Documentation:**
-- `docs/opportunistic-mutation-milestone.md` and `docs/list-vector-tuple-friction-research-brief.md` keep their historical references to "V8". Don't rewrite history.
-- Update `CLAUDE.md`, `docs/dense-map-implementation-plan.md`, and any other live docs to reflect the new terminology.
+- Historical references keep the old name; don't rewrite history. This includes `docs/opportunistic-mutation-milestone.md`, `docs/list-vector-tuple-friction-research-brief.md`, `docs/dense-map-implementation-plan.md`, `docs/map-workload-findings.md`, `docs/map-workload-instrumentation-plan.md`, and `docs/zap-map-representation-research-brief.md`.
+- Live planning text uses the new terminology after the rename. Today this means this list-unification plan and any new public docs generated after Stage 10.
 - Existing commit messages keep their historical references; don't rewrite git history.
+
+**Current scan after implementation:**
+- `rg -n 'legacy-name-pattern' src` returns zero matches.
+- The renamed modules are `src/uniqueness.zig`, `src/uniqueness_signature.zig`, `src/uniqueness_fixpoint.zig`, and `src/uniqueness_interprocedural.zig`.
+- Zap library, Zap tests, examples, scripts, `README.md`, `CLAUDE.md`, and `AGENTS.md` have no legacy uniqueness-analysis name hits.
+- Historical docs listed above are excluded from the cleanup gate.
 
 **Naming options (author's choice; document in commit message):**
 - `AliasSafety` — emphasizes the safety property.
@@ -725,9 +731,9 @@ The work in this stage is recognizing the IR pattern (`List.map`, `List.reduce`,
 - `Linearity` — emphasizes the linear-typing connection.
 
 **Deliverables:**
-- 10.1 All `src/v8_*.zig` files renamed.
+- 10.1 All legacy uniqueness-analysis module filenames renamed.
 - 10.2 All internal symbols renamed.
-- 10.3 `grep -rn "V8\|v8_" src/` returns zero matches.
+- 10.3 Source has no legacy uniqueness-analysis name hits.
 - 10.4 Documentation updated.
 
 **Verification gates:**
@@ -736,10 +742,10 @@ The work in this stage is recognizing the IR pattern (`List.map`, `List.reduce`,
 - All CLBG benchmarks byte-exact and within noise of pre-rename wall-times.
 
 **Done criteria:**
-- "V8" terminology is gone from the codebase. The naming aligns with industry conventions (uniqueness analysis, alias safety, linearity).
-- Commit: "refactor: rename V8 terminology to <chosen name> (Stage 10)".
+- Legacy uniqueness-analysis terminology is gone from live source and non-historical planning prose. Historical research/plan docs and preserved commit-message references may keep it intentionally.
+- Commit: "refactor: rename legacy uniqueness terminology".
 
-This stage can be deferred indefinitely. It's pure cleanup with no behavior change. Sequence after the user has bandwidth.
+This stage is pure cleanup with no behavior change.
 
 ---
 
@@ -752,7 +758,7 @@ These hold at every commit boundary, not just at the end of each stage:
 - **All CLBG benchmarks byte-exact.** k-nucleotide, fannkuch n=10, fannkuch n=11, spectral-norm, nbody, mandelbrot, binarytrees.
 - **No regressions on benchmarks already passing.** Wall-time within noise of the pre-stage baseline.
 - **No `zig build zir-test` invocations.** Ever. Period. The user runs zir-test themselves.
-- **No verifier rejections of correct programs.** V8 (or its renamed successor) remains the post-rewrite safety net. Wrong inference produces compilation failure, never miscompilation.
+- **No verifier rejections of correct programs.** uniqueness (or its renamed successor) remains the post-rewrite safety net. Wrong inference produces compilation failure, never miscompilation.
 - **No partially-finished states across commits.** Every commit must build and pass tests. If a stage requires cross-file changes that don't compile partway, the changes go in a single commit.
 - **Commit hygiene.** One commit per logical unit of work. Commit messages explain why, not just what. Use the project's commit message style (lower-case `feat(scope):` / `fix(scope):` / `refactor(scope):` / `docs:` prefixes).
 
@@ -775,14 +781,14 @@ Where to read code when context is needed:
 - `src/arc_param_convention.zig` (~4,962 lines) — chain-consistency audit; `computeLiftSet` line 293; Phase 2.6.2 gate line 643.
 - `src/arc_liveness.zig` (~4,972 lines) — `ArcOwnership` analysis; the target of Stage 8's extension.
 - `src/arc_drop_insertion.zig` (~2,632 lines) — drop-insertion pass.
-- `src/arc_verifier.zig` (~2,580 lines) — V1–V8 invariant enforcement; runs post-rewrite as the safety net.
+- `src/arc_verifier.zig` (~2,580 lines) — V1–uniqueness invariant enforcement; runs post-rewrite as the safety net.
 - `src/arc_optimizer.zig` (~493 lines) — additional ownership optimizations.
 
-### V8 uniqueness inference
-- `src/v8_uniqueness.zig` (~2,272 lines) — per-instruction forward dataflow with `tuple_pending` tracking.
-- `src/v8_signature.zig` (~352 lines) — 4-element lattice `{CU, PU, AL, ⊤}`.
-- `src/v8_fixpoint.zig` (~2,496 lines) — Tarjan SCC + worklist join.
-- `src/v8_interprocedural.zig` (~1,554 lines) — cross-function uniqueness propagation.
+### uniqueness inference
+- `src/uniqueness.zig` (~2,272 lines) — per-instruction forward dataflow with `tuple_pending` tracking.
+- `src/uniqueness_signature.zig` (~352 lines) — 4-element lattice `{CU, PU, AL, ⊤}`.
+- `src/uniqueness_fixpoint.zig` (~2,496 lines) — Tarjan SCC + worklist join.
+- `src/uniqueness_interprocedural.zig` (~1,554 lines) — cross-function uniqueness propagation.
 
 ### Codegen
 - `src/zir_builder.zig` — emits ZIR via C-ABI calls into the Zig fork. The only codegen path. SIMD codegen in Stage 9 lives here.
@@ -797,10 +803,10 @@ Where to read code when context is needed:
 - `lib/kernel.zap` — macros and core language constructs.
 
 ### Benchmarks
-- `~/projects/lang-benches/zap/k-nucleotide/` — Map-heavy. Untouched by this plan.
-- `~/projects/lang-benches/zap/fannkuch-redux/` — uses `VectorI64` today; migrated in Stage 5.
-- `~/projects/lang-benches/zap/spectral-norm/` — uses `VectorF64` today; migrated in Stage 5.
-- `~/projects/lang-benches/zap/nbody/`, `mandelbrot/`, `binarytrees/` — no collections used; untouched.
+- `~/projects/lang-benches/k-nucleotide/` — Map-heavy. Untouched by this plan.
+- `~/projects/lang-benches/fannkuch-redux/` — uses `VectorI64` today; migrated in Stage 5.
+- `~/projects/lang-benches/spectral-norm/` — uses `VectorF64` today; migrated in Stage 5.
+- `~/projects/lang-benches/nbody/`, `mandelbrot/`, `binarytrees/` — no collections used; untouched.
 
 ### Test infrastructure
 - `bench/map-workloads/` — Phase 0 instrumentation (still in repo, behind `-Dinstrument-map=true`). `bench/map-workloads/run-differential-tests.sh` is the differential test runner.
@@ -841,9 +847,9 @@ Stage 6 (Delete ConsList + Vector remnants)         ← Option B (List unificati
    │
 Stage 8 (Phase 2.7 — close fannkuch n=11 gate)      ← Depends on Stage 6 (uses unified List(T))
    │
-Stage 9 (SIMD codegen for List(T : Numeric))         ← Depends on Stage 8 (V8 firing)
+Stage 9 (SIMD codegen for List(T : Numeric))         ← Depends on Stage 8 (uniqueness firing)
    │
-Stage 10 (V8 rename — pure cleanup, deferrable)     ← INDEPENDENT, no behavior change
+Stage 10 (uniqueness terminology cleanup)           ← DONE
 ```
 
 | Stage | Goal | Depends on | Files touched (rough) | Estimated effort |
@@ -852,12 +858,12 @@ Stage 10 (V8 rename — pure cleanup, deferrable)     ← INDEPENDENT, no behavi
 | 2 | Vector→List rename in IR/scope/types | 1 | `src/ir.zig`, `src/types.zig`, `src/scope.zig`, `src/zir_builder.zig`, `src/zir_backend.zig`, `lib/vector_*.zap`, `lib/list.zap` | 1.5 weeks |
 | 3 | Generic List(T) Zap surface | 2 | `lib/list.zap`, `src/zir_builder.zig` | 1 week |
 | 4 | `[h \| t]` pattern → flat-buffer | 3 | `src/parser.zig`, `src/hir.zig`, `src/ir.zig`, `src/runtime.zig`, `lib/list.zap` | 1.5 weeks |
-| 5 | Migrate stdlib + benchmarks | 4 | `lib/*.zap`, `~/projects/lang-benches/zap/{fannkuch,spectral-norm}/` | 1 week |
+| 5 | Migrate stdlib + benchmarks | 4 | `lib/*.zap`, `~/projects/lang-benches/{fannkuch,spectral-norm}/` | 1 week |
 | 6 | Delete ConsList + Vector remnants | 5 | `src/runtime.zig`, `src/ir.zig`, cleanup | 0.5 weeks |
 | 7 | Tuple formalization | independent | `src/types.zig`, `lib/tuple.zap` | 1 week |
-| 8 | Phase 2.7 (close fannkuch n=11) | 6 | `src/arc_liveness.zig`, `src/arc_param_convention.zig`, `src/arc_drop_insertion.zig`, `src/v8_uniqueness.zig` | 2–3 weeks (this is the hard one) |
+| 8 | Phase 2.7 (close fannkuch n=11) | 6 | `src/arc_liveness.zig`, `src/arc_param_convention.zig`, `src/arc_drop_insertion.zig`, `src/uniqueness.zig` | 2–3 weeks (this is the hard one) |
 | 9 | SIMD codegen | 8 | `src/zir_builder.zig`, possibly `~/projects/zig/src/zir_api.zig` | 2 weeks |
-| 10 | V8 rename | independent | `src/v8_*.zig` and all callers | 0.5 weeks |
+| 10 | uniqueness terminology cleanup | independent | `src/uniqueness*.zig` and all callers | done |
 | **Total** | | | | ~12 weeks calendar; less with parallelism |
 
 **Parallelism opportunities.** Stage 7 can run alongside Stages 1–6 as long as the agent coordinates file ownership (Stage 7 touches `lib/tuple.zap` and `src/types.zig`'s tuple-related code; Stages 1–6 touch List/Vector code). Stage 10 can run after Stage 6 in parallel with Stages 8–9. Stages 1–6 are strictly sequential. Stages 8 and 9 are strictly sequential.
@@ -870,7 +876,7 @@ Stage 10 (V8 rename — pure cleanup, deferrable)     ← INDEPENDENT, no behavi
 2. **`Tuple` is first-class.** Heterogeneous fixed-arity, compile-time indexing only, surface in `lib/tuple.zap` with `@fndoc` on all public functions.
 3. **`zig build test` green** with default and `-Dinstrument-map=true` flags.
 4. **CLBG benchmarks byte-exact** at every gate:
-   - k-nucleotide: 100% V8 firing on `Map.put`, byte-exact, ≤ current wall-time.
+   - k-nucleotide: 100% uniqueness firing on `Map.put`, byte-exact, ≤ current wall-time.
    - fannkuch-redux n=10: byte-exact, ≤ 3s.
    - fannkuch-redux n=11: byte-exact, ≤ 30s (closes the 17% gap).
    - spectral-norm: byte-exact, ≤ 1s with SIMD (Stage 9).
@@ -879,7 +885,7 @@ Stage 10 (V8 rename — pure cleanup, deferrable)     ← INDEPENDENT, no behavi
 6. **No `ConsList\|cons_list\|cons_cell` references** in `src/`, `lib/`, `test/`, `examples/`.
 7. **The `ZAP_ENABLE_PHASE_2_6_2` env-var gate is gone** from `src/arc_param_convention.zig`.
 8. **SIMD codegen fires** on numeric `List(T)` traversals over uniquely-owned buffers, measurably improving fannkuch and spectral-norm wall-times.
-9. **(Optional, deferrable indefinitely)** "V8" terminology renamed (Stage 10).
+9. **(Optional, deferrable indefinitely)** "uniqueness" terminology renamed (Stage 10).
 10. **Phase 0 instrumentation infrastructure still works** on the unified `List(T)`.
 
 **zir-test is NOT a done criterion.** The user runs zir-test themselves on their own schedule. Subagents must never invoke it.
@@ -894,10 +900,10 @@ Allowed verification commands (fast):
 - `zig build test -Dinstrument-map=true` — instrumentation build green.
 - `bench/map-workloads/run-differential-tests.sh` — differential test runner (~30 seconds).
 - Direct CLBG benchmark invocation:
-  - `~/projects/lang-benches/zap/k-nucleotide/zap-out/bin/k_nucleotide`
-  - `~/projects/lang-benches/zap/fannkuch-redux/zap-out/bin/fannkuch_redux 10`
-  - `~/projects/lang-benches/zap/fannkuch-redux/zap-out/bin/fannkuch_redux 11`
-  - `~/projects/lang-benches/zap/spectral-norm/zap-out/bin/spectral_norm 2500`
+  - `~/projects/lang-benches/k-nucleotide/zap-out/bin/k_nucleotide`
+  - `~/projects/lang-benches/fannkuch-redux/zap-out/bin/fannkuch_redux 10`
+  - `~/projects/lang-benches/fannkuch-redux/zap-out/bin/fannkuch_redux 11`
+  - `~/projects/lang-benches/spectral-norm/zap-out/bin/spectral_norm 2500`
   - etc.
 
 **Forbidden verification commands:**
@@ -907,11 +913,11 @@ Allowed verification commands (fast):
 
 ## 10. Risk Inventory
 
-- **Risk:** Stage 4's flat-buffer `[h | t]` lowering produces a slow recursive function pattern (each recursive `tail` allocates) under non-uniqueness. **Mitigation:** under V8 uniqueness, `tail` becomes `tail_owned_unchecked` and reuses the parent buffer. The cost falls on workloads that hold many versions of nearly-identical lists; those workloads were always going to pay this cost under Option B (this is the documented trade-off in §3).
-- **Risk:** Stage 8's `arc_liveness.ArcOwnership` extension introduces verifier rejections of correct programs. **Mitigation:** TDD discipline. Add failing tests first; the V8 verifier is the post-rewrite safety net and will catch incorrect inferences as compile errors, never as miscompilation.
+- **Risk:** Stage 4's flat-buffer `[h | t]` lowering produces a slow recursive function pattern (each recursive `tail` allocates) under non-uniqueness. **Mitigation:** under uniqueness inference, `tail` becomes `tail_owned_unchecked` and reuses the parent buffer. The cost falls on workloads that hold many versions of nearly-identical lists; those workloads were always going to pay this cost under Option B (this is the documented trade-off in §3).
+- **Risk:** Stage 8's `arc_liveness.ArcOwnership` extension introduces verifier rejections of correct programs. **Mitigation:** TDD discipline. Add failing tests first; the uniqueness verifier is the post-rewrite safety net and will catch incorrect inferences as compile errors, never as miscompilation.
 - **Risk:** Stage 9's SIMD codegen produces incorrect output on edge cases (length-not-divisible-by-N, alignment, etc.). **Mitigation:** byte-exact CLBG benchmark output is the gating signal; eligibility check is conservative. The fallback to scalar codegen is always sound.
 - **Risk:** Stage 5 stdlib migration breaks a `lib/*.zap` file in a way that causes user-code tests to fail. **Mitigation:** TDD per file; `zig build test` green at every commit boundary.
-- **Risk:** Stage 7 tuple formalization conflicts with assumptions in the V8 uniqueness pipeline (which already has `tuple_pending` tracking). **Mitigation:** the formalization should not change tuple semantics — it adds a surface library and a real type registration. The IR side already has `tuple_init` and `index_get`; those don't change.
+- **Risk:** Stage 7 tuple formalization conflicts with assumptions in the uniqueness pipeline (which already has `tuple_pending` tracking). **Mitigation:** the formalization should not change tuple semantics — it adds a surface library and a real type registration. The IR side already has `tuple_init` and `index_get`; those don't change.
 - **Risk:** stash@{0} contains unsalvageable WIP for Stage 8 and the agent burns time trying to recover it. **Mitigation:** explicit decision point at the start of Stage 8 — inspect with `git stash show -p stash@{0}`, make a clean recover-or-restart call, document the decision in the next commit message.
 - **Risk:** SIMD eligibility check is too conservative or too aggressive. **Mitigation:** gate Stage 9 sub-deliverables one operation pattern at a time. Each operation pattern (`map`, `reduce`, `zipWith`, etc.) gets its own commit with byte-exact verification before the next pattern is enabled.
 

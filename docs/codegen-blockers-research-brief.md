@@ -521,7 +521,11 @@ This requires:
    ```
 3. **Update Zap-side**: change `StructFieldDef.type_expr` from `[]const u8` to `ZigType`, switch `emitNestedTypeDecl` / `emitRootFields` to emit the right kind based on the `ZigType` shape.
 
-For complex types like `[Tree]` the body would be ~6 instructions (the same sequence `emitImportedTypeRef` already emits in body context: `decl_val "ListOf"`, `decl_val "Tree"`, `call`, `field_val "empty"`, `call`, `typeof`). The same logic, just plumbed through the new multi-instruction path.
+For complex types like `[Tree]` the body would be a short multi-instruction
+sequence matching the current `emitImportedTypeRef` path: emit the runtime
+`List(Tree)` cell reference, fetch its `empty` function, call it, then emit
+`typeof` on the empty-list value. The same logic, just plumbed through the new
+multi-instruction path.
 
 #### Estimated effort
 

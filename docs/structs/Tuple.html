@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Zap.Dep — Zap</title>
+<title>Tuple — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -41,7 +41,7 @@
 </a>
 </div>
 </header>
-<div class="layout layout-no-toc">
+<div class="layout">
 <nav class="sidebar">
 <div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
@@ -67,8 +67,8 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
-<li><a href="../structs/Tuple.html">Tuple</a></li>
-<li class="active"><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li class="active"><a href="../structs/Tuple.html">Tuple</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
 <li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
@@ -111,16 +111,47 @@
 <nav class="breadcrumb" aria-label="Breadcrumb">
 <span>Structs</span>
 <span>/</span>
-<span class="breadcrumb-current">Zap.Dep</span>
+<span class="breadcrumb-current">Tuple</span>
 </nav>
-<h1 class="page-title">Zap.Dep</h1>
-<p class="tagline">Dependency declaration used by `Zap.Manifest`.</p>
+<h1 class="page-title">Tuple</h1>
+<p class="tagline">Heterogeneous fixed-arity product type.</p>
 <div class="structdoc">
-<p>Dependency declaration used by <code>Zap.Manifest</code>.</p>
-<p>A dependency can point to a local path or a Git source with a tag,
-branch, revision, or local override.</p>
+<p>Heterogeneous fixed-arity product type.</p>
+<p>Tuples are anonymous structural shapes. <code>{i64, String, Bool}</code> is a
+distinct type from <code>{i64, String, Bool, Atom}</code>. Slot access is
+compile-time only with numeric fields such as <code>tuple.0</code> and
+<code>tuple.1</code>; runtime indexing is intentionally unsupported because
+tuple slots can have different static types.</p>
+</div>
+<h2 id="macros">Macros</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#size-1">size/1</a></td><td class="summary-doc">Returns the number of slots in a tuple.</td></tr>
+</table>
+<h2>Macro Details</h2>
+<div class="function-detail" id="size-1">
+<div class="function-header">
+<h3>size<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#size-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">size</span><span class="sig-paren">(</span>tuple_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Returns the number of slots in a tuple.</p>
+<p>The result is determined from the tuple's static arity. This is a
+macro so heterogeneous tuple values can be passed without widening
+them to a nominal wrapper type.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/tuple.zap#L22">Source</a>
 </div>
 </main>
+<aside class="toc">
+<h3>On This Page</h3>
+<ul>
+<li class="toc-section">Macros</li>
+<li><a href="#size-1">size/1</a></li>
+</ul>
+</aside>
 </div>
 <div id="search-modal" class="search-modal" hidden>
 <div class="search-backdrop"></div>

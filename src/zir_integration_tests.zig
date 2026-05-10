@@ -3079,13 +3079,10 @@ test "ZIR: Phase 4 Map workload byte-exact with retain/release balance check" {
 // Phase 5 wires `arc_returned_locals` into the release filter and
 // emits a `noteReturnElision` ZIR call at every elision point. The
 // runtime counter `arc_return_elisions_total` must remain at zero
-// for any program whose only ARC-managed types are *not* yet flagged
-// (i.e., `.map`, `.list`, `.string_type`, `.marray_type`). Phase 6
-// flips the flag, at which point this test's counter expectation
-// will need to update — but until then, an unexpected non-zero
-// reading here would mean Phase 5's emission accidentally fired on
-// a non-`.opaque_type` local, surfacing a regression in either
-// `isArcManagedTypeId` or the analyzer's filter.
+// for any program whose ARC-managed locals should not participate
+// in return-source elision. An unexpected non-zero reading here
+// would mean Phase 5's emission accidentally fired outside the
+// analyzer's intended filter.
 test "ZIR: Phase 5 return-elision counter fires for Map workload (post-Phase-F)" {
     var result = try compileAndRunWithEnv(
         \\pub struct TestProg {
@@ -3169,4 +3166,3 @@ test "ZIR: Phase 5 return-elision counter stays zero for non-ARC workload" {
     // Else: no stats dumped because no ARC traffic fired — also a
     // valid observation that the counter stayed at zero.
 }
-

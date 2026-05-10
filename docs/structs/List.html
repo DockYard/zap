@@ -72,6 +72,7 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Tuple.html">Tuple</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
@@ -124,39 +125,70 @@
 <a class="implements-link" href="../structs/Enumerable.html">Enumerable</a>
 <a class="implements-link" href="../structs/Membership.html">Membership</a>
 </div>
-<p class="tagline">Functions for working with lists.</p>
+<p class="tagline">A flat-buffer sequence of elements.</p>
 <div class="structdoc">
-<p>Functions for working with lists.</p>
-<p>Lists in Zap are singly-linked immutable cons cells using
-nullable pointers. An empty list is <code>[]</code> (null), and a
-non-empty list is a chain of cells each holding a head value
-and a tail pointer.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.length([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])         <span class="hl-comment"># =&gt; 3</span>
-List.head([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>])        <span class="hl-comment"># =&gt; 10</span>
-List.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])        <span class="hl-comment"># =&gt; [3, 2, 1]</span></code></pre>
+<p>A flat-buffer sequence of elements.</p>
+<p><code>List(t)</code> is backed by the runtime's single-allocation contiguous
+buffer. Lists support O(1) indexed reads, copy-on-write mutation, and
+ARC-managed lifetime for elements that own runtime resources.</p>
 </div>
 <h2 id="functions">Functions</h2>
 <table class="summary">
-<tr><td class="summary-name"><a href="#empty?-1">empty?/1</a></td><td class="summary-doc">Returns `true` if the list has no elements.</td></tr>
+<tr><td class="summary-name"><a href="#new_filled-2">new_filled/2</a></td><td class="summary-doc">Allocate a list of `size` elements, each initialized to `init`.</td></tr>
+<tr><td class="summary-name"><a href="#new_empty-1">new_empty/1</a></td><td class="summary-doc">Allocate an empty list with at least `initial_capacity` reserved slots.</td></tr>
+<tr><td class="summary-name"><a href="#empty?-1">empty?/1</a></td><td class="summary-doc">Returns `true` when the list has no elements.</td></tr>
 <tr><td class="summary-name"><a href="#length-1">length/1</a></td><td class="summary-doc">Returns the number of elements in the list.</td></tr>
-<tr><td class="summary-name"><a href="#head-1">head/1</a></td><td class="summary-doc">Returns the first element of the list.</td></tr>
-<tr><td class="summary-name"><a href="#tail-1">tail/1</a></td><td class="summary-doc">Returns the list without its first element.</td></tr>
-<tr><td class="summary-name"><a href="#at-2">at/2</a></td><td class="summary-doc">Returns the element at the given zero-based index.</td></tr>
-<tr><td class="summary-name"><a href="#last-1">last/1</a></td><td class="summary-doc">Returns the last element of the list.</td></tr>
-<tr><td class="summary-name"><a href="#contains?-2">contains?/2</a></td><td class="summary-doc">Returns `true` if the list contains the given value.</td></tr>
-<tr><td class="summary-name"><a href="#reverse-1">reverse/1</a></td><td class="summary-doc">Reverses the order of elements.</td></tr>
-<tr><td class="summary-name"><a href="#prepend-2">prepend/2</a></td><td class="summary-doc">Prepends a value to the front of a list.</td></tr>
-<tr><td class="summary-name"><a href="#append-2">append/2</a></td><td class="summary-doc">Appends a value to the end of a list.</td></tr>
+<tr><td class="summary-name"><a href="#capacity-1">capacity/1</a></td><td class="summary-doc">Returns the list's reserved capacity.</td></tr>
+<tr><td class="summary-name"><a href="#get-2">get/2</a></td><td class="summary-doc">Returns the element at `index`.</td></tr>
+<tr><td class="summary-name"><a href="#at-2">at/2</a></td><td class="summary-doc">Returns the element at `index`.</td></tr>
+<tr><td class="summary-name"><a href="#set-3">set/3</a></td><td class="summary-doc">Returns a list with `value` stored at `index`.</td></tr>
+<tr><td class="summary-name"><a href="#push-2">push/2</a></td><td class="summary-doc">Returns a list with `value` added to the end.</td></tr>
+<tr><td class="summary-name"><a href="#pop-1">pop/1</a></td><td class="summary-doc">Removes the last element and returns `{list, value}`.</td></tr>
+<tr><td class="summary-name"><a href="#append-2">append/2</a></td><td class="summary-doc">Concatenates two lists.</td></tr>
 <tr><td class="summary-name"><a href="#concat-2">concat/2</a></td><td class="summary-doc">Concatenates two lists.</td></tr>
-<tr><td class="summary-name"><a href="#take-2">take/2</a></td><td class="summary-doc">Takes the first `count` elements.</td></tr>
-<tr><td class="summary-name"><a href="#drop-2">drop/2</a></td><td class="summary-doc">Drops the first `count` elements.</td></tr>
-<tr><td class="summary-name"><a href="#uniq-1">uniq/1</a></td><td class="summary-doc">Returns a new list with duplicates removed.</td></tr>
-<tr><td class="summary-name"><a href="#head!-1">head!/1</a></td><td class="summary-doc">Returns the first element of the list.</td></tr>
-<tr><td class="summary-name"><a href="#last!-1">last!/1</a></td><td class="summary-doc">Returns the last element of the list.</td></tr>
-<tr><td class="summary-name"><a href="#at!-2">at!/2</a></td><td class="summary-doc">Returns the element at the given zero-based index.</td></tr>
+<tr><td class="summary-name"><a href="#head-1">head/1</a></td><td class="summary-doc">Returns the first element, or the element type's default for an empty list.</td></tr>
+<tr><td class="summary-name"><a href="#tail-1">tail/1</a></td><td class="summary-doc">Returns all elements after the first as a new list.</td></tr>
+<tr><td class="summary-name"><a href="#prepend-2">prepend/2</a></td><td class="summary-doc">Returns `value` followed by the contents of `list`.</td></tr>
+<tr><td class="summary-name"><a href="#last-1">last/1</a></td><td class="summary-doc">Returns the last element, or the element type's default for an empty list.</td></tr>
+<tr><td class="summary-name"><a href="#contains?-2">contains?/2</a></td><td class="summary-doc">Returns `true` when `value` is present in the list.</td></tr>
+<tr><td class="summary-name"><a href="#reverse-1">reverse/1</a></td><td class="summary-doc">Returns a new list with elements in reverse order.</td></tr>
+<tr><td class="summary-name"><a href="#take-2">take/2</a></td><td class="summary-doc">Returns the first `count` elements.</td></tr>
+<tr><td class="summary-name"><a href="#drop-2">drop/2</a></td><td class="summary-doc">Returns the list after dropping the first `count` elements.</td></tr>
+<tr><td class="summary-name"><a href="#uniq-1">uniq/1</a></td><td class="summary-doc">Returns a list with duplicate values removed.</td></tr>
+<tr><td class="summary-name"><a href="#map-2">map/2</a></td><td class="summary-doc">Transforms each element with `callback`.</td></tr>
+<tr><td class="summary-name"><a href="#filter-2">filter/2</a></td><td class="summary-doc">Keeps elements for which `predicate` returns true.</td></tr>
+<tr><td class="summary-name"><a href="#reduce-3">reduce/3</a></td><td class="summary-doc">Folds the list from left to right.</td></tr>
+<tr><td class="summary-name"><a href="#head!-1">head!/1</a></td><td class="summary-doc">Returns the first element.</td></tr>
+<tr><td class="summary-name"><a href="#last!-1">last!/1</a></td><td class="summary-doc">Returns the last element.</td></tr>
+<tr><td class="summary-name"><a href="#at!-2">at!/2</a></td><td class="summary-doc">Returns the element at `index`.</td></tr>
 </table>
 <h2>Function Details</h2>
+<div class="function-detail" id="new_filled-2">
+<div class="function-header">
+<h3>new_filled<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#new_filled-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">new_filled</span><span class="sig-paren">(</span>size<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>init<span class="sig-separator">::</span><span class="sig-type-pill">t</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">List(t)</span></code></div>
+<div class="function-doc">
+<p>Allocate a list of <code>size</code> elements, each initialized to <code>init</code>.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L16">Source</a>
+</div>
+<div class="function-detail" id="new_empty-1">
+<div class="function-header">
+<h3>new_empty<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#new_empty-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">new_empty</span><span class="sig-paren">(</span>initial_capacity<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">List(t)</span></code></div>
+<div class="function-doc">
+<p>Allocate an empty list with at least <code>initial_capacity</code> reserved slots.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L24">Source</a>
+</div>
 <div class="function-detail" id="empty?-1">
 <div class="function-header">
 <h3>empty?<span class="arity">/1</span></h3>
@@ -164,14 +196,11 @@ List.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>
 <div style="flex:1"></div>
 <a href="#empty?-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">empty?</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">empty?</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <div class="function-doc">
-<p>Returns <code>true</code> if the list has no elements.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.empty?([])        <span class="hl-comment"># =&gt; true</span>
-List.empty?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>]) <span class="hl-comment"># =&gt; false</span></code></pre>
+<p>Returns <code>true</code> when the list has no elements.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L28">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L32">Source</a>
 </div>
 <div class="function-detail" id="length-1">
 <div class="function-header">
@@ -180,45 +209,37 @@ List.empty?([<span class="hl-number">1</span>, <span class="hl-number">2</span>,
 <div style="flex:1"></div>
 <a href="#length-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">length</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">length</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Returns the number of elements in the list.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.length([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])  <span class="hl-comment"># =&gt; 3</span>
-List.length([])         <span class="hl-comment"># =&gt; 0</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L41">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L40">Source</a>
 </div>
-<div class="function-detail" id="head-1">
+<div class="function-detail" id="capacity-1">
 <div class="function-header">
-<h3>head<span class="arity">/1</span></h3>
+<h3>capacity<span class="arity">/1</span></h3>
 <span class="badge">fn</span>
 <div style="flex:1"></div>
-<a href="#head-1" class="anchor-link">#</a>
+<a href="#capacity-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">head</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="signature"><code><span class="sig-name">capacity</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
-<p>Returns the first element of the list.
-Returns 0 for an empty list.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.head([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>])  <span class="hl-comment"># =&gt; 10</span></code></pre>
+<p>Returns the list's reserved capacity.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L54">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L48">Source</a>
 </div>
-<div class="function-detail" id="tail-1">
+<div class="function-detail" id="get-2">
 <div class="function-header">
-<h3>tail<span class="arity">/1</span></h3>
+<h3>get<span class="arity">/2</span></h3>
 <span class="badge">fn</span>
 <div style="flex:1"></div>
-<a href="#tail-1" class="anchor-link">#</a>
+<a href="#get-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">tail</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">get</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">t</span></code></div>
 <div class="function-doc">
-<p>Returns the list without its first element.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.tail([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>])  <span class="hl-comment"># =&gt; [20, 30]</span></code></pre>
+<p>Returns the element at <code>index</code>.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L66">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L56">Source</a>
 </div>
 <div class="function-detail" id="at-2">
 <div class="function-header">
@@ -227,76 +248,50 @@ Returns 0 for an empty list.</p>
 <div style="flex:1"></div>
 <a href="#at-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">at</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="signature"><code><span class="sig-name">at</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">t</span></code></div>
 <div class="function-doc">
-<p>Returns the element at the given zero-based index.
-Returns 0 if the index is out of bounds.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.at([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>], <span class="hl-number">1</span>)  <span class="hl-comment"># =&gt; 20</span></code></pre>
+<p>Returns the element at <code>index</code>.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L79">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L64">Source</a>
 </div>
-<div class="function-detail" id="last-1">
+<div class="function-detail" id="set-3">
 <div class="function-header">
-<h3>last<span class="arity">/1</span></h3>
+<h3>set<span class="arity">/3</span></h3>
 <span class="badge">fn</span>
 <div style="flex:1"></div>
-<a href="#last-1" class="anchor-link">#</a>
+<a href="#set-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">last</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="signature"><code><span class="sig-name">set</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">t</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">List(t)</span></code></div>
 <div class="function-doc">
-<p>Returns the last element of the list.
-Returns 0 for an empty list.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.last([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])  <span class="hl-comment"># =&gt; 3</span></code></pre>
+<p>Returns a list with <code>value</code> stored at <code>index</code>.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L92">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L72">Source</a>
 </div>
-<div class="function-detail" id="contains?-2">
+<div class="function-detail" id="push-2">
 <div class="function-header">
-<h3>contains?<span class="arity">/2</span></h3>
+<h3>push<span class="arity">/2</span></h3>
 <span class="badge">fn</span>
 <div style="flex:1"></div>
-<a href="#contains?-2" class="anchor-link">#</a>
+<a href="#push-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">contains?</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">element</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">push</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">t</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">List(t)</span></code></div>
 <div class="function-doc">
-<p>Returns <code>true</code> if the list contains the given value.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">2</span>)  <span class="hl-comment"># =&gt; true</span>
-List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">5</span>)  <span class="hl-comment"># =&gt; false</span></code></pre>
+<p>Returns a list with <code>value</code> added to the end.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L105">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L80">Source</a>
 </div>
-<div class="function-detail" id="reverse-1">
+<div class="function-detail" id="pop-1">
 <div class="function-header">
-<h3>reverse<span class="arity">/1</span></h3>
+<h3>pop<span class="arity">/1</span></h3>
 <span class="badge">fn</span>
 <div style="flex:1"></div>
-<a href="#reverse-1" class="anchor-link">#</a>
+<a href="#pop-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">reverse</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">pop</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{List(t), t}</span></code></div>
 <div class="function-doc">
-<p>Reverses the order of elements.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])  <span class="hl-comment"># =&gt; [3, 2, 1]</span></code></pre>
+<p>Removes the last element and returns <code>{list, value}</code>.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L117">Source</a>
-</div>
-<div class="function-detail" id="prepend-2">
-<div class="function-header">
-<h3>prepend<span class="arity">/2</span></h3>
-<span class="badge">fn</span>
-<div style="flex:1"></div>
-<a href="#prepend-2" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">prepend</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">element</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
-<div class="function-doc">
-<p>Prepends a value to the front of a list.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.prepend([<span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">1</span>)  <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
-</div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L129">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L88">Source</a>
 </div>
 <div class="function-detail" id="append-2">
 <div class="function-header">
@@ -305,13 +300,11 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div style="flex:1"></div>
 <a href="#append-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">append</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">element</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">append</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">List(t)</span></code></div>
 <div class="function-doc">
-<p>Appends a value to the end of a list. O(n).</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.append([<span class="hl-number">1</span>, <span class="hl-number">2</span>], <span class="hl-number">3</span>)  <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
+<p>Concatenates two lists.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L141">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L98">Source</a>
 </div>
 <div class="function-detail" id="concat-2">
 <div class="function-header">
@@ -320,13 +313,89 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div style="flex:1"></div>
 <a href="#concat-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">concat</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">concat</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">List(t)</span></code></div>
 <div class="function-doc">
 <p>Concatenates two lists.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.concat([<span class="hl-number">1</span>, <span class="hl-number">2</span>], [<span class="hl-number">3</span>, <span class="hl-number">4</span>])  <span class="hl-comment"># =&gt; [1, 2, 3, 4]</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L153">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L106">Source</a>
+</div>
+<div class="function-detail" id="head-1">
+<div class="function-header">
+<h3>head<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#head-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">head</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">t</span></code></div>
+<div class="function-doc">
+<p>Returns the first element, or the element type's default for an empty list.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L114">Source</a>
+</div>
+<div class="function-detail" id="tail-1">
+<div class="function-header">
+<h3>tail<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#tail-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">tail</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">List(t)</span></code></div>
+<div class="function-doc">
+<p>Returns all elements after the first as a new list.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L122">Source</a>
+</div>
+<div class="function-detail" id="prepend-2">
+<div class="function-header">
+<h3>prepend<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#prepend-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">prepend</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">t</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">List(t)</span></code></div>
+<div class="function-doc">
+<p>Returns <code>value</code> followed by the contents of <code>list</code>.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L130">Source</a>
+</div>
+<div class="function-detail" id="last-1">
+<div class="function-header">
+<h3>last<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#last-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">last</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">t</span></code></div>
+<div class="function-doc">
+<p>Returns the last element, or the element type's default for an empty list.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L138">Source</a>
+</div>
+<div class="function-detail" id="contains?-2">
+<div class="function-header">
+<h3>contains?<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#contains?-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">contains?</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">t</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns <code>true</code> when <code>value</code> is present in the list.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L146">Source</a>
+</div>
+<div class="function-detail" id="reverse-1">
+<div class="function-header">
+<h3>reverse<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#reverse-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">reverse</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">List(t)</span></code></div>
+<div class="function-doc">
+<p>Returns a new list with elements in reverse order.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L154">Source</a>
 </div>
 <div class="function-detail" id="take-2">
 <div class="function-header">
@@ -335,13 +404,11 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div style="flex:1"></div>
 <a href="#take-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">take</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">take</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">List(t)</span></code></div>
 <div class="function-doc">
-<p>Takes the first <code>count</code> elements.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.take([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>, <span class="hl-number">5</span>], <span class="hl-number">3</span>)  <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
+<p>Returns the first <code>count</code> elements.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L165">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L162">Source</a>
 </div>
 <div class="function-detail" id="drop-2">
 <div class="function-header">
@@ -350,13 +417,11 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div style="flex:1"></div>
 <a href="#drop-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">drop</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">drop</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">List(t)</span></code></div>
 <div class="function-doc">
-<p>Drops the first <code>count</code> elements.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.drop([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>, <span class="hl-number">5</span>], <span class="hl-number">2</span>)  <span class="hl-comment"># =&gt; [3, 4, 5]</span></code></pre>
+<p>Returns the list after dropping the first <code>count</code> elements.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L177">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L170">Source</a>
 </div>
 <div class="function-detail" id="uniq-1">
 <div class="function-header">
@@ -365,14 +430,50 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div style="flex:1"></div>
 <a href="#uniq-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">uniq</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">uniq</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">List(t)</span></code></div>
 <div class="function-doc">
-<p>Returns a new list with duplicates removed.
-Preserves the order of first occurrences.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.uniq([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">1</span>])  <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
+<p>Returns a list with duplicate values removed.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L190">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L178">Source</a>
+</div>
+<div class="function-detail" id="map-2">
+<div class="function-header">
+<h3>map<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#map-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">map</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">(t -&gt; mapped)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">List(mapped)</span></code></div>
+<div class="function-doc">
+<p>Transforms each element with <code>callback</code>.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L186">Source</a>
+</div>
+<div class="function-detail" id="filter-2">
+<div class="function-header">
+<h3>filter<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#filter-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">filter</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">, </span>predicate<span class="sig-separator">::</span><span class="sig-type-pill">(t -&gt; Bool)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">List(t)</span></code></div>
+<div class="function-doc">
+<p>Keeps elements for which <code>predicate</code> returns true.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L194">Source</a>
+</div>
+<div class="function-detail" id="reduce-3">
+<div class="function-header">
+<h3>reduce<span class="arity">/3</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#reduce-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">reduce</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">, </span>initial<span class="sig-separator">::</span><span class="sig-type-pill">accumulator</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">(accumulator, t -&gt; accumulator)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">accumulator</span></code></div>
+<div class="function-doc">
+<p>Folds the list from left to right.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L202">Source</a>
 </div>
 <div class="function-detail" id="head!-1">
 <div class="function-header">
@@ -381,15 +482,11 @@ Preserves the order of first occurrences.</p>
 <div style="flex:1"></div>
 <a href="#head!-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">head!</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="signature"><code><span class="sig-name">head!</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">t</span></code></div>
 <div class="function-doc">
-<p>Returns the first element of the list.
-Raises if the list is empty.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.head!([<span class="hl-number">10</span>, <span class="hl-number">20</span>])  <span class="hl-comment"># =&gt; 10</span>
-List.head!([])        <span class="hl-comment"># raises</span></code></pre>
+<p>Returns the first element. Raises when the list is empty.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L204">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L210">Source</a>
 </div>
 <div class="function-detail" id="last!-1">
 <div class="function-header">
@@ -398,15 +495,11 @@ List.head!([])        <span class="hl-comment"># raises</span></code></pre>
 <div style="flex:1"></div>
 <a href="#last!-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">last!</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="signature"><code><span class="sig-name">last!</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">t</span></code></div>
 <div class="function-doc">
-<p>Returns the last element of the list.
-Raises if the list is empty.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.last!([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])  <span class="hl-comment"># =&gt; 3</span>
-List.last!([])         <span class="hl-comment"># raises</span></code></pre>
+<p>Returns the last element. Raises when the list is empty.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L223">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L222">Source</a>
 </div>
 <div class="function-detail" id="at!-2">
 <div class="function-header">
@@ -415,35 +508,41 @@ List.last!([])         <span class="hl-comment"># raises</span></code></pre>
 <div style="flex:1"></div>
 <a href="#at!-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">at!</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="signature"><code><span class="sig-name">at!</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">List(t)</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">t</span></code></div>
 <div class="function-doc">
-<p>Returns the element at the given zero-based index.
-Raises if the index is out of bounds.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.at!([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>], <span class="hl-number">1</span>)  <span class="hl-comment"># =&gt; 20</span>
-List.at!([<span class="hl-number">10</span>, <span class="hl-number">20</span>], <span class="hl-number">5</span>)      <span class="hl-comment"># raises</span></code></pre>
+<p>Returns the element at <code>index</code>. Raises when <code>index</code> is out of bounds.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L242">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/list.zap#L234">Source</a>
 </div>
 </main>
 <aside class="toc">
 <h3>On This Page</h3>
 <ul>
 <li class="toc-section">Functions</li>
+<li><a href="#new_filled-2">new_filled/2</a></li>
+<li><a href="#new_empty-1">new_empty/1</a></li>
 <li><a href="#empty?-1">empty?/1</a></li>
 <li><a href="#length-1">length/1</a></li>
+<li><a href="#capacity-1">capacity/1</a></li>
+<li><a href="#get-2">get/2</a></li>
+<li><a href="#at-2">at/2</a></li>
+<li><a href="#set-3">set/3</a></li>
+<li><a href="#push-2">push/2</a></li>
+<li><a href="#pop-1">pop/1</a></li>
+<li><a href="#append-2">append/2</a></li>
+<li><a href="#concat-2">concat/2</a></li>
 <li><a href="#head-1">head/1</a></li>
 <li><a href="#tail-1">tail/1</a></li>
-<li><a href="#at-2">at/2</a></li>
+<li><a href="#prepend-2">prepend/2</a></li>
 <li><a href="#last-1">last/1</a></li>
 <li><a href="#contains?-2">contains?/2</a></li>
 <li><a href="#reverse-1">reverse/1</a></li>
-<li><a href="#prepend-2">prepend/2</a></li>
-<li><a href="#append-2">append/2</a></li>
-<li><a href="#concat-2">concat/2</a></li>
 <li><a href="#take-2">take/2</a></li>
 <li><a href="#drop-2">drop/2</a></li>
 <li><a href="#uniq-1">uniq/1</a></li>
+<li><a href="#map-2">map/2</a></li>
+<li><a href="#filter-2">filter/2</a></li>
+<li><a href="#reduce-3">reduce/3</a></li>
 <li><a href="#head!-1">head!/1</a></li>
 <li><a href="#last!-1">last!/1</a></li>
 <li><a href="#at!-2">at!/2</a></li>

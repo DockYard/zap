@@ -67,6 +67,7 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Tuple.html">Tuple</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li class="active"><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
@@ -1059,7 +1060,7 @@ comprehension path avoids it.</p>
 <div style="flex:1"></div>
 <a href="#render_summary_page-14" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_summary_page</span><span class="sig-paren">(</span>summary<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>kind<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>all_functions<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_macros<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_impls<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_variants<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_required<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_summary_page</span><span class="sig-paren">(</span>summary<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">, </span>kind<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>all_functions<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>all_macros<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>all_impls<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>all_variants<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>all_required<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Compose a complete HTML page for a single module summary.</p>
 <p><code>summary</code> is a <code>%{Atom =&gt; Term}</code> map produced by
@@ -1079,7 +1080,7 @@ sidebar highlights the current module.</p>
 <div style="flex:1"></div>
 <a href="#render_right_rail-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_right_rail</span><span class="sig-paren">(</span>functions<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>macros<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_right_rail</span><span class="sig-paren">(</span>functions<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>macros<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Render the right-rail &quot;On this page&quot; TOC from the sorted function
 and macro lists. Each non-empty kind contributes a
@@ -1097,7 +1098,7 @@ freed column.</p>
 <div style="flex:1"></div>
 <a href="#render_toc_items-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_toc_items</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_toc_items</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L747">Source</a>
 </div>
 <div class="function-detail" id="filter_members_by_module-2">
@@ -1107,7 +1108,7 @@ freed column.</p>
 <div style="flex:1"></div>
 <a href="#filter_members_by_module-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">filter_members_by_module</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[?]</span></code></div>
+<div class="signature"><code><span class="sig-name">filter_members_by_module</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[%{Atom =&gt; Term}]</span></code></div>
 <div class="function-doc">
 <p>Filter a flat function/macro manifest down to only the entries
 whose <code>:module</code> field equals <code>module_name</code>. Used by
@@ -1123,7 +1124,7 @@ don't have to re-check the module name on every iteration.</p>
 <div style="flex:1"></div>
 <a href="#filter_members_walk-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">filter_members_walk</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[?]</span></code></div>
+<div class="signature"><code><span class="sig-name">filter_members_walk</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[%{Atom =&gt; Term}]</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L767">Source</a>
 </div>
 <div class="function-detail" id="sort_members_by_source_line-1">
@@ -1133,7 +1134,7 @@ don't have to re-check the module name on every iteration.</p>
 <div style="flex:1"></div>
 <a href="#sort_members_by_source_line-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">sort_members_by_source_line</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[?]</span></code></div>
+<div class="signature"><code><span class="sig-name">sort_members_by_source_line</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[%{Atom =&gt; Term}]</span></code></div>
 <div class="function-doc">
 <p>Sort a list of member maps by <code>:source_line</code> ascending. Insertion
 sort: predictable, stable on equal keys, and avoids the recursive
@@ -1152,7 +1153,7 @@ layout the legacy generator emitted — the same order an
 <div style="flex:1"></div>
 <a href="#sort_members_walk-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">sort_members_walk</span><span class="sig-paren">(</span>remaining<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>sorted<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[?]</span></code></div>
+<div class="signature"><code><span class="sig-name">sort_members_walk</span><span class="sig-paren">(</span>remaining<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>sorted<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[%{Atom =&gt; Term}]</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L794">Source</a>
 </div>
 <div class="function-detail" id="insert_member_by_line-2">
@@ -1162,7 +1163,7 @@ layout the legacy generator emitted — the same order an
 <div style="flex:1"></div>
 <a href="#insert_member_by_line-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">insert_member_by_line</span><span class="sig-paren">(</span>sorted<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>item<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[?]</span></code></div>
+<div class="signature"><code><span class="sig-name">insert_member_by_line</span><span class="sig-paren">(</span>sorted<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>item<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[%{Atom =&gt; Term}]</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L804">Source</a>
 </div>
 <div class="function-detail" id="insert_member_walk-3">
@@ -1172,7 +1173,7 @@ layout the legacy generator emitted — the same order an
 <div style="flex:1"></div>
 <a href="#insert_member_walk-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">insert_member_walk</span><span class="sig-paren">(</span>sorted<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>item<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>prefix<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[?]</span></code></div>
+<div class="signature"><code><span class="sig-name">insert_member_walk</span><span class="sig-paren">(</span>sorted<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>item<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">, </span>prefix<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[%{Atom =&gt; Term}]</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L808">Source</a>
 </div>
 <div class="function-detail" id="member_lt?-2">
@@ -1182,7 +1183,7 @@ layout the legacy generator emitted — the same order an
 <div style="flex:1"></div>
 <a href="#member_lt?-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">member_lt?</span><span class="sig-paren">(</span>a<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>b<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">member_lt?</span><span class="sig-paren">(</span>a<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">, </span>b<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <div class="function-doc">
 <p>Order two member maps for the per-page table sort. Compare on
 <code>:source_file</code> first so functions from the struct's own source group
@@ -1200,7 +1201,7 @@ siblings) so the order remains stable across runs.</p>
 <div style="flex:1"></div>
 <a href="#file_lt_or_eq?-4" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">file_lt_or_eq?</span><span class="sig-paren">(</span>a_file<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>b_file<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>a<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>b<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">file_lt_or_eq?</span><span class="sig-paren">(</span>a_file<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>b_file<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>a<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">, </span>b<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L834">Source</a>
 </div>
 <div class="function-detail" id="file_eq_or_gt?-3">
@@ -1210,7 +1211,7 @@ siblings) so the order remains stable across runs.</p>
 <div style="flex:1"></div>
 <a href="#file_eq_or_gt?-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">file_eq_or_gt?</span><span class="sig-paren">(</span>file_eq<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>a<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>b<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">file_eq_or_gt?</span><span class="sig-paren">(</span>file_eq<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>a<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">, </span>b<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L842">Source</a>
 </div>
 <div class="function-detail" id="line_lt_or_eq?-4">
@@ -1220,7 +1221,7 @@ siblings) so the order remains stable across runs.</p>
 <div style="flex:1"></div>
 <a href="#line_lt_or_eq?-4" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">line_lt_or_eq?</span><span class="sig-paren">(</span>a_line<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>b_line<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>a<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>b<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">line_lt_or_eq?</span><span class="sig-paren">(</span>a_line<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>b_line<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>a<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">, </span>b<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L850">Source</a>
 </div>
 <div class="function-detail" id="line_eq_or_gt?-3">
@@ -1230,7 +1231,7 @@ siblings) so the order remains stable across runs.</p>
 <div style="flex:1"></div>
 <a href="#line_eq_or_gt?-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">line_eq_or_gt?</span><span class="sig-paren">(</span>line_eq<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>a<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>b<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">line_eq_or_gt?</span><span class="sig-paren">(</span>line_eq<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>a<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">, </span>b<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L858">Source</a>
 </div>
 <div class="function-detail" id="string_lt?-2">
@@ -1289,7 +1290,7 @@ primitive.</p>
 <div style="flex:1"></div>
 <a href="#list_concat_two-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">list_concat_two</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[?]</span></code></div>
+<div class="signature"><code><span class="sig-name">list_concat_two</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[%{Atom =&gt; Term}]</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L915">Source</a>
 </div>
 <div class="function-detail" id="render_summary_rows_from_members-2">
@@ -1299,7 +1300,7 @@ primitive.</p>
 <div style="flex:1"></div>
 <a href="#render_summary_rows_from_members-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_summary_rows_from_members</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_summary_rows_from_members</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Render summary table rows from a list of member maps already
 filtered to one module's entries. Each row uses the member's
@@ -1314,7 +1315,7 @@ filtered to one module's entries. Each row uses the member's
 <div style="flex:1"></div>
 <a href="#render_member_details_sorted-5" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_member_details_sorted</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>is_macro<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_member_details_sorted</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>is_macro<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Render function detail blocks from a list of member maps already
 filtered+sorted to one module's entries. Mirrors
@@ -1330,7 +1331,7 @@ filter — the caller has done that work.</p>
 <div style="flex:1"></div>
 <a href="#render_module_member_details-6" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_module_member_details</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>is_macro<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_module_member_details</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>is_macro<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Walk the flat function or macro manifest, filter by <code>:module</code> to
 keep only entries belonging to <code>module_name</code>, and emit a
@@ -1349,7 +1350,7 @@ the result to <code>module_main_content</code>'s <code>functions_details</code> 
 <div style="flex:1"></div>
 <a href="#member_detail_for_module-5" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">member_detail_for_module</span><span class="sig-paren">(</span>member<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>is_macro<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">member_detail_for_module</span><span class="sig-paren">(</span>member<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>is_macro<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L973">Source</a>
 </div>
 <div class="function-detail" id="compose_member_detail-9">
@@ -1674,7 +1675,7 @@ escape sequences. Other control characters are rare in stdlib
 <div style="flex:1"></div>
 <a href="#struct_search_entry-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">struct_search_entry</span><span class="sig-paren">(</span>summary<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>kind_label<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">struct_search_entry</span><span class="sig-paren">(</span>summary<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">, </span>kind_label<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Render one struct/protocol/union summary as a JSON entry.</p>
 </div>
@@ -1687,7 +1688,7 @@ escape sequences. Other control characters are rare in stdlib
 <div style="flex:1"></div>
 <a href="#render_struct_search_entries-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_struct_search_entries</span><span class="sig-paren">(</span>summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>kind_label<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_struct_search_entries</span><span class="sig-paren">(</span>summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>kind_label<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Walk a list of struct/protocol/union summaries, accumulating JSON search entries.</p>
 </div>
@@ -1719,7 +1720,7 @@ in this struct.</p>
 <div style="flex:1"></div>
 <a href="#function_search_entry-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">function_search_entry</span><span class="sig-paren">(</span>entry<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>kind_label<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">function_search_entry</span><span class="sig-paren">(</span>entry<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">, </span>kind_label<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Render a <code>:module</code> + <code>:name</code> + <code>:arity</code> flat-summary entry as a JSON search entry. Used for functions and macros.</p>
 </div>
@@ -1732,7 +1733,7 @@ in this struct.</p>
 <div style="flex:1"></div>
 <a href="#render_function_search_entries-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_function_search_entries</span><span class="sig-paren">(</span>items<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>kind_label<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_function_search_entries</span><span class="sig-paren">(</span>items<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>kind_label<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Walk a list of function/macro flat-summaries, accumulating JSON search entries.</p>
 </div>
@@ -1761,7 +1762,7 @@ closer here drops the last separator before the <code>]</code>.</p>
 <div style="flex:1"></div>
 <a href="#render_search_index-5" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_search_index</span><span class="sig-paren">(</span>struct_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>protocol_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>union_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>function_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>macro_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_search_index</span><span class="sig-paren">(</span>struct_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>protocol_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>union_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>function_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>macro_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Compose the full search-index JSON document. Each struct,
 protocol, union, function, and macro becomes one JSON entry
@@ -1777,7 +1778,7 @@ matching the legacy Zig-side search index shape so the bundled
 <div style="flex:1"></div>
 <a href="#render_kind_extras-4" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_kind_extras</span><span class="sig-paren">(</span>kind<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>all_variants<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_required<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_kind_extras</span><span class="sig-paren">(</span>kind<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>all_variants<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>all_required<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Render kind-specific summary tables that don't fit
 <code>module_main_content</code>'s hardcoded Functions/Macros slots.</p>
@@ -1796,7 +1797,7 @@ block.</p>
 <div style="flex:1"></div>
 <a href="#render_variant_rows-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_variant_rows</span><span class="sig-paren">(</span>variants<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_variant_rows</span><span class="sig-paren">(</span>variants<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1413">Source</a>
 </div>
 <div class="function-detail" id="render_required_rows-3">
@@ -1806,7 +1807,7 @@ block.</p>
 <div style="flex:1"></div>
 <a href="#render_required_rows-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_required_rows</span><span class="sig-paren">(</span>required<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_required_rows</span><span class="sig-paren">(</span>required<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1428">Source</a>
 </div>
 <div class="function-detail" id="collect_implemented_protocols-3">
@@ -1816,7 +1817,7 @@ block.</p>
 <div style="flex:1"></div>
 <a href="#collect_implemented_protocols-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">collect_implemented_protocols</span><span class="sig-paren">(</span>impls<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[String]</span></code></div>
+<div class="signature"><code><span class="sig-name">collect_implemented_protocols</span><span class="sig-paren">(</span>impls<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[String]</span></code></div>
 <div class="function-doc">
 <p>Walk the flat impl manifest and collect protocol names whose
 <code>:target</code> matches <code>module_name</code>. Returns the collected list so
@@ -1847,7 +1848,7 @@ list-membership protocol.</p>
 <div style="flex:1"></div>
 <a href="#render_module_member_rows-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_module_member_rows</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_module_member_rows</span><span class="sig-paren">(</span>members<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Render summary rows for the subset of <code>members</code> whose <code>:module</code>
 field equals <code>module_name</code>. Used to project the flat global
@@ -1864,7 +1865,7 @@ Returns the empty string when no member matches so
 <div style="flex:1"></div>
 <a href="#member_row_for_module-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">member_row_for_module</span><span class="sig-paren">(</span>member<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">member_row_for_module</span><span class="sig-paren">(</span>member<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">, </span>module_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Render a single <code>summary_row</code> for <code>member</code> if <code>member[:module]</code>
 equals <code>module_name</code>, otherwise return the empty string. Splits
@@ -1880,7 +1881,7 @@ single tail call regardless of whether the member matches.</p>
 <div style="flex:1"></div>
 <a href="#write_pages_to-15" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">write_pages_to</span><span class="sig-paren">(</span>out_dir<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>landing_md<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>struct_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>protocol_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>union_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>function_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>macro_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>impl_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>variant_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>required_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>guide_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>js_content<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">write_pages_to</span><span class="sig-paren">(</span>out_dir<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>landing_md<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>struct_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>protocol_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>union_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>function_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>macro_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>impl_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>variant_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>required_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>guide_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>js_content<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Render every summary list to disk under <code>out_dir</code> and return the
 total number of pages written. Each summary becomes
@@ -1899,7 +1900,7 @@ every page.</p>
 <div style="flex:1"></div>
 <a href="#collect_guide_slugs-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">collect_guide_slugs</span><span class="sig-paren">(</span>guides<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[String]</span></code></div>
+<div class="signature"><code><span class="sig-name">collect_guide_slugs</span><span class="sig-paren">(</span>guides<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[String]</span></code></div>
 <div class="function-doc">
 <p>Walk the guide manifest and pull each entry's slug out of the
 <code>:source_path</code> field. Slug = filename stem (basename minus the
@@ -1930,7 +1931,7 @@ path during reflection.</p>
 <div style="flex:1"></div>
 <a href="#write_guide_pages-10" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">write_guide_pages</span><span class="sig-paren">(</span>out_dir<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>guides<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">write_guide_pages</span><span class="sig-paren">(</span>out_dir<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>guides<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Render every entry in the guide manifest to
 <code>&lt;out_dir&gt;/guides/&lt;slug&gt;.html</code>. Each guide is loaded at runtime
@@ -1948,7 +1949,7 @@ number of pages successfully written.</p>
 <div style="flex:1"></div>
 <a href="#write_one_guide_page-11" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">write_one_guide_page</span><span class="sig-paren">(</span>out_dir<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>guide<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>slug<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">write_one_guide_page</span><span class="sig-paren">(</span>out_dir<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>guide<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">, </span>slug<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1609">Source</a>
 </div>
 <div class="function-detail" id="render_guide_page-9">
@@ -2077,7 +2078,7 @@ matches the file-naming convention <code>guides/&lt;slug&gt;.md</code>.</p>
 <div style="flex:1"></div>
 <a href="#render_index_page-9" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_index_page</span><span class="sig-paren">(</span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>struct_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>landing_md<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_index_page</span><span class="sig-paren">(</span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>struct_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>landing_md<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Compose the docs landing page. When <code>landing_md</code> is non-empty it
 is rendered through <code>Markdown.to_html</code> and used as the main
@@ -2095,7 +2096,7 @@ and one card per declared struct (legacy <code>appendDefaultLanding</code>).</p>
 <div style="flex:1"></div>
 <a href="#render_default_landing-4" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_default_landing</span><span class="sig-paren">(</span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>struct_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_default_landing</span><span class="sig-paren">(</span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>struct_summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Default landing-page body used when no <code>landing_md</code> is supplied.
 Renders the project name as <code>&lt;h1&gt;</code>, an optional version pill, and
@@ -2112,7 +2113,7 @@ legacy <code>appendDefaultLanding</code> Zig helper.</p>
 <div style="flex:1"></div>
 <a href="#render_struct_cards-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_struct_cards</span><span class="sig-paren">(</span>summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_struct_cards</span><span class="sig-paren">(</span>summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1766">Source</a>
 </div>
 <div class="function-detail" id="render_struct_card-1">
@@ -2122,7 +2123,7 @@ legacy <code>appendDefaultLanding</code> Zig helper.</p>
 <div style="flex:1"></div>
 <a href="#render_struct_card-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">render_struct_card</span><span class="sig-paren">(</span>entry<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">render_struct_card</span><span class="sig-paren">(</span>entry<span class="sig-separator">::</span><span class="sig-type-pill">%{Atom =&gt; Term}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1774">Source</a>
 </div>
 <div class="function-detail" id="render_struct_card_summary-1">
@@ -2214,7 +2215,7 @@ arrays of names alongside their summaries.</p>
 <div style="flex:1"></div>
 <a href="#manifest_names-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">manifest_names</span><span class="sig-paren">(</span>summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[String]</span></code></div>
+<div class="signature"><code><span class="sig-name">manifest_names</span><span class="sig-paren">(</span>summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[String]</span></code></div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc.zap#L1861">Source</a>
 </div>
 <div class="function-detail" id="write_summary_pages-16">
@@ -2224,7 +2225,7 @@ arrays of names alongside their summaries.</p>
 <div style="flex:1"></div>
 <a href="#write_summary_pages-16" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">write_summary_pages</span><span class="sig-paren">(</span>out_dir<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>summaries<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>kind<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>all_functions<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_macros<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_impls<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_variants<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>all_required<span class="sig-separator">::</span><span class="sig-type-pill">[?]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">write_summary_pages</span><span class="sig-paren">(</span>out_dir<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>summaries<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>kind<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>project_name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>project_version<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>source_url<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>structs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>protocols<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>unions<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>guide_slugs<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>all_functions<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>all_macros<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>all_impls<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>all_variants<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>all_required<span class="sig-separator">::</span><span class="sig-type-pill">[%{Atom =&gt; Term}]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Iterate <code>summaries</code>, render each as a full HTML page, and write
 <code>&lt;out_dir&gt;/&lt;name&gt;.html</code>. Returns the number of pages written.

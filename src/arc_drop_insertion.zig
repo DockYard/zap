@@ -126,9 +126,11 @@ const arc_liveness = @import("arc_liveness.zig");
 /// in a separate pass from `insertScopeExitDrops` because:
 ///
 ///   * The non-ARC aggregate (tuple, struct) is not in
-///     `arc_managed_locals`, so `arc_liveness` does not track its
-///     last-use. We compute last-use locally with a forward walk
-///     over the same depth-first instruction stream.
+///     `arc_managed_locals`, so the inserted releases are not
+///     ordinary scope-exit drops. The pass computes insertion sites
+///     over the current depth-first instruction stream while using
+///     `ArcOwnership.arc_managed_locals` only to classify extracted
+///     component locals.
 ///   * The releases inserted here are RUNTIME refcount decrements,
 ///     not analyzer last-use markers. They balance the retains the
 ///     IR builder emits at `index_get + retain` destructure sites,
@@ -149,17 +151,20 @@ const arc_liveness = @import("arc_liveness.zig");
 pub fn insertTupleComponentReleases(
     allocator: std.mem.Allocator,
     function: *ir.Function,
+    ownership: *const arc_liveness.ArcOwnership,
 ) !void {
     // Step 1: collect every non-ARC aggregate's dest and its
     // ARC-managed extracted locals. Walk every instruction in the
     // function (across nested streams) to find:
-    //   * `tuple_init`/`struct_init` whose dest's `local_ownership`
-    //     is NOT `.owned` (the aggregate is non-ARC).
+    //   * aggregate objects absent from `ownership.arc_managed_locals`
+    //     (the aggregate is non-ARC).
     //   * Subsequent `index_get(parent, _)` /
-    //     `field_get(parent, _)` whose dest IS ARC-managed.
+    //     `field_get(parent, _)` whose dest is present in
+    //     `ownership.arc_managed_locals`.
     var collector: ComponentReleaseCollector = .{
         .allocator = allocator,
         .function = function,
+        .ownership = ownership,
         .non_arc_aggregates = .empty,
         .extractions_by_aggregate = .empty,
         .last_use_by_aggregate = .empty,
@@ -171,7 +176,12 @@ pub fn insertTupleComponentReleases(
         std.debug.print("[debug-2.6.3] fn={s}\n", .{function.name});
         var lu = collector.last_use_by_aggregate.iterator();
         while (lu.next()) |e| {
-            std.debug.print("  aggregate={d} last_use_id={d}\n", .{ e.key_ptr.*, e.value_ptr.* });
+            std.debug.print("  aggregate={d} last_use_ids=[", .{e.key_ptr.*});
+            for (e.value_ptr.items, 0..) |last_use_id, index| {
+                if (index > 0) std.debug.print(", ", .{});
+                std.debug.print("{d}", .{last_use_id});
+            }
+            std.debug.print("]\n", .{});
             if (collector.extractions_by_aggregate.get(e.key_ptr.*)) |list| {
                 for (list.items) |comp| {
                     std.debug.print("    extract={d}\n", .{comp});
@@ -192,18 +202,7 @@ pub fn insertTupleComponentReleases(
         while (iter.next()) |list_ptr| list_ptr.deinit(allocator);
         by_last_use.deinit(allocator);
     }
-    var lu_iter = collector.last_use_by_aggregate.iterator();
-    while (lu_iter.next()) |entry| {
-        const aggregate_local = entry.key_ptr.*;
-        const last_use_id = entry.value_ptr.*;
-        const extractions = collector.extractions_by_aggregate.getPtr(aggregate_local) orelse continue;
-        if (extractions.items.len == 0) continue;
-        const gop = try by_last_use.getOrPut(allocator, last_use_id);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        for (extractions.items) |comp_local| {
-            try gop.value_ptr.append(allocator, comp_local);
-        }
-    }
+    try collector.scheduleComponentReleases(&by_last_use);
 
     if (by_last_use.count() == 0) return;
 
@@ -229,13 +228,13 @@ pub fn insertTupleComponentReleases(
 /// numbering aligns with downstream consumers.
 ///
 /// Discovery strategy: track every `index_get(object, _) -> dest` /
-/// `field_get(object, _) -> dest` pair where `object` is non-ARC
-/// (its `local_ownership` is not `.owned`) and `dest` IS ARC-
-/// managed. The `object` LocalId is the aggregate whose components
-/// need balancing releases. The aggregate may originate from a
-/// `tuple_init`/`struct_init` instruction OR from a call return
-/// value — both shapes are valid and both leak the same way without
-/// the balancing release.
+/// `field_get(object, _) -> dest` pair where `object` is absent from
+/// `ownership.arc_managed_locals` and `dest` is present in it. The
+/// `object` LocalId is the aggregate whose components need balancing
+/// releases. The aggregate may originate from a `tuple_init` /
+/// `struct_init` instruction OR from a call return value — both
+/// shapes are valid and both leak the same way without the balancing
+/// release.
 ///
 /// Two passes:
 ///   1. Discovery pass — enumerate extraction pairs and record
@@ -246,6 +245,7 @@ pub fn insertTupleComponentReleases(
 const ComponentReleaseCollector = struct {
     allocator: std.mem.Allocator,
     function: *const ir.Function,
+    ownership: *const arc_liveness.ArcOwnership,
     /// Set of LocalIds that act as non-ARC aggregates whose
     /// extracted ARC components need balancing releases. Populated
     /// during the discovery pass.
@@ -254,17 +254,19 @@ const ComponentReleaseCollector = struct {
     /// locals (the dest of every `index_get`/`field_get` whose
     /// `object` is the aggregate AND whose own dest is ARC-managed).
     extractions_by_aggregate: std.AutoHashMapUnmanaged(ir.LocalId, std.ArrayListUnmanaged(ir.LocalId)),
-    /// For each aggregate dest, the InstructionId of the last
-    /// instruction in the function that uses the aggregate. Updated
-    /// monotonically during the second walk: the last visited use
-    /// wins.
-    last_use_by_aggregate: std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
+    /// For each aggregate dest, every path-sensitive InstructionId
+    /// where the aggregate is at last-use. Branches can produce more
+    /// than one terminal site for the same aggregate; every such site
+    /// needs a balancing component release on its own control path.
+    last_use_by_aggregate: std.AutoHashMapUnmanaged(ir.LocalId, std.ArrayListUnmanaged(arc_liveness.InstructionId)),
 
     fn deinit(self: *ComponentReleaseCollector) void {
         self.non_arc_aggregates.deinit(self.allocator);
         var iter = self.extractions_by_aggregate.valueIterator();
         while (iter.next()) |list_ptr| list_ptr.deinit(self.allocator);
         self.extractions_by_aggregate.deinit(self.allocator);
+        var last_use_iter = self.last_use_by_aggregate.valueIterator();
+        while (last_use_iter.next()) |list_ptr| list_ptr.deinit(self.allocator);
         self.last_use_by_aggregate.deinit(self.allocator);
     }
 
@@ -278,15 +280,14 @@ const ComponentReleaseCollector = struct {
             try self.discoverStream(block.instructions);
         }
 
-        // Pass 2: compute last-use of each tracked aggregate.
-        // Mirrors `flattenInstructions` exactly so the ids align with
-        // downstream consumers (the rebuilder uses the same walk
-        // order, matching id-by-id).
+        // Pass 2: compute every path-sensitive last-use of each
+        // tracked aggregate over the current stream. The production
+        // pipeline runs this pass after scope-exit drop insertion, so
+        // this deliberately does not read ArcOwnership.last_use_sites:
+        // those ids describe an earlier IR shape. We only reuse
+        // ArcOwnership for stable ARC-local classification.
         if (self.non_arc_aggregates.count() == 0) return;
-        var next_id: arc_liveness.InstructionId = 0;
-        for (self.function.body) |block| {
-            try self.lastUseStream(block.instructions, &next_id);
-        }
+        try self.computePathSensitiveLastUses();
     }
 
     fn discoverStream(
@@ -298,8 +299,8 @@ const ComponentReleaseCollector = struct {
                 .index_get => |ig| {
                     // Non-ARC aggregate `object` with ARC-managed
                     // extracted `dest` is the canonical destructure-
-                    // then-V8 pattern. Record both sides.
-                    if (!self.isOwnedLocal(ig.object) and self.isOwnedLocal(ig.dest)) {
+                    // then-uniqueness pattern. Record both sides.
+                    if (!self.isArcManagedLocal(ig.object) and self.isArcManagedLocal(ig.dest)) {
                         try self.non_arc_aggregates.put(self.allocator, ig.object, {});
                         const gop = try self.extractions_by_aggregate.getOrPut(self.allocator, ig.object);
                         if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -307,7 +308,7 @@ const ComponentReleaseCollector = struct {
                     }
                 },
                 .field_get => |fg| {
-                    if (!self.isOwnedLocal(fg.object) and self.isOwnedLocal(fg.dest)) {
+                    if (!self.isArcManagedLocal(fg.object) and self.isArcManagedLocal(fg.dest)) {
                         try self.non_arc_aggregates.put(self.allocator, fg.object, {});
                         const gop = try self.extractions_by_aggregate.getOrPut(self.allocator, fg.object);
                         if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -366,150 +367,528 @@ const ComponentReleaseCollector = struct {
         }
     }
 
-    fn lastUseStream(
+    fn computePathSensitiveLastUses(self: *ComponentReleaseCollector) error{OutOfMemory}!void {
+        var aggregate_to_index: std.AutoHashMapUnmanaged(ir.LocalId, u32) = .empty;
+        defer aggregate_to_index.deinit(self.allocator);
+        var aggregate_locals: std.ArrayListUnmanaged(ir.LocalId) = .empty;
+        defer aggregate_locals.deinit(self.allocator);
+
+        var aggregate_iter = self.non_arc_aggregates.keyIterator();
+        while (aggregate_iter.next()) |aggregate_ptr| {
+            const aggregate_local = aggregate_ptr.*;
+            const index: u32 = @intCast(aggregate_locals.items.len);
+            try aggregate_to_index.put(self.allocator, aggregate_local, index);
+            try aggregate_locals.append(self.allocator, aggregate_local);
+        }
+
+        var liveness = ComponentAggregateLiveness{
+            .collector = self,
+            .local_to_index = &aggregate_to_index,
+            .tracked_locals = aggregate_locals.items,
+            .pointer_to_id = .empty,
+        };
+        defer liveness.deinit();
+        try liveness.compute();
+    }
+
+    fn numberStream(
         self: *ComponentReleaseCollector,
         stream: []const ir.Instruction,
         next_id: *arc_liveness.InstructionId,
+        pointer_to_id: *std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
     ) error{OutOfMemory}!void {
         for (stream) |*instr| {
             const my_id = next_id.*;
             next_id.* += 1;
-            try self.recordOtherUses(instr, my_id);
-            try self.lastUseChildren(instr, next_id);
+            try pointer_to_id.put(self.allocator, instr, my_id);
+            try self.numberChildren(instr, next_id, pointer_to_id);
         }
     }
 
-    fn lastUseChildren(
+    fn numberChildren(
         self: *ComponentReleaseCollector,
         instr: *const ir.Instruction,
         next_id: *arc_liveness.InstructionId,
+        pointer_to_id: *std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
     ) error{OutOfMemory}!void {
         switch (instr.*) {
             .if_expr => |ie| {
-                try self.lastUseStream(ie.then_instrs, next_id);
-                try self.lastUseStream(ie.else_instrs, next_id);
+                try self.numberStream(ie.then_instrs, next_id, pointer_to_id);
+                try self.numberStream(ie.else_instrs, next_id, pointer_to_id);
             },
             .case_block => |cb| {
-                try self.lastUseStream(cb.pre_instrs, next_id);
+                try self.numberStream(cb.pre_instrs, next_id, pointer_to_id);
                 for (cb.arms) |arm| {
-                    try self.lastUseStream(arm.cond_instrs, next_id);
-                    try self.lastUseStream(arm.body_instrs, next_id);
+                    try self.numberStream(arm.cond_instrs, next_id, pointer_to_id);
+                    try self.numberStream(arm.body_instrs, next_id, pointer_to_id);
                 }
-                try self.lastUseStream(cb.default_instrs, next_id);
+                try self.numberStream(cb.default_instrs, next_id, pointer_to_id);
             },
             .switch_literal => |sl| {
-                for (sl.cases) |c| try self.lastUseStream(c.body_instrs, next_id);
-                try self.lastUseStream(sl.default_instrs, next_id);
+                for (sl.cases) |c| try self.numberStream(c.body_instrs, next_id, pointer_to_id);
+                try self.numberStream(sl.default_instrs, next_id, pointer_to_id);
             },
             .switch_return => |sr| {
-                for (sr.cases) |c| try self.lastUseStream(c.body_instrs, next_id);
-                try self.lastUseStream(sr.default_instrs, next_id);
+                for (sr.cases) |c| try self.numberStream(c.body_instrs, next_id, pointer_to_id);
+                try self.numberStream(sr.default_instrs, next_id, pointer_to_id);
             },
             .union_switch => |us| {
-                for (us.cases) |c| try self.lastUseStream(c.body_instrs, next_id);
+                for (us.cases) |c| try self.numberStream(c.body_instrs, next_id, pointer_to_id);
             },
             .union_switch_return => |usr| {
-                for (usr.cases) |c| try self.lastUseStream(c.body_instrs, next_id);
+                for (usr.cases) |c| try self.numberStream(c.body_instrs, next_id, pointer_to_id);
             },
             .try_call_named => |tc| {
-                try self.lastUseStream(tc.handler_instrs, next_id);
-                try self.lastUseStream(tc.success_instrs, next_id);
+                try self.numberStream(tc.handler_instrs, next_id, pointer_to_id);
+                try self.numberStream(tc.success_instrs, next_id, pointer_to_id);
             },
             .guard_block => |gb| {
-                try self.lastUseStream(gb.body, next_id);
+                try self.numberStream(gb.body, next_id, pointer_to_id);
             },
             .optional_dispatch => |od| {
-                try self.lastUseStream(od.nil_instrs, next_id);
-                try self.lastUseStream(od.struct_instrs, next_id);
+                try self.numberStream(od.nil_instrs, next_id, pointer_to_id);
+                try self.numberStream(od.struct_instrs, next_id, pointer_to_id);
             },
             else => {},
         }
     }
 
-    /// Track all uses of any tracked aggregate. ANY instruction that
-    /// names the aggregate's local in a use position updates the
-    /// last-use stamp. The walk visits every instruction once, so
-    /// the highest InstructionId where the aggregate is used wins.
-    fn recordOtherUses(
-        self: *ComponentReleaseCollector,
-        instr: *const ir.Instruction,
-        my_id: arc_liveness.InstructionId,
-    ) error{OutOfMemory}!void {
-        switch (instr.*) {
-            .index_get => |ig| try self.bumpUse(ig.object, my_id),
-            .field_get => |fg| try self.bumpUse(fg.object, my_id),
-            .move_value => |mv| try self.bumpUse(mv.source, my_id),
-            .share_value => |sv| try self.bumpUse(sv.source, my_id),
-            .copy_value => |cv| try self.bumpUse(cv.source, my_id),
-            .borrow_value => |bv| try self.bumpUse(bv.source, my_id),
-            .local_get => |lg| try self.bumpUse(lg.source, my_id),
-            .local_set => |ls| try self.bumpUse(ls.value, my_id),
-            .ret => |r| if (r.value) |v| try self.bumpUse(v, my_id),
-            .cond_return => |cr| if (cr.value) |v| try self.bumpUse(v, my_id),
-            .release => |r| try self.bumpUse(r.value, my_id),
-            .retain => |r| try self.bumpUse(r.value, my_id),
-            .tuple_init => |ti| {
-                for (ti.elements) |elem| try self.bumpUse(elem, my_id);
-            },
-            .list_init => |li| {
-                for (li.elements) |elem| try self.bumpUse(elem, my_id);
-            },
-            .list_cons => |lc| {
-                try self.bumpUse(lc.head, my_id);
-                try self.bumpUse(lc.tail, my_id);
-            },
-            .map_init => |mi| {
-                for (mi.entries) |e| {
-                    try self.bumpUse(e.key, my_id);
-                    try self.bumpUse(e.value, my_id);
-                }
-            },
-            .struct_init => |si| {
-                for (si.fields) |f| try self.bumpUse(f.value, my_id);
-            },
-            .union_init => |ui| try self.bumpUse(ui.value, my_id),
-            .make_closure => |mc| {
-                for (mc.captures) |cap| try self.bumpUse(cap, my_id);
-            },
-            .call_builtin => |cb| {
-                for (cb.args) |arg| try self.bumpUse(arg, my_id);
-            },
-            .call_named => |cn| {
-                for (cn.args) |arg| try self.bumpUse(arg, my_id);
-            },
-            .call_direct => |cd| {
-                for (cd.args) |arg| try self.bumpUse(arg, my_id);
-            },
-            .call_closure => |cc| {
-                try self.bumpUse(cc.callee, my_id);
-                for (cc.args) |arg| try self.bumpUse(arg, my_id);
-            },
-            .call_dispatch => |cd| {
-                for (cd.args) |arg| try self.bumpUse(arg, my_id);
-            },
-            .try_call_named => |tcn| {
-                for (tcn.args) |arg| try self.bumpUse(arg, my_id);
-                try self.bumpUse(tcn.input_local, my_id);
-            },
-            .tail_call => |tc| {
-                for (tc.args) |arg| try self.bumpUse(arg, my_id);
-            },
-            else => {},
-        }
-    }
-
-    fn bumpUse(
+    fn recordLastUse(
         self: *ComponentReleaseCollector,
         local: ir.LocalId,
         my_id: arc_liveness.InstructionId,
     ) error{OutOfMemory}!void {
         if (!self.non_arc_aggregates.contains(local)) return;
-        try self.last_use_by_aggregate.put(self.allocator, local, my_id);
+        const gop = try self.last_use_by_aggregate.getOrPut(self.allocator, local);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        for (gop.value_ptr.items) |existing_id| {
+            if (existing_id == my_id) return;
+        }
+        try gop.value_ptr.append(self.allocator, my_id);
     }
 
-    fn isOwnedLocal(self: *const ComponentReleaseCollector, local: ir.LocalId) bool {
-        if (local >= self.function.local_ownership.len) return false;
-        return self.function.local_ownership[local] == .owned;
+    fn isArcManagedLocal(self: *const ComponentReleaseCollector, local: ir.LocalId) bool {
+        return self.ownership.arc_managed_locals.contains(local);
+    }
+
+    fn scheduleComponentReleases(
+        self: *ComponentReleaseCollector,
+        by_last_use: *std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)),
+    ) error{OutOfMemory}!void {
+        var pointer_to_id: std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId) = .empty;
+        defer pointer_to_id.deinit(self.allocator);
+
+        var next_id: arc_liveness.InstructionId = 0;
+        for (self.function.body) |block| {
+            try self.numberStream(block.instructions, &next_id, &pointer_to_id);
+        }
+
+        var active = ActiveExtractions{ .allocator = self.allocator, .by_aggregate = .empty };
+        defer active.deinit();
+        for (self.function.body) |block| {
+            try self.scheduleStream(block.instructions, &pointer_to_id, &active, by_last_use);
+        }
+    }
+
+    fn scheduleStream(
+        self: *ComponentReleaseCollector,
+        stream: []const ir.Instruction,
+        pointer_to_id: *const std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
+        active: *ActiveExtractions,
+        by_last_use: *std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)),
+    ) error{OutOfMemory}!void {
+        for (stream) |*instr| {
+            const id = pointer_to_id.get(instr).?;
+            try self.activateExtraction(instr.*, active);
+            try self.scheduleInstructionReleases(instr.*, id, active, by_last_use);
+            try self.scheduleChildren(instr, pointer_to_id, active, by_last_use);
+        }
+    }
+
+    fn scheduleChildren(
+        self: *ComponentReleaseCollector,
+        instr: *const ir.Instruction,
+        pointer_to_id: *const std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
+        active: *ActiveExtractions,
+        by_last_use: *std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)),
+    ) error{OutOfMemory}!void {
+        switch (instr.*) {
+            .if_expr => |if_expr| {
+                try self.scheduleBranchedStream(if_expr.then_instrs, pointer_to_id, active, by_last_use);
+                try self.scheduleBranchedStream(if_expr.else_instrs, pointer_to_id, active, by_last_use);
+            },
+            .case_block => |case_block| {
+                try self.scheduleStream(case_block.pre_instrs, pointer_to_id, active, by_last_use);
+                for (case_block.arms) |arm| {
+                    try self.scheduleBranchedStream(arm.cond_instrs, pointer_to_id, active, by_last_use);
+                    try self.scheduleBranchedStream(arm.body_instrs, pointer_to_id, active, by_last_use);
+                }
+                try self.scheduleBranchedStream(case_block.default_instrs, pointer_to_id, active, by_last_use);
+            },
+            .switch_literal => |switch_literal| {
+                for (switch_literal.cases) |case| {
+                    try self.scheduleBranchedStream(case.body_instrs, pointer_to_id, active, by_last_use);
+                }
+                try self.scheduleBranchedStream(switch_literal.default_instrs, pointer_to_id, active, by_last_use);
+            },
+            .switch_return => |switch_return| {
+                for (switch_return.cases) |case| {
+                    try self.scheduleBranchedStream(case.body_instrs, pointer_to_id, active, by_last_use);
+                }
+                try self.scheduleBranchedStream(switch_return.default_instrs, pointer_to_id, active, by_last_use);
+            },
+            .union_switch => |union_switch| {
+                for (union_switch.cases) |case| {
+                    try self.scheduleBranchedStream(case.body_instrs, pointer_to_id, active, by_last_use);
+                }
+            },
+            .union_switch_return => |union_switch_return| {
+                for (union_switch_return.cases) |case| {
+                    try self.scheduleBranchedStream(case.body_instrs, pointer_to_id, active, by_last_use);
+                }
+            },
+            .try_call_named => |try_call_named| {
+                try self.scheduleBranchedStream(try_call_named.handler_instrs, pointer_to_id, active, by_last_use);
+                try self.scheduleBranchedStream(try_call_named.success_instrs, pointer_to_id, active, by_last_use);
+            },
+            .guard_block => |guard_block| {
+                try self.scheduleBranchedStream(guard_block.body, pointer_to_id, active, by_last_use);
+            },
+            .optional_dispatch => |optional_dispatch| {
+                try self.scheduleBranchedStream(optional_dispatch.nil_instrs, pointer_to_id, active, by_last_use);
+                try self.scheduleBranchedStream(optional_dispatch.struct_instrs, pointer_to_id, active, by_last_use);
+            },
+            else => {},
+        }
+    }
+
+    fn scheduleBranchedStream(
+        self: *ComponentReleaseCollector,
+        stream: []const ir.Instruction,
+        pointer_to_id: *const std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
+        active: *const ActiveExtractions,
+        by_last_use: *std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)),
+    ) error{OutOfMemory}!void {
+        var branch_active = try active.clone();
+        defer branch_active.deinit();
+        try self.scheduleStream(stream, pointer_to_id, &branch_active, by_last_use);
+    }
+
+    fn activateExtraction(
+        self: *ComponentReleaseCollector,
+        instr: ir.Instruction,
+        active: *ActiveExtractions,
+    ) error{OutOfMemory}!void {
+        switch (instr) {
+            .index_get => |index_get| {
+                if (self.non_arc_aggregates.contains(index_get.object) and self.isArcManagedLocal(index_get.dest)) {
+                    try active.add(index_get.object, index_get.dest);
+                }
+            },
+            .field_get => |field_get| {
+                if (self.non_arc_aggregates.contains(field_get.object) and self.isArcManagedLocal(field_get.dest)) {
+                    try active.add(field_get.object, field_get.dest);
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn scheduleInstructionReleases(
+        self: *ComponentReleaseCollector,
+        instr: ir.Instruction,
+        id: arc_liveness.InstructionId,
+        active: *const ActiveExtractions,
+        by_last_use: *std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)),
+    ) error{OutOfMemory}!void {
+        var uses = arc_liveness.UseList{};
+        defer uses.deinit(std.heap.page_allocator);
+        arc_liveness.collectUses(instr, &uses);
+        for (uses.slice()) |local| {
+            const last_use_ids = self.last_use_by_aggregate.get(local) orelse continue;
+            if (!containsInstructionId(last_use_ids.items, id)) continue;
+            const active_components = active.by_aggregate.get(local) orelse continue;
+            const gop = try by_last_use.getOrPut(self.allocator, id);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            for (active_components.items) |component_local| {
+                try appendUniqueLocal(self.allocator, gop.value_ptr, component_local);
+            }
+        }
+    }
+};
+
+const ActiveExtractions = struct {
+    allocator: std.mem.Allocator,
+    by_aggregate: std.AutoHashMapUnmanaged(ir.LocalId, std.ArrayListUnmanaged(ir.LocalId)),
+
+    fn deinit(self: *ActiveExtractions) void {
+        var iter = self.by_aggregate.valueIterator();
+        while (iter.next()) |list_ptr| list_ptr.deinit(self.allocator);
+        self.by_aggregate.deinit(self.allocator);
+    }
+
+    fn clone(self: *const ActiveExtractions) error{OutOfMemory}!ActiveExtractions {
+        var result = ActiveExtractions{ .allocator = self.allocator, .by_aggregate = .empty };
+        errdefer result.deinit();
+        var iter = self.by_aggregate.iterator();
+        while (iter.next()) |entry| {
+            var list: std.ArrayListUnmanaged(ir.LocalId) = .empty;
+            errdefer list.deinit(self.allocator);
+            try list.appendSlice(self.allocator, entry.value_ptr.items);
+            try result.by_aggregate.put(self.allocator, entry.key_ptr.*, list);
+        }
+        return result;
+    }
+
+    fn add(self: *ActiveExtractions, aggregate: ir.LocalId, component: ir.LocalId) error{OutOfMemory}!void {
+        const gop = try self.by_aggregate.getOrPut(self.allocator, aggregate);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try appendUniqueLocal(self.allocator, gop.value_ptr, component);
+    }
+};
+
+fn containsInstructionId(items: []const arc_liveness.InstructionId, needle: arc_liveness.InstructionId) bool {
+    for (items) |item| {
+        if (item == needle) return true;
+    }
+    return false;
+}
+
+fn appendUniqueLocal(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(ir.LocalId),
+    local: ir.LocalId,
+) error{OutOfMemory}!void {
+    for (list.items) |existing| {
+        if (existing == local) return;
+    }
+    try list.append(allocator, local);
+}
+
+const ComponentAggregateLiveness = struct {
+    collector: *ComponentReleaseCollector,
+    local_to_index: *const std.AutoHashMapUnmanaged(ir.LocalId, u32),
+    tracked_locals: []const ir.LocalId,
+    pointer_to_id: std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
+
+    fn deinit(self: *ComponentAggregateLiveness) void {
+        self.pointer_to_id.deinit(self.collector.allocator);
+    }
+
+    fn compute(self: *ComponentAggregateLiveness) error{OutOfMemory}!void {
+        var next_id: arc_liveness.InstructionId = 0;
+        for (self.collector.function.body) |block| {
+            try self.collector.numberStream(block.instructions, &next_id, &self.pointer_to_id);
+        }
+
+        for (self.collector.function.body) |block| {
+            var stream_live_after = try ComponentLocalSet.init(self.collector.allocator, @intCast(self.tracked_locals.len));
+            defer stream_live_after.deinit(self.collector.allocator);
+            var stream_live_before = try self.processStream(block.instructions, &stream_live_after);
+            defer stream_live_before.deinit(self.collector.allocator);
+        }
+    }
+
+    fn processStream(
+        self: *ComponentAggregateLiveness,
+        stream: []const ir.Instruction,
+        stream_live_after: *const ComponentLocalSet,
+    ) error{OutOfMemory}!ComponentLocalSet {
+        if (stream.len == 0) return try stream_live_after.clone(self.collector.allocator);
+
+        var current_live = try stream_live_after.clone(self.collector.allocator);
+        var instruction_index: usize = stream.len;
+        while (instruction_index > 0) {
+            instruction_index -= 1;
+            const instr = &stream[instruction_index];
+            const id = self.pointer_to_id.get(instr).?;
+
+            var instruction_live_after = if (arc_liveness.isTerminator(instr.*))
+                try ComponentLocalSet.init(self.collector.allocator, @intCast(self.tracked_locals.len))
+            else
+                try current_live.clone(self.collector.allocator);
+            defer instruction_live_after.deinit(self.collector.allocator);
+
+            try self.recurseChildren(instr, &instruction_live_after);
+            try self.recordInstructionLastUses(instr.*, id, &instruction_live_after);
+
+            var next_live = try instruction_live_after.clone(self.collector.allocator);
+            self.applyDefs(instr.*, &next_live);
+            self.applyUses(instr.*, &next_live);
+
+            current_live.deinit(self.collector.allocator);
+            current_live = next_live;
+        }
+
+        return current_live;
+    }
+
+    fn recurseChildren(
+        self: *ComponentAggregateLiveness,
+        instr: *const ir.Instruction,
+        parent_live_after: *const ComponentLocalSet,
+    ) error{OutOfMemory}!void {
+        switch (instr.*) {
+            .if_expr => |if_expr| {
+                var then_in = try self.processStream(if_expr.then_instrs, parent_live_after);
+                defer then_in.deinit(self.collector.allocator);
+                var else_in = try self.processStream(if_expr.else_instrs, parent_live_after);
+                defer else_in.deinit(self.collector.allocator);
+            },
+            .case_block => |case_block| {
+                var pre_in = try self.processStream(case_block.pre_instrs, parent_live_after);
+                defer pre_in.deinit(self.collector.allocator);
+                for (case_block.arms) |arm| {
+                    var cond_in = try self.processStream(arm.cond_instrs, parent_live_after);
+                    defer cond_in.deinit(self.collector.allocator);
+                    var body_in = try self.processStream(arm.body_instrs, parent_live_after);
+                    defer body_in.deinit(self.collector.allocator);
+                }
+                var default_in = try self.processStream(case_block.default_instrs, parent_live_after);
+                defer default_in.deinit(self.collector.allocator);
+            },
+            .switch_literal => |switch_literal| {
+                for (switch_literal.cases) |case| {
+                    var body_in = try self.processStream(case.body_instrs, parent_live_after);
+                    defer body_in.deinit(self.collector.allocator);
+                }
+                var default_in = try self.processStream(switch_literal.default_instrs, parent_live_after);
+                defer default_in.deinit(self.collector.allocator);
+            },
+            .switch_return => |switch_return| {
+                var empty = try ComponentLocalSet.init(self.collector.allocator, @intCast(self.tracked_locals.len));
+                defer empty.deinit(self.collector.allocator);
+                for (switch_return.cases) |case| {
+                    var body_in = try self.processStream(case.body_instrs, &empty);
+                    defer body_in.deinit(self.collector.allocator);
+                }
+                var default_in = try self.processStream(switch_return.default_instrs, &empty);
+                defer default_in.deinit(self.collector.allocator);
+            },
+            .union_switch => |union_switch| {
+                for (union_switch.cases) |case| {
+                    var body_in = try self.processStream(case.body_instrs, parent_live_after);
+                    defer body_in.deinit(self.collector.allocator);
+                }
+            },
+            .union_switch_return => |union_switch_return| {
+                var empty = try ComponentLocalSet.init(self.collector.allocator, @intCast(self.tracked_locals.len));
+                defer empty.deinit(self.collector.allocator);
+                for (union_switch_return.cases) |case| {
+                    var body_in = try self.processStream(case.body_instrs, &empty);
+                    defer body_in.deinit(self.collector.allocator);
+                }
+            },
+            .try_call_named => |try_call_named| {
+                var handler_in = try self.processStream(try_call_named.handler_instrs, parent_live_after);
+                defer handler_in.deinit(self.collector.allocator);
+                var success_in = try self.processStream(try_call_named.success_instrs, parent_live_after);
+                defer success_in.deinit(self.collector.allocator);
+            },
+            .guard_block => |guard_block| {
+                var body_in = try self.processStream(guard_block.body, parent_live_after);
+                defer body_in.deinit(self.collector.allocator);
+            },
+            .optional_dispatch => |optional_dispatch| {
+                var empty = try ComponentLocalSet.init(self.collector.allocator, @intCast(self.tracked_locals.len));
+                defer empty.deinit(self.collector.allocator);
+                var nil_in = try self.processStream(optional_dispatch.nil_instrs, &empty);
+                defer nil_in.deinit(self.collector.allocator);
+                var struct_in = try self.processStream(optional_dispatch.struct_instrs, &empty);
+                defer struct_in.deinit(self.collector.allocator);
+            },
+            else => {},
+        }
+    }
+
+    fn recordInstructionLastUses(
+        self: *ComponentAggregateLiveness,
+        instr: ir.Instruction,
+        id: arc_liveness.InstructionId,
+        live_after: *const ComponentLocalSet,
+    ) error{OutOfMemory}!void {
+        var uses = arc_liveness.UseList{};
+        defer uses.deinit(std.heap.page_allocator);
+        arc_liveness.collectUses(instr, &uses);
+        for (uses.slice()) |local| {
+            const bit_index = self.local_to_index.get(local) orelse continue;
+            if (live_after.contains(bit_index)) continue;
+            try self.collector.recordLastUse(local, id);
+        }
+    }
+
+    fn applyDefs(self: *ComponentAggregateLiveness, instr: ir.Instruction, set: *ComponentLocalSet) void {
+        const defs = arc_liveness.collectDefs(instr);
+        for (defs.slice()) |local| {
+            if (self.local_to_index.get(local)) |bit_index| set.unset(bit_index);
+        }
+    }
+
+    fn applyUses(self: *ComponentAggregateLiveness, instr: ir.Instruction, set: *ComponentLocalSet) void {
+        var uses = arc_liveness.UseList{};
+        defer uses.deinit(std.heap.page_allocator);
+        arc_liveness.collectUses(instr, &uses);
+        for (uses.slice()) |local| {
+            if (self.local_to_index.get(local)) |bit_index| set.set(bit_index);
+        }
+    }
+};
+
+const ComponentLocalSet = struct {
+    storage: Storage,
+    bit_count: u32,
+
+    const Storage = union(enum) {
+        small: u64,
+        large: std.DynamicBitSet,
+    };
+
+    fn init(allocator: std.mem.Allocator, bit_count: u32) !ComponentLocalSet {
+        if (bit_count <= 64) {
+            return .{ .storage = .{ .small = 0 }, .bit_count = bit_count };
+        }
+        const large = try std.DynamicBitSet.initEmpty(allocator, bit_count);
+        return .{ .storage = .{ .large = large }, .bit_count = bit_count };
+    }
+
+    fn deinit(self: *ComponentLocalSet, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        switch (self.storage) {
+            .large => |*large| large.deinit(),
+            .small => {},
+        }
+    }
+
+    fn clone(self: *const ComponentLocalSet, allocator: std.mem.Allocator) !ComponentLocalSet {
+        switch (self.storage) {
+            .small => |value| return .{ .storage = .{ .small = value }, .bit_count = self.bit_count },
+            .large => |large| {
+                var new = try std.DynamicBitSet.initEmpty(allocator, self.bit_count);
+                new.setUnion(large);
+                return .{ .storage = .{ .large = new }, .bit_count = self.bit_count };
+            },
+        }
+    }
+
+    fn contains(self: *const ComponentLocalSet, index: u32) bool {
+        switch (self.storage) {
+            .small => |value| return (value & (@as(u64, 1) << @intCast(index))) != 0,
+            .large => |large| return large.isSet(index),
+        }
+    }
+
+    fn set(self: *ComponentLocalSet, index: u32) void {
+        switch (self.storage) {
+            .small => |*value| value.* |= (@as(u64, 1) << @intCast(index)),
+            .large => |*large| large.set(index),
+        }
+    }
+
+    fn unset(self: *ComponentLocalSet, index: u32) void {
+        switch (self.storage) {
+            .small => |*value| value.* &= ~(@as(u64, 1) << @intCast(index)),
+            .large => |*large| large.unset(index),
+        }
     }
 };
 
@@ -796,7 +1175,9 @@ pub fn insertScopeExitDrops(
     // entries the pass cannot insert anything. The traversal below
     // still works but skipping it saves a pointless walk over every
     // function in the program (most have no ARC locals today).
-    if (ownership.live_before_ret.count() == 0) return;
+    if (ownership.live_before_ret.count() == 0 and
+        ownership.owned_at_ret.count() == 0 and
+        ownership.owned_at_case_break.count() == 0) return;
 
     var rebuilder = StreamRebuilder{
         .allocator = allocator,
@@ -872,7 +1253,7 @@ const StreamRebuilder = struct {
             self.next_id += 1;
 
             const child_result = try self.rebuildChildren(instr, my_id);
-            const drops = try self.dropsForTerminator(instr, my_id);
+            const drops = try self.dropsBeforeInstruction(instr, my_id);
             const retains = try self.retainsForTerminator(instr, my_id);
 
             const outcome: InstructionOutcome = .{
@@ -1119,6 +1500,17 @@ const StreamRebuilder = struct {
         }
     }
 
+    fn dropsBeforeInstruction(
+        self: *StreamRebuilder,
+        instr: *const ir.Instruction,
+        id: arc_liveness.InstructionId,
+    ) error{OutOfMemory}![]ir.Instruction {
+        return switch (instr.*) {
+            .case_break => |case_break| self.dropsForCaseBreak(id, case_break.value),
+            else => self.dropsForTerminator(instr, id),
+        };
+    }
+
     /// Build the `release` instruction list to inject immediately
     /// before `instr` (which has just been assigned `id`). For
     /// non-ret-equivalent terminators or terminators with no
@@ -1183,6 +1575,12 @@ const StreamRebuilder = struct {
                 try seen.put(self.allocator, local_id, {});
 
                 if (args_view.containsLocal(local_id)) continue;
+                // Return-source locals transfer their existing
+                // ownership unit to the caller's return slot. Emitting
+                // a scope-exit release for one would destroy the value
+                // immediately before `ret`, leaving the caller with a
+                // dangling ARC cell.
+                if (self.ownership.return_source_locals.contains(local_id)) continue;
                 // Phase B (Phase 6 redux plan §3.B): skip LocalIds bound
                 // to a `borrowed` formal parameter. The caller owns the
                 // value across the entire call (caller-side `share_value`
@@ -1203,10 +1601,45 @@ const StreamRebuilder = struct {
                 // both are borrows whose underlying owner outlives the
                 // borrow's scope.
                 if (isBorrowedLocal(self.function, local_id)) continue;
+                // A `param_get` after an `.owned` parameter slot was
+                // consumed is a non-owning refetch of that slot's
+                // storage, not a fresh +1. Backward liveness still
+                // sees the local as used before the terminator; the
+                // ownership side table records the stronger fact so
+                // drop insertion does not synthesize a stale release.
+                if (self.ownership.non_owning_param_refetches.contains(local_id)) continue;
                 try releases.append(self.allocator, ir.Instruction{
                     .release = .{ .value = local_id },
                 });
             }
+        }
+
+        return try releases.toOwnedSlice(self.allocator);
+    }
+
+    fn dropsForCaseBreak(
+        self: *StreamRebuilder,
+        id: arc_liveness.InstructionId,
+        case_result: ?ir.LocalId,
+    ) error{OutOfMemory}![]ir.Instruction {
+        const owned_set = self.ownership.owned_at_case_break.get(id) orelse return &.{};
+        if (owned_set.count() == 0) return &.{};
+
+        var releases: std.ArrayListUnmanaged(ir.Instruction) = .empty;
+        errdefer releases.deinit(self.allocator);
+        try releases.ensureTotalCapacity(self.allocator, owned_set.count());
+
+        var iter = owned_set.keyIterator();
+        while (iter.next()) |local_ptr| {
+            const local_id = local_ptr.*;
+            if (case_result) |result| {
+                if (local_id == result) continue;
+            }
+            if (isBorrowedParameterLocal(self.function, local_id)) continue;
+            if (isBorrowedLocal(self.function, local_id)) continue;
+            try releases.append(self.allocator, ir.Instruction{
+                .release = .{ .value = local_id },
+            });
         }
 
         return try releases.toOwnedSlice(self.allocator);
@@ -1660,10 +2093,11 @@ test "arc_drop_insertion: simple ret(param) does NOT release the param (Phase B)
     try std.testing.expectEqual(releases_before + expected_releases, releases_after);
 }
 
-test "arc_drop_insertion: branching function inserts releases on each ret arm" {
+test "arc_drop_insertion: branching borrowed return values are not dropped" {
     // Two arms each returning a distinct ARC-managed local.
     // The analyzer materializes a per-terminator live-before-ret
-    // entry; the pass must insert the matching releases on each arm.
+    // entry; the pass must insert releases only for owned locals that
+    // are neither borrowed parameters nor return-source transfers.
     const source =
         \\pub struct Test {
         \\  opaque Handle = String
@@ -1690,16 +2124,25 @@ test "arc_drop_insertion: branching function inserts releases on each ret arm" {
 
     var expected_inserts: usize = 0;
     var live_iter = ownership.live_before_ret.valueIterator();
-    while (live_iter.next()) |set_ptr| expected_inserts += set_ptr.count();
-    try std.testing.expect(expected_inserts >= 1);
+    while (live_iter.next()) |set_ptr| {
+        var set_iter = set_ptr.keyIterator();
+        while (set_iter.next()) |local_ptr| {
+            const local_id = local_ptr.*;
+            if (ownership.return_source_locals.contains(local_id)) continue;
+            if (isBorrowedParameterLocal(pick_func, local_id)) continue;
+            if (isBorrowedLocal(pick_func, local_id)) continue;
+            expected_inserts += 1;
+        }
+    }
+    try std.testing.expect(ownership.live_before_ret.count() >= 1);
 
     const releases_before = countReleases(pick_func);
     try insertScopeExitDrops(suite.irAllocator(), pick_func, &ownership);
     const releases_after = countReleases(pick_func);
 
     // A non-tail terminator never subtracts args, so the post-pass
-    // release count grows by exactly the sum of live-before-ret
-    // sizes.
+    // release count grows by exactly the filtered live-before-ret
+    // size.
     try std.testing.expectEqual(releases_before + expected_inserts, releases_after);
 }
 
@@ -1791,6 +2234,50 @@ test "arc_drop_insertion: tail-call site does NOT drop its argument locals" {
     // is therefore informational, not load-bearing here. Touch the
     // observable so the compiler doesn't reject the unused local.
     if (seen_tail_call) {} else {}
+}
+
+test "arc_drop_insertion: non-owning owned-param refetch is not released" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const stream = try arena.alloc(ir.Instruction, 1);
+    stream[0] = .{ .tail_call = .{ .name = "loop", .args = &.{} } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 4);
+    for (local_ownership) |*o| o.* = .trivial;
+    local_ownership[3] = .owned;
+
+    var function = ir.Function{
+        .id = 0,
+        .name = "non_owning_refetch_drop_test",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(std.testing.allocator);
+
+    var live_set: arc_liveness.ArcLocalSet = .empty;
+    errdefer live_set.deinit(std.testing.allocator);
+    try live_set.put(std.testing.allocator, 3, {});
+    try ownership.live_before_ret.putNoClobber(std.testing.allocator, 0, live_set);
+    try ownership.non_owning_param_refetches.put(std.testing.allocator, 3, {});
+
+    try insertScopeExitDrops(arena, &function, &ownership);
+    try std.testing.expectEqual(@as(usize, 0), countReleases(&function));
 }
 
 test "arc_drop_insertion: identity-function parameter is skipped (Phase B + Phase E.5 Gap 4)" {
@@ -1984,6 +2471,51 @@ test "arc_drop_insertion: direct return of borrowed param INSERTS retain (Phase 
     // Exactly one retain was added at the ret site to promote the
     // borrowed param to a fresh owner for the caller.
     try std.testing.expect(retains_after > retains_before);
+}
+
+test "arc_drop_insertion: returned owned call result is not dropped before ret" {
+    // A call result already owns the +1 that the caller receives.
+    // Drop insertion must not release that local immediately before
+    // returning it, or the caller gets a dead cell.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn fresh() -> Handle { "x" }
+        \\
+        \\  pub fn make() -> Handle { Test.fresh() }
+        \\}
+    ;
+    var suite = try DropTestSuite.init(std.testing.allocator, source);
+    defer suite.deinit();
+
+    const make_func = suite.findFunctionByName("make") orelse return error.MissingFunction;
+    var ownership = try arc_liveness.computeArcOwnership(
+        std.testing.allocator,
+        make_func,
+        suite.typeStore(),
+        arc_liveness.defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    var returned_local: ?ir.LocalId = null;
+    const RetFinder = struct {
+        returned_local: *?ir.LocalId,
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (instr.* == .ret and instr.ret.value != null) {
+                self.returned_local.* = instr.ret.value;
+            }
+        }
+    };
+    var ret_finder = RetFinder{ .returned_local = &returned_local };
+    ir.forEachInstruction(make_func, &ret_finder, RetFinder.visit);
+    const ret_local = returned_local orelse return error.MissingReturn;
+
+    try insertScopeExitDrops(suite.irAllocator(), make_func, &ownership);
+
+    var release_locals = try collectReleaseLocals(std.testing.allocator, make_func);
+    defer release_locals.deinit(std.testing.allocator);
+    try std.testing.expect(!release_locals.contains(ret_local));
 }
 
 test "arc_drop_insertion: switch_return arm with non-return-source value gets retain appended to arm body" {
@@ -2443,6 +2975,92 @@ test "Phase E.5 Gap 7: owned binding whose last use is share_value gets scope-ex
     try std.testing.expect(released_call_dest or released_binding);
 }
 
+test "arc_drop_insertion: flat case_block releases branch temporaries before case_break" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const guard_body = try arena.alloc(ir.Instruction, 3);
+    guard_body[0] = .{ .const_string = .{ .dest = 2, .value = "selected" } };
+    guard_body[1] = .{ .const_string = .{ .dest = 3, .value = "temporary" } };
+    guard_body[2] = .{ .case_break = .{ .value = 2 } };
+
+    const pre_instrs = try arena.alloc(ir.Instruction, 4);
+    pre_instrs[0] = .{ .const_bool = .{ .dest = 0, .value = true } };
+    pre_instrs[1] = .{ .guard_block = .{ .condition = 0, .body = guard_body } };
+    pre_instrs[2] = .{ .const_string = .{ .dest = 4, .value = "default" } };
+    pre_instrs[3] = .{ .case_break = .{ .value = 4 } };
+
+    const stream = try arena.alloc(ir.Instruction, 2);
+    stream[0] = .{ .case_block = .{
+        .dest = 1,
+        .pre_instrs = pre_instrs,
+        .arms = &.{},
+        .default_instrs = &.{},
+        .default_result = null,
+    } };
+    stream[1] = .{ .ret = .{ .value = 1 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 5);
+    for (local_ownership) |*ownership_class| ownership_class.* = .trivial;
+    local_ownership[1] = .owned;
+    local_ownership[2] = .owned;
+    local_ownership[3] = .owned;
+    local_ownership[4] = .owned;
+
+    var function = ir.Function{
+        .id = 0,
+        .name = "flat_case_drop_test",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .string,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var dummy_type_store: types_mod.TypeStore = undefined;
+    var ownership = try arc_liveness.computeArcOwnership(
+        std.testing.allocator,
+        &function,
+        &dummy_type_store,
+        arc_liveness.defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    try insertScopeExitDrops(arena, &function, &ownership);
+
+    for (function.body[0].instructions) |instr| {
+        if (instr == .release) {
+            try std.testing.expect(instr.release.value != 2);
+            try std.testing.expect(instr.release.value != 3);
+            try std.testing.expect(instr.release.value != 4);
+        }
+    }
+
+    const rewritten_case = function.body[0].instructions[0].case_block;
+    const rewritten_guard_body = rewritten_case.pre_instrs[1].guard_block.body;
+    var saw_branch_temp_release = false;
+    for (rewritten_guard_body, 0..) |instr, idx| {
+        if (idx + 1 >= rewritten_guard_body.len) continue;
+        if (instr == .release and instr.release.value == 3 and
+            rewritten_guard_body[idx + 1] == .case_break and
+            rewritten_guard_body[idx + 1].case_break.value.? == 2)
+        {
+            saw_branch_temp_release = true;
+        }
+    }
+    try std.testing.expect(saw_branch_temp_release);
+}
+
 test "Phase E.5 Gap 6: paramIndexForLocal walks body to find param_get dest" {
     // The pre-Phase-E.5 implementation assumed parameter LocalIds
     // occupy the first `function.param_conventions.len` slots. That
@@ -2517,13 +3135,21 @@ test "Phase 2.6.3: insertTupleComponentReleases is no-op when no non-ARC tuples 
     defer suite.deinit();
 
     const id_func = suite.findFunctionByName("id") orelse return error.MissingFunction;
+    var ownership = try arc_liveness.computeArcOwnership(
+        std.testing.allocator,
+        id_func,
+        suite.typeStore(),
+        arc_liveness.defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
     const releases_before = countReleases(id_func);
-    try insertTupleComponentReleases(suite.irAllocator(), id_func);
+    try insertTupleComponentReleases(suite.irAllocator(), id_func, &ownership);
     try std.testing.expectEqual(releases_before, countReleases(id_func));
 }
 
 test "Phase 2.6.3: insertTupleComponentReleases emits release for ARC component at tuple last-use" {
-    // The destructure-then-V8 idiom that fannkuch's main_loop uses:
+    // The destructure-then-uniqueness idiom that fannkuch's main_loop uses:
     //
     //   pp_flips = make_pair(h, h2)        ; ARC component pp + Bool flag
     //   {pp, _flag} = pp_flips             ; index_get + retain on pp
@@ -2534,7 +3160,7 @@ test "Phase 2.6.3: insertTupleComponentReleases emits release for ARC component 
     //   ; downstream `*_owned_unchecked`.
     //   pp                                  ; return pp (or use it)
     //
-    // The `Handle` type stands in for `VectorI64` (avoids the
+    // The `Handle` type stands in for an ARC-managed list-like value (avoids the
     // `@native_type` scope plumbing). Phase 2.6.3's pass should insert
     // exactly one release whose value matches the destructured `pp`
     // local.
@@ -2555,8 +3181,16 @@ test "Phase 2.6.3: insertTupleComponentReleases emits release for ARC component 
     defer suite.deinit();
 
     const run_func = suite.findFunctionByName("run") orelse return error.MissingFunction;
+    var ownership = try arc_liveness.computeArcOwnership(
+        std.testing.allocator,
+        run_func,
+        suite.typeStore(),
+        arc_liveness.defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
     const releases_before = countReleases(run_func);
-    try insertTupleComponentReleases(suite.irAllocator(), run_func);
+    try insertTupleComponentReleases(suite.irAllocator(), run_func, &ownership);
     const releases_after = countReleases(run_func);
 
     // Exactly ONE release was emitted: the destructured ARC handle
@@ -2589,6 +3223,151 @@ test "Phase 2.6.3: insertTupleComponentReleases emits release for ARC component 
         if (saw_release_for_extracted) break;
     }
     try std.testing.expect(saw_release_for_extracted);
+}
+
+test "Phase 2.7: insertTupleComponentReleases uses ArcOwnership classification for extracted component" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const tuple_elements = try arena.alloc(ir.LocalId, 1);
+    tuple_elements[0] = 0;
+
+    const stream = try arena.alloc(ir.Instruction, 5);
+    stream[0] = .{ .const_string = .{ .dest = 0, .value = "component" } };
+    stream[1] = .{ .tuple_init = .{ .dest = 1, .elements = tuple_elements } };
+    stream[2] = .{ .index_get = .{ .dest = 2, .object = 1, .index = 0 } };
+    stream[3] = .{ .retain = .{ .value = 2 } };
+    stream[4] = .{ .ret = .{ .value = 2 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 3);
+    local_ownership[0] = .owned;
+    local_ownership[1] = .trivial;
+    local_ownership[2] = .borrowed;
+
+    var function = ir.Function{
+        .id = 0,
+        .name = "tuple_component_release_classification",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .string,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var dummy_type_store: types_mod.TypeStore = undefined;
+    var ownership = try arc_liveness.computeArcOwnership(
+        std.testing.allocator,
+        &function,
+        &dummy_type_store,
+        arc_liveness.defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(ir.OwnershipClass.borrowed, function.local_ownership[2]);
+    try std.testing.expect(ownership.arc_managed_locals.contains(2));
+
+    const releases_before = countReleases(&function);
+    try insertTupleComponentReleases(arena, &function, &ownership);
+    const releases_after = countReleases(&function);
+    try std.testing.expectEqual(releases_before + 1, releases_after);
+
+    var saw_release_after_retain = false;
+    for (function.body[0].instructions, 0..) |instr, idx| {
+        if (instr != .retain or instr.retain.value != 2) continue;
+        if (idx + 1 < function.body[0].instructions.len and
+            function.body[0].instructions[idx + 1] == .release and
+            function.body[0].instructions[idx + 1].release.value == 2)
+        {
+            saw_release_after_retain = true;
+        }
+    }
+    try std.testing.expect(saw_release_after_retain);
+}
+
+test "Phase 2.7: insertTupleComponentReleases releases aggregate components on every branch last-use" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const tuple_elements = try arena.alloc(ir.LocalId, 1);
+    tuple_elements[0] = 0;
+
+    const then_instrs = try arena.alloc(ir.Instruction, 2);
+    then_instrs[0] = .{ .index_get = .{ .dest = 3, .object = 1, .index = 0 } };
+    then_instrs[1] = .{ .retain = .{ .value = 3 } };
+
+    const else_instrs = try arena.alloc(ir.Instruction, 2);
+    else_instrs[0] = .{ .index_get = .{ .dest = 4, .object = 1, .index = 0 } };
+    else_instrs[1] = .{ .retain = .{ .value = 4 } };
+
+    const stream = try arena.alloc(ir.Instruction, 4);
+    stream[0] = .{ .const_string = .{ .dest = 0, .value = "component" } };
+    stream[1] = .{ .tuple_init = .{ .dest = 1, .elements = tuple_elements } };
+    stream[2] = .{ .const_bool = .{ .dest = 2, .value = true } };
+    stream[3] = .{ .if_expr = .{
+        .dest = 5,
+        .condition = 2,
+        .then_instrs = then_instrs,
+        .then_result = 3,
+        .else_instrs = else_instrs,
+        .else_result = 4,
+    } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 6);
+    for (local_ownership) |*ownership_class| ownership_class.* = .trivial;
+    local_ownership[0] = .owned;
+    local_ownership[3] = .owned;
+    local_ownership[4] = .owned;
+    local_ownership[5] = .owned;
+
+    var function = ir.Function{
+        .id = 0,
+        .name = "tuple_component_release_branch_last_use",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .string,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 6,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var dummy_type_store: types_mod.TypeStore = undefined;
+    var ownership = try arc_liveness.computeArcOwnership(
+        std.testing.allocator,
+        &function,
+        &dummy_type_store,
+        arc_liveness.defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    try std.testing.expect(ownership.isLastUseAt(1, 4));
+    try std.testing.expect(ownership.isLastUseAt(1, 6));
+
+    const releases_before = countReleases(&function);
+    try insertTupleComponentReleases(arena, &function, &ownership);
+    try std.testing.expectEqual(releases_before + 2, countReleases(&function));
+
+    const rewritten_if = function.body[0].instructions[3].if_expr;
+    try std.testing.expectEqual(ir.Instruction{ .release = .{ .value = 3 } }, rewritten_if.then_instrs[2]);
+    try std.testing.expectEqual(ir.Instruction{ .release = .{ .value = 4 } }, rewritten_if.else_instrs[2]);
 }
 
 test "Phase E.5 Gap 6: isBorrowedParameterLocal works when param_get is allocated above binding range" {

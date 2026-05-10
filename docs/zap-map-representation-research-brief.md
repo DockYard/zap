@@ -171,7 +171,7 @@ The agent should weigh: is the extra ~3-5 weeks of dense-rewrite work worth ~10Ã
 
 ### 3.7 What if dense is right for `Map` but HAMT is right for `Vector`?
 
-Reminder: the broader plan also involves giving `Vector(T)` a flat-buffer fast path so `MArrayI64` / `MArrayF64` can be deleted. `Vector` already needs a dense representation for that â€” the agent should consider whether the `Map` and `Vector` redesigns share infrastructure (buffer COW, ownership-aware ABI).
+Reminder: this brief predates list unification. The broader plan originally involved giving `Vector(T)` a flat-buffer fast path so `MArrayI64` / `MArrayF64` could be deleted. That work is now represented by flat-buffer `List(T)`; the agent should consider whether the `Map` and `List` redesigns share infrastructure (buffer COW, ownership-aware ABI).
 
 The cleanest end state might be: **all three core collections (`Map`, `List`, `Vector`) use dense/contiguous representations as their default, with HAMT-style structural sharing reserved only for very specialized "persistent-versioned" types** (e.g., a separate `PersistentMap` opt-in). The agent should evaluate whether this is the right end-state vision, or whether `Map` specifically should keep HAMT semantics by default for some reason `Vector` doesn't.
 

@@ -4,6 +4,12 @@
 
 **The question to research:** How should Zap implement *Roc-style opportunistic in-place mutation* — pure functional surface semantics for `Map`, `List`, and `Vector`, with the compiler/runtime silently mutating in place when a value's reference count is unique, and falling back to persistent (structural-sharing) updates otherwise — and once that capability exists, eliminate the existing imperative escape-hatch types `MArrayI64` and `MArrayF64` from the language. Survey the design space, identify the hardest sub-problems, and return concrete implementation strategies with trade-offs.
 
+**Status note:** this brief is historical. Zap has since unified the sequence
+surface on flat-buffer `List(T)`: there is no user-facing `Vector(T)`,
+`VectorI64`, or `VectorF64`. Read references to user-facing Vector below as the
+pre-unification design context; the current implementation target for indexed
+sequence operations is `List(T)`.
+
 ---
 
 ## 1. What Zap Is

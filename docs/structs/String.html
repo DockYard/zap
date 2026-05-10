@@ -72,6 +72,7 @@
 <li class="active"><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Tuple.html">Tuple</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
@@ -141,6 +142,8 @@ rather than modifying in place.</p>
 <table class="summary">
 <tr><td class="summary-name"><a href="#length-1">length/1</a></td><td class="summary-doc">Returns the byte length of a string.</td></tr>
 <tr><td class="summary-name"><a href="#byte_at-2">byte_at/2</a></td><td class="summary-doc">Returns the byte at the given index as a single-character string.</td></tr>
+<tr><td class="summary-name"><a href="#from_byte-1">from_byte/1</a></td><td class="summary-doc">Constructs a one-byte string from an integer in `0..255`.</td></tr>
+<tr><td class="summary-name"><a href="#compare-2">compare/2</a></td><td class="summary-doc">Lexicographic byte-wise comparison of two strings.</td></tr>
 <tr><td class="summary-name"><a href="#contains?-2">contains?/2</a></td><td class="summary-doc">Returns `true` if `haystack` contains `needle` as a substring.</td></tr>
 <tr><td class="summary-name"><a href="#starts_with?-2">starts_with?/2</a></td><td class="summary-doc">Returns `true` if the string starts with the given prefix.</td></tr>
 <tr><td class="summary-name"><a href="#ends_with?-2">ends_with?/2</a></td><td class="summary-doc">Returns `true` if the string ends with the given suffix.</td></tr>
@@ -206,6 +209,52 @@ out of bounds.</p>
 </div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L47">Source</a>
 </div>
+<div class="function-detail" id="from_byte-1">
+<div class="function-header">
+<h3>from_byte<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#from_byte-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">from_byte</span><span class="sig-paren">(</span>byte<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Constructs a one-byte string from an integer in <code>0..255</code>. The
+inverse of <code>byte_at</code> — useful when emitting raw binary output
+(e.g., PBM image data) where higher-level string functions
+aren't appropriate. Higher bits of the input are masked off, so
+the result is always exactly one byte.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.from_byte(<span class="hl-number">65</span>)  <span class="hl-comment"># =&gt; &quot;A&quot;</span>
+<span class="hl-type">String</span>.from_byte(<span class="hl-number">0</span>)   <span class="hl-comment"># =&gt; one-byte string with byte 0x00</span>
+<span class="hl-type">String</span>.from_byte(<span class="hl-number">255</span>) <span class="hl-comment"># =&gt; one-byte string with byte 0xFF</span></code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L65">Source</a>
+</div>
+<div class="function-detail" id="compare-2">
+<div class="function-header">
+<h3>compare<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#compare-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">compare</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Lexicographic byte-wise comparison of two strings. Returns a
+negative integer when <code>left</code> precedes <code>right</code>, zero when they
+are byte-identical, and a positive integer when <code>left</code> follows
+<code>right</code>.</p>
+<p>Useful as a comparator for <code>Enum.sort</code> over <code>String</code> keys
+when the protocol-based <code>&lt;=</code> is too generic for the call site
+to resolve cleanly. Equivalent in shape to C's <code>strcmp</code> and
+OCaml's <code>String.compare</code>.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.compare(<span class="hl-string">"abc"</span>, <span class="hl-string">"abc"</span>)   <span class="hl-comment"># =&gt; 0</span>
+<span class="hl-type">String</span>.compare(<span class="hl-string">"abc"</span>, <span class="hl-string">"abd"</span>)   <span class="hl-comment"># =&gt; -1</span>
+<span class="hl-type">String</span>.compare(<span class="hl-string">"abd"</span>, <span class="hl-string">"abc"</span>)   <span class="hl-comment"># =&gt; 1</span>
+<span class="hl-type">String</span>.compare(<span class="hl-string">"ab"</span>,  <span class="hl-string">"abc"</span>)   <span class="hl-comment"># =&gt; -1</span></code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L88">Source</a>
+</div>
 <div class="function-detail" id="contains?-2">
 <div class="function-header">
 <h3>contains?<span class="arity">/2</span></h3>
@@ -221,7 +270,7 @@ out of bounds.</p>
 <span class="hl-type">String</span>.contains?(<span class="hl-string">"hello world"</span>, <span class="hl-string">"xyz"</span>)    <span class="hl-comment"># =&gt; false</span>
 <span class="hl-type">String</span>.contains?(<span class="hl-string">"hello"</span>, <span class="hl-string">""</span>)             <span class="hl-comment"># =&gt; true</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L61">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L102">Source</a>
 </div>
 <div class="function-detail" id="starts_with?-2">
 <div class="function-header">
@@ -237,7 +286,7 @@ out of bounds.</p>
 <pre><code class="language-zap"><span class="hl-type">String</span>.starts_with?(<span class="hl-string">"hello"</span>, <span class="hl-string">"hel"</span>)   <span class="hl-comment"># =&gt; true</span>
 <span class="hl-type">String</span>.starts_with?(<span class="hl-string">"hello"</span>, <span class="hl-string">"world"</span>) <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L74">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L115">Source</a>
 </div>
 <div class="function-detail" id="ends_with?-2">
 <div class="function-header">
@@ -253,7 +302,7 @@ out of bounds.</p>
 <pre><code class="language-zap"><span class="hl-type">String</span>.ends_with?(<span class="hl-string">"hello"</span>, <span class="hl-string">"llo"</span>)    <span class="hl-comment"># =&gt; true</span>
 <span class="hl-type">String</span>.ends_with?(<span class="hl-string">"hello"</span>, <span class="hl-string">"world"</span>)  <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L87">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L128">Source</a>
 </div>
 <div class="function-detail" id="trim-1">
 <div class="function-header">
@@ -269,7 +318,7 @@ out of bounds.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap"><span class="hl-type">String</span>.trim(<span class="hl-string">"  hello  "</span>)   <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L101">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L142">Source</a>
 </div>
 <div class="function-detail" id="slice-3">
 <div class="function-header">
@@ -287,7 +336,7 @@ are clamped to the string length.</p>
 <pre><code class="language-zap"><span class="hl-type">String</span>.slice(<span class="hl-string">"hello world"</span>, <span class="hl-number">0</span>, <span class="hl-number">5</span>)   <span class="hl-comment"># =&gt; &quot;hello&quot;</span>
 <span class="hl-type">String</span>.slice(<span class="hl-string">"hello world"</span>, <span class="hl-number">6</span>, <span class="hl-number">11</span>)  <span class="hl-comment"># =&gt; &quot;world&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L117">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L158">Source</a>
 </div>
 <div class="function-detail" id="to_atom-1">
 <div class="function-header">
@@ -304,7 +353,7 @@ are clamped to the string length.</p>
 <pre><code class="language-zap"><span class="hl-type">String</span>.to_atom(<span class="hl-string">"ok"</span>)    <span class="hl-comment"># =&gt; :ok</span>
 <span class="hl-type">String</span>.to_atom(<span class="hl-string">"error"</span>) <span class="hl-comment"># =&gt; :error</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L132">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L173">Source</a>
 </div>
 <div class="function-detail" id="to_existing_atom-1">
 <div class="function-header">
@@ -321,7 +370,7 @@ sentinel value if the atom has not been previously interned.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap"><span class="hl-type">String</span>.to_existing_atom(<span class="hl-string">"ok"</span>)  <span class="hl-comment"># =&gt; :ok (if :ok exists)</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L147">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L188">Source</a>
 </div>
 <div class="function-detail" id="upcase-1">
 <div class="function-header">
@@ -339,7 +388,7 @@ sentinel value if the atom has not been previously interned.</p>
 <span class="hl-type">String</span>.upcase(<span class="hl-string">"Hello World"</span>) <span class="hl-comment"># =&gt; &quot;HELLO WORLD&quot;</span>
 <span class="hl-type">String</span>.upcase(<span class="hl-string">"123"</span>)        <span class="hl-comment"># =&gt; &quot;123&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L163">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L204">Source</a>
 </div>
 <div class="function-detail" id="downcase-1">
 <div class="function-header">
@@ -357,7 +406,7 @@ sentinel value if the atom has not been previously interned.</p>
 <span class="hl-type">String</span>.downcase(<span class="hl-string">"Hello World"</span>) <span class="hl-comment"># =&gt; &quot;hello world&quot;</span>
 <span class="hl-type">String</span>.downcase(<span class="hl-string">"123"</span>)        <span class="hl-comment"># =&gt; &quot;123&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L179">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L220">Source</a>
 </div>
 <div class="function-detail" id="reverse-1">
 <div class="function-header">
@@ -374,7 +423,7 @@ sentinel value if the atom has not been previously interned.</p>
 <span class="hl-type">String</span>.reverse(<span class="hl-string">"abc"</span>)    <span class="hl-comment"># =&gt; &quot;cba&quot;</span>
 <span class="hl-type">String</span>.reverse(<span class="hl-string">""</span>)       <span class="hl-comment"># =&gt; &quot;&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L193">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L234">Source</a>
 </div>
 <div class="function-detail" id="replace-3">
 <div class="function-header">
@@ -391,7 +440,7 @@ sentinel value if the atom has not been previously interned.</p>
 <span class="hl-type">String</span>.replace(<span class="hl-string">"aaa"</span>, <span class="hl-string">"a"</span>, <span class="hl-string">"bb"</span>)                <span class="hl-comment"># =&gt; &quot;bbbbbb&quot;</span>
 <span class="hl-type">String</span>.replace(<span class="hl-string">"hello"</span>, <span class="hl-string">"xyz"</span>, <span class="hl-string">"abc"</span>)           <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L207">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L248">Source</a>
 </div>
 <div class="function-detail" id="index_of-2">
 <div class="function-header">
@@ -409,7 +458,7 @@ string, or -1 if not found.</p>
 <span class="hl-type">String</span>.index_of(<span class="hl-string">"hello"</span>, <span class="hl-string">"xyz"</span>)           <span class="hl-comment"># =&gt; -1</span>
 <span class="hl-type">String</span>.index_of(<span class="hl-string">"hello"</span>, <span class="hl-string">""</span>)              <span class="hl-comment"># =&gt; 0</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L222">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L263">Source</a>
 </div>
 <div class="function-detail" id="pad_leading-3">
 <div class="function-header">
@@ -426,7 +475,7 @@ the given padding character.</p>
 <pre><code class="language-zap"><span class="hl-type">String</span>.pad_leading(<span class="hl-string">"42"</span>, <span class="hl-number">5</span>, <span class="hl-string">"0"</span>)   <span class="hl-comment"># =&gt; &quot;00042&quot;</span>
 <span class="hl-type">String</span>.pad_leading(<span class="hl-string">"hello"</span>, <span class="hl-number">3</span>, <span class="hl-string">" "</span>) <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L236">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L277">Source</a>
 </div>
 <div class="function-detail" id="pad_trailing-3">
 <div class="function-header">
@@ -443,7 +492,7 @@ the given padding character.</p>
 <pre><code class="language-zap"><span class="hl-type">String</span>.pad_trailing(<span class="hl-string">"hi"</span>, <span class="hl-number">5</span>, <span class="hl-string">"."</span>)   <span class="hl-comment"># =&gt; &quot;hi...&quot;</span>
 <span class="hl-type">String</span>.pad_trailing(<span class="hl-string">"hello"</span>, <span class="hl-number">3</span>, <span class="hl-string">" "</span>) <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L250">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L291">Source</a>
 </div>
 <div class="function-detail" id="repeat-2">
 <div class="function-header">
@@ -460,7 +509,7 @@ the given padding character.</p>
 <span class="hl-type">String</span>.repeat(<span class="hl-string">"x"</span>, <span class="hl-number">5</span>)   <span class="hl-comment"># =&gt; &quot;xxxxx&quot;</span>
 <span class="hl-type">String</span>.repeat(<span class="hl-string">"hi"</span>, <span class="hl-number">0</span>)  <span class="hl-comment"># =&gt; &quot;&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L264">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L305">Source</a>
 </div>
 <div class="function-detail" id="to_integer-1">
 <div class="function-header">
@@ -478,7 +527,7 @@ is not a valid integer.</p>
 <pre><code class="language-zap"><span class="hl-type">String</span>.to_integer(<span class="hl-string">"42"</span>)    <span class="hl-comment"># =&gt; 42</span>
 <span class="hl-type">String</span>.to_integer(<span class="hl-string">"hello"</span>) <span class="hl-comment"># =&gt; 0</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L280">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L321">Source</a>
 </div>
 <div class="function-detail" id="to_float-1">
 <div class="function-header">
@@ -496,7 +545,7 @@ is not a valid float.</p>
 <pre><code class="language-zap"><span class="hl-type">String</span>.to_float(<span class="hl-string">"3.14"</span>)    <span class="hl-comment"># =&gt; 3.14</span>
 <span class="hl-type">String</span>.to_float(<span class="hl-string">"hello"</span>)   <span class="hl-comment"># =&gt; 0.0</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L296">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L337">Source</a>
 </div>
 <div class="function-detail" id="capitalize-1">
 <div class="function-header">
@@ -514,7 +563,7 @@ is not a valid float.</p>
 <span class="hl-type">String</span>.capitalize(<span class="hl-string">"HELLO"</span>)   <span class="hl-comment"># =&gt; &quot;Hello&quot;</span>
 <span class="hl-type">String</span>.capitalize(<span class="hl-string">""</span>)        <span class="hl-comment"># =&gt; &quot;&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L312">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L353">Source</a>
 </div>
 <div class="function-detail" id="trim_leading-1">
 <div class="function-header">
@@ -532,7 +581,7 @@ the beginning only.</p>
 <pre><code class="language-zap"><span class="hl-type">String</span>.trim_leading(<span class="hl-string">"  hello  "</span>)  <span class="hl-comment"># =&gt; &quot;hello  &quot;</span>
 <span class="hl-type">String</span>.trim_leading(<span class="hl-string">"hello"</span>)       <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L328">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L369">Source</a>
 </div>
 <div class="function-detail" id="trim_trailing-1">
 <div class="function-header">
@@ -550,7 +599,7 @@ the end only.</p>
 <pre><code class="language-zap"><span class="hl-type">String</span>.trim_trailing(<span class="hl-string">"  hello  "</span>)  <span class="hl-comment"># =&gt; &quot;  hello&quot;</span>
 <span class="hl-type">String</span>.trim_trailing(<span class="hl-string">"hello"</span>)       <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L344">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L385">Source</a>
 </div>
 <div class="function-detail" id="count-2">
 <div class="function-header">
@@ -567,7 +616,7 @@ the end only.</p>
 <span class="hl-type">String</span>.count(<span class="hl-string">"aaa"</span>, <span class="hl-string">"aa"</span>)                     <span class="hl-comment"># =&gt; 1</span>
 <span class="hl-type">String</span>.count(<span class="hl-string">"hello"</span>, <span class="hl-string">"xyz"</span>)                  <span class="hl-comment"># =&gt; 0</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L358">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L399">Source</a>
 </div>
 <div class="function-detail" id="split-2">
 <div class="function-header">
@@ -584,7 +633,7 @@ the end only.</p>
 <span class="hl-type">String</span>.split(<span class="hl-string">"hello"</span>, <span class="hl-string">""</span>)       <span class="hl-comment"># =&gt; [&quot;hello&quot;]</span>
 <span class="hl-type">String</span>.split(<span class="hl-string">"no match"</span>, <span class="hl-string">","</span>)   <span class="hl-comment"># =&gt; [&quot;no match&quot;]</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L372">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L413">Source</a>
 </div>
 <div class="function-detail" id="join-2">
 <div class="function-header">
@@ -601,7 +650,7 @@ the end only.</p>
 <span class="hl-type">String</span>.join([<span class="hl-string">"hello"</span>], <span class="hl-string">"-"</span>)          <span class="hl-comment"># =&gt; &quot;hello&quot;</span>
 <span class="hl-type">String</span>.join([], <span class="hl-string">", "</span>)                <span class="hl-comment"># =&gt; &quot;&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L386">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/string.zap#L427">Source</a>
 </div>
 </main>
 <aside class="toc">
@@ -610,6 +659,8 @@ the end only.</p>
 <li class="toc-section">Functions</li>
 <li><a href="#length-1">length/1</a></li>
 <li><a href="#byte_at-2">byte_at/2</a></li>
+<li><a href="#from_byte-1">from_byte/1</a></li>
+<li><a href="#compare-2">compare/2</a></li>
 <li><a href="#contains?-2">contains?/2</a></li>
 <li><a href="#starts_with?-2">starts_with?/2</a></li>
 <li><a href="#ends_with?-2">ends_with?/2</a></li>
