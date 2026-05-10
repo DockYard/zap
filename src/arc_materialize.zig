@@ -18,17 +18,43 @@
 // `live_before_ret` tables become stale post-insertion; that's
 // fine because no consumer downstream needs them.
 //
-// Currently handles:
-//   * `actx.arc_ops` `.retain`/`.release` records whose insertion
-//     point is in a TOP-LEVEL block of the function body. Records
-//     pointing into nested streams (if_expr arms, case_block arms,
-//     etc.) are left in place — `emitAnalysisArcOps` continues to
-//     emit them at ZIR time. As the pass's reach is extended into
-//     nested streams in follow-up commits, the emit helper's input
-//     shrinks until it can be deleted entirely.
-//   * `actx.drop_specializations` records similarly, emitting
-//     `.release { kind: .release | .free }` for each `FieldDrop`.
-//     Same nested-stream limitation.
+// CURRENT COVERAGE — IMPORTANT LIMITATION:
+//
+// `perceus.zig` encodes nested-stream navigation in the
+// `instr_index` field via a synthetic numbering scheme (see
+// `perceus.zig:617-650` — for instance, `case_block` arm 6
+// instruction 30 becomes `instr_index = (6*100) + 30 + 1 = 631`).
+// The `block` field still names a top-level block label, so
+// `findBlockByLabel` succeeds, but the synthetic `instr_index`
+// never matches an actual instruction position in the top-level
+// block — the insertion is silently scheduled past the end of
+// the block and would land at the wrong location.
+//
+// To avoid mis-emission, the current pass treats any record whose
+// synthetic `instr_index` is >= the matched block's instruction
+// count as out-of-band and leaves it in the analysis context for
+// `emitAnalysisArcOps` / `emitDropSpecializationsForCurrentInstr`
+// to handle at ZIR time via the driver's nested-stream walk
+// state. This means: for Perceus-generated records (the majority
+// in practice), the materialization pass is a no-op until it's
+// extended to either (a) decode the synthetic-index encoding and
+// follow it into nested streams, or (b) replace the synthetic
+// encoding with actual nested-stream insertion-point identifiers
+// in `perceus.zig` itself.
+//
+// What the current pass DOES materialize:
+//   * Non-Perceus `actx.arc_ops` records whose `instr_index`
+//     refers to an actual instruction position in a top-level
+//     block. These exist but are infrequent compared to the
+//     Perceus traffic.
+//   * Drop-specializations whose `field_drops[i].local` is
+//     explicitly set AND whose `instr_index` is in-bounds for a
+//     top-level block. Same shape constraints.
+//
+// As the pass's reach is extended into nested streams in
+// follow-up commits, the emit helper's input shrinks until it
+// can be deleted entirely. Until then the existing helpers
+// remain the load-bearing emission path.
 //
 // Out of scope (Phase 3 follow-up):
 //   * `actx.reuse_pairs` — `.reset` and `.reuse_alloc` IR. Perceus
@@ -109,6 +135,18 @@ fn materializeArcOps(
             continue;
         };
 
+        // Synthetic-index detection: perceus.zig encodes nested-
+        // stream navigation in the instr_index (see file-level
+        // comment). When the index exceeds the top-level block's
+        // instruction count, the record targets a nested stream
+        // and the materialization pass cannot place it correctly
+        // by linear index alone. Defer to the existing ZIR helper.
+        const block_len: u32 = @intCast(function.body[block_index].instructions.len);
+        if (op.insertion_point.instr_index > block_len) {
+            try ops_remaining.append(allocator, op);
+            continue;
+        }
+
         const gop = try schedule_by_block.getOrPut(allocator, block_index);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(allocator, .{
@@ -157,6 +195,11 @@ fn materializeDropSpecializations(
             try specs_remaining.append(allocator, spec);
             continue;
         };
+        const block_len: u32 = @intCast(function.body[block_index].instructions.len);
+        if (spec.insertion_point.instr_index > block_len) {
+            try specs_remaining.append(allocator, spec);
+            continue;
+        }
         const gop = try schedule_by_block.getOrPut(allocator, block_index);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         for (spec.field_drops) |fd| {
