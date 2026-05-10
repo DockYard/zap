@@ -5270,11 +5270,27 @@ pub const IrBuilder = struct {
                 const map_zig_type = self.known_local_types.get(scrutinee_local) orelse ZigType.any;
                 const key_type: ZigType = if (map_zig_type == .map) map_zig_type.map.key.* else .atom;
                 const value_type: ZigType = if (map_zig_type == .map) map_zig_type.map.value.* else .i64;
+                // Resolve the map's value HIR type so the extracted
+                // local participates in `arc_managed_locals` when the
+                // value type is ARC-managed (List, Map, recursive
+                // struct, etc.). Same fix shape as commit ce5e715
+                // (`emitMapBindings`) applied to the decision-tree
+                // case-extraction path.
+                const value_hir_type: ?hir_mod.TypeId = blk: {
+                    const ts = self.type_store orelse break :blk null;
+                    const scrutinee_hir = self.local_hir_types.get(scrutinee_local) orelse break :blk null;
+                    const t = ts.getType(scrutinee_hir);
+                    if (t != .map) break :blk null;
+                    break :blk t.map.value;
+                };
                 for (em.keys) |ke| {
                     const key_local = try self.lowerExpr(ke.key);
                     const default_local = try self.emitDefaultValueForType(value_type);
                     const value_local = self.next_local;
                     self.next_local += 1;
+                    if (value_hir_type) |vht| {
+                        try self.local_hir_types.put(value_local, vht);
+                    }
                     try self.current_instrs.append(self.allocator, .{
                         .map_get = .{
                             .dest = value_local,
@@ -5285,6 +5301,7 @@ pub const IrBuilder = struct {
                             .value_type = value_type,
                         },
                     });
+                    try self.emitArcRetainOnAggregateExtract(value_local);
                     try self.known_local_types.put(value_local, value_type);
                     try scrutinee_map.put(ke.scrutinee_id, value_local);
                 }
@@ -5756,11 +5773,26 @@ pub const IrBuilder = struct {
                 const map_zig_type = self.known_local_types.get(scrutinee_local) orelse ZigType.any;
                 const key_type: ZigType = if (map_zig_type == .map) map_zig_type.map.key.* else .atom;
                 const value_type: ZigType = if (map_zig_type == .map) map_zig_type.map.value.* else .i64;
+                // Same plumbing as the dispatch path's extract_struct
+                // and the case path's extract_map: resolve the map's
+                // value HIR type and populate `local_hir_types` so the
+                // value-extracted local enters `arc_managed_locals`
+                // when it's ARC-managed.
+                const value_hir_type: ?hir_mod.TypeId = blk: {
+                    const ts = self.type_store orelse break :blk null;
+                    const scrutinee_hir = self.local_hir_types.get(scrutinee_local) orelse break :blk null;
+                    const t = ts.getType(scrutinee_hir);
+                    if (t != .map) break :blk null;
+                    break :blk t.map.value;
+                };
                 for (em.keys) |ke| {
                     const key_local = try self.lowerExpr(ke.key);
                     const default_local = try self.emitDefaultValueForType(value_type);
                     const value_local = self.next_local;
                     self.next_local += 1;
+                    if (value_hir_type) |vht| {
+                        try self.local_hir_types.put(value_local, vht);
+                    }
                     try self.current_instrs.append(self.allocator, .{
                         .map_get = .{
                             .dest = value_local,
@@ -5771,6 +5803,7 @@ pub const IrBuilder = struct {
                             .value_type = value_type,
                         },
                     });
+                    try self.emitArcRetainOnAggregateExtract(value_local);
                     try self.known_local_types.put(value_local, value_type);
                     try scrutinee_map.put(ke.scrutinee_id, value_local);
                 }
