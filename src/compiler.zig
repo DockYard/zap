@@ -2308,6 +2308,14 @@ fn runArcDropInsertion(
             error.OutOfMemory => return error.OutOfMemory,
             error.ArcInvariantViolation => return error.IrFailed,
         };
+        // V8 (forward retain→release reachability) runs post-drop
+        // insertion. Warning-only mode currently — diagnostics are
+        // printed but don't halt compilation. See arc_verifier.zig's
+        // V8 doc block for the rollout plan to fail-mode.
+        zap.arc_verifier.verifyPostDropInsertion(alloc, function, program) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ArcInvariantViolation => return error.IrFailed,
+        };
     }
 
     if (std.c.getenv("ZAP_DUMP_IR_FN")) |raw| {

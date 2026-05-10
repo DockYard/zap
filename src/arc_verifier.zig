@@ -2739,6 +2739,396 @@ test "arc_verifier: lookupConventionByName is last-wins for duplicate names" {
 }
 
 // ============================================================
+// V8 — forward retain→release reachability dataflow.
+//
+// For every `.retain { value: X }` IR instruction, every forward
+// path through the function must reach a balancing operation: a
+// `.release { value: X }`, a consume site (share_value mode=consume,
+// move_value source, tail_call argument), or X being the function's
+// return value (return-source elision).
+//
+// V8 is the dynamic counterpart of V10's static audit. V10 catches
+// new ZIR-direct ARC emissions; V8 catches IR-level imbalance —
+// retains that lack matching releases, which is the runtime symptom
+// the binarytrees ~12 GB leak exhibited (916M leaked retains).
+//
+// Pipeline placement: V8 runs AFTER `arc_drop_insertion` because
+// that's where most `.release` IR appears. The pre-drop verifier
+// (V1-V7, V11) doesn't run V8 — at that pipeline position, only the
+// post-call cleanup releases exist; scope-exit destroys haven't been
+// inserted yet. V8 is invoked from `verifyPostDropInsertion` (a
+// new public entry point in this module) which the compiler driver
+// calls from `compiler.zig:2307` after `insertScopeExitDrops`.
+//
+// This implementation handles linear streams precisely. Nested
+// control flow (if_expr, case_block, switch_return, optional_dispatch,
+// union_switch_return, try_call_named, guard_block) is handled by
+// recursing into each arm with a cloned state and merging at the
+// rejoin point. The merge rule is permissive: parent state inherits
+// the maximum of any arm's outstanding count for each local, which
+// catches "retain in one arm, release in all arms" but allows the
+// parent to continue (subsequent code can drain remaining counts).
+// Strict per-arm-equality merge is deferred — it would false-positive
+// on legitimate patterns like `if cond { retain(x); use(x); release(x) }`
+// where the retain/release pair is contained within one arm.
+//
+// `.owned`-convention parameters carry an implicit +1 from the
+// caller's `share_value(retain)` site. V8 seeds the entry state
+// with +1 for each `.owned`-convention param's dest local (resolved
+// via the function's first `.param_get` instructions). Without this
+// seed, V8 false-positives on every `.owned`-convention function:
+// the callee's matching scope-exit `.release` would have nothing to
+// match.
+// ============================================================
+
+const V8State = struct {
+    allocator: std.mem.Allocator,
+    /// Per-local outstanding retain count. A non-zero entry means
+    /// the local has been retained (or owns an implicit +1 from
+    /// `.owned`-convention parameter inheritance) without yet being
+    /// matched by a release / consume / return-source elision.
+    counts: std.AutoHashMapUnmanaged(ir.LocalId, u32) = .empty,
+    /// Set to true once any V8 violation is reported. Subsequent
+    /// terminator checks short-circuit so a single function doesn't
+    /// produce a flood of cascade diagnostics.
+    failed: bool = false,
+
+    fn deinit(self: *V8State) void {
+        self.counts.deinit(self.allocator);
+    }
+
+    fn retain(self: *V8State, value: ir.LocalId) !void {
+        const gop = try self.counts.getOrPut(self.allocator, value);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+
+    fn consumeOne(self: *V8State, value: ir.LocalId) void {
+        if (self.counts.getPtr(value)) |entry| {
+            if (entry.* > 0) entry.* -= 1;
+        }
+    }
+
+    fn copy(self: *const V8State) !V8State {
+        var dup: V8State = .{ .allocator = self.allocator };
+        try dup.counts.ensureTotalCapacity(self.allocator, self.counts.count());
+        var iter = self.counts.iterator();
+        while (iter.next()) |entry| {
+            try dup.counts.put(self.allocator, entry.key_ptr.*, entry.value_ptr.*);
+        }
+        return dup;
+    }
+
+    fn mergeMax(self: *V8State, other: *const V8State) !void {
+        var iter = other.counts.iterator();
+        while (iter.next()) |entry| {
+            const cur = self.counts.get(entry.key_ptr.*) orelse 0;
+            if (entry.value_ptr.* > cur) {
+                try self.counts.put(self.allocator, entry.key_ptr.*, entry.value_ptr.*);
+            }
+        }
+    }
+
+    /// Returns the LocalId of any unbalanced retain count, or null
+    /// when every count is zero (or the only non-zero is the
+    /// return-source local with count 1).
+    fn unbalancedLocal(self: *const V8State, return_value: ?ir.LocalId) ?ir.LocalId {
+        var iter = self.counts.iterator();
+        while (iter.next()) |entry| {
+            const v = entry.value_ptr.*;
+            if (v == 0) continue;
+            // Return-source elision: a single retain on the return
+            // value transfers ownership to the caller's return slot.
+            if (return_value) |rv| {
+                if (entry.key_ptr.* == rv and v == 1) continue;
+            }
+            return entry.key_ptr.*;
+        }
+        return null;
+    }
+};
+
+/// Seed V8's entry state with +1 for each `.owned`-convention
+/// parameter, resolved via the first `.param_get` with matching
+/// index encountered in a recursive walk over every nested
+/// instruction stream. `.owned` convention guarantees the caller
+/// retained the param via `share_value(retain)` and the callee
+/// owns the +1 — V8 must model this implicit retain or every
+/// function with `.owned` params produces a false-positive at its
+/// matching scope-exit `.release`.
+fn v8SeedOwnedParams(state: *V8State, function: *const ir.Function) error{OutOfMemory}!void {
+    if (function.param_conventions.len == 0) return;
+    var resolved: std.AutoHashMapUnmanaged(u32, ir.LocalId) = .empty;
+    defer resolved.deinit(state.allocator);
+    for (function.body) |block| {
+        try v8SeedFromStream(state.allocator, block.instructions, &resolved);
+    }
+    for (function.param_conventions, 0..) |conv, i| {
+        if (conv != .owned) continue;
+        const param_index: u32 = @intCast(i);
+        if (resolved.get(param_index)) |dest_local| {
+            try state.retain(dest_local);
+        }
+        // If no param_get was ever emitted for this index, the
+        // param is unused inside the function body — no implicit
+        // retain to seed.
+    }
+}
+
+fn v8SeedFromStream(
+    allocator: std.mem.Allocator,
+    stream: []const ir.Instruction,
+    resolved: *std.AutoHashMapUnmanaged(u32, ir.LocalId),
+) error{OutOfMemory}!void {
+    for (stream) |instr| {
+        switch (instr) {
+            .param_get => |pg| {
+                const gop = try resolved.getOrPut(allocator, pg.index);
+                if (!gop.found_existing) gop.value_ptr.* = pg.dest;
+            },
+            .if_expr => |ie| {
+                try v8SeedFromStream(allocator, ie.then_instrs, resolved);
+                try v8SeedFromStream(allocator, ie.else_instrs, resolved);
+            },
+            .case_block => |cb| {
+                try v8SeedFromStream(allocator, cb.pre_instrs, resolved);
+                for (cb.arms) |arm| {
+                    try v8SeedFromStream(allocator, arm.cond_instrs, resolved);
+                    try v8SeedFromStream(allocator, arm.body_instrs, resolved);
+                }
+                try v8SeedFromStream(allocator, cb.default_instrs, resolved);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| try v8SeedFromStream(allocator, c.body_instrs, resolved);
+                try v8SeedFromStream(allocator, sl.default_instrs, resolved);
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| try v8SeedFromStream(allocator, c.body_instrs, resolved);
+                try v8SeedFromStream(allocator, sr.default_instrs, resolved);
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| try v8SeedFromStream(allocator, c.body_instrs, resolved);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| try v8SeedFromStream(allocator, c.body_instrs, resolved);
+            },
+            .try_call_named => |tc| {
+                try v8SeedFromStream(allocator, tc.success_instrs, resolved);
+                try v8SeedFromStream(allocator, tc.handler_instrs, resolved);
+            },
+            .guard_block => |gb| {
+                try v8SeedFromStream(allocator, gb.body, resolved);
+            },
+            .optional_dispatch => |od| {
+                try v8SeedFromStream(allocator, od.nil_instrs, resolved);
+                try v8SeedFromStream(allocator, od.struct_instrs, resolved);
+            },
+            else => {},
+        }
+    }
+}
+
+/// V8 forward dataflow walker. Processes instructions linearly,
+/// updating `state` in place. Recursion into nested streams
+/// (if_expr, case_block, etc.) computes per-arm states and merges
+/// them via maximum-count union back into the parent state.
+fn v8VerifyStream(
+    function: *const ir.Function,
+    state: *V8State,
+    stream: []const ir.Instruction,
+) error{OutOfMemory}!void {
+    for (stream) |*instr| {
+        try v8VerifyInstruction(function, state, instr);
+    }
+}
+
+fn v8VerifyInstruction(
+    function: *const ir.Function,
+    state: *V8State,
+    instr: *const ir.Instruction,
+) error{OutOfMemory}!void {
+    switch (instr.*) {
+        .retain => |r| try state.retain(r.value),
+        .release => |r| state.consumeOne(r.value),
+        .move_value => |mv| {
+            // Move transfers ownership: source consumed, dest inherits.
+            state.consumeOne(mv.source);
+            try state.retain(mv.dest);
+        },
+        .share_value => |sv| {
+            if (sv.mode == .consume) state.consumeOne(sv.source);
+            // Mode=retain: the corresponding `.retain` IR is emitted
+            // separately by the IR builder (Phase 1 Class A item 2);
+            // V8 accounts for it when it processes that `.retain`.
+        },
+        .tail_call => |tc| {
+            // Tail call consumes its args.
+            for (tc.args) |arg| state.consumeOne(arg);
+            v8CheckTerminator(function, state, "tail_call", null);
+        },
+        .ret => |r| v8CheckTerminator(function, state, "ret", r.value),
+        .cond_return => |cr| v8CheckTerminator(function, state, "cond_return", cr.value),
+        .switch_return => |sr| {
+            for (sr.cases) |c| {
+                var arm = try state.copy();
+                defer arm.deinit();
+                try v8VerifyStream(function, &arm, c.body_instrs);
+                v8CheckTerminator(function, &arm, "switch_return", c.return_value);
+                try state.mergeMax(&arm);
+            }
+            if (sr.default_instrs.len > 0) {
+                var arm = try state.copy();
+                defer arm.deinit();
+                try v8VerifyStream(function, &arm, sr.default_instrs);
+                v8CheckTerminator(function, &arm, "switch_return.default", sr.default_result);
+                try state.mergeMax(&arm);
+            }
+        },
+        .union_switch_return => |usr| {
+            for (usr.cases) |c| {
+                var arm = try state.copy();
+                defer arm.deinit();
+                try v8VerifyStream(function, &arm, c.body_instrs);
+                v8CheckTerminator(function, &arm, "union_switch_return", c.return_value);
+                try state.mergeMax(&arm);
+            }
+        },
+        .if_expr => |ie| {
+            var then_state = try state.copy();
+            defer then_state.deinit();
+            try v8VerifyStream(function, &then_state, ie.then_instrs);
+            var else_state = try state.copy();
+            defer else_state.deinit();
+            try v8VerifyStream(function, &else_state, ie.else_instrs);
+            try state.mergeMax(&then_state);
+            try state.mergeMax(&else_state);
+        },
+        .case_block => |cb| {
+            try v8VerifyStream(function, state, cb.pre_instrs);
+            for (cb.arms) |arm| {
+                var s = try state.copy();
+                defer s.deinit();
+                try v8VerifyStream(function, &s, arm.cond_instrs);
+                try v8VerifyStream(function, &s, arm.body_instrs);
+                try state.mergeMax(&s);
+            }
+            if (cb.default_instrs.len > 0) {
+                var s = try state.copy();
+                defer s.deinit();
+                try v8VerifyStream(function, &s, cb.default_instrs);
+                try state.mergeMax(&s);
+            }
+        },
+        .switch_literal => |sl| {
+            for (sl.cases) |c| {
+                var s = try state.copy();
+                defer s.deinit();
+                try v8VerifyStream(function, &s, c.body_instrs);
+                try state.mergeMax(&s);
+            }
+            if (sl.default_instrs.len > 0) {
+                var s = try state.copy();
+                defer s.deinit();
+                try v8VerifyStream(function, &s, sl.default_instrs);
+                try state.mergeMax(&s);
+            }
+        },
+        .union_switch => |us| {
+            for (us.cases) |c| {
+                var s = try state.copy();
+                defer s.deinit();
+                try v8VerifyStream(function, &s, c.body_instrs);
+                try state.mergeMax(&s);
+            }
+        },
+        .try_call_named => |tc| {
+            var success_state = try state.copy();
+            defer success_state.deinit();
+            try v8VerifyStream(function, &success_state, tc.success_instrs);
+            var handler_state = try state.copy();
+            defer handler_state.deinit();
+            try v8VerifyStream(function, &handler_state, tc.handler_instrs);
+            try state.mergeMax(&success_state);
+            try state.mergeMax(&handler_state);
+        },
+        .guard_block => |gb| {
+            try v8VerifyStream(function, state, gb.body);
+        },
+        .optional_dispatch => |od| {
+            var nil_state = try state.copy();
+            defer nil_state.deinit();
+            try v8VerifyStream(function, &nil_state, od.nil_instrs);
+            v8CheckTerminator(function, &nil_state, "optional_dispatch.nil", od.nil_result);
+            var struct_state = try state.copy();
+            defer struct_state.deinit();
+            try v8VerifyStream(function, &struct_state, od.struct_instrs);
+            v8CheckTerminator(function, &struct_state, "optional_dispatch.struct", od.struct_result);
+            try state.mergeMax(&nil_state);
+            try state.mergeMax(&struct_state);
+        },
+        else => {},
+    }
+}
+
+fn v8CheckTerminator(
+    function: *const ir.Function,
+    state: *V8State,
+    site: []const u8,
+    return_value: ?ir.LocalId,
+) void {
+    if (state.failed) return;
+    if (state.unbalancedLocal(return_value)) |bad_local| {
+        state.failed = true;
+        if (suppress_diagnostics) return;
+        // V8 is in opt-in warning mode while the implementation is
+        // being refined. Several common ARC patterns (post-call
+        // release of share_value dest, .borrowed-convention params
+        // whose retains aren't seen because the param_get's source
+        // is a different local than V8 expects, complex tail-call
+        // arg consumption) currently false-positive. Set
+        // `ZAP_DEBUG_V8=1` to see V8's warnings during investigation;
+        // otherwise stay quiet so the build output isn't flooded.
+        // The check infrastructure is fully in place — when V8's
+        // model is refined to eliminate the false-positive classes,
+        // this gate flips off and V8 becomes a permanent tripwire
+        // alongside V1-V7, V10, V11.
+        if (std.c.getenv("ZAP_DEBUG_V8") == null) return;
+        const count = state.counts.get(bad_local) orelse 0;
+        std.debug.print(
+            "arc_verifier: function '{s}' violates ARC invariant V8: local %{d} has {d} unbalanced retain(s) at {s} terminator — every `.retain` must be matched on every forward path by a `.release`, a consume site, or being the function's return value (return-source elision)\n",
+            .{ function.name, bad_local, count, site },
+        );
+    }
+}
+
+/// Public entry point for V8 post-drop-insertion verification.
+/// Called from `compiler.zig` after
+/// `arc_drop_insertion.insertScopeExitDrops`. Currently runs in
+/// warning-only mode — V8 violations print to stderr but do not
+/// halt compilation. Once the existing IR passes V8 cleanly across
+/// the test suite and benchmark corpus, the warning can be flipped
+/// to a hard error by changing `v8CheckTerminator` to return
+/// `error.ArcInvariantViolation` from this function.
+pub fn verifyPostDropInsertion(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: *const ir.Program,
+) VerifyError!void {
+    _ = program;
+    if (function.body.len == 0) return;
+    var state: V8State = .{ .allocator = allocator };
+    defer state.deinit();
+    try v8SeedOwnedParams(&state, function);
+    for (function.body) |block| {
+        try v8VerifyStream(function, &state, block.instructions);
+    }
+    // Warning-only: do not propagate violations as errors. The
+    // diagnostic messages emitted from `v8CheckTerminator` give
+    // developers actionable feedback without breaking the build
+    // until V8 has been validated against the full corpus.
+}
+
+// ============================================================
 // V10 — static "no ZIR-direct ARC emission" audit.
 //
 // Phase 0 of the ARC IR-source-of-truth refactor (see
