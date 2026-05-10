@@ -5149,6 +5149,26 @@ pub const IrBuilder = struct {
                         self.fieldZigTypeAndStorage(sname, field_name)
                     else
                         null;
+                    // Plumb the field's HIR type onto the destructured
+                    // local so the matching `emitArcRetainOnAggregateExtract`
+                    // call below can detect ARC-managed extractions
+                    // (boxed-recursive struct types like `Tree | nil`
+                    // included). Without this, the field-extracted
+                    // local has no recorded HIR type,
+                    // `isArcManagedLocal` returns its conservative-
+                    // false default, and no `.retain` IR is emitted —
+                    // leaving the runtime's `retainAnyOpt` (formerly
+                    // emitted from the ZIR backend) without a matching
+                    // IR-level release. This is the binarytrees-class
+                    // leak: ~610M tree nodes never freed because the
+                    // field-extracted child locals never reached
+                    // `arc_managed_locals` and never got a scope-exit
+                    // `.release`.
+                    if (struct_type) |sname| {
+                        if (self.lookupStructFieldHirTypeByName(sname, field_name)) |field_hir_type| {
+                            try self.local_hir_types.put(field_local, field_hir_type);
+                        }
+                    }
                     try self.current_instrs.append(self.allocator, .{
                         .field_get = .{
                             .dest = field_local,
@@ -5157,6 +5177,12 @@ pub const IrBuilder = struct {
                             .struct_type = struct_type,
                         },
                     });
+                    // Retain the extracted ARC value at the IR level.
+                    // The matching `.release` is inserted by
+                    // `arc_drop_insertion` once the field-extracted
+                    // local enters `arc_managed_locals` (via the
+                    // `local_hir_types` plumbing above).
+                    try self.emitArcRetainOnAggregateExtract(field_local);
                     if (field_info) |i| {
                         try self.known_local_types.put(field_local, i.type_expr);
                     }
@@ -5621,6 +5647,19 @@ pub const IrBuilder = struct {
                         self.fieldZigTypeAndStorage(sname, field_name)
                     else
                         null;
+                    // See parallel comment in lowerDecisionTreeForCase's
+                    // extract_struct arm: this plumbing is what closes
+                    // the binarytrees-class leak by exposing the field-
+                    // extracted local's HIR type to
+                    // `emitArcRetainOnAggregateExtract`, which then
+                    // emits an explicit `.retain` IR that
+                    // `arc_drop_insertion` balances with a matching
+                    // scope-exit `.release`.
+                    if (struct_type) |sname| {
+                        if (self.lookupStructFieldHirTypeByName(sname, field_name)) |field_hir_type| {
+                            try self.local_hir_types.put(field_local, field_hir_type);
+                        }
+                    }
                     try self.current_instrs.append(self.allocator, .{
                         .field_get = .{
                             .dest = field_local,
@@ -5629,6 +5668,7 @@ pub const IrBuilder = struct {
                             .struct_type = struct_type,
                         },
                     });
+                    try self.emitArcRetainOnAggregateExtract(field_local);
                     if (field_info) |i| {
                         try self.known_local_types.put(field_local, i.type_expr);
                     }
@@ -5977,6 +6017,34 @@ pub const IrBuilder = struct {
         if (struct_type != .struct_type) return null;
         for (struct_type.struct_type.fields) |f| {
             if (f.name == field_name_id) return f.type_id;
+        }
+        return null;
+    }
+
+    /// String-keyed analogue of `lookupStructFieldHirType`. The
+    /// multi-clause dispatch decision-tree lowering paths
+    /// (`lowerDecisionTreeForCase`, `lowerDecisionTreeForDispatch`)
+    /// resolve the receiver's struct type via
+    /// `structTypeForFieldReceiver`, which returns `?[]const u8`
+    /// (a borrowed string) rather than an `ast.StringId`. Linear-
+    /// scanning the type store by name lets those paths populate
+    /// `local_hir_types` for the field-extracted local without
+    /// having to round-trip the strings through the interner. The
+    /// alternative — interning the strings just to call
+    /// `lookupStructFieldHirType` — would mutate the interner
+    /// during IR build, which the interner's contract forbids.
+    fn lookupStructFieldHirTypeByName(
+        self: *const IrBuilder,
+        struct_name: []const u8,
+        field_name: []const u8,
+    ) ?hir_mod.TypeId {
+        const ts = self.type_store orelse return null;
+        const type_id = self.resolveNominalTypeId(struct_name) orelse return null;
+        const struct_type = ts.getType(type_id);
+        if (struct_type != .struct_type) return null;
+        for (struct_type.struct_type.fields) |f| {
+            const fname = ts.interner.get(f.name);
+            if (std.mem.eql(u8, fname, field_name)) return f.type_id;
         }
         return null;
     }
@@ -6570,11 +6638,45 @@ pub const IrBuilder = struct {
                         .share => blk: {
                             const has_arg_ownership_type = arg_ownership_type != types_mod.TypeStore.UNKNOWN and
                                 arg_ownership_type != types_mod.TypeStore.ERROR;
-                            const share_hir_source = if (has_arg_ownership_type) arg_ownership_type else arg.expr.type_id;
+                            // Three-tier resolution of the share's HIR
+                            // source type, in order of preference:
+                            //   1. `arg_ownership_type` from the call
+                            //      target's parameter signature (most
+                            //      authoritative when known).
+                            //   2. `arg.expr.type_id` from the type checker
+                            //      (works when the type checker resolved
+                            //      the expression to a concrete type).
+                            //   3. `local_hir_types[arg_local]` from the
+                            //      IR-builder's type tracking (the
+                            //      fallback that catches `t.left` /
+                            //      `t.right` field accesses on indirect-
+                            //      storage recursive struct types where
+                            //      the HIR type checker leaves the
+                            //      expression type as `UNKNOWN`. Without
+                            //      this fallback, no `share_value` is
+                            //      emitted at the call site, so no post-
+                            //      call `.release` is paired with the
+                            //      field-extracted local's `.retain` —
+                            //      the binarytrees-class leak.
+                            const arg_local_hir = self.local_hir_types.get(arg_local);
+                            const arg_local_hir_is_arc = if (arg_local_hir) |tid|
+                                self.isArcManagedType(tid)
+                            else
+                                false;
+                            const share_hir_source = if (has_arg_ownership_type)
+                                arg_ownership_type
+                            else if (arg.expr.type_id != types_mod.TypeStore.UNKNOWN and arg.expr.type_id != types_mod.TypeStore.ERROR)
+                                arg.expr.type_id
+                            else if (arg_local_hir) |tid|
+                                tid
+                            else
+                                arg.expr.type_id;
                             const should_share_arc = if (has_arg_ownership_type)
                                 self.isArcManagedType(arg_ownership_type)
+                            else if (self.isArcManagedType(arg.expr.type_id))
+                                true
                             else
-                                self.isArcManagedType(arg.expr.type_id);
+                                arg_local_hir_is_arc;
                             if (should_share_arc) {
                                 const shared_local = self.next_local;
                                 self.next_local += 1;
@@ -7197,6 +7299,23 @@ pub const IrBuilder = struct {
                 const obj = try self.lowerExpr(fg.object);
                 const field_name = self.interner.get(fg.field);
                 const struct_type = self.structTypeForFieldReceiver(obj);
+                // If the HIR type checker did not resolve the field
+                // access to a concrete TypeId (it stays `UNKNOWN`),
+                // fall back to the field's declared type from the
+                // struct definition. Without this, a `t.left` access
+                // on a `Tree { left :: Tree | nil }` value records
+                // `local_hir_types[dest] = UNKNOWN`, and
+                // `emitArcRetainOnAggregateExtract` short-circuits
+                // because `isArcManagedTypeId(UNKNOWN)` is false. The
+                // resulting missed retain is the binarytrees-class
+                // leak: ~610M tree nodes never freed because their
+                // field-extracted child locals never reached
+                // `arc_managed_locals`.
+                if (struct_type) |sname| {
+                    if (self.lookupStructFieldHirTypeByName(sname, field_name)) |field_hir_type| {
+                        try self.local_hir_types.put(dest, field_hir_type);
+                    }
+                }
                 try self.current_instrs.append(self.allocator, .{
                     .field_get = .{
                         .dest = dest,
@@ -7205,23 +7324,27 @@ pub const IrBuilder = struct {
                         .struct_type = struct_type,
                     },
                 });
-                // Retain the extracted ARC value: a plain (non-ARC)
-                // struct's `field_get` lowers to `field_val`, which
+                // Retain the extracted ARC value at the IR level. A plain
+                // (non-ARC) struct's `field_get` lowers to `field_val`, which
                 // never bumps the cell's refcount. Mirrors the tuple
-                // `index_get` retain — multiple field reads from
-                // distinct parents that share the underlying ARC
-                // pointer would otherwise share a single +1 and
-                // double-free at scope exit. ARC-managed parent
-                // aggregates (Map, List) extract via dedicated
-                // opcodes (`map_get`, `list_head`, …) whose runtime
-                // helpers retain children internally, so they never
-                // reach this `.field_get` site. Indirect-storage
-                // recursive struct fields are retained in the ZIR
-                // backend (`emitIndirectFieldDeref` →
-                // `retainAnyOpt`) — those types are nominal struct
-                // types, not in `isArcManagedTypeId`'s set, so this
-                // helper is a no-op for them and the two retain
-                // sites do not collide.
+                // `index_get` retain — multiple field reads from distinct
+                // parents that share the underlying ARC pointer would
+                // otherwise share a single +1 and double-free at scope exit.
+                //
+                // ARC-managed parent aggregates (Map, List) extract via
+                // dedicated opcodes (`map_get`, `list_head`, …) whose runtime
+                // helpers retain children internally, so they never reach
+                // this `.field_get` site.
+                //
+                // Indirect-storage recursive struct fields (`?Tree.left` in
+                // a `Tree { left :: Tree | nil, … }` shape) ARE handled here:
+                // `isArcManagedTypeId` returns true for boxed-recursive
+                // struct types via `structTypeUsesRecursiveBoxing`, so the
+                // helper emits `.retain` IR. The matching scope-exit
+                // `.release` is emitted by `arc_drop_insertion`. The ZIR
+                // `.field_get` lowering performs only the storage-shape
+                // auto-deref (`?*const T → ?T`); no ZIR-level retain
+                // emission. (Phase 1 Class A.)
                 try self.emitArcRetainOnAggregateExtract(dest);
                 if (struct_type) |sname| {
                     if (self.fieldZigTypeAndStorage(sname, field_name)) |info| {

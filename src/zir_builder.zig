@@ -5683,42 +5683,38 @@ pub const ZirDriver = struct {
                     if (self.findStructDef(sname)) |sdef| {
                         if (findFieldDef(sdef, fg.field)) |fdef| {
                             if (fdef.storage == .indirect) {
+                                // Auto-deref the storage shape: source-level
+                                // the user observes `T`/`?T`; storage-level
+                                // we hold `*const T` / `?*const T`. Emitting
+                                // the deref here keeps the storage indirection
+                                // an implementation detail.
                                 ref = try self.emitIndirectFieldDeref(ref, fdef.type_expr);
-                                if (self.zigTypeIsRecursiveStruct(fdef.type_expr)) {
-                                    // Boxed-recursive ABI: the parent owns
-                                    // this child's Arc, and the extracted
-                                    // value is a second handle to the same
-                                    // allocation. Retain so the parent's
-                                    // eventual deep release and the
-                                    // extracted value's release each
-                                    // decrement exactly once. Without this,
-                                    // the inner ownership graph aliases:
-                                    // the inner consumer frees the child
-                                    // first, then the outer drop walks the
-                                    // freed memory.
-                                    //
-                                    // Skip the retain when the parent IS
-                                    // a destructive-scrutinee local. The
-                                    // Perceus analyzer proved that every
-                                    // such extraction is immediately
-                                    // consumed by a call (transferring
-                                    // ownership), and that the scrutinee's
-                                    // own drop will be shallow — so the
-                                    // inner consumer is the sole owner
-                                    // of the child Arc and the parent's
-                                    // teardown does not walk into it.
-                                    const skip_retain = self.destructive_scrutinee_locals.contains(fg.object);
-                                    if (!skip_retain) {
-                                        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                                        if (rt_import == error_ref) return error.EmitFailed;
-                                        const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
-                                        if (arc_runtime == error_ref) return error.EmitFailed;
-                                        const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAnyOpt", 12);
-                                        if (retain_fn == error_ref) return error.EmitFailed;
-                                        const args = [_]u32{ref};
-                                        _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
-                                    }
-                                }
+                                // Phase 1 Class A — the boxed-recursive
+                                // retain that previously fired here as a
+                                // direct `retainAnyOpt` ZIR call now lives
+                                // at the IR level. The IR builder's
+                                // `extract_struct` decision-tree arms (in
+                                // `lowerDecisionTreeForCase` and
+                                // `lowerDecisionTreeForDispatch`, plus the
+                                // top-level `.field_get` arm in `lowerExpr`)
+                                // emit an explicit `.retain` IR after the
+                                // `.field_get`, which lowers via the canonical
+                                // `.retain` handler below to `retainAny`.
+                                // `retainAny` already handles optional pointers
+                                // (`runtime.zig:1538-1554` unwraps optionals),
+                                // so the previous `retainAnyOpt` specialization
+                                // is unnecessary.
+                                //
+                                // The destructive-scrutinee retain-elision
+                                // optimization (skip the retain when the parent
+                                // is being destructively consumed) is not yet
+                                // re-implemented at the IR level. The current
+                                // behavior is correctness-preserving over-
+                                // retain, paired with the matching scope-exit
+                                // `.release` from `arc_drop_insertion`. A
+                                // future arc_optimizer pass can elide the
+                                // pair when destructive_scrutinee_locals
+                                // proves the consumer owns the +1.
                             }
                         }
                     }
