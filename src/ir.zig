@@ -2589,6 +2589,19 @@ pub const IrBuilder = struct {
             self.next_local += 1;
             if (optional_struct_name) |sname| {
                 try self.known_local_types.put(payload_local, .{ .struct_ref = sname });
+                // Populate the HIR type so `local_ownership` is computed
+                // correctly for the payload local. Without this, the
+                // ownership table tags `payload_local` as `.trivial` and
+                // every downstream pass that consults `local_ownership`
+                // (drop insertion, in particular) treats the local as if
+                // it weren't ARC-managed — even when the underlying
+                // struct is. This blocks the binarytrees-style fix where
+                // drop insertion appends a `.release { payload_local }`
+                // at the struct branch's end to balance the caller's
+                // `.owned` convention retain.
+                if (self.resolveNominalTypeId(sname)) |type_id| {
+                    try self.local_hir_types.put(payload_local, type_id);
+                }
             }
 
             try self.current_instrs.append(self.allocator, .{

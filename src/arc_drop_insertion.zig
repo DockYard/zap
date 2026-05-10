@@ -1175,9 +1175,27 @@ pub fn insertScopeExitDrops(
     // entries the pass cannot insert anything. The traversal below
     // still works but skipping it saves a pointless walk over every
     // function in the program (most have no ARC locals today).
+    //
+    // Exception: when the function's body is dominated by an
+    // `optional_dispatch` whose scrutinee parameter convention is
+    // `.owned`, the rebuilder's optional_dispatch handler synthesizes
+    // an end-of-struct-arm `.release` of the payload local to balance
+    // the caller's `share_value(retain)` site. The synthesized release
+    // doesn't depend on `live_before_ret` / `owned_at_ret`, so the
+    // fast path's empty-tables check would otherwise skip it.
+    // Without this exception, the binarytrees-class leak persists:
+    // the tail-recursive `check(t.left)` shape produces a function
+    // whose only top-level instruction is `optional_dispatch`, the
+    // analyzer doesn't record any live-before-ret entries (the
+    // dispatch isn't a return-equivalent terminator), and the
+    // `.owned` param's required scope-exit release is silently
+    // omitted.
     if (ownership.live_before_ret.count() == 0 and
         ownership.owned_at_ret.count() == 0 and
-        ownership.owned_at_case_break.count() == 0) return;
+        ownership.owned_at_case_break.count() == 0)
+    {
+        if (!functionNeedsOptionalDispatchPayloadRelease(function)) return;
+    }
 
     var rebuilder = StreamRebuilder{
         .allocator = allocator,
@@ -1490,10 +1508,43 @@ const StreamRebuilder = struct {
                 // the optional_dispatch in the parent stream.
                 const new_nil = try self.rebuildStream(od.nil_instrs);
                 const new_struct = try self.rebuildStream(od.struct_instrs);
-                if (new_nil == null and new_struct == null) return .{ .rebuilt = null };
+
+                // Phase 1 follow-up (binarytrees): each optional_dispatch
+                // arm's body ends with a synthetic ret-equivalent (per
+                // arc_liveness:1190-1214). When the function's `?T`
+                // parameter is `.owned`, the callee inherited a +1
+                // refcount from the caller's `share_value` site and
+                // must release it at scope-exit on every path. Drop
+                // insertion's standard machinery emits this release at
+                // ret-equivalent terminators, but `optional_dispatch`
+                // is not in `isReturnEquivalentTerminator` and the arm
+                // bodies don't contain `.ret` themselves — so the
+                // release was being missed, leaking the underlying
+                // ARC cell on every dispatch.
+                //
+                // Strategy: append a `.release { value: payload_local }`
+                // to the struct branch's body when (a) the dispatched
+                // parameter slot's convention is `.owned`, and (b) the
+                // payload's underlying type is ARC-managed. The
+                // payload_local is the unwrapped `T` from `?T`; on the
+                // struct branch we know it's non-nil, so releasing the
+                // payload pointer decrements the same cell the caller's
+                // `share_value(retain)` retained. The nil branch
+                // doesn't need a release (nothing was retained — the
+                // optional was empty).
+                const arm_release_struct: ?ir.Instruction = optionalDispatchPayloadRelease(self.function, od);
+
+                if (new_nil == null and new_struct == null and arm_release_struct == null) {
+                    return .{ .rebuilt = null };
+                }
                 var copy = od;
                 if (new_nil) |s| copy.nil_instrs = s;
-                if (new_struct) |s| copy.struct_instrs = s;
+                const struct_base: []const ir.Instruction = new_struct orelse od.struct_instrs;
+                if (arm_release_struct) |rel_instr| {
+                    copy.struct_instrs = try self.appendInstruction(struct_base, rel_instr);
+                } else if (new_struct) |s| {
+                    copy.struct_instrs = s;
+                }
                 return .{ .rebuilt = ir.Instruction{ .optional_dispatch = copy } };
             },
             else => return .{ .rebuilt = null },
@@ -1772,6 +1823,84 @@ const InstructionOutcome = struct {
 /// mode is "drops are not inserted at the new shape" — which is a
 /// crash-free regression that the test suite catches via the
 /// live-before-ret coverage tests.
+/// Synthesize the end-of-struct-arm release for an `optional_dispatch`
+/// whose scrutinee parameter has `.owned` convention. Returns `null`
+/// when the dispatch doesn't fit that shape.
+///
+/// See the parallel comment in `rebuildChildren` and in
+/// `insertScopeExitDrops` for the full reasoning.
+fn optionalDispatchPayloadRelease(
+    function: *const ir.Function,
+    od: ir.OptionalDispatch,
+) ?ir.Instruction {
+    if (od.scrutinee_param >= function.param_conventions.len) return null;
+    if (function.param_conventions[od.scrutinee_param] != .owned) return null;
+    if (od.payload_local >= function.local_ownership.len) return null;
+    if (function.local_ownership[od.payload_local] == .trivial) return null;
+    return ir.Instruction{ .release = .{ .value = od.payload_local } };
+}
+
+/// Walk the function body looking for an `optional_dispatch` whose
+/// scrutinee param is `.owned` and whose payload local is ARC-managed.
+/// Used by the entry-point fast path to decide whether to take the
+/// "no live-before-ret entries" early return.
+fn functionNeedsOptionalDispatchPayloadRelease(function: *const ir.Function) bool {
+    for (function.body) |block| {
+        if (instructionsContainOwnedOptionalDispatch(function, block.instructions)) return true;
+    }
+    return false;
+}
+
+fn instructionsContainOwnedOptionalDispatch(
+    function: *const ir.Function,
+    stream: []const ir.Instruction,
+) bool {
+    for (stream) |instr| {
+        switch (instr) {
+            .optional_dispatch => |od| {
+                if (optionalDispatchPayloadRelease(function, od) != null) return true;
+                if (instructionsContainOwnedOptionalDispatch(function, od.nil_instrs)) return true;
+                if (instructionsContainOwnedOptionalDispatch(function, od.struct_instrs)) return true;
+            },
+            .if_expr => |ie| {
+                if (instructionsContainOwnedOptionalDispatch(function, ie.then_instrs)) return true;
+                if (instructionsContainOwnedOptionalDispatch(function, ie.else_instrs)) return true;
+            },
+            .case_block => |cb| {
+                if (instructionsContainOwnedOptionalDispatch(function, cb.pre_instrs)) return true;
+                for (cb.arms) |arm| {
+                    if (instructionsContainOwnedOptionalDispatch(function, arm.cond_instrs)) return true;
+                    if (instructionsContainOwnedOptionalDispatch(function, arm.body_instrs)) return true;
+                }
+                if (instructionsContainOwnedOptionalDispatch(function, cb.default_instrs)) return true;
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| if (instructionsContainOwnedOptionalDispatch(function, c.body_instrs)) return true;
+                if (instructionsContainOwnedOptionalDispatch(function, sl.default_instrs)) return true;
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| if (instructionsContainOwnedOptionalDispatch(function, c.body_instrs)) return true;
+                if (instructionsContainOwnedOptionalDispatch(function, sr.default_instrs)) return true;
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| if (instructionsContainOwnedOptionalDispatch(function, c.body_instrs)) return true;
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| if (instructionsContainOwnedOptionalDispatch(function, c.body_instrs)) return true;
+            },
+            .try_call_named => |tc| {
+                if (instructionsContainOwnedOptionalDispatch(function, tc.handler_instrs)) return true;
+                if (instructionsContainOwnedOptionalDispatch(function, tc.success_instrs)) return true;
+            },
+            .guard_block => |gb| {
+                if (instructionsContainOwnedOptionalDispatch(function, gb.body)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
 fn isReturnEquivalentTerminator(instr: ir.Instruction) bool {
     return switch (instr) {
         .ret,
