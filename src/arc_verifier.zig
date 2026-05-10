@@ -3116,16 +3116,386 @@ pub fn verifyPostDropInsertion(
 ) VerifyError!void {
     _ = program;
     if (function.body.len == 0) return;
+
+    // V8 — forward retain→release reachability.
     var state: V8State = .{ .allocator = allocator };
     defer state.deinit();
     try v8SeedOwnedParams(&state, function);
     for (function.body) |block| {
         try v8VerifyStream(function, &state, block.instructions);
     }
-    // Warning-only: do not propagate violations as errors. The
-    // diagnostic messages emitted from `v8CheckTerminator` give
-    // developers actionable feedback without breaking the build
-    // until V8 has been validated against the full corpus.
+
+    // V9 — backward release→retain reachability. Each release
+    // independently walks backward to find a matching retain or
+    // implicit-retain producer.
+    v9CheckAllReleases(function);
+
+    // Warning-only mode (V8/V9): both checks emit diagnostics via
+    // ZAP_DEBUG_V8 / ZAP_DEBUG_V9 env vars but do not propagate
+    // violations as errors. See the V8/V9 doc blocks above for the
+    // rollout-to-fail-mode plan.
+}
+
+// ============================================================
+// V9 — backward release→retain reachability check.
+//
+// For every `.release { value: X }` IR instruction, every backward
+// path from that release must reach one of:
+//   (a) `.retain { value: X }` — explicit retain matching the release;
+//   (b) an ARC-producing instruction with `dest: X` (allocation,
+//       runtime-extracting helper, etc.) whose runtime semantics
+//       initialize the cell at refcount 1;
+//   (c) the function's `.owned`-convention parameter whose
+//       `param_get`'s dest local is X.
+//
+// V9 is the dual of V8. Where V8 walks forward from each retain to
+// confirm a balancing release/consume/return-source elision exists
+// on every path, V9 walks backward from each release to confirm a
+// matching retain or implicit-retain source exists. Both run
+// post-drop-insertion. Together they enforce the "every retain has
+// a balancing release and vice versa" linear-lifetime invariant
+// from Swift's `LinearLifetimeChecker.cpp`.
+//
+// V9 currently runs in opt-in warning mode behind `ZAP_DEBUG_V9` —
+// same rollout pattern as V8. The check infrastructure is in place;
+// the false-positive classes (e.g., consume-mode chain through
+// move_value where the original source's retain was elided) need
+// investigation before the gate flips off.
+// ============================================================
+
+const V9ProducerKind = enum {
+    /// Explicit `.retain { value: dest }`.
+    explicit_retain,
+    /// Allocation-shaped instruction with non-trivial dest type.
+    /// `.struct_init`, `.list_init`, `.map_init`, `.tuple_init`,
+    /// `.union_init`. Allocation sets refcount to 1 implicitly.
+    allocation,
+    /// Runtime extraction helper that retains its return value.
+    /// `.list_get`, `.list_head`, `.list_tail`, `.map_get`. The
+    /// runtime's `List.get` etc. call `retainElement` before
+    /// returning, satisfying V9.
+    runtime_extract,
+    /// `.move_value { dest: X, source: Y }` — ownership transfers
+    /// from Y to X. V9 follows the chain backward through the move.
+    move_chain,
+    /// Function parameter with `.owned` convention. Caller
+    /// transferred a +1 retain that the callee owns.
+    owned_param,
+    /// `.copy_value { dest: X }` — produces a fresh persistent
+    /// owner. Phase 1 Class A item 1 paired this with an explicit
+    /// `.retain { kind: .persistent }` IR; the explicit retain
+    /// satisfies V9 directly. The `.copy_value` itself is dataflow
+    /// alias.
+    copy_value_paired_retain,
+    /// `.share_value { dest: X }` — same pattern as copy_value.
+    share_value_paired_retain,
+    /// Call instruction with `.owned` result convention.
+    call_owned_return,
+};
+
+const V9ProducerWalker = struct {
+    function: *const ir.Function,
+    /// Output: when a producer is found backward, this records its
+    /// kind (for diagnostic reporting on V9 failure).
+    found_kind: ?V9ProducerKind = null,
+    /// The local being tracked. Updated when `.move_value` retargets
+    /// the search through a chain.
+    target: ir.LocalId,
+
+    fn produces(walker: *V9ProducerWalker, instr: ir.Instruction) ?V9ProducerKind {
+        return switch (instr) {
+            .retain => |r| if (r.value == walker.target) .explicit_retain else null,
+            .struct_init => |si| walker.checkAllocDest(si.dest),
+            .list_init => |li| walker.checkAllocDest(li.dest),
+            .map_init => |mi| walker.checkAllocDest(mi.dest),
+            .tuple_init => |ti| walker.checkAllocDest(ti.dest),
+            .union_init => |ui| walker.checkAllocDest(ui.dest),
+            .list_cons => |lc| walker.checkAllocDest(lc.dest),
+            .list_get => |lg| if (lg.dest == walker.target) .runtime_extract else null,
+            .list_head => |lh| if (lh.dest == walker.target) .runtime_extract else null,
+            .list_tail => |lt| if (lt.dest == walker.target) .runtime_extract else null,
+            .map_get => |mg| if (mg.dest == walker.target) .runtime_extract else null,
+            .copy_value => |cv| if (cv.dest == walker.target) .copy_value_paired_retain else null,
+            .share_value => |sv| if (sv.dest == walker.target) .share_value_paired_retain else null,
+            .call_named => |cn| walker.checkCallDest(cn.dest),
+            .call_direct => |cd| walker.checkCallDest(cd.dest),
+            .call_closure => |cc| walker.checkCallDest(cc.dest),
+            .call_dispatch => |cd| walker.checkCallDest(cd.dest),
+            .call_builtin => |cb| walker.checkCallDest(cb.dest),
+            else => null,
+        };
+    }
+
+    /// Allocations and similar set the refcount to 1 only when the
+    /// dest's type is ARC-managed. The verifier consults
+    /// `local_ownership` to decide.
+    fn checkAllocDest(walker: *V9ProducerWalker, dest: ir.LocalId) ?V9ProducerKind {
+        if (dest != walker.target) return null;
+        if (dest >= walker.function.local_ownership.len) return null;
+        if (walker.function.local_ownership[dest] == .trivial) return null;
+        return .allocation;
+    }
+
+    /// Calls return their value with whatever convention the callee
+    /// declared. Without per-callee resolution, V9 takes the
+    /// conservative position: any ARC-managed dest returned by a
+    /// call counts as a producer. This is sound (there's a +1 by
+    /// the time the caller observes the dest) but doesn't validate
+    /// the callee's contract — that's V7's job.
+    fn checkCallDest(walker: *V9ProducerWalker, dest: ir.LocalId) ?V9ProducerKind {
+        if (dest != walker.target) return null;
+        if (dest >= walker.function.local_ownership.len) return null;
+        if (walker.function.local_ownership[dest] == .trivial) return null;
+        return .call_owned_return;
+    }
+};
+
+/// Walk a stream backward looking for a producer of `walker.target`.
+/// Updates `walker.found_kind` when a producer is found.
+/// `.move_value { dest: target, source: Y }` retargets the search
+/// through Y for the remainder of the backward walk.
+fn v9WalkStreamBackward(
+    walker: *V9ProducerWalker,
+    stream: []const ir.Instruction,
+    end_index: usize,
+) bool {
+    var idx = end_index;
+    while (idx > 0) {
+        idx -= 1;
+        const instr = stream[idx];
+        // Move chain: retarget the search through the move's source.
+        if (instr == .move_value and instr.move_value.dest == walker.target) {
+            walker.target = instr.move_value.source;
+            continue;
+        }
+        // Recurse into nested streams (in reverse: later children
+        // first since they execute after earlier in forward order;
+        // for backward walk we want to traverse in reverse-of-
+        // forward-order). Practically, we walk EACH child stream
+        // backward; if any finds a producer, we're done.
+        if (v9WalkInstructionChildren(walker, instr)) return true;
+        // Direct producer check on this instruction.
+        if (walker.produces(instr)) |kind| {
+            walker.found_kind = kind;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn v9WalkInstructionChildren(
+    walker: *V9ProducerWalker,
+    instr: ir.Instruction,
+) bool {
+    switch (instr) {
+        .if_expr => |ie| {
+            if (v9WalkStreamBackward(walker, ie.then_instrs, ie.then_instrs.len)) return true;
+            if (v9WalkStreamBackward(walker, ie.else_instrs, ie.else_instrs.len)) return true;
+        },
+        .case_block => |cb| {
+            for (cb.arms) |arm| {
+                if (v9WalkStreamBackward(walker, arm.body_instrs, arm.body_instrs.len)) return true;
+                if (v9WalkStreamBackward(walker, arm.cond_instrs, arm.cond_instrs.len)) return true;
+            }
+            if (v9WalkStreamBackward(walker, cb.pre_instrs, cb.pre_instrs.len)) return true;
+            if (v9WalkStreamBackward(walker, cb.default_instrs, cb.default_instrs.len)) return true;
+        },
+        .switch_literal => |sl| {
+            for (sl.cases) |c| {
+                if (v9WalkStreamBackward(walker, c.body_instrs, c.body_instrs.len)) return true;
+            }
+            if (v9WalkStreamBackward(walker, sl.default_instrs, sl.default_instrs.len)) return true;
+        },
+        .switch_return => |sr| {
+            for (sr.cases) |c| {
+                if (v9WalkStreamBackward(walker, c.body_instrs, c.body_instrs.len)) return true;
+            }
+            if (v9WalkStreamBackward(walker, sr.default_instrs, sr.default_instrs.len)) return true;
+        },
+        .union_switch => |us| {
+            for (us.cases) |c| {
+                if (v9WalkStreamBackward(walker, c.body_instrs, c.body_instrs.len)) return true;
+            }
+        },
+        .union_switch_return => |usr| {
+            for (usr.cases) |c| {
+                if (v9WalkStreamBackward(walker, c.body_instrs, c.body_instrs.len)) return true;
+            }
+        },
+        .try_call_named => |tc| {
+            if (v9WalkStreamBackward(walker, tc.success_instrs, tc.success_instrs.len)) return true;
+            if (v9WalkStreamBackward(walker, tc.handler_instrs, tc.handler_instrs.len)) return true;
+        },
+        .guard_block => |gb| {
+            if (v9WalkStreamBackward(walker, gb.body, gb.body.len)) return true;
+        },
+        .optional_dispatch => |od| {
+            if (v9WalkStreamBackward(walker, od.struct_instrs, od.struct_instrs.len)) return true;
+            if (v9WalkStreamBackward(walker, od.nil_instrs, od.nil_instrs.len)) return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// Check whether `target` is the dest local of any `.owned`-convention
+/// parameter via its `param_get` instruction.
+fn v9IsOwnedParamLocal(function: *const ir.Function, target: ir.LocalId) bool {
+    var resolved: std.AutoHashMapUnmanaged(u32, ir.LocalId) = .empty;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (function.body) |block| {
+        v9SeedParamGets(a, block.instructions, &resolved) catch return false;
+    }
+    var iter = resolved.iterator();
+    while (iter.next()) |entry| {
+        if (entry.value_ptr.* != target) continue;
+        const param_index = entry.key_ptr.*;
+        if (param_index >= function.param_conventions.len) continue;
+        if (function.param_conventions[param_index] == .owned) return true;
+    }
+    return false;
+}
+
+fn v9SeedParamGets(
+    allocator: std.mem.Allocator,
+    stream: []const ir.Instruction,
+    resolved: *std.AutoHashMapUnmanaged(u32, ir.LocalId),
+) error{OutOfMemory}!void {
+    for (stream) |instr| {
+        switch (instr) {
+            .param_get => |pg| {
+                const gop = try resolved.getOrPut(allocator, pg.index);
+                if (!gop.found_existing) gop.value_ptr.* = pg.dest;
+            },
+            .if_expr => |ie| {
+                try v9SeedParamGets(allocator, ie.then_instrs, resolved);
+                try v9SeedParamGets(allocator, ie.else_instrs, resolved);
+            },
+            .case_block => |cb| {
+                try v9SeedParamGets(allocator, cb.pre_instrs, resolved);
+                for (cb.arms) |arm| {
+                    try v9SeedParamGets(allocator, arm.cond_instrs, resolved);
+                    try v9SeedParamGets(allocator, arm.body_instrs, resolved);
+                }
+                try v9SeedParamGets(allocator, cb.default_instrs, resolved);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| try v9SeedParamGets(allocator, c.body_instrs, resolved);
+                try v9SeedParamGets(allocator, sl.default_instrs, resolved);
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| try v9SeedParamGets(allocator, c.body_instrs, resolved);
+                try v9SeedParamGets(allocator, sr.default_instrs, resolved);
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| try v9SeedParamGets(allocator, c.body_instrs, resolved);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| try v9SeedParamGets(allocator, c.body_instrs, resolved);
+            },
+            .try_call_named => |tc| {
+                try v9SeedParamGets(allocator, tc.success_instrs, resolved);
+                try v9SeedParamGets(allocator, tc.handler_instrs, resolved);
+            },
+            .guard_block => |gb| try v9SeedParamGets(allocator, gb.body, resolved),
+            .optional_dispatch => |od| {
+                try v9SeedParamGets(allocator, od.nil_instrs, resolved);
+                try v9SeedParamGets(allocator, od.struct_instrs, resolved);
+            },
+            else => {},
+        }
+    }
+}
+
+/// V9 entry point. Walks every `.release { value: X }` in the
+/// function and verifies a matching producer is reachable on every
+/// backward path.
+fn v9CheckAllReleases(function: *const ir.Function) void {
+    for (function.body) |block| {
+        v9CheckStream(function, block.instructions);
+    }
+}
+
+fn v9CheckStream(function: *const ir.Function, stream: []const ir.Instruction) void {
+    for (stream, 0..) |instr, idx| {
+        switch (instr) {
+            .release => |r| {
+                // V1/V4 already check that .release on .borrowed
+                // locals is invalid; V9 only fires for .owned locals.
+                if (r.value < function.local_ownership.len) {
+                    if (function.local_ownership[r.value] != .owned) continue;
+                }
+                v9CheckRelease(function, stream, idx, r.value);
+            },
+            .if_expr => |ie| {
+                v9CheckStream(function, ie.then_instrs);
+                v9CheckStream(function, ie.else_instrs);
+            },
+            .case_block => |cb| {
+                v9CheckStream(function, cb.pre_instrs);
+                for (cb.arms) |arm| {
+                    v9CheckStream(function, arm.cond_instrs);
+                    v9CheckStream(function, arm.body_instrs);
+                }
+                v9CheckStream(function, cb.default_instrs);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| v9CheckStream(function, c.body_instrs);
+                v9CheckStream(function, sl.default_instrs);
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| v9CheckStream(function, c.body_instrs);
+                v9CheckStream(function, sr.default_instrs);
+            },
+            .union_switch => |us| for (us.cases) |c| v9CheckStream(function, c.body_instrs),
+            .union_switch_return => |usr| for (usr.cases) |c| v9CheckStream(function, c.body_instrs),
+            .try_call_named => |tc| {
+                v9CheckStream(function, tc.success_instrs);
+                v9CheckStream(function, tc.handler_instrs);
+            },
+            .guard_block => |gb| v9CheckStream(function, gb.body),
+            .optional_dispatch => |od| {
+                v9CheckStream(function, od.nil_instrs);
+                v9CheckStream(function, od.struct_instrs);
+            },
+            else => {},
+        }
+    }
+}
+
+fn v9CheckRelease(
+    function: *const ir.Function,
+    stream: []const ir.Instruction,
+    release_index: usize,
+    value: ir.LocalId,
+) void {
+    var walker = V9ProducerWalker{
+        .function = function,
+        .target = value,
+    };
+    if (v9WalkStreamBackward(&walker, stream, release_index)) return;
+    // No producer found within this stream. Walk earlier blocks.
+    // (Most functions have a single block; this is a safety net.)
+    var found = false;
+    for (function.body, 0..) |block, bi| {
+        const block_stream = block.instructions;
+        if (block_stream.ptr == stream.ptr) break;
+        _ = bi;
+        if (v9WalkStreamBackward(&walker, block_stream, block_stream.len)) {
+            found = true;
+            break;
+        }
+    }
+    if (found) return;
+    if (v9IsOwnedParamLocal(function, walker.target)) return;
+    if (suppress_diagnostics) return;
+    if (std.c.getenv("ZAP_DEBUG_V9") == null) return;
+    std.debug.print(
+        "arc_verifier: function '{s}' violates ARC invariant V9: release of local %{d} has no matching retain or producer on any backward path — every `.release` must be balanced by a `.retain`, an allocation, a runtime-extracting helper, an .owned-convention parameter, or an ownership move from such a source\n",
+        .{ function.name, value },
+    );
 }
 
 // ============================================================
