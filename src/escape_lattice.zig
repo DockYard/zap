@@ -34,13 +34,81 @@ pub const BlockVirtualKey = struct {
     alloc_site: AllocSiteId,
 };
 
+/// One step of nested-stream descent from a top-level block toward
+/// a position inside one of its nested instruction streams. Used to
+/// address positions inside `case_block` arms, `if_expr` then/else,
+/// `optional_dispatch` nil/struct, etc. without packing the
+/// navigation into a synthetic `instr_index`.
+///
+/// The previous design encoded nested-stream positions via formulas
+/// like `instr_index +| (arm_idx * 100 + idx) +| 1` (see
+/// `perceus.zig:617-665` history). The encoding never actually
+/// fired at ZIR-emit time because `zir_builder.zig:3420` only
+/// updates `current_instr_index` during the top-level block walk,
+/// not during nested-stream emission — so synthetic-encoded
+/// `InsertionPoint`s targeting nested positions never matched the
+/// driver state. The optimization opportunity (Perceus reuse,
+/// drop-specialization inside nested arms) was permanently dropped
+/// for every program that exercised the nested path.
+///
+/// `StreamStep` and the new `path` field on `InsertionPoint`
+/// replace that encoding with explicit descent. The materialization
+/// pass walks the path through nested streams the same way
+/// `arc_drop_insertion.zig`'s `StreamRebuilder` does. The
+/// previously-broken optimization becomes correctly addressable
+/// post-refactor.
+pub const StreamStep = struct {
+    /// Index within the parent stream of the instruction whose
+    /// nested stream we descend into. This locates the parent
+    /// instruction; `child` then selects which of its nested
+    /// streams to enter.
+    parent_instr_index: u32,
+    /// Which nested stream of the parent instruction to enter.
+    child: ChildSlot,
+};
+
+/// Which child stream of an instruction with nested streams. Each
+/// constructor is the IR-side parallel of a recursion case in
+/// `arc_drop_insertion.zig`'s `rebuildChildren` switch.
+pub const ChildSlot = union(enum) {
+    if_expr_then,
+    if_expr_else,
+    case_block_pre,
+    case_block_arm_cond: u32, // arm index within `case_block.arms`
+    case_block_arm_body: u32, // arm index within `case_block.arms`
+    case_block_default,
+    switch_literal_case: u32, // case index within `switch_literal.cases`
+    switch_literal_default,
+    switch_return_case: u32, // case index within `switch_return.cases`
+    switch_return_default,
+    union_switch_case: u32, // case index within `union_switch.cases`
+    union_switch_return_case: u32, // case index within `union_switch_return.cases`
+    try_call_named_success,
+    try_call_named_handler,
+    guard_block_body,
+    optional_dispatch_nil,
+    optional_dispatch_struct,
+};
+
 /// Identifier for an insertion point in the IR for ARC operations.
+///
+/// Top-level positions: `path.len == 0`, `instr_index` indexes into
+/// `function.body[<block_with_label>].instructions`.
+///
+/// Nested positions: `path[0]` describes the descent from the
+/// top-level block; subsequent steps descend further. `instr_index`
+/// indexes into the innermost stream reached by walking the path.
 pub const InsertionPoint = struct {
     function: ir.FunctionId,
     block: ir.LabelId,
-    /// Index within the block's instruction list.
+    /// Empty for positions in the top-level block. Each element
+    /// descends one level of nesting (see `StreamStep`).
+    path: []const StreamStep = &.{},
+    /// Index within the final (innermost) stream reached by walking
+    /// `path` from the top-level block.
     instr_index: u32,
-    /// Whether to insert before or after the instruction.
+    /// Whether to insert before or after the instruction at
+    /// `instr_index`.
     position: enum { before, after },
 };
 

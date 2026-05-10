@@ -52,6 +52,15 @@ pub const TypeInfo = struct {
 pub const DeconstructionSite = struct {
     function: ir.FunctionId,
     block: ir.LabelId,
+    /// Path from the top-level block to the stream containing the
+    /// deconstruction instruction. Empty for top-level positions.
+    /// Each step descends one level of nesting. Replaces the
+    /// previous synthetic-index encoding (which was effectively
+    /// dead code — `current_instr_index` in the ZIR driver is only
+    /// updated during top-level block emission, so nested-encoded
+    /// records never matched).
+    path: []const lattice.StreamStep = &.{},
+    /// Index within the innermost stream reached by walking `path`.
     instr_index: u32,
     scrutinee: ir.LocalId,
     scrutinee_type: TypeInfo,
@@ -76,6 +85,11 @@ pub const DeconstructionSite = struct {
 pub const ConstructionSite = struct {
     function: ir.FunctionId,
     block: ir.LabelId,
+    /// Path from the top-level block to the stream containing the
+    /// construction instruction. Same semantics as
+    /// `DeconstructionSite.path`.
+    path: []const lattice.StreamStep = &.{},
+    /// Index within the innermost stream.
     instr_index: u32,
     dest: ir.LocalId,
     dest_type: TypeInfo,
@@ -393,7 +407,32 @@ pub const PerceusAnalyzer = struct {
         block_label: ir.LabelId,
         parent_index: u32,
     ) !void {
-        // Recurse into nested instruction lists to find inner pattern matches
+        // Recurse into nested instruction lists to find inner pattern matches.
+        //
+        // The synthetic `parent_index +| (idx) +| 1` encoding here is
+        // a known suboptimality: the resulting `instr_index` values
+        // never match `zir_builder.zig`'s `current_instr_index`
+        // tracker (which is only updated during top-level block
+        // emission — see `zir_builder.zig:3420`), so
+        // `emitAnalysisArcOps` /
+        // `emitDropSpecializationsForCurrentInstr` never fire on
+        // these nested records. However, perceus's nested
+        // deconstruction-site discovery has a SECOND consumer:
+        // `emitPerceusResetForCase` matches reuse pairs by
+        // `pair.reset.source == case_block.dest` (a local-id
+        // equality check, not a position match), so the nested
+        // sites DO contribute to Perceus reuse for inner case
+        // blocks. This path is load-bearing — removing the nested
+        // scan breaks the `nested pattern matching finds inner
+        // reuse` test in `perceus.zig:2358`.
+        //
+        // The proper production-quality fix is to address positions
+        // via `lattice.StreamStep` paths (schema now in
+        // `escape_lattice.zig`) and extend
+        // `arc_materialize.zig` to walk them. That's a follow-up
+        // optimization improvement; the current synthetic encoding
+        // is preserved here so the local-id-matching consumer
+        // (`emitPerceusResetForCase`) continues to fire.
         switch (instr.*) {
             .case_block => |cb| {
                 for (cb.arms) |arm| {
