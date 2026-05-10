@@ -4530,6 +4530,25 @@ pub const IrBuilder = struct {
             // `Map(K, V).get` signature, so we must produce a value of
             // the right Zig type or the call won't typecheck.
             const default_local = try self.emitDefaultValueForType(value_type);
+            // Plumb the map's value HIR type onto the destructured
+            // local so `emitArcRetainOnAggregateExtract` can detect an
+            // ARC-managed extraction. Without this, an extracted map
+            // value of an ARC-managed type (List, Map, recursive
+            // struct, etc.) reaches `arc_managed_locals` only via
+            // `local_ownership` derived from `local_hir_types` — and
+            // the latter would be unset, classifying the local as
+            // `.trivial` and silencing every downstream retain/release
+            // emission. This is the same bug shape that produced the
+            // binarytrees ~12 GB leak (commit 122bf73).
+            if (binding.param_index < clause.params.len) {
+                const param_hir_type = clause.params[binding.param_index].type_id;
+                if (self.type_store) |ts| {
+                    if (ts.getType(param_hir_type) == .map) {
+                        const value_hir_type = ts.getType(param_hir_type).map.value;
+                        try self.local_hir_types.put(binding.local_index, value_hir_type);
+                    }
+                }
+            }
             // Extract the value via map_get
             try self.current_instrs.append(self.allocator, .{
                 .map_get = .{
@@ -4541,6 +4560,12 @@ pub const IrBuilder = struct {
                     .value_type = value_type,
                 },
             });
+            // Retain the extracted ARC value at the IR level. The
+            // matching scope-exit `.release` is inserted by
+            // `arc_drop_insertion` once the binding's local enters
+            // `arc_managed_locals` (via the `local_hir_types`
+            // plumbing above).
+            try self.emitArcRetainOnAggregateExtract(binding.local_index);
         }
     }
 
