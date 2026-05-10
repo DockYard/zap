@@ -2672,3 +2672,213 @@ test "arc_verifier: lookupConventionByName is last-wins for duplicate names" {
     try testing.expectEqual(@as(usize, 1), looked_up.len);
     try testing.expectEqual(ir.ParamConvention.owned, looked_up[0]);
 }
+
+// ============================================================
+// V10 — static "no ZIR-direct ARC emission" audit.
+//
+// Phase 0 of the ARC IR-source-of-truth refactor (see
+// `docs/arc-emission-architecture-research-brief.md`). The architectural
+// invariant being pinned:
+//
+//     Every retain or release runtime call the compiled Zap program
+//     executes corresponds 1:1 to the lowering of a `.retain` or
+//     `.release` IR instruction.
+//
+// Concretely: the only call sites in `src/zir_builder.zig` that may
+// emit `retainAny*` / `releaseAny*` / `freeAny` / `resetAny` /
+// `reuseAllocByType` runtime calls are the IR-instruction handlers
+// for `.retain`, `.release`, `.reset`, and (when introduced) `.reuse_alloc`.
+//
+// V10 is a *source-level* audit: it scans `zir_builder.zig` line by
+// line, counts each forbidden-pattern occurrence, and asserts the
+// count exactly equals an allowlist of currently-known sites. New
+// violations introduced after this test was written (i.e., a future
+// PR adds a `retainAnyOpt` outside a canonical handler) cause the
+// test to fail with a precise location. Existing violations stay
+// allowlisted until the relevant phase removes them; the allowlist
+// shrinks across Phase 1 / Phase 2 / Phase 3 commits.
+//
+// The audit operates on the *embedded* source text — not on the IR
+// the compiler currently emits — so it runs at `zig build test` time
+// without requiring a built compiler binary. Mode: warning (non-fail)
+// for now via the diagnostic-only path. The matching strict-mode
+// gate flips on once Phase 1/2/3 reduce the allowlist to its known-
+// canonical targets.
+// ============================================================
+
+const v10_zir_builder_source = @embedFile("zir_builder.zig");
+
+const V10ForbiddenPattern = struct {
+    /// Substring scanned for. Matches any token contained within
+    /// (so `retainAny` matches `retainAny`, `retainAnyPersistent`,
+    /// `retainAnyOpt`, `retainChildrenAny`).
+    needle: []const u8,
+    /// Human-readable description used in diagnostics.
+    label: []const u8,
+};
+
+const v10_forbidden_patterns: []const V10ForbiddenPattern = &.{
+    .{ .needle = "\"retainAny\"", .label = "ArcRuntime.retainAny" },
+    .{ .needle = "\"retainAnyPersistent\"", .label = "ArcRuntime.retainAnyPersistent" },
+    .{ .needle = "\"retainAnyOpt\"", .label = "ArcRuntime.retainAnyOpt" },
+    .{ .needle = "\"retainChildrenAny\"", .label = "ArcRuntime.retainChildrenAny" },
+    .{ .needle = "\"releaseAny\"", .label = "ArcRuntime.releaseAny" },
+    .{ .needle = "\"releaseChildrenAny\"", .label = "ArcRuntime.releaseChildrenAny" },
+    .{ .needle = "\"freeAny\"", .label = "ArcRuntime.freeAny" },
+    .{ .needle = "\"resetAny\"", .label = "ArcRuntime.resetAny" },
+    .{ .needle = "\"reuseAllocByType\"", .label = "ArcRuntime.reuseAllocByType" },
+};
+
+/// Scan `source` for occurrences of each forbidden pattern. Returns
+/// the total number of hits. Each hit is also surfaced via
+/// `std.debug.print` when `verbose` is true so a failing assertion
+/// has actionable context.
+fn v10CountForbiddenEmissions(source: []const u8, verbose: bool) usize {
+    var count: usize = 0;
+    var line_no: usize = 1;
+    var line_start: usize = 0;
+    var i: usize = 0;
+    while (i < source.len) : (i += 1) {
+        if (source[i] == '\n') {
+            const line = source[line_start..i];
+            for (v10_forbidden_patterns) |pat| {
+                if (std.mem.indexOf(u8, line, pat.needle) != null) {
+                    count += 1;
+                    if (verbose) {
+                        std.debug.print(
+                            "[arc_verifier V10] zir_builder.zig:{d}: {s} emission outside canonical handler\n  {s}\n",
+                            .{ line_no, pat.label, std.mem.trim(u8, line, " \t") },
+                        );
+                    }
+                }
+            }
+            line_no += 1;
+            line_start = i + 1;
+        }
+    }
+    // Trailing line without newline.
+    if (line_start < source.len) {
+        const line = source[line_start..];
+        for (v10_forbidden_patterns) |pat| {
+            if (std.mem.indexOf(u8, line, pat.needle) != null) {
+                count += 1;
+                if (verbose) {
+                    std.debug.print(
+                        "[arc_verifier V10] zir_builder.zig:{d}: {s} emission outside canonical handler\n  {s}\n",
+                        .{ line_no, pat.label, std.mem.trim(u8, line, " \t") },
+                    );
+                }
+            }
+        }
+    }
+    return count;
+}
+
+/// Allowlisted total of forbidden-pattern occurrences as of the most
+/// recent ARC refactor commit. Each entry below corresponds to a
+/// specific known emission site in `zir_builder.zig`.
+///
+/// Increase this number ONLY when a new canonical handler is added
+/// (e.g., the `.reuse_alloc` IR-instruction handler in Phase 3). To
+/// remove a known violation, decrement this number AND the violation
+/// catalogue below in the same commit. A drift between the audit and
+/// the catalogue is a bug.
+///
+/// Catalogue (audit baseline as of commit 14b3ac0; revise on each
+/// phase advance):
+///
+///   Canonical IR-handler sites — these MUST be in the count, removing
+///   them from `zir_builder.zig` means the IR-level retain/release
+///   primitive itself is broken:
+///
+///     1. `.retain` IR handler: 1 × "retainAny" emission
+///        (zir_builder.zig:6720)
+///     2. `.release` IR handler: 1 × "releaseAny" emission
+///        (zir_builder.zig:6772)
+///     3. `.reset` IR handler: 1 × "resetAny" emission
+///        (zir_builder.zig:6788)
+///
+///   Class A residual violations (Phase 1 follow-up):
+///     4. `.copy_value` lowering: 1 × "retainAnyPersistent"
+///        (zir_builder.zig:4194)
+///     5. `.share_value` mode=retain: 1 × "retainAny"
+///        (zir_builder.zig:4299)
+///
+///   Class B violations (Phase 2):
+///     6. `emitAnalysisArcOps` retain branch: 1 × "retainAny"
+///        (zir_builder.zig:3907)
+///     7. `emitAnalysisArcOps` release branch: 1 × "releaseAny"
+///        (zir_builder.zig:3922)
+///     8. `emitDropSpecializationsForCurrentInstr` deep arm:
+///        1 × "releaseAny" (zir_builder.zig:3962)
+///     9. `emitDropSpecializationsForCurrentInstr` shallow arm:
+///        1 × "freeAny" (zir_builder.zig:3963)
+///    10. `emitPerceusResetForCase`: 1 × "resetAny"
+///        (zir_builder.zig:3984)
+///
+///   Class C violations (Phase 3):
+///    11. early `.struct_init` reuse path: 1 × "reuseAllocByType"
+///        (zir_builder.zig:5336)
+///    12. `.struct_init` reuse-pair: 1 × "reuseAllocByType"
+///        (zir_builder.zig:5573)
+///    13. `.union_init` reuse-pair: 1 × "reuseAllocByType"
+///        (zir_builder.zig:5917)
+///    14. an additional `reuseAllocByType` emission at line 6804
+///        — provisional categorisation (likely the same Perceus
+///        reuse class). Verify during Phase 3 implementation.
+///
+///   `.release` IR handler also emits `noteReturnElision` (a counter
+///   bump), but that is not a forbidden ARC runtime call — pure
+///   bookkeeping, no refcount effect.
+///
+/// Total expected: 14. Phase 1 follow-up reduces to 12. Phase 2
+/// reduces to 7. Phase 3 reduces to 3 (only the canonical
+/// `.retain` / `.release` / `.reset` handlers remain, plus a fourth
+/// for `.reuse_alloc` once introduced).
+///
+/// The audit baseline of 14 was empirically established by running
+/// V10 against zir_builder.zig at commit 14b3ac0 — the predecessor
+/// research briefs (arc1.md / arch2.md) catalogued 7 violations
+/// each, but the actual scan finds 14 (canonical 3 + Class A 2 +
+/// Class B 5 + Class C 4). This discrepancy is exactly why an
+/// automated audit is load-bearing: hand-maintained catalogues
+/// drift, scanners do not.
+const v10_expected_total: usize = 14;
+
+test "V10: zir_builder.zig forbidden ARC emissions match phase-tracked allowlist" {
+    const observed = v10CountForbiddenEmissions(v10_zir_builder_source, false);
+    if (observed != v10_expected_total) {
+        // Re-scan with verbose output to surface every site for
+        // anyone investigating the failure.
+        std.debug.print(
+            "\n[arc_verifier V10] zir_builder.zig forbidden-pattern audit drifted: observed {d}, expected {d}\n" ++
+                "Phase advance: update v10_expected_total AND the catalogue comment in arc_verifier.zig.\n" ++
+                "All current sites:\n",
+            .{ observed, v10_expected_total },
+        );
+        _ = v10CountForbiddenEmissions(v10_zir_builder_source, true);
+    }
+    try testing.expectEqual(v10_expected_total, observed);
+}
+
+test "V10: forbidden-pattern scanner correctly identifies a hit" {
+    const sample =
+        \\fn legit_handler() void {
+        \\    const fn = zir_builder_emit_field_val(handle, arc_runtime, "retainAny", 9);
+        \\}
+    ;
+    try testing.expectEqual(@as(usize, 1), v10CountForbiddenEmissions(sample, false));
+}
+
+test "V10: forbidden-pattern scanner correctly ignores unrelated text" {
+    const sample =
+        \\fn unrelated() void {
+        \\    const x: i64 = 0;
+        \\    // a comment mentioning retainAny without quoting
+        \\    var y = x + 1;
+        \\}
+    ;
+    // No occurrence of `"retainAny"` (note quotes); just a bare
+    // identifier in a comment — should not match.
+    try testing.expectEqual(@as(usize, 0), v10CountForbiddenEmissions(sample, false));
+}
