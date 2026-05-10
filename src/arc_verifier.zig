@@ -787,12 +787,77 @@ fn emitDiagnostic(
     );
 }
 
+/// V11 — every local appearing as source or dest of an ARC-affecting
+/// IR instruction must have `local_ownership[L] != .trivial`. Catches
+/// the seeding-miss class of bug that produced the binarytrees leak
+/// (commit 122bf73): when a local's `local_ownership` is misclassified
+/// as `.trivial` despite the local participating in retain/release/
+/// share_value/copy_value/move_value/borrow_value, the seed walk in
+/// `arc_liveness.identifyArcLocals` skips it (Phase E.5 Gap 5 only
+/// seeds locals with `local_ownership != .trivial`), `arc_managed_locals`
+/// is incomplete, and `arc_drop_insertion` never emits the matching
+/// scope-exit `.release` — leaking the cell.
+///
+/// V11 is the static counterpart of the V10 ZIR-direct-emission audit:
+/// V10 catches new ZIR-side ARC emissions, V11 catches new IR-side
+/// classification gaps.
+fn checkLocalIsArcManaged(
+    function: *const ir.Function,
+    local_id: ir.LocalId,
+    instr_tag: []const u8,
+    role: []const u8,
+) VerifyError!void {
+    if (local_id >= function.local_ownership.len) return;
+    if (function.local_ownership[local_id] == .trivial) {
+        if (suppress_diagnostics) return error.ArcInvariantViolation;
+        std.debug.print(
+            "arc_verifier: function '{s}' violates ARC invariant V11: local %{d} appears as {s} of `.{s}` but `local_ownership` classifies it as .trivial — the seed walk in arc_liveness.identifyArcLocals will skip this local, breaking arc_managed_locals completeness and risking the binarytrees-class leak\n",
+            .{ function.name, local_id, role, instr_tag },
+        );
+        return error.ArcInvariantViolation;
+    }
+}
+
 /// Per-instruction invariant check.
 fn verifyInstruction(
     ctx: *VerifyContext,
     instr: *const ir.Instruction,
 ) VerifyError!void {
     const function = ctx.function;
+    switch (instr.*) {
+        // V11 — ARC-affecting alias and dataflow instructions: source
+        // and dest LocalIds must have non-trivial ownership classes.
+        .retain => |r| {
+            try checkLocalIsArcManaged(function, r.value, "retain", "source");
+        },
+        .copy_value => |cv| {
+            try checkLocalIsArcManaged(function, cv.source, "copy_value", "source");
+            try checkLocalIsArcManaged(function, cv.dest, "copy_value", "dest");
+        },
+        .move_value => |mv| {
+            // V6 already checks that .move_value source is .owned;
+            // V11 ensures dest is also non-trivial.
+            try checkLocalIsArcManaged(function, mv.dest, "move_value", "dest");
+        },
+        .share_value => |sv| {
+            try checkLocalIsArcManaged(function, sv.source, "share_value", "source");
+            try checkLocalIsArcManaged(function, sv.dest, "share_value", "dest");
+        },
+        // `.borrow_value` has no refcount effect — it's a pure
+        // dataflow alias. The classifier may legitimately emit
+        // `.borrow_value` for `.local_get`s whose source is non-ARC
+        // (e.g., a `.trivial`-classified local that flows into a
+        // borrowing position by virtue of its only use being a
+        // borrow); the borrow is then a no-op marker. V11 must not
+        // flag these. The refcount-bumping alias instructions
+        // (.copy_value, .move_value, .share_value) above DO require
+        // ARC-managed sources/dests.
+        .borrow_value => {},
+        else => {},
+    }
+    // V1-V7 follow on the same instruction. Re-dispatch on a separate
+    // switch so the V11 check above doesn't interfere with the existing
+    // semantics of V1-V7 (each set their own short-circuit returns).
     switch (instr.*) {
         // V1 + V2 + V4: `.release` semantics.
         .release => |r| {
