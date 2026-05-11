@@ -232,12 +232,31 @@ fn stdoutWrite(bytes: []const u8) void {
 
 // ============================================================
 // Arena Allocator
-// Uses std.heap.ArenaAllocator backed by page_allocator.
+// Uses std.heap.ArenaAllocator backed by c_allocator (libc malloc).
 // Thread-safe and lock-free in Zig 0.16. Init is cheap (no
 // allocation until first use), so no lazy initialization needed.
+//
+// Backed by `c_allocator` rather than `page_allocator` so the
+// arena's internal `rawResize` calls can succeed when libc's
+// view of block capacity (`malloc_usable_size`) shows slack. On
+// macOS the `page_allocator`'s `rawResize` is hard-wired to
+// `false` (no `mremap` available), so every arena grow used to
+// orphan a previously-allocated node in `buffer_list`, pinning it
+// for the rest of the program. With libc malloc, the arena can
+// extend its current node when malloc's size-class has room, and
+// freed arena nodes return to malloc's free list (where their
+// pages become reusable for subsequent allocations) rather than
+// staying mmap'd as orphaned page-allocator regions.
+//
+// This also enables the `String.concat` `Allocator.resize` fast
+// path (which extends the most-recent arena allocation in place
+// rather than allocating a fresh `a.len + b.len` buffer) to
+// succeed across the arena's geometric-doubling boundaries when
+// the current libc block carries slack from the previous size
+// class. See `tryArenaExtend` and `String.concat` below.
 // ============================================================
 
-var runtime_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+var runtime_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.c_allocator);
 
 // Terminal mode state for raw/normal switching
 var original_termios: std.posix.termios = undefined;
@@ -322,6 +341,28 @@ fn bumpAllocSlice(comptime T: type, len: usize) []T {
     const slice = runtime_arena.allocator().alloc(T, len) catch return &.{};
     recordBump(.other, len * @sizeOf(T));
     return slice;
+}
+
+/// Try to extend an arena allocation in place. Returns true on success;
+/// the slice's underlying buffer now has `new_len` bytes available
+/// (callers may treat `slice.ptr[0..new_len]` as a valid slice). Returns
+/// false when the arena has no nodes yet, when `slice` is not the
+/// most-recent allocation in the arena's current node (which includes
+/// the case where `slice` lives in `.rodata` / a different allocator
+/// entirely — the inner address check rejects those), or when the
+/// current node has no spare capacity for the extension.
+///
+/// Guards the `runtime_arena.allocator().resize` call against the
+/// stdlib's panic-on-null-first-node behaviour (`loadFirstNode().?`
+/// inside `ArenaAllocator.resize`). Without this guard, calling
+/// `String.concat("literal_a", "literal_b")` before any other arena
+/// allocation has happened would panic because `used_list` is still
+/// null. Once the arena has at least one node, the inner `resize`
+/// safely returns `false` for non-tail / out-of-arena slices via its
+/// own address comparison against `node.end_index`.
+fn tryArenaExtend(slice: []const u8, new_len: usize) bool {
+    if (runtime_arena.state.used_list == null) return false;
+    return runtime_arena.allocator().resize(@constCast(slice), new_len);
 }
 
 pub fn resetAllocator() void {
@@ -3823,10 +3864,59 @@ pub const String = struct {
         return 0xFFFFFFFF;
     }
 
-    /// Concatenate two strings into a fresh allocation backed by the
-    /// runtime arena. Zap-emitted code calls this directly because Zap
-    /// has no notion of allocators at the call site.
+    /// Concatenate two strings into an allocation backed by the runtime
+    /// arena. Zap-emitted code calls this directly because Zap has no
+    /// notion of allocators at the call site.
+    ///
+    /// Fast path: if `a` is the most-recent arena allocation, ask the
+    /// arena to extend it in place (`Allocator.resize`). On success we
+    /// only allocate / copy `b.len` bytes — the `a` prefix already
+    /// lives at the right address. This collapses tail-recursive
+    /// `acc <> ch` accumulator patterns (e.g. k-nucleotide's
+    /// `clean_line`, which calls `concat(acc, single_byte)` once per
+    /// FASTA sequence byte) from O(n²) cumulative arena pressure to
+    /// O(n). Without this, a ~60-byte cleaned line allocates
+    /// 1+2+3+…+60 ≈ 1830 bytes through the arena's geometric-doubling
+    /// growth, and across ~37 k lines the arena's node list ends up
+    /// pinning the largest doubled nodes (~33 MB on macOS, where
+    /// `page_allocator` cannot remap and old nodes never reclaim).
+    ///
+    /// Semantics are preserved: the returned slice has length
+    /// `a.len + b.len`. Existing observers of `a` still see the original
+    /// `a.len` bytes — `resize` only extends the buffer, it does not
+    /// move it, and the first `a.len` bytes are unchanged. The new
+    /// slice's `[a.len .. a.len + b.len]` tail is written from `b`,
+    /// matching the non-fast-path behaviour byte-for-byte.
+    ///
+    /// Soundness conditions for the in-place extend:
+    ///   1. `a.ptr + a.len` is exactly at the arena's bump cursor.
+    ///      `ArenaAllocator.resize` checks this internally
+    ///      (`cur_buf.ptr + state.end_index == buf.ptr + buf.len`) and
+    ///      returns `false` if not, so we fall back to the copy path.
+    ///   2. `a` is not aliased — no other reference exists. Zap's
+    ///      purely-functional semantics + uniqueness analysis enforce
+    ///      this at the language level: in `acc = acc <> next`, the
+    ///      rebinding consumes the previous binding, and uniqueness
+    ///      analysis would have promoted to consume-mode if any
+    ///      aliased read existed.
+    ///   3. The extended bytes are appended, not modifying any prior
+    ///      content. The `@memcpy` below only writes
+    ///      `extended[a.len..a.len + b.len]`; existing pointers into
+    ///      `a` see unchanged data.
+    ///
+    /// Aliasing of `b` with `a`'s buffer (e.g. `concat(s, s.slice(0,3))`)
+    /// is also safe: the destination region `result[a.len ..]` lies
+    /// strictly past `a`'s original end, so `b`'s source bytes are read
+    /// from disjoint memory — `@memcpy`'s non-overlap precondition is
+    /// satisfied.
     pub fn concat(a: []const u8, b: []const u8) []const u8 {
+        if (b.len == 0) return a;
+        if (a.len > 0 and tryArenaExtend(a, a.len + b.len)) {
+            recordBump(.string_concat, b.len);
+            const extended = @as([*]u8, @constCast(a.ptr))[0 .. a.len + b.len];
+            @memcpy(extended[a.len..], b);
+            return extended;
+        }
         const result = bumpAllocAt(.string_concat, a.len + b.len);
         if (result.len == 0) return a; // fallback: return first string
         @memcpy(result[0..a.len], a);
@@ -10537,6 +10627,80 @@ test "String operations" {
 
 test "String concat" {
     try std.testing.expectEqualStrings("hello world", String.concat("hello", " world"));
+}
+
+test "String concat: in-place extend preserves prefix observers" {
+    // Tail-recursive accumulator pattern (`clean_line` in k-nucleotide):
+    // `acc = concat(acc, ch)` on the most-recent arena allocation should
+    // hit the `tryArenaExtend` fast path and keep `acc.ptr` stable. The
+    // first concat seeds the arena (literal `a.len == 0` -> falls back
+    // to `bumpAllocAt`); every subsequent concat extends in place. This
+    // test asserts the load-bearing property that the buffer pointer
+    // does not move across in-place extensions — if the fast path
+    // regresses to allocate-and-copy, `acc.ptr` would change on each
+    // call and the cumulative arena allocation pattern returns to the
+    // pre-fix O(n²) shape.
+    var acc: []const u8 = "";
+    acc = String.concat(acc, "A");
+    const seed_ptr = acc.ptr;
+    acc = String.concat(acc, "C");
+    try std.testing.expectEqualStrings("AC", acc);
+    try std.testing.expectEqual(seed_ptr, acc.ptr);
+    acc = String.concat(acc, "G");
+    try std.testing.expectEqualStrings("ACG", acc);
+    try std.testing.expectEqual(seed_ptr, acc.ptr);
+    acc = String.concat(acc, "T");
+    try std.testing.expectEqualStrings("ACGT", acc);
+    try std.testing.expectEqual(seed_ptr, acc.ptr);
+}
+
+test "String concat: empty right-hand returns identity" {
+    // Skipping the resize round-trip when `b` is empty saves a branch
+    // and an arena lookup. The pre-existing path also returned the
+    // requested result via the `a.len + b.len == a.len` no-op @memcpy,
+    // but the explicit guard avoids touching the arena entirely when
+    // there's nothing to append.
+    const literal: []const u8 = "abc";
+    try std.testing.expectEqualStrings("abc", String.concat(literal, ""));
+}
+
+test "String concat: literal left-hand allocates fresh buffer" {
+    // When `a` is a `.rodata` literal (not in the arena), the
+    // `tryArenaExtend` path returns false via
+    // `runtime_arena.allocator().resize`'s internal address comparison,
+    // and we fall back to the bump-alloc copy path. The returned slice
+    // must NOT alias the literal — its bytes must equal `a ++ b`, and
+    // the literal `a` must remain unchanged.
+    const a: []const u8 = "hello";
+    const result = String.concat(a, " world");
+    try std.testing.expectEqualStrings("hello world", result);
+    try std.testing.expectEqualStrings("hello", a);
+}
+
+test "String concat: in-place extend is O(n) in arena bytes" {
+    // Without the fast path, a tail-recursive accumulator of N
+    // single-byte appends allocates 1 + 2 + 3 + ... + N = N*(N+1)/2
+    // bytes through the arena (O(N^2)). With the fast path, the seed
+    // allocates 1 byte and every subsequent extension grows the active
+    // arena allocation by exactly 1 byte (O(N) cumulative bytes
+    // observed by recordBump). This test pins the asymptotic behaviour
+    // for a representative `N = 64` (close to k-nucleotide's typical
+    // FASTA line length of 60).
+    const baseline_string_concat_bytes = bump_site_bytes[@intFromEnum(BumpSite.string_concat)];
+    var acc: []const u8 = "";
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        acc = String.concat(acc, "A");
+    }
+    try std.testing.expectEqual(@as(usize, 64), acc.len);
+    const delta = bump_site_bytes[@intFromEnum(BumpSite.string_concat)] - baseline_string_concat_bytes;
+    // Fast-path correctness bound: seed of 1 byte + 63 single-byte
+    // extensions = 64 bytes recorded. The pre-fix path would record
+    // 64 * 65 / 2 = 2080 bytes. Allow a 4x ceiling to absorb the
+    // small (one-time) bumpAllocAt 8-byte alignment of the seed plus
+    // anything unrelated this test might trigger; the gap between
+    // worst-case fast-path and worst-case slow-path is >25x.
+    try std.testing.expect(delta < 256);
 }
 
 test "List(i64) sliceFrom returns indexed suffix" {
