@@ -146,18 +146,21 @@ pub fn materializeAnalysisArcOps(
     function: *ir.Function,
     analysis_context: *escape_lattice.AnalysisContext,
 ) !void {
-    // Phase 3 prelude: replace the synthetic-LocalId scheme that
-    // perceus uses for reset tokens (`10000 + match_site_id`) with
-    // real LocalIds allocated against the function's slot space.
+    // Replace the synthetic-LocalId placeholder perceus emits for
+    // reset tokens (`10000 + match_site_id`) with real LocalIds
+    // allocated against the function's slot space. After this
+    // rewrite the synthetic IDs are gone from `reuse_pairs`; every
+    // downstream consumer (the `.reset` IR materialization below,
+    // the construction-instruction rewrite, the ZIR backend's
+    // `refForLocal`) sees real, dense IDs.
     try rewriteReuseTokensToRealLocals(allocator, function, analysis_context);
 
-    // Phase 3: rewrite each reuse_pair's construction instruction
+    // Rewrite each reuse_pair's construction instruction
     // (tuple_init / struct_init / union_init) to carry the
-    // `reuse_token` field so the ZIR backend's canonical handler
-    // takes the reuse-aware lowering path. This removes the need
-    // for `findReusePairForDest` in zir_builder, eliminating three
-    // Class C `reuseAllocByType` emissions outside the canonical
-    // `.reuse_alloc` IR handler.
+    // `reuse_token` field. The ZIR backend's tuple_init /
+    // struct_init / union_init handlers dispatch on this field,
+    // routing through `emitReuseAllocCall` when set — the single
+    // canonical `reuseAllocByType` emission site.
     try rewriteReuseConstructions(allocator, function, analysis_context);
 
     var pending = PendingTree.init(allocator);
@@ -293,12 +296,14 @@ pub fn materializeAnalysisArcOps(
 
 /// Walk `analysis_context.reuse_pairs` and replace every reset
 /// token's synthetic LocalId (`10000 + match_site_id` per
-/// `perceus.zig:940`) with a fresh real LocalId allocated against
-/// the function's local-slot space. Updates both `pair.reset.dest`
-/// and `pair.reuse.token` in place, plus any `arc_op` whose
-/// `value` references the same synthetic ID so the legacy
-/// `emitPerceusResetForCase` continues to function while we
-/// transition off the synthetic encoding.
+/// `perceus.zig:generateReusePair`) with a fresh real LocalId
+/// allocated against the function's local-slot space. Updates
+/// both `pair.reset.dest` and `pair.reuse.token` in place, plus
+/// any `arc_op` whose `value` references the same synthetic ID.
+/// After this pass, the synthetic placeholders are gone — every
+/// downstream consumer (`materializeAnalysisArcOps`'s `.reset`
+/// branch, `rewriteReuseConstructions`, the ZIR backend's
+/// `refForLocal`) sees real LocalIds.
 ///
 /// Token ownership is `.owned` — `resetAny` returns an opaque
 /// pointer that downstream `reuseAllocByType` either reuses (the
@@ -368,11 +373,10 @@ fn findResetTokenForSource(
 
 /// Walk `analysis_context.reuse_pairs` and rewrite each matching
 /// construction instruction (tuple_init / struct_init / union_init)
-/// to carry the pair's reuse token in its `reuse_token` field. After
-/// this pass, the ZIR backend's canonical lowering reads
-/// `instruction.reuse_token` directly — no more side-table lookup
-/// via the deleted `findReusePairForDest` helper. Construction sites
-/// can live at any nesting depth; the rewrite walks the
+/// to carry the pair's reuse token in its `reuse_token` field. The
+/// ZIR backend's canonical lowering reads `instruction.reuse_token`
+/// directly and routes through `emitReuseAllocCall`. Construction
+/// sites can live at any nesting depth; the rewrite walks the
 /// `pair.reuse.insertion_point.path` the same way
 /// `materializeAnalysisArcOps` does for retain/release records.
 fn rewriteReuseConstructions(
