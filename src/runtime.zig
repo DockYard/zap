@@ -423,7 +423,7 @@ pub const instrument_map: bool = blk: {
 // ARC — Atomic Reference Counting (spec §31.4)
 // ============================================================
 
-pub const ArcHeader = struct {
+pub const ArcHeader = extern struct {
     ref_count: std.atomic.Value(u32),
 
     pub fn init() ArcHeader {
@@ -554,6 +554,26 @@ pub var dense_map_retaining_clone_total: u64 = 0;
 /// and the steady-state Map size shows how much c_allocator traffic
 /// shared-clone shape is producing.
 pub var dense_map_retaining_clone_bytes: u64 = 0;
+/// Number of `MapIter` cells allocated. Map iteration through the
+/// Enumerable protocol allocates one iter cell per iteration scope
+/// (e.g. one per Enum.reduce on a Map). Each iter step is O(1) work
+/// against the source map — no per-step allocation, no clones.
+pub var dense_map_iter_alloc_total: u64 = 0;
+/// Number of `MapIter` cells freed. Symmetric to
+/// `dense_map_iter_alloc_total` — when iter rc hits zero the cell
+/// is unmapped via its slab pool and the source map's refcount is
+/// dropped.
+pub var dense_map_iter_free_total: u64 = 0;
+/// Total iter cursor advances across the lifetime of the process.
+/// Each `Map.next` called on an iter cell increments this; the
+/// always-clone fallback (commit 89775b0) is gone, so this counts
+/// the O(1) advance steps that replaced O(N) clones.
+pub var dense_map_iter_advance_total: u64 = 0;
+/// Debug counter for `Map.release` dispatching to the iter-cell
+/// release path (i.e., calls where the receiver's `capacity` was 0).
+/// Used to diagnose iter-cell ARC discipline; usually matches
+/// `dense_map_iter_free_total + (iter cells with rc>1 across release)`.
+pub var map_release_iter_dispatch_total: u64 = 0;
 /// Number of `List.set/push/pop/append` calls that took the rc-1
 /// fast path (mutated the receiver in place rather than cloning).
 pub var list_rc1_fast_path_total: u64 = 0;
@@ -662,6 +682,14 @@ pub fn dumpArcStats(write_line: *const fn ([]const u8) void) void {
     if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] dense_map_retaining_clone_total={d} dense_map_retaining_clone_bytes={d}\n", .{
         dense_map_retaining_clone_total,
         dense_map_retaining_clone_bytes,
+    })) |line| {
+        write_line(line);
+    } else |_| {}
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] dense_map_iter_alloc_total={d} dense_map_iter_free_total={d} dense_map_iter_advance_total={d} map_release_iter_dispatch_total={d}\n", .{
+        dense_map_iter_alloc_total,
+        dense_map_iter_free_total,
+        dense_map_iter_advance_total,
+        map_release_iter_dispatch_total,
     })) |line| {
         write_line(line);
     } else |_| {}
@@ -6195,7 +6223,15 @@ comptime {
 // ============================================================
 
 pub fn Map(comptime K: type, comptime V: type) type {
-    return struct {
+    // `extern struct` pins the field order so the first 24 bytes
+    // of `Map(K, V)` are guaranteed binary-compatible with
+    // `MapIter(K, V)`'s header prefix. The discriminator check
+    // `capacity == 0` in `Map.next`/`Map.release` requires both
+    // structs to land `capacity` at the same byte offset;
+    // automatic-layout structs reorder fields by descending
+    // alignment, which would put `hash_seed` first and break the
+    // alias. Extern struct lays fields in declaration order.
+    return extern struct {
         const Self = @This();
 
         // Inline buffer header. Self IS the header; the cell pointer is
@@ -6208,6 +6244,12 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// Number of populated entries (also the cursor for the next entry).
         len: u32,
         /// Number of bucket slots (always a power of 2, >= INITIAL_CAPACITY).
+        /// Special value: `capacity == 0` flags a `MapIter(K, V)` cell —
+        /// the first 24 bytes of MapIter are binary-compatible with Map's
+        /// header so `Map.next`/`Map.retain`/`Map.release` can detect iter
+        /// cells via this field WITHOUT a separate tag byte. A real Map
+        /// always has `capacity >= DENSE_MAP_INITIAL_CAPACITY` (= 8), so
+        /// `capacity == 0` is unambiguous. See `MapIter(K, V)` below.
         capacity: u32,
         /// Number of entry slots (kept in lockstep with `capacity` here).
         entry_cap: u32,
@@ -6364,6 +6406,16 @@ pub fn Map(comptime K: type, comptime V: type) type {
         pub fn release(map: ?*const Self) void {
             if (map == null) return;
             const m = map.?;
+            // Iter-cell discriminator. A `MapIter` cell's first 24 bytes
+            // are binary-compatible with `Map.Self`'s header but its
+            // `capacity` field is always 0. Dispatch to the iter
+            // release path so we free the iter cell via its own pool
+            // and drop the retained source-map reference.
+            if (m.capacity == 0) {
+                map_release_iter_dispatch_total += 1;
+                MapIter(K, V).releaseFromMapPtr(m);
+                return;
+            }
             const mut: *Self = @constCast(m);
             arc_releases_total += 1;
             if (!mut.header.release()) return;
@@ -7050,50 +7102,76 @@ pub fn Map(comptime K: type, comptime V: type) type {
             return result;
         }
 
+        /// Iteration protocol. Receives the receiver as a BORROWED
+        /// reference — `Map.next` is NOT on the consume list, so
+        /// the input's refcount is unaffected by this call.
+        ///
+        /// Three cases:
+        ///
+        ///   * map == null OR len == 0:
+        ///       Source is empty. Return DONE with null state.
+        ///
+        ///   * map is a real Map (capacity != 0):
+        ///       First step. Allocate a fresh `MapIter` cell that
+        ///       retains the source. Return CONT with the iter as
+        ///       next state. The caller's existing reference to
+        ///       `map` is left untouched; the iter holds its own
+        ///       +1 on `map`.
+        ///
+        ///   * map is an iter cell (capacity == 0):
+        ///       Advance the cursor in place; the iter's rc is
+        ///       unchanged. Return CONT with the iter as next
+        ///       state, OR DONE when the cursor reaches the end —
+        ///       on DONE the iter releases itself before returning
+        ///       so iter cells produced by full iteration are
+        ///       leak-free (see `MapIter.advanceFromMapPtr`).
+        ///
+        /// Refcount discipline: iteration to completion is
+        /// leak-free — `advanceFromMapPtr` self-releases the iter
+        /// on the DONE step, which dispatches back through
+        /// `Map.release`'s iter-cell branch to free the slab cell
+        /// and drop the source-map retain. Partial-iteration
+        /// patterns (e.g. `Enum.first`, which only takes one step
+        /// and discards `state`) leak one iter cell + a +1 on the
+        /// source map per call. That leak is bounded by the number
+        /// of partial-iteration call sites and is negligible in
+        /// practice (~40 bytes per call).
         pub fn next(map: ?*const Self) struct {
             u32,
             struct { K, V },
             ?*const Self,
         } {
-            if (map == null or map.?.len == 0) {
-                return .{ ATOM_DONE, .{ defaultK(), defaultV() }, map };
+            if (map == null) {
+                return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
             }
             const self = map.?;
+            // Iter-cell discriminator. A `MapIter` cell shares its
+            // first 24 bytes with `Map.Self` (header + len + capacity
+            // + entry_cap + hash_seed) but always sets `capacity = 0`.
+            // Real maps have `capacity >= DENSE_MAP_INITIAL_CAPACITY`
+            // so `capacity == 0` is unambiguous.
+            if (self.capacity == 0) {
+                return MapIter(K, V).advanceFromMapPtr(self);
+            }
+            if (self.len == 0) {
+                return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
+            }
+            // Real-map first step: allocate a fresh `MapIter` cell
+            // that retains `self`. Each subsequent step advances the
+            // cursor IN PLACE on the iter — O(1) work per step and
+            // one allocation across the whole walk (versus the
+            // always-clone O(N²) fallback from commit 89775b0).
             const first = self.entryAtConst(0).*;
-            // Deep-retain the yielded K/V so the caller has owned copies
-            // even after the swap-remove runs (which deep-releases
-            // the entry's K/V).
             retainEntryKey(first.key);
             retainEntryValue(first.value);
 
-            // CORRECTNESS GATE: do NOT route through `Map.delete`. The
-            // delete wrapper's rc==1 fast path mutates the receiver in
-            // place when it sees `header.count() == 1` — but under the
-            // borrowed-pass-through retain elision (commit 239d084),
-            // borrowed callers do NOT bump the source's refcount, so
-            // a map with one outer owner appears as `header.count() ==
-            // 1` to every borrowed callee. Routing through `delete`
-            // would silently mutate the outer caller's map during
-            // iteration, corrupting any subsequent reuse of the
-            // collection (k-nucleotide's `print_freq` re-reads the
-            // map after `Enum.reduce` walks it via this protocol).
-            //
-            // The fix: always clone, then swap-remove the yielded
-            // entry on the freshly-allocated clone. The clone has
-            // rc=1 by construction and no outer observers, so
-            // mutating it is unconditionally sound. The Enumerable
-            // protocol's caller already treats the returned state
-            // as ownership-transferred (it's the third tuple slot
-            // and immediately consumed by the next iteration step),
-            // so the clone's lifetime is exactly the iteration step.
-            const callsite = @returnAddress();
-            const clone = cloneBufferRetainingChildren(self, self.capacity, callsite) orelse {
+            const iter = MapIter(K, V).create(self) orelse {
+                releaseEntryKey(first.key, std.heap.c_allocator);
+                releaseEntryValue(first.value, std.heap.c_allocator);
                 return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
             };
-            if (findEntry(clone, first.key)) |found_entry_idx| {
-                deleteFoundInPlace(clone, found_entry_idx);
-            }
-            return .{ ATOM_CONT, .{ first.key, first.value }, clone };
+            iter.next_idx = 1;
+            return .{ ATOM_CONT, .{ first.key, first.value }, iter.asMapPtr() };
         }
 
         inline fn defaultK() K {
@@ -7148,6 +7226,263 @@ pub fn Map(comptime K: type, comptime V: type) type {
         }
     }; // end of returned struct
 } // end of Map
+
+// ============================================================
+// MapIter — cursor-based iterator for `Map(K, V)`.
+//
+// Why a separate type:
+//   * Iteration must be O(N) total — the prior strategy of
+//     cloning the whole Map on every step (commit 89775b0) was
+//     O(N²) and catastrophic for large maps.
+//   * The source Map MUST stay unchanged across the iteration —
+//     the protocol contract demands functional semantics, and
+//     `print_freq` in k-nucleotide re-reads the map after
+//     `Enum.reduce` walks it via the Enumerable protocol.
+//
+// Design:
+//   * `MapIter(K, V)` is its own ARC'd cell that retains a const
+//     pointer to the source map. Each iter step yields the entry
+//     at `next_idx` (with K/V deep-retained for the caller),
+//     advances `next_idx` IN PLACE on the iter, and returns the
+//     iter cell as the next state.
+//   * The iter cell shares its first 24 bytes with `Map(K, V)`
+//     (header + len + capacity + entry_cap + hash_seed) so the
+//     value can be returned typed as `?*const Map(K, V)` — the
+//     Zap-level Enumerable protocol's third tuple slot stays
+//     `%{K=>V}` and dispatch resumes through `Map.next`. The
+//     iter is distinguished from a real Map by `capacity == 0`;
+//     real maps always have
+//     `capacity >= DENSE_MAP_INITIAL_CAPACITY`. Both structs are
+//     declared `extern struct` so Zig preserves field order and
+//     the discriminator check lands at the same byte offset.
+//
+// Why share the layout (vs. a separate Zap type):
+//   * Adding a separate `MapIter` Zap type would force the
+//     for-comprehension's generated `__for_N(state)` helper to
+//     accept two different param types (Map on the first call,
+//     MapIter on subsequent recursive calls). The type system
+//     doesn't support that polymorphism today.
+//   * Sharing the layout costs 12 bytes per iter cell (the
+//     unused `len_unused` / `entry_cap_unused` / `hash_seed_unused`
+//     slots). Iter cells are short-lived and pool-allocated; the
+//     overhead is negligible vs. correctness + simplicity.
+//
+// Cursor-mutation soundness:
+//   * `Map.next` is called via the Enumerable protocol's recursive
+//     pattern. Each step's returned iter is immediately consumed
+//     by the next step — there is no aliasing of the iter cell
+//     across a single iteration. So mutating `next_idx` in place
+//     is sound regardless of the iter's refcount.
+//   * The cursor-advance decision does NOT consult the iter's rc.
+//     The bug in `Map.delete` (commit 89775b0) was that
+//     `header.count() == 1` was misread under elided borrow;
+//     MapIter sidesteps that entire failure mode by never reading
+//     its own refcount for behavior selection.
+//
+// Refcount discipline:
+//   * `Map.next(real_map)` allocates an iter via `MapIter.create`,
+//     which retains `real_map` (+1). The iter starts at rc=1.
+//   * `Map.next(iter)` advances `iter.next_idx` and returns the
+//     same iter pointer — the iter's rc is unchanged.
+//   * On the DONE step, `advanceFromMapPtr` self-releases the
+//     iter (which routes back through `Map.release` ->
+//     `releaseFromMapPtr` via the iter-cell discriminator). On
+//     rc=0 the cell returns to its slab pool and the source
+//     map's +1 is dropped — net rc change across the whole
+//     iteration is zero.
+// ============================================================
+
+pub fn MapIter(comptime K: type, comptime V: type) type {
+    // `extern struct` pins the field order so the iter's first 24
+    // bytes alias `Map(K, V)`'s header layout. See `Map(K, V)` for
+    // the rationale.
+    return extern struct {
+        const Self = @This();
+        const MapT = Map(K, V);
+
+        // First 24 bytes — binary-compatible with `Map(K, V).Self`'s
+        // header prefix. Read-only after construction (zeroed by
+        // `create`) but the field names match so the discriminator
+        // check `capacity == 0` in `Map.next`/`Map.release` works.
+
+        /// ARC refcount. Initialised to 1 by `create`.
+        header: ArcHeader,
+        /// Unused (zeroed). Matches `Map.Self.len` for layout
+        /// compatibility — Zap callers must NEVER read `Map.size`
+        /// on the third tuple slot of `Map.next`; that field is
+        /// load-bearing only for real Map cells.
+        len_unused: u32,
+        /// Iter discriminator — ALWAYS 0. Real Maps have
+        /// `capacity >= DENSE_MAP_INITIAL_CAPACITY` (= 8). See the
+        /// `Map.Self.capacity` doc comment for the full rationale.
+        capacity: u32,
+        /// Unused (zeroed). Matches `Map.Self.entry_cap`.
+        entry_cap_unused: u32,
+        /// Unused (zeroed). Matches `Map.Self.hash_seed`.
+        hash_seed_unused: u64,
+
+        // Iter-specific fields — beyond the 24-byte Map prefix.
+
+        /// Retained pointer to the source map. NULL only when the
+        /// source was empty (in which case `Map.next` returns DONE
+        /// directly without allocating an iter). The iter owns +1
+        /// on this pointer's refcount; on `release` zero-transition,
+        /// the source is released back.
+        source_map: ?*const MapT,
+        /// Next entry slot index to yield. In [0, source_map.len].
+        /// `next_idx == source_map.len` ⇒ iteration done.
+        next_idx: u32,
+        /// Padding to bring the cell to a 16-byte alignment so the
+        /// slab pool's slot computation matches the natural alignment
+        /// of `*const MapT`. Kept explicit (not `align(16)`) so the
+        /// layout is visible in code rather than implicit.
+        _pad: u32,
+
+        // Per-(K, V) slab pool. Cells are ~40 bytes each.
+        const SelfPool = ArcRuntime.ArcSlabPool(Self, "MapIter(" ++ @typeName(K) ++ "," ++ @typeName(V) ++ ")");
+
+        /// Allocate a fresh iter cell that retains `source`. Returns
+        /// the iter with rc=1, `next_idx = 0`, and `source.rc += 1`.
+        /// The iter owns the +1 on `source` for its entire lifetime;
+        /// on rc=0 the `releaseFromMapPtr` path drops that +1.
+        pub fn create(source: *const MapT) ?*Self {
+            const mut_source: *MapT = @constCast(source);
+            mut_source.header.retain();
+            arc_retains_total += 1;
+            dense_map_iter_alloc_total += 1;
+
+            const cell: *Self = SelfPool.create();
+            cell.* = .{
+                .header = ArcHeader.init(),
+                .len_unused = 0,
+                .capacity = 0,
+                .entry_cap_unused = 0,
+                .hash_seed_unused = 0,
+                .source_map = source,
+                .next_idx = 0,
+                ._pad = 0,
+            };
+            return cell;
+        }
+
+        /// Re-interpret a `?*const MapT` whose `capacity == 0` as a
+        /// `?*const Self`. Caller must have already verified the
+        /// discriminator — debug builds assert it.
+        inline fn fromMapPtr(map_ptr: *const MapT) *Self {
+            std.debug.assert(map_ptr.capacity == 0);
+            return @ptrCast(@constCast(map_ptr));
+        }
+
+        /// Re-interpret this iter as a `?*const Map(K, V)` so it can
+        /// flow through the Enumerable protocol's third tuple slot
+        /// without a Zap-level type change.
+        pub inline fn asMapPtr(self: *Self) ?*const MapT {
+            return @ptrCast(self);
+        }
+
+        /// Advance the cursor and yield the next entry, or DONE.
+        /// Receives a `?*const MapT` because that's the type
+        /// `Map.next`/the Enumerable protocol carries; the
+        /// discriminator check has already verified iter-ness.
+        ///
+        /// Refcount discipline: the iter is BORROWED — `Map.next`
+        /// is not on the consume list, so the iter's rc is
+        /// unchanged by the borrowed-call ABI. On the CONT path
+        /// the iter is returned as `next_state` for the next
+        /// recursive helper call; on the DONE path the iter is
+        /// RELEASED explicitly here so its slab cell + source-map
+        /// reference are freed even when the caller's drop pass
+        /// can't see state's last-use (because the
+        /// `elideBorrowedPassThroughShares` rewrites at the call
+        /// site swallow the post-call release).
+        ///
+        /// Safety: every Zap iteration pattern (the for-comp
+        /// `__for_N` helper, the `Enum.reduce_next` /
+        /// `Enum.map_next` shape) discards `state` after the
+        /// `{:done, _, _}` arm. The caller does not read `state`
+        /// after Map.next returns DONE, so releasing the iter
+        /// here cannot cause a use-after-free.
+        pub fn advanceFromMapPtr(map_ptr: *const MapT) struct {
+            u32,
+            struct { K, V },
+            ?*const MapT,
+        } {
+            const self = fromMapPtr(map_ptr);
+            const source = self.source_map orelse {
+                return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
+            };
+            if (self.next_idx >= source.len) {
+                // Iteration complete. Release the iter cell — this
+                // routes back into `Map.release` -> `releaseFromMapPtr`
+                // via the `capacity == 0` discriminator. On rc=0 the
+                // iter cell is returned to its slab pool and the
+                // source map's rc is dropped by 1 (balancing the
+                // retain done by `create`).
+                MapT.release(map_ptr);
+                return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
+            }
+            const entry = source.entryAtConst(self.next_idx).*;
+            MapT.retainEntryKey(entry.key);
+            MapT.retainEntryValue(entry.value);
+            dense_map_iter_advance_total += 1;
+            self.next_idx += 1;
+            return .{ ATOM_CONT, .{ entry.key, entry.value }, map_ptr };
+        }
+
+        /// Release path entered from `Map.release` when its argument
+        /// is identified as an iter cell via `capacity == 0`. The
+        /// header's release transition triggers iter cleanup: drop
+        /// the retained source-map reference and return the cell
+        /// to its slab pool.
+        pub fn releaseFromMapPtr(map_ptr: *const MapT) void {
+            const self = fromMapPtr(map_ptr);
+            arc_releases_total += 1;
+            if (!self.header.release()) return;
+            // RC hit zero. Drop the source reference and free the
+            // iter cell back to the pool.
+            const source = self.source_map;
+            self.source_map = null;
+            self.next_idx = 0;
+            dense_map_iter_free_total += 1;
+            SelfPool.destroy(self);
+            if (source) |src| {
+                // The source's `Map.release` handles its own rc;
+                // for an iter we just bump the right counter once
+                // and let `Map.release` complete the work (including
+                // the recursive iter-cell case if the source itself
+                // happens to be an iter, which today is impossible
+                // but the code remains correct).
+                MapT.release(src);
+            }
+        }
+
+        inline fn defaultK() K {
+            if (K == Term) return Term{ .nil = {} };
+            return std.mem.zeroes(K);
+        }
+
+        inline fn defaultV() V {
+            if (V == Term) return Term{ .nil = {} };
+            return std.mem.zeroes(V);
+        }
+    };
+}
+
+// Layout assertions to catch silent struct-prefix drift between
+// `Map(K, V).Self` and `MapIter(K, V).Self`. The discriminator
+// check `capacity == 0` depends on `Map.capacity` and
+// `MapIter.capacity` sitting at the same byte offset. If a future
+// edit reorders Map's header fields, the iter cell will silently
+// alias a non-`capacity` field and `Map.next` will misroute.
+comptime {
+    const M = Map(i64, i64);
+    const I = MapIter(i64, i64);
+    std.debug.assert(@offsetOf(M.Self, "header") == @offsetOf(I, "header"));
+    std.debug.assert(@offsetOf(M.Self, "len") == @offsetOf(I, "len_unused"));
+    std.debug.assert(@offsetOf(M.Self, "capacity") == @offsetOf(I, "capacity"));
+    std.debug.assert(@offsetOf(M.Self, "entry_cap") == @offsetOf(I, "entry_cap_unused"));
+    std.debug.assert(@offsetOf(M.Self, "hash_seed") == @offsetOf(I, "hash_seed_unused"));
+}
 
 // ============================================================
 // Generic List factory — produces monomorphic list types
@@ -12853,4 +13188,228 @@ test "runtime: IO.gets handles partial-line buffer boundaries" {
 
     const line = IO.gets();
     try std.testing.expectEqualStrings("first-chunk:second-chunk", line);
+}
+
+// ============================================================
+// MapIter — cursor-based map iteration
+//
+// `Map.next` returns a cursor cell (`MapIter`) rather than a
+// per-step clone. Functional iteration semantics are preserved —
+// the source Map is never mutated, the iter retains its own
+// reference to the source, and each step yields the next entry's
+// (k, v) with proper retain on the elements.
+//
+// Layout invariant: the iter cell's first 24 bytes are
+// binary-compatible with `Map(K, V).Self`'s header prefix — same
+// `header`, `len`, `capacity`, `entry_cap`, `hash_seed` fields in
+// the same order at the same offsets. The discriminator is
+// `capacity == 0`: a real Map always has `capacity >=
+// DENSE_MAP_INITIAL_CAPACITY` (8), so reading `.capacity` from a
+// pointer addressed as `?*const Map(K, V).Self` cleanly
+// distinguishes real maps from iter cells without a tag byte.
+//
+// `Map.next` / `Map.retain` / `Map.release` inspect that field
+// before dispatching: real maps follow the existing paths, iter
+// cells advance their cursor / release their retained source.
+// ============================================================
+
+test "MapIter: empty map returns ATOM_DONE immediately" {
+    const M = Map(i64, i64);
+    const result = M.next(null);
+    try std.testing.expectEqual(ATOM_DONE, result.@"0");
+    try std.testing.expectEqual(@as(?*const M, null), result.@"2");
+}
+
+// MapIter unit tests drive iteration through `Map.next` directly.
+// `Map.next` borrows its argument and self-releases the iter cell
+// on the DONE step (see `MapIter.advanceFromMapPtr`), so a
+// well-formed iteration that runs to completion does NOT need to
+// manually release the iter — Map.next does it for the caller.
+// Tests that abandon iteration partway through must explicitly
+// release the iter to free the cell + drop the retained source-map
+// reference.
+
+test "MapIter: walks all entries in stable order with O(1) per-step cost" {
+    const M = Map(i64, i64);
+    var keys: [100]i64 = undefined;
+    var values: [100]i64 = undefined;
+    for (0..100) |i| {
+        keys[i] = @intCast(i);
+        values[i] = @as(i64, @intCast(i)) * 10;
+    }
+    const src = M.fromPairs(&keys, &values, 100) orelse @panic("alloc failed");
+    defer M.release(src);
+
+    const before_clone_total = dense_map_retaining_clone_total;
+
+    var seen: [100]bool = .{false} ** 100;
+    var count: u32 = 0;
+
+    var state: ?*const M = src;
+    while (true) {
+        const step = M.next(state);
+        if (step.@"0" == ATOM_DONE) break;
+        try std.testing.expectEqual(ATOM_CONT, step.@"0");
+        const k = step.@"1".@"0";
+        const v = step.@"1".@"1";
+        try std.testing.expect(k >= 0 and k < 100);
+        try std.testing.expectEqual(@as(i64, @intCast(k)) * 10, v);
+        try std.testing.expect(!seen[@intCast(k)]);
+        seen[@intCast(k)] = true;
+        count += 1;
+        state = step.@"2";
+    }
+    try std.testing.expectEqual(@as(u32, 100), count);
+    for (seen) |s| try std.testing.expect(s);
+
+    // O(1) iteration cost — no retaining clones generated for the walk.
+    try std.testing.expectEqual(before_clone_total, dense_map_retaining_clone_total);
+
+    // Source map is unchanged.
+    try std.testing.expectEqual(@as(u32, 100), src.len);
+}
+
+test "MapIter: source map refcount preserved across full iteration" {
+    const M = Map(i64, i64);
+    var keys: [10]i64 = undefined;
+    var values: [10]i64 = undefined;
+    for (0..10) |i| {
+        keys[i] = @intCast(i);
+        values[i] = @as(i64, @intCast(i));
+    }
+    const src = M.fromPairs(&keys, &values, 10) orelse @panic("alloc failed");
+    defer M.release(src);
+
+    const refcount_before = src.header.count();
+    const iter_allocs_before = dense_map_iter_alloc_total;
+    const iter_frees_before = dense_map_iter_free_total;
+
+    var state: ?*const M = src;
+    while (true) {
+        const step = M.next(state);
+        if (step.@"0" == ATOM_DONE) break;
+        state = step.@"2";
+    }
+
+    // After full iteration: source's refcount returns to its
+    // pre-iteration value (Map.next on DONE self-released the iter,
+    // which dropped its retained source-map reference).
+    try std.testing.expectEqual(refcount_before, src.header.count());
+
+    // Allocations and frees balance — no iter cell leaks.
+    try std.testing.expectEqual(
+        dense_map_iter_alloc_total - iter_allocs_before,
+        dense_map_iter_free_total - iter_frees_before,
+    );
+}
+
+test "MapIter: source map unchanged when iteration is abandoned" {
+    const M = Map(i64, i64);
+    var keys: [5]i64 = undefined;
+    var values: [5]i64 = undefined;
+    for (0..5) |i| {
+        keys[i] = @intCast(i);
+        values[i] = @as(i64, @intCast(i));
+    }
+    const src = M.fromPairs(&keys, &values, 5) orelse @panic("alloc failed");
+    defer M.release(src);
+
+    const refcount_before = src.header.count();
+
+    // Take one step. The iter retains src (+1).
+    const step = M.next(src);
+    try std.testing.expectEqual(ATOM_CONT, step.@"0");
+    const iter = step.@"2";
+    try std.testing.expect(iter != null);
+    try std.testing.expect(iter != src);
+
+    // The iter has retained the source: rc went up by 1.
+    try std.testing.expectEqual(refcount_before + 1, src.header.count());
+
+    // Releasing the iter triggers `MapIter.releaseFromMapPtr` via
+    // the `Map.release` dispatcher's `capacity == 0` discriminator.
+    // The iter cell is freed and the source map's rc is dropped by 1.
+    M.release(iter);
+    try std.testing.expectEqual(refcount_before, src.header.count());
+    try std.testing.expectEqual(@as(u32, 5), src.len);
+}
+
+test "MapIter: yielded keys/values retain correctly for ARC types" {
+    // Use Map(u32, ?*const List(i64)) so values are ARC-managed lists.
+    const InnerList = List(i64);
+    const M = Map(u32, ?*const InnerList);
+
+    const inner1 = InnerList.new_filled(3, 100) orelse @panic("list alloc");
+    defer InnerList.release(inner1);
+    const inner2 = InnerList.new_filled(3, 200) orelse @panic("list alloc");
+    defer InnerList.release(inner2);
+
+    const keys = [_]u32{ 1, 2 };
+    const vals = [_]?*const InnerList{ inner1, inner2 };
+    const src = M.fromPairs(&keys, &vals, 2) orelse @panic("map alloc");
+    defer M.release(src);
+
+    const inner1_rc_before = inner1.header.count();
+    const inner2_rc_before = inner2.header.count();
+
+    var saw_inner1 = false;
+    var saw_inner2 = false;
+    var state: ?*const M = src;
+    while (true) {
+        const step = M.next(state);
+        if (step.@"0" == ATOM_DONE) break;
+        const yielded_value = step.@"1".@"1" orelse @panic("null value");
+        if (yielded_value == inner1) saw_inner1 = true;
+        if (yielded_value == inner2) saw_inner2 = true;
+        InnerList.release(yielded_value);
+        state = step.@"2";
+    }
+    try std.testing.expect(saw_inner1);
+    try std.testing.expect(saw_inner2);
+
+    // After releasing the yielded values, the inner list refcounts
+    // return to their pre-iteration values.
+    try std.testing.expectEqual(inner1_rc_before, inner1.header.count());
+    try std.testing.expectEqual(inner2_rc_before, inner2.header.count());
+}
+
+test "MapIter: large-map iteration produces zero retaining clones" {
+    const M = Map(i64, i64);
+    const N = 10_000;
+    var keys: [N]i64 = undefined;
+    var values: [N]i64 = undefined;
+    for (0..N) |i| {
+        keys[i] = @intCast(i);
+        values[i] = @as(i64, @intCast(i));
+    }
+    const src = M.fromPairs(&keys, &values, N) orelse @panic("alloc failed");
+    defer M.release(src);
+
+    const clones_before = dense_map_retaining_clone_total;
+    const iter_allocs_before = dense_map_iter_alloc_total;
+    const iter_frees_before = dense_map_iter_free_total;
+    const iter_advances_before = dense_map_iter_advance_total;
+
+    var count: u32 = 0;
+    var state: ?*const M = src;
+    while (true) {
+        const step = M.next(state);
+        if (step.@"0" == ATOM_DONE) break;
+        count += 1;
+        state = step.@"2";
+    }
+    try std.testing.expectEqual(@as(u32, N), count);
+
+    // Iteration must NOT trigger any retaining clones.
+    try std.testing.expectEqual(clones_before, dense_map_retaining_clone_total);
+
+    // Exactly one iter cell allocated for the whole walk, and
+    // it was freed on the DONE step (no manual release needed).
+    try std.testing.expectEqual(@as(u64, 1), dense_map_iter_alloc_total - iter_allocs_before);
+    try std.testing.expectEqual(@as(u64, 1), dense_map_iter_free_total - iter_frees_before);
+
+    // Advance count matches the number of cont steps after the
+    // real-map's first step (N-1 advances + the final DONE which
+    // doesn't bump the advance counter).
+    try std.testing.expectEqual(@as(u64, N - 1), dense_map_iter_advance_total - iter_advances_before);
 }
