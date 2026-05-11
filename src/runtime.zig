@@ -1557,9 +1557,10 @@ pub const ArcRuntime = struct {
     pub const SLAB_MAGIC: u32 = 0xA8C50A8;
 
     /// Per-slab header. Lives at the start of every slab; the slot
-    /// array begins at `@sizeOf(SlabHeader(Inner))` rounded up to
+    /// array begins at `@sizeOf(SlabHeader(Inner, ...))` rounded up to
     /// `@alignOf(Inner)`. Layout-only — no methods; the
-    /// `ArcSlabPool(Inner, Name)` struct mutates these fields directly.
+    /// `ArcSlabPool(Inner, Name, side_table)` struct mutates these
+    /// fields directly.
     ///
     /// `prev`/`next` form an intrusive doubly-linked list of partial
     /// slabs (slabs with at least one free slot AND `live_count > 0`).
@@ -1568,7 +1569,20 @@ pub const ArcRuntime = struct {
     /// without an extra parameter. `allocation_base` and
     /// `allocation_size` capture the trim-front bookkeeping needed by
     /// the slab-unmap path (see `mmapAlignedSlab`).
-    pub fn SlabHeader(comptime Inner: type) type {
+    ///
+    /// `side_table_capacity` is the comptime capacity of the side-table
+    /// refcount array embedded after the fixed header when
+    /// `side_table=true`. When `side_table=false`, this array has zero
+    /// length and adds no per-slab overhead.
+    ///
+    /// Side-table mode (used by `Arc(T)` cells whose `T` does not embed
+    /// its own ARC header): refcounts live in `refcounts[slot_index]`
+    /// after the header, freeing the slot itself to hold only the raw
+    /// `Inner` value. This collapses per-cell overhead from
+    /// `sizeOf(ArcHeader) + alignment_pad + sizeOf(T)` to a flat
+    /// `sizeOf(T) + sizeOf(u32)` (the side-table entry), eliminating the
+    /// natural-alignment padding that plagues 8-aligned `T` types.
+    pub fn SlabHeader(comptime Inner: type, comptime side_table: bool) type {
         const inner_alignment = @alignOf(Inner);
         const FreeNode = struct {
             next_index: u32,
@@ -1579,11 +1593,69 @@ pub const ArcRuntime = struct {
         // 4 bytes, so Inner's alignment governs.
         const slot_size_unrounded = inner_min_size;
         const slot_size_value = std.mem.alignForward(usize, slot_size_unrounded, inner_alignment);
+
+        // Compute capacity once at comptime. With side-table mode each
+        // slot pays an extra 4 bytes (one u32 refcount); without it
+        // capacity is `(SLAB_SIZE - slotOffset) / slot_size` as before.
+        //
+        // Side-table layout:
+        //   [fixed header fields]
+        //   [refcounts: [capacity]u32]  (4-byte aligned; header end is
+        //                                naturally 4-byte aligned)
+        //   [pad to alignOf(Inner)]
+        //   [slots: [capacity]Inner]
+        //
+        // Since `capacity` depends on the layout that depends on
+        // `capacity`, we compute a closed-form lower bound:
+        //   header_size + 4*capacity + align_pad + slot_size*capacity <= SLAB_SIZE
+        // Bounding align_pad by inner_alignment-1 gives:
+        //   capacity <= (SLAB_SIZE - header_size - inner_alignment + 1) / (slot_size + 4)
+        // We use `floor((SLAB_SIZE - header_size - inner_alignment) / (slot_size + 4))`
+        // as a safe, possibly-off-by-one underestimate; this costs at
+        // most one slot per slab (<0.04% capacity), well worth the
+        // simplicity vs. a two-pass layout solver.
+        // Measure the fixed-header prefix size by realizing an
+        // equivalent struct with a zero-length refcounts array. The
+        // refcounts array (even of length zero) contributes nothing to
+        // `@sizeOf`, so this gives us the exact prefix size we need to
+        // size the real refcounts array against.
+        const HeaderPrefix = struct {
+            magic: u32,
+            live_count: u32,
+            free_list_head: u32,
+            bump_index: u32,
+            capacity: u32,
+            prev: ?*anyopaque,
+            next: ?*anyopaque,
+            owner: *anyopaque,
+            allocation_base: [*]align(std.heap.page_size_min) u8,
+            allocation_size: usize,
+            refcounts: [0]std.atomic.Value(u32),
+        };
+        const fixed_header_size: usize = @sizeOf(HeaderPrefix);
+        const capacity_value: u32 = blk: {
+            if (side_table) {
+                const denom: usize = slot_size_value + 4;
+                if (SLAB_SIZE <= fixed_header_size + inner_alignment) break :blk 0;
+                const numerator: usize = SLAB_SIZE - fixed_header_size - inner_alignment;
+                break :blk @intCast(numerator / denom);
+            } else {
+                // Non-side-table mode: compute against simple slot-only
+                // layout. Slots start at `alignForward(fixed_header_size,
+                // alignOf(Inner))`.
+                const slots_start = std.mem.alignForward(usize, fixed_header_size, inner_alignment);
+                if (SLAB_SIZE <= slots_start) break :blk 0;
+                const usable = SLAB_SIZE - slots_start;
+                break :blk @intCast(usable / slot_size_value);
+            }
+        };
         return struct {
             const Self = @This();
             pub const inner_align: usize = inner_alignment;
             pub const slot_size: usize = slot_size_value;
             pub const free_node_type: type = FreeNode;
+            pub const has_side_table: bool = side_table;
+            pub const fixed_capacity: u32 = capacity_value;
 
             magic: u32,
             live_count: u32,
@@ -1595,16 +1667,34 @@ pub const ArcRuntime = struct {
             owner: *anyopaque,
             allocation_base: [*]align(std.heap.page_size_min) u8,
             allocation_size: usize,
+            // Embedded refcounts side-table; zero-length array when
+            // `side_table=false` so the layout matches the legacy
+            // header exactly. The array's `len` is comptime-constant
+            // per (Inner, side_table) pair so the offset to `slotOffset()`
+            // is a constant load.
+            refcounts: [if (side_table) capacity_value else 0]std.atomic.Value(u32),
 
-            /// Compute slot-array offset (header end rounded up to
-            /// `Inner`'s alignment). Comptime-constant per Inner so the
-            /// hot path is one constant load.
+            /// Compute slot-array offset (refcounts end rounded up to
+            /// `Inner`'s alignment). Comptime-constant per (Inner,
+            /// side_table) so the hot path is one constant load.
             pub fn slotOffset() usize {
+                // The struct already contains the refcounts array
+                // (possibly zero-length) before any slots; rounding up
+                // to inner alignment matches what `slotPtr` indexes.
                 return std.mem.alignForward(usize, @sizeOf(Self), inner_alignment);
             }
 
-            /// Total slots that fit in a `SLAB_SIZE` slab after header.
+            /// Total slots that fit in a `SLAB_SIZE` slab after header
+            /// (and side-table when present). Comptime constant.
+            ///
+            /// In side-table mode this MUST equal `fixed_capacity` so
+            /// the embedded refcounts array length matches the slot
+            /// count. In legacy (non-side-table) mode we recompute
+            /// against the realised header size for a tighter bound.
             pub fn capacityFor() u32 {
+                if (comptime side_table) {
+                    return capacity_value;
+                }
                 const usable = SLAB_SIZE - slotOffset();
                 return @intCast(usable / slot_size);
             }
@@ -1615,6 +1705,14 @@ pub const ArcRuntime = struct {
             pub fn slotPtr(self: *Self, index: u32) [*]u8 {
                 const base: [*]u8 = @ptrCast(self);
                 return base + slotOffset() + (slot_size * @as(usize, index));
+            }
+
+            /// Return a pointer to the side-table refcount entry at
+            /// `index`. Only valid when `side_table=true`. Caller
+            /// guarantees `index < capacity`.
+            pub fn refCountPtr(self: *Self, index: u32) *std.atomic.Value(u32) {
+                comptime std.debug.assert(side_table);
+                return &self.refcounts[index];
             }
         };
     }
@@ -1689,8 +1787,13 @@ pub const ArcRuntime = struct {
     /// partial slabs (slabs with free slots AND `live_count > 0`), and
     /// at most one cached empty slab to avoid mmap/munmap thrash when a
     /// workload oscillates around exactly one slab's working set.
-    pub fn SlabBackend(comptime Inner: type) type {
-        const Header = SlabHeader(Inner);
+    ///
+    /// `side_table` mirrors the same comptime parameter on the matching
+    /// `SlabHeader(Inner, side_table)` — a backend's slabs must all
+    /// share one layout so `slabFromInnerPtr` can recover the right
+    /// header type for every cell.
+    pub fn SlabBackend(comptime Inner: type, comptime side_table: bool) type {
+        const Header = SlabHeader(Inner, side_table);
         return struct {
             const Self = @This();
             pub const Hdr = Header;
@@ -1705,16 +1808,31 @@ pub const ArcRuntime = struct {
     /// Generic slab-class pool. `Inner` is the cell type to allocate;
     /// `pool_name` is the stats-display name shown by
     /// `ZAP_ARC_STATS=1`. The pool is thread-local — each (Inner,
-    /// pool_name, thread) gets its own backend.
+    /// pool_name, side_table, thread) gets its own backend.
+    ///
+    /// `side_table` toggles the side-table refcount layout. When true,
+    /// each slab carries a per-slot refcount array embedded in the slab
+    /// header, and the slot itself stores only the raw `Inner` value
+    /// (no embedded ArcHeader). When false, `Inner` is expected to embed
+    /// its own ArcHeader (the legacy inline-header layout used by
+    /// MapIter cells and the like).
     ///
     /// Hot path: `create` either pops the active slab's free list,
     /// bump-allocates the next slot, or rotates a partial/cached slab
     /// into the active position. `destroy` pushes the slot onto the
     /// owning slab's free list, decrements `live_count`, and either
     /// caches or unmaps the slab when it goes empty and is not active.
-    pub fn ArcSlabPool(comptime Inner: type, comptime pool_name: []const u8) type {
-        const Header = SlabHeader(Inner);
-        const Backend = SlabBackend(Inner);
+    ///
+    /// Side-table mode adds three public methods:
+    ///   * `retain(ptr: *Inner)` — atomic refcount increment.
+    ///   * `release(ptr: *Inner) -> bool` — atomic refcount decrement,
+    ///     returns true on the zero transition.
+    ///   * `refCount(ptr: *Inner) -> u32` — read current refcount.
+    /// These compute slab base from `ptr & SLAB_BASE_MASK`, then slot
+    /// index from offset arithmetic, then index the side-table.
+    pub fn ArcSlabPool(comptime Inner: type, comptime pool_name: []const u8, comptime side_table: bool) type {
+        const Header = SlabHeader(Inner, side_table);
+        const Backend = SlabBackend(Inner, side_table);
         const capacity_per_slab = Header.capacityFor();
         comptime {
             // Sanity check: every slab must hold at least one cell.
@@ -1726,6 +1844,7 @@ pub const ArcRuntime = struct {
             pub const HeaderType = Header;
             pub const BackendType = Backend;
             pub const slot_capacity: u32 = capacity_per_slab;
+            pub const has_side_table: bool = side_table;
 
             threadlocal var backend: Backend = .empty;
             threadlocal var stats: PoolStats = .{ .name = pool_name };
@@ -1746,10 +1865,18 @@ pub const ArcRuntime = struct {
             }
 
             /// Initialize a freshly mmapped slab's header in place.
-            /// The slab body (after the header) is left untouched —
-            /// slots get their first write via the `Inner` initializer
-            /// during `create`, and the free-list head starts as
-            /// NULL_SLOT (bump-allocate from `bump_index = 0`).
+            /// The slab body (slots after the side-table) is left
+            /// untouched — slots get their first write via the `Inner`
+            /// initializer during `create`, and the free-list head
+            /// starts as NULL_SLOT (bump-allocate from `bump_index = 0`).
+            ///
+            /// In side-table mode the embedded refcounts array is
+            /// zero-initialised so newly bump-allocated slots see rc=0
+            /// before `create` writes the rc=1 starter value. (Cells
+            /// returned from the free list will have their slot
+            /// overwritten by the value initialiser and their refcount
+            /// reset to 1 by `create`; this implicit init is for the
+            /// bump-allocate path's safety only.)
             fn initSlab(slab: *Header, base_addr: [*]align(std.heap.page_size_min) u8, alloc_size: usize) void {
                 slab.* = .{
                     .magic = SLAB_MAGIC,
@@ -1762,6 +1889,7 @@ pub const ArcRuntime = struct {
                     .owner = @ptrCast(&backend),
                     .allocation_base = base_addr,
                     .allocation_size = alloc_size,
+                    .refcounts = if (comptime side_table) [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** capacity_per_slab else .{},
                 };
             }
 
@@ -1872,6 +2000,11 @@ pub const ArcRuntime = struct {
             /// Allocate one cell from this pool. The returned pointer
             /// is to the raw `Inner` slot inside the active slab; the
             /// caller is responsible for initializing the Inner value.
+            ///
+            /// In side-table mode the slot's refcount entry is
+            /// initialised to 1 here so the caller observes a fully
+            /// owned cell on return (matching the semantics of
+            /// `ArcHeader.init`).
             pub fn create() *Inner {
                 ensureArcStatsAtexit();
                 stats.noteAllocation();
@@ -1883,6 +2016,9 @@ pub const ArcRuntime = struct {
                         const free_node: *Header.free_node_type = @ptrCast(@alignCast(slot_ptr_bytes));
                         slab.free_list_head = free_node.next_index;
                         slab.live_count += 1;
+                        if (comptime side_table) {
+                            slab.refcounts[slot_index].store(1, .monotonic);
+                        }
                         return @ptrCast(@alignCast(slot_ptr_bytes));
                     }
                     if (slab.bump_index < slab.capacity) {
@@ -1890,6 +2026,9 @@ pub const ArcRuntime = struct {
                         slab.bump_index += 1;
                         slab.live_count += 1;
                         const slot_ptr_bytes = slab.slotPtr(slot_index);
+                        if (comptime side_table) {
+                            slab.refcounts[slot_index].store(1, .monotonic);
+                        }
                         return @ptrCast(@alignCast(slot_ptr_bytes));
                     }
                     slab = rotateActive();
@@ -1941,6 +2080,43 @@ pub const ArcRuntime = struct {
                 }
             }
 
+            /// Atomically increment the side-table refcount for `inner`.
+            /// Only available when `side_table=true`. Caller must hold
+            /// at least one prior reference; the new count is the old
+            /// count + 1.
+            pub fn retain(inner: *Inner) void {
+                comptime std.debug.assert(side_table);
+                const slab = slabFromInnerPtr(inner);
+                const slot_index = slotIndexInSlab(slab, inner);
+                _ = slab.refcounts[slot_index].fetchAdd(1, .monotonic);
+            }
+
+            /// Atomically decrement the side-table refcount for `inner`.
+            /// Returns `true` on the zero transition (the caller is the
+            /// last owner and must finish destruction by calling
+            /// `destroy(inner)`); returns `false` when other owners
+            /// remain.
+            ///
+            /// The `acq_rel` ordering pairs with the load on `retain`
+            /// to provide release ordering for any side-effects the
+            /// caller performed prior to release.
+            pub fn release(inner: *Inner) bool {
+                comptime std.debug.assert(side_table);
+                const slab = slabFromInnerPtr(inner);
+                const slot_index = slotIndexInSlab(slab, inner);
+                const prev = slab.refcounts[slot_index].fetchSub(1, .acq_rel);
+                return prev == 1;
+            }
+
+            /// Read the side-table refcount for `inner` with acquire
+            /// ordering. Only available when `side_table=true`.
+            pub fn refCount(inner: *const Inner) u32 {
+                comptime std.debug.assert(side_table);
+                const slab = slabFromInnerPtr(@constCast(inner));
+                const slot_index = slotIndexInSlab(slab, @constCast(inner));
+                return slab.refcounts[slot_index].load(.acquire);
+            }
+
             /// Test-only: reset the backend's high-water mark and
             /// release every slab back to the OS. The caller must
             /// guarantee no live cells exist before invoking this;
@@ -1968,10 +2144,23 @@ pub const ArcRuntime = struct {
         };
     }
 
-    /// Per-type sized slab allocator pool. Replaces the previous
-    /// free-list-over-arena `std.heap.MemoryPool(Arc(T).Inner)` design,
-    /// which structurally could not return pages to the OS while any
-    /// cell anywhere in the pool was live.
+    /// Per-type sized slab allocator pool for generic `Arc(T)` cells.
+    /// The slot type is `T` itself — there is no enclosing `Inner`
+    /// struct with an embedded `ArcHeader`. Instead, every slab carries
+    /// a parallel `refcounts: [capacity]u32` side-table that mirrors the
+    /// slot array; given a `*T` pointer we mask it down to the slab base
+    /// (`ptr & SLAB_BASE_MASK`), compute the slot index from the slot
+    /// offset, and index the side-table for the refcount.
+    ///
+    /// Why side-table rather than inline header: a 4-byte `ArcHeader`
+    /// embedded in front of an 8-aligned `T` pays 4 bytes of padding
+    /// (8-byte alignment for the parent struct). For `T = Tree` (16
+    /// bytes), that's 4 + 4 + 16 = 24 bytes per cell vs. 16 bytes for
+    /// the raw value. Across 8.4M live cells during binarytrees N=21
+    /// stretch construction the padding alone consumes ~67 MB. The
+    /// side-table layout packs the rc next to its slot without forcing
+    /// any per-cell padding inside the slot itself; the per-cell cost
+    /// is exactly `sizeOf(T) + 4`.
     ///
     /// Industrial consensus design (mimalloc, snmalloc, SLUB, jemalloc,
     /// TCMalloc all converge on this): 64 KiB-aligned `mmap`'d slabs,
@@ -1993,27 +2182,25 @@ pub const ArcRuntime = struct {
     /// See `docs/arcpool-slab-allocator-implementation-spec.md` for the
     /// design contract and rationale.
     fn ArcPool(comptime T: type) type {
-        return ArcSlabPool(Arc(T).Inner, "Arc(" ++ @typeName(T) ++ ")");
+        return ArcSlabPool(T, "Arc(" ++ @typeName(T) ++ ")", true);
     }
 
-    /// Allocate and wrap a value in an Arc. Returns a pointer to the
-    /// value field inside the Arc inner struct.
+    /// Allocate and wrap a value in an Arc. Returns a pointer directly
+    /// to the slab slot holding `value`; the slot's side-table refcount
+    /// is initialised to 1 by the pool's `create`.
     ///
     /// The `allocator` parameter is preserved for ABI stability with
     /// existing ZIR call sites (`allocAny(@TypeOf(value), allocator,
-    /// value)`) but is no longer the source of storage — `Arc(T).Inner`
-    /// allocations come from a per-type `MemoryPool`. Routing through
-    /// the pool removes one libc-allocator round-trip per Arc node, which
+    /// value)`) but is no longer the source of storage — `Arc(T)`
+    /// allocations come from a per-type slab pool. Routing through the
+    /// pool removes one libc-allocator round-trip per Arc node, which
     /// dominates Arc-heavy workloads (e.g., binarytrees `make`/`check`
     /// at ~600 M nodes per N=21 run).
     pub fn allocAny(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
         _ = allocator;
-        const inner = ArcPool(T).create();
-        inner.* = .{
-            .header = ArcHeader.init(),
-            .value = value,
-        };
-        return &inner.value;
+        const ptr = ArcPool(T).create();
+        ptr.* = value;
+        return ptr;
     }
 
     /// Element type of an Arc value pointer. The ZIR backend calls every
@@ -2040,12 +2227,14 @@ pub const ArcRuntime = struct {
         return @typeInfo(PtrT) == .optional;
     }
 
-    /// Returns true when `T` carries its own ARC header inline as the first
-    /// field rather than relying on the generic `Arc(T).Inner` wrapper.
+    /// Returns true when `T` carries its own ARC header inline as the
+    /// first field rather than relying on the generic side-table pool.
     /// Such types are responsible for their own allocation pool and
     /// destruction (via a `release` or `arcReleaseDeep` method) — typically
     /// because they own variable-length payload buffers (`Map(K, V)`,
-    /// `List(T)`).
+    /// `List(T)`). Inline-header types bypass the side-table refcount
+    /// path entirely: their refcount lives in the cell's own `header`
+    /// field, allocated and freed through the type's bespoke pool.
     fn hasInlineArcHeader(comptime T: type) bool {
         const info = @typeInfo(T);
         if (info != .@"struct") return false;
@@ -2082,9 +2271,9 @@ pub const ArcRuntime = struct {
             }
             return;
         }
-        const inner: *Arc(T).Inner = @constCast(@fieldParentPtr("value", ptr));
-        if (inner.header.release()) {
-            ArcPool(T).destroy(inner);
+        const slot_ptr: *T = @constCast(ptr);
+        if (ArcPool(T).release(slot_ptr)) {
+            ArcPool(T).destroy(slot_ptr);
         }
     }
 
@@ -2126,10 +2315,16 @@ pub const ArcRuntime = struct {
     /// does that. The split exists so a compiler-generated deep-release helper
     /// can read indirect-storage child pointers from the parent struct *before*
     /// the parent's backing allocation is destroyed.
+    ///
+    /// The split is critical for side-table soundness: the caller reads
+    /// child pointers OUT of the slot (which still holds the user's `T`
+    /// value) BEFORE this function returns the slot to the free list.
+    /// On the zero transition the slot's content is still intact, so
+    /// callers can dereference `owned.*` to walk children before
+    /// invoking `destroyPreparedAny`.
     pub fn prepareReleaseAny(comptime T: type, ptr: *const T) ?*T {
-        const Inner = Arc(T).Inner;
-        const inner: *Inner = @constCast(@fieldParentPtr("value", ptr));
-        if (inner.header.release()) return &inner.value;
+        const slot_ptr: *T = @constCast(ptr);
+        if (ArcPool(T).release(slot_ptr)) return slot_ptr;
         return null;
     }
 
@@ -2140,8 +2335,7 @@ pub const ArcRuntime = struct {
     /// argument is vestigial — see `allocAny` and `ArcPool`.
     pub fn destroyPreparedAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) void {
         _ = allocator;
-        const inner: *Arc(T).Inner = @fieldParentPtr("value", ptr);
-        ArcPool(T).destroy(inner);
+        ArcPool(T).destroy(ptr);
     }
 
     /// Deep-release an Arc-managed value. Walks the value's struct fields
@@ -2260,9 +2454,7 @@ pub const ArcRuntime = struct {
             arc_retains_total += 1;
             return;
         }
-        const Inner = Arc(T).Inner;
-        const inner: *Inner = @constCast(@fieldParentPtr("value", ptr));
-        inner.header.retain();
+        ArcPool(T).retain(@constCast(ptr));
         arc_retains_total += 1;
     }
 
@@ -2290,9 +2482,7 @@ pub const ArcRuntime = struct {
             arc_retains_total += 1;
             return;
         }
-        const Inner = Arc(T).Inner;
-        const inner: *Inner = @constCast(@fieldParentPtr("value", ptr));
-        inner.header.retain();
+        ArcPool(T).retain(@constCast(ptr));
         arc_retains_total += 1;
     }
 
@@ -2321,9 +2511,7 @@ pub const ArcRuntime = struct {
         if (comptime hasInlineArcHeader(T)) {
             return ptr.header.count();
         }
-        const Inner = Arc(T).Inner;
-        const inner: *Inner = @constCast(@fieldParentPtr("value", ptr));
-        return inner.header.count();
+        return ArcPool(T).refCount(ptr);
     }
 
     /// Reset a value for Perceus-style reuse. If the reference count is 1,
@@ -7339,7 +7527,10 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
         _pad: u32,
 
         // Per-(K, V) slab pool. Cells are ~40 bytes each.
-        const SelfPool = ArcRuntime.ArcSlabPool(Self, "MapIter(" ++ @typeName(K) ++ "," ++ @typeName(V) ++ ")");
+        // `side_table=false`: MapIter cells embed their own ArcHeader as
+        // the first field (mirroring `Map` and `List`); their refcount
+        // is managed inline by the cell rather than by the pool.
+        const SelfPool = ArcRuntime.ArcSlabPool(Self, "MapIter(" ++ @typeName(K) ++ "," ++ @typeName(V) ++ ")", false);
 
         /// Allocate a fresh iter cell that retains `source`. Returns
         /// the iter with rc=1, `next_idx = 0`, and `source.rc += 1`.
@@ -12605,7 +12796,7 @@ const SlabTestInner8 = struct {
 };
 
 test "slab pool: alloc/free returns same slab cell" {
-    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/alloc-free");
+    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/alloc-free", false);
     Pool.statsForTest().live = 0;
     Pool.resetForTest();
 
@@ -12623,7 +12814,7 @@ test "slab pool: alloc/free returns same slab cell" {
 }
 
 test "slab pool: live_count tracks cells correctly" {
-    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/live-count");
+    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/live-count", false);
     Pool.statsForTest().live = 0;
     Pool.resetForTest();
 
@@ -12651,7 +12842,7 @@ test "slab pool: live_count tracks cells correctly" {
 }
 
 test "slab pool: unmaps empty slab when not active" {
-    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/unmap-empty");
+    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/unmap-empty", false);
     Pool.statsForTest().live = 0;
     Pool.resetForTest();
 
@@ -12710,7 +12901,7 @@ test "slab pool: unmaps empty slab when not active" {
 }
 
 test "slab pool: caches one empty slab to avoid mmap thrash" {
-    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/mmap-thrash");
+    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/mmap-thrash", false);
     Pool.statsForTest().live = 0;
     Pool.resetForTest();
 
@@ -12736,7 +12927,7 @@ test "slab pool: caches one empty slab to avoid mmap thrash" {
 }
 
 test "slab pool: high_water tracks peak live" {
-    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/high-water");
+    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/high-water", false);
     Pool.statsForTest().live = 0;
     Pool.statsForTest().high_water = 0;
     Pool.resetForTest();
@@ -12771,11 +12962,11 @@ test "slab pool: high_water tracks peak live" {
 }
 
 test "slab pool: handles Arc(SmallType).Inner sizes correctly" {
-    const PoolSmall = ArcRuntime.ArcSlabPool(SlabTestInner8, "SlabTest8/multi-size");
+    const PoolSmall = ArcRuntime.ArcSlabPool(SlabTestInner8, "SlabTest8/multi-size", false);
     PoolSmall.statsForTest().live = 0;
     PoolSmall.resetForTest();
 
-    const PoolLarge = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/multi-size");
+    const PoolLarge = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/multi-size", false);
     PoolLarge.statsForTest().live = 0;
     PoolLarge.resetForTest();
 
@@ -12812,6 +13003,281 @@ test "slab pool: aligned-mmap helper returns 64KiB-aligned slabs" {
     while (mmap_index < 4) : (mmap_index += 1) {
         ArcRuntime.unmapSlab(bases[mmap_index]);
     }
+}
+
+// ============================================================
+// Side-table slab pool tests — verify that the side-table layout
+// drops per-cell overhead from `sizeOf(ArcHeader)+pad+sizeOf(T)` to
+// `sizeOf(T) + 4` (the side-table entry), preserves rc init/retain/
+// release/refCount semantics, and never corrupts neighbor slots.
+//
+// The test types deliberately omit `header: ArcHeader` so the pool's
+// `side_table=true` path is exercised — these are not `hasInlineArcHeader`
+// types from the runtime's perspective.
+// ============================================================
+
+const SideTableTreeLike = struct {
+    left: ?*const SideTableTreeLike,
+    right: ?*const SideTableTreeLike,
+};
+
+const SideTablePair = struct {
+    first: u64,
+    second: u64,
+};
+
+test "side-table slab pool: allocAny initializes refcount to 1" {
+    const Pool = ArcRuntime.ArcSlabPool(SideTableTreeLike, "SideTable/init-rc", true);
+    Pool.statsForTest().live = 0;
+    Pool.resetForTest();
+
+    const cell = Pool.create();
+    try std.testing.expectEqual(@as(u32, 1), Pool.refCount(cell));
+
+    // Destruction must follow zero-transition discipline.
+    try std.testing.expect(Pool.release(cell));
+    Pool.destroy(cell);
+
+    Pool.resetForTest();
+}
+
+test "side-table slab pool: retain increments side-table refcount" {
+    const Pool = ArcRuntime.ArcSlabPool(SideTableTreeLike, "SideTable/retain", true);
+    Pool.statsForTest().live = 0;
+    Pool.resetForTest();
+
+    const cell = Pool.create();
+    try std.testing.expectEqual(@as(u32, 1), Pool.refCount(cell));
+
+    Pool.retain(cell);
+    try std.testing.expectEqual(@as(u32, 2), Pool.refCount(cell));
+
+    Pool.retain(cell);
+    try std.testing.expectEqual(@as(u32, 3), Pool.refCount(cell));
+
+    // Three retains → three releases.
+    try std.testing.expect(!Pool.release(cell));
+    try std.testing.expectEqual(@as(u32, 2), Pool.refCount(cell));
+    try std.testing.expect(!Pool.release(cell));
+    try std.testing.expectEqual(@as(u32, 1), Pool.refCount(cell));
+    try std.testing.expect(Pool.release(cell));
+    Pool.destroy(cell);
+
+    Pool.resetForTest();
+}
+
+test "side-table slab pool: release decrements and frees on zero" {
+    const Pool = ArcRuntime.ArcSlabPool(SideTablePair, "SideTable/release-zero", true);
+    Pool.statsForTest().live = 0;
+    Pool.resetForTest();
+
+    const cell = Pool.create();
+    cell.* = .{ .first = 0xCAFEBABE, .second = 0xDEADBEEF };
+    try std.testing.expectEqual(@as(u64, 1), Pool.statsForTest().live);
+
+    // rc=1 → release returns true, caller must destroy.
+    try std.testing.expect(Pool.release(cell));
+    try std.testing.expectEqual(@as(u32, 0), Pool.refCount(cell));
+
+    Pool.destroy(cell);
+    try std.testing.expectEqual(@as(u64, 0), Pool.statsForTest().live);
+
+    Pool.resetForTest();
+}
+
+test "side-table slab pool: slot/slab lookup is correct under multiple slabs" {
+    const Pool = ArcRuntime.ArcSlabPool(SideTablePair, "SideTable/multi-slab", true);
+    Pool.statsForTest().live = 0;
+    Pool.resetForTest();
+
+    // Allocate enough cells to spill into a second slab.
+    const slot_capacity = Pool.slot_capacity;
+    const total_cells: usize = @as(usize, slot_capacity) + 100;
+    const cells = try std.testing.allocator.alloc(*SideTablePair, total_cells);
+    defer std.testing.allocator.free(cells);
+
+    var allocate_index: usize = 0;
+    while (allocate_index < total_cells) : (allocate_index += 1) {
+        cells[allocate_index] = Pool.create();
+        cells[allocate_index].* = .{
+            .first = allocate_index,
+            .second = allocate_index * 2,
+        };
+        // Each cell starts at rc=1.
+        try std.testing.expectEqual(@as(u32, 1), Pool.refCount(cells[allocate_index]));
+    }
+
+    // Verify spans two distinct slabs (slabs are 64 KiB aligned).
+    const first_slab_addr = @intFromPtr(cells[0]) & ArcRuntime.SLAB_BASE_MASK;
+    const last_slab_addr = @intFromPtr(cells[total_cells - 1]) & ArcRuntime.SLAB_BASE_MASK;
+    try std.testing.expect(first_slab_addr != last_slab_addr);
+
+    // Retain one cell in each slab; ensure refcount is per-slot, not
+    // global. Pick the first cell (slab 0) and the last cell (slab 1).
+    Pool.retain(cells[0]);
+    try std.testing.expectEqual(@as(u32, 2), Pool.refCount(cells[0]));
+    try std.testing.expectEqual(@as(u32, 1), Pool.refCount(cells[1]));
+    try std.testing.expectEqual(@as(u32, 1), Pool.refCount(cells[total_cells - 1]));
+
+    Pool.retain(cells[total_cells - 1]);
+    try std.testing.expectEqual(@as(u32, 2), Pool.refCount(cells[total_cells - 1]));
+    try std.testing.expectEqual(@as(u32, 2), Pool.refCount(cells[0]));
+    try std.testing.expectEqual(@as(u32, 1), Pool.refCount(cells[1]));
+
+    // Restore rc to 1 for each retained cell.
+    try std.testing.expect(!Pool.release(cells[0]));
+    try std.testing.expect(!Pool.release(cells[total_cells - 1]));
+
+    // Verify values survived through retain/release storms.
+    var verify_index: usize = 0;
+    while (verify_index < total_cells) : (verify_index += 1) {
+        try std.testing.expectEqual(@as(u64, verify_index), cells[verify_index].first);
+        try std.testing.expectEqual(@as(u64, verify_index * 2), cells[verify_index].second);
+    }
+
+    // Release/destroy all cells.
+    var release_index: usize = 0;
+    while (release_index < total_cells) : (release_index += 1) {
+        try std.testing.expect(Pool.release(cells[release_index]));
+        Pool.destroy(cells[release_index]);
+    }
+
+    Pool.resetForTest();
+}
+
+test "side-table slab pool: deep-release reads children before slot freed" {
+    // The split-phase release contract guarantees that on a zero
+    // transition, the slot's contents (the user's T value) remain
+    // valid until `destroy` is called. This is the load-bearing
+    // property for deep-release of recursive types like Tree, which
+    // must read `t.left` / `t.right` BEFORE the parent's slot returns
+    // to the free list.
+    const Pool = ArcRuntime.ArcSlabPool(SideTableTreeLike, "SideTable/deep-release", true);
+    Pool.statsForTest().live = 0;
+    Pool.resetForTest();
+
+    const leaf_left = Pool.create();
+    leaf_left.* = .{ .left = null, .right = null };
+
+    const leaf_right = Pool.create();
+    leaf_right.* = .{ .left = null, .right = null };
+
+    const root = Pool.create();
+    root.* = .{ .left = leaf_left, .right = leaf_right };
+
+    // root is final owner of both leaves; rc on root drops 1 → 0;
+    // we must be able to read root.left and root.right after
+    // release/before destroy.
+    try std.testing.expect(Pool.release(root));
+    // The contract: at this point root's slot still holds the values.
+    const observed_left = root.left;
+    const observed_right = root.right;
+    try std.testing.expectEqual(leaf_left, observed_left);
+    try std.testing.expectEqual(leaf_right, observed_right);
+
+    // Now free the root slot, then walk through to release leaves.
+    Pool.destroy(root);
+
+    try std.testing.expect(Pool.release(leaf_left));
+    Pool.destroy(leaf_left);
+    try std.testing.expect(Pool.release(leaf_right));
+    Pool.destroy(leaf_right);
+
+    try std.testing.expectEqual(@as(u64, 0), Pool.statsForTest().live);
+
+    Pool.resetForTest();
+}
+
+test "side-table slab pool: hasInlineArcHeader types bypass the side table" {
+    // Map(K, V) and List(T) embed their own ArcHeader and own their own
+    // allocation pools (c_allocator-backed buffers). They never route
+    // through `ArcRuntime.allocAny`, `releaseAny`, etc. — verifying
+    // that the side-table path does not interfere with their refcount
+    // accounting is a contract test.
+    const MapI64 = Map(i64, i64);
+    const keys = [_]i64{ 1, 2 };
+    const vals = [_]i64{ 10, 20 };
+    const m = MapI64.fromPairs(&keys, &vals, 2) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer MapI64.release(m);
+
+    // Refcount lives in the Map's own `header` field; the generic
+    // refCountAny entry point routes inline-header types through the
+    // type's own header.count() rather than the side-table.
+    try std.testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(m));
+    try std.testing.expectEqual(@as(u32, 1), m.header.count());
+
+    // Retain through the generic entry point still touches the inline
+    // header, never the (nonexistent) side-table for this type.
+    ArcRuntime.retainAny(m);
+    try std.testing.expectEqual(@as(u32, 2), m.header.count());
+
+    // Restore rc to 1 before defer cleanup.
+    MapI64.release(m);
+}
+
+test "side-table slab pool: slot size equals sizeof(T) exactly" {
+    // The architectural payoff: a 16-byte `T` lands in a 16-byte slot
+    // (no embedded ArcHeader, no alignment padding inside the slot).
+    // For binarytrees `Tree` (two optional pointers = 16 bytes on a
+    // 64-bit platform), the previous `Arc(Tree).Inner` was 24 bytes
+    // (4-byte header + 4-byte align pad + 16-byte value). The new
+    // side-table layout pulls that back to a flat 16 bytes per slot
+    // plus 4 bytes side-table per slot — exactly the predicted
+    // savings.
+    const Pool = ArcRuntime.ArcSlabPool(SideTableTreeLike, "SideTable/sizeof-check", true);
+    comptime std.debug.assert(@sizeOf(SideTableTreeLike) == 16);
+    comptime std.debug.assert(Pool.HeaderType.slot_size == 16);
+
+    const Pool2 = ArcRuntime.ArcSlabPool(SideTablePair, "SideTable/sizeof-check-2", true);
+    comptime std.debug.assert(@sizeOf(SideTablePair) == 16);
+    comptime std.debug.assert(Pool2.HeaderType.slot_size == 16);
+}
+
+test "side-table slab pool: refcount table sized correctly per slab capacity" {
+    // The embedded refcounts array length must match the comptime
+    // capacity exposed by `Pool.slot_capacity`. If these ever drift
+    // (e.g., capacity computation rounds one way and array length
+    // another), slot indices near capacity would corrupt unrelated
+    // memory.
+    const Pool = ArcRuntime.ArcSlabPool(SideTableTreeLike, "SideTable/array-sizing", true);
+    const capacity = Pool.slot_capacity;
+    try std.testing.expect(capacity > 0);
+
+    // The refcounts array length must equal the pool capacity (this
+    // assertion is checked at comptime via the type's array length).
+    const HeaderType = Pool.HeaderType;
+    comptime std.debug.assert(HeaderType.fixed_capacity == HeaderType.capacityFor());
+
+    // Round-trip a slot at the last valid index. If the refcount array
+    // were undersized this access would corrupt slot data; if oversized
+    // capacity would shrink below what `slot_capacity` advertises.
+    Pool.statsForTest().live = 0;
+    Pool.resetForTest();
+
+    var allocations = try std.testing.allocator.alloc(*SideTableTreeLike, capacity);
+    defer std.testing.allocator.free(allocations);
+
+    var allocation_index: usize = 0;
+    while (allocation_index < capacity) : (allocation_index += 1) {
+        allocations[allocation_index] = Pool.create();
+        try std.testing.expectEqual(@as(u32, 1), Pool.refCount(allocations[allocation_index]));
+    }
+    try std.testing.expectEqual(@as(u64, capacity), Pool.statsForTest().live);
+
+    // Free all in reverse to exercise the free-list LIFO discipline at
+    // both ends of the refcounts array.
+    var free_index: usize = capacity;
+    while (free_index > 0) {
+        free_index -= 1;
+        try std.testing.expect(Pool.release(allocations[free_index]));
+        Pool.destroy(allocations[free_index]);
+    }
+    try std.testing.expectEqual(@as(u64, 0), Pool.statsForTest().live);
+
+    Pool.resetForTest();
 }
 
 // ============================================================
