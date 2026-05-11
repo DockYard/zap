@@ -1396,8 +1396,8 @@ fn shouldBorrow(
 ///   * dest is ARC-managed (`.owned` in `local_ownership`).
 ///   * dest's only use is a `tail_call` argument
 ///     (`tail_call_arg_use_count == total_use_count == 1`).
-///   * source's only use is this `.local_get`
-///     (`source.total_use_count == 1`).
+///   * source is at LAST-USE at this `.local_get`
+///     (path-sensitive: `ownership.isLastUseAt(source, local_get_id)`).
 ///
 /// Under these preconditions the move is safe:
 ///   * Source owns +1; the move transfers that ownership to dest
@@ -1411,17 +1411,39 @@ fn shouldBorrow(
 ///   * The callee's borrowing parameter convention does not
 ///     decrement the cell. Net per-iteration retain delta is 0.
 ///
+/// Path-sensitive last-use: a flat `source_counts.total_use_count == 1`
+/// check would over-reject when the source has earlier reads that
+/// are themselves last-uses on their own paths (e.g., a `borrow_value`
+/// used as a share-source for an intermediate call). Those earlier
+/// reads do not extend the source's live range past this `local_get`
+/// when the live-set dataflow has already cleared the source's bit
+/// before this point. Mirrors the path-sensitive refinement applied
+/// to `shouldMoveIntoOwnedConsume` (Phase 1.4) and
+/// `shouldMoveIntoAggregate`.
+///
 /// Without this discrimination, the conservative `.copy_value`
 /// emits a retain on source's cell that has no matching release
 /// (the post-call release was elided as a tail-call arg cleanup
 /// by the rewriter — see Phase E.6 / E.8 orphan-share fix). The
 /// missing release accumulates +1 per iteration, producing the
 /// exact pool-leak signature observed in Phase F's retry-3.
+///
+/// The spectral-norm cascade: `iterate`'s tail call to itself
+/// passes a destructured `v_after` (slot 1). Without path-sensitive
+/// last-use, the source's earlier read as a `borrow_value` for the
+/// previous `ata_times_u` call's share argument blocks the move,
+/// the classifier emits `copy_value` (refcount bumps to 2), and
+/// the dataflow downgrades the resulting dest to non-unique. The
+/// interprocedural fixpoint then cascades that demotion through
+/// `ata_times_u → at_times_u → List.set`, defeating 50% of the
+/// `List.set` calls' fast-path uniqueness rewrite.
 fn shouldMove(
     function: *const ir.Function,
     summary: *const UseSummary,
+    ownership: *const arc_liveness.ArcOwnership,
     dest: ir.LocalId,
     source: ir.LocalId,
+    local_get_id: arc_liveness.InstructionId,
 ) bool {
     // Dest must be ARC-managed; trivial dests get no ARC ops at all
     // and the move/copy distinction is moot.
@@ -1436,13 +1458,25 @@ fn shouldMove(
     if (dest_counts.total_use_count != 1) return false;
     if (dest_counts.tail_call_arg_use_count != 1) return false;
 
-    const source_counts = summary.get(source);
-    // Source's only use must be this `.local_get`. Any other use
-    // means the cell needs to live past the move site, requiring
-    // a `.copy_value` to retain across uses.
-    if (source_counts.total_use_count != 1) return false;
-
-    return true;
+    // Path-sensitive last-use: the source must be dead immediately
+    // after this read on the local_get's execution path. Multiple
+    // last-use sites per source (one per branch of an if/case where
+    // the binding is read in every arm) all satisfy this predicate
+    // independently, mirroring the live-set dataflow's per-arm
+    // answer. A flat `source.total_use_count == 1` would over-reject
+    // when the source has earlier reads (e.g., a `borrow_value`)
+    // whose own last-use site lies before this local_get.
+    //
+    // Fallback to the flat `total_use_count == 1` check when the
+    // analyzer has no `last_use_sites` populated (typical of unit
+    // tests with hand-rolled IR). The flat check is sound but
+    // strictly weaker; production code paths always provide a
+    // populated ownership table.
+    if (ownership.last_use_sites.count() == 0) {
+        const source_counts = summary.get(source);
+        return source_counts.total_use_count == 1;
+    }
+    return ownership.isLastUseAt(source, local_get_id);
 }
 
 /// Phase E.10: decide whether a `.local_get{dest, source}` should
@@ -1669,16 +1703,17 @@ const StreamRewriter = struct {
                         {
                             self.function.local_ownership[lg.dest] = .borrowed;
                         }
-                    } else if (shouldMove(self.function, self.use_summary, lg.dest, lg.source)) {
-                        // Phase E.8: dest's only use is a tail_call
-                        // arg AND source's only use is this read.
-                        // Emit `.move_value` to transfer ownership
-                        // without a retain. The arc_liveness forward
-                        // dataflow on `.move_value` clears source's
-                        // owned bit and sets dest's, so no scope-
-                        // exit release fires for source; the
-                        // tail_call arg-set handling already
-                        // suppresses the destroy on dest.
+                    } else if (shouldMove(self.function, self.use_summary, self.ownership, lg.dest, lg.source, local_get_id)) {
+                        // Phase E.8 + Phase 1.4 path-sensitive refinement:
+                        // dest's only use is a tail_call arg AND
+                        // source is at last-use here. Emit
+                        // `.move_value` to transfer ownership without
+                        // a retain. The arc_liveness forward dataflow
+                        // on `.move_value` clears source's owned bit
+                        // and sets dest's, so no scope-exit release
+                        // fires for source; the tail_call arg-set
+                        // handling already suppresses the destroy on
+                        // dest.
                         try new_instrs.append(self.allocator, .{
                             .move_value = .{ .dest = lg.dest, .source = lg.source },
                         });
@@ -1771,7 +1806,7 @@ const StreamRewriter = struct {
                         {
                             self.function.local_ownership[bv.dest] = .owned;
                         }
-                        if (shouldMove(self.function, self.use_summary, bv.dest, bv.source)) {
+                        if (shouldMove(self.function, self.use_summary, self.ownership, bv.dest, bv.source, local_get_id)) {
                             try new_instrs.append(self.allocator, .{
                                 .move_value = .{ .dest = bv.dest, .source = bv.source },
                             });
