@@ -1374,7 +1374,7 @@ const Analyzer = struct {
             try self.synthesizeReturnPendingByFunction(function.id, args, dest, pre_arg_unique);
             return;
         }
-        if (functionIsFreshAllocatorWrapper(function)) {
+        if (functionIsFreshAllocatorWrapperWithProgram(function, self.program)) {
             try self.unique.put(self.allocator, dest, {});
             return;
         }
@@ -1473,7 +1473,7 @@ const Analyzer = struct {
         const program = self.program orelse return false;
         for (program.functions) |*func| {
             if (std.mem.eql(u8, func.name, name)) {
-                return functionIsFreshAllocatorWrapper(func);
+                return functionIsFreshAllocatorWrapperWithProgram(func, program);
             }
         }
         return false;
@@ -1494,24 +1494,67 @@ const Analyzer = struct {
 /// result as `definitely_unique`.
 ///
 /// The check is structural: walk every instruction in the function's
-/// body; if exactly ONE `call_builtin` exists and its name passes
-/// `arc_liveness.isFreshAllocatorBuiltin`, AND the function's
-/// `result_convention == .owned`, the function is a fresh-allocator
-/// wrapper. Multiple call_builtin sites or a body shape that doesn't
-/// terminate in the allocator's dest disqualify the function (the
-/// safe default).
+/// body. The wrapper is fresh when its body contains EXACTLY ONE
+/// allocator-producing call site (either a `call_builtin` that passes
+/// `arc_liveness.isFreshAllocatorBuiltin`, or a `call_named`/`call_direct`
+/// whose target is ITSELF a fresh-allocator wrapper) and zero other
+/// non-fresh calls. Transitive recognition is essential for benchmark
+/// patterns like `ones(n) -> List.new_filled(n, 1.0)` where the user
+/// wraps the runtime allocator in a thin Zap helper — without
+/// transitive recognition, every such wrapper's caller observes a
+/// non-unique result and the uniqueness fixpoint cascades demotions
+/// through the rest of the program.
+///
+/// The function's `result_convention == .owned` is also required, since
+/// only ARC-managed returns participate in uniqueness analysis.
 ///
 /// We don't require the ret to literally be `value=allocator_dest`
 /// because the IR builder may emit local_set/move chains between the
-/// call and the ret. The single-call-builtin invariant plus
-/// `result_convention == .owned` is sufficient.
+/// call and the ret. The single-call invariant plus `result_convention
+/// == .owned` is sufficient.
+///
+/// Recursion safety: cycles among Zap-fn wrappers (e.g. mutual
+/// recursion that ends up calling List.new_filled at some depth) are
+/// not legitimate fresh-allocator chains — fresh allocator semantics
+/// require a syntactically-bounded call depth. The recursion depth is
+/// capped at a small constant; chains exceeding the cap are rejected
+/// (the safe default). The cap also prevents stack overflow on
+/// pathological IR shapes.
 pub fn functionIsFreshAllocatorWrapper(function: *const ir.Function) bool {
+    return functionIsFreshAllocatorWrapperWithProgram(function, null);
+}
+
+/// Transitive variant: when `program` is non-null, calls to other Zap
+/// functions are followed and recognised as fresh when the callee is
+/// itself a fresh-allocator wrapper. Without `program`, only direct
+/// `call_builtin` to a runtime allocator counts (the legacy behaviour).
+pub fn functionIsFreshAllocatorWrapperWithProgram(
+    function: *const ir.Function,
+    program: ?*const ir.Program,
+) bool {
+    return functionIsFreshAllocatorWrapperWithDepth(function, program, 0);
+}
+
+/// Maximum chain depth for transitive fresh-allocator recognition.
+/// In practice the deepest legitimate chain is 1–2 hops (user wrapper
+/// around runtime intrinsic). The cap defends against pathological IR
+/// shapes and recursive cycles.
+const FRESH_ALLOCATOR_MAX_DEPTH: usize = 8;
+
+fn functionIsFreshAllocatorWrapperWithDepth(
+    function: *const ir.Function,
+    program: ?*const ir.Program,
+    depth: usize,
+) bool {
     if (function.result_convention != .owned) return false;
+    if (depth >= FRESH_ALLOCATOR_MAX_DEPTH) return false;
     var allocator_count: usize = 0;
     var other_call_count: usize = 0;
     var ctx = AllocatorWrapperScan{
         .allocator_count = &allocator_count,
         .other_call_count = &other_call_count,
+        .program = program,
+        .depth = depth,
     };
     for (function.body) |block| {
         scanAllocatorWrapperStream(block.instructions, &ctx);
@@ -1522,7 +1565,29 @@ pub fn functionIsFreshAllocatorWrapper(function: *const ir.Function) bool {
 const AllocatorWrapperScan = struct {
     allocator_count: *usize,
     other_call_count: *usize,
+    /// Optional program reference. When non-null, `call_named` /
+    /// `call_direct` targets are resolved and (transitively) checked
+    /// via `functionIsFreshAllocatorWrapperWithDepth`. When null, every
+    /// non-builtin call counts as "other".
+    program: ?*const ir.Program = null,
+    /// Current recursion depth. Passed to nested calls so transitive
+    /// chains observe the same cap.
+    depth: usize = 0,
 };
+
+fn lookupProgramFunctionByName(program: *const ir.Program, name: []const u8) ?*const ir.Function {
+    for (program.functions) |*func| {
+        if (std.mem.eql(u8, func.name, name)) return func;
+    }
+    return null;
+}
+
+fn lookupProgramFunctionById(program: *const ir.Program, function_id: ir.FunctionId) ?*const ir.Function {
+    for (program.functions) |*func| {
+        if (func.id == function_id) return func;
+    }
+    return null;
+}
 
 fn scanAllocatorWrapperStream(
     stream: []const ir.Instruction,
@@ -1537,9 +1602,35 @@ fn scanAllocatorWrapperStream(
                     ctx.other_call_count.* += 1;
                 }
             },
-            // Any other call shape is "other" — the wrapper is no
-            // longer a thin forward.
-            .call_named, .call_direct, .try_call_named, .call_dispatch, .call_closure, .tail_call => {
+            // For Zap function calls, follow the chain when the program
+            // is available: a call to another fresh-allocator wrapper
+            // counts as an allocator call, not an "other" call. This
+            // is the transitive recognition that lets benchmark
+            // helpers like `ones(n) -> List.new_filled(n, 1.0)` flow
+            // through to callers as fresh allocations.
+            .call_named => |cn| {
+                if (ctx.program) |program| {
+                    if (lookupProgramFunctionByName(program, cn.name)) |target| {
+                        if (functionIsFreshAllocatorWrapperWithDepth(target, ctx.program, ctx.depth + 1)) {
+                            ctx.allocator_count.* += 1;
+                            continue;
+                        }
+                    }
+                }
+                ctx.other_call_count.* += 1;
+            },
+            .call_direct => |cd| {
+                if (ctx.program) |program| {
+                    if (lookupProgramFunctionById(program, cd.function)) |target| {
+                        if (functionIsFreshAllocatorWrapperWithDepth(target, ctx.program, ctx.depth + 1)) {
+                            ctx.allocator_count.* += 1;
+                            continue;
+                        }
+                    }
+                }
+                ctx.other_call_count.* += 1;
+            },
+            .try_call_named, .call_dispatch, .call_closure, .tail_call => {
                 ctx.other_call_count.* += 1;
             },
             .if_expr => |ie| {

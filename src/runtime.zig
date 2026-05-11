@@ -179,15 +179,85 @@ var runtime_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.he
 var original_termios: std.posix.termios = undefined;
 var raw_mode_saved: bool = false;
 
+// ============================================================
+// bumpAlloc instrumentation
+//
+// Tracks total bytes and per-callsite breakdown for arena allocations.
+// Gated by env var `ZAP_BUMP_STATS=1` for emission; counters always
+// update so the cost is one branchless atomic-free add per call. The
+// arena on macOS lacks `mremap`, so old arena nodes pin until process
+// exit — total bytes allocated equals (or exceeds) peak RSS contribution,
+// and the per-callsite breakdown identifies which path produced the
+// pages that never get freed.
+// ============================================================
+
+pub var bump_bytes_total: u64 = 0;
+pub var bump_calls_total: u64 = 0;
+
+/// Per-callsite breakdown. The tag enum corresponds to logical
+/// allocation classes — adjust if a new high-volume callsite needs
+/// distinct tracking.
+pub const BumpSite = enum(u8) {
+    other = 0,
+    string_concat = 1,
+    string_upcase = 2,
+    string_downcase = 3,
+    string_reverse = 4,
+    string_replace = 5,
+    string_pad_leading = 6,
+    string_pad_trailing = 7,
+    string_repeat = 8,
+    string_capitalize = 9,
+    string_split = 10,
+    string_join = 11,
+    interpolate_int = 12,
+    interpolate_float = 13,
+    integer_to_string = 14,
+    float_to_string = 15,
+    float_to_string_precision = 16,
+    io_gets = 17,
+    io_try_get_char = 18,
+    io_get_char = 19,
+    file_read = 20,
+    path_join = 21,
+    system_cwd = 22,
+    system_get_env = 23,
+    vector_sort = 24,
+    list_concat_outer = 25,
+    misc_slice = 26,
+};
+
+const BUMP_SITE_COUNT: usize = @typeInfo(BumpSite).@"enum".fields.len;
+
+pub var bump_site_bytes: [BUMP_SITE_COUNT]u64 = .{0} ** BUMP_SITE_COUNT;
+pub var bump_site_calls: [BUMP_SITE_COUNT]u64 = .{0} ** BUMP_SITE_COUNT;
+
+inline fn recordBump(site: BumpSite, len: usize) void {
+    bump_bytes_total += @as(u64, len);
+    bump_calls_total += 1;
+    const idx: usize = @intFromEnum(site);
+    bump_site_bytes[idx] += @as(u64, len);
+    bump_site_calls[idx] += 1;
+}
+
 fn bumpAlloc(len: usize) []u8 {
     // Use alignedAlloc with pointer alignment (8 on 64-bit) so that bump-allocated
     // memory can safely be cast to pointer types via @ptrCast(@alignCast(...)).
     const aligned = runtime_arena.allocator().alignedAlloc(u8, .@"8", len) catch return &.{};
+    recordBump(.other, len);
+    return @alignCast(aligned);
+}
+
+fn bumpAllocAt(comptime site: BumpSite, len: usize) []u8 {
+    const aligned = runtime_arena.allocator().alignedAlloc(u8, .@"8", len) catch return &.{};
+    recordBump(site, len);
     return @alignCast(aligned);
 }
 
 fn bumpAllocSlice(comptime T: type, len: usize) []T {
-    return runtime_arena.allocator().alloc(T, len) catch return &.{};
+    const slice = runtime_arena.allocator().alloc(T, len) catch return &.{};
+    recordBump(.other, len * @sizeOf(T));
+    return slice;
 }
 
 pub fn resetAllocator() void {
@@ -367,6 +437,18 @@ pub var dense_map_mut_calls_total: u64 = 0;
 /// skipped the `header.count() == 1` branch entirely. Comparing
 /// against `dense_map_mut_calls_total` gives the uniqueness-coverage ratio.
 pub var dense_map_unchecked_total: u64 = 0;
+/// Total dense-Map `cloneBufferRetainingChildren` calls — every time
+/// we have to deep-retain-clone a Map buffer because a put/delete saw
+/// shared ownership. Each clone is one full c_allocator allocation
+/// proportional to the Map's capacity, so this counter directly
+/// surfaces leak-shaped allocation pressure that escapes the rc=1
+/// fast path.
+pub var dense_map_retaining_clone_total: u64 = 0;
+/// Total dense-Map clone bytes — sum of buffer sizes for every
+/// `cloneBufferRetainingChildren` call. The difference between this
+/// and the steady-state Map size shows how much c_allocator traffic
+/// shared-clone shape is producing.
+pub var dense_map_retaining_clone_bytes: u64 = 0;
 /// Number of `List.set/push/pop/append` calls that took the rc-1
 /// fast path (mutated the receiver in place rather than cloning).
 pub var list_rc1_fast_path_total: u64 = 0;
@@ -379,6 +461,30 @@ pub var list_mut_calls_total: u64 = 0;
 /// uniqueness proved statically uniquely owned. See
 /// `dense_map_unchecked_total` for the symmetric meaning on Maps.
 pub var list_unchecked_total: u64 = 0;
+/// Total List `cons` calls — `[head | tail]` syntax. Each cons
+/// allocates a fresh buffer of size `tail_len + 1` and copies all of
+/// `tail` into it, even on rc=1 ownership. High-volume cons traffic
+/// in the user program creates intermediate buffers that may not be
+/// freed quickly enough by the c_allocator (depending on call
+/// patterns), so this counter exposes whether the workload depends
+/// on cons.
+pub var list_cons_calls_total: u64 = 0;
+pub var list_cons_alloc_bytes: u64 = 0;
+/// Total List `cloneBufferRetainingChildren` calls — the shared-path
+/// clone that happens when push/append/set sees a multi-owner List.
+/// Surfaces leak shapes that escape rc=1 fast paths.
+pub var list_retaining_clone_total: u64 = 0;
+pub var list_retaining_clone_bytes: u64 = 0;
+/// List release that did NOT bring rc to zero (the cell stays
+/// alive). When this count is high relative to allocations, the
+/// program is holding shared owners somewhere and freed buffers
+/// piling up at MALLOC_SMALL level is the visible symptom.
+pub var list_release_kept_alive_total: u64 = 0;
+/// List release that did bring rc to zero (the buffer is freed).
+pub var list_release_freed_total: u64 = 0;
+pub var list_cons_rc1_inplace_total: u64 = 0;
+pub var list_cons_rc1_grow_total: u64 = 0;
+pub var list_cons_shared_total: u64 = 0;
 
 /// Per-pool live-cell statistics. Each pool wrapper (e.g.
 /// `ArcRuntime.ArcPool(T)`, `List(T).SelfPool`, `Map(K,V).SelfPool`)
@@ -448,6 +554,12 @@ pub fn dumpArcStats(write_line: *const fn ([]const u8) void) void {
     })) |line| {
         write_line(line);
     } else |_| {}
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] dense_map_retaining_clone_total={d} dense_map_retaining_clone_bytes={d}\n", .{
+        dense_map_retaining_clone_total,
+        dense_map_retaining_clone_bytes,
+    })) |line| {
+        write_line(line);
+    } else |_| {}
     if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] list_mut_calls_total={d} list_rc1_fast_path_total={d} list_unchecked_total={d}\n", .{
         list_mut_calls_total,
         list_rc1_fast_path_total,
@@ -455,6 +567,49 @@ pub fn dumpArcStats(write_line: *const fn ([]const u8) void) void {
     })) |line| {
         write_line(line);
     } else |_| {}
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] list_cons_calls_total={d} list_cons_alloc_bytes={d}\n", .{
+        list_cons_calls_total,
+        list_cons_alloc_bytes,
+    })) |line| {
+        write_line(line);
+    } else |_| {}
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] list_cons_rc1_inplace_total={d} list_cons_rc1_grow_total={d} list_cons_shared_total={d}\n", .{
+        list_cons_rc1_inplace_total,
+        list_cons_rc1_grow_total,
+        list_cons_shared_total,
+    })) |line| {
+        write_line(line);
+    } else |_| {}
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] list_retaining_clone_total={d} list_retaining_clone_bytes={d}\n", .{
+        list_retaining_clone_total,
+        list_retaining_clone_bytes,
+    })) |line| {
+        write_line(line);
+    } else |_| {}
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] list_release_kept_alive_total={d} list_release_freed_total={d}\n", .{
+        list_release_kept_alive_total,
+        list_release_freed_total,
+    })) |line| {
+        write_line(line);
+    } else |_| {}
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] bump_calls_total={d} bump_bytes_total={d}\n", .{
+        bump_calls_total,
+        bump_bytes_total,
+    })) |line| {
+        write_line(line);
+    } else |_| {}
+    inline for (@typeInfo(BumpSite).@"enum".fields) |field| {
+        const idx: usize = field.value;
+        if (bump_site_calls[idx] != 0) {
+            if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] bump_site={s} calls={d} bytes={d}\n", .{
+                field.name,
+                bump_site_calls[idx],
+                bump_site_bytes[idx],
+            })) |line| {
+                write_line(line);
+            } else |_| {}
+        }
+    }
     var cursor = pool_stats_head;
     while (cursor) |stats| : (cursor = stats.next) {
         if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] pool={s} live={d} high_water={d}\n", .{
@@ -1830,7 +1985,11 @@ pub fn List(comptime T: type) type {
             const v = vec.?;
             const mut: *Self = @constCast(v);
             arc_releases_total += 1;
-            if (!mut.header.release()) return;
+            if (!mut.header.release()) {
+                list_release_kept_alive_total += 1;
+                return;
+            }
+            list_release_freed_total += 1;
             mut.bufferFreeDeep();
         }
 
@@ -1851,6 +2010,8 @@ pub fn List(comptime T: type) type {
         fn cloneBufferRetainingChildren(self: *const Self, new_capacity: u32) ?*Self {
             std.debug.assert(new_capacity >= self.len);
             const fresh = bufferAlloc(new_capacity, self.len) orelse return null;
+            list_retaining_clone_total += 1;
+            list_retaining_clone_bytes += bufferSize(new_capacity);
             const old_data = self.dataPtr();
             const new_data = fresh.dataPtr();
             for (0..self.len) |i| {
@@ -2196,24 +2357,97 @@ pub fn List(comptime T: type) type {
             return append(a, b);
         }
 
-        /// Construct `head :: tail`, returning a fresh flat buffer.
-        /// `head` and `tail` are consumed. Tail elements are retained
-        /// into the new buffer before the consumed tail owner is
-        /// released.
+        /// Construct `head :: tail`, returning the resulting flat
+        /// buffer. `head` and `tail` are consumed.
+        ///
+        /// Refcount-aware fast paths:
+        ///   * `tail == null` — allocate a fresh single-element
+        ///     buffer; no allocation when an empty buffer is reused
+        ///     downstream.
+        ///   * `tail.rc == 1` and `tail.cap > tail.len` — shift
+        ///     elements right by one slot and write `head` into
+        ///     slot 0. No allocation, no per-element retain — the
+        ///     existing buffer is reused and returned. Elements were
+        ///     already owned by `tail` so the ARC counts are
+        ///     unchanged.
+        ///   * `tail.rc == 1` and `tail.cap == tail.len` — allocate a
+        ///     larger buffer at `pickCapacity(tail.cap, tail.len + 1)`,
+        ///     move elements verbatim (no retain — ownership transfers
+        ///     to the new buffer), free the old buffer shallowly. This
+        ///     keeps `cons` accumulators amortized O(log n) total
+        ///     allocations instead of O(n) — matching the growth
+        ///     pattern of `push`.
+        ///   * `tail.rc > 1` — fallback to the historical
+        ///     deep-retain clone: allocate a fresh buffer sized to
+        ///     `tail.len + 1`, deep-retain copy every element, then
+        ///     release the borrowed tail owner.
+        ///
+        /// The rc-aware fast paths mirror `List.push` and
+        /// `Map.put`'s uniqueness fast paths. Without them, every
+        /// `[head | tail]` in a tight loop would copy the entire
+        /// tail even when the caller had unique ownership — a
+        /// quadratic-allocation shape that pinned multi-GB of
+        /// c_allocator buffers in benchmarks like k-nucleotide.
         pub fn cons(head: T, tail: ?*const Self) ?*const Self {
-            const tail_len: u32 = if (tail) |t| t.len else 0;
-            const fresh = bufferAlloc(pickCapacity(0, tail_len + 1), tail_len + 1) orelse return null;
+            list_cons_calls_total += 1;
+            if (tail == null) {
+                const fresh_cap = pickCapacity(0, 1);
+                const fresh = bufferAlloc(fresh_cap, 1) orelse return null;
+                list_cons_alloc_bytes += bufferSize(fresh_cap);
+                fresh.dataPtr()[0] = head;
+                return fresh;
+            }
+            const t = tail.?;
+            if (t.header.count() == 1) {
+                const mut: *Self = @constCast(t);
+                if (mut.cap > mut.len) {
+                    list_cons_rc1_inplace_total += 1;
+                    // In-place shift: move elements right by one, then
+                    // write head at slot 0. No buffer allocation.
+                    const data = mut.dataPtr();
+                    var i: u32 = mut.len;
+                    while (i > 0) : (i -= 1) {
+                        data[i] = data[i - 1];
+                    }
+                    data[0] = head;
+                    mut.len += 1;
+                    return mut;
+                }
+                list_cons_rc1_grow_total += 1;
+                // Need to grow. Move children to a fresh larger
+                // buffer (no per-element retain — children transfer
+                // verbatim), shift them into slot 1.. and put head at
+                // slot 0, then free the old buffer shallowly.
+                const new_cap = pickCapacity(mut.cap, mut.len + 1);
+                const grown = bufferAlloc(new_cap, mut.len + 1) orelse return null;
+                list_cons_alloc_bytes += bufferSize(new_cap);
+                const old_data = mut.dataPtr();
+                const new_data = grown.dataPtr();
+                new_data[0] = head;
+                var i: u32 = 0;
+                while (i < mut.len) : (i += 1) {
+                    new_data[i + 1] = old_data[i];
+                }
+                mut.bufferFreeShallow();
+                return grown;
+            }
+            list_cons_shared_total += 1;
+            // Shared: deep-retain clone with an exact-fit capacity.
+            // Each element gets a fresh retain since the source map
+            // stays valid.
+            const tail_len: u32 = t.len;
+            const fresh_cap = pickCapacity(0, tail_len + 1);
+            const fresh = bufferAlloc(fresh_cap, tail_len + 1) orelse return null;
+            list_cons_alloc_bytes += bufferSize(fresh_cap);
             const data = fresh.dataPtr();
             data[0] = head;
-            if (tail) |t| {
-                const tail_data = t.dataPtr();
-                var i: u32 = 0;
-                while (i < t.len) : (i += 1) {
-                    data[i + 1] = tail_data[i];
-                    retainElement(tail_data[i]);
-                }
-                release(tail);
+            const tail_data = t.dataPtr();
+            var i: u32 = 0;
+            while (i < tail_len) : (i += 1) {
+                data[i + 1] = tail_data[i];
+                retainElement(tail_data[i]);
             }
+            release(tail);
             return fresh;
         }
 
@@ -3104,7 +3338,7 @@ pub const String = struct {
     /// runtime arena. Zap-emitted code calls this directly because Zap
     /// has no notion of allocators at the call site.
     pub fn concat(a: []const u8, b: []const u8) []const u8 {
-        const result = bumpAlloc(a.len + b.len);
+        const result = bumpAllocAt(.string_concat, a.len + b.len);
         if (result.len == 0) return a; // fallback: return first string
         @memcpy(result[0..a.len], a);
         @memcpy(result[a.len..], b);
@@ -3193,7 +3427,7 @@ pub const String = struct {
     }
 
     pub fn upcase(s: []const u8) []const u8 {
-        const result = bumpAlloc(s.len);
+        const result = bumpAllocAt(.string_upcase, s.len);
         if (result.len == 0) return s;
         for (s, 0..) |c, i| {
             result[i] = if (c >= 'a' and c <= 'z') c - 32 else c;
@@ -3202,7 +3436,7 @@ pub const String = struct {
     }
 
     pub fn downcase(s: []const u8) []const u8 {
-        const result = bumpAlloc(s.len);
+        const result = bumpAllocAt(.string_downcase, s.len);
         if (result.len == 0) return s;
         for (s, 0..) |c, i| {
             result[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
@@ -3212,7 +3446,7 @@ pub const String = struct {
 
     pub fn reverse_string(s: []const u8) []const u8 {
         if (s.len == 0) return s;
-        const result = bumpAlloc(s.len);
+        const result = bumpAllocAt(.string_reverse, s.len);
         if (result.len == 0) return s;
         for (s, 0..) |c, i| {
             result[s.len - 1 - i] = c;
@@ -3234,7 +3468,7 @@ pub const String = struct {
         }
         if (count == 0) return s;
         const new_len = s.len - (count * pattern.len) + (count * replacement.len);
-        const result = bumpAlloc(new_len);
+        const result = bumpAllocAt(.string_replace, new_len);
         if (result.len == 0) return s;
         var src: usize = 0;
         var dst: usize = 0;
@@ -3265,7 +3499,7 @@ pub const String = struct {
         const target: usize = if (total_len > 0) @intCast(total_len) else return s;
         if (s.len >= target) return s;
         const pad_count = target - s.len;
-        const result = bumpAlloc(target);
+        const result = bumpAllocAt(.string_pad_leading, target);
         if (result.len == 0) return s;
         const fill: u8 = if (pad_char.len > 0) pad_char[0] else ' ';
         @memset(result[0..pad_count], fill);
@@ -3276,7 +3510,7 @@ pub const String = struct {
     pub fn pad_trailing(s: []const u8, total_len: i64, pad_char: []const u8) []const u8 {
         const target: usize = if (total_len > 0) @intCast(total_len) else return s;
         if (s.len >= target) return s;
-        const result = bumpAlloc(target);
+        const result = bumpAllocAt(.string_pad_trailing, target);
         if (result.len == 0) return s;
         @memcpy(result[0..s.len], s);
         const fill: u8 = if (pad_char.len > 0) pad_char[0] else ' ';
@@ -3287,7 +3521,7 @@ pub const String = struct {
     pub fn repeat_string(s: []const u8, count: i64) []const u8 {
         if (count <= 0 or s.len == 0) return "";
         const n: usize = @intCast(count);
-        const result = bumpAlloc(s.len * n);
+        const result = bumpAllocAt(.string_repeat, s.len * n);
         if (result.len == 0) return s;
         for (0..n) |i| {
             @memcpy(result[i * s.len .. (i + 1) * s.len], s);
@@ -3297,7 +3531,7 @@ pub const String = struct {
 
     pub fn capitalize(s: []const u8) []const u8 {
         if (s.len == 0) return s;
-        const result = bumpAlloc(s.len);
+        const result = bumpAllocAt(.string_capitalize, s.len);
         if (result.len == 0) return s;
         result[0] = if (s[0] >= 'a' and s[0] <= 'z') s[0] - 32 else s[0];
         for (s[1..], 0..) |c, i| {
@@ -3339,7 +3573,7 @@ pub const String = struct {
         while (pos < s.len) {
             if (pos + delimiter.len <= s.len and std.mem.eql(u8, s[pos .. pos + delimiter.len], delimiter)) {
                 const seg = s[seg_start..pos];
-                const seg_copy = bumpAlloc(seg.len);
+                const seg_copy = bumpAllocAt(.string_split, seg.len);
                 if (seg_copy.len > 0) @memcpy(seg_copy, seg);
                 result = List([]const u8).push(result, seg_copy);
                 pos += delimiter.len;
@@ -3349,7 +3583,7 @@ pub const String = struct {
             }
         }
         const last_seg = s[seg_start..];
-        const last_copy = bumpAlloc(last_seg.len);
+        const last_copy = bumpAllocAt(.string_split, last_seg.len);
         if (last_copy.len > 0) @memcpy(last_copy, last_seg);
         result = List([]const u8).push(result, last_copy);
         return result;
@@ -3366,7 +3600,7 @@ pub const String = struct {
             total += List([]const u8).get(list, @intCast(index)).len;
         }
         total += separator.len * (count - 1);
-        const result = bumpAlloc(total);
+        const result = bumpAllocAt(.string_join, total);
         if (result.len == 0) return "";
         var dst: usize = 0;
         var first = true;
@@ -3470,14 +3704,14 @@ pub const Kernel = struct {
         } else if (info == .int or info == .comptime_int) {
             var buf: [64]u8 = undefined;
             const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-            const result = bumpAlloc(slice.len);
+            const result = bumpAllocAt(.interpolate_int, slice.len);
             if (result.len == 0) return "?";
             @memcpy(result, slice);
             return result;
         } else if (info == .float or info == .comptime_float) {
             var buf: [64]u8 = undefined;
             const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-            const result = bumpAlloc(slice.len);
+            const result = bumpAllocAt(.interpolate_float, slice.len);
             if (result.len == 0) return "?";
             @memcpy(result, slice);
             return result;
@@ -5564,6 +5798,8 @@ pub fn Map(comptime K: type, comptime V: type) type {
             std.debug.assert(std.math.isPowerOfTwo(new_capacity));
             std.debug.assert(new_capacity >= self.len);
             const fresh = bufferAlloc(new_capacity, self.hash_seed, creation_callsite) orelse return null;
+            dense_map_retaining_clone_total += 1;
+            dense_map_retaining_clone_bytes += bufferSize(new_capacity, new_capacity);
 
             const old_entries = self.entriesPtr();
             const new_entries = fresh.entriesPtr();
@@ -6451,7 +6687,7 @@ pub const Integer = struct {
     fn formatSignedDecimal(value: i128) []const u8 {
         var buf: [128]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-        const result = bumpAlloc(slice.len);
+        const result = bumpAllocAt(.integer_to_string, slice.len);
         if (result.len == 0) return "?";
         @memcpy(result, slice);
         return result;
@@ -6460,7 +6696,7 @@ pub const Integer = struct {
     fn formatUnsignedDecimal(value: u128) []const u8 {
         var buf: [128]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-        const result = bumpAlloc(slice.len);
+        const result = bumpAllocAt(.integer_to_string, slice.len);
         if (result.len == 0) return "?";
         @memcpy(result, slice);
         return result;
@@ -7989,7 +8225,7 @@ pub const Float = struct {
     pub fn to_string_f16(value: f16) []const u8 {
         var buf: [64]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-        const result = bumpAlloc(slice.len);
+        const result = bumpAllocAt(.float_to_string, slice.len);
         if (result.len == 0) return "?";
         @memcpy(result, slice);
         return result;
@@ -7998,7 +8234,7 @@ pub const Float = struct {
     pub fn to_string_f32(value: f32) []const u8 {
         var buf: [64]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-        const result = bumpAlloc(slice.len);
+        const result = bumpAllocAt(.float_to_string, slice.len);
         if (result.len == 0) return "?";
         @memcpy(result, slice);
         return result;
@@ -8007,7 +8243,7 @@ pub const Float = struct {
     pub fn to_string_f64(value: f64) []const u8 {
         var buf: [64]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-        const result = bumpAlloc(slice.len);
+        const result = bumpAllocAt(.float_to_string, slice.len);
         if (result.len == 0) return "?";
         @memcpy(result, slice);
         return result;
@@ -8023,7 +8259,7 @@ pub const Float = struct {
         var buf: [128]u8 = undefined;
         const d: usize = if (decimals < 0) 0 else if (decimals > 32) 32 else @intCast(decimals);
         const slice = std.fmt.bufPrint(&buf, "{d:.[1]}", .{ value, d }) catch return "?";
-        const result = bumpAlloc(slice.len);
+        const result = bumpAllocAt(.float_to_string_precision, slice.len);
         if (result.len == 0) return "?";
         @memcpy(result, slice);
         return result;
@@ -8213,7 +8449,7 @@ pub const Float = struct {
     pub fn to_string_f80(value: f80) []const u8 {
         var buf: [128]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-        const result = bumpAlloc(slice.len);
+        const result = bumpAllocAt(.float_to_string, slice.len);
         if (result.len == 0) return "?";
         @memcpy(result, slice);
         return result;
@@ -8222,7 +8458,7 @@ pub const Float = struct {
     pub fn to_string_f128(value: f128) []const u8 {
         var buf: [128]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-        const result = bumpAlloc(slice.len);
+        const result = bumpAllocAt(.float_to_string, slice.len);
         if (result.len == 0) return "?";
         @memcpy(result, slice);
         return result;
@@ -8983,7 +9219,7 @@ pub const IO = struct {
         // Strip trailing \r if present (Windows line endings)
         if (len > 0 and buf[len - 1] == '\r') len -= 1;
         if (len == 0) return "";
-        const result = bumpAlloc(len);
+        const result = bumpAllocAt(.io_gets, len);
         if (result.len == 0) return "";
         @memcpy(result, buf[0..len]);
         return result;
@@ -9033,7 +9269,7 @@ pub const IO = struct {
         var one_buf = [_]u8{0};
         const n = posixRead(STDIN_FD, &one_buf);
         if (n == 0) return "";
-        const result_buf = bumpAlloc(1);
+        const result_buf = bumpAllocAt(.io_try_get_char, 1);
         if (result_buf.len == 0) return "";
         result_buf[0] = one_buf[0];
         return result_buf;
@@ -9046,7 +9282,7 @@ pub const IO = struct {
         var one_buf = [_]u8{0};
         const n = posixRead(STDIN_FD, &one_buf);
         if (n == 0) return "";
-        const result = bumpAlloc(1);
+        const result = bumpAllocAt(.io_get_char, 1);
         if (result.len == 0) return "";
         result[0] = one_buf[0];
         return result;
@@ -9177,7 +9413,7 @@ pub const File = struct {
         const file_size: usize = @intCast(@max(stat.size, 0));
         if (file_size == 0) return "";
         const read_size = @min(file_size, 1024 * 1024);
-        const result = bumpAlloc(read_size);
+        const result = bumpAllocAt(.file_read, read_size);
         if (result.len == 0) return "";
         var total: usize = 0;
         while (total < read_size) {
@@ -9477,7 +9713,7 @@ pub const Path = struct {
         if (b.len == 0) return a;
         const need_sep = a[a.len - 1] != '/';
         const total = a.len + b.len + @as(usize, if (need_sep) 1 else 0);
-        const result = bumpAlloc(total);
+        const result = bumpAllocAt(.path_join, total);
         if (result.len == 0) return "";
         @memcpy(result[0..a.len], a);
         if (need_sep) {
@@ -9528,7 +9764,7 @@ pub const System = struct {
         var buf: [4096]u8 = undefined;
         const ptr = std.c.getcwd(&buf, buf.len) orelse return "";
         const len = std.mem.sliceTo(ptr, 0).len;
-        const result = bumpAlloc(len);
+        const result = bumpAllocAt(.system_cwd, len);
         if (result.len == 0) return "";
         @memcpy(result, buf[0..len]);
         return result;
@@ -10069,6 +10305,124 @@ test "List(i64) append self grows without reading freed storage" {
     try std.testing.expectEqual(@as(i64, 2), ListI64.get(result, 1));
     try std.testing.expectEqual(@as(i64, 1), ListI64.get(result, 2));
     try std.testing.expectEqual(@as(i64, 2), ListI64.get(result, 3));
+}
+
+test "List(i64) cons on null tail allocates fresh single-element buffer" {
+    const before_calls = list_cons_calls_total;
+    const ListI64 = List(i64);
+    const result = ListI64.cons(42, null) orelse return error.OutOfMemory;
+    defer ListI64.release(result);
+
+    try std.testing.expectEqual(@as(i64, 1), ListI64.length(result));
+    try std.testing.expectEqual(@as(i64, 42), ListI64.get(result, 0));
+    try std.testing.expectEqual(@as(u32, 1), result.header.count());
+    try std.testing.expectEqual(before_calls + 1, list_cons_calls_total);
+}
+
+test "List(i64) cons on rc==1 tail with spare capacity mutates in place" {
+    const ListI64 = List(i64);
+    var tail: ?*const ListI64 = ListI64.new_empty(8) orelse return error.OutOfMemory;
+    tail = ListI64.push(tail, 20) orelse return error.OutOfMemory;
+    tail = ListI64.push(tail, 30) orelse return error.OutOfMemory;
+    const before_ptr = @intFromPtr(tail.?);
+
+    const before_inplace = list_cons_rc1_inplace_total;
+    const result = ListI64.cons(10, tail) orelse return error.OutOfMemory;
+    defer ListI64.release(result);
+
+    // Same pointer — the fast path mutated in place.
+    try std.testing.expectEqual(before_ptr, @intFromPtr(result));
+    try std.testing.expectEqual(before_inplace + 1, list_cons_rc1_inplace_total);
+
+    try std.testing.expectEqual(@as(i64, 3), ListI64.length(result));
+    try std.testing.expectEqual(@as(i64, 10), ListI64.get(result, 0));
+    try std.testing.expectEqual(@as(i64, 20), ListI64.get(result, 1));
+    try std.testing.expectEqual(@as(i64, 30), ListI64.get(result, 2));
+}
+
+test "List(i64) cons on rc==1 tail at capacity grows and frees old buffer" {
+    const ListI64 = List(i64);
+    var tail: ?*const ListI64 = ListI64.new_empty(2) orelse return error.OutOfMemory;
+    tail = ListI64.push(tail, 5) orelse return error.OutOfMemory;
+    tail = ListI64.push(tail, 6) orelse return error.OutOfMemory;
+    // Tail has cap=4 now (push grew once); fill it.
+    tail = ListI64.push(tail, 7) orelse return error.OutOfMemory;
+    tail = ListI64.push(tail, 8) orelse return error.OutOfMemory;
+    try std.testing.expectEqual(@as(i64, 4), ListI64.length(tail));
+    try std.testing.expectEqual(@as(i64, 4), ListI64.capacity(tail));
+
+    const before_grow = list_cons_rc1_grow_total;
+    const result = ListI64.cons(1, tail) orelse return error.OutOfMemory;
+    defer ListI64.release(result);
+
+    try std.testing.expectEqual(before_grow + 1, list_cons_rc1_grow_total);
+    try std.testing.expectEqual(@as(i64, 5), ListI64.length(result));
+    try std.testing.expect(ListI64.capacity(result) >= 5);
+    try std.testing.expectEqual(@as(i64, 1), ListI64.get(result, 0));
+    try std.testing.expectEqual(@as(i64, 5), ListI64.get(result, 1));
+    try std.testing.expectEqual(@as(i64, 6), ListI64.get(result, 2));
+    try std.testing.expectEqual(@as(i64, 7), ListI64.get(result, 3));
+    try std.testing.expectEqual(@as(i64, 8), ListI64.get(result, 4));
+    try std.testing.expectEqual(@as(u32, 1), result.header.count());
+}
+
+test "List(i64) cons on rc>1 tail clones with deep-retain and leaves original intact" {
+    const ListI64 = List(i64);
+    var tail: ?*const ListI64 = ListI64.new_empty(4) orelse return error.OutOfMemory;
+    tail = ListI64.push(tail, 100) orelse return error.OutOfMemory;
+    tail = ListI64.push(tail, 200) orelse return error.OutOfMemory;
+    defer ListI64.release(tail);
+
+    // Retain to bump rc to 2 — simulates a shared owner.
+    const shared = ListI64.retain(tail);
+    try std.testing.expectEqual(@as(u32, 2), tail.?.header.count());
+
+    const before_shared = list_cons_shared_total;
+    const result = ListI64.cons(99, shared) orelse return error.OutOfMemory;
+    defer ListI64.release(result);
+
+    try std.testing.expectEqual(before_shared + 1, list_cons_shared_total);
+    // Fresh pointer — clone path was taken.
+    try std.testing.expect(@intFromPtr(result) != @intFromPtr(tail.?));
+    // Tail's refcount dropped by one — the cons consumed the borrowed owner.
+    try std.testing.expectEqual(@as(u32, 1), tail.?.header.count());
+
+    try std.testing.expectEqual(@as(i64, 3), ListI64.length(result));
+    try std.testing.expectEqual(@as(i64, 99), ListI64.get(result, 0));
+    try std.testing.expectEqual(@as(i64, 100), ListI64.get(result, 1));
+    try std.testing.expectEqual(@as(i64, 200), ListI64.get(result, 2));
+
+    // Original tail is unchanged.
+    try std.testing.expectEqual(@as(i64, 2), ListI64.length(tail));
+    try std.testing.expectEqual(@as(i64, 100), ListI64.get(tail, 0));
+    try std.testing.expectEqual(@as(i64, 200), ListI64.get(tail, 1));
+}
+
+test "List(i64) repeated cons on rc==1 keeps allocations O(log n)" {
+    // Validates that the rc-1 fast path produces amortized O(log n)
+    // capacity doublings even for n=128 prepends. Before the fast
+    // path, each cons re-allocated a buffer sized exactly to the
+    // new length — O(n) allocations totalling O(n²) bytes.
+    const ListI64 = List(i64);
+    var current: ?*const ListI64 = null;
+    const before_alloc_bytes = list_cons_alloc_bytes;
+
+    var i: i64 = 0;
+    while (i < 128) : (i += 1) {
+        current = ListI64.cons(i, current) orelse return error.OutOfMemory;
+    }
+    defer ListI64.release(current);
+
+    try std.testing.expectEqual(@as(i64, 128), ListI64.length(current));
+    try std.testing.expectEqual(@as(i64, 127), ListI64.get(current, 0));
+    try std.testing.expectEqual(@as(i64, 0), ListI64.get(current, 127));
+
+    // The doubling pattern yields capacities 4, 8, 16, ..., 128
+    // (5 capacity transitions for 128 entries). Each grow allocates
+    // bufferSize(cap) bytes. Total bytes should be < 16 KB —
+    // dramatically less than the O(n²) shape's 128 KB+.
+    const allocated = list_cons_alloc_bytes - before_alloc_bytes;
+    try std.testing.expect(allocated < 16 * 1024);
 }
 
 test "listSum bridge dispatches to concrete List(i64) sum" {

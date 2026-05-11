@@ -244,6 +244,7 @@ pub fn inferConventions(
             if (after > before) changed = true;
         }
     }
+
 }
 
 /// Set of `(FunctionId, slot)` pairs that have passed the chain-
@@ -404,9 +405,22 @@ fn computeLiftSet(
         // at owned-arg sites is treated as move_value), restore
         // conventions, and intersect candidates with surviving
         // (unique-on-entry) slots.
+        //
+        // The simulation must also tentatively promote slots already
+        // approved by the conservative `lift_set` (Stage 0). Those slots
+        // WILL be promoted by `evaluateFunction` in the final fixpoint,
+        // so the simulation must reflect the post-`evaluateFunction`
+        // state — otherwise SCC partners further down the chain (e.g.
+        // helper-of-helper functions whose chain root terminates at a
+        // `lift_set` slot in a caller) will see the caller's slot as
+        // `.borrowed`, the caller's `param_get` will lower as non-
+        // unique under `isUniqueOnEntry`, and the share_value→move_value
+        // simulation will read a non-unique source. The result is
+        // false demotions on the SCC's interior slots even though the
+        // post-promotion runtime ABI is sound.
         var survivors: LiftSet = .empty;
         defer survivors.deinit(allocator);
-        try liftSetSurvivesUniquenessCheck(allocator, program, signatures, ownerships, &candidates, &survivors);
+        try liftSetSurvivesUniquenessCheck(allocator, program, signatures, ownerships, &lift_set, &candidates, &survivors);
 
         // Merge survivors into the main lift_set.
         const before_count = lift_set.count();
@@ -570,18 +584,56 @@ fn liftSetSurvivesUniquenessCheck(
     program: *const ir.Program,
     signatures: *const uniqueness_signature.ProgramSignatures,
     ownerships: *const arc_liveness.ProgramArcOwnership,
+    approved: *const LiftSet,
     candidates: *const LiftSet,
     survivors: *LiftSet,
 ) !void {
     if (candidates.count() == 0) return;
 
-    // Save originals and tentatively promote candidate slots.
+    // Save originals and tentatively promote slots.
+    //
+    // Two sources of tentative promotion:
+    //
+    //   1. `approved` — slots already accepted by the conservative
+    //      monotone-up audit (Stage 0). These will be promoted to
+    //      `.owned` by `evaluateFunction` in the final fixpoint, so the
+    //      simulation must observe them as `.owned` already. Otherwise
+    //      the SCC partners further down the chain (helpers whose
+    //      chain root terminates at an approved slot) would read the
+    //      approved slot as `.borrowed` via `isUniqueOnEntry`, and the
+    //      `share_value → move_value` rewrite simulation at an
+    //      `.owned` arg slot would observe a non-unique source — a
+    //      false-positive demotion that has nothing to do with the
+    //      actual post-promotion runtime ABI.
+    //
+    //   2. `candidates` — the optimistic SCC-bootstrap set. These are
+    //      the slots whose survival the pre-flight is testing. SCC
+    //      partners enter together so mutually-recursive PU chains
+    //      can be validated simultaneously.
     //
     // The mutation seam matches `evaluateFunction`'s @constCast of
     // `function.param_conventions` — the slice is `const` to the rest
     // of the IR but writeable by the inference pass and its sub-passes.
     var saved: std.AutoHashMapUnmanaged(u64, ir.ParamConvention) = .empty;
     defer saved.deinit(allocator);
+
+    // Promote approved slots first so candidates added with the same
+    // key (which can't actually happen — seedOptimisticCandidates
+    // excludes lift_set members — but kept defensively) don't double-
+    // record.
+    var approved_iter = approved.iterator();
+    while (approved_iter.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const fid: ir.FunctionId = @intCast(key >> 32);
+        const slot: usize = @intCast(key & 0xFFFFFFFF);
+        const function = lookupFunctionMut(program, fid) orelse continue;
+        if (slot >= function.param_conventions.len) continue;
+        const original = function.param_conventions[slot];
+        if (original == .owned) continue;
+        try saved.put(allocator, key, original);
+        const conventions: MutableConventions = @constCast(function.param_conventions);
+        conventions[slot] = .owned;
+    }
 
     var iter = candidates.iterator();
     while (iter.next()) |entry| {
@@ -1949,7 +2001,7 @@ const TentativeAnalyzer = struct {
             try self.synthesizeReturnPendingFromSig(function.id, args, dest, pre_arg_unique);
             return;
         }
-        if (functionIsFreshAllocatorWrapperByPointer(function)) {
+        if (functionIsFreshAllocatorWrapperWithProgram(function, self.program)) {
             try self.unique.put(self.allocator, dest, {});
             return;
         }
@@ -1960,7 +2012,7 @@ const TentativeAnalyzer = struct {
     fn calleeIsFreshAllocatorWrapper(self: *const TentativeAnalyzer, name: []const u8) bool {
         for (self.program.functions) |*func| {
             if (std.mem.eql(u8, func.name, name)) {
-                return functionIsFreshAllocatorWrapperByPointer(func);
+                return functionIsFreshAllocatorWrapperWithProgram(func, self.program);
             }
         }
         return false;
@@ -2005,13 +2057,43 @@ fn calleeFunctionOwnedReceiverSlotByPointer(function: *const ir.Function) ?usize
 /// duplicated to avoid the import dependency cycle (arc_param_convention
 /// -> uniqueness -> uniqueness_interprocedural -> arc_param_convention would
 /// be a cycle).
+///
+/// Recognises thin Zap-fn wrappers around runtime allocator intrinsics
+/// (`List.new_filled`, `Map.new`, etc.). A function counts as fresh
+/// when its body has exactly ONE allocator-producing call site and
+/// zero other non-fresh calls. The recognition is TRANSITIVE: a
+/// `call_named`/`call_direct` whose target is itself a fresh-allocator
+/// wrapper counts as an allocator call. This is essential for
+/// benchmark patterns like `ones(n) -> List.new_filled(n, 1.0)` where
+/// the user wraps the runtime allocator in a thin Zap helper.
 fn functionIsFreshAllocatorWrapperByPointer(function: *const ir.Function) bool {
+    return functionIsFreshAllocatorWrapperWithProgram(function, null);
+}
+
+fn functionIsFreshAllocatorWrapperWithProgram(
+    function: *const ir.Function,
+    program: ?*const ir.Program,
+) bool {
+    return functionIsFreshAllocatorWrapperWithDepth(function, program, 0);
+}
+
+/// Same recursion-depth cap as `uniqueness.FRESH_ALLOCATOR_MAX_DEPTH`.
+const FRESH_ALLOCATOR_MAX_DEPTH: usize = 8;
+
+fn functionIsFreshAllocatorWrapperWithDepth(
+    function: *const ir.Function,
+    program: ?*const ir.Program,
+    depth: usize,
+) bool {
     if (function.result_convention != .owned) return false;
+    if (depth >= FRESH_ALLOCATOR_MAX_DEPTH) return false;
     var allocator_count: usize = 0;
     var other_call_count: usize = 0;
     var ctx = AllocatorWrapperScanCtx{
         .allocator_count = &allocator_count,
         .other_call_count = &other_call_count,
+        .program = program,
+        .depth = depth,
     };
     for (function.body) |block| {
         scanAllocatorWrapperStream(block.instructions, &ctx);
@@ -2022,7 +2104,23 @@ fn functionIsFreshAllocatorWrapperByPointer(function: *const ir.Function) bool {
 const AllocatorWrapperScanCtx = struct {
     allocator_count: *usize,
     other_call_count: *usize,
+    program: ?*const ir.Program = null,
+    depth: usize = 0,
 };
+
+fn lookupAllocatorTargetByName(program: *const ir.Program, name: []const u8) ?*const ir.Function {
+    for (program.functions) |*func| {
+        if (std.mem.eql(u8, func.name, name)) return func;
+    }
+    return null;
+}
+
+fn lookupAllocatorTargetById(program: *const ir.Program, function_id: ir.FunctionId) ?*const ir.Function {
+    for (program.functions) |*func| {
+        if (func.id == function_id) return func;
+    }
+    return null;
+}
 
 fn scanAllocatorWrapperStream(stream: []const ir.Instruction, ctx: *AllocatorWrapperScanCtx) void {
     for (stream) |*instr| {
@@ -2034,7 +2132,32 @@ fn scanAllocatorWrapperStream(stream: []const ir.Instruction, ctx: *AllocatorWra
                     ctx.other_call_count.* += 1;
                 }
             },
-            .call_named, .call_direct, .try_call_named, .call_dispatch, .call_closure, .tail_call => {
+            // Transitive recognition: a call to another fresh-allocator
+            // wrapper counts as an allocator call when the program is
+            // available. Mutual recursion is bounded by the depth cap.
+            .call_named => |cn| {
+                if (ctx.program) |program| {
+                    if (lookupAllocatorTargetByName(program, cn.name)) |target| {
+                        if (functionIsFreshAllocatorWrapperWithDepth(target, ctx.program, ctx.depth + 1)) {
+                            ctx.allocator_count.* += 1;
+                            continue;
+                        }
+                    }
+                }
+                ctx.other_call_count.* += 1;
+            },
+            .call_direct => |cd| {
+                if (ctx.program) |program| {
+                    if (lookupAllocatorTargetById(program, cd.function)) |target| {
+                        if (functionIsFreshAllocatorWrapperWithDepth(target, ctx.program, ctx.depth + 1)) {
+                            ctx.allocator_count.* += 1;
+                            continue;
+                        }
+                    }
+                }
+                ctx.other_call_count.* += 1;
+            },
+            .try_call_named, .call_dispatch, .call_closure, .tail_call => {
                 ctx.other_call_count.* += 1;
             },
             .if_expr => |ie| {
@@ -4204,7 +4327,9 @@ test "arc_param_convention: liftSetSurvivesUniquenessCheck admits a slot whose b
     defer test_signatures.deinit(std.testing.allocator);
     var test_ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
     defer test_ownerships.deinit();
-    try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
+    var empty_approved: LiftSet = .empty;
+    defer empty_approved.deinit(std.testing.allocator);
+    try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &empty_approved, &candidates, &survivors);
 
     // The slot's body is a thin forward to List.set — uniqueness should
     // see uniqueness preserved through the rewritten share→move and
@@ -4340,7 +4465,9 @@ test "arc_param_convention: liftSetSurvivesUniquenessCheck rejects when caller p
     defer test_signatures.deinit(std.testing.allocator);
     var test_ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
     defer test_ownerships.deinit();
-    try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
+    var empty_approved: LiftSet = .empty;
+    defer empty_approved.deinit(std.testing.allocator);
+    try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &empty_approved, &candidates, &survivors);
 
     // Caller's body has `copy_value` clobbering uniqueness before the
     // call to callee. The uniqueness fixpoint sees the call's arg is non-unique
@@ -4392,6 +4519,8 @@ test "arc_param_convention: liftSetSurvivesUniquenessCheck restores conventions 
     defer test_signatures.deinit(std.testing.allocator);
     var test_ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
     defer test_ownerships.deinit();
+    var empty_approved: LiftSet = .empty;
+    defer empty_approved.deinit(std.testing.allocator);
 
     // Empty candidates: no-op.
     {
@@ -4399,7 +4528,7 @@ test "arc_param_convention: liftSetSurvivesUniquenessCheck restores conventions 
         defer candidates.deinit(std.testing.allocator);
         var survivors: LiftSet = .empty;
         defer survivors.deinit(std.testing.allocator);
-        try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
+        try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &empty_approved, &candidates, &survivors);
         try std.testing.expectEqual(@as(u32, 0), survivors.count());
         try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[0].param_conventions[0]);
     }
@@ -4412,7 +4541,7 @@ test "arc_param_convention: liftSetSurvivesUniquenessCheck restores conventions 
         try candidates.put(std.testing.allocator, liftKey(0, 0), {});
         var survivors: LiftSet = .empty;
         defer survivors.deinit(std.testing.allocator);
-        try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
+        try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &empty_approved, &candidates, &survivors);
         // After the call returns, conventions are back to .borrowed.
         try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[0].param_conventions[0]);
     }
@@ -4479,7 +4608,9 @@ test "arc_param_convention: TentativeAnalyzer tuple_pending preserves witness th
     try candidates.put(std.testing.allocator, liftKey(0, 0), {});
     var survivors: LiftSet = .empty;
     defer survivors.deinit(std.testing.allocator);
-    try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
+    var empty_approved: LiftSet = .empty;
+    defer empty_approved.deinit(std.testing.allocator);
+    try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &empty_approved, &candidates, &survivors);
 
     // The body has no demoting operations on the param's flow. With
     // tentative promotion to .owned, the uniqueness pre-flight should see
@@ -4615,7 +4746,9 @@ test "arc_param_convention: TentativeAnalyzer synthesizes return pending from ca
     try candidates.put(std.testing.allocator, liftKey(1, 0), {});
     var survivors: LiftSet = .empty;
     defer survivors.deinit(std.testing.allocator);
-    try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &candidates, &survivors);
+    var empty_approved: LiftSet = .empty;
+    defer empty_approved.deinit(std.testing.allocator);
+    try liftSetSurvivesUniquenessCheck(std.testing.allocator, &program, &test_signatures, &test_ownerships, &empty_approved, &candidates, &survivors);
 
     // Both slots survive: callee.0 because its body is a clean
     // tuple_init+ret; caller.0 because (with Phase 2.6.2 plumbing)
