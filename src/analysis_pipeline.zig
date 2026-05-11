@@ -279,22 +279,33 @@ pub fn runAnalysisPipelineWithIo(
     const perceus_result = try perceus_analyzer.analyze();
     defer perceus_result.deinit(alloc);
 
-    // Copy Perceus results into context.
+    // Copy Perceus results into context. `perceus_result` owns the
+    // InsertionPoint.path slices and frees them on deinit, so each
+    // copy here must deep-clone the path to give the context its own
+    // independently-owned slice. Without the clone, the context's
+    // arc_ops / drop_specs / reuse_pairs would hold dangling pointers
+    // after `perceus_result.deinit` runs.
     for (perceus_result.reuse_pairs) |pair| {
-        try ctx.addReusePair(pair);
+        var owned_pair = pair;
+        owned_pair.reuse.insertion_point.path = try alloc.dupe(lattice.StreamStep, pair.reuse.insertion_point.path);
+        try ctx.addReusePair(owned_pair);
     }
     for (perceus_result.arc_ops) |op| {
-        try ctx.arc_ops.append(alloc, op);
+        var owned_op = op;
+        owned_op.insertion_point.path = try alloc.dupe(lattice.StreamStep, op.insertion_point.path);
+        try ctx.arc_ops.append(alloc, owned_op);
     }
     for (perceus_result.drop_specializations) |spec| {
         const copied_fields = try alloc.alloc(lattice.FieldDrop, spec.field_drops.len);
         @memcpy(copied_fields, spec.field_drops);
+        var owned_ip = spec.insertion_point;
+        owned_ip.path = try alloc.dupe(lattice.StreamStep, spec.insertion_point.path);
         try ctx.addDropSpecialization(.{
             .match_site = spec.match_site,
             .constructor_tag = spec.constructor_tag,
             .field_drops = copied_fields,
             .function = spec.function,
-            .insertion_point = spec.insertion_point,
+            .insertion_point = owned_ip,
         });
     }
     for (perceus_result.destructive_optional_dispatch) |entry| {
