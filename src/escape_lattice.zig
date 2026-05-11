@@ -1152,12 +1152,19 @@ pub const AnalysisContext = struct {
         self.field_escapes.deinit();
 
         self.borrow_verdicts.deinit();
+        for (self.reuse_pairs.items) |pair| {
+            self.allocator.free(pair.reuse.insertion_point.path);
+        }
         self.reuse_pairs.deinit(self.allocator);
         for (self.drop_specializations.items) |ds| {
             self.allocator.free(ds.field_drops);
+            self.allocator.free(ds.insertion_point.path);
         }
         self.drop_specializations.deinit(self.allocator);
         self.alloc_strategies.deinit();
+        for (self.arc_ops.items) |op| {
+            self.allocator.free(op.insertion_point.path);
+        }
         self.arc_ops.deinit(self.allocator);
         self.outlives_constraints.deinit(self.allocator);
         self.closure_tiers.deinit();

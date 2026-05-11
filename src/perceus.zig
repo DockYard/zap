@@ -128,10 +128,17 @@ pub const AnalysisResult = struct {
     destructive_optional_dispatch: []const DestructiveOptionalDispatch,
 
     pub fn deinit(self: *const AnalysisResult, allocator: std.mem.Allocator) void {
+        for (self.reuse_pairs) |pair| {
+            allocator.free(pair.reuse.insertion_point.path);
+        }
         allocator.free(self.reuse_pairs);
+        for (self.arc_ops) |op| {
+            allocator.free(op.insertion_point.path);
+        }
         allocator.free(self.arc_ops);
         for (self.drop_specializations) |ds| {
             allocator.free(ds.field_drops);
+            allocator.free(ds.insertion_point.path);
         }
         allocator.free(self.drop_specializations);
         allocator.free(self.function_stats);
@@ -189,10 +196,17 @@ pub const PerceusAnalyzer = struct {
     }
 
     pub fn deinit(self: *PerceusAnalyzer) void {
+        for (self.reuse_pairs.items) |pair| {
+            self.allocator.free(pair.reuse.insertion_point.path);
+        }
         self.reuse_pairs.deinit(self.allocator);
+        for (self.arc_ops.items) |op| {
+            self.allocator.free(op.insertion_point.path);
+        }
         self.arc_ops.deinit(self.allocator);
         for (self.drop_specializations.items) |ds| {
             self.allocator.free(ds.field_drops);
+            self.allocator.free(ds.insertion_point.path);
         }
         self.drop_specializations.deinit(self.allocator);
         self.function_stats.deinit(self.allocator);
@@ -281,6 +295,13 @@ pub const PerceusAnalyzer = struct {
                     .dynamic_reuse => stats.dynamic_reuses += 1,
                 }
             }
+            // Free each ConstructionSite's path slice (allocator.dupe'd
+            // in scanInstructionForConstructions) before freeing the
+            // array itself. generateReusePair has already copied paths
+            // it needed into the analysis-context-owned InsertionPoint
+            // records, so these transient site-level paths can be
+            // released here.
+            for (constructions) |con| self.allocator.free(con.path);
             self.allocator.free(constructions);
 
             // Phase 4: Generate drop specializations
@@ -527,6 +548,18 @@ pub const PerceusAnalyzer = struct {
 
     /// Find all construction sites in branch bodies that are compatible with a
     /// deconstruction site for reuse.
+    ///
+    /// Path threading: the deconstruction site's instruction lives at
+    /// `decon.path` + `decon.instr_index`. Each descent into one of its
+    /// nested streams (case_block.pre_instrs, arms[i].body_instrs,
+    /// default_instrs, if_expr.then/else_instrs) pushes one more
+    /// `StreamStep` onto a builder seeded with `decon.path`. Leaf-level
+    /// `ConstructionSite` records snapshot the builder's current
+    /// contents via `allocator.dupe`. Replaces the previous
+    /// `branch_offset *| 1000 +| idx` saturating-add encoding (which
+    /// was lossy under arm/index counts > {100, 1000} and never
+    /// matched the ZIR driver's position tracker — see file-level
+    /// commentary in `arc_phase-2-3-completion-research-brief.md`).
     fn findCompatibleConstructionsForMatch(
         self: *PerceusAnalyzer,
         func: *const ir.Function,
@@ -547,54 +580,90 @@ pub const PerceusAnalyzer = struct {
             self.findNestedInstruction(block.instructions, decon.scrutinee) orelse
                 return try results.toOwnedSlice(self.allocator);
 
+        // Seed path-builder with the deconstruction site's own nesting
+        // path. Each descent below adds one more StreamStep whose
+        // `parent_instr_index` is `decon.instr_index` (the position of
+        // the deconstruction instruction within its enclosing stream)
+        // and whose `child` slot identifies which nested stream we're
+        // entering.
+        var path_builder: std.ArrayListUnmanaged(lattice.StreamStep) = .empty;
+        defer path_builder.deinit(self.allocator);
+        try path_builder.appendSlice(self.allocator, decon.path);
+
         switch (instr.*) {
             .case_block => |cb| {
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = decon.instr_index,
+                    .child = .case_block_pre,
+                });
                 try self.scanInstructionsForConstructions(
                     cb.pre_instrs,
                     decon,
                     func.id,
                     decon.block,
-                    0,
+                    &path_builder,
                     &results,
                 );
-                // Scan each arm's body for compatible constructions
+                _ = path_builder.pop();
+
                 for (cb.arms, 0..) |arm, arm_idx| {
+                    try path_builder.append(self.allocator, .{
+                        .parent_instr_index = decon.instr_index,
+                        .child = .{ .case_block_arm_body = @intCast(arm_idx) },
+                    });
                     try self.scanInstructionsForConstructions(
                         arm.body_instrs,
                         decon,
                         func.id,
                         decon.block,
-                        @intCast(arm_idx),
+                        &path_builder,
                         &results,
                     );
+                    _ = path_builder.pop();
                 }
-                // Scan default branch
+
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = decon.instr_index,
+                    .child = .case_block_default,
+                });
                 try self.scanInstructionsForConstructions(
                     cb.default_instrs,
                     decon,
                     func.id,
                     decon.block,
-                    @intCast(cb.arms.len),
+                    &path_builder,
                     &results,
                 );
+                _ = path_builder.pop();
             },
             .if_expr => |ie| {
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = decon.instr_index,
+                    .child = .if_expr_then,
+                });
                 try self.scanInstructionsForConstructions(
                     ie.then_instrs,
                     decon,
                     func.id,
                     decon.block,
-                    0,
+                    &path_builder,
                     &results,
                 );
+                _ = path_builder.pop();
+
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = decon.instr_index,
+                    .child = .if_expr_else,
+                });
                 try self.scanInstructionsForConstructions(
                     ie.else_instrs,
                     decon,
                     func.id,
                     decon.block,
-                    1,
+                    &path_builder,
                     &results,
                 );
+                _ = path_builder.pop();
             },
             else => {},
         }
@@ -651,7 +720,7 @@ pub const PerceusAnalyzer = struct {
         decon: *const DeconstructionSite,
         function_id: ir.FunctionId,
         block_label: ir.LabelId,
-        branch_offset: u32,
+        path_builder: *std.ArrayListUnmanaged(lattice.StreamStep),
         results: *std.ArrayList(ConstructionSite),
     ) !void {
         for (instrs, 0..) |instr, idx| {
@@ -660,18 +729,31 @@ pub const PerceusAnalyzer = struct {
                 decon,
                 function_id,
                 block_label,
-                branch_offset *| 1000 +| @as(u32, @intCast(idx)),
+                path_builder,
+                @intCast(idx),
                 results,
             );
         }
     }
 
+    /// Walk a single instruction, recording a ConstructionSite for the
+    /// instruction itself if reuse-compatible, and recursing into every
+    /// nested stream the instruction owns. `path_builder` is the
+    /// caller's mutable cursor (push/pop pattern); `instr_index` is the
+    /// position of `instr` within its containing stream (i.e., the
+    /// innermost stream identified by `path_builder.items`).
+    ///
+    /// Replaces the previous `instr_index +| (arm_idx * 100 + idx) +|
+    /// 1` saturating-add encoding. The path-based replacement is
+    /// lossless and exhaustive over every nested-stream-bearing IR
+    /// instruction.
     fn scanInstructionForConstructions(
         self: *PerceusAnalyzer,
         instr: ir.Instruction,
         decon: *const DeconstructionSite,
         function_id: ir.FunctionId,
         block_label: ir.LabelId,
+        path_builder: *std.ArrayListUnmanaged(lattice.StreamStep),
         instr_index: u32,
         results: *std.ArrayList(ConstructionSite),
     ) !void {
@@ -683,6 +765,7 @@ pub const PerceusAnalyzer = struct {
                 try results.append(self.allocator, .{
                     .function = function_id,
                     .block = block_label,
+                    .path = try self.allocator.dupe(lattice.StreamStep, path_builder.items),
                     .instr_index = instr_index,
                     .dest = dest,
                     .dest_type = ct,
@@ -693,56 +776,147 @@ pub const PerceusAnalyzer = struct {
 
         switch (instr) {
             .guard_block => |gb| {
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = instr_index,
+                    .child = .guard_block_body,
+                });
                 for (gb.body, 0..) |nested, idx| {
-                    try self.scanInstructionForConstructions(nested, decon, function_id, block_label, instr_index +| @as(u32, @intCast(idx)) +| 1, results);
+                    try self.scanInstructionForConstructions(
+                        nested, decon, function_id, block_label,
+                        path_builder, @intCast(idx), results,
+                    );
                 }
+                _ = path_builder.pop();
             },
             .if_expr => |ie| {
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = instr_index,
+                    .child = .if_expr_then,
+                });
                 for (ie.then_instrs, 0..) |nested, idx| {
-                    try self.scanInstructionForConstructions(nested, decon, function_id, block_label, instr_index +| @as(u32, @intCast(idx)) +| 1, results);
+                    try self.scanInstructionForConstructions(
+                        nested, decon, function_id, block_label,
+                        path_builder, @intCast(idx), results,
+                    );
                 }
+                _ = path_builder.pop();
+
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = instr_index,
+                    .child = .if_expr_else,
+                });
                 for (ie.else_instrs, 0..) |nested, idx| {
-                    try self.scanInstructionForConstructions(nested, decon, function_id, block_label, instr_index +| @as(u32, @intCast(idx)) +| 100, results);
+                    try self.scanInstructionForConstructions(
+                        nested, decon, function_id, block_label,
+                        path_builder, @intCast(idx), results,
+                    );
                 }
+                _ = path_builder.pop();
             },
             .case_block => |cb| {
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = instr_index,
+                    .child = .case_block_pre,
+                });
                 for (cb.pre_instrs, 0..) |nested, idx| {
-                    try self.scanInstructionForConstructions(nested, decon, function_id, block_label, instr_index +| @as(u32, @intCast(idx)) +| 1, results);
+                    try self.scanInstructionForConstructions(
+                        nested, decon, function_id, block_label,
+                        path_builder, @intCast(idx), results,
+                    );
                 }
+                _ = path_builder.pop();
+
                 for (cb.arms, 0..) |arm, arm_idx| {
+                    try path_builder.append(self.allocator, .{
+                        .parent_instr_index = instr_index,
+                        .child = .{ .case_block_arm_body = @intCast(arm_idx) },
+                    });
                     for (arm.body_instrs, 0..) |nested, idx| {
-                        try self.scanInstructionForConstructions(nested, decon, function_id, block_label, instr_index +| @as(u32, @intCast(arm_idx * 100 + idx)) +| 1, results);
+                        try self.scanInstructionForConstructions(
+                            nested, decon, function_id, block_label,
+                            path_builder, @intCast(idx), results,
+                        );
                     }
+                    _ = path_builder.pop();
                 }
+
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = instr_index,
+                    .child = .case_block_default,
+                });
                 for (cb.default_instrs, 0..) |nested, idx| {
-                    try self.scanInstructionForConstructions(nested, decon, function_id, block_label, instr_index +| @as(u32, @intCast(idx)) +| 900, results);
+                    try self.scanInstructionForConstructions(
+                        nested, decon, function_id, block_label,
+                        path_builder, @intCast(idx), results,
+                    );
                 }
+                _ = path_builder.pop();
             },
             .switch_literal => |sl| {
                 for (sl.cases, 0..) |case, case_idx| {
+                    try path_builder.append(self.allocator, .{
+                        .parent_instr_index = instr_index,
+                        .child = .{ .switch_literal_case = @intCast(case_idx) },
+                    });
                     for (case.body_instrs, 0..) |nested, idx| {
-                        try self.scanInstructionForConstructions(nested, decon, function_id, block_label, instr_index +| @as(u32, @intCast(case_idx * 100 + idx)) +| 1, results);
+                        try self.scanInstructionForConstructions(
+                            nested, decon, function_id, block_label,
+                            path_builder, @intCast(idx), results,
+                        );
                     }
+                    _ = path_builder.pop();
                 }
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = instr_index,
+                    .child = .switch_literal_default,
+                });
                 for (sl.default_instrs, 0..) |nested, idx| {
-                    try self.scanInstructionForConstructions(nested, decon, function_id, block_label, instr_index +| @as(u32, @intCast(idx)) +| 900, results);
+                    try self.scanInstructionForConstructions(
+                        nested, decon, function_id, block_label,
+                        path_builder, @intCast(idx), results,
+                    );
                 }
+                _ = path_builder.pop();
             },
             .switch_return => |sr| {
                 for (sr.cases, 0..) |case, case_idx| {
+                    try path_builder.append(self.allocator, .{
+                        .parent_instr_index = instr_index,
+                        .child = .{ .switch_return_case = @intCast(case_idx) },
+                    });
                     for (case.body_instrs, 0..) |nested, idx| {
-                        try self.scanInstructionForConstructions(nested, decon, function_id, block_label, instr_index +| @as(u32, @intCast(case_idx * 100 + idx)) +| 1, results);
+                        try self.scanInstructionForConstructions(
+                            nested, decon, function_id, block_label,
+                            path_builder, @intCast(idx), results,
+                        );
                     }
+                    _ = path_builder.pop();
                 }
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = instr_index,
+                    .child = .switch_return_default,
+                });
                 for (sr.default_instrs, 0..) |nested, idx| {
-                    try self.scanInstructionForConstructions(nested, decon, function_id, block_label, instr_index +| @as(u32, @intCast(idx)) +| 900, results);
+                    try self.scanInstructionForConstructions(
+                        nested, decon, function_id, block_label,
+                        path_builder, @intCast(idx), results,
+                    );
                 }
+                _ = path_builder.pop();
             },
             .union_switch_return => |usr| {
                 for (usr.cases, 0..) |case, case_idx| {
+                    try path_builder.append(self.allocator, .{
+                        .parent_instr_index = instr_index,
+                        .child = .{ .union_switch_return_case = @intCast(case_idx) },
+                    });
                     for (case.body_instrs, 0..) |nested, idx| {
-                        try self.scanInstructionForConstructions(nested, decon, function_id, block_label, instr_index +| @as(u32, @intCast(case_idx * 100 + idx)) +| 1, results);
+                        try self.scanInstructionForConstructions(
+                            nested, decon, function_id, block_label,
+                            path_builder, @intCast(idx), results,
+                        );
                     }
+                    _ = path_builder.pop();
                 }
             },
             else => {},
@@ -777,6 +951,7 @@ pub const PerceusAnalyzer = struct {
             .insertion_point = .{
                 .function = function_id,
                 .block = con.block,
+                .path = try self.allocator.dupe(lattice.StreamStep, con.path),
                 .instr_index = con.instr_index,
                 .position = .before,
             },
@@ -794,13 +969,18 @@ pub const PerceusAnalyzer = struct {
 
         try self.reuse_pairs.append(self.allocator, pair);
 
-        // Generate ARC operations: reset at deconstruction, reuse at construction
+        // Generate ARC operations: reset at deconstruction, reuse at construction.
+        // Each InsertionPoint copies the relevant site's `path` so the
+        // materialization pass can navigate to the correct nested
+        // stream without reconstructing position from synthetic
+        // arithmetic.
         try self.arc_ops.append(self.allocator, .{
             .kind = .reset,
             .value = decon.scrutinee,
             .insertion_point = .{
                 .function = function_id,
                 .block = decon.block,
+                .path = try self.allocator.dupe(lattice.StreamStep, decon.path),
                 .instr_index = decon.instr_index,
                 .position = .before,
             },
@@ -813,6 +993,7 @@ pub const PerceusAnalyzer = struct {
             .insertion_point = .{
                 .function = function_id,
                 .block = con.block,
+                .path = try self.allocator.dupe(lattice.StreamStep, con.path),
                 .instr_index = con.instr_index,
                 .position = .before,
             },
@@ -847,6 +1028,7 @@ pub const PerceusAnalyzer = struct {
                         .insertion_point = .{
                             .function = func.id,
                             .block = decon.block,
+                            .path = try self.allocator.dupe(lattice.StreamStep, decon.path),
                             .instr_index = decon.instr_index,
                             .position = .after,
                         },
@@ -860,6 +1042,7 @@ pub const PerceusAnalyzer = struct {
                             .insertion_point = .{
                                 .function = func.id,
                                 .block = decon.block,
+                                .path = try self.allocator.dupe(lattice.StreamStep, decon.path),
                                 .instr_index = decon.instr_index,
                                 .position = .after,
                             },
@@ -879,6 +1062,7 @@ pub const PerceusAnalyzer = struct {
                     .insertion_point = .{
                         .function = func.id,
                         .block = decon.block,
+                        .path = try self.allocator.dupe(lattice.StreamStep, decon.path),
                         .instr_index = decon.instr_index,
                         .position = .after,
                     },
@@ -930,6 +1114,7 @@ pub const PerceusAnalyzer = struct {
                     .insertion_point = .{
                         .function = func.id,
                         .block = decon.block,
+                        .path = try self.allocator.dupe(lattice.StreamStep, decon.path),
                         .instr_index = decon.instr_index,
                         .position = .after,
                     },
