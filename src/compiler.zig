@@ -645,6 +645,12 @@ pub fn compileForCtfe(
 
     var analysis_result = try pipeline.runAnalysisAndContify(&ir_program);
 
+    // Materialize the analysis-context records into first-class
+    // `.retain { kind }` / `.release { kind }` IR instructions so
+    // the whole-program codegen path consumes the same canonical
+    // IR shape as `compileStructByStruct`'s merged path.
+    try materializeAnalysisArcOps(alloc, &ir_program, &analysis_result.context);
+
     // Second type-check pass — borrow / move diagnostics live behind
     // the analysis context, so they only fire on this re-check.
     // Replays `checkProgram` + `checkUnusedBindings` against the same
@@ -2080,21 +2086,13 @@ pub fn compileStructByStruct(
         // Phase 2: materialize the analysis-context records
         // (arc_ops, drop_specializations) into first-class
         // `.retain { kind }` / `.release { kind }` IR instructions
-        // inserted directly into the function body. After
-        // materialization, the consumed records are removed from
-        // the analysis context; the ZIR-time helpers
-        // (`emitAnalysisArcOps`, `emitDropSpecializationsForCurrentInstr`)
-        // observe the empty remainder and become no-ops for the
-        // materialized cases. Records targeting nested streams
-        // remain in place for the helpers to handle until follow-up
-        // commits extend the materialization pass's reach.
-        for (merged_ir.functions, 0..) |_, fi| {
-            const function: *ir.Function = @constCast(&merged_ir.functions[fi]);
-            zap.arc_materialize.materializeAnalysisArcOps(alloc, function, &analysis_result.context) catch {
-                merged_ownership.deinit();
-                return error.IrFailed;
-            };
-        }
+        // inserted directly into the function body. Records that
+        // can't be resolved against the merged IR remain in the
+        // analysis context for the V10 audit to surface.
+        materializeAnalysisArcOps(alloc, &merged_ir, &analysis_result.context) catch {
+            merged_ownership.deinit();
+            return error.IrFailed;
+        };
         // Replace the per-struct combined ownership with the
         // recomputed merged ownership so downstream consumers
         // (ZIR backend, `arc_share_skipped`, etc.) see the
@@ -2294,6 +2292,27 @@ fn runArcOwnershipAndVerify(
             // `std.log.err` inside `verify`.
             error.ArcInvariantViolation => return error.IrFailed,
         };
+    }
+}
+
+/// Walk every function in `program` and materialize the analysis-
+/// context's `arc_ops` and `drop_specializations` records into
+/// first-class `.retain { kind }` / `.release { kind }` IR
+/// instructions inserted in the function body. Records that can't be
+/// resolved (other function, deferred kind, unresolved path) remain
+/// in the analysis context so the V10/V11 audits can surface them.
+/// Shared between the whole-program (`compileForCtfe`) and per-
+/// struct merged (`compileStructByStruct`) pipelines so both
+/// entry points lower analysis records into canonical IR before
+/// ZIR emission.
+fn materializeAnalysisArcOps(
+    alloc: std.mem.Allocator,
+    program: *ir.Program,
+    analysis_context: *zap.escape_lattice.AnalysisContext,
+) CompileError!void {
+    for (program.functions, 0..) |_, fi| {
+        const function: *ir.Function = @constCast(&program.functions[fi]);
+        zap.arc_materialize.materializeAnalysisArcOps(alloc, function, analysis_context) catch return error.IrFailed;
     }
 }
 
