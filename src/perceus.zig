@@ -889,7 +889,26 @@ pub const PerceusAnalyzer = struct {
     ) !void {
         const con_type = extractConstructionType(&instr);
         if (con_type) |ct| {
-            if (areTypesReuseCompatible(&decon.scrutinee_type, &ct)) {
+            // Only tuple / struct / union construction instructions
+            // have a `reuse_token` field in IR and a reuse-aware
+            // lowering path in `zir_builder` (the
+            // `emitReuseAllocCall` helper assumes a struct-like
+            // layout where field-by-field stores via `field_ptr`
+            // and `zir_builder_emit_store` populate the reused
+            // allocation). `.list_init` and `.map_init` use
+            // accumulator/builder patterns (`List.empty.push(...)`,
+            // `Map.empty.insert(...)`) that cannot write into a
+            // pre-allocated buffer at all, so generating reuse
+            // pairs for them would emit a `.reset` IR that consumes
+            // the source's storage without any downstream consumer
+            // — pure memory leak. Skip those kinds at pair-discovery
+            // time; the corresponding deconstructions still hit the
+            // normal drop-insertion path.
+            const supports_reuse = switch (ct.kind) {
+                .struct_type, .tuple_type, .union_type => true,
+                .list_type, .map_type => false,
+            };
+            if (supports_reuse and areTypesReuseCompatible(&decon.scrutinee_type, &ct)) {
                 const alloc_id = self.nextAllocSiteId();
                 const dest = extractConstructionDest(&instr).?;
                 try results.append(self.allocator, .{
@@ -2896,10 +2915,21 @@ test "construction with same-name struct always reuses regardless of field count
 }
 
 // ============================================================
-// Test 11: List type reuse (FBIP canonical example)
+// Test 11: List type reuse is intentionally gated off
 // ============================================================
 
-test "list deconstruction + list construction yields reuse pair (FBIP)" {
+test "list deconstruction + list construction does NOT yield a reuse pair" {
+    // Rationale: `.list_init` lowers via accumulator/builder
+    // (`List.empty().push(...)`) rather than struct-field stores
+    // into a pre-allocated buffer. The reuse-aware lowering path
+    // (`emitReuseAllocCall` + per-field `zir_builder_emit_store`)
+    // can only target IR kinds that perform direct field writes —
+    // tuple_init / struct_init / union_init. Generating a reuse
+    // pair for a list construction would emit a `.reset` IR that
+    // consumes the scrutinee's storage without any downstream
+    // consumer, leaking the freed slot. `scanInstructionForConstructions`
+    // skips list_type / map_type at pair-discovery time; this test
+    // pins that behavior.
     const allocator = testing.allocator;
 
     const cond_instrs = [_]ir.Instruction{
@@ -2943,8 +2973,7 @@ test "list deconstruction + list construction yields reuse pair (FBIP)" {
     const result = try analyzer.analyze();
     defer result.deinit(allocator);
 
-    // List -> list is always reuse-compatible
-    try testing.expectEqual(@as(usize, 1), result.reuse_pairs.len);
+    try testing.expectEqual(@as(usize, 0), result.reuse_pairs.len);
 }
 
 // ============================================================
