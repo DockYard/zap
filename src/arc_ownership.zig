@@ -5042,6 +5042,180 @@ test "arc_ownership: still emits copy_value when source has additional uses (Pha
     try std.testing.expectEqual(@as(usize, 1), totals.copy_count);
 }
 
+test "arc_ownership: shouldMove returns true when source flat use_count=2 but local_get is at path-sensitive last-use" {
+    // Phase 1.4 / Phase 2.2 / commit `8e783b2` regression — the path-
+    // sensitive refinement: when `last_use_sites` is populated (the
+    // production case), `shouldMove` must consult
+    // `ArcOwnership.isLastUseAt` rather than the flat
+    // `total_use_count == 1` predicate.
+    //
+    // Spectral-norm's `iterate` is the canonical reproducer: the
+    // recursive-step tail_call's arg local has TWO flat reads — an
+    // earlier `borrow_value` (used as a share-source for an
+    // intermediate call) plus the tail_call's own `local_get`. The
+    // flat predicate sees `total_use_count == 2` and falls back to
+    // `copy_value`, retaining the cell at the tail-call boundary;
+    // the dataflow downgrades the resulting dest to non-unique and
+    // the interprocedural fixpoint cascades the demotion through
+    // every subsequent owned-consume site. Per `isLastUseAt`, the
+    // tail_call's `local_get` IS at the source's last use on its
+    // execution path — the earlier `borrow_value`'s own last-use
+    // site lies before this point, so the source is dead immediately
+    // after this read.
+    //
+    // This unit test pins the path-sensitive predicate directly:
+    // build a 2-use source where one use was a borrow (already at
+    // last-use earlier) and the other is the tail_call's local_get,
+    // then synthesise an `ArcOwnership` where ONLY the tail_call's
+    // local_get is a recorded last-use site for the source. The
+    // flat fallback would return false (total_use_count == 2); the
+    // path-sensitive predicate must return true.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Function shape:
+    //   %0 = (some owned producer; identity immaterial)
+    //   %1 = borrow_value %0          -- earlier reader of %0
+    //   %2 = local_get %0              -- tail_call's arg loader (last use)
+    //   tail_call self args=[%2]
+    //
+    // `%0` has total_use_count == 2 (borrow + local_get). The
+    // synthetic `ArcOwnership` records the local_get's id (2) as a
+    // last-use site for %0; the borrow's id (1) is NOT recorded.
+    const args = try arena.alloc(ir.LocalId, 1);
+    args[0] = 2;
+    const instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        .{ .borrow_value = .{ .dest = 1, .source = 0 } },
+        .{ .local_get = .{ .dest = 2, .source = 0 } },
+        .{ .tail_call = .{ .name = "self_loop", .args = args } },
+    };
+    const local_ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned };
+
+    var function = try buildMoveValueTestFunction(arena, "self_loop", &instrs, &local_ownership, 0);
+
+    // Collect the use summary so the predicate's per-local counts
+    // (tail_call_arg_use_count, total_use_count) match production.
+    var use_summary: UseSummary = .{};
+    defer use_summary.deinit(arena);
+    try collectUseSummary(arena, &function, &use_summary);
+
+    // Sanity: %0's flat use count is 2 (borrow + local_get); the
+    // flat predicate WOULD reject the move. The path-sensitive
+    // predicate must override.
+    const source_counts = use_summary.get(0);
+    try std.testing.expectEqual(@as(u32, 2), source_counts.total_use_count);
+
+    // Build a synthetic ArcOwnership where %0's last-use is at the
+    // local_get's id only. The local_get is the 3rd instruction
+    // (id 2) in the top-level stream.
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(arena);
+    const local_get_id: arc_liveness.InstructionId = 2;
+    const local_get_key = (@as(u64, @intCast(@as(u32, 0))) << 32) | @as(u64, @intCast(local_get_id));
+    try ownership.last_use_sites.put(arena, local_get_key, {});
+    // Also record %2's last-use at the tail_call (id 3), since the
+    // shouldMove caller passes the local_get's id for `source` and
+    // the path-sensitive check ignores `dest`'s last-use entry —
+    // this entry only exists to keep the ownership table "populated"
+    // (last_use_sites.count() > 0) so the fallback path is skipped.
+    const dest_key = (@as(u64, @intCast(@as(u32, 2))) << 32) | @as(u64, @intCast(3));
+    try ownership.last_use_sites.put(arena, dest_key, {});
+
+    // Path-sensitive predicate must return true.
+    try std.testing.expect(shouldMove(&function, &use_summary, &ownership, 2, 0, local_get_id));
+
+    // Flip the synthetic ownership so %0 is NOT at last-use at
+    // local_get_id (only %2 has an entry, keeping the table non-
+    // empty so the fallback is skipped). The predicate must return
+    // false — the path-sensitive check fails.
+    var ownership_no_last_use: arc_liveness.ArcOwnership = .{};
+    defer ownership_no_last_use.deinit(arena);
+    try ownership_no_last_use.last_use_sites.put(arena, dest_key, {});
+    try std.testing.expect(!shouldMove(&function, &use_summary, &ownership_no_last_use, 2, 0, local_get_id));
+}
+
+test "arc_ownership: shouldMove falls back to flat total_use_count==1 when last_use_sites is empty" {
+    // The fallback path covers the unit-test shape where the caller
+    // hands a hand-rolled `ir.Function` to `classifyAndNormalize`
+    // without first running `arc_liveness.computeArcOwnership` — the
+    // resulting `ArcOwnership` is the zero-init `{}`, so
+    // `last_use_sites.count()` is 0. The flat check is sound but
+    // strictly weaker; production code paths always provide a
+    // populated ownership table.
+    //
+    // This test pins the fallback directly: when `last_use_sites`
+    // is empty AND the source has exactly one use (a `local_get`
+    // feeding a tail_call), `shouldMove` returns true. With two
+    // uses, it returns false.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Single-use shape — flat predicate accepts.
+    {
+        const args = try arena.alloc(ir.LocalId, 1);
+        args[0] = 1;
+        const instrs = [_]ir.Instruction{
+            .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+            .{ .local_get = .{ .dest = 1, .source = 0 } },
+            .{ .tail_call = .{ .name = "self_loop", .args = args } },
+        };
+        const local_ownership = [_]ir.OwnershipClass{ .owned, .owned };
+
+        var function = try buildMoveValueTestFunction(arena, "self_loop_single_use", &instrs, &local_ownership, 0);
+
+        var use_summary: UseSummary = .{};
+        defer use_summary.deinit(arena);
+        try collectUseSummary(arena, &function, &use_summary);
+
+        const source_counts = use_summary.get(0);
+        try std.testing.expectEqual(@as(u32, 1), source_counts.total_use_count);
+
+        var empty_ownership: arc_liveness.ArcOwnership = .{};
+        defer empty_ownership.deinit(arena);
+        try std.testing.expectEqual(@as(u32, 0), empty_ownership.last_use_sites.count());
+
+        // Fallback path: flat check passes (total_use_count == 1).
+        const local_get_id: arc_liveness.InstructionId = 1;
+        try std.testing.expect(shouldMove(&function, &use_summary, &empty_ownership, 1, 0, local_get_id));
+    }
+
+    // Two-use shape — flat predicate rejects.
+    {
+        const args = try arena.alloc(ir.LocalId, 1);
+        args[0] = 1;
+        const instrs = [_]ir.Instruction{
+            .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+            .{ .local_get = .{ .dest = 1, .source = 0 } },
+            // Second use of source 0: a local_set carrying %0
+            // (non-borrow position). The use_summary counts this as
+            // a non-borrow use so total_use_count rises to 2.
+            .{ .local_set = .{ .dest = 2, .value = 0 } },
+            .{ .tail_call = .{ .name = "self_loop_two_uses", .args = args } },
+        };
+        const local_ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned };
+
+        var function = try buildMoveValueTestFunction(arena, "self_loop_two_uses", &instrs, &local_ownership, 0);
+
+        var use_summary: UseSummary = .{};
+        defer use_summary.deinit(arena);
+        try collectUseSummary(arena, &function, &use_summary);
+
+        const source_counts = use_summary.get(0);
+        try std.testing.expectEqual(@as(u32, 2), source_counts.total_use_count);
+
+        var empty_ownership: arc_liveness.ArcOwnership = .{};
+        defer empty_ownership.deinit(arena);
+        try std.testing.expectEqual(@as(u32, 0), empty_ownership.last_use_sites.count());
+
+        // Fallback path: flat check fails (total_use_count == 2).
+        const local_get_id: arc_liveness.InstructionId = 1;
+        try std.testing.expect(!shouldMove(&function, &use_summary, &empty_ownership, 1, 0, local_get_id));
+    }
+}
+
 // ============================================================
 // Phase E.10 — move_value emission for aggregate-store operands
 // ============================================================

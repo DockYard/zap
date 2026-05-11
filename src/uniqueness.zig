@@ -993,12 +993,44 @@ const Analyzer = struct {
                 try self.unique.put(self.allocator, li.dest, {});
             },
             .list_cons => |lc| {
+                // Phase F gap #2 — path-sensitive escape suppression
+                // on the tail. The runtime's `List.cons` (commit
+                // fb32ef1) has an rc-1 in-place fast path: when the
+                // tail's cell is at refcount 1 the cons mutates the
+                // tail's buffer directly, returning the same cell as
+                // `lc.dest`. The compiler-side counterpart is to
+                // recognise that when the tail local is at last-use
+                // path-sensitively, any tuple_pending state on it is
+                // NOT defeated by the cons (no new alias is created;
+                // the cell flows through). Mirrors the Phase 1.4 /
+                // 2.2 last-use refinements in
+                // `arc_ownership.shouldMoveIntoOwnedConsume` and
+                // `shouldMoveIntoAggregate`. Without this gate, the
+                // tail's pending entry is dissolved before
+                // `walkStream`'s `promoteAtLastUse` fires at this
+                // same instruction id, so extracted-from-tail locals
+                // never inherit their component's uniqueness — the
+                // exact pattern the `acc = [x | acc]` accumulator
+                // hits when the accumulator is a destructured tuple
+                // component.
+                const tail_at_last_use = if (self.ownership) |o|
+                    o.isLastUseAt(lc.tail, my_id)
+                else
+                    false;
+
                 _ = self.unique.remove(lc.head);
                 _ = self.unique.remove(lc.tail);
                 self.escapeIfExtractedLocal(lc.head);
-                self.escapeIfExtractedLocal(lc.tail);
                 self.escapePending(lc.head);
-                self.escapePending(lc.tail);
+                if (!tail_at_last_use) {
+                    // Not at last-use: the cons retains a new alias
+                    // to the tail's cell, so any pending entry on
+                    // the tail loses its sole-owner guarantee.
+                    // Dissolve the pending entry (preserves the
+                    // pre-fix semantics for non-last-use cases).
+                    self.escapeIfExtractedLocal(lc.tail);
+                    self.escapePending(lc.tail);
+                }
                 try self.unique.put(self.allocator, lc.dest, {});
             },
             .map_init => |mi| {
@@ -2513,4 +2545,75 @@ test "uniqueness: param_get becomes unique when fixpoint says unique-on-entry" {
         defer u.deinit(testing.allocator);
         try testing.expect(u.isUnique(4));
     }
+}
+
+test "uniqueness: list_cons whose tail is at last-use produces a unique dest" {
+    // Phase F gap-analysis item #2 — the `acc = [x | acc]` accumulator
+    // pattern. When the local feeding `list_cons.tail` is at last-use
+    // path-sensitively (so the runtime's rc-1 in-place fast path from
+    // commit `fb32ef1` can fire), the analyzer must still classify
+    // `lc.dest` as unique so the downstream `List.push`/`List.set`
+    // chain hits its own owned-mutating fast paths. Without this,
+    // long-running accumulators built via `[x | acc]` would force the
+    // checked variants at every iteration and the rc-1 in-place fast
+    // path would never realise as a uniqueness witness on its result.
+    //
+    // Stream (mirroring the IR after `shouldMoveIntoAggregate` has
+    // lowered the `.local_get` for the tail to `.move_value`):
+    //   [0] list_init %0 = []                  -- fresh, unique tail-seed
+    //   [1] const_int %1 = 7                   -- new head element
+    //   [2] move_value %2 <- %0                -- tail at last-use
+    //   [3] list_cons %3 = [%1 | %2]           -- consumes %2
+    //   [4] const_int %4 = 11                  -- next push element
+    //   [5] move_value %5 <- %3                -- transfer dest's uniqueness
+    //   [6] call_builtin "List.push" args=[%5, %4] dest=%6
+    //
+    // Expected: uniqueness holds at id 6 — the List.push receiver %5
+    // was move_value'd from %3 (`lc.dest`), and `lc.dest` is unique by
+    // runtime contract (rc-1 in-place when tail was rc=1, fresh-rc-1
+    // deep clone otherwise).
+    //
+    // This test pins the dest-is-unique outcome; the path-sensitive
+    // escape suppression that the matching fix introduces affects
+    // tuple_pending state on the tail rather than the dest's
+    // uniqueness directly, but the regression guard ensures the
+    // accumulator chain stays sound across future refactors of the
+    // `.list_cons` handler.
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const push_args = try arena.alloc(ir.LocalId, 2);
+    push_args[0] = 5;
+    push_args[1] = 4;
+    const push_modes = try arena.alloc(ir.ValueMode, 2);
+    push_modes[0] = .move;
+    push_modes[1] = .borrow;
+    const instrs = [_]ir.Instruction{
+        .{ .list_init = .{ .dest = 0, .elements = &.{} } },
+        .{ .const_int = .{ .dest = 1, .value = 7 } },
+        .{ .move_value = .{ .dest = 2, .source = 0 } },
+        .{ .list_cons = .{ .dest = 3, .head = 1, .tail = 2 } },
+        .{ .const_int = .{ .dest = 4, .value = 11 } },
+        .{ .move_value = .{ .dest = 5, .source = 3 } },
+        .{ .call_builtin = .{
+            .dest = 6,
+            .name = "List.push",
+            .args = push_args,
+            .arg_modes = push_modes,
+        } },
+    };
+    var function = try buildTestFunction(arena, "list_cons_tail_last_use", &instrs, 7);
+
+    // Record %2 as at last-use at the `list_cons` instruction (id 3).
+    var ownership = try buildSyntheticOwnership(arena, &.{
+        .{ .local = 2, .id = 3 },
+    });
+    defer ownership.deinit(testing.allocator);
+
+    var u = try analyzeUniquenessFull(testing.allocator, &function, null, null, null, &ownership);
+    defer u.deinit(testing.allocator);
+
+    // List.push at id 6 must observe a unique receiver.
+    try testing.expect(u.isUnique(6));
 }

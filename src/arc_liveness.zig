@@ -6011,6 +6011,209 @@ test "arc_liveness: Phase 2.7 ignores non-ARC aggregate without ARC-managed extr
     try std.testing.expectEqual(@as(u32, 0), ownership.last_use_sites.size);
 }
 
+test "arc_liveness: switch_return arm-local struct_init return value enters return_source_locals" {
+    // Regression test for commit `1e73e66`: `applySpecialization`
+    // handles `.switch_return` by iterating every arm's
+    // `return_value`. When an arm body builds a fresh `struct_init`
+    // and the switch_return's arm marks that dest as `return_value`,
+    // the local is at last-use at the switch_return instruction (the
+    // struct's only reader is the implicit return) and
+    // `canElideReturnSource` accepts it (the local was NOT loaded
+    // from a borrowed param), so the dest must be added to
+    // `return_source_locals`. Without this, the function-epilogue
+    // retain-on-ret fires while the (no-op) release at the parent
+    // level fires against an unset slot — exactly the +1-per-return
+    // leak that binarytrees' `make` exhibited at 7.1 GB peak RSS
+    // pre-fix.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Arm body builds %2 via struct_init then the switch_return's
+    // case marks %2 as the arm's return_value.
+    const arm_fields = try arena.alloc(ir.StructFieldInit, 1);
+    arm_fields[0] = .{ .name = "leaf", .value = 1 };
+    const arm_body = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .struct_init = .{
+            .dest = 2,
+            .type_name = "Leaf",
+            .fields = arm_fields,
+        } },
+    });
+    const cases = try arena.alloc(ir.ReturnCase, 1);
+    cases[0] = .{
+        .value = .{ .int = 1 },
+        .body_instrs = arm_body,
+        .return_value = 2,
+    };
+
+    // Default body builds %4 via struct_init and returns %4 to keep
+    // the analyzer's per-arm bookkeeping consistent (every reachable
+    // exit terminates in a fresh +1).
+    const default_fields = try arena.alloc(ir.StructFieldInit, 1);
+    default_fields[0] = .{ .name = "leaf", .value = 3 };
+    const default_body = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .const_int = .{ .dest = 3, .value = 0 } },
+        .{ .struct_init = .{
+            .dest = 4,
+            .type_name = "Leaf",
+            .fields = default_fields,
+        } },
+    });
+
+    const stream = try arena.alloc(ir.Instruction, 1);
+    stream[0] = .{ .switch_return = .{
+        .scrutinee_param = 0,
+        .cases = cases,
+        .default_instrs = default_body,
+        .default_result = 4,
+    } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    // Locals: %0 = scrutinee (trivial), %1/%3 = trivial field values,
+    // %2/%4 = owned struct dests (the arm/default return values).
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 5);
+    for (local_ownership) |*o| o.* = .trivial;
+    local_ownership[2] = .owned;
+    local_ownership[4] = .owned;
+
+    const params = try arena.alloc(ir.Param, 1);
+    params[0] = .{ .name = "tag", .type_expr = .i64, .type_id = null };
+    const param_conventions = try arena.alloc(ir.ParamConvention, 1);
+    param_conventions[0] = .trivial;
+
+    const function = ir.Function{
+        .id = 0,
+        .name = "switch_return_arm_local_struct_init",
+        .scope_id = 0,
+        .arity = 1,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = param_conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        &function,
+        suite_dummy_type_store_for_h6,
+        arc_managed_for_h6,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    // Pre-fix (before commit 1e73e66): `return_source_locals` was
+    // empty for switch_return arms because `applySpecialization`
+    // handled only `.ret` and `.cond_return`. Post-fix: both arm
+    // returns (%2 and %4) enter `return_source_locals`.
+    try std.testing.expect(ownership.return_source_locals.contains(2));
+    try std.testing.expect(ownership.return_source_locals.contains(4));
+}
+
+test "arc_liveness: union_switch_return arm-local struct_init return value enters return_source_locals" {
+    // Mirror of the `switch_return` test above for the union-shaped
+    // multi-arm return terminator. `union_switch_return` has no
+    // default arm in the IR shape — every variant is enumerated as
+    // a case. `applySpecialization` (commit `1e73e66`) walks each
+    // case's `return_value` and applies the same elision discipline
+    // as the single-`.ret` case.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Case 0: build %2 via struct_init, return %2.
+    const case0_fields = try arena.alloc(ir.StructFieldInit, 1);
+    case0_fields[0] = .{ .name = "leaf", .value = 1 };
+    const case0_body = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .struct_init = .{
+            .dest = 2,
+            .type_name = "Leaf",
+            .fields = case0_fields,
+        } },
+    });
+
+    // Case 1: build %4 via struct_init, return %4.
+    const case1_fields = try arena.alloc(ir.StructFieldInit, 1);
+    case1_fields[0] = .{ .name = "leaf", .value = 3 };
+    const case1_body = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .const_int = .{ .dest = 3, .value = 0 } },
+        .{ .struct_init = .{
+            .dest = 4,
+            .type_name = "Leaf",
+            .fields = case1_fields,
+        } },
+    });
+
+    const cases = try arena.alloc(ir.UnionCase, 2);
+    cases[0] = .{
+        .variant_name = "VariantA",
+        .field_bindings = &.{},
+        .body_instrs = case0_body,
+        .return_value = 2,
+    };
+    cases[1] = .{
+        .variant_name = "VariantB",
+        .field_bindings = &.{},
+        .body_instrs = case1_body,
+        .return_value = 4,
+    };
+
+    const stream = try arena.alloc(ir.Instruction, 1);
+    stream[0] = .{ .union_switch_return = .{
+        .scrutinee_param = 0,
+        .cases = cases,
+    } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    // %0 = scrutinee (trivial); %1/%3 trivial; %2/%4 owned.
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 5);
+    for (local_ownership) |*o| o.* = .trivial;
+    local_ownership[2] = .owned;
+    local_ownership[4] = .owned;
+
+    const params = try arena.alloc(ir.Param, 1);
+    params[0] = .{ .name = "tag", .type_expr = .void, .type_id = null };
+    const param_conventions = try arena.alloc(ir.ParamConvention, 1);
+    param_conventions[0] = .trivial;
+
+    const function = ir.Function{
+        .id = 0,
+        .name = "union_switch_return_arm_local_struct_init",
+        .scope_id = 0,
+        .arity = 1,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = param_conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        &function,
+        suite_dummy_type_store_for_h6,
+        arc_managed_for_h6,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    try std.testing.expect(ownership.return_source_locals.contains(2));
+    try std.testing.expect(ownership.return_source_locals.contains(4));
+}
+
 // Stand-in `TypeStore` pointer for the Phase H.6 hand-rolled test.
 // The test's `arc_managed_for_h6` callback hard-codes a yes for
 // every type id without consulting the store, so the analyzer never
