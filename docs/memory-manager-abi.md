@@ -147,7 +147,29 @@ The manager package places the meta header, the core vtable, and any embedded de
 
 The header's `core_vtable_offset` field gives the byte offset (from the start of the section) at which the core vtable lives. In the canonical v1.0 layout `meta.core_vtable_offset == @sizeOf(ZapMemoryManagerMetaV1) == 32`. Embedded descriptors, if any, follow the core vtable.
 
-Each underlying constant must have external linkage (the `export` keyword in Zig) so that the linker does not dead-strip it. Recommended symbol names are `zap_memory_manager_meta` and `zap_memory_manager_core`, but the compiler does NOT rely on these names — it discovers all data purely by walking the section's contents starting at offset 0.
+**Recommended emission pattern: single composite extern struct.** The manager wraps the meta header, the core vtable, and any embedded descriptors into a single composite `extern struct` and emits that struct via one `export const ... linksection(...)` declaration. Wrapping into a single declaration is the only portable way to guarantee that the linker preserves the relative order of the three artifacts within the `.zapmem` section; emitting them as multiple separate declarations with the same `linksection` attribute leaves the relative ordering unspecified and may produce a section layout that does not match `meta.core_vtable_offset`. The composite-struct pattern looks like:
+
+```zig
+const ZapMemorySection = extern struct {
+    meta: ZapMemoryManagerMetaV1,
+    core: ZapMemoryManagerCoreV1,
+    // ...optional embedded descriptors follow here, one field per entry.
+};
+
+pub export const zap_memory_section linksection(SECTION_NAME) = ZapMemorySection{
+    .meta = .{
+        // ...meta fields, including
+        // .core_vtable_offset = @offsetOf(ZapMemorySection, "core"),
+    },
+    .core = .{
+        // ...core fields.
+    },
+};
+```
+
+The composite struct's `@offsetOf(ZapMemorySection, "core")` provides the value for `meta.core_vtable_offset`, and `@offsetOf(...)` on any embedded descriptor field provides its section offset. Because Zig lays out an `extern struct` in declaration order and emits it as a single contiguous initializer, the resulting `.zapmem` section is guaranteed to match the layout in the table above.
+
+The composite-struct symbol must have external linkage (the `export` keyword in Zig) so that the linker does not dead-strip it. The recommended symbol name is `zap_memory_section`, but the compiler does NOT rely on this name — it discovers all data purely by walking the section's contents starting at offset 0. Managers may also use multiple-declaration emission (one `export const` per artifact, each with the same `linksection`) provided they verify the produced section layout for every supported target; the resulting layout is implementation-defined and not portable across linkers.
 
 A manager package emits exactly one `ZapMemoryManagerMetaV1` and exactly one `ZapMemoryManagerCoreV1` into the `.zapmem` section. Emitting zero or more than one of either is a manager defect; the compiler rejects such managers with a build-time error.
 
@@ -175,7 +197,7 @@ The Zap compiler rejects the manager with a clear build-time error if any of the
 
 - `meta.magic` does not equal the target-endianness-correct form of `'ZMEM'`.
 - `meta.abi_major` does not equal the compiler's known ABI major (`1` for this spec).
-- `meta.abi_minor` exceeds the compiler's known ABI minor *and* `meta.size` does not include enough trailing zero-extension to make the missing-bytes interpretation safe. (In practice: the compiler accepts any `abi_minor` as long as it can read at least the prefix it understands.)
+- `meta.abi_minor > compiler.known_abi_minor` AND `meta.size < sizeof(compiler.known_meta)`: rejected with `zap: manager claims abi_minor <N> but provides metadata smaller than this compiler's known prefix; rebuild manager with a newer ABI minor or upgrade the compiler`. If `meta.size >= sizeof(compiler.known_meta)`, the compiler reads its known prefix and silently ignores any trailing bytes regardless of `abi_minor`. This is the size-field forward-extension contract (section 2.3).
 - `meta.size < 32` (the v1.0 base size for the meta header; the compiler refuses partial structures).
 - `meta.core_vtable_offset < meta.size` (the core vtable must follow the header without overlapping it).
 - `meta.core_vtable_offset + sizeof(ZapMemoryManagerCoreV1)` exceeds the section size.
@@ -949,10 +971,14 @@ The primitive does not currently accept package dependencies (`build.zig.zon` de
 The Zap runtime exports a single global storage for the active manager's context:
 
 ```zig
-pub extern var zap_memory_manager_context: *anyopaque;
+pub extern var zap_memory_manager_context: ?*anyopaque = null;
 ```
 
-The startup hook (emitted in step 8) populates this from the manager's `init` return value. Every compiler-emitted retain/release/allocate/deallocate site loads this global and passes it as the first argument to the corresponding vtable function. The global is written once (at startup) and read on every call site; it is never written again during the program's lifetime.
+The runtime initializes this global to `null` at load time (it lives in `.bss`/`.data` and has an explicit `null` initializer). The startup hook emitted in step 8 invokes the manager's `init`, validates that the returned context pointer is non-null (treating null as initialization failure per section 4.2), and writes the validated pointer into `zap_memory_manager_context` before transferring control to user-level main.
+
+Every compiler-emitted retain/release/allocate/deallocate site unwraps the nullable using the canonical Zig idiom — for example, `const ctx = zap_memory_manager_context orelse @panic("zap: memory manager not initialized; allocation issued before startup completed")`. The unwrap compiles to a single not-null branch on every target; the cold panic path emits a deterministic abort with a clear diagnostic.
+
+Reaching an allocation site before startup completes is a structural bug in the runtime (it indicates that user-visible allocation was triggered before `init` ran) rather than a recoverable condition; the panic surfaces the bug at the point of misuse. The global is written exactly once (immediately after `init` returns successfully) and read on every subsequent call site; it is never reassigned during the program's lifetime.
 
 Multi-process binaries (future) will replace this global with a per-process slot loaded from the active process's runtime state; the change is reserved for ABI v2.0 and does not affect v1.x managers.
 
@@ -1005,9 +1031,9 @@ The Zap compiler resolves `ThirdParty.MyManager`, reads its `@memory_manager_sou
 
 #### 11.1.1 Third-party manager dependencies
 
-v1.0 third-party managers may not have Zig-package dependencies (no `build.zig.zon` `dependencies` table). The manager source must be self-contained: `@import("std")`, `@import("builtin")`, and the manager's own files. The `zap_fork_compile_zig_to_object` primitive does not currently accept a deps graph.
+v1.0 third-party managers may not declare Zig-package dependencies. The manager source must be self-contained: `@import("std")`, `@import("builtin")`, and the manager's own files (no `build.zig.zon` `dependencies` table). The `zap_fork_compile_zig_to_object` primitive is a flat C-ABI function whose signature is fixed for the lifetime of ABI v1.x; it carries no deps-array field and no size-extensible options struct, so dep support cannot be added under the `size`-field forward-extension convention used elsewhere in this spec (section 2.3 applies to extern structs, not flat C-ABI signatures).
 
-A future ABI version may add dep support by extending the fork primitive's signature; this would be an `abi_minor` change since adding optional fields to an extern struct is non-breaking under the `size`-field convention (section 2.3).
+Future ABI versions may add dep support by introducing a new C-ABI entry point (e.g., `zap_fork_compile_zig_to_object_v2`) that accepts a deps graph. The v1.0 primitive `zap_fork_compile_zig_to_object` will remain stable and continue to work for self-contained managers.
 
 ### 11.2 Versioning the third-party manager
 
@@ -1021,8 +1047,13 @@ For each memory manager, there is a Zap struct that names the manager and points
 
 ### 12.1 First-party `Zap.Memory.ARC`
 
+The `@memory_manager_source` attribute is file-level metadata that points at the manager's Zig source; the convention matches `@native_type` in `lib/list.zap` — file-top, before `pub struct`. The descriptive heredoc lives inside the struct body as `@structdoc`, matching the convention in `lib/list.zap`.
+
 ```
-@doc = """
+@memory_manager_source = "src/runtime/memory/arc/manager.zig"
+
+pub struct Zap.Memory.ARC {
+  @structdoc = """
   Atomic reference counting memory manager.
 
   Each refcounted cell carries an inline header storing the refcount
@@ -1032,17 +1063,16 @@ For each memory manager, there is a Zap struct that names the manager and points
 
   Declared capabilities: REFCOUNT_V1.
   """
-
-@memory_manager_source = "src/runtime/memory/arc/manager.zig"
-
-pub struct Zap.Memory.ARC {
 }
 ```
 
 ### 12.2 First-party `Zap.Memory.Arena`
 
 ```
-@doc = """
+@memory_manager_source = "src/runtime/memory/arena/manager.zig"
+
+pub struct Zap.Memory.Arena {
+  @structdoc = """
   Whole-program arena memory manager.
 
   All allocations come from a single arena. Individual deallocations
@@ -1053,10 +1083,6 @@ pub struct Zap.Memory.ARC {
 
   Declared capabilities: none.
   """
-
-@memory_manager_source = "src/runtime/memory/arena/manager.zig"
-
-pub struct Zap.Memory.Arena {
 }
 ```
 
@@ -1071,7 +1097,7 @@ The compiler resolves the path against the package the struct is declared in; th
 
 ### 12.4 Pseudo-emptiness of the struct
 
-The struct is intentionally empty. It exists purely as a typed reference for use in `Zap.Manifest.memory:` and to carry the `@memory_manager_source` attribute. Future ABI versions may add type-level methods to memory-manager structs (e.g., for per-process selection in v2), but v1.0 keeps them empty.
+The struct body is intentionally empty of fields and functions — only the `@structdoc` attribute lives inside it. The struct exists purely as a typed reference for use in `Zap.Manifest.memory:` and to carry the `@memory_manager_source` attribute (at file top) and `@structdoc` (inside the body). Future ABI versions may add type-level methods to memory-manager structs (e.g., for per-process selection in v2), but v1.0 keeps the bodies free of methods and fields.
 
 ---
 
@@ -1195,40 +1221,50 @@ fn noopGetCapabilityDesc(
     return null;
 }
 
-// The meta header. Placed at section offset 0 by linksection.
-export const zap_memory_manager_meta: ZapMemoryManagerMetaV1
-    linksection(SECTION_NAME) = .{
-    .magic = ZMEM_MAGIC,
-    .abi_major = 1,
-    .abi_minor = 0,
-    .size = @sizeOf(ZapMemoryManagerMetaV1),
-    ._reserved2 = 0,
-    .desc_count = 0,
-    .declared_caps = 0,    // No capabilities declared.
-    .core_vtable_offset = @sizeOf(ZapMemoryManagerMetaV1),
-    .reserved = 0,
+// Composite section payload: wraps the meta header and core vtable into
+// a single extern struct so the linker emits them as one contiguous
+// allocation in declaration order. This is the recommended emission
+// pattern per section 3.2; it guarantees that `meta.core_vtable_offset`
+// matches the actual layout regardless of linker quirks.
+const ZapMemorySection = extern struct {
+    meta: ZapMemoryManagerMetaV1,
+    core: ZapMemoryManagerCoreV1,
 };
 
-// The core vtable. Placed immediately after the meta header in the
-// same .zapmem section. The compiler finds it via meta.core_vtable_offset.
-export const zap_memory_manager_core: ZapMemoryManagerCoreV1
+pub export const zap_memory_section: ZapMemorySection
     linksection(SECTION_NAME) = .{
-    .abi_major = 1,
-    .abi_minor = 0,
-    .size = @sizeOf(ZapMemoryManagerCoreV1),
-    .declared_caps = 0,
-    .init = noopInit,
-    .deinit = noopDeinit,
-    .allocate = noopAllocate,
-    .deallocate = noopDeallocate,
-    .get_capability_desc = noopGetCapabilityDesc,
+    .meta = .{
+        .magic = ZMEM_MAGIC,
+        .abi_major = 1,
+        .abi_minor = 0,
+        .size = @sizeOf(ZapMemoryManagerMetaV1),
+        ._reserved2 = 0,
+        .desc_count = 0,
+        .declared_caps = 0,    // No capabilities declared.
+        .core_vtable_offset = @offsetOf(ZapMemorySection, "core"),
+        .reserved = 0,
+    },
+    .core = .{
+        .abi_major = 1,
+        .abi_minor = 0,
+        .size = @sizeOf(ZapMemoryManagerCoreV1),
+        .declared_caps = 0,
+        .init = noopInit,
+        .deinit = noopDeinit,
+        .allocate = noopAllocate,
+        .deallocate = noopDeallocate,
+        .get_capability_desc = noopGetCapabilityDesc,
+    },
 };
 ```
 
 ### 14.2 Zap source: `lib/zap/memory/noop.zap`
 
 ```
-@doc = """
+@memory_manager_source = "src/runtime/memory/noop/manager.zig"
+
+pub struct Zap.Memory.NoOp {
+  @structdoc = """
   No-op memory manager. Used only for compiler integration tests:
   allocation fails immediately, deallocation does nothing, no
   capabilities are declared.
@@ -1238,10 +1274,6 @@ export const zap_memory_manager_core: ZapMemoryManagerCoreV1
   pipeline accepts a minimal manager and that capability-elision
   removes all retain/release calls.
   """
-
-@memory_manager_source = "src/runtime/memory/noop/manager.zig"
-
-pub struct Zap.Memory.NoOp {
 }
 ```
 
@@ -1259,7 +1291,9 @@ A program built with `memory: Zap.Memory.NoOp`:
 
 ## 15. Worked example: minimal refcounting manager
 
-This example shows a small but complete refcounting manager. It uses `std.heap.page_allocator` for backing storage. Each refcounted cell carries an inline 16-byte header that stores the refcount along with the original allocation size and alignment, so `release` can recover those values and free the page correctly when the count reaches zero. The manager also handles raw allocations (those not produced for a refcounted type) by routing them through the same path; `tinyrefDeallocate` is exercised for transient scratch buffers and other non-refcounted allocations. It declares `REFCOUNT_V1`.
+This example shows a small but complete refcounting manager. It uses `std.heap.page_allocator` for backing storage. Each refcounted cell carries an inline header sitting immediately before the user pointer; the header stores the refcount along with enough metadata (the offset of the user pointer from the start of the original allocation block, the block's total size, and the user-requested alignment) to recover the original allocation precisely when the count reaches zero. The manager also handles raw allocations (those not produced for a refcounted type) by routing them through the same path; `tinyrefDeallocate` is exercised for transient scratch buffers and other non-refcounted allocations. It declares `REFCOUNT_V1`.
+
+The header layout is sized to support arbitrary user-requested alignments, including alignments greater than the header's own size (for example 32-byte AVX vectors or 64-byte cacheline alignment). Production managers that target only small power-of-two alignments may shrink the header further; the layout shown here is the general-case template.
 
 ### 15.1 Zig source: `tinyref/src/manager.zig`
 
@@ -1328,22 +1362,52 @@ const SECTION_NAME = switch (builtin.target.ofmt) {
     else => @compileError("unsupported object format"),
 };
 
-// Inline header placed at the start of every allocation. The 16-byte
-// size keeps user-payload alignment at 16 bytes (sufficient for every
-// scalar type and for SIMD vectors up to 16 wide on the targets we
-// care about). The header carries the refcount plus enough metadata
-// to recover the original allocation size and alignment when the
-// cell is freed during `release` or `deallocate`.
+// Inline header placed immediately before the user pointer. The header
+// is allocated into headroom carved out of the underlying page-allocator
+// block, then offset-shifted by `tinyrefAllocate` so that the user
+// pointer satisfies an arbitrary requested alignment (including 32-byte
+// AVX or 64-byte cacheline alignments that exceed the header's own
+// size).
+//
+// The header stores:
+//   - `refcount`:     atomic refcount for REFCOUNT_V1 semantics.
+//   - `size`:         user payload size, so `freeCell` can verify the
+//                     runtime's `size` argument and so a future manager
+//                     extension may grow the payload in place.
+//   - `alignment`:    user-requested alignment, used to dispatch
+//                     `page_allocator.free` against the same alignment
+//                     the original alignedAlloc used.
+//   - `block_offset`: distance in bytes from the start of the original
+//                     page-allocator block to the user pointer; required
+//                     to recover the original block address regardless
+//                     of the alignment slack the allocator inserted.
+//   - `block_size`:   total length (in bytes) of the original block,
+//                     including header headroom and alignment slack;
+//                     required to free the block as a precisely-sized
+//                     slice.
+//
+// The header is larger than the 16 bytes used in earlier drafts: storing
+// `block_offset` and `block_size` is mandatory to handle alignment > 16
+// correctly. Production managers that pool allocations by size class can
+// shrink the header by replacing `size`/`alignment`/`block_size` with a
+// size-class index and reading the rest from a per-class descriptor; the
+// general-case header below is sized for correctness over compactness.
 const Header = extern struct {
-    refcount: u32,    // atomic, accessed via @atomicRmw
-    size: u32,        // user payload size in bytes
-    alignment: u32,   // user-requested alignment, must be power of two
-    _pad: u32,        // explicit padding to round Header up to 16 bytes
+    refcount: u32,        // atomic, accessed via @atomicRmw
+    size: u32,            // user payload size in bytes
+    alignment: u32,       // user-requested alignment, power of two
+    block_offset: u32,    // bytes from block start to user pointer
+    block_size: u64,      // total size of the page-allocator block
 };
-const HEADER_SIZE: usize = @sizeOf(Header);    // 16
+const HEADER_SIZE: usize = @sizeOf(Header);    // 24 bytes
+const HEADER_ALIGN: u32 = @alignOf(Header);    // 8 bytes on 64-bit targets
 
 comptime {
-    if (HEADER_SIZE != 16) @compileError("Header must be exactly 16 bytes");
+    // Lock the header layout for this example. A production manager may
+    // pick a different size — the only hard constraint is that
+    // `tinyrefAllocate` reserves at least `HEADER_SIZE` bytes between the
+    // block start and the user pointer.
+    if (HEADER_SIZE != 24) @compileError("Header must be exactly 24 bytes");
 }
 
 // Per-manager context. The example carries a single atomic counter
@@ -1370,50 +1434,89 @@ fn tinyrefDeinit(ctx: *anyopaque) callconv(.c) void {
     // we get here.
 }
 
-// Allocate `size` bytes with at least `alignment` alignment. Writes
-// size/alignment into the inline Header so release/deallocate can
-// later recover them.
+// Allocate `size` bytes with at least `alignment` byte alignment for
+// the returned user pointer. Handles arbitrary power-of-two alignment
+// values, including alignments larger than HEADER_SIZE.
+//
+// Layout of the underlying block:
+//
+//     [ alignment slack ][ Header ][ user payload (size bytes) ]
+//     ^                            ^
+//     block_start                  user_start (aligned to `alignment`)
+//
+// The block is allocated at alignment = max(alignment, HEADER_ALIGN) so
+// that, regardless of where in the block the user pointer ends up, the
+// header behind it remains naturally aligned. We reserve worst-case
+// padding (`padded_alignment`) ahead of the header so we always have
+// room to advance the user pointer forward to satisfy `alignment`.
+//
+// The allocation uses `rawAlloc` / `rawFree` rather than `alignedAlloc`
+// because the runtime alignment value cannot be passed through the
+// comptime-alignment alloc helpers. The matching free in `freeCell` uses
+// the same alignment, so the allocator's vtable dispatch is symmetric.
 fn tinyrefAllocate(ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8 {
     const context: *Context = @ptrCast(@alignCast(ctx));
     _ = context.allocation_counter.fetchAdd(1, .monotonic);
 
-    // The page allocator requires alignment to be a power of two and
-    // at most a page; our caller already guarantees both.
-    const effective_align: u32 = @max(alignment, @as(u32, HEADER_SIZE));
-    const total: usize = HEADER_SIZE + size;
+    // `padded_alignment` is the alignment handed to the underlying
+    // allocator; it must be at least `HEADER_ALIGN` so that the header
+    // (placed immediately before the user pointer) is also naturally
+    // aligned, and at least `alignment` so the user pointer can be
+    // advanced forward to satisfy the request.
+    const padded_alignment: u32 = @max(alignment, HEADER_ALIGN);
+    const total: usize = HEADER_SIZE + size + padded_alignment;
+    const allocator_alignment = std.mem.Alignment.fromByteUnits(padded_alignment);
 
-    const block = std.heap.page_allocator.alignedAlloc(
-        u8,
-        @intCast(effective_align),
+    const block_ptr = std.heap.page_allocator.rawAlloc(
         total,
-    ) catch return null;
+        allocator_alignment,
+        @returnAddress(),
+    ) orelse return null;
 
-    const header_ptr: *Header = @ptrCast(@alignCast(block.ptr));
+    // Place the user pointer at the next address that is aligned to the
+    // requested `alignment` AND leaves at least HEADER_SIZE bytes behind
+    // it for the header.
+    const block_start = @intFromPtr(block_ptr);
+    const user_start_min = block_start + HEADER_SIZE;
+    const user_start = std.mem.alignForward(usize, user_start_min, alignment);
+
+    // The header sits immediately before the user pointer. Because
+    // `block_start` is aligned to `padded_alignment` (at least
+    // HEADER_ALIGN) and `user_start` advances from there by a multiple
+    // of `alignment` (also at least HEADER_ALIGN by `padded_alignment`'s
+    // definition), `(user_start - HEADER_SIZE)` is HEADER_ALIGN-aligned.
+    const header_ptr: *Header = @ptrFromInt(user_start - HEADER_SIZE);
     header_ptr.* = .{
         .refcount = 1,
         .size = @intCast(size),
-        .alignment = effective_align,
-        ._pad = 0,
+        .alignment = alignment,
+        .block_offset = @intCast(user_start - block_start),
+        .block_size = @intCast(total),
     };
 
-    // Hand back a pointer past the header.
-    return @ptrCast(&block.ptr[HEADER_SIZE]);
+    return @ptrFromInt(user_start);
 }
 
 // Helper: free a cell whose Header is at `*header` and whose user
 // pointer is at `user_ptr`. Used by both `release` (when the refcount
 // reaches zero) and `tinyrefDeallocate` (for raw, non-refcounted
 // allocations).
+//
+// Recovers the original block address via `header.block_offset` and
+// frees the block as a slice of `header.block_size` bytes, passing the
+// padded alignment used at allocation time so the allocator's vtable
+// dispatch is symmetric with `rawAlloc`.
 fn freeCell(header: *Header, user_ptr: [*]u8) void {
-    const total: usize = HEADER_SIZE + header.size;
-    const block_start: [*]u8 = user_ptr - HEADER_SIZE;
-    // Reconstruct the slice with the original allocation alignment so
-    // page_allocator.free dispatches correctly.
-    const slice = block_start[0..total];
-    // page_allocator.free accepts a slice and reads the alignment from
-    // the slice's address; the slice we hand it points at block_start,
-    // which we allocated with the alignment we recorded.
-    std.heap.page_allocator.free(slice);
+    const user_addr = @intFromPtr(user_ptr);
+    const block_start_addr = user_addr - @as(usize, header.block_offset);
+    const block_start: [*]u8 = @ptrFromInt(block_start_addr);
+    const padded_alignment: u32 = @max(header.alignment, HEADER_ALIGN);
+    const slice = block_start[0..@as(usize, header.block_size)];
+    std.heap.page_allocator.rawFree(
+        slice,
+        std.mem.Alignment.fromByteUnits(padded_alignment),
+        @returnAddress(),
+    );
 }
 
 // Called for raw (non-refcounted) allocations only. The runtime never
@@ -1433,9 +1536,9 @@ fn tinyrefDeallocate(
     // check against the inline header to catch double-frees and
     // mismatched sizes — a real production manager would compile this
     // check out under ReleaseFast.
-    const header_ptr: *Header = @ptrCast(@alignCast(ptr - HEADER_SIZE));
+    const header_ptr: *Header = @ptrFromInt(@intFromPtr(ptr) - HEADER_SIZE);
     std.debug.assert(header_ptr.size == size);
-    std.debug.assert(header_ptr.alignment >= alignment);
+    std.debug.assert(header_ptr.alignment == alignment);
     freeCell(header_ptr, ptr);
 }
 
@@ -1450,8 +1553,7 @@ fn tinyrefGetCapabilityDesc(
 
 fn tinyrefRetain(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
     _ = ctx;
-    const user_ptr: [*]u8 = @ptrCast(object);
-    const header_ptr: *Header = @ptrCast(@alignCast(user_ptr - HEADER_SIZE));
+    const header_ptr: *Header = @ptrFromInt(@intFromPtr(object) - HEADER_SIZE);
     _ = @atomicRmw(u32, &header_ptr.refcount, .Add, 1, .monotonic);
 }
 
@@ -1467,14 +1569,14 @@ fn tinyrefRelease(
 ) callconv(.c) void {
     _ = ctx;
     const user_ptr: [*]u8 = @ptrCast(object);
-    const header_ptr: *Header = @ptrCast(@alignCast(user_ptr - HEADER_SIZE));
+    const header_ptr: *Header = @ptrFromInt(@intFromPtr(object) - HEADER_SIZE);
     const prev = @atomicRmw(u32, &header_ptr.refcount, .Sub, 1, .acq_rel);
     if (prev == 1) {
         // The decrement that took us to zero. Walk children first so
         // they observe the still-valid parent, then free the cell.
         if (deep_walk) |walk| walk(object);
-        // Recover size/alignment from the header (we stored them in
-        // `tinyrefAllocate`) and free the original page-allocator slice.
+        // Recover the original block address from header.block_offset
+        // and free the page-allocator slice we originally allocated.
         freeCell(header_ptr, user_ptr);
     }
 }
@@ -1492,56 +1594,70 @@ const refcount_desc: ZapCapabilityDescV1 = .{
     .vtable = &refcount_vtable,
 };
 
-// Meta header at section offset 0.
-export const zap_memory_manager_meta: ZapMemoryManagerMetaV1
-    linksection(SECTION_NAME) = .{
-    .magic = ZMEM_MAGIC,
-    .abi_major = 1,
-    .abi_minor = 0,
-    .size = @sizeOf(ZapMemoryManagerMetaV1),
-    ._reserved2 = 0,
-    .desc_count = 0,
-    .declared_caps = CAP_REFCOUNT_V1_BIT,
-    .core_vtable_offset = @sizeOf(ZapMemoryManagerMetaV1),
-    .reserved = 0,
+// Composite section payload following the recommended emission pattern
+// from section 3.2: wrapping the meta header and core vtable into a
+// single extern struct so the linker emits them as one contiguous
+// allocation in declaration order. `meta.core_vtable_offset` is derived
+// from the struct layout via `@offsetOf`, so the section is always
+// self-consistent regardless of linker behavior.
+//
+// This example uses runtime-only capability discovery (`desc_count = 0`):
+// the compiler retrieves the refcount descriptor via `get_capability_desc`
+// at startup rather than reading it directly from the .zapmem section.
+// A manager that prefers embedded discovery would add a `desc_0:
+// ZapCapabilityDescV1` field after `core` and set `desc_count = 1`.
+const ZapMemorySection = extern struct {
+    meta: ZapMemoryManagerMetaV1,
+    core: ZapMemoryManagerCoreV1,
 };
 
-// Core vtable immediately following the meta header in the same
-// .zapmem section. The compiler locates it at meta.core_vtable_offset.
-export const zap_memory_manager_core: ZapMemoryManagerCoreV1
+pub export const zap_memory_section: ZapMemorySection
     linksection(SECTION_NAME) = .{
-    .abi_major = 1,
-    .abi_minor = 0,
-    .size = @sizeOf(ZapMemoryManagerCoreV1),
-    .declared_caps = CAP_REFCOUNT_V1_BIT,
-    .init = tinyrefInit,
-    .deinit = tinyrefDeinit,
-    .allocate = tinyrefAllocate,
-    .deallocate = tinyrefDeallocate,
-    .get_capability_desc = tinyrefGetCapabilityDesc,
+    .meta = .{
+        .magic = ZMEM_MAGIC,
+        .abi_major = 1,
+        .abi_minor = 0,
+        .size = @sizeOf(ZapMemoryManagerMetaV1),
+        ._reserved2 = 0,
+        .desc_count = 0,
+        .declared_caps = CAP_REFCOUNT_V1_BIT,
+        .core_vtable_offset = @offsetOf(ZapMemorySection, "core"),
+        .reserved = 0,
+    },
+    .core = .{
+        .abi_major = 1,
+        .abi_minor = 0,
+        .size = @sizeOf(ZapMemoryManagerCoreV1),
+        .declared_caps = CAP_REFCOUNT_V1_BIT,
+        .init = tinyrefInit,
+        .deinit = tinyrefDeinit,
+        .allocate = tinyrefAllocate,
+        .deallocate = tinyrefDeallocate,
+        .get_capability_desc = tinyrefGetCapabilityDesc,
+    },
 };
 ```
 
 ### 15.2 Zap source: `lib/tinyref.zap`
 
 ```
-@doc = """
-  Minimal example refcounting manager. Backs allocations with the
-  page allocator and stores a 32-bit atomic refcount plus the
-  original size and alignment in an inline header. Demonstrates the
-  smallest manager that declares REFCOUNT_V1 while still freeing
-  cells correctly when the refcount reaches zero.
-  """
-
 @memory_manager_source = "src/manager.zig"
 
 pub struct TinyRef {
+  @structdoc = """
+  Minimal example refcounting manager. Backs allocations with the
+  page allocator and stores a 32-bit atomic refcount along with the
+  original allocation's offset, size, and alignment in an inline
+  header. Supports arbitrary user-requested alignment values.
+  Demonstrates the smallest manager that declares REFCOUNT_V1 while
+  still freeing cells correctly when the refcount reaches zero.
+  """
 }
 ```
 
 ### 15.3 Notes on the example
 
-- The 16-byte inline `Header` keeps the user payload 16-byte aligned and is large enough to store the refcount alongside the size and alignment needed to free the cell later. A production manager that targets fixed-size cells (slab pool buckets) can shrink the header by replacing the inline `size`/`alignment` fields with a size-class index.
+- The 24-byte inline `Header` carries the refcount along with `size`, `alignment`, `block_offset`, and `block_size`. The first three fields suffice for fixed-alignment cells; the latter two are what enables this example to support arbitrary user-requested alignments (32, 64, or larger) without losing the ability to recover and free the original page-allocator block. A production manager that targets fixed-size cells (slab pool buckets) can shrink the header by replacing the inline `size`/`alignment`/`block_size` fields with a size-class index — the per-class descriptor then carries the same information for every cell in the class. The example uses the general layout for clarity; the comptime assertion on `HEADER_SIZE` is a soft lock specific to this example, not part of the ABI.
 - `release` invokes `deep_walk` before freeing so children see a still-valid parent during their own release path. The compiler chooses `deep_walk` per refcounted type: cells with no refcounted children get `null` and never trigger the walk; cells with refcounted children get the per-type walk function the compiler generated.
 - `tinyrefDeallocate` is reserved for raw allocations only. The runtime never calls it for refcounted cells — those go through `release` exclusively (section 4.5). The example uses it both to free scratch buffers and to demonstrate header-based size/alignment recovery in a non-refcounted path.
 - The example uses `std.heap.page_allocator` directly. A production manager amortizes per-allocation syscalls with a slab pool: blocks of fixed-size cells per power-of-two size class, with O(1) allocation and free.
@@ -1611,6 +1727,26 @@ This is the canonical, normative mapping from FourCC tag to bit position in `dec
 ### A.1 Computing the bit mask from a tag
 
 ```zig
+const std = @import("std");
+const builtin = @import("builtin");
+
+// FourCC tag constants matching the canonical table in Appendix A.
+// `std.mem.readInt` with the target's native endian resolves each
+// four-character literal at comptime to the target-endianness-correct
+// u32 representation of the tag — exactly the integer value the manager
+// metadata validator compares against.
+const TAG_ENDIAN = builtin.target.cpu.arch.endian();
+const REFC_TAG: u32 = std.mem.readInt(u32, "REFC", TAG_ENDIAN);
+const GCOL_TAG: u32 = std.mem.readInt(u32, "GCOL", TAG_ENDIAN);
+const REGN_TAG: u32 = std.mem.readInt(u32, "REGN", TAG_ENDIAN);
+const STAT_TAG: u32 = std.mem.readInt(u32, "STAT", TAG_ENDIAN);
+const FNLZ_TAG: u32 = std.mem.readInt(u32, "FNLZ", TAG_ENDIAN);
+const WKRF_TAG: u32 = std.mem.readInt(u32, "WKRF", TAG_ENDIAN);
+const ARSR_TAG: u32 = std.mem.readInt(u32, "ARSR", TAG_ENDIAN);
+const ARTS_TAG: u32 = std.mem.readInt(u32, "ARTS", TAG_ENDIAN);
+const SHHP_TAG: u32 = std.mem.readInt(u32, "SHHP", TAG_ENDIAN);
+const TRAC_TAG: u32 = std.mem.readInt(u32, "TRAC", TAG_ENDIAN);
+
 fn bit_for_tag(tag: u32) ?u6 {
     // Sequential search of the canonical table. The table is small
     // enough that linear scan is faster than any hashing scheme.
@@ -1618,22 +1754,22 @@ fn bit_for_tag(tag: u32) ?u6 {
         // Match against the tag in the target's endianness.
         // The compiler builds for a single target so this branch
         // resolves at comptime.
-        TAG_REFC => 0,
-        TAG_GCOL => 1,
-        TAG_REGN => 2,
-        TAG_STAT => 3,
-        TAG_FNLZ => 4,
-        TAG_WKRF => 5,
-        TAG_ARSR => 6,
-        TAG_ARTS => 7,
-        TAG_SHHP => 8,
-        TAG_TRAC => 9,
+        REFC_TAG => 0,
+        GCOL_TAG => 1,
+        REGN_TAG => 2,
+        STAT_TAG => 3,
+        FNLZ_TAG => 4,
+        WKRF_TAG => 5,
+        ARSR_TAG => 6,
+        ARTS_TAG => 7,
+        SHHP_TAG => 8,
+        TRAC_TAG => 9,
         else => null,
     };
 }
 ```
 
-The Zap compiler's metadata validator uses an equivalent lookup against the target-endianness-correct tag values.
+The Zap compiler's metadata validator uses an equivalent lookup against the target-endianness-correct tag values. The naming convention `<NAME>_TAG` matches the worked refcount example in section 15.
 
 ---
 
@@ -1735,13 +1871,62 @@ The byte sequence `5A 4D 45 4D` is the same in both cases — the bytes spell `Z
 
 ## Appendix C. `ZapForkTarget` tag mapping (v1.0)
 
-The `arch_tag`, `os_tag`, and `abi_tag` fields of `ZapForkTarget` (section 10.1.1) map to the integer values of the Zig fork's `std.Target.Cpu.Arch`, `std.Target.Os.Tag`, and `std.Target.Abi` enums, respectively. The mapping is **stable for the lifetime of the Zap fork's pinned Zig version** and is verified at the C-ABI boundary by `zap_fork_compile_zig_to_object`.
+The `arch_tag`, `os_tag`, and `abi_tag` fields of `ZapForkTarget` (section 10.1.1) carry the integer values of the Zap-pinned Zig fork's `std.Target.Cpu.Arch`, `std.Target.Os.Tag`, and `std.Target.Abi` enums, respectively. The Zig fork pins these enum definitions for the lifetime of ABI v1.x — adding new tags is permitted (appends to the end of the enum) but reordering or removing existing tags is prohibited. This guarantees that the integer values shown below are stable wire constants.
+
+The values in this appendix are read directly from `lib/std/Target.zig` in the pinned Zig fork (`~/projects/zig`). Each enum begins at integer 0 and increments by 1 per declaration; the tables below give the discriminant of every supported tag.
+
+### C.1 Supported target triples (v1.0)
+
+The set of supported targets is the intersection of (a) targets the Zap-pinned Zig fork can compile and (b) targets for which the Zap runtime has been ported. v1.0 supports exactly five triples:
+
+| Triple                  | `arch_tag` (u16) | `os_tag` (u16) | `abi_tag` (u16) |
+|-------------------------|------------------|----------------|------------------|
+| `x86_64-linux-gnu`      | 54 (`x86_64`)    | 9 (`linux`)    | 1 (`gnu`)        |
+| `x86_64-macos-none`     | 54 (`x86_64`)    | 20 (`macos`)   | 0 (`none`)       |
+| `aarch64-linux-gnu`     | 0 (`aarch64`)    | 9 (`linux`)    | 1 (`gnu`)        |
+| `aarch64-macos-none`    | 0 (`aarch64`)    | 20 (`macos`)   | 0 (`none`)       |
+| `x86_64-windows-msvc`   | 54 (`x86_64`)    | 24 (`windows`) | 22 (`msvc`)      |
 
 A v1.0 caller that passes an unsupported `(arch_tag, os_tag, abi_tag)` triple receives `ZapForkResult.TargetUnsupported`. The diagnostic buffer carries a human-readable explanation including the rejected triple.
 
-The set of supported targets is the intersection of:
-- Targets the Zap-pinned Zig fork can compile.
-- Targets for which the Zap runtime has been ported (currently: `x86_64-linux-gnu`, `x86_64-macos-none`, `aarch64-linux-gnu`, `aarch64-macos-none`, `x86_64-windows-msvc`).
+### C.2 `std.Target.Cpu.Arch` value table
+
+The relevant subset of the pinned enum for v1.0 supported architectures:
+
+| Identifier   | u16 value |
+|--------------|-----------|
+| `aarch64`    | 0         |
+| `x86_64`     | 54        |
+
+The full enum at the time of pinning is the 58-entry list at `lib/std/Target.zig:1326` in the Zig fork; only the two entries above are reachable through v1.0's supported target intersection.
+
+### C.3 `std.Target.Os.Tag` value table
+
+The relevant subset of the pinned enum for v1.0 supported operating systems:
+
+| Identifier   | u16 value |
+|--------------|-----------|
+| `linux`      | 9         |
+| `macos`      | 20        |
+| `windows`    | 24        |
+
+The full enum at the time of pinning is the 42-entry list at `lib/std/Target.zig:18` in the Zig fork; only the three entries above are reachable through v1.0's supported target intersection.
+
+### C.4 `std.Target.Abi` value table
+
+The relevant subset of the pinned enum for v1.0 supported ABIs:
+
+| Identifier   | u16 value |
+|--------------|-----------|
+| `none`       | 0         |
+| `gnu`        | 1         |
+| `msvc`       | 22        |
+
+The full enum at the time of pinning is the 27-entry list at `lib/std/Target.zig:762` in the Zig fork; only the three entries above are reachable through v1.0's supported target intersection.
+
+### C.5 Stability contract
+
+These integer values are normative for ABI v1.x. The Zap fork of Zig pins them in `lib/std/Target.zig`; any change to the Zig upstream that reorders the existing enum entries listed in C.2 through C.4 must be backed out during the fork-rebase rather than carried in. New architectures, operating systems, or ABIs added to upstream Zig append to the end of each enum and therefore preserve the existing values.
 
 A v1.x manager source is expected to support every Zap-supported target via the comptime branches shown in sections 14 and 15. Managers that target a subset of platforms guard the unsupported branches with `@compileError`.
 
