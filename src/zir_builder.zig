@@ -3418,7 +3418,6 @@ pub const ZirDriver = struct {
 
             for (block.instructions, 0..) |instr, instr_idx| {
                 self.current_instr_index = @intCast(instr_idx);
-                try self.emitAnalysisArcOps(true);
                 self.emitInstruction(instr) catch |err| {
                     std.log.err(
                         "ZIR emit failed in function {s} at instruction {d} ({s}): {s}",
@@ -3426,7 +3425,6 @@ pub const ZirDriver = struct {
                     );
                     return err;
                 };
-                try self.emitAnalysisArcOps(false);
             }
         }
 
@@ -3887,109 +3885,6 @@ pub const ZirDriver = struct {
             .ret => |r| r.value != null and r.value.? == local,
             else => false,
         };
-    }
-
-    fn emitAnalysisArcOps(self: *ZirDriver, before: bool) !void {
-        if (self.analysis_context) |actx| {
-            for (actx.arc_ops.items) |op| {
-                if (op.insertion_point.function != self.current_function_id) continue;
-                if (op.insertion_point.block != self.current_block_label) continue;
-                if (op.insertion_point.instr_index != self.current_instr_index) continue;
-                if ((op.insertion_point.position == .before) != before) continue;
-                switch (op.kind) {
-                    .retain => {
-                        if (!self.shouldSkipArc(op.value)) {
-                            const val_ref = self.refForLocal(op.value) catch continue;
-                            const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                            if (rt_import == error_ref) return error.EmitFailed;
-                            const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
-                            if (arc_runtime == error_ref) return error.EmitFailed;
-                            const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
-                            if (retain_fn == error_ref) return error.EmitFailed;
-                            const args = [_]u32{val_ref};
-                            _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
-                        }
-                    },
-                    .release => {
-                        if (op.reason == .perceus_drop) continue;
-                        if (!self.shouldSkipArc(op.value)) {
-                            const val_ref = self.refForLocal(op.value) catch continue;
-                            const alloc_ref = try self.emitAllocatorRef();
-                            const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                            if (rt_import == error_ref) return error.EmitFailed;
-                            const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
-                            if (arc_runtime == error_ref) return error.EmitFailed;
-                            const release_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "releaseAny", 10);
-                            if (release_fn == error_ref) return error.EmitFailed;
-                            const args = [_]u32{ alloc_ref, val_ref };
-                            _ = zir_builder_emit_call_ref(self.handle, release_fn, &args, 2);
-                        }
-                    },
-                    else => {},
-                }
-            }
-        }
-    }
-
-    fn emitDropSpecializationsForCurrentInstr(self: *ZirDriver, value_local: ir.LocalId, constructor_tag: ?u32) !void {
-        if (self.analysis_context) |actx| {
-            for (actx.drop_specializations.items) |spec| {
-                if (spec.function != self.current_function_id) continue;
-                if (spec.insertion_point.block != self.current_block_label) continue;
-                if (spec.insertion_point.instr_index != self.current_instr_index) continue;
-                if (spec.insertion_point.position != .after) continue;
-                if (constructor_tag) |tag| {
-                    if (spec.constructor_tag != tag) continue;
-                }
-                for (spec.field_drops) |field_drop| {
-                    const drop_local = field_drop.local orelse value_local;
-                    const val_ref = self.refForLocal(drop_local) catch continue;
-                    const alloc_ref = try self.emitAllocatorRef();
-                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                    if (rt_import == error_ref) return error.EmitFailed;
-                    const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
-                    if (arc_runtime == error_ref) return error.EmitFailed;
-                    // `.shallow` is the destructive-optional-dispatch
-                    // case: every recursive child of the parent has
-                    // already been extracted-and-consumed by an inner
-                    // call (which now owns the only handle to that
-                    // Arc), so reclaiming the parent must NOT walk the
-                    // children — those pointers were freed by the
-                    // consumers. `freeAny` decrements the parent's
-                    // refcount and frees the parent's allocation
-                    // without touching the children.
-                    const helper_name: []const u8 = switch (field_drop.kind) {
-                        .deep => "releaseAny",
-                        .shallow => "freeAny",
-                    };
-                    const release_fn = zir_builder_emit_field_val(self.handle, arc_runtime, helper_name.ptr, @intCast(helper_name.len));
-                    if (release_fn == error_ref) return error.EmitFailed;
-                    const args = [_]u32{ alloc_ref, val_ref };
-                    _ = zir_builder_emit_call_ref(self.handle, release_fn, &args, 2);
-                }
-            }
-        }
-    }
-
-    fn emitPerceusResetForCase(self: *ZirDriver, cb: ir.CaseBlock) !void {
-        if (self.analysis_context) |actx| {
-            for (actx.reuse_pairs.items) |pair| {
-                if (pair.reset.source == cb.dest) {
-                    const source_ref = self.refForLocal(pair.reset.source) catch continue;
-                    const alloc_ref = try self.emitAllocatorRef();
-                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                    if (rt_import == error_ref) return error.EmitFailed;
-                    const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
-                    if (arc_runtime == error_ref) return error.EmitFailed;
-                    const reset_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "resetAny", 8);
-                    if (reset_fn == error_ref) return error.EmitFailed;
-                    const args = [_]u32{ alloc_ref, source_ref };
-                    const token_ref = zir_builder_emit_call_ref(self.handle, reset_fn, &args, 2);
-                    if (token_ref == error_ref) return error.EmitFailed;
-                    try self.setLocal(pair.reset.dest, token_ref);
-                }
-            }
-        }
     }
 
     fn emitClosureSwitchDispatch(self: *ZirDriver, cc: ir.CallClosure, targets: []const ir.FunctionId) !bool {
@@ -7439,8 +7334,6 @@ pub const ZirDriver = struct {
         self.current_case_dest = cb.dest;
         defer self.current_case_dest = saved_case_dest;
 
-        try self.emitPerceusResetForCase(cb);
-
         if (cb.arms.len == 0) {
             // The Zap frontend lowers atom/pattern case blocks to flat
             // pre_instrs containing match_atom + guard_block pairs, with
@@ -7484,9 +7377,6 @@ pub const ZirDriver = struct {
             // Capture the arm body
             self.beginCapture();
             for (arm.body_instrs) |bi| try self.emitInstruction(bi);
-            if (arm.result) |r| {
-                try self.emitDropSpecializationsForCurrentInstr(r, @intCast(i));
-            }
             var arm_len: u32 = 0;
             const arm_ptr = self.endCapture(&arm_len);
 
@@ -7536,7 +7426,6 @@ pub const ZirDriver = struct {
 
         // The last ref produced is the result of the entire case block
         try self.setLocal(cb.dest, current_else_result);
-        try self.emitDropSpecializationsForCurrentInstr(cb.dest, null);
     }
 
     /// Find the setup instruction that defines a guard condition local.
@@ -7648,7 +7537,6 @@ pub const ZirDriver = struct {
     /// the guard_blocks as arms and restructure into nested if-else-bodies.
     fn emitFlatCaseBlock(self: *ZirDriver, cb: ir.CaseBlock) BuildError!void {
         const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
-        try self.emitPerceusResetForCase(cb);
 
         // Split pre_instrs into: setup before each guard, guard_blocks, and
         // trailing default instructions after the last guard_block.
@@ -7667,7 +7555,6 @@ pub const ZirDriver = struct {
                     try self.local_refs.put(self.allocator, cb.dest, value_ref);
                 }
             }
-            try self.emitDropSpecializationsForCurrentInstr(cb.dest, null);
             return;
         }
 
@@ -7756,7 +7643,6 @@ pub const ZirDriver = struct {
                 // The case_break in the body sets cb.dest
                 const result = if (self.local_refs.get(cb.dest)) |vr| try self.materializeValueRef(vr) else @intFromEnum(Zir.Inst.Ref.void_value);
                 try self.setLocal(cb.dest, result);
-                try self.emitDropSpecializationsForCurrentInstr(cb.dest, null);
                 return;
             }
 
@@ -7818,7 +7704,6 @@ pub const ZirDriver = struct {
             // trailing default ops do not run unconditionally.
             self.beginCapture();
             try self.emitFlattenedGuardSequence(gb.body);
-            try self.emitDropSpecializationsForCurrentInstr(cb.dest, @intCast(gi));
             var body_len: u32 = 0;
             const body_ptr = self.endCapture(&body_len);
 
@@ -7863,7 +7748,6 @@ pub const ZirDriver = struct {
 
         // Set the case_block result
         try self.setLocal(cb.dest, current_else_result);
-        try self.emitDropSpecializationsForCurrentInstr(cb.dest, null);
     }
 
     /// Emit a switch_return as a chain of if-else-bodies.
@@ -8138,9 +8022,6 @@ pub const ZirDriver = struct {
         // transferred their refcount unit into this function, so the
         // payload must be released between the struct branch body and
         // the ret unless the return-specialization suppresses it.
-        if (self.currentParamConvention(od.scrutinee_param) == .owned) {
-            try self.emitDropSpecializationsForCurrentInstr(od.payload_local, null);
-        }
         if (od.struct_result) |sr| {
             const ret_ref = try self.refForLocal(sr);
             if (zir_builder_emit_ret(self.handle, ret_ref) != 0) {

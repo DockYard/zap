@@ -3609,66 +3609,52 @@ fn v10CountForbiddenEmissions(source: []const u8, verbose: bool) usize {
 /// catalogue below in the same commit. A drift between the audit and
 /// the catalogue is a bug.
 ///
-/// Catalogue (audit baseline post Phase 1 Class A items 1+2 — the
-/// `.copy_value` and `.share_value` mode=retain implicit-retain
-/// emissions have moved into IR-level `.retain { kind }` instructions
-/// emitted by `arc_ownership.zig`):
+/// Catalogue (audit baseline post Phase 2/3 materialization +
+/// legacy-emitter deletion — Tasks 10.3 / 10.4 / 10.5):
 ///
 ///   Canonical IR-handler sites — these MUST be in the count,
 ///   removing them from `zir_builder.zig` means the IR-level
-///   retain/release primitive itself is broken:
+///   retain/release/reset/reuse_alloc primitive itself is broken:
 ///
 ///     1. `.retain` IR handler `retainAny` branch (kind=.normal):
 ///        1 × "retainAny" (zir_builder.zig)
 ///     2. `.retain` IR handler `retainAnyPersistent` branch
 ///        (kind=.persistent): 1 × "retainAnyPersistent"
 ///        (zir_builder.zig — added in Phase 1 Class A item 1)
-///     3. `.release` IR handler: 1 × "releaseAny" emission
+///     3. `.release` IR handler deep branch: 1 × "releaseAny"
+///        (zir_builder.zig — kind=.release in ReleaseKind dispatch)
+///     4. `.release` IR handler shallow branch: 1 × "freeAny"
+///        (zir_builder.zig — kind=.free in ReleaseKind dispatch)
+///     5. `.reset` IR handler: 1 × "resetAny"
 ///        (zir_builder.zig)
-///     4. `.reset` IR handler: 1 × "resetAny" emission
+///     6. `.reuse_alloc` IR handler: 1 × "reuseAllocByType"
 ///        (zir_builder.zig)
 ///
-///   Class B violations (Phase 2):
-///     5. `emitAnalysisArcOps` retain branch: 1 × "retainAny"
-///        (zir_builder.zig:3907)
-///     6. `emitAnalysisArcOps` release branch: 1 × "releaseAny"
-///        (zir_builder.zig:3922)
-///     7. `emitDropSpecializationsForCurrentInstr` deep arm:
-///        1 × "releaseAny" (zir_builder.zig:3962)
-///     8. `emitDropSpecializationsForCurrentInstr` shallow arm:
-///        1 × "freeAny" (zir_builder.zig:3963)
-///     9. `emitPerceusResetForCase`: 1 × "resetAny"
-///        (zir_builder.zig:3984)
-///
-///   Class C violations (Phase 3):
-///    10. early `.struct_init` reuse path: 1 × "reuseAllocByType"
-///        (zir_builder.zig:5336)
-///    11. `.struct_init` reuse-pair: 1 × "reuseAllocByType"
-///        (zir_builder.zig:5573)
-///    12. `.union_init` reuse-pair: 1 × "reuseAllocByType"
-///        (zir_builder.zig:5917)
-///    13. an additional `reuseAllocByType` emission at line 6804
-///        — provisional categorisation (likely the same Perceus
-///        reuse class). Verify during Phase 3 implementation.
+///   Class C-residual violations (Phase 3 Part B — pending):
+///     7. early `.struct_init` reuse path: 1 × "reuseAllocByType"
+///        — emitted INLINE during struct_init lowering when a
+///        matching `reuse_pair` is found. Needs to be replaced
+///        by a pre-pass that rewrites the `struct_init`
+///        instruction itself to `.reuse_alloc` + per-field stores
+///        in IR.
+///     8. `.struct_init` reuse-pair (typed): same shape as #7,
+///        named-struct path.
+///     9. `.union_init` reuse-pair: same shape as #7 for union
+///        variants.
 ///
 ///   `.release` IR handler also emits `noteReturnElision` (a counter
 ///   bump), but that is not a forbidden ARC runtime call — pure
 ///   bookkeeping, no refcount effect.
 ///
-/// Total expected: 14. Phase 1 Class A migration dropped the count
-/// from 14→13 by collapsing two violations into the canonical
-/// `.retain` handler's kind dispatch. Phase 2 ReleaseKind addition
-/// adds `"freeAny"` to the canonical `.release` handler's kind
-/// dispatch (back to 14). The materialization pass added in Phase
-/// 2 doesn't change the V10 count itself because the helpers
-/// (`emitAnalysisArcOps`, `emitDropSpecializationsForCurrentInstr`,
-/// `emitPerceusResetForCase`) still exist in the source tree —
-/// they just receive empty input lists for top-level records that
-/// the materialization pass consumed. Subsequent commits will
-/// delete the helpers entirely once the materialization pass
-/// covers nested-stream cases too, dropping the V10 count to its
-/// permanent floor.
-const v10_expected_total: usize = 14;
+/// Total expected: 9. Tasks 10.3 / 10.4 / 10.5 deleted the
+/// `emitAnalysisArcOps`, `emitDropSpecializationsForCurrentInstr`,
+/// and `emitPerceusResetForCase` helpers — the materialization
+/// pass now lowers every retain/release/reset record into IR ops
+/// at the correct nested-stream position, and the canonical IR
+/// handlers fire from a single dispatch site. Phase 3 Part B
+/// (rewriting struct_init/union_init to use `.reuse_alloc` + field
+/// stores) will reduce this to 6.
+const v10_expected_total: usize = 9;
 
 test "V10: zir_builder.zig forbidden ARC emissions match phase-tracked allowlist" {
     const observed = v10CountForbiddenEmissions(v10_zir_builder_source, false);
