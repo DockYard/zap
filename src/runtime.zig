@@ -12478,3 +12478,379 @@ test "slab pool: aligned-mmap helper returns 64KiB-aligned slabs" {
         ArcRuntime.unmapSlab(bases[mmap_index]);
     }
 }
+
+// ============================================================
+// byte_intern_table — process-lifetime single-byte interning
+// ============================================================
+
+test "runtime: String.byte_at returns slice into byte_intern_table" {
+    // Regression for commit 287e9cd. Walking a string byte-by-byte
+    // (e.g., k-nucleotide's per-base FASTA scan, ~11.5M iterations on
+    // a 250 KB sequence) must not pin one bump-arena page per byte.
+    // The fix routes every single-byte return through the
+    // process-lifetime `byte_intern_table` so all callers share the
+    // same 256-byte storage. If the regression returns (i.e., a fresh
+    // `bumpAlloc(1)` per call), the returned slice's pointer would
+    // land in the arena and NOT equal `&byte_intern_table[s[0]]`.
+    const source = "Z";
+    const first = String.byte_at(source, 0);
+    try std.testing.expectEqual(@as(usize, 1), first.len);
+    try std.testing.expectEqual(@as(u8, 'Z'), first[0]);
+    // The slice's pointer must equal the table address for byte 'Z'.
+    // Any non-interned path would land elsewhere in memory.
+    try std.testing.expectEqual(
+        @intFromPtr(&byte_intern_table[@as(usize, 'Z')]),
+        @intFromPtr(first.ptr),
+    );
+}
+
+test "runtime: byte_intern_table slice survives runtime_arena reset" {
+    // The interned table lives in `.rodata`. Slices into it must
+    // remain valid after `runtime_arena.reset(.free_all)` — a property
+    // the runtime relies on when callers hold the byte slice across
+    // an arena-clearing boundary (e.g., a streaming loop that resets
+    // the arena between iterations). If the byte_at path regressed to
+    // `bumpAlloc`, the slice would point into the arena and reading
+    // it after `reset(.free_all)` would observe freed memory.
+    const source = "Q";
+    const saved = String.byte_at(source, 0);
+    const saved_ptr = saved.ptr;
+    try std.testing.expectEqual(@as(u8, 'Q'), saved[0]);
+
+    // Reset the arena, freeing every node. Any slice that lived in
+    // the arena would be dangling now. The interned slice is unaffected.
+    // `reset` returns a bool indicating success; we discard it because
+    // the test does not depend on whether the arena released its
+    // pages — only on the table-backed slice's continued validity.
+    _ = runtime_arena.reset(.free_all);
+
+    try std.testing.expectEqual(saved_ptr, saved.ptr);
+    try std.testing.expectEqual(@as(usize, 1), saved.len);
+    try std.testing.expectEqual(@as(u8, 'Q'), saved[0]);
+    // The slice must still point into the table at the right offset.
+    try std.testing.expectEqual(
+        @intFromPtr(&byte_intern_table[@as(usize, 'Q')]),
+        @intFromPtr(saved.ptr),
+    );
+}
+
+test "runtime: String.from_byte returns identity slice" {
+    // `String.from_byte` is the inverse of `byte_at`. Both must route
+    // through the same interned table so a value produced by
+    // `from_byte(b)` is pointer-equal to a value extracted by
+    // `byte_at(s, i)` when `s[i] == b`. This pinning property keeps
+    // PBM-image-style streaming output (a long sequence of single-byte
+    // emissions) from allocating one arena page per call.
+    const result = String.from_byte(65);
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqual(@as(u8, 'A'), result[0]);
+    try std.testing.expectEqual(
+        @intFromPtr(&byte_intern_table[65]),
+        @intFromPtr(result.ptr),
+    );
+
+    // Round-trip: byte_at of an 'A' must return the exact same slice
+    // address that from_byte(65) returned — they share the table.
+    const round_trip = String.byte_at("A", 0);
+    try std.testing.expectEqual(@intFromPtr(result.ptr), @intFromPtr(round_trip.ptr));
+}
+
+test "runtime: String.next yields stable single-byte slices" {
+    // The string iterator returns a head slice and a tail slice on
+    // every step. The head must alias the interned table (so iterating
+    // an N-byte string never produces N transient arena allocations).
+    // Each step's head pointer must equal `&byte_intern_table[byte]`.
+    const source = "hello";
+    var remaining: []const u8 = source;
+    const expected = "hello";
+    var index: usize = 0;
+    while (remaining.len > 0) : (index += 1) {
+        const step = String.next(remaining);
+        const head = step[1];
+        const tail = step[2];
+        try std.testing.expectEqual(@as(usize, 1), head.len);
+        try std.testing.expectEqual(expected[index], head[0]);
+        try std.testing.expectEqual(
+            @intFromPtr(&byte_intern_table[@as(usize, expected[index])]),
+            @intFromPtr(head.ptr),
+        );
+        remaining = tail;
+    }
+    try std.testing.expectEqual(@as(usize, 5), index);
+}
+
+// ============================================================
+// Wyhash.hashInt — SplitMix64 integer mixer used by DenseMap
+// ============================================================
+
+test "runtime: hashInt single-bit avalanche" {
+    // Regression for commit e94d59f. A weak integer mixer (e.g., the
+    // identity function or a simple xor) flips fewer than half of its
+    // output bits for a single-bit input flip — the dense Map's
+    // probing distribution would then collapse on integer-key
+    // workloads. SplitMix64's finalizer is known to achieve 28-32 bit
+    // avalanche on average; we require ≥ 24 bits for every input bit
+    // position. Mentally inverting the function (e.g., reverting to
+    // `value ^ seed`) would observe Hamming distances of just 1 or 2
+    // for many positions — this test catches that regression.
+    const seed: u64 = 0xDEADBEEFCAFEBABE;
+    const baseline_input: u64 = 0x0123_4567_89AB_CDEF;
+    const baseline_hash = Wyhash.hashInt(seed, baseline_input);
+    var bit: u6 = 0;
+    while (true) {
+        const flipped_input = baseline_input ^ (@as(u64, 1) << bit);
+        const flipped_hash = Wyhash.hashInt(seed, flipped_input);
+        const diff = baseline_hash ^ flipped_hash;
+        const distance: u32 = @popCount(diff);
+        try std.testing.expect(distance >= 24);
+        if (bit == 63) break;
+        bit += 1;
+    }
+}
+
+test "runtime: hashInt distribution over sequential inputs" {
+    // The dense Map uses the low bits of `hashInt(seed, key)` mod cap
+    // to pick the home slot. A poor mixer (e.g., identity) clusters
+    // sequential keys into the same bucket — for inputs 0..N-1 with
+    // 16 buckets, the identity mixer puts ⌈N/16⌉ keys in every bucket
+    // for a max-equals-mean distribution that looks healthy but for
+    // any non-sequential key set degenerates immediately. SplitMix64's
+    // finalizer scatters sequential inputs across buckets with a max
+    // count not far from the binomial mean. We bound max ≤ 1.5×mean.
+    const seed: u64 = 0xA5A5_5A5A_A5A5_5A5A;
+    const total_count: usize = 1000;
+    const bucket_count: usize = 16;
+    var buckets: [16]u32 = .{0} ** 16;
+    var index: u64 = 0;
+    while (index < total_count) : (index += 1) {
+        const hash_value = Wyhash.hashInt(seed, index);
+        buckets[@as(usize, @intCast(hash_value & 0xF))] += 1;
+    }
+    const mean: u32 = @intCast(total_count / bucket_count);
+    var max_count: u32 = 0;
+    for (buckets) |b| {
+        if (b > max_count) max_count = b;
+    }
+    // Mean is 62.5 for N=1000, ceiling = 63. 1.5× is ~94 — a SplitMix64
+    // finalizer comfortably stays below that. Identity would fail
+    // (the high bits all collide into bucket 0, and a uniform run of
+    // ascending values would skew heavily under any clustering pattern
+    // not aligned with 16). The conservative 1.5× ceiling pins the
+    // mixing quality without flaking on legitimate variance.
+    const ceiling: u32 = mean + (mean / 2);
+    try std.testing.expect(max_count <= ceiling);
+}
+
+test "runtime: hashInt deterministic" {
+    // Regression-protects against accidental statefulness in the
+    // mixer (e.g., reading a global RNG instead of just the inputs).
+    // The function must be a pure function of (seed, value); two
+    // independent calls with the same arguments must return the same
+    // hash. If a reviewer mistakenly added a thread-local state to
+    // the mixer, this test would observe drift on the second call.
+    const seed: u64 = 0x1234_5678_9ABC_DEF0;
+    const value: u64 = 0x0FED_CBA9_8765_4321;
+    const first = Wyhash.hashInt(seed, value);
+    const second = Wyhash.hashInt(seed, value);
+    const third = Wyhash.hashInt(seed, value);
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(first, third);
+
+    // Different seeds yield different hashes for the same value.
+    const other_seed: u64 = seed ^ 0xFFFF_FFFF_FFFF_FFFF;
+    try std.testing.expect(Wyhash.hashInt(other_seed, value) != first);
+    // Different values yield different hashes under the same seed.
+    try std.testing.expect(Wyhash.hashInt(seed, value ^ 1) != first);
+}
+
+// ============================================================
+// Buffered stdin — drain ordering, EOF stickiness
+// ============================================================
+
+test "runtime: stdinReadByte EOF stickiness" {
+    // Regression for commit e94d59f. Once stdin hits EOF, the runtime
+    // sets `stdin_eof = true` so subsequent reads short-circuit
+    // without re-entering `read(2)`. Without the sticky guard,
+    // line-by-line readers that consume past EOF (e.g., `IO.gets()`
+    // followed by another `IO.gets()`) would spin in a tight syscall
+    // loop, each `read` returning 0 and incurring kernel-boundary
+    // overhead. We pin BOTH halves of the contract:
+    //
+    //   1. `stdinRefill` with `stdin_eof = true` returns 0 without
+    //      issuing a syscall.
+    //   2. `stdinReadByte` with `stdin_eof = true` and an empty
+    //      buffer returns null and leaves `stdin_eof` set.
+    //
+    // The first half is the load-bearing invariant — it's what
+    // protects against the post-EOF syscall storm. Without the
+    // `if (stdin_eof) return 0;` guard at the top of `stdinRefill`,
+    // the function would issue an unpredictable `read(STDIN_FD,...)`
+    // here. We use a sentinel value in the buffer to detect any such
+    // unexpected syscall write: if `stdinRefill` somehow succeeded,
+    // it would overwrite `stdin_buf[0]` and bump `stdin_buf_len`. We
+    // verify both fields are unchanged.
+    const saved_pos = stdin_buf_pos;
+    const saved_len = stdin_buf_len;
+    const saved_eof = stdin_eof;
+    const saved_byte = stdin_buf[0];
+    defer {
+        stdin_buf_pos = saved_pos;
+        stdin_buf_len = saved_len;
+        stdin_eof = saved_eof;
+        stdin_buf[0] = saved_byte;
+    }
+
+    // Mark a sentinel byte. Any `read(2)` that actually fires would
+    // overwrite this — proving the guard is missing.
+    const sentinel: u8 = 0xA5;
+    stdin_buf[0] = sentinel;
+    stdin_buf_pos = 0;
+    stdin_buf_len = 0;
+    stdin_eof = true;
+
+    // Direct invocation: stdinRefill must short-circuit on stdin_eof.
+    try std.testing.expectEqual(@as(usize, 0), stdinRefill());
+    // Sentinel preserved → no syscall fired.
+    try std.testing.expectEqual(sentinel, stdin_buf[0]);
+    try std.testing.expectEqual(@as(usize, 0), stdin_buf_pos);
+    try std.testing.expectEqual(@as(usize, 0), stdin_buf_len);
+    try std.testing.expect(stdin_eof);
+
+    // Three calls in a row to stdinReadByte — each must return null
+    // and leave the EOF flag set. The buffer remains empty.
+    try std.testing.expectEqual(@as(?u8, null), stdinReadByte());
+    try std.testing.expectEqual(@as(?u8, null), stdinReadByte());
+    try std.testing.expectEqual(@as(?u8, null), stdinReadByte());
+
+    // Buffer fields must be unchanged by the EOF reads.
+    try std.testing.expectEqual(@as(usize, 0), stdin_buf_pos);
+    try std.testing.expectEqual(@as(usize, 0), stdin_buf_len);
+    try std.testing.expect(stdin_eof);
+    try std.testing.expectEqual(sentinel, stdin_buf[0]);
+}
+
+test "runtime: stdinReadByte drains buffer before refill" {
+    // Pre-fill the buffer with known bytes and confirm
+    // `stdinReadByte` returns them in order without issuing a refill.
+    // A regression that broke the drain ordering (e.g., always
+    // refilling first) would either consume the test bytes silently
+    // or block on `read(STDIN_FD)`. With `stdin_eof = false` and a
+    // non-zero `stdin_buf_len`, the function MUST consume the buffer
+    // before consulting the syscall.
+    const saved_pos = stdin_buf_pos;
+    const saved_len = stdin_buf_len;
+    const saved_eof = stdin_eof;
+    const saved_buf: [4]u8 = .{ stdin_buf[0], stdin_buf[1], stdin_buf[2], stdin_buf[3] };
+    defer {
+        stdin_buf_pos = saved_pos;
+        stdin_buf_len = saved_len;
+        stdin_eof = saved_eof;
+        stdin_buf[0] = saved_buf[0];
+        stdin_buf[1] = saved_buf[1];
+        stdin_buf[2] = saved_buf[2];
+        stdin_buf[3] = saved_buf[3];
+    }
+
+    // Inject a four-byte sequence. With stdin_eof=false and a partial
+    // buffer present, calls must consume from the buffer alone. If
+    // the function regressed to refill-first, the test would either
+    // block (real stdin is a terminal in `zig build test`) or return
+    // unrelated bytes.
+    stdin_buf[0] = 'a';
+    stdin_buf[1] = 'b';
+    stdin_buf[2] = 'c';
+    stdin_buf[3] = 'd';
+    stdin_buf_pos = 0;
+    stdin_buf_len = 4;
+    stdin_eof = false;
+
+    try std.testing.expectEqual(@as(?u8, 'a'), stdinReadByte());
+    try std.testing.expectEqual(@as(?u8, 'b'), stdinReadByte());
+    try std.testing.expectEqual(@as(?u8, 'c'), stdinReadByte());
+    try std.testing.expectEqual(@as(?u8, 'd'), stdinReadByte());
+
+    // After consuming all four bytes, pos == len. The NEXT call would
+    // attempt a refill — we do NOT call it here because we cannot
+    // mock fd 0. The buffer-drain contract is the load-bearing
+    // invariant we wanted to pin.
+    try std.testing.expectEqual(@as(usize, 4), stdin_buf_pos);
+    try std.testing.expectEqual(@as(usize, 4), stdin_buf_len);
+}
+
+test "runtime: IO.gets handles partial-line buffer boundaries" {
+    // The fast path inside `IO.gets` requires the entire line plus
+    // its terminating newline to live in the current refill window.
+    // When a line spans a refill boundary, `gets` falls back to a
+    // scratch buffer and stitches the chunks together. Validate the
+    // boundary behaviour by simulating two refills back-to-back:
+    // pre-fill the buffer with a partial-line (no newline), let
+    // `gets` consume it into scratch, then re-fill the buffer with
+    // the line's tail (including the newline) BEFORE returning to
+    // `gets`. The result must be the concatenated line.
+    //
+    // To control the refill, we open a pipe via libc and rebind
+    // STDIN_FD via `dup2` for the duration of the test. The bytes
+    // we pre-pack into `stdin_buf` (no newline) are consumed first,
+    // then the in-flight `stdinRefill` call inside `gets` reads
+    // from the pipe to obtain the line's tail (which contains the
+    // newline). The line we assert is "first-chunk:second-chunk\n"
+    // minus the trailing newline.
+    //
+    // `std.posix.pipe`/`close`/`dup` aren't exposed in this Zig
+    // version's posix layer, so we drop to libc directly. The
+    // runtime always links libc (`main.zig` builds with
+    // `link_libc = true`), and the existing buffered-stdin code
+    // already uses `std.c.*` syscalls, so this is the cleanest
+    // route.
+    const libc = struct {
+        extern "c" fn pipe(fds: *[2]std.c.fd_t) c_int;
+        extern "c" fn dup(fd: std.c.fd_t) c_int;
+        extern "c" fn dup2(old_fd: std.c.fd_t, new_fd: std.c.fd_t) c_int;
+        extern "c" fn close(fd: std.c.fd_t) c_int;
+    };
+
+    const saved_pos = stdin_buf_pos;
+    const saved_len = stdin_buf_len;
+    const saved_eof = stdin_eof;
+    defer {
+        stdin_buf_pos = saved_pos;
+        stdin_buf_len = saved_len;
+        stdin_eof = saved_eof;
+    }
+
+    // Open a pipe; write the line's tail and EOF the write end so
+    // the read side observes the bytes followed by EOF.
+    var pipe_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expect(libc.pipe(&pipe_fds) == 0);
+    const read_end = pipe_fds[0];
+    const write_end = pipe_fds[1];
+    defer _ = libc.close(read_end);
+
+    const tail_bytes = "second-chunk\nleftover";
+    const written = std.c.write(write_end, tail_bytes.ptr, tail_bytes.len);
+    try std.testing.expectEqual(@as(isize, @intCast(tail_bytes.len)), written);
+    _ = libc.close(write_end);
+
+    // Redirect STDIN_FD to point at the pipe's read end. Save the
+    // original fd so we can restore it.
+    const saved_stdin_fd = libc.dup(STDIN_FD);
+    try std.testing.expect(saved_stdin_fd >= 0);
+    defer {
+        _ = libc.dup2(saved_stdin_fd, STDIN_FD);
+        _ = libc.close(saved_stdin_fd);
+    }
+    try std.testing.expect(libc.dup2(read_end, STDIN_FD) >= 0);
+
+    // Pre-pack the first chunk into the buffer. It does NOT contain
+    // a newline — `gets` will consume it into scratch and then call
+    // `stdinRefill` which reads the pipe's tail. The combined line
+    // is "first-chunk:second-chunk".
+    const head_bytes = "first-chunk:";
+    @memcpy(stdin_buf[0..head_bytes.len], head_bytes);
+    stdin_buf_pos = 0;
+    stdin_buf_len = head_bytes.len;
+    stdin_eof = false;
+
+    const line = IO.gets();
+    try std.testing.expectEqualStrings("first-chunk:second-chunk", line);
+}

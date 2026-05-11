@@ -4796,3 +4796,216 @@ test "arc_param_convention: TentativeAnalyzer synthesizes return pending from ca
     try std.testing.expect(liftSetContains(&survivors, 0, 0));
     try std.testing.expect(liftSetContains(&survivors, 1, 0));
 }
+
+test "arc_param_convention: liftSetSurvivesUniquenessCheck observes approved slots as .owned during simulation" {
+    // Regression for commit 37fd795 (and the `approved`-promotion seam
+    // introduced in fb32ef1). Stage 0 of the inference produces an
+    // approved `lift_set`: slots already accepted by the conservative
+    // monotone-up audit. Those slots will be promoted to `.owned` by
+    // `evaluateFunction` in the final fixpoint, so the Stage-1
+    // SCC-bootstrap simulation MUST observe them as `.owned` too —
+    // otherwise SCC partners further down the chain read the
+    // already-approved slot as `.borrowed` via `isUniqueOnEntry`, the
+    // `share_value → move_value` rewrite simulation reads a non-unique
+    // source, and the partner is falsely demoted.
+    //
+    // Synthesis:
+    //
+    //   Function `caller` (id=0, in `approved`):
+    //     [0] param_get %0 = index 0      -- read caller's slot 0
+    //     [1] share_value %1 = %0         -- to be rewritten to move
+    //                                       because callee.0 is .owned
+    //                                       (callee is in candidates,
+    //                                       tentatively .owned)
+    //     [2] call_named name="callee" args=[%1] dest=%2
+    //     [3] ret value=%2
+    //
+    //   Function `callee` (id=1, in `candidates`):
+    //     [0] param_get %0 = index 0      -- read callee's slot 0
+    //     [1] const_int %1 = 0
+    //     [2] const_int %2 = 0
+    //     [3] move_value %3 = %0          -- transfer ownership
+    //     [4] call_builtin "List:i64.set" args=[%3, %1, %2] dest=%4
+    //     [5] ret value=%4
+    //
+    // Reversal test:
+    //
+    //   WITHOUT the `approved` promotion: caller.0 stays `.borrowed`
+    //   during simulation. The interprocedural fixpoint's optimistic
+    //   initialization sets `unique_on_entry[caller][0] = false` (only
+    //   `.owned` slots start true). caller's `param_get` returns a
+    //   non-unique value; the share→move rewrite reads a non-unique
+    //   source; the per-arg uniqueness for callee.0 at the call site
+    //   is false; the demotion walker flips
+    //   `unique_on_entry[callee][0]` to false; callee fails the
+    //   uniqueness check and `survivors` does NOT contain callee.0.
+    //
+    //   WITH the `approved` promotion: caller.0 is tentatively
+    //   promoted to `.owned` before the fixpoint runs.
+    //   `unique_on_entry[caller][0]` initializes to true; caller's
+    //   `param_get` is unique; the share→move propagates uniqueness;
+    //   the per-arg uniqueness for callee.0 is true;
+    //   `unique_on_entry[callee][0]` stays true; callee survives.
+    //
+    // Mentally inverting the code under test: if a reviewer reverted
+    // the `approved` promotion loop in
+    // `liftSetSurvivesUniquenessCheck` (or passed `&empty_approved`
+    // here), this test would fail — `survivors` would NOT contain
+    // callee.0.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Caller function `caller` (id=0). slot 0 is in `approved`.
+    const caller_args = try arena.alloc(ir.LocalId, 1);
+    caller_args[0] = 1;
+    const caller_modes = try arena.alloc(ir.ValueMode, 1);
+    caller_modes[0] = .move;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .share_value = .{ .dest = 1, .source = 0, .mode = .retain } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "callee",
+            .args = caller_args,
+            .arg_modes = caller_modes,
+        } },
+        .{ .ret = .{ .value = 2 } },
+    };
+    const caller_blocks = try arena.alloc(ir.Block, 1);
+    caller_blocks[0] = .{ .label = 0, .instructions = try arena.dupe(ir.Instruction, &caller_instrs) };
+    const caller_ownership = try arena.alloc(ir.OwnershipClass, 3);
+    for (caller_ownership) |*o| o.* = .owned;
+    const caller_conventions = try arena.alloc(ir.ParamConvention, 1);
+    caller_conventions[0] = .borrowed;
+    const caller_params = try arena.alloc(ir.Param, 1);
+    caller_params[0] = .{ .name = "arr", .type_expr = .void };
+
+    // Callee function `callee` (id=1). slot 0 is in `candidates`.
+    // Body forwards slot 0 into List:i64.set (recognized as an
+    // owned-arg builtin, so the share_value is in the rewritten set
+    // when callee.0 is tentatively promoted).
+    const callee_args = try arena.alloc(ir.LocalId, 3);
+    callee_args[0] = 3;
+    callee_args[1] = 1;
+    callee_args[2] = 2;
+    const callee_modes = try arena.alloc(ir.ValueMode, 3);
+    callee_modes[0] = .move;
+    callee_modes[1] = .borrow;
+    callee_modes[2] = .borrow;
+    const callee_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .move_value = .{ .dest = 3, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "List:i64.set",
+            .args = callee_args,
+            .arg_modes = callee_modes,
+        } },
+        .{ .ret = .{ .value = 4 } },
+    };
+    const callee_blocks = try arena.alloc(ir.Block, 1);
+    callee_blocks[0] = .{ .label = 0, .instructions = try arena.dupe(ir.Instruction, &callee_instrs) };
+    const callee_ownership = try arena.alloc(ir.OwnershipClass, 5);
+    for (callee_ownership) |*o| o.* = .owned;
+    const callee_conventions = try arena.alloc(ir.ParamConvention, 1);
+    callee_conventions[0] = .borrowed;
+    const callee_params = try arena.alloc(ir.Param, 1);
+    callee_params[0] = .{ .name = "arr", .type_expr = .void };
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = .{
+        .id = 0,
+        .name = "caller",
+        .scope_id = 0,
+        .arity = 1,
+        .params = caller_params,
+        .return_type = .void,
+        .body = caller_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+        .param_conventions = caller_conventions,
+        .local_ownership = caller_ownership,
+        .result_convention = .owned,
+    };
+    functions[1] = .{
+        .id = 1,
+        .name = "callee",
+        .scope_id = 0,
+        .arity = 1,
+        .params = callee_params,
+        .return_type = .void,
+        .body = callee_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+        .param_conventions = callee_conventions,
+        .local_ownership = callee_ownership,
+        .result_convention = .owned,
+    };
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var test_signatures = try uniqueness_fixpoint.computeSignatures(std.testing.allocator, &program);
+    defer test_signatures.deinit(std.testing.allocator);
+    var test_ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
+    defer test_ownerships.deinit();
+
+    // Approved: caller.0. Candidates: callee.0.
+    var approved: LiftSet = .empty;
+    defer approved.deinit(std.testing.allocator);
+    try approved.put(std.testing.allocator, liftKey(0, 0), {});
+
+    var candidates: LiftSet = .empty;
+    defer candidates.deinit(std.testing.allocator);
+    try candidates.put(std.testing.allocator, liftKey(1, 0), {});
+
+    var survivors: LiftSet = .empty;
+    defer survivors.deinit(std.testing.allocator);
+    try liftSetSurvivesUniquenessCheck(
+        std.testing.allocator,
+        &program,
+        &test_signatures,
+        &test_ownerships,
+        &approved,
+        &candidates,
+        &survivors,
+    );
+
+    // With the `approved` promotion in place: caller.0 was treated as
+    // `.owned` during simulation, caller's `param_get` returned
+    // unique, the share→move rewrite at the call to callee passed a
+    // unique arg, and callee.0 stays unique-on-entry. callee.0
+    // survives.
+    try std.testing.expect(liftSetContains(&survivors, 1, 0));
+
+    // Sanity (the test's symmetric counterpart): the cascade only
+    // fires because caller.0 is in `approved`. If `approved` were
+    // empty, callee.0 would be demoted by the same mechanism that the
+    // existing `copy_value-clobbered receiver` test exercises (the
+    // caller's `param_get` of a `.borrowed` slot reads non-unique).
+    // We confirm that branch explicitly to pin the demotion behaviour
+    // and prove the test's regression-protection: if the `approved`
+    // promotion loop were reverted, the WITH-approved branch would
+    // observe the same survivors as the without-approved branch.
+    var survivors_no_approved: LiftSet = .empty;
+    defer survivors_no_approved.deinit(std.testing.allocator);
+    var empty_approved: LiftSet = .empty;
+    defer empty_approved.deinit(std.testing.allocator);
+    try liftSetSurvivesUniquenessCheck(
+        std.testing.allocator,
+        &program,
+        &test_signatures,
+        &test_ownerships,
+        &empty_approved,
+        &candidates,
+        &survivors_no_approved,
+    );
+    try std.testing.expect(!liftSetContains(&survivors_no_approved, 1, 0));
+
+    // Conventions must be restored on every exit path.
+    try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[0].param_conventions[0]);
+    try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[1].param_conventions[0]);
+}
