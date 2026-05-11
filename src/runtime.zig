@@ -7061,12 +7061,39 @@ pub fn Map(comptime K: type, comptime V: type) type {
             const self = map.?;
             const first = self.entryAtConst(0).*;
             // Deep-retain the yielded K/V so the caller has owned copies
-            // even after `delete` runs swap-remove (which deep-releases
+            // even after the swap-remove runs (which deep-releases
             // the entry's K/V).
             retainEntryKey(first.key);
             retainEntryValue(first.value);
-            const remaining = delete(self, first.key);
-            return .{ ATOM_CONT, .{ first.key, first.value }, remaining };
+
+            // CORRECTNESS GATE: do NOT route through `Map.delete`. The
+            // delete wrapper's rc==1 fast path mutates the receiver in
+            // place when it sees `header.count() == 1` — but under the
+            // borrowed-pass-through retain elision (commit 239d084),
+            // borrowed callers do NOT bump the source's refcount, so
+            // a map with one outer owner appears as `header.count() ==
+            // 1` to every borrowed callee. Routing through `delete`
+            // would silently mutate the outer caller's map during
+            // iteration, corrupting any subsequent reuse of the
+            // collection (k-nucleotide's `print_freq` re-reads the
+            // map after `Enum.reduce` walks it via this protocol).
+            //
+            // The fix: always clone, then swap-remove the yielded
+            // entry on the freshly-allocated clone. The clone has
+            // rc=1 by construction and no outer observers, so
+            // mutating it is unconditionally sound. The Enumerable
+            // protocol's caller already treats the returned state
+            // as ownership-transferred (it's the third tuple slot
+            // and immediately consumed by the next iteration step),
+            // so the clone's lifetime is exactly the iteration step.
+            const callsite = @returnAddress();
+            const clone = cloneBufferRetainingChildren(self, self.capacity, callsite) orelse {
+                return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
+            };
+            if (findEntry(clone, first.key)) |found_entry_idx| {
+                deleteFoundInPlace(clone, found_entry_idx);
+            }
+            return .{ ATOM_CONT, .{ first.key, first.value }, clone };
         }
 
         inline fn defaultK() K {
