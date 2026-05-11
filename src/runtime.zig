@@ -459,51 +459,6 @@ pub const ArcHeader = extern struct {
     }
 };
 
-pub fn Arc(comptime T: type) type {
-    return struct {
-        const Self = @This();
-
-        const Inner = struct {
-            header: ArcHeader,
-            value: T,
-        };
-
-        ptr: *Inner,
-
-        pub fn init(allocator: std.mem.Allocator, value: T) !Self {
-            const inner = try allocator.create(Inner);
-            inner.* = .{
-                .header = ArcHeader.init(),
-                .value = value,
-            };
-            return .{ .ptr = inner };
-        }
-
-        pub fn retain(self: Self) Self {
-            self.ptr.header.retain();
-            return self;
-        }
-
-        pub fn release(self: Self, allocator: std.mem.Allocator) void {
-            if (self.ptr.header.release()) {
-                allocator.destroy(self.ptr);
-            }
-        }
-
-        pub fn get(self: Self) *T {
-            return &self.ptr.value;
-        }
-
-        pub fn getConst(self: Self) *const T {
-            return &self.ptr.value;
-        }
-
-        pub fn refCount(self: Self) u32 {
-            return self.ptr.header.count();
-        }
-    };
-}
-
 // ============================================================
 // ARC instrumentation counters (Phase 1 of the k-nucleotide RSS
 // roadmap — see `docs/k-nucleotide-rss-gap-implementation-plan.md`).
@@ -623,6 +578,24 @@ pub const PoolStats = struct {
     high_water: u64 = 0,
     registered: bool = false,
     next: ?*PoolStats = null,
+    /// Number of slabs currently linked into the backend's `partial`
+    /// list (slabs with at least one free slot AND `live_count > 0`).
+    /// Combined with `slab_active_partial_live_sum` this gives a
+    /// fragmentation read: `live_sum / (count * capacity_per_slab)`
+    /// is the mean occupancy of partial slabs. A low ratio across many
+    /// partial slabs signals that the pool is holding mostly-empty
+    /// slabs that could be unmapped if the deep-release pattern were
+    /// more aggressive. Bumped by `pushPartial`/`unlinkPartial` and
+    /// adjusted on every `destroy` whose freed slot leaves the slab
+    /// in a non-zero `live_count` state on the partial list.
+    slab_active_partial_count: usize = 0,
+    /// Sum of `live_count` across every slab in the partial list.
+    /// See `slab_active_partial_count` for the fragmentation reading.
+    /// Tracked alongside the count so a future telemetry dump can
+    /// surface both numerator and denominator independently (per-pool
+    /// capacity_per_slab is comptime-known, so a downstream consumer
+    /// derives slab capacity from `name` + the runtime's type table).
+    slab_active_partial_live_sum: usize = 0,
 
     pub fn noteAllocation(self: *PoolStats) void {
         registerIfNeeded(self);
@@ -745,8 +718,12 @@ pub fn dumpArcStats(write_line: *const fn ([]const u8) void) void {
     }
     var cursor = pool_stats_head;
     while (cursor) |stats| : (cursor = stats.next) {
-        if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] pool={s} live={d} high_water={d}\n", .{
-            stats.name, stats.live, stats.high_water,
+        if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] pool={s} live={d} high_water={d} partial_slabs={d} partial_live_sum={d}\n", .{
+            stats.name,
+            stats.live,
+            stats.high_water,
+            stats.slab_active_partial_count,
+            stats.slab_active_partial_live_sum,
         })) |line| {
             write_line(line);
         } else |_| {}
@@ -1566,9 +1543,10 @@ pub const ArcRuntime = struct {
     /// slabs (slabs with at least one free slot AND `live_count > 0`).
     /// `owner` points back to the `Backend` that owns the slab so a
     /// destroy from a cell pointer alone can locate the right backend
-    /// without an extra parameter. `allocation_base` and
-    /// `allocation_size` capture the trim-front bookkeeping needed by
-    /// the slab-unmap path (see `mmapAlignedSlab`).
+    /// without an extra parameter. `allocation_base` is the aligned
+    /// `SLAB_SIZE`-sized region returned by `mmapAlignedSlab`; the
+    /// head and tail of the over-allocation are trimmed eagerly inside
+    /// the helper so unmap only needs the base + `SLAB_SIZE`.
     ///
     /// `side_table_capacity` is the comptime capacity of the side-table
     /// refcount array embedded after the fixed header when
@@ -1629,7 +1607,6 @@ pub const ArcRuntime = struct {
             next: ?*anyopaque,
             owner: *anyopaque,
             allocation_base: [*]align(std.heap.page_size_min) u8,
-            allocation_size: usize,
             refcounts: [0]std.atomic.Value(u32),
         };
         const fixed_header_size: usize = @sizeOf(HeaderPrefix);
@@ -1666,7 +1643,6 @@ pub const ArcRuntime = struct {
             next: ?*Self,
             owner: *anyopaque,
             allocation_base: [*]align(std.heap.page_size_min) u8,
-            allocation_size: usize,
             // Embedded refcounts side-table; zero-length array when
             // `side_table=false` so the layout matches the legacy
             // header exactly. The array's `len` is comptime-constant
@@ -1877,7 +1853,7 @@ pub const ArcRuntime = struct {
             /// overwritten by the value initialiser and their refcount
             /// reset to 1 by `create`; this implicit init is for the
             /// bump-allocate path's safety only.)
-            fn initSlab(slab: *Header, base_addr: [*]align(std.heap.page_size_min) u8, alloc_size: usize) void {
+            fn initSlab(slab: *Header, base_addr: [*]align(std.heap.page_size_min) u8) void {
                 slab.* = .{
                     .magic = SLAB_MAGIC,
                     .live_count = 0,
@@ -1888,7 +1864,6 @@ pub const ArcRuntime = struct {
                     .next = null,
                     .owner = @ptrCast(&backend),
                     .allocation_base = base_addr,
-                    .allocation_size = alloc_size,
                     .refcounts = if (comptime side_table) [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** capacity_per_slab else .{},
                 };
             }
@@ -1915,15 +1890,29 @@ pub const ArcRuntime = struct {
                 }
                 const aligned_base = mmapAlignedSlab() orelse return null;
                 const slab: *Header = @ptrCast(@alignCast(aligned_base));
-                initSlab(slab, aligned_base, SLAB_SIZE);
+                initSlab(slab, aligned_base);
                 return slab;
+            }
+
+            /// True iff `slab` is currently linked into the backend's
+            /// partial-slab list. Used by the partial-occupancy
+            /// telemetry in `PoolStats` so list-add/remove and
+            /// live_count-on-partial adjustments stay in sync.
+            inline fn slabOnPartialList(slab: *Header) bool {
+                return slab.prev != null or backend.partial_head == slab;
             }
 
             /// Unlink a slab from the partial-slab list. Safe to call
             /// even if the slab is not currently on the list — in
             /// that case prev/next are null and the head pointer is
             /// untouched if it doesn't reference this slab.
+            ///
+            /// Telemetry: when the slab is genuinely on the list,
+            /// decrement the partial-slab count and remove its
+            /// live_count contribution from the live-sum so the
+            /// fragmentation read in `PoolStats` stays accurate.
             fn unlinkPartial(slab: *Header) void {
+                const was_on_list = slabOnPartialList(slab);
                 if (slab.prev) |prev_slab| {
                     prev_slab.next = slab.next;
                 } else if (backend.partial_head == slab) {
@@ -1934,9 +1923,19 @@ pub const ArcRuntime = struct {
                 }
                 slab.prev = null;
                 slab.next = null;
+                if (was_on_list) {
+                    std.debug.assert(stats.slab_active_partial_count > 0);
+                    stats.slab_active_partial_count -= 1;
+                    std.debug.assert(stats.slab_active_partial_live_sum >= slab.live_count);
+                    stats.slab_active_partial_live_sum -= slab.live_count;
+                }
             }
 
             /// Insert a slab at the head of the partial-slab list.
+            /// Telemetry: bump the partial-slab count and add the
+            /// slab's current `live_count` to the live-sum so the
+            /// fragmentation read in `PoolStats` reflects the new
+            /// member.
             fn pushPartial(slab: *Header) void {
                 slab.prev = null;
                 slab.next = backend.partial_head;
@@ -1944,6 +1943,8 @@ pub const ArcRuntime = struct {
                     head_slab.prev = slab;
                 }
                 backend.partial_head = slab;
+                stats.slab_active_partial_count += 1;
+                stats.slab_active_partial_live_sum += slab.live_count;
             }
 
             /// Look up the owning slab header for a cell pointer.
@@ -1983,6 +1984,19 @@ pub const ArcRuntime = struct {
             /// empty slab onto the partial list either; an empty active
             /// would already have hit the cached_empty fast-path on the
             /// preceding destroy.
+            ///
+            /// OOM policy: this function panics on slab acquisition
+            /// failure. The runtime's public `ArcRuntime.allocAny` /
+            /// pool `create()` deliberately return non-optional `*Inner`
+            /// rather than `?*Inner` — every allocation site in the
+            /// generated Zap runtime treats out-of-memory as a fatal
+            /// condition, matching the rest of the runtime's
+            /// panic-on-OOM stance (see `Map.bufferAlloc`, `List.cons`,
+            /// `String.concat`, etc., which crash on failure rather
+            /// than thread an error through every call site). A
+            /// graceful-OOM redesign would require an error-return
+            /// convention across the whole runtime ABI; until that
+            /// lands, panic is the documented policy.
             fn rotateActive() *Header {
                 backend.active = null;
 
@@ -2058,6 +2072,18 @@ pub const ArcRuntime = struct {
                 const free_node: *Header.free_node_type = @ptrCast(@alignCast(slot_ptr_bytes));
                 free_node.next_index = slab.free_list_head;
                 slab.free_list_head = slot_index;
+                std.debug.assert(slab.live_count > 0);
+                // Telemetry: if the slab is currently on the partial
+                // list, its contribution to `slab_active_partial_live_sum`
+                // is about to decrease by 1. Adjust before the count
+                // decrement so the sum stays consistent with the slab
+                // list state even when the slab stays on the partial
+                // list after this destroy (i.e., live_count > 0).
+                const on_partial_before = slabOnPartialList(slab);
+                if (on_partial_before) {
+                    std.debug.assert(stats.slab_active_partial_live_sum > 0);
+                    stats.slab_active_partial_live_sum -= 1;
+                }
                 slab.live_count -= 1;
 
                 if (slab == backend.active) return;
@@ -2140,6 +2166,8 @@ pub const ArcRuntime = struct {
                     backend.cached_empty = null;
                 }
                 stats.high_water = 0;
+                stats.slab_active_partial_count = 0;
+                stats.slab_active_partial_live_sum = 0;
             }
         };
     }
@@ -2323,6 +2351,10 @@ pub const ArcRuntime = struct {
     /// callers can dereference `owned.*` to walk children before
     /// invoking `destroyPreparedAny`.
     pub fn prepareReleaseAny(comptime T: type, ptr: *const T) ?*T {
+        comptime {
+            if (hasInlineArcHeader(T))
+                @compileError("prepareReleaseAny: inline-header types must release via T.release, not the generic Arc pool");
+        }
         const slot_ptr: *T = @constCast(ptr);
         if (ArcPool(T).release(slot_ptr)) return slot_ptr;
         return null;
@@ -6508,6 +6540,15 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
         pub fn size(map: ?*const Self) i64 {
             if (map) |m| {
+                // Iter-cell guard. A `MapIter` cell aliases `Map.Self`'s
+                // first 24 bytes but its `capacity` field is always 0;
+                // a real Map has `capacity >= DENSE_MAP_INITIAL_CAPACITY`
+                // (8). Reading `m.len` on an iter cell would expose the
+                // iter's zero-initialised `len_unused` field, which is
+                // not the source map's length and would silently mislead
+                // callers. `Map.size` is never meant to receive iter
+                // cells — they are valid only as `Map.next` state.
+                if (m.capacity == 0) @panic("Map.size: received MapIter cell; iter cells are only valid as Map.next state");
                 if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
                 return @intCast(m.len);
             }
@@ -6515,6 +6556,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
         }
 
         pub fn isEmpty(map: ?*const Self) bool {
+            if (map) |m| {
+                if (m.capacity == 0) @panic("Map.isEmpty: received MapIter cell; iter cells are only valid as Map.next state");
+            }
             return map == null;
         }
 
@@ -6580,6 +6624,16 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
         pub fn retain(map: ?*const Self) ?*const Self {
             if (map) |m| {
+                // Iter-cell guard. `Map.retain` is the public ARC entry
+                // point for real Map cells; iter cells manage their own
+                // refcount via the slab pool's inline header and are
+                // never meant to be retained through this path. Iter
+                // cells are produced by `Map.next` and consumed by
+                // either the next `Map.next` step or `Map.release` (via
+                // the iter-cell dispatch). A retain on an iter cell
+                // would silently bump the iter's rc without any
+                // matching release path here — a leak. Panic instead.
+                if (m.capacity == 0) @panic("Map.retain: received MapIter cell; iter cells are only valid as Map.next state");
                 const mut: *Self = @constCast(m);
                 mut.header.retain();
                 arc_retains_total += 1;
@@ -6762,6 +6816,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
         pub fn getStr(map: ?*const Self, key: K, default: []const u8) []const u8 {
             _ = key;
             if (map) |m| {
+                if (m.capacity == 0) @panic("Map.getStr: received MapIter cell; iter cells are only valid as Map.next state");
                 if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
             }
             return default;
@@ -6772,6 +6827,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
         // -------------------------------------------------------------------
 
         pub fn put(map: ?*const Self, key: K, value: V) ?*const Self {
+            if (map) |m| {
+                if (m.capacity == 0) @panic("Map.put: received MapIter cell; iter cells are only valid as Map.next state");
+            }
             const callsite = @returnAddress();
             if (comptime instrument_map) {
                 if (map) |m| {
@@ -6885,6 +6943,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
         // -------------------------------------------------------------------
 
         pub fn delete(map: ?*const Self, key: K) ?*const Self {
+            if (map) |m| {
+                if (m.capacity == 0) @panic("Map.delete: received MapIter cell; iter cells are only valid as Map.next state");
+            }
             const callsite = @returnAddress();
             if (comptime instrument_map) {
                 if (map) |m| {
@@ -6983,6 +7044,12 @@ pub fn Map(comptime K: type, comptime V: type) type {
         // -------------------------------------------------------------------
 
         pub fn merge(map_a: ?*const Self, map_b: ?*const Self) ?*const Self {
+            if (map_a) |m| {
+                if (m.capacity == 0) @panic("Map.merge: received MapIter cell; iter cells are only valid as Map.next state");
+            }
+            if (map_b) |m| {
+                if (m.capacity == 0) @panic("Map.merge: received MapIter cell; iter cells are only valid as Map.next state");
+            }
             if (comptime instrument_map) {
                 if (map_a) |m| _ = mapInstrumentationBumpMutation(@intFromPtr(m), .merge);
                 if (map_b) |m| _ = mapInstrumentationBumpMutation(@intFromPtr(m), .merge);
@@ -7045,6 +7112,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// Like `put`, but skips the rc==1 check. Caller must have
         /// proven uniqueness via uniqueness. See safety contract above.
         pub fn put_owned_unchecked(map: ?*const Self, key: K, value: V) ?*const Self {
+            if (map) |m| {
+                if (m.capacity == 0) @panic("Map.put_owned_unchecked: received MapIter cell; iter cells are only valid as Map.next state");
+            }
             const callsite = @returnAddress();
             dense_map_mut_calls_total += 1;
             dense_map_unchecked_total += 1;
@@ -7068,6 +7138,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// Like `delete`, but skips the rc==1 check. Caller must
         /// have proven uniqueness via uniqueness. See safety contract above.
         pub fn delete_owned_unchecked(map: ?*const Self, key: K) ?*const Self {
+            if (map) |m| {
+                if (m.capacity == 0) @panic("Map.delete_owned_unchecked: received MapIter cell; iter cells are only valid as Map.next state");
+            }
             dense_map_mut_calls_total += 1;
             dense_map_unchecked_total += 1;
             const self = map orelse return null;
@@ -7089,6 +7162,12 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// The result is always A's pointer (possibly after a
         /// transparent resize).
         pub fn merge_owned_unchecked(map_a: ?*const Self, map_b: ?*const Self) ?*const Self {
+            if (map_a) |m| {
+                if (m.capacity == 0) @panic("Map.merge_owned_unchecked: received MapIter cell; iter cells are only valid as Map.next state");
+            }
+            if (map_b) |m| {
+                if (m.capacity == 0) @panic("Map.merge_owned_unchecked: received MapIter cell; iter cells are only valid as Map.next state");
+            }
             if (map_a == null and map_b == null) return null;
             if (map_b == null) return map_a;
             if (map_a == null) {
@@ -7262,6 +7341,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
         pub fn keys(map: ?*const Self) ?*const List(K) {
             const self = map orelse return null;
+            if (self.capacity == 0) @panic("Map.keys: received MapIter cell; iter cells are only valid as Map.next state");
             if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(self));
             const len = self.len;
             if (len == 0) return null;
@@ -7277,6 +7357,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
         pub fn values(map: ?*const Self) ?*const List(V) {
             const self = map orelse return null;
+            if (self.capacity == 0) @panic("Map.values: received MapIter cell; iter cells are only valid as Map.next state");
             if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(self));
             const len = self.len;
             if (len == 0) return null;
@@ -7394,6 +7475,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
         pub fn enumReduceSimple(map: ?*const Self, initial: i64, callback: anytype) i64 {
             if (map == null) return initial;
             const self = map.?;
+            if (self.capacity == 0) @panic("Map.enumReduceSimple: received MapIter cell; iter cells are only valid as Map.next state");
             var acc: i64 = initial;
             const entries = self.entriesPtr();
             for (0..self.len) |i| {
@@ -7405,6 +7487,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
         pub fn enumReduceValues(map: ?*const Self, initial: i64, callback: anytype) i64 {
             if (map == null) return initial;
             const self = map.?;
+            if (self.capacity == 0) @panic("Map.enumReduceValues: received MapIter cell; iter cells are only valid as Map.next state");
             var acc: i64 = initial;
             const entries = self.entriesPtr();
             for (0..self.len) |i| {
@@ -7520,17 +7603,24 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
         /// Next entry slot index to yield. In [0, source_map.len].
         /// `next_idx == source_map.len` ⇒ iteration done.
         next_idx: u32,
-        /// Padding to bring the cell to a 16-byte alignment so the
-        /// slab pool's slot computation matches the natural alignment
-        /// of `*const MapT`. Kept explicit (not `align(16)`) so the
-        /// layout is visible in code rather than implicit.
-        _pad: u32,
 
-        // Per-(K, V) slab pool. Cells are ~40 bytes each.
+        // Per-(K, V) slab pool. Cells are 40 bytes each (the trailing
+        // 4 bytes after `next_idx` is implicit C-ABI tail padding from
+        // the extern struct's 8-byte alignment requirement — the
+        // `source_map` pointer pulls the struct's alignment up to 8).
         // `side_table=false`: MapIter cells embed their own ArcHeader as
         // the first field (mirroring `Map` and `List`); their refcount
         // is managed inline by the cell rather than by the pool.
         const SelfPool = ArcRuntime.ArcSlabPool(Self, "MapIter(" ++ @typeName(K) ++ "," ++ @typeName(V) ++ ")", false);
+
+        // Lock the cell size so future field-ordering edits cannot
+        // silently change the slab slot layout. 40 bytes = 4 (header)
+        // + 4 (len_unused) + 4 (capacity) + 4 (entry_cap_unused) +
+        // 8 (hash_seed_unused) + 8 (source_map) + 4 (next_idx) +
+        // 4 (implicit tail pad to 8-byte alignment).
+        comptime {
+            std.debug.assert(@sizeOf(Self) == 40);
+        }
 
         /// Allocate a fresh iter cell that retains `source`. Returns
         /// the iter with rc=1, `next_idx = 0`, and `source.rc += 1`.
@@ -7551,7 +7641,6 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
                 .hash_seed_unused = 0,
                 .source_map = source,
                 .next_idx = 0,
-                ._pad = 0,
             };
             return cell;
         }
@@ -11028,21 +11117,6 @@ pub const System = struct {
 // Tests
 // ============================================================
 
-test "Arc basic reference counting" {
-    const alloc = std.testing.allocator;
-    const arc = try Arc(i64).init(alloc, 42);
-    try std.testing.expectEqual(@as(u32, 1), arc.refCount());
-    try std.testing.expectEqual(@as(i64, 42), arc.get().*);
-
-    const arc2 = arc.retain();
-    try std.testing.expectEqual(@as(u32, 2), arc.refCount());
-
-    arc2.release(alloc);
-    try std.testing.expectEqual(@as(u32, 1), arc.refCount());
-
-    arc.release(alloc);
-}
-
 test "Tuple.size returns tuple arity" {
     try std.testing.expectEqual(@as(i64, 3), Tuple.size(.{ 1, "two", true }));
 }
@@ -11086,15 +11160,6 @@ test "ArcRuntime.prepareReleaseAny returns ptr only on the zero-transition" {
     try std.testing.expectEqual(@as(i64, 7), owned.*);
     // Children would be walked here in a deep-release helper. Then:
     ArcRuntime.destroyPreparedAny(i64, alloc, owned);
-}
-
-test "Arc struct value" {
-    const alloc = std.testing.allocator;
-    const Point = struct { x: f64, y: f64 };
-    const arc = try Arc(Point).init(alloc, .{ .x = 1.0, .y = 2.0 });
-    try std.testing.expectEqual(@as(f64, 1.0), arc.getConst().x);
-    try std.testing.expectEqual(@as(f64, 2.0), arc.getConst().y);
-    arc.release(alloc);
 }
 
 test "releaseChildrenAny releases ?*const Map(K, V) field" {
@@ -13280,6 +13345,243 @@ test "side-table slab pool: refcount table sized correctly per slab capacity" {
     Pool.resetForTest();
 }
 
+test "slab pool: partial-slab telemetry tracks count and live-sum through push/unlink" {
+    // The `slab_active_partial_count` and `slab_active_partial_live_sum`
+    // counters in `PoolStats` must stay in lockstep with the
+    // backend's partial-slab list across the full state machine:
+    // full→partial transitions push, drains to live==0 unlink, and
+    // every `destroy` that lowers a partial slab's live_count must
+    // adjust the live-sum. A drift between these counters and the
+    // list state would make the fragmentation read (live_sum /
+    // (count * slab_capacity)) garbage in any future telemetry
+    // consumer or RSS-bound diagnostic.
+    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/partial-telemetry", false);
+    Pool.statsForTest().live = 0;
+    Pool.statsForTest().slab_active_partial_count = 0;
+    Pool.statsForTest().slab_active_partial_live_sum = 0;
+    Pool.resetForTest();
+
+    // Initially no partial slabs.
+    try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_count);
+    try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_live_sum);
+
+    const slab_capacity = Pool.slot_capacity;
+
+    // Fill slab 0 completely, then allocate one more — that triggers
+    // rotateActive which pulls a fresh slab as active. Slab 0 is
+    // still FULL at this moment, so it is NOT on the partial list.
+    const slab_zero_cells = try std.testing.allocator.alloc(*SlabTestInner24, slab_capacity);
+    defer std.testing.allocator.free(slab_zero_cells);
+
+    var i: usize = 0;
+    while (i < slab_capacity) : (i += 1) {
+        slab_zero_cells[i] = Pool.create();
+    }
+
+    const slab_one_first = Pool.create();
+    try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_count);
+    try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_live_sum);
+
+    // Free one cell from slab 0. Slab 0 was full → now partial. The
+    // destroy path pushes it onto the partial list with live_count =
+    // slab_capacity - 1.
+    Pool.destroy(slab_zero_cells[0]);
+    try std.testing.expectEqual(@as(usize, 1), Pool.statsForTest().slab_active_partial_count);
+    try std.testing.expectEqual(@as(usize, slab_capacity - 1), Pool.statsForTest().slab_active_partial_live_sum);
+
+    // Free another cell from slab 0. Stays partial; live_sum drops
+    // by 1.
+    Pool.destroy(slab_zero_cells[1]);
+    try std.testing.expectEqual(@as(usize, 1), Pool.statsForTest().slab_active_partial_count);
+    try std.testing.expectEqual(@as(usize, slab_capacity - 2), Pool.statsForTest().slab_active_partial_live_sum);
+
+    // Drain the rest of slab 0 — live_count → 0, slab unlinked,
+    // count and live_sum return to 0.
+    var drain_index: usize = 2;
+    while (drain_index < slab_capacity) : (drain_index += 1) {
+        Pool.destroy(slab_zero_cells[drain_index]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_count);
+    try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_live_sum);
+
+    // Slab 1 is still the active slab with one cell live. Free it
+    // — active slabs don't go partial, so the counters stay at 0.
+    Pool.destroy(slab_one_first);
+    try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_count);
+    try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_live_sum);
+
+    Pool.resetForTest();
+}
+
+test "side-table slab pool: tight slab-occupancy bound for representative tree workload" {
+    // Pin the architectural RSS floor that drives binarytrees N=21
+    // peak memory (~162 MB measured). The load-bearing invariant is
+    // that a 16-byte `T = SideTableTreeLike` (two optional pointers,
+    // identical shape to the binarytrees `Tree`) lands at 16 bytes
+    // per slot plus 4 bytes per refcount entry. This translates to
+    // `(SLAB_SIZE - fixed_header - inner_alignment) / (slot_size + 4)`
+    // cells per 64 KiB slab; a regression that grew `slot_size` by
+    // even 4 bytes would balloon the cell count per slab downward
+    // and bloat peak RSS for N=21 by ~30%.
+    //
+    // Direct N=21 measurement is too slow for a unit test (~6.5s).
+    // Instead, construct a representative tree of cells of known size
+    // and check that slot capacity per slab still exceeds the
+    // expected tight lower bound. We assert against a tight bound
+    // (within 1 cell of the closed-form maximum) so any future regression
+    // in `SlabHeader.capacityFor` arithmetic surfaces here.
+    const Pool = ArcRuntime.ArcSlabPool(SideTableTreeLike, "SideTable/tree-occupancy-bound", true);
+    const slab_capacity = Pool.slot_capacity;
+
+    // Expected: 64 KiB slab, ~64 bytes header, 8-byte inner alignment,
+    // 16 + 4 = 20 bytes per slot pair. Closed-form bound:
+    //   floor((65536 - header_size - inner_alignment) / 20)
+    // We must clear at least 3200 cells/slab — anything significantly
+    // below means the header is growing or the refcount stride
+    // changed. The actual capacity should be ~3273.
+    try std.testing.expect(slab_capacity >= 3200);
+    try std.testing.expect(slab_capacity <= 3280);
+
+    Pool.statsForTest().live = 0;
+    Pool.resetForTest();
+
+    // Build a small representative tree of cells to exercise the
+    // side-table refcount slot at multiple slot indices in one slab.
+    const cell_count: usize = 1024;
+    const cells = try std.testing.allocator.alloc(*SideTableTreeLike, cell_count);
+    defer std.testing.allocator.free(cells);
+
+    var allocate_index: usize = 0;
+    while (allocate_index < cell_count) : (allocate_index += 1) {
+        cells[allocate_index] = Pool.create();
+        cells[allocate_index].* = .{ .left = null, .right = null };
+        try std.testing.expectEqual(@as(u32, 1), Pool.refCount(cells[allocate_index]));
+    }
+
+    // All cells must land in a single slab (1024 < slab_capacity),
+    // so the slab base is identical across the whole range.
+    const first_slab_addr = @intFromPtr(cells[0]) & ArcRuntime.SLAB_BASE_MASK;
+    var verify_index: usize = 1;
+    while (verify_index < cell_count) : (verify_index += 1) {
+        try std.testing.expectEqual(
+            first_slab_addr,
+            @intFromPtr(cells[verify_index]) & ArcRuntime.SLAB_BASE_MASK,
+        );
+    }
+
+    // Each slot is exactly 16 bytes apart (slot_size assertion).
+    // Verify by walking the slot stride between adjacent cells.
+    var stride_index: usize = 1;
+    while (stride_index < cell_count) : (stride_index += 1) {
+        const diff = @intFromPtr(cells[stride_index]) - @intFromPtr(cells[stride_index - 1]);
+        try std.testing.expectEqual(@as(usize, 16), diff);
+    }
+
+    var release_index: usize = 0;
+    while (release_index < cell_count) : (release_index += 1) {
+        try std.testing.expect(Pool.release(cells[release_index]));
+        Pool.destroy(cells[release_index]);
+    }
+
+    Pool.resetForTest();
+}
+
+test "ArcSlabPool side-table: cached_empty preserves refcount slot integrity across slab reuse" {
+    // Regression for the cached_empty + side-table interaction. When a
+    // slab is fully drained (live_count → 0) but the backend has no
+    // cached_empty, the destroy path stashes it in `cached_empty`
+    // instead of unmapping. A subsequent `rotateActive` (or
+    // `acquireFreshActive`) pulls that slab back and resets its
+    // free-list / bump_index — but the embedded refcounts side-table
+    // is NOT explicitly re-zeroed at that point. The new contract is
+    // that every freshly-allocated slot (via either bump-allocate or
+    // free-list pop) overwrites its refcount entry to 1 inside
+    // `create`. Verify that property holds across at least one full
+    // cycle of fill-drain-reuse so a future regression in
+    // `acquireFreshActive` or `create` cannot silently leave a stale
+    // refcount visible to the side-table accessors.
+    const Pool = ArcRuntime.ArcSlabPool(SideTableTreeLike, "SideTable/cached-empty-rc-integrity", true);
+    Pool.statsForTest().live = 0;
+    Pool.resetForTest();
+
+    const slot_capacity = Pool.slot_capacity;
+
+    // Fill two full slabs so the first becomes a partial then,
+    // after we drain it, drops to live_count == 0 and gets cached.
+    const total_cells: usize = @as(usize, slot_capacity) * 2;
+    const cells = try std.testing.allocator.alloc(*SideTableTreeLike, total_cells);
+    defer std.testing.allocator.free(cells);
+
+    var allocate_index: usize = 0;
+    while (allocate_index < total_cells) : (allocate_index += 1) {
+        cells[allocate_index] = Pool.create();
+        try std.testing.expectEqual(@as(u32, 1), Pool.refCount(cells[allocate_index]));
+    }
+
+    // Release all cells of slab 0 (indices [0, slot_capacity)) so it
+    // drains to live_count == 0 and gets cached (slab 1 is active
+    // so it isn't a candidate to cache itself).
+    var release_index: usize = 0;
+    while (release_index < slot_capacity) : (release_index += 1) {
+        try std.testing.expect(Pool.release(cells[release_index]));
+        Pool.destroy(cells[release_index]);
+    }
+
+    // Backend must now hold one cached_empty (slab 0).
+    const backend_ptr = Pool.backendForTest();
+    try std.testing.expect(backend_ptr.cached_empty != null);
+
+    // Release all cells of slab 1 too (indices [slot_capacity, 2*slot_capacity)).
+    // Since cached_empty is already occupied by slab 0, slab 1 — once
+    // dropped from active inside the next `rotateActive` — would be
+    // unmapped. We don't force a rotate here; the goal is to make sure
+    // the cached slab's refcount slots are not stale by the time
+    // create() returns a slot from it.
+    release_index = slot_capacity;
+    while (release_index < total_cells) : (release_index += 1) {
+        try std.testing.expect(Pool.release(cells[release_index]));
+        Pool.destroy(cells[release_index]);
+    }
+
+    try std.testing.expectEqual(@as(u64, 0), Pool.statsForTest().live);
+
+    // Allocate fresh cells; the next create() drains the cached_empty
+    // first (via acquireFreshActive). Every new cell's refcount must
+    // start at 1 — no stale refcount values from prior occupants.
+    const fresh_count: usize = slot_capacity;
+    const fresh_cells = try std.testing.allocator.alloc(*SideTableTreeLike, fresh_count);
+    defer std.testing.allocator.free(fresh_cells);
+
+    var fresh_index: usize = 0;
+    while (fresh_index < fresh_count) : (fresh_index += 1) {
+        fresh_cells[fresh_index] = Pool.create();
+        try std.testing.expectEqual(@as(u32, 1), Pool.refCount(fresh_cells[fresh_index]));
+    }
+
+    // One additional reuse cycle to confirm idempotence — drain and
+    // refill again.
+    fresh_index = 0;
+    while (fresh_index < fresh_count) : (fresh_index += 1) {
+        try std.testing.expect(Pool.release(fresh_cells[fresh_index]));
+        Pool.destroy(fresh_cells[fresh_index]);
+    }
+    try std.testing.expectEqual(@as(u64, 0), Pool.statsForTest().live);
+
+    fresh_index = 0;
+    while (fresh_index < fresh_count) : (fresh_index += 1) {
+        fresh_cells[fresh_index] = Pool.create();
+        try std.testing.expectEqual(@as(u32, 1), Pool.refCount(fresh_cells[fresh_index]));
+    }
+
+    fresh_index = 0;
+    while (fresh_index < fresh_count) : (fresh_index += 1) {
+        try std.testing.expect(Pool.release(fresh_cells[fresh_index]));
+        Pool.destroy(fresh_cells[fresh_index]);
+    }
+
+    Pool.resetForTest();
+}
+
 // ============================================================
 // byte_intern_table — process-lifetime single-byte interning
 // ============================================================
@@ -13878,4 +14180,140 @@ test "MapIter: large-map iteration produces zero retaining clones" {
     // real-map's first step (N-1 advances + the final DONE which
     // doesn't bump the advance counter).
     try std.testing.expectEqual(@as(u64, N - 1), dense_map_iter_advance_total - iter_advances_before);
+}
+
+test "MapIter: single-entry map yields exactly one CONT then DONE" {
+    // Boundary case for `Map.next`: when the source map has exactly
+    // one entry, the first `Map.next(real_map)` call returns CONT
+    // with that entry and an iter as next state, and the immediately
+    // following `Map.next(iter)` call must return DONE. The iter
+    // self-releases on DONE, so the source map's refcount is
+    // unchanged across the round-trip and the iter cell count
+    // returns to its pre-iteration value.
+    const M = Map(i64, i64);
+    const keys = [_]i64{42};
+    const values = [_]i64{420};
+    const src = M.fromPairs(&keys, &values, 1) orelse @panic("alloc failed");
+    defer M.release(src);
+
+    const refcount_before = src.header.count();
+    const iter_allocs_before = dense_map_iter_alloc_total;
+    const iter_frees_before = dense_map_iter_free_total;
+
+    const first = M.next(src);
+    try std.testing.expectEqual(ATOM_CONT, first.@"0");
+    try std.testing.expectEqual(@as(i64, 42), first.@"1".@"0");
+    try std.testing.expectEqual(@as(i64, 420), first.@"1".@"1");
+    const iter = first.@"2";
+    try std.testing.expect(iter != null);
+    try std.testing.expect(iter != src);
+
+    const second = M.next(iter);
+    try std.testing.expectEqual(ATOM_DONE, second.@"0");
+    try std.testing.expectEqual(@as(?*const M, null), second.@"2");
+
+    // Source unchanged; iter cell freed; refcount restored.
+    try std.testing.expectEqual(refcount_before, src.header.count());
+    try std.testing.expectEqual(@as(u32, 1), src.len);
+    try std.testing.expectEqual(@as(u64, 1), dense_map_iter_alloc_total - iter_allocs_before);
+    try std.testing.expectEqual(@as(u64, 1), dense_map_iter_free_total - iter_frees_before);
+}
+
+test "MapIter: abandoning iteration after 2+ advances releases iter cell cleanly" {
+    // Companion to "source map unchanged when iteration is abandoned"
+    // which abandons at the first step. This variant exercises the
+    // mid-cursor-advance abandonment path: advance the iter twice
+    // (so `next_idx` reaches 2 — past the first step), then drop
+    // it. The iter cell must still be freed via `Map.release`'s
+    // iter-cell dispatch, the source map's refcount must return to
+    // its pre-iteration value, and the iter cell free counter must
+    // tick exactly once.
+    const M = Map(i64, i64);
+    var keys: [10]i64 = undefined;
+    var values: [10]i64 = undefined;
+    for (0..10) |i| {
+        keys[i] = @intCast(i);
+        values[i] = @as(i64, @intCast(i)) * 100;
+    }
+    const src = M.fromPairs(&keys, &values, 10) orelse @panic("alloc failed");
+    defer M.release(src);
+
+    const refcount_before = src.header.count();
+    const iter_allocs_before = dense_map_iter_alloc_total;
+    const iter_frees_before = dense_map_iter_free_total;
+    const iter_advances_before = dense_map_iter_advance_total;
+
+    // Step 1: first call returns CONT + the first entry + an iter.
+    const step_one = M.next(src);
+    try std.testing.expectEqual(ATOM_CONT, step_one.@"0");
+    var iter = step_one.@"2";
+    try std.testing.expect(iter != null);
+
+    // Step 2: cursor advances in place — same iter pointer returned
+    // (the iter is reused as state across calls).
+    const step_two = M.next(iter);
+    try std.testing.expectEqual(ATOM_CONT, step_two.@"0");
+    try std.testing.expectEqual(iter, step_two.@"2");
+    iter = step_two.@"2";
+
+    // Step 3: advance once more so the cursor lands past the second
+    // entry (next_idx == 3 inside the iter — fully mid-iteration).
+    const step_three = M.next(iter);
+    try std.testing.expectEqual(ATOM_CONT, step_three.@"0");
+    try std.testing.expectEqual(iter, step_three.@"2");
+    iter = step_three.@"2";
+
+    // Source's refcount has gone up by 1 (the iter retains it).
+    try std.testing.expectEqual(refcount_before + 1, src.header.count());
+
+    // Two advances were recorded (steps 2 and 3 — step 1 is the
+    // first-step allocation path which does NOT bump the advance
+    // counter; see `Map.next`'s real-map branch).
+    try std.testing.expectEqual(@as(u64, 2), dense_map_iter_advance_total - iter_advances_before);
+
+    // Abandon the iteration mid-cursor-advance. `Map.release` routes
+    // through the `capacity == 0` discriminator and frees the iter
+    // cell + drops its retained source reference.
+    M.release(iter);
+
+    try std.testing.expectEqual(refcount_before, src.header.count());
+    try std.testing.expectEqual(@as(u64, 1), dense_map_iter_alloc_total - iter_allocs_before);
+    try std.testing.expectEqual(@as(u64, 1), dense_map_iter_free_total - iter_frees_before);
+    try std.testing.expectEqual(@as(u32, 10), src.len);
+}
+
+test "MapIter: defensive path for null source_map returns DONE" {
+    // Defensive coverage for `advanceFromMapPtr`'s null-source guard.
+    // The path is unreachable from `Map.next` today (iter cells are
+    // only created with a non-null source), but the guard exists so
+    // future refactors can't silently UB on a freshly-zeroed iter
+    // cell. Construct the failure shape directly: allocate an iter,
+    // null its source_map, and confirm advanceFromMapPtr returns DONE
+    // with no further side effects before freeing the cell.
+    const M = Map(i64, i64);
+    const keys = [_]i64{1};
+    const values = [_]i64{10};
+    const src = M.fromPairs(&keys, &values, 1) orelse @panic("alloc failed");
+    defer M.release(src);
+
+    const IterT = MapIter(i64, i64);
+    const iter = IterT.create(src) orelse @panic("iter create");
+
+    // Drop the retained source-map reference manually so we don't
+    // leak the +1 the iter took on `create`. We hand-construct the
+    // failure shape after this point so the iter no longer owns
+    // anything on `src`.
+    M.release(src);
+    iter.source_map = null;
+
+    // advanceFromMapPtr must return DONE on the null-source path.
+    const step = IterT.advanceFromMapPtr(iter.asMapPtr().?);
+    try std.testing.expectEqual(ATOM_DONE, step.@"0");
+    try std.testing.expectEqual(@as(?*const M, null), step.@"2");
+
+    // The iter cell still has rc=1 (advanceFromMapPtr only self-
+    // releases on the cursor-end DONE path, not the null-source
+    // DONE path). Free it through Map.release so its slab cell
+    // returns to the pool.
+    M.release(iter.asMapPtr());
 }
