@@ -2207,6 +2207,30 @@ fn runArcOwnershipAndVerify(
         const function: *ir.Function = @constCast(&program.functions[i]);
         zap.arc_ownership.rewriteOwnedConsumeSites(alloc, function, program) catch return error.OutOfMemory;
     }
+    // Phase 7: eliminate redundant retain/release atomic round-trips
+    // for the canonical "borrowed pass-through" shape — a
+    // `share_value` + `retain` + call (.borrowed slot) + `release`
+    // sequence whose source local is itself `.borrowed` or `.owned`.
+    // The pair brackets +1/-1 around the call but produces no
+    // observable refcount change because something at higher scope
+    // (the caller-of-our-caller for .borrowed sources, or our own
+    // scope-exit drop for .owned sources) already keeps the cell
+    // alive. Replacing the four-instruction sequence with a single
+    // `borrow_value` strips two atomic ops per call without changing
+    // semantics — the dominant wall-time cost on tight recursive
+    // numeric loops like spectral-norm's `dot_a_row` /
+    // `dot_at_row` and fannkuch's `count_flips` / `shift_left`.
+    //
+    // Must run AFTER `rewriteOwnedConsumeSites` so the only
+    // remaining `share_value` instructions are on `.borrowed` slots
+    // (consume sites are already rewritten to `move_value`). Must
+    // run BEFORE `arc_drop_insertion` so it sees the post-rewrite
+    // `local_ownership` and skips scope-exit releases for the now-
+    // borrowed aliases.
+    for (program.functions, 0..) |_, i| {
+        const function: *ir.Function = @constCast(&program.functions[i]);
+        zap.arc_ownership.elideBorrowedPassThroughShares(alloc, function, program) catch return error.OutOfMemory;
+    }
     // Phase H/uniqueness (codegen): for each owned-mutating call site whose
     // uniqueness static-uniqueness predicate holds, swap the callee name to
     // its `*_owned_unchecked` peer. This is a strict refinement of
