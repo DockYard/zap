@@ -2,7 +2,7 @@
 
 **Status:** Normative. Final for v1.0. Any incompatible change requires an ABI major bump (v2.0).
 
-**Audience:** Third-party authors of Zap memory managers, contributors to the Zap compiler and runtime, and authors of the first-party `Zap.ARC` and `Zap.Arena` managers.
+**Audience:** Third-party authors of Zap memory managers, contributors to the Zap compiler and runtime, and authors of the first-party `Zap.Memory.ARC` and `Zap.Memory.Arena` managers.
 
 **Scope:** This document specifies the binary interface, build-time discovery protocol, and semantic contract that every Zap memory manager — first-party or third-party — must implement. The specification is normative: ambiguity in this document is a defect of this document, not a license for implementer choice.
 
@@ -15,17 +15,17 @@ A Zap memory manager is a Zig package that supplies the runtime allocation, deal
 ```
 %Zap.Manifest{
   name: "my_app",
-  memory: Zap.ARC,    # or Zap.Arena, or any third-party Zap struct
+  memory: Zap.Memory.ARC,    # or Zap.Memory.Arena, or any third-party Zap struct
   ...
 }
 ```
 
-The compiler treats first-party (`Zap.ARC`, `Zap.Arena`) and third-party managers identically. There is no hardcoded knowledge of any specific manager in the Zig compiler sources. Manager resolution is fully data-driven via the `@memory_manager_source` attribute on the Zap struct.
+The compiler treats first-party (`Zap.Memory.ARC`, `Zap.Memory.Arena`) and third-party managers identically. There is no hardcoded knowledge of any specific manager in the Zig compiler sources. Manager resolution is fully data-driven via the `@memory_manager_source` attribute on the Zap struct.
 
 ### 1.1 The build pipeline at a glance
 
 ```
-Zap.Manifest.memory: Zap.ARC
+Zap.Manifest.memory: Zap.Memory.ARC
         |
         v
 Resolve struct -> @memory_manager_source attribute
@@ -37,7 +37,8 @@ Generic Zig-fork primitive: compile <manager>.zig to <manager>.o
 Parse .zapmem section from <manager>.o (ELF/Mach-O/COFF)
         |
         v
-Validate ZapMemoryManagerMetaV1 (magic, abi_major, caps consistency)
+Validate ZapMemoryManagerMetaV1 + embedded ZapMemoryManagerCoreV1
+  (magic, abi_major, caps consistency, core vtable offset)
         |
         v
 Thread declared_caps into HIR type elaboration
@@ -53,16 +54,16 @@ Link <manager>.o into final Zap binary
 
 ### 1.2 First-party manager locations
 
-| Manager       | Zap struct        | Zap source                         | Zig source                                  |
-|---------------|-------------------|------------------------------------|---------------------------------------------|
-| `Zap.ARC`     | `Zap.ARC`         | `lib/zap/memory/arc.zap`           | `src/runtime/memory/arc/manager.zig`        |
-| `Zap.Arena`   | `Zap.Arena`       | `lib/zap/memory/arena.zap`         | `src/runtime/memory/arena/manager.zig`      |
+| Manager              | Zap struct           | Zap source                         | Zig source                                  |
+|----------------------|----------------------|------------------------------------|---------------------------------------------|
+| `Zap.Memory.ARC`     | `Zap.Memory.ARC`     | `lib/zap/memory/arc.zap`           | `src/runtime/memory/arc/manager.zig`        |
+| `Zap.Memory.Arena`   | `Zap.Memory.Arena`   | `lib/zap/memory/arena.zap`         | `src/runtime/memory/arena/manager.zig`      |
 
-Third-party managers may live anywhere on the filesystem; the `@memory_manager_source` attribute carries the path.
+Third-party managers may live anywhere on the filesystem; the `@memory_manager_source` attribute carries the path. Architectural conventions for a production manager (slab pooling, size-class buckets, atomic per-cell headers) are out of scope for this specification; the goal here is the wire contract, not implementation guidance.
 
 ### 1.3 What this ABI does NOT cover
 
-- **Per-process manager selection.** v1 ships a single manager per binary. The future BEAM-style `Process.spawn(memory: Zap.Arena)` model is reserved for v2.
+- **Per-process manager selection.** v1 ships a single manager per binary. The future BEAM-style `Process.spawn(memory: Zap.Memory.Arena)` model is reserved for v2.
 - **Cross-manager object sharing.** Forbidden in v1 (see section 13).
 - **Tracing garbage collection.** Reserved (see section 9); no v1 manager may implement it.
 - **Region-based memory management.** Reserved; no v1 manager may implement it.
@@ -81,7 +82,23 @@ The ABI is identified by an `(abi_major, abi_minor)` pair, both `u16`.
 
 ### 2.2 Capability versioning
 
-Each capability has its own independent version (a `u16` in the capability descriptor). The core ABI and a capability evolve separately. A v1.0 manager may implement `REFCOUNT_V2` if and only if the running compiler supports `REFCOUNT_V2`; otherwise the descriptor is ignored. Capability version comparison is exact: a compiler that expects `REFCOUNT_V1` does not accept `REFCOUNT_V2` (the compiler must call `get_capability_desc` with a specific `(id, version)` expectation in future ABIs; in v1 the version is implicit at `1`).
+Each capability has its own independent version (a `u16` in the capability descriptor). The core ABI and a capability evolve separately.
+
+A manager may embed multiple descriptors for the same capability ID at different versions. A v1.x compiler iterates the descriptors, selects the highest version it understands (v1.0 understands only `version = 1` for each capability), and uses that descriptor's vtable. The selection algorithm:
+
+1. Scan all descriptors (embedded + any obtained via `get_capability_desc`) for the requested capability ID.
+2. Discard any whose `version` exceeds the compiler's maximum supported version for that capability.
+3. From the remainder, select the descriptor with the highest `version`.
+4. If the remainder is empty but the capability bit is set in `declared_caps`, the manager is rejected at build time.
+
+A manager that embeds only a higher-version descriptor for a capability declared in `declared_caps` is rejected at build time by an older compiler with a clear error:
+
+```
+zap: manager declares <CAPABILITY> at version <N>; this compiler supports only versions up to <M>;
+     rebuild manager with version <M> support or upgrade the compiler
+```
+
+Future versions of a capability are introduced by adding a new descriptor with the new version, while keeping the older version in the descriptor list. The manager picks which versions to support; the compiler picks the highest mutually-understood version.
 
 ### 2.3 The `size` field convention
 
@@ -97,7 +114,15 @@ This is the same forward-compatibility discipline used by Vulkan's `sType`/`pNex
 
 ## 3. The `.zapmem` metadata section
 
-Every memory manager package emits a fixed-size metadata blob into a dedicated, named object-file section. The Zap compiler parses this section at build time using the Zig standard library's object-format readers (`std.elf`, `std.macho`, `std.coff`). No subprocess (`nm`, `objdump`) is required and no symbol-name encoding tricks are used.
+Every memory manager package emits a single contiguous metadata blob into a dedicated, named object-file section. The blob contains:
+
+1. A `ZapMemoryManagerMetaV1` header (32 bytes in v1.0).
+2. A `ZapMemoryManagerCoreV1` core vtable (56 bytes in v1.0 on a 64-bit target).
+3. Zero or more `ZapCapabilityDescV1` embedded descriptors (24 bytes each).
+
+The Zap compiler parses this section at build time using the Zig standard library's object-format readers (`std.elf`, `std.macho`, `std.coff`). The compiler discovers every required artifact by **section content**: the only symbol the manager must export at the linker level is the section itself. Symbol names within the section are advisory.
+
+No subprocess (`nm`, `objdump`) is required and no symbol-name encoding tricks are used.
 
 ### 3.1 Section name by object format
 
@@ -111,9 +136,20 @@ The compiler determines the target object format from the manager's compiled obj
 
 ### 3.2 Emission
 
-The manager package emits a single `ZapMemoryManagerMetaV1` value as an exported, statically-initialized, C-ABI-compatible constant placed in `.zapmem` via Zig's `linksection` attribute. The constant must have external linkage (the `export` keyword in Zig) so that the linker does not dead-strip it. The recommended name is `zap_memory_manager_meta`, but the compiler does not rely on the symbol name — it discovers the data purely by section content.
+The manager package places the meta header, the core vtable, and any embedded descriptors into the `.zapmem` section using Zig's `linksection` attribute. The three artifacts are placed in fixed order:
 
-A manager package emits exactly one `ZapMemoryManagerMetaV1` into the `.zapmem` section. Emitting zero or more than one is a manager defect; the compiler rejects such managers with a build-time error.
+```
+.zapmem layout:
+    [ ZapMemoryManagerMetaV1                  ] @ section offset 0
+    [ ZapMemoryManagerCoreV1                  ] @ section offset = meta.core_vtable_offset
+    [ ZapCapabilityDescV1 * meta.desc_count   ] @ section offset = meta.core_vtable_offset + core.size
+```
+
+The header's `core_vtable_offset` field gives the byte offset (from the start of the section) at which the core vtable lives. In the canonical v1.0 layout `meta.core_vtable_offset == @sizeOf(ZapMemoryManagerMetaV1) == 32`. Embedded descriptors, if any, follow the core vtable.
+
+Each underlying constant must have external linkage (the `export` keyword in Zig) so that the linker does not dead-strip it. Recommended symbol names are `zap_memory_manager_meta` and `zap_memory_manager_core`, but the compiler does NOT rely on these names — it discovers all data purely by walking the section's contents starting at offset 0.
+
+A manager package emits exactly one `ZapMemoryManagerMetaV1` and exactly one `ZapMemoryManagerCoreV1` into the `.zapmem` section. Emitting zero or more than one of either is a manager defect; the compiler rejects such managers with a build-time error.
 
 ### 3.3 Discovery
 
@@ -122,8 +158,12 @@ The Zap compiler, after compiling the manager's Zig source to an object file, pe
 1. Open the object file. Detect the object format from its magic bytes (`\x7fELF` for ELF, `0xFEEDFACE`/`0xFEEDFACF`/`0xCAFEBABE` for Mach-O, `MZ` for PE/COFF).
 2. Locate the named section as listed in 3.1. Absence of the section is a build-time error.
 3. Verify the section is at least `sizeof(ZapMemoryManagerMetaV1)` (32 bytes for v1.0; see appendix B). Smaller is a build-time error.
-4. Read the first `sizeof(ZapMemoryManagerMetaV1)` bytes from the section as a `ZapMemoryManagerMetaV1` value (host endianness — the section is compiled for the same target as the final binary).
-5. Validate the value per 3.5.
+4. Read the first `sizeof(ZapMemoryManagerMetaV1)` bytes from the section as a `ZapMemoryManagerMetaV1` value (target endianness — the section is compiled for the same target as the final binary).
+5. Validate the meta header per 3.5.
+6. Read `sizeof(ZapMemoryManagerCoreV1)` bytes starting at `meta.core_vtable_offset` (relative to the start of the section) as a `ZapMemoryManagerCoreV1` value.
+7. Validate the core vtable per 3.5.
+8. If `meta.desc_count > 0`, read `desc_count` consecutive `ZapCapabilityDescV1` entries starting at `meta.core_vtable_offset + core.size`.
+9. Validate each descriptor per 3.5.
 
 ### 3.4 Endianness
 
@@ -133,19 +173,27 @@ All multi-byte integers in the `.zapmem` section and all ABI structures are stor
 
 The Zap compiler rejects the manager with a clear build-time error if any of the following is true:
 
-- `magic` does not equal the target-endianness-correct form of `'ZMEM'`.
-- `abi_major` does not equal the compiler's known ABI major (`1` for this spec).
-- `abi_minor` exceeds the compiler's known ABI minor *and* `size` does not include enough trailing zero-extension to make the missing-bytes interpretation safe. (In practice: the compiler accepts any `abi_minor` as long as it can read at least the prefix it understands.)
-- `size < 32` (the v1.0 base size; the compiler refuses partial structures).
-- `desc_count > 0` and the section is smaller than `size + desc_count * sizeof(ZapCapabilityDescV1)`.
-- `declared_caps` references a reserved-but-unimplemented capability bit (e.g., `GCOL` in v1.0). Reserved bits are reserved precisely because no v1 manager may declare them.
-- `reserved` is non-zero.
+- `meta.magic` does not equal the target-endianness-correct form of `'ZMEM'`.
+- `meta.abi_major` does not equal the compiler's known ABI major (`1` for this spec).
+- `meta.abi_minor` exceeds the compiler's known ABI minor *and* `meta.size` does not include enough trailing zero-extension to make the missing-bytes interpretation safe. (In practice: the compiler accepts any `abi_minor` as long as it can read at least the prefix it understands.)
+- `meta.size < 32` (the v1.0 base size for the meta header; the compiler refuses partial structures).
+- `meta.core_vtable_offset < meta.size` (the core vtable must follow the header without overlapping it).
+- `meta.core_vtable_offset + sizeof(ZapMemoryManagerCoreV1)` exceeds the section size.
+- `core.abi_major != meta.abi_major` or `core.abi_minor != meta.abi_minor` (header and core vtable must agree on version).
+- `core.declared_caps != meta.declared_caps` (header and core vtable must agree on the capability bitmask).
+- `core.size < 56` (the v1.0 base size for the core vtable on a 64-bit target).
+- `meta.desc_count > 0` and the section is smaller than `meta.core_vtable_offset + core.size + meta.desc_count * sizeof(ZapCapabilityDescV1)`.
+- A bit set in `meta.declared_caps` corresponds to a reserved-but-unimplemented capability (e.g., `GCOL` in v1.0). Reserved bits are reserved precisely because no v1 manager may declare them.
+- `meta.desc_count > 0` and any embedded descriptor's `id` does not correspond to a bit set in `meta.declared_caps`. Embedding a descriptor for an undeclared capability is rejected: `zap: manager embeds descriptor for capability <TAG> but does not declare it in declared_caps`.
+- `meta.reserved` is non-zero.
+
+A v1.x compiler may encounter bits set in `meta.declared_caps` that are unknown to it (added in a later v1.y minor). Such unknown bits are silently ignored — they have no effect on HIR or codegen. The manager must still implement the corresponding capability for the bits to be useful; bits the compiler does not recognize simply produce no compiler-side hooks. This is forward-compatible only for additive capabilities. A capability requiring new compiler-side codegen (write barriers, region setup) cannot be exercised by an older compiler; managers must omit the bit when targeting compilers that do not support the capability.
 
 ### 3.6 The metadata structure
 
 ```zig
-/// The .zapmem section header. Exactly one of these per manager package.
-/// All fields in target native byte order.
+/// The .zapmem section header. Exactly one of these per manager package,
+/// placed at section offset 0. All fields in target native byte order.
 pub const ZapMemoryManagerMetaV1 = extern struct {
     /// FourCC 'ZMEM' (Z=0x5A, M=0x4D, E=0x45, M=0x4D).
     /// Little-endian targets see 0x4D454D5A.
@@ -163,21 +211,31 @@ pub const ZapMemoryManagerMetaV1 = extern struct {
     /// this is exactly 32; for v1.x with x > 0 it may be larger.
     size: u16,
 
-    /// Optional sanity-check marker for the source object format.
-    /// 0 = unspecified; 1 = ELF; 2 = Mach-O; 3 = COFF.
-    /// The compiler is not required to enforce this; it is a debug aid.
-    object_fmt: u16,
+    /// Reserved. Must be 0 in v1.x. (Was `object_fmt` in pre-release
+    /// drafts; the section format is implicit in the object format,
+    /// so this field is unused.)
+    _reserved2: u16,
+
+    /// Number of ZapCapabilityDescV1 entries embedded in the section
+    /// after the core vtable. If 0, descriptors are discovered
+    /// exclusively at runtime via core.get_capability_desc. Embedding
+    /// is recommended (see section 5.4).
+    desc_count: u32,
 
     /// Bitmask of capability IDs this manager implements. See section 7
     /// for the canonical tag -> bit position mapping.
     declared_caps: u64,
 
-    /// Number of ZapCapabilityDescV1 entries embedded immediately after
-    /// this struct in the .zapmem section. If 0, descriptors are
-    /// discovered exclusively at runtime via core.get_capability_desc.
-    /// Embedding is recommended (faster validation, avoids the runtime
-    /// load round-trip during compiler queries).
-    desc_count: u32,
+    /// Byte offset (from the start of the .zapmem section) at which
+    /// the ZapMemoryManagerCoreV1 struct lives. The compiler reads
+    /// the core vtable from this offset; it does not rely on any
+    /// symbol name.
+    ///
+    /// In a canonical v1.0 layout this is exactly `@sizeOf(meta)` = 32.
+    /// The field is explicit (rather than implicit) so that future
+    /// minor versions may extend the meta header without breaking the
+    /// core vtable lookup.
+    core_vtable_offset: u32,
 
     /// Reserved. Must be 0 in v1.x.
     reserved: u32,
@@ -191,13 +249,15 @@ comptime {
 }
 ```
 
-Embedded descriptors, if present, immediately follow the `ZapMemoryManagerMetaV1` value in the `.zapmem` section, each laid out as `ZapCapabilityDescV1` (section 6).
+The core vtable (section 4) immediately follows the meta header in the canonical v1.0 layout. Embedded descriptors, if present, follow the core vtable.
 
 ---
 
 ## 4. The core vtable: `ZapMemoryManagerCoreV1`
 
-The core vtable is the always-present, mandatory interface for every manager. It is reachable via the manager's exported `zap_memory_manager_core` symbol, which is a `*const ZapMemoryManagerCoreV1`.
+The core vtable is the always-present, mandatory interface for every manager. It lives inside the `.zapmem` section at the byte offset given by `meta.core_vtable_offset` (typically immediately after the meta header). The runtime locates it purely by section content; the recommended exported symbol name `zap_memory_manager_core` is advisory and not part of the discovery contract.
+
+### 4.1 Init options
 
 ```zig
 /// Initialization options passed to the manager's init function.
@@ -211,8 +271,15 @@ pub const ZapInitOptions = extern struct {
     /// Reserved. Must be 0 in v1.x.
     reserved: u32,
 };
+```
 
-/// The mandatory core vtable. Every manager exports exactly one of these.
+**Cross-version `ZapInitOptions` discipline.** If the compiler/runtime is newer than the manager, the runtime may pass options with `size > sizeof(v1.0-options)`. The manager uses `options.size` to detect and ignore trailing fields. If the manager is newer than the compiler, the runtime passes `null` (or a smaller-than-current-manager options); the manager checks `options == null || options.size < sizeof(<known options>)` and proceeds with defaults.
+
+### 4.2 The vtable
+
+```zig
+/// The mandatory core vtable. Every manager emits exactly one of these
+/// into the .zapmem section at offset meta.core_vtable_offset.
 pub const ZapMemoryManagerCoreV1 = extern struct {
     /// ABI major version this vtable conforms to. Must equal the value
     /// in the .zapmem metadata.
@@ -224,7 +291,7 @@ pub const ZapMemoryManagerCoreV1 = extern struct {
 
     /// Size in bytes of this struct as the manager understood it at
     /// build time. For v1.0 this is the value of @sizeOf(ZapMemoryManagerCoreV1)
-    /// computed against this exact definition.
+    /// computed against this exact definition (56 on a 64-bit target).
     size: u32,
 
     /// Bitmask of capability IDs. Must equal the value in the .zapmem
@@ -232,32 +299,68 @@ pub const ZapMemoryManagerCoreV1 = extern struct {
     declared_caps: u64,
 
     /// Initialize the manager. Called exactly once, before any other
-    /// function on the manager is called and before user-code main runs.
-    /// Returns an opaque context pointer that is threaded through all
-    /// subsequent calls. Returning null indicates initialization failure;
-    /// the runtime aborts with a diagnostic.
+    /// vtable function on the manager is called and before user-code
+    /// main runs.
     ///
-    /// Thread-safety: called exactly once, on the main thread, before
-    /// any user thread exists. No synchronization required.
+    /// Returns an opaque context pointer that is threaded through all
+    /// subsequent calls. Returning null indicates initialization
+    /// failure; the runtime aborts with the diagnostic
+    /// `zap: manager <name> failed to initialize` before user code runs.
+    ///
+    /// Managers with no per-process state must still return a non-null
+    /// pointer; the conventional pattern is to return the address of
+    /// an empty static struct. The runtime treats any non-null value
+    /// as success and any null value as init failure.
+    ///
+    /// The manager MAY call its own `allocate` from within `init` to
+    /// build internal data structures. Allocations made during init
+    /// will be matched by `deallocate` calls made during deinit (or
+    /// freed wholesale by the manager during deinit, at its discretion).
+    ///
+    /// Thread-safety: called on the thread that invokes the Zap
+    /// runtime startup. The runtime guarantees that during init, no
+    /// other thread will call any function on this manager. Managers
+    /// may assume single-threaded access to themselves during this
+    /// phase.
     init: *const fn (options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque,
 
-    /// Deinitialize the manager. Called exactly once, after user-code
-    /// main returns (or the program aborts), and after all other user
-    /// threads have joined. The manager must release all owned
-    /// resources; the runtime makes no further calls afterward.
+    /// Deinitialize the manager. See section 4.4 for the full
+    /// lifecycle and termination-path specification.
     ///
-    /// Thread-safety: called exactly once, on the main thread.
+    /// During `deinit`, the manager:
+    ///   - MAY use any allocator NOT routed through its own
+    ///     `core.allocate` (e.g., `std.heap.page_allocator` for scratch).
+    ///   - MUST NOT call its own `core.allocate`, `core.retain`,
+    ///     `core.release`, or `core.deallocate`. After `deinit` begins,
+    ///     the runtime no longer routes user-level allocations through
+    ///     this manager.
+    ///   - MUST NOT return failure. If internal cleanup fails (e.g.,
+    ///     scratch allocation fails for a diagnostic report), the
+    ///     manager logs to stderr and returns normally.
+    ///   - MAY take arbitrary time to complete. The runtime does not
+    ///     enforce a timeout.
+    ///
+    /// Thread-safety: called on the same thread that called init. The
+    /// runtime guarantees that during deinit, no other thread will
+    /// call any function on this manager.
     deinit: *const fn (ctx: *anyopaque) callconv(.c) void,
 
     /// Allocate `size` bytes with at least `alignment` byte alignment.
     /// `alignment` is always a power of two and at least
     /// `@alignOf(usize)`. On success returns a non-null pointer to at
-    /// least `size` writable bytes. On failure returns null; the
-    /// runtime treats null as a fatal out-of-memory condition.
+    /// least `size` writable bytes. On failure returns null; see
+    /// section 4.3.1 for the out-of-memory protocol.
     ///
     /// The manager may return memory whose first usable address is
-    /// already aligned; it must not return memory whose alignment is
-    /// less than requested.
+    /// already over-aligned; it must not return memory whose alignment
+    /// is less than requested.
+    ///
+    /// There is no spec-imposed maximum allocation size. A manager
+    /// that cannot fulfill a request of any size returns null.
+    ///
+    /// `allocate` may be called from `init` (for the manager's own
+    /// internal setup) and is otherwise called only during program
+    /// execution. `allocate` is never called during or after `deinit`.
     ///
     /// Thread-safety: may be called concurrently from any thread. The
     /// manager is responsible for any required synchronization.
@@ -267,16 +370,32 @@ pub const ZapMemoryManagerCoreV1 = extern struct {
         alignment: u32,
     ) callconv(.c) ?[*]u8,
 
-    /// Deallocate a previously allocated block. `ptr`, `size`, and
-    /// `alignment` must exactly match the values from the call to
-    /// `allocate` that produced this pointer (the runtime stores them
-    /// alongside every allocation for managers that need them; managers
-    /// that don't need them may ignore `size` and `alignment`).
+    /// Deallocate a previously allocated block. See section 4.5 for
+    /// the allocation lifecycle pairing rules — in particular, this
+    /// function is NEVER called for refcounted cells, only for raw
+    /// allocations.
+    ///
+    /// The runtime guarantees:
+    ///   - `ptr` is bit-identical to the value `allocate` returned
+    ///     for this allocation.
+    ///   - `size` equals the value passed to `allocate`. The compiler
+    ///     tracks size alongside the allocation; managers that need
+    ///     it may rely on it.
+    ///   - `alignment` equals the value passed to `allocate`.
+    ///   - `deallocate` is never called more than once per allocation.
+    ///   - `deallocate` is never called with a pointer that was
+    ///     returned to a `release`-and-free cycle.
+    ///
+    /// Manager-internal data layout (whether to prepend a header to
+    /// the returned pointer, whether to bucket allocations by size)
+    /// is at the manager's discretion. If the manager prepends a
+    /// header, it owns the offset arithmetic in `allocate` and
+    /// `deallocate`.
     ///
     /// A manager that performs no individual deallocation (e.g., a
     /// pure arena) provides a no-op implementation; the runtime still
-    /// calls it for every block to permit accounting in diagnostic
-    /// wrappers.
+    /// calls it for every raw block to permit accounting in
+    /// diagnostic wrappers.
     ///
     /// Thread-safety: may be called concurrently from any thread.
     deallocate: *const fn (
@@ -286,14 +405,23 @@ pub const ZapMemoryManagerCoreV1 = extern struct {
         alignment: u32,
     ) callconv(.c) void,
 
-    /// Look up the descriptor for a specific capability. Returns null
-    /// if the capability is not implemented by this manager. The
-    /// returned pointer is valid for the lifetime of the manager
-    /// context and is read-only.
+    /// Look up the descriptor for a specific capability. The compiler
+    /// queries capabilities only by canonical IDs from Appendix A.
+    /// Managers must respond:
     ///
-    /// The runtime may call this at any time after init returns and
-    /// before deinit is called. Result pointers are stable and may
-    /// be cached.
+    ///   - For an ID in `declared_caps`: return a valid descriptor.
+    ///   - For an ID NOT in `declared_caps`: return `null`.
+    ///   - For `id = 0` or any non-canonical ID: return `null`.
+    ///
+    /// The v1.x FourCC namespace is closed to the canonical table in
+    /// Appendix A. Vendor-private extensions must use a future
+    /// capability ID assigned in a later ABI version. In v1.x,
+    /// managers must not invent new tag IDs.
+    ///
+    /// The returned pointer is valid for the lifetime of the manager
+    /// context and is read-only. The runtime may call this at any
+    /// time after init returns and before deinit is called. Result
+    /// pointers are stable and may be cached.
     ///
     /// Thread-safety: may be called concurrently from any thread. The
     /// returned descriptor and its vtable must be safe for concurrent
@@ -316,23 +444,65 @@ comptime {
 }
 ```
 
-### 4.1 Lifecycle
+### 4.3 Build-time vs. runtime split
 
-1. **Process start.** The Zap runtime invokes `core.init(null)` (or with init options for runtime-configurable managers; v1.0 always passes null). The runtime captures the returned context pointer.
-2. **User code runs.** All allocations and deallocations from compiler-generated code, stdlib, and user code flow through `core.allocate` / `core.deallocate`. Capability vtables (e.g., `REFCOUNT_V1.retain` / `REFCOUNT_V1.release`) are called for capability-mediated operations.
-3. **User code exits.** The runtime invokes `core.deinit(ctx)`. The manager releases all owned resources. After `deinit` returns, the runtime does not call any function on this manager again.
+`init`, `deinit`, `allocate`, `deallocate`, `retain`, `release`, and `get_capability_desc` are runtime functions. The Zap compiler reads only the `.zapmem` metadata section at build time (the meta header, the embedded `ZapMemoryManagerCoreV1` struct, and any embedded `ZapCapabilityDescV1` entries). The compiler invokes no function pointers at build time; it only reads static data. A manager wishing to influence build-time behavior must do so via fields in the static `ZapMemoryManagerMetaV1` and `ZapMemoryManagerCoreV1` constants.
 
-### 4.2 Thread safety
+#### 4.3.1 Out-of-memory protocol
 
-All managers shipped with v1.0 must be thread-safe — that is, `allocate`, `deallocate`, and `get_capability_desc` may be called concurrently from any thread. `init` and `deinit` are called exactly once each on the main thread, so they need not be reentrant.
+When a manager cannot satisfy an `allocate` request:
 
-Zig 0.16's `std.heap.ArenaAllocator` is lock-free; `Zap.Arena` may use it directly without additional synchronization.
+1. Return `null`. Do not print, do not abort, do not exit.
+2. The runtime detects the null return and aborts with a diagnostic of the form:
+   ```
+   zap: out of memory: requested <size> bytes (alignment <alignment>) from manager <manager_name>; aborting
+   ```
+   The `<manager_name>` is read from the manager's stdlib struct path (e.g., `Zap.Memory.ARC`).
+3. Managers must not call `std.process.abort`, `std.process.exit`, or perform IO during the allocation path. The runtime owns the OOM diagnostic.
+4. Behavior on allocation success but partial fill (e.g., backing-store partial failure) is undefined; managers must either fully succeed or return null.
 
-### 4.3 Failure semantics
+v1 managers may not retry, swap heaps, or otherwise recover from OOM. Future ABI minor versions may add a `try_allocate` variant; v1.0 has only the abort-on-failure path.
 
-A null return from `allocate` is fatal: the runtime aborts with a diagnostic. v1 managers may not retry, swap heaps, or otherwise recover. Future ABI minor versions may add a `try_allocate` variant; v1.0 has only the abort-on-failure path.
+A null return from `init` is fatal: the runtime aborts before user code runs with the diagnostic `zap: manager <name> failed to initialize`.
 
-A null return from `init` is fatal: the runtime aborts before user code runs.
+### 4.4 Deinit lifecycle and termination paths
+
+`deinit` runs on the following termination paths:
+
+1. **Normal main return.** `deinit` is called on the main thread after user code returns and after the runtime has joined all user-spawned threads.
+2. **`std.process.exit(N)` / `@panic` / unhandled error / `abort()`.** `deinit` is NOT called. The OS reclaims memory; the manager is not given a chance to clean up.
+3. **External signal (SIGTERM / SIGKILL / SIGINT default).** `deinit` is NOT called.
+
+Managers must not rely on `deinit` running. Critical cleanup (file syncs, network flushes) must be performed by user code before `main` returns. `deinit` is an optimization for clean diagnostic reporting and resource teardown, not a guaranteed hook.
+
+After `deinit` returns, the runtime does not call any function on this manager again, on any path.
+
+### 4.5 Allocation lifecycle pairing
+
+Every successful `allocate` call has exactly one matching call later. The matching call depends on whether the cell is *refcounted* or *raw*.
+
+**Raw allocations** — cells whose type has no inline refcount header, transient scratch buffers, runtime-internal scratch. These are matched by `core.deallocate(ctx, ptr, size, alignment)`. The runtime tracks size and alignment alongside the allocation; managers that do not need them may ignore them.
+
+**Refcounted allocations** — cells whose type carries an inline refcount header under a manager that declares `REFCOUNT_V1`. These are matched by `refcount.release` reaching count zero. The manager's `release` implementation is responsible for the entire freeing path: invoking `deep_walk` (if non-null) and then returning the cell's storage to its underlying allocator. The runtime will NEVER call `core.deallocate` on a refcounted cell. A manager wishing to route refcounted cell frees through its own `core.deallocate` may do so internally as a private implementation detail; this is an implementation choice with no spec implications.
+
+The Zap compiler decides per-type at HIR elaboration whether each allocation is refcounted (i.e., whether the type carries an `ArcHeader` field). The choice depends on whether the active manager declares `REFCOUNT_V1`. Under a manager that declares no `REFCOUNT_V1`, all allocations are raw and matched by `core.deallocate`.
+
+A manager that declares `REFCOUNT_V1` will see two distinct allocation populations at runtime: refcounted cells (matched by `release`) and raw allocations (matched by `deallocate`). The manager must support both. A manager may distinguish between them by its own bookkeeping (e.g., size class, presence of a per-cell header it owns); the runtime does not tag pointers.
+
+### 4.6 Lifecycle summary
+
+1. **Process start.** The Zap runtime invokes `core.init(null)` (or with init options for runtime-configurable managers; v1.0 always passes null). The runtime captures the returned context pointer and stores it in the global `zap_memory_manager_context` (see section 10.2).
+2. **User code runs.** All raw allocations and deallocations from compiler-generated code, stdlib, and user code flow through `core.allocate` / `core.deallocate`. Refcounted cells flow through `core.allocate` for creation and `REFCOUNT_V1.retain` / `REFCOUNT_V1.release` for lifecycle, with `release` owning the free path when the count reaches zero.
+3. **User code exits cleanly.** The runtime invokes `core.deinit(ctx)`. The manager releases all owned resources. After `deinit` returns, the runtime does not call any function on this manager again.
+4. **Process aborts.** `deinit` does not run. See 4.4.
+
+### 4.7 Thread safety
+
+All managers shipped with v1.0 must be thread-safe — that is, `allocate`, `deallocate`, `get_capability_desc`, and capability vtable functions may be called concurrently from any thread.
+
+`init` is called on the thread that invokes the Zap runtime startup. `deinit` is called on the same thread at shutdown. The runtime guarantees that during init and deinit, no other thread will call any function on this manager. Managers may assume single-threaded access to themselves during these phases.
+
+Zig 0.16's `std.heap.ArenaAllocator` is not lock-free, so `Zap.Memory.Arena` wraps it with a mutex when called from the multi-threaded allocator path; managers built on lock-free pools may avoid the extra synchronization.
 
 ---
 
@@ -354,17 +524,23 @@ pub const ZapCapabilityDescV1 = extern struct {
     /// ZapRefcountCapabilityV2, etc.
     version: u16,
 
-    /// Size in bytes of the vtable pointed at by `vtable`. Permits
-    /// non-breaking forward extension within a capability minor
-    /// version. The compiler may refuse to load a manager whose
-    /// descriptor `size` is smaller than the v1.0 baseline of the
-    /// capability.
+    /// Size in bytes of the *vtable* pointed at by `vtable`, NOT the
+    /// size of this descriptor. The descriptor itself is fixed at 24
+    /// bytes for v1.x; growing the descriptor requires an abi_major
+    /// bump.
+    ///
+    /// The `size` field enables forward-extension within a capability:
+    /// `ZapRefcountCapabilityV2` may add fields after the v1 layout;
+    /// a v1.0 compiler reads only the first `sizeof(ZapRefcountCapabilityV1)`
+    /// bytes and ignores any tail.
     size: u16,
 
-    /// Capability-specific flags. The meaning of each bit is defined
-    /// by the capability's own spec section. Unknown flag bits must
-    /// be ignored by the compiler (forward-compatibility); unknown
-    /// flag bits must not be set by a v1.0 manager.
+    /// Capability-specific flags. In v1.0, all flag bits are reserved
+    /// for future use; managers MUST set `flags = 0` on every descriptor.
+    /// v1.x compilers ignore unknown flag bits. Bits 0..3 are reserved
+    /// for ABI-wide use across all capabilities; bits 4..31 are
+    /// reserved for per-capability use, to be defined per-capability
+    /// in future minor versions.
     flags: u32,
 
     /// Pointer to the capability vtable. Typed implicitly by
@@ -385,7 +561,7 @@ comptime {
 
 A capability descriptor is discoverable in two ways:
 
-1. **Embedded in the `.zapmem` section.** Each entry consumes 24 bytes after the `ZapMemoryManagerMetaV1` header. Embedding is recommended: it makes capability metadata available to the compiler at build time without requiring the manager to be initialized first.
+1. **Embedded in the `.zapmem` section.** Each entry consumes 24 bytes after the core vtable. Embedding is recommended: it makes capability metadata available to the compiler at build time without requiring the manager to be initialized first.
 2. **Runtime via `core.get_capability_desc(ctx, id)`.** The compiler-emitted runtime calls this to obtain the descriptor for a specific capability when emitting code that uses it. Implementations should return a pointer to a static-lifetime descriptor (typically the same descriptor that was embedded in `.zapmem`).
 
 If a capability is declared in `declared_caps` but `get_capability_desc` returns null for that id, the manager is malformed and the runtime aborts. If a capability is NOT declared in `declared_caps`, `get_capability_desc` must return null for that id.
@@ -398,11 +574,25 @@ The `vtable: *const anyopaque` is implicitly typed by the `(id, version)` pair. 
 
 The descriptor pointer returned by `get_capability_desc` and the vtable pointer it carries must remain valid and stable for the lifetime of the manager context. The runtime is permitted to cache them after the first lookup.
 
+### 5.4 Embedded vs. runtime descriptor discovery
+
+Managers may embed capability descriptors directly in the `.zapmem` section (with `desc_count > 0`) or expose them only at runtime via `get_capability_desc` (with `desc_count = 0`). Both are valid.
+
+**Embedded is recommended.** The compiler reads descriptors at build time and may specialize codegen for the manager's specific vtable layout (e.g., inline the offset of `release` within the refcount vtable). Embedded descriptors give the best runtime performance because retain/release sites are direct function calls to known vtable offsets.
+
+**Runtime-only is permitted.** The compiler emits one indirect call to `get_capability_desc(REFC_TAG)` at program startup, caches the result, and retain/release sites load from the cached descriptor. The performance cost is one extra startup indirection; the runtime cost of retain/release is identical.
+
+**Validation.** If `desc_count > 0`, every embedded descriptor's `id` must correspond to a bit set in `declared_caps`. If `declared_caps` has a bit set with no matching embedded descriptor, the compiler queries `get_capability_desc` for it at startup; the manager must respond non-null. A bit set in `declared_caps` with neither an embedded descriptor nor a non-null `get_capability_desc` response is a manager defect; the runtime aborts.
+
+### 5.5 Unknown IDs
+
+Managers must respond to `get_capability_desc(ctx, id)` with `null` for any ID that is not in `declared_caps`, including `id = 0`, IDs reserved-but-unimplemented in v1.0 (e.g., `GCOL`), and IDs not yet assigned in the canonical table. Managers must not invent ID values in v1.x; the FourCC namespace is closed to Appendix A.
+
 ---
 
 ## 6. Capability descriptor flags
 
-The `flags` field of `ZapCapabilityDescV1` is capability-specific. Generic bits reserved at the descriptor level (i.e., applicable across capabilities) are defined here; per-capability bits are defined in each capability's spec section.
+The `flags` field of `ZapCapabilityDescV1` is partitioned into ABI-wide bits (0..3) and per-capability bits (4..31). In v1.0, every bit is reserved.
 
 ### 6.1 Reserved generic flag bits
 
@@ -413,7 +603,7 @@ The `flags` field of `ZapCapabilityDescV1` is capability-specific. Generic bits 
 | 2    | `0x0000_0004` | Reserved. Must be 0 in v1.0.                                     |
 | 3    | `0x0000_0008` | Reserved. Must be 0 in v1.0.                                     |
 
-Bits 4..31 are available for per-capability use. No capability in v1.0 defines any flag bit; managers must set `flags = 0` for every descriptor in v1.0.
+In v1.0, all flag bits are reserved for future use; managers MUST set `flags = 0` on every descriptor. v1.x compilers ignore unknown flag bits. Bits 0..3 are reserved for ABI-wide use across all capabilities; bits 4..31 are reserved for per-capability use, to be defined per-capability in future minor versions.
 
 ---
 
@@ -496,7 +686,9 @@ pub const ZapRefcountCapabilityV1 = extern struct {
     ///      callback is responsible for releasing all refcounted
     ///      children of the object.
     ///   2. Frees `object`'s storage by whatever internal mechanism
-    ///      the manager uses (typically `core.deallocate`).
+    ///      the manager uses. The manager owns this entire freeing
+    ///      path; the runtime will not call `core.deallocate` on the
+    ///      cell after release returns. See section 4.5.
     ///
     /// The `deep_walk` callback may be null when the cell type has
     /// no refcounted children (e.g., a flat String).
@@ -528,19 +720,32 @@ comptime {
 
 The compiler-emitted layout for refcounted cells (under a manager that declares `REFCOUNT_V1`) includes an inline header carrying the refcount and a type tag. The exact layout is private to the compiler/runtime and may change between Zap releases; managers must treat the pointer passed to `retain` / `release` as opaque and may not inspect the cell's contents.
 
-When a manager does NOT declare `REFCOUNT_V1`, the compiler omits the refcount header entirely from the cell layout. Object pointers in this configuration point directly at the first user field. This is the conditional-layout mechanism that makes Zap.Arena cell-overhead-free.
+When a manager does NOT declare `REFCOUNT_V1`, the compiler omits the refcount header entirely from the cell layout. Object pointers in this configuration point directly at the first user field. This is the conditional-layout mechanism that makes `Zap.Memory.Arena` cell-overhead-free.
 
-### 8.2 Deep-walk semantics
+### 8.2 Who frees the cell
 
-The compiler emits one deep-walk function per type that has refcounted children. The function's job is to call `release(ctx, child, child_deep_walk)` for every refcounted child of the given object. Walking is shallow per call: a Map's deep-walk releases its values (which may themselves trigger recursive deep-walks via their own per-type callbacks); the manager does not need to know about transitive ownership.
+**`release` is the sole authority for freeing a refcounted cell.** When the final-count transition to zero is observed inside `release`, the manager's `release` implementation must:
+
+1. Invoke `deep_walk(object)` if non-null, so children are released first.
+2. Return the cell's storage to its underlying allocator (free the page, return the slot to a slab pool, etc.).
+
+After `release` invokes `deep_walk` and frees the cell, the runtime does NOT call `core.deallocate` on the same pointer. There is no compiler-emitted wrapper that frees refcounted cells; the manager owns the entire freeing path.
+
+To support this, the manager must be able to recover the original allocation size and alignment from the cell pointer. The standard pattern is to store size and alignment in the cell's inline header (alongside the refcount); section 15 shows a worked example.
+
+### 8.3 Deep-walk semantics
+
+The compiler chooses `deep_walk` **per refcounted type** at HIR elaboration time. For types with no refcounted children (e.g., a flat String, an `i64`), the compiler emits `null` in every `release` call site. For types with refcounted children (e.g., a `Map(String, User)`), the compiler emits a pointer to its per-type generated walk function. The manager sees the choice as a runtime callback; it does not dispatch on it itself.
+
+The compiler-emitted walk function's job is to call `release(ctx, child, child_deep_walk)` for every refcounted child of the given object. Walking is shallow per call: a Map's deep-walk releases its values (which may themselves trigger recursive deep-walks via their own per-type callbacks); the manager does not need to know about transitive ownership.
 
 The manager is the sole authority on *when* to invoke `deep_walk`. The compiler emits `release` calls; the manager invokes `deep_walk` only at the moment of the final-count transition to zero. This means a manager that batches frees (e.g., a generational arena that frees an entire generation at once) is free to call `deep_walk` for each freed object in any order, or not at all if the manager's discipline makes the deep-walk unnecessary (an arena, for example, does not need deep-walks: the entire arena is freed in one operation and refcounting is elided at compile time).
 
-### 8.3 Reentrancy
+### 8.4 Reentrancy
 
 `deep_walk` may transitively call `release` on this manager. The manager must support arbitrary recursion depth — there is no maximum nesting — within the limits of available stack space. Managers that wish to avoid deep stacks may implement worklist-based release internally and trampoline through `deep_walk`.
 
-### 8.4 No-op when capability absent
+### 8.5 No-op when capability absent
 
 If a manager does not declare `REFCOUNT_V1`, the compiler statically elides every retain and release in user code (the calls simply do not appear in the emitted IR). This is the central optimization that makes non-refcounting managers cell-overhead-free; see section 10 for how the elision is wired through the build pipeline.
 
@@ -632,7 +837,7 @@ This section describes the exact sequence of build-time operations the Zap compi
 ```
 Step 1. Parse the project's build.zap and load the manifest.
         The manifest's `memory:` field names a Zap struct
-        (e.g., Zap.ARC, Zap.Arena, or any third-party struct).
+        (e.g., Zap.Memory.ARC, Zap.Memory.Arena, or any third-party struct).
 
 Step 2. Resolve the struct reference to its source file.
         Read the struct's @memory_manager_source attribute, which
@@ -641,24 +846,19 @@ Step 2. Resolve the struct reference to its source file.
         (for third-party managers).
 
 Step 3. Compile the manager's Zig source to an object file.
-        The compiler invokes a generic Zig-fork primitive:
-
-            zig_fork_compile_zig_to_object(
-                source_path: [*:0]const u8,
-                target: *const Target,
-                optimize: OptimizeMode,
-                out_object_path: [*:0]const u8,
-            ) c_int
-
-        This primitive is general-purpose; it is not specific to
-        memory managers. The result is an object file in the target
+        The compiler invokes the Zig-fork primitive
+        `zap_fork_compile_zig_to_object` (see section 10.1.1). The
+        primitive is general-purpose; it is not specific to memory
+        managers. The result is an object file in the target
         platform's native format (ELF, Mach-O, or COFF).
 
 Step 4. Parse the .zapmem section from the object file.
         The compiler uses std.elf, std.macho, or std.coff (depending
-        on detected object format) to locate the .zapmem section
-        and read its first sizeof(ZapMemoryManagerMetaV1) bytes
-        plus any embedded ZapCapabilityDescV1 entries.
+        on detected object format) to locate the .zapmem section.
+        It reads the meta header (at section offset 0), then the
+        core vtable (at offset meta.core_vtable_offset), then any
+        embedded ZapCapabilityDescV1 entries. All discovery is by
+        section content; no symbol-name lookup is performed.
 
 Step 5. Validate the metadata per section 3.5.
         Any validation failure aborts the build with a diagnostic
@@ -683,17 +883,84 @@ Step 7. Thread declared_caps into codegen.
           - If REFCOUNT_V1 is unset: emit nothing. The dup/drop nodes
             are statically elided and produce no machine code.
 
-Step 8. Link the manager object alongside the Zap-generated objects.
+Step 8. Emit the runtime startup hook.
+        The compiler generates a small startup stub that calls the
+        manager's `init` and stores the returned context pointer in
+        the global `zap_memory_manager_context` (see section 10.2).
+
+Step 9. Link the manager object alongside the Zap-generated objects.
         The final link step includes <manager>.o in its input set.
-        The Zap-generated code references the manager via the
-        manager's exported `zap_memory_manager_core` symbol.
+        The runtime locates the core vtable by walking the linked
+        .zapmem section at startup; no per-symbol reference is
+        emitted.
 ```
 
-### 10.2 Build cache integration
+#### 10.1.1 `zap_fork_compile_zig_to_object`
+
+The Zig-fork primitive used in step 3 is a public C-ABI surface available to anyone calling into the Zig fork (not memory-manager-specific). Its full signature:
+
+```zig
+pub const ZapForkTarget = extern struct {
+    /// Maps to std.Target.Cpu.Arch (Zig enum). See Appendix C for the
+    /// canonical tag mapping for v1.0.
+    arch_tag: u16,
+
+    /// Maps to std.Target.Os.Tag.
+    os_tag: u16,
+
+    /// Maps to std.Target.Abi.
+    abi_tag: u16,
+
+    /// Reserved. Must be 0 in v1.0.
+    _reserved: u16,
+};
+
+pub const ZapForkOptimize = enum(c_int) {
+    Debug = 0,
+    ReleaseSafe = 1,
+    ReleaseFast = 2,
+    ReleaseSmall = 3,
+};
+
+pub const ZapForkResult = enum(c_int) {
+    Ok = 0,
+    SourceNotFound = 1,
+    CompilationFailed = 2,
+    TargetUnsupported = 3,
+    InternalError = 99,
+};
+
+pub extern fn zap_fork_compile_zig_to_object(
+    source_path: [*:0]const u8,
+    target: *const ZapForkTarget,
+    optimize: ZapForkOptimize,
+    out_object_path: [*:0]const u8,
+    out_diagnostic_buffer: ?[*]u8,
+    out_diagnostic_capacity: usize,
+) callconv(.c) ZapForkResult;
+```
+
+The diagnostic buffer receives a UTF-8 error message on non-`Ok` returns; pass `null` to discard. The function writes at most `out_diagnostic_capacity` bytes (including a trailing NUL if space permits) and truncates the message otherwise. On `Ok`, the buffer is left untouched.
+
+The primitive does not currently accept package dependencies (`build.zig.zon` deps arrays); see section 11.1.1 for the implication.
+
+### 10.2 Runtime manager context storage
+
+The Zap runtime exports a single global storage for the active manager's context:
+
+```zig
+pub extern var zap_memory_manager_context: *anyopaque;
+```
+
+The startup hook (emitted in step 8) populates this from the manager's `init` return value. Every compiler-emitted retain/release/allocate/deallocate site loads this global and passes it as the first argument to the corresponding vtable function. The global is written once (at startup) and read on every call site; it is never written again during the program's lifetime.
+
+Multi-process binaries (future) will replace this global with a per-process slot loaded from the active process's runtime state; the change is reserved for ABI v2.0 and does not affect v1.x managers.
+
+### 10.3 Build cache integration
 
 The compiled `<manager>.o` is content-addressed by `(zig_fork_version, manager_source_hash, target, optimize)`. The compiler caches compiled manager objects in the same on-disk cache as Zap-generated objects; the cache miss happens only on first build or when one of the cache keys changes.
 
-### 10.3 Failure modes and diagnostics
+### 10.4 Failure modes and diagnostics
 
 | Failure                                  | Stage   | Diagnostic                                                                           |
 |------------------------------------------|---------|--------------------------------------------------------------------------------------|
@@ -702,14 +969,19 @@ The compiled `<manager>.o` is content-addressed by `(zig_fork_version, manager_s
 | `.zapmem` section absent from object     | Step 4  | "manager `<name>` did not emit a `.zapmem` metadata section; see docs/memory-manager-abi.md section 3" |
 | Magic mismatch                           | Step 5  | "manager `<name>` has invalid magic (expected `'ZMEM'`, got `<bytes>`)"               |
 | `abi_major` mismatch                     | Step 5  | "manager `<name>` declares ABI major `<n>`, compiler supports ABI major `1`"          |
+| Capability version too new               | Step 5  | "manager `<name>` declares `<TAG>` at version `<n>`; this compiler supports only versions up to `<m>`" |
 | Reserved capability bit declared         | Step 5  | "manager `<name>` declares reserved capability `<TAG>` (bit `<n>`), which has no committed v1.0 shape" |
+| Embedded descriptor for undeclared cap   | Step 5  | "manager `<name>` embeds descriptor for capability `<TAG>` but does not declare it in declared_caps" |
 | Embedded descriptor exceeds section size | Step 5  | "manager `<name>` declares `<n>` embedded descriptors but section is only `<bytes>` bytes" |
+| `core.declared_caps != meta.declared_caps` | Step 5 | "manager `<name>` has mismatched declared_caps between meta header and core vtable"   |
+| Init returns null at runtime             | Runtime | "zap: manager `<name>` failed to initialize"                                          |
+| `allocate` returns null at runtime       | Runtime | "zap: out of memory: requested `<size>` bytes (alignment `<alignment>`) from manager `<name>`; aborting" |
 
 ---
 
 ## 11. First-party / third-party symmetry
 
-The Zap compiler has zero hardcoded knowledge of `Zap.ARC` or `Zap.Arena`. Both are resolved through exactly the same `@memory_manager_source` attribute mechanism as any third-party manager. There is no special-case code path, no name-based dispatch, no whitelist.
+The Zap compiler has zero hardcoded knowledge of `Zap.Memory.ARC` or `Zap.Memory.Arena`. Both are resolved through exactly the same `@memory_manager_source` attribute mechanism as any third-party manager. There is no special-case code path, no name-based dispatch, no whitelist.
 
 ### 11.1 What a third party ships
 
@@ -729,7 +1001,13 @@ The user then references the Zap struct from their project's `build.zap`:
 }
 ```
 
-The Zap compiler resolves `ThirdParty.MyManager`, reads its `@memory_manager_source`, compiles the named Zig file, validates the resulting `.zapmem` metadata, and threads `declared_caps` into HIR and codegen — exactly as it does for `Zap.ARC`.
+The Zap compiler resolves `ThirdParty.MyManager`, reads its `@memory_manager_source`, compiles the named Zig file, validates the resulting `.zapmem` metadata, and threads `declared_caps` into HIR and codegen — exactly as it does for `Zap.Memory.ARC`.
+
+#### 11.1.1 Third-party manager dependencies
+
+v1.0 third-party managers may not have Zig-package dependencies (no `build.zig.zon` `dependencies` table). The manager source must be self-contained: `@import("std")`, `@import("builtin")`, and the manager's own files. The `zap_fork_compile_zig_to_object` primitive does not currently accept a deps graph.
+
+A future ABI version may add dep support by extending the fork primitive's signature; this would be an `abi_minor` change since adding optional fields to an extern struct is non-breaking under the `size`-field convention (section 2.3).
 
 ### 11.2 Versioning the third-party manager
 
@@ -741,7 +1019,7 @@ The third party's package version is independent of Zap's ABI version. The third
 
 For each memory manager, there is a Zap struct that names the manager and points at its Zig source. The struct itself is mostly metadata: it has no runtime fields. The compiler reads the `@memory_manager_source` attribute to find the Zig source file.
 
-### 12.1 First-party `Zap.ARC`
+### 12.1 First-party `Zap.Memory.ARC`
 
 ```
 @doc = """
@@ -749,19 +1027,19 @@ For each memory manager, there is a Zap struct that names the manager and points
 
   Each refcounted cell carries an inline header storing the refcount
   and type tag. Retains and releases are atomic. When a release
-  brings the count to zero, the runtime walks the cell's children
-  and releases them before returning storage to the slab pool.
+  brings the count to zero, the manager's release function walks the
+  cell's children, releases them, and frees the cell's storage.
 
   Declared capabilities: REFCOUNT_V1.
   """
 
 @memory_manager_source = "src/runtime/memory/arc/manager.zig"
 
-pub struct Zap.ARC {
+pub struct Zap.Memory.ARC {
 }
 ```
 
-### 12.2 First-party `Zap.Arena`
+### 12.2 First-party `Zap.Memory.Arena`
 
 ```
 @doc = """
@@ -778,7 +1056,7 @@ pub struct Zap.ARC {
 
 @memory_manager_source = "src/runtime/memory/arena/manager.zig"
 
-pub struct Zap.Arena {
+pub struct Zap.Memory.Arena {
 }
 ```
 
@@ -823,15 +1101,17 @@ This example shows the minimum viable manager: it declares zero capabilities, al
 
 ```zig
 const std = @import("std");
+const builtin = @import("builtin");
 
 const ZapMemoryManagerMetaV1 = extern struct {
     magic: u32,
     abi_major: u16,
     abi_minor: u16,
     size: u16,
-    object_fmt: u16,
-    declared_caps: u64,
+    _reserved2: u16,
     desc_count: u32,
+    declared_caps: u64,
+    core_vtable_offset: u32,
     reserved: u32,
 };
 
@@ -860,30 +1140,19 @@ const ZapMemoryManagerCoreV1 = extern struct {
     get_capability_desc: *const fn (*anyopaque, u32) callconv(.c) ?*const ZapCapabilityDescV1,
 };
 
-// FourCC 'ZMEM' as little-endian u32. Big-endian targets would use
-// 0x5A4D454D; pick at comptime based on target endianness.
-const ZMEM_MAGIC: u32 = switch (@import("builtin").target.cpu.arch.endian()) {
+// FourCC 'ZMEM' as a u32 in the target's endianness. Both branches
+// produce the same byte sequence (5A 4D 45 4D); only the integer
+// interpretation differs.
+const ZMEM_MAGIC: u32 = switch (builtin.target.cpu.arch.endian()) {
     .little => 0x4D454D5A,
     .big => 0x5A4D454D,
 };
 
-const SECTION_NAME = switch (@import("builtin").target.ofmt) {
+const SECTION_NAME = switch (builtin.target.ofmt) {
     .elf => ".zapmem",
     .macho => "__DATA,__zapmem",
     .coff => ".zapmem",
     else => @compileError("unsupported object format for .zapmem section"),
-};
-
-// The metadata blob. Placed in .zapmem by linksection.
-export const zap_memory_manager_meta: ZapMemoryManagerMetaV1 linksection(SECTION_NAME) = .{
-    .magic = ZMEM_MAGIC,
-    .abi_major = 1,
-    .abi_minor = 0,
-    .size = @sizeOf(ZapMemoryManagerMetaV1),
-    .object_fmt = 0,
-    .declared_caps = 0,    // No capabilities declared.
-    .desc_count = 0,
-    .reserved = 0,
 };
 
 // A non-null placeholder context so the runtime can tell init succeeded.
@@ -926,7 +1195,24 @@ fn noopGetCapabilityDesc(
     return null;
 }
 
-export const zap_memory_manager_core: ZapMemoryManagerCoreV1 = .{
+// The meta header. Placed at section offset 0 by linksection.
+export const zap_memory_manager_meta: ZapMemoryManagerMetaV1
+    linksection(SECTION_NAME) = .{
+    .magic = ZMEM_MAGIC,
+    .abi_major = 1,
+    .abi_minor = 0,
+    .size = @sizeOf(ZapMemoryManagerMetaV1),
+    ._reserved2 = 0,
+    .desc_count = 0,
+    .declared_caps = 0,    // No capabilities declared.
+    .core_vtable_offset = @sizeOf(ZapMemoryManagerMetaV1),
+    .reserved = 0,
+};
+
+// The core vtable. Placed immediately after the meta header in the
+// same .zapmem section. The compiler finds it via meta.core_vtable_offset.
+export const zap_memory_manager_core: ZapMemoryManagerCoreV1
+    linksection(SECTION_NAME) = .{
     .abi_major = 1,
     .abi_minor = 0,
     .size = @sizeOf(ZapMemoryManagerCoreV1),
@@ -955,25 +1241,25 @@ export const zap_memory_manager_core: ZapMemoryManagerCoreV1 = .{
 
 @memory_manager_source = "src/runtime/memory/noop/manager.zig"
 
-pub struct Zap.NoOp {
+pub struct Zap.Memory.NoOp {
 }
 ```
 
 ### 14.3 Expected behavior
 
-A program built with `memory: Zap.NoOp`:
+A program built with `memory: Zap.Memory.NoOp`:
 
 1. Compiles cleanly. The `.zapmem` section is present, magic matches, `declared_caps = 0`.
 2. The compiler elides every retain/release in HIR (because `REFCOUNT_V1` is not declared).
 3. Map/List/String types are emitted without the refcount-header field.
 4. At runtime, `init` returns the placeholder pointer.
-5. The first allocation returns null, the runtime aborts with an out-of-memory diagnostic.
+5. The first allocation returns null, the runtime aborts with: `zap: out of memory: requested <size> bytes (alignment <alignment>) from manager Zap.Memory.NoOp; aborting`.
 
 ---
 
 ## 15. Worked example: minimal refcounting manager
 
-This example shows a small but complete refcounting manager. It uses `std.heap.page_allocator` for backing storage and a side table for refcounts (one atomic `u32` per allocation, keyed by allocation pointer). It declares `REFCOUNT_V1`.
+This example shows a small but complete refcounting manager. It uses `std.heap.page_allocator` for backing storage. Each refcounted cell carries an inline 16-byte header that stores the refcount along with the original allocation size and alignment, so `release` can recover those values and free the page correctly when the count reaches zero. The manager also handles raw allocations (those not produced for a refcounted type) by routing them through the same path; `tinyrefDeallocate` is exercised for transient scratch buffers and other non-refcounted allocations. It declares `REFCOUNT_V1`.
 
 ### 15.1 Zig source: `tinyref/src/manager.zig`
 
@@ -986,9 +1272,10 @@ const ZapMemoryManagerMetaV1 = extern struct {
     abi_major: u16,
     abi_minor: u16,
     size: u16,
-    object_fmt: u16,
-    declared_caps: u64,
+    _reserved2: u16,
     desc_count: u32,
+    declared_caps: u64,
+    core_vtable_offset: u32,
     reserved: u32,
 };
 
@@ -1041,17 +1328,35 @@ const SECTION_NAME = switch (builtin.target.ofmt) {
     else => @compileError("unsupported object format"),
 };
 
-// Per-allocation context: refcount stored adjacent to the user
-// payload (allocation lays out [ refcount(4) | padding | user payload ]).
-const HEADER_SIZE: usize = 16;    // 4 bytes refcount + 12 bytes padding
-                                  // to keep user payload 16-byte aligned.
+// Inline header placed at the start of every allocation. The 16-byte
+// size keeps user-payload alignment at 16 bytes (sufficient for every
+// scalar type and for SIMD vectors up to 16 wide on the targets we
+// care about). The header carries the refcount plus enough metadata
+// to recover the original allocation size and alignment when the
+// cell is freed during `release` or `deallocate`.
+const Header = extern struct {
+    refcount: u32,    // atomic, accessed via @atomicRmw
+    size: u32,        // user payload size in bytes
+    alignment: u32,   // user-requested alignment, must be power of two
+    _pad: u32,        // explicit padding to round Header up to 16 bytes
+};
+const HEADER_SIZE: usize = @sizeOf(Header);    // 16
 
+comptime {
+    if (HEADER_SIZE != 16) @compileError("Header must be exactly 16 bytes");
+}
+
+// Per-manager context. The example carries a single atomic counter
+// for diagnostics so that `ctx` is exercised meaningfully on every
+// allocation path. A production manager would track per-size-class
+// statistics, current high-water mark, etc.
 const Context = struct {
-    // No per-context state; uses page_allocator directly. A real
-    // manager would track allocations for diagnostics.
+    allocation_counter: std.atomic.Value(u64),
 };
 
-var context_storage: Context = .{};
+var context_storage: Context = .{
+    .allocation_counter = std.atomic.Value(u64).init(0),
+};
 
 fn tinyrefInit(options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque {
     _ = options;
@@ -1060,23 +1365,62 @@ fn tinyrefInit(options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque {
 
 fn tinyrefDeinit(ctx: *anyopaque) callconv(.c) void {
     _ = ctx;
+    // No cleanup required — context_storage is statically allocated and
+    // every Zap-issued allocation is freed via release/deallocate before
+    // we get here.
 }
 
+// Allocate `size` bytes with at least `alignment` alignment. Writes
+// size/alignment into the inline Header so release/deallocate can
+// later recover them.
 fn tinyrefAllocate(ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8 {
-    _ = ctx;
-    const total = HEADER_SIZE + size;
+    const context: *Context = @ptrCast(@alignCast(ctx));
+    _ = context.allocation_counter.fetchAdd(1, .monotonic);
+
+    // The page allocator requires alignment to be a power of two and
+    // at most a page; our caller already guarantees both.
+    const effective_align: u32 = @max(alignment, @as(u32, HEADER_SIZE));
+    const total: usize = HEADER_SIZE + size;
+
     const block = std.heap.page_allocator.alignedAlloc(
         u8,
-        @intCast(@max(alignment, @as(u32, HEADER_SIZE))),
+        @intCast(effective_align),
         total,
     ) catch return null;
-    // Initialize refcount to 1.
-    const refcount_ptr: *u32 = @ptrCast(@alignCast(block.ptr));
-    refcount_ptr.* = 1;
+
+    const header_ptr: *Header = @ptrCast(@alignCast(block.ptr));
+    header_ptr.* = .{
+        .refcount = 1,
+        .size = @intCast(size),
+        .alignment = effective_align,
+        ._pad = 0,
+    };
+
     // Hand back a pointer past the header.
     return @ptrCast(&block.ptr[HEADER_SIZE]);
 }
 
+// Helper: free a cell whose Header is at `*header` and whose user
+// pointer is at `user_ptr`. Used by both `release` (when the refcount
+// reaches zero) and `tinyrefDeallocate` (for raw, non-refcounted
+// allocations).
+fn freeCell(header: *Header, user_ptr: [*]u8) void {
+    const total: usize = HEADER_SIZE + header.size;
+    const block_start: [*]u8 = user_ptr - HEADER_SIZE;
+    // Reconstruct the slice with the original allocation alignment so
+    // page_allocator.free dispatches correctly.
+    const slice = block_start[0..total];
+    // page_allocator.free accepts a slice and reads the alignment from
+    // the slice's address; the slice we hand it points at block_start,
+    // which we allocated with the alignment we recorded.
+    std.heap.page_allocator.free(slice);
+}
+
+// Called for raw (non-refcounted) allocations only. The runtime never
+// calls this for cells produced for a refcounted Zap type — those are
+// freed exclusively via `release`. Examples of raw allocations:
+// transient scratch buffers, runtime-internal bookkeeping, and any
+// Zap-level allocations issued under a non-refcounted type.
 fn tinyrefDeallocate(
     ctx: *anyopaque,
     ptr: [*]u8,
@@ -1084,12 +1428,15 @@ fn tinyrefDeallocate(
     alignment: u32,
 ) callconv(.c) void {
     _ = ctx;
-    _ = alignment;
-    // Recover the block start by stepping back over the header.
-    const block_start: [*]u8 = @ptrCast(&ptr[0]);
-    const real_start = block_start - HEADER_SIZE;
-    const total = HEADER_SIZE + size;
-    std.heap.page_allocator.free(real_start[0..total]);
+    // The runtime passes back the exact `size` and `alignment` we were
+    // called with at allocate-time. We could trust them, but we cross-
+    // check against the inline header to catch double-frees and
+    // mismatched sizes — a real production manager would compile this
+    // check out under ReleaseFast.
+    const header_ptr: *Header = @ptrCast(@alignCast(ptr - HEADER_SIZE));
+    std.debug.assert(header_ptr.size == size);
+    std.debug.assert(header_ptr.alignment >= alignment);
+    freeCell(header_ptr, ptr);
 }
 
 fn tinyrefGetCapabilityDesc(
@@ -1104,31 +1451,31 @@ fn tinyrefGetCapabilityDesc(
 fn tinyrefRetain(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
     _ = ctx;
     const user_ptr: [*]u8 = @ptrCast(object);
-    const refcount_ptr: *u32 = @ptrCast(@alignCast(user_ptr - HEADER_SIZE));
-    _ = @atomicRmw(u32, refcount_ptr, .Add, 1, .monotonic);
+    const header_ptr: *Header = @ptrCast(@alignCast(user_ptr - HEADER_SIZE));
+    _ = @atomicRmw(u32, &header_ptr.refcount, .Add, 1, .monotonic);
 }
 
+// `release` is the sole authority for freeing a refcounted cell.
+// When the final decrement brings the count to zero, this function
+// must (1) invoke deep_walk if non-null and (2) return the cell's
+// storage to its underlying allocator. The runtime will never call
+// `deallocate` on a refcounted cell after `release` returns.
 fn tinyrefRelease(
     ctx: *anyopaque,
     object: *anyopaque,
     deep_walk: ?ZapDeepWalkFn,
 ) callconv(.c) void {
+    _ = ctx;
     const user_ptr: [*]u8 = @ptrCast(object);
-    const refcount_ptr: *u32 = @ptrCast(@alignCast(user_ptr - HEADER_SIZE));
-    const prev = @atomicRmw(u32, refcount_ptr, .Sub, 1, .acq_rel);
+    const header_ptr: *Header = @ptrCast(@alignCast(user_ptr - HEADER_SIZE));
+    const prev = @atomicRmw(u32, &header_ptr.refcount, .Sub, 1, .acq_rel);
     if (prev == 1) {
-        // The decrement that took us to zero. Walk children, then free.
+        // The decrement that took us to zero. Walk children first so
+        // they observe the still-valid parent, then free the cell.
         if (deep_walk) |walk| walk(object);
-        // We don't know the original size or alignment here — a real
-        // manager would store them in the header. For this minimal
-        // example, deallocate uses the page allocator's size tracking.
-        const ctx_typed: *Context = @ptrCast(@alignCast(ctx));
-        _ = ctx_typed;
-        // In practice, the runtime calls deallocate separately after
-        // release returns; release is responsible only for the count
-        // transition + deep-walk. The runtime's compiler-emitted
-        // wrapper knows the cell's size and alignment.
-        // Therefore we do nothing further here.
+        // Recover size/alignment from the header (we stored them in
+        // `tinyrefAllocate`) and free the original page-allocator slice.
+        freeCell(header_ptr, user_ptr);
     }
 }
 
@@ -1145,19 +1492,24 @@ const refcount_desc: ZapCapabilityDescV1 = .{
     .vtable = &refcount_vtable,
 };
 
+// Meta header at section offset 0.
 export const zap_memory_manager_meta: ZapMemoryManagerMetaV1
     linksection(SECTION_NAME) = .{
     .magic = ZMEM_MAGIC,
     .abi_major = 1,
     .abi_minor = 0,
     .size = @sizeOf(ZapMemoryManagerMetaV1),
-    .object_fmt = 0,
-    .declared_caps = CAP_REFCOUNT_V1_BIT,
+    ._reserved2 = 0,
     .desc_count = 0,
+    .declared_caps = CAP_REFCOUNT_V1_BIT,
+    .core_vtable_offset = @sizeOf(ZapMemoryManagerMetaV1),
     .reserved = 0,
 };
 
-export const zap_memory_manager_core: ZapMemoryManagerCoreV1 = .{
+// Core vtable immediately following the meta header in the same
+// .zapmem section. The compiler locates it at meta.core_vtable_offset.
+export const zap_memory_manager_core: ZapMemoryManagerCoreV1
+    linksection(SECTION_NAME) = .{
     .abi_major = 1,
     .abi_minor = 0,
     .size = @sizeOf(ZapMemoryManagerCoreV1),
@@ -1175,9 +1527,10 @@ export const zap_memory_manager_core: ZapMemoryManagerCoreV1 = .{
 ```
 @doc = """
   Minimal example refcounting manager. Backs allocations with the
-  page allocator and stores a 32-bit atomic refcount in an inline
-  header. Demonstrates the smallest manager that declares
-  REFCOUNT_V1.
+  page allocator and stores a 32-bit atomic refcount plus the
+  original size and alignment in an inline header. Demonstrates the
+  smallest manager that declares REFCOUNT_V1 while still freeing
+  cells correctly when the refcount reaches zero.
   """
 
 @memory_manager_source = "src/manager.zig"
@@ -1188,10 +1541,12 @@ pub struct TinyRef {
 
 ### 15.3 Notes on the example
 
-- The example uses a 16-byte inline header (4-byte refcount + 12 bytes padding) to keep user-payload alignment regardless of the host's pointer size. A production manager would size the header to match its target's natural alignment.
-- The example uses `std.heap.page_allocator` directly. A production manager would use a slab pool (see `src/runtime/memory/arc/manager.zig`) to amortize syscall overhead.
-- `release` does not call `deallocate` itself in this example; the runtime's compiler-emitted wrapper is responsible for that. A self-contained manager could call `deallocate` from `release` instead, at the cost of needing to know the cell's size and alignment (typically by stuffing them into the header).
-- This entire example is under 200 lines and demonstrates: metadata section emission, capability declaration, capability descriptor, core vtable, refcount capability vtable, atomic refcount semantics, and deep-walk integration.
+- The 16-byte inline `Header` keeps the user payload 16-byte aligned and is large enough to store the refcount alongside the size and alignment needed to free the cell later. A production manager that targets fixed-size cells (slab pool buckets) can shrink the header by replacing the inline `size`/`alignment` fields with a size-class index.
+- `release` invokes `deep_walk` before freeing so children see a still-valid parent during their own release path. The compiler chooses `deep_walk` per refcounted type: cells with no refcounted children get `null` and never trigger the walk; cells with refcounted children get the per-type walk function the compiler generated.
+- `tinyrefDeallocate` is reserved for raw allocations only. The runtime never calls it for refcounted cells — those go through `release` exclusively (section 4.5). The example uses it both to free scratch buffers and to demonstrate header-based size/alignment recovery in a non-refcounted path.
+- The example uses `std.heap.page_allocator` directly. A production manager amortizes per-allocation syscalls with a slab pool: blocks of fixed-size cells per power-of-two size class, with O(1) allocation and free.
+- `ctx` is used meaningfully on the allocation path: the example increments an atomic allocation counter on every `allocate` so the `ctx` parameter exercises the per-manager state path. On the retain/release/deallocate paths `ctx` is discarded with `_ = ctx` because the inline `Header` already carries everything those functions need; the discards are deliberate, not accidental. A truly stateless manager could pass a sentinel pointer from `init` and discard `ctx` in every vtable function, but realistic managers always have at least bookkeeping state.
+- This example demonstrates: metadata section emission with the meta + core-vtable layout, capability declaration, capability descriptor, core vtable, refcount capability vtable, atomic refcount semantics, deep-walk integration, and `release`-owned freeing.
 
 ---
 
@@ -1204,7 +1559,7 @@ Two non-user-facing managers ship with the Zap source tree as part of the test i
 | `Zap.Memory.Leak`     | `src/runtime/memory/leak/manager.zig`         | Allocates from the page allocator, never frees. Declares no capabilities. Used to verify that retain/release elision is complete under a non-refcounting manager. |
 | `Zap.Memory.Tracking` | `src/runtime/memory/tracking/manager.zig`     | Wraps another manager and logs every allocate / deallocate / retain / release call. Used to detect missing or duplicated lifecycle events in compiler tests. |
 
-These managers are not part of the public ABI surface in the sense that users do not select them via `memory:` in production builds. They are used by the Zap test runner to validate ABI-conformance properties (e.g., "every retain has a matching release") on every CI run. Their implementation follows the same ABI as `Zap.ARC` and `Zap.Arena`; no special compiler accommodation is needed.
+These managers are not part of the public ABI surface in the sense that users do not select them via `memory:` in production builds. They are used by the Zap test runner to validate ABI-conformance properties (e.g., "every retain has a matching release") on every CI run. Their implementation follows the same ABI as `Zap.Memory.ARC` and `Zap.Memory.Arena`; no special compiler accommodation is needed.
 
 ---
 
@@ -1286,52 +1641,85 @@ The Zap compiler's metadata validator uses an equivalent lookup against the targ
 
 This appendix gives the exact byte layout of the `.zapmem` section, by offset, for a 64-bit target with 8-byte alignment. All multi-byte fields are stored in the target's native byte order (see section 3.4).
 
-### B.1 `ZapMemoryManagerMetaV1` (32 bytes)
+The section is a single contiguous blob laid out as:
 
 ```
-Offset  Size  Field           Notes
-------  ----  --------------  --------------------------------------------
-0x00    4     magic           'ZMEM' as u32 (target-endianness)
-0x04    2     abi_major       1
-0x06    2     abi_minor       0
-0x08    2     size            32 in v1.0
-0x0A    2     object_fmt      0..3 (0=unspecified)
-0x0C    4     (padding)       Zero-filled; required by Zig's natural
-                              alignment of the following u64 field
-0x10    8     declared_caps   Bitmask, see Appendix A
-0x18    4     desc_count      Number of embedded ZapCapabilityDescV1
-0x1C    4     reserved        Must be 0
-0x20    -     -               (end of struct; total 32 bytes)
+[ ZapMemoryManagerMetaV1                     ]  @ 0
+[ ZapMemoryManagerCoreV1                     ]  @ meta.core_vtable_offset (32 in v1.0)
+[ ZapCapabilityDescV1 * meta.desc_count      ]  @ meta.core_vtable_offset + core.size (88 in v1.0)
 ```
 
-### B.2 Embedded `ZapCapabilityDescV1` array (24 bytes per entry)
+### B.1 `ZapMemoryManagerMetaV1` (32 bytes, at section offset 0x00)
 
-Starting at offset `0x20` (immediately after `ZapMemoryManagerMetaV1`), `desc_count` entries follow:
+```
+Offset  Size  Field               Notes
+------  ----  ------------------  ------------------------------------------
+0x00    4     magic               'ZMEM' as u32 (target-endianness)
+0x04    2     abi_major           1
+0x06    2     abi_minor           0
+0x08    2     size                32 in v1.0 (sizeof(ZapMemoryManagerMetaV1))
+0x0A    2     _reserved2          Reserved; must be 0
+0x0C    4     desc_count          Number of embedded ZapCapabilityDescV1
+0x10    8     declared_caps       Bitmask, see Appendix A
+0x18    4     core_vtable_offset  Byte offset (from section start) of the
+                                  ZapMemoryManagerCoreV1 struct. 32 in v1.0.
+0x1C    4     reserved            Must be 0
+0x20    -     -                   (end of meta; total 32 bytes)
+```
+
+The struct layout above places the `u64` `declared_caps` at offset 0x10 (8-byte aligned) without any explicit padding bytes — every preceding field naturally aligns the next.
+
+### B.2 `ZapMemoryManagerCoreV1` (56 bytes, at section offset `meta.core_vtable_offset`)
+
+In the canonical v1.0 layout, this begins at offset 0x20 (immediately after the meta header):
+
+```
+Offset  Size  Field                Notes
+------  ----  -------------------  -----------------------------------------
+0x00    2     abi_major            Must equal meta.abi_major
+0x02    2     abi_minor            Must equal meta.abi_minor
+0x04    4     size                 56 in v1.0 on a 64-bit target
+0x08    8     declared_caps        Must equal meta.declared_caps
+0x10    8     init                 Function pointer (callconv(.c))
+0x18    8     deinit               Function pointer (callconv(.c))
+0x20    8     allocate             Function pointer (callconv(.c))
+0x28    8     deallocate           Function pointer (callconv(.c))
+0x30    8     get_capability_desc  Function pointer (callconv(.c))
+0x38    -     -                    (end of core vtable; total 56 bytes)
+```
+
+Section-absolute offsets in the canonical v1.0 layout: 0x20 .. 0x57.
+
+### B.3 Embedded `ZapCapabilityDescV1` array (24 bytes per entry)
+
+Starting at section offset `meta.core_vtable_offset + core.size` (= 0x58 in the canonical v1.0 layout), `meta.desc_count` entries follow:
 
 ```
 Entry offset relative to start of entry:
 0x00    4     id              FourCC tag as u32 (target-endianness)
 0x04    2     version         Per-capability version
 0x06    2     size            sizeof(vtable struct)
-0x08    4     flags           Capability-specific
+0x08    4     flags           Capability-specific; must be 0 in v1.0
 0x0C    4     (padding)       Zero-filled; required for 8-byte align
 0x10    8     vtable          Pointer to capability vtable
 0x18    -     -               (end of entry; total 24 bytes)
 ```
 
-### B.3 Total `.zapmem` section size
+### B.4 Total `.zapmem` section size
 
 ```
-section_size = 32 + 24 * desc_count
+section_size = sizeof(meta) + sizeof(core) + 24 * meta.desc_count
+             = 32 + 56 + 24 * meta.desc_count          # canonical v1.0
+             = 88 + 24 * meta.desc_count
 ```
 
-If `desc_count = 0`, the section is exactly 32 bytes. If `desc_count = 1` (e.g., a refcounting-only manager that embeds its single descriptor), the section is 56 bytes.
+If `meta.desc_count = 0`, the section is exactly 88 bytes. If `meta.desc_count = 1` (e.g., a refcounting-only manager that embeds its single descriptor), the section is 112 bytes.
 
-### B.4 Alignment
+### B.5 Alignment
 
-The `.zapmem` section is aligned to 8 bytes (the natural alignment of `u64` and pointer). Zig's `linksection` attribute combined with the natural alignment of the exported struct produces correct alignment automatically; managers do not need explicit `@alignOf` annotations.
+The `.zapmem` section is aligned to 8 bytes (the natural alignment of `u64` and pointer). Zig's `linksection` attribute combined with the natural alignment of the exported structs produces correct alignment automatically; managers do not need explicit `@alignOf` annotations. The meta header, the core vtable, and each descriptor all begin on 8-byte boundaries in the canonical layout because each struct's size is a multiple of 8.
 
-### B.5 Endianness summary
+### B.6 Endianness summary
 
 ```
 Little-endian targets (x86_64, aarch64, riscv64, wasm32, ...):
@@ -1342,6 +1730,20 @@ Big-endian targets (powerpc64be, s390x, ...):
 ```
 
 The byte sequence `5A 4D 45 4D` is the same in both cases — the bytes spell `Z`, `M`, `E`, `M`. Only the interpretation as a `u32` differs. The Zap compiler reads the bytes as a `u32` in the target's native byte order and compares against the target-endianness-correct constant.
+
+---
+
+## Appendix C. `ZapForkTarget` tag mapping (v1.0)
+
+The `arch_tag`, `os_tag`, and `abi_tag` fields of `ZapForkTarget` (section 10.1.1) map to the integer values of the Zig fork's `std.Target.Cpu.Arch`, `std.Target.Os.Tag`, and `std.Target.Abi` enums, respectively. The mapping is **stable for the lifetime of the Zap fork's pinned Zig version** and is verified at the C-ABI boundary by `zap_fork_compile_zig_to_object`.
+
+A v1.0 caller that passes an unsupported `(arch_tag, os_tag, abi_tag)` triple receives `ZapForkResult.TargetUnsupported`. The diagnostic buffer carries a human-readable explanation including the rejected triple.
+
+The set of supported targets is the intersection of:
+- Targets the Zap-pinned Zig fork can compile.
+- Targets for which the Zap runtime has been ported (currently: `x86_64-linux-gnu`, `x86_64-macos-none`, `aarch64-linux-gnu`, `aarch64-macos-none`, `x86_64-windows-msvc`).
+
+A v1.x manager source is expected to support every Zap-supported target via the comptime branches shown in sections 14 and 15. Managers that target a subset of platforms guard the unsupported branches with `@compileError`.
 
 ---
 
