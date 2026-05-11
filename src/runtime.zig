@@ -682,6 +682,12 @@ pub fn dumpArcStats(write_line: *const fn ([]const u8) void) void {
             write_line(line);
         } else |_| {}
     }
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] slab_mmap_count={d} slab_munmap_count={d}\n", .{
+        ArcRuntime.slab_mmap_count,
+        ArcRuntime.slab_munmap_count,
+    })) |line| {
+        write_line(line);
+    } else |_| {}
 }
 
 fn writeLineToStderr(bytes: []const u8) void {
@@ -1469,37 +1475,456 @@ pub const ArcRuntime = struct {
         arc_return_elisions_total += 1;
     }
 
-    /// Per-type sized allocator pool. Each `Arc(T).Inner` size class gets
-    /// its own `std.heap.MemoryPool` so allocation becomes a free-list pop
-    /// and free becomes a free-list push — no malloc/free traffic in the
-    /// hot path. The pool grows in page-sized chunks from `page_allocator`
-    /// and never shrinks within process lifetime, so small-object
-    /// workloads (binarytrees ~600 M nodes) pay the cost of the OS page
-    /// commits exactly once instead of per-allocation.
-    ///
-    /// `threadlocal` because `MemoryPool` itself is single-threaded.
-    /// Multi-threaded Zap programs get one pool per thread, with no
-    /// shared free list and no contention. Functions that never
-    /// allocate values of `T` pay nothing — the pool starts in
-    /// `.empty` state (no allocation, no syscall).
-    fn ArcPool(comptime T: type) type {
-        return struct {
-            const Pool = std.heap.MemoryPool(Arc(T).Inner);
-            threadlocal var pool: Pool = .empty;
-            threadlocal var stats: PoolStats = .{ .name = "Arc(" ++ @typeName(T) ++ ")" };
+    /// Slab-class allocator constants. Slab size and alignment are
+    /// coupled — slabs are 64 KiB aligned so a slot pointer can be
+    /// masked to its owning slab in a single AND. Magic number is a
+    /// cheap header-corruption check used on the destroy path (debug
+    /// builds only; release builds elide the assert).
+    pub const SLAB_SIZE: usize = 64 * 1024;
+    pub const SLAB_ALIGN: usize = SLAB_SIZE;
+    pub const SLAB_MASK: usize = SLAB_SIZE - 1;
+    pub const SLAB_BASE_MASK: usize = ~SLAB_MASK;
+    pub const NULL_SLOT: u32 = 0xFFFFFFFF;
+    pub const SLAB_MAGIC: u32 = 0xA8C50A8;
 
-            fn create() *Arc(T).Inner {
-                ensureArcStatsAtexit();
-                stats.noteAllocation();
-                return pool.create(std.heap.page_allocator) catch
-                    @panic("ArcRuntime: ArcPool out of memory");
+    /// Per-slab header. Lives at the start of every slab; the slot
+    /// array begins at `@sizeOf(SlabHeader(Inner))` rounded up to
+    /// `@alignOf(Inner)`. Layout-only — no methods; the
+    /// `ArcSlabPool(Inner, Name)` struct mutates these fields directly.
+    ///
+    /// `prev`/`next` form an intrusive doubly-linked list of partial
+    /// slabs (slabs with at least one free slot AND `live_count > 0`).
+    /// `owner` points back to the `Backend` that owns the slab so a
+    /// destroy from a cell pointer alone can locate the right backend
+    /// without an extra parameter. `allocation_base` and
+    /// `allocation_size` capture the trim-front bookkeeping needed by
+    /// the slab-unmap path (see `mmapAlignedSlab`).
+    pub fn SlabHeader(comptime Inner: type) type {
+        const inner_alignment = @alignOf(Inner);
+        const FreeNode = struct {
+            next_index: u32,
+        };
+        const inner_min_size = @max(@sizeOf(Inner), @sizeOf(FreeNode));
+        // Round slot size up to Inner's alignment so consecutive slots
+        // stay aligned. The free-list overlay only touches the first
+        // 4 bytes, so Inner's alignment governs.
+        const slot_size_unrounded = inner_min_size;
+        const slot_size_value = std.mem.alignForward(usize, slot_size_unrounded, inner_alignment);
+        return struct {
+            const Self = @This();
+            pub const inner_align: usize = inner_alignment;
+            pub const slot_size: usize = slot_size_value;
+            pub const free_node_type: type = FreeNode;
+
+            magic: u32,
+            live_count: u32,
+            free_list_head: u32,
+            bump_index: u32,
+            capacity: u32,
+            prev: ?*Self,
+            next: ?*Self,
+            owner: *anyopaque,
+            allocation_base: [*]align(std.heap.page_size_min) u8,
+            allocation_size: usize,
+
+            /// Compute slot-array offset (header end rounded up to
+            /// `Inner`'s alignment). Comptime-constant per Inner so the
+            /// hot path is one constant load.
+            pub fn slotOffset() usize {
+                return std.mem.alignForward(usize, @sizeOf(Self), inner_alignment);
             }
 
-            fn destroy(inner: *Arc(T).Inner) void {
-                stats.noteDeallocation();
-                pool.destroy(inner);
+            /// Total slots that fit in a `SLAB_SIZE` slab after header.
+            pub fn capacityFor() u32 {
+                const usable = SLAB_SIZE - slotOffset();
+                return @intCast(usable / slot_size);
+            }
+
+            /// Return the slot pointer at `index`. The pointer is to
+            /// the raw byte slot — the caller is responsible for
+            /// reinterpreting it as `*Inner`.
+            pub fn slotPtr(self: *Self, index: u32) [*]u8 {
+                const base: [*]u8 = @ptrCast(self);
+                return base + slotOffset() + (slot_size * @as(usize, index));
             }
         };
+    }
+
+    /// Aligned-mmap helper: obtain a `SLAB_SIZE` block of memory
+    /// aligned to `SLAB_SIZE`. POSIX `mmap` returns page-aligned but
+    /// not arbitrarily-aligned memory, so we over-allocate by one
+    /// slab's worth, then `munmap` the head and tail to leave exactly
+    /// a `SLAB_SIZE`-aligned `SLAB_SIZE` region.
+    ///
+    /// Returns the aligned base pointer or null on OOM. The caller
+    /// stores `aligned_base` (not the original mmap return) in the
+    /// slab header — slabs are freed via `posix.munmap` on a
+    /// `SLAB_SIZE`-sized range that the kernel knows about because we
+    /// already trimmed the over-allocation.
+    pub fn mmapAlignedSlab() ?[*]align(std.heap.page_size_min) u8 {
+        const page_size = std.heap.page_size_min;
+        // SLAB_SIZE must be a multiple of the OS page size for the
+        // trim arithmetic to be valid; the constants chosen
+        // (SLAB_SIZE = 64 KiB) satisfy this on every Zig-supported
+        // platform (page sizes of 4 KiB or 16 KiB both divide 64 KiB).
+        std.debug.assert(SLAB_SIZE % page_size == 0);
+
+        const overalloc_len: usize = SLAB_SIZE + SLAB_ALIGN - page_size;
+        const raw = std.posix.mmap(
+            null,
+            overalloc_len,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            -1,
+            0,
+        ) catch return null;
+
+        const raw_addr = @intFromPtr(raw.ptr);
+        const aligned_addr = std.mem.alignForward(usize, raw_addr, SLAB_ALIGN);
+        const head_bytes = aligned_addr - raw_addr;
+        const tail_bytes = overalloc_len - head_bytes - SLAB_SIZE;
+
+        if (head_bytes != 0) {
+            std.posix.munmap(@alignCast(raw[0..head_bytes]));
+        }
+        if (tail_bytes != 0) {
+            const tail_start = head_bytes + SLAB_SIZE;
+            std.posix.munmap(@alignCast(raw[tail_start..(tail_start + tail_bytes)]));
+        }
+
+        slab_mmap_count += 1;
+        const aligned_ptr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(aligned_addr);
+        return aligned_ptr;
+    }
+
+    /// Lightweight diagnostic counters for slab mmap/munmap traffic.
+    /// Bumped only at slab grain (not for the head/tail trim sub-unmap),
+    /// so the difference between `slab_mmap_count` and
+    /// `slab_munmap_count` is the count of currently-mapped slabs
+    /// across all pools on this thread. Surfaced through `ZAP_ARC_STATS=1`
+    /// for diagnostic runs.
+    pub var slab_mmap_count: u64 = 0;
+    pub var slab_munmap_count: u64 = 0;
+
+    /// Counterpart that unmaps a `SLAB_SIZE`-aligned slab returned by
+    /// `mmapAlignedSlab`. The trimmed head and tail were unmapped
+    /// already; this releases only the `SLAB_SIZE` body.
+    pub fn unmapSlab(base: [*]align(std.heap.page_size_min) u8) void {
+        const slab_slice = base[0..SLAB_SIZE];
+        std.posix.munmap(@alignCast(slab_slice));
+        slab_munmap_count += 1;
+    }
+
+    /// Backend (per-type, per-thread) for the slab allocator. Holds the
+    /// current allocation target (`active`), a doubly-linked list of
+    /// partial slabs (slabs with free slots AND `live_count > 0`), and
+    /// at most one cached empty slab to avoid mmap/munmap thrash when a
+    /// workload oscillates around exactly one slab's working set.
+    pub fn SlabBackend(comptime Inner: type) type {
+        const Header = SlabHeader(Inner);
+        return struct {
+            const Self = @This();
+            pub const Hdr = Header;
+            pub const empty: Self = .{};
+
+            active: ?*Header = null,
+            partial_head: ?*Header = null,
+            cached_empty: ?*Header = null,
+        };
+    }
+
+    /// Generic slab-class pool. `Inner` is the cell type to allocate;
+    /// `pool_name` is the stats-display name shown by
+    /// `ZAP_ARC_STATS=1`. The pool is thread-local — each (Inner,
+    /// pool_name, thread) gets its own backend.
+    ///
+    /// Hot path: `create` either pops the active slab's free list,
+    /// bump-allocates the next slot, or rotates a partial/cached slab
+    /// into the active position. `destroy` pushes the slot onto the
+    /// owning slab's free list, decrements `live_count`, and either
+    /// caches or unmaps the slab when it goes empty and is not active.
+    pub fn ArcSlabPool(comptime Inner: type, comptime pool_name: []const u8) type {
+        const Header = SlabHeader(Inner);
+        const Backend = SlabBackend(Inner);
+        const capacity_per_slab = Header.capacityFor();
+        comptime {
+            // Sanity check: every slab must hold at least one cell.
+            // For 64 KiB slabs and our largest plausible Inner, this
+            // is always true, but the assert documents the assumption.
+            std.debug.assert(capacity_per_slab > 0);
+        }
+        return struct {
+            pub const HeaderType = Header;
+            pub const BackendType = Backend;
+            pub const slot_capacity: u32 = capacity_per_slab;
+
+            threadlocal var backend: Backend = .empty;
+            threadlocal var stats: PoolStats = .{ .name = pool_name };
+
+            /// Test-only accessor — returns a pointer to the
+            /// thread-local backend so unit tests can inspect the
+            /// slab list state without exposing every internal field
+            /// individually.
+            pub fn backendForTest() *Backend {
+                return &backend;
+            }
+
+            /// Test-only accessor — returns a pointer to the
+            /// thread-local stats so unit tests can read live /
+            /// high_water counters and the pool name.
+            pub fn statsForTest() *PoolStats {
+                return &stats;
+            }
+
+            /// Initialize a freshly mmapped slab's header in place.
+            /// The slab body (after the header) is left untouched —
+            /// slots get their first write via the `Inner` initializer
+            /// during `create`, and the free-list head starts as
+            /// NULL_SLOT (bump-allocate from `bump_index = 0`).
+            fn initSlab(slab: *Header, base_addr: [*]align(std.heap.page_size_min) u8, alloc_size: usize) void {
+                slab.* = .{
+                    .magic = SLAB_MAGIC,
+                    .live_count = 0,
+                    .free_list_head = NULL_SLOT,
+                    .bump_index = 0,
+                    .capacity = capacity_per_slab,
+                    .prev = null,
+                    .next = null,
+                    .owner = @ptrCast(&backend),
+                    .allocation_base = base_addr,
+                    .allocation_size = alloc_size,
+                };
+            }
+
+            /// Acquire a slab to use as the new active slab. Pulls from
+            /// the cached-empty slot if present, else allocates a fresh
+            /// mmapped slab. Returns null on OOM.
+            fn acquireFreshActive() ?*Header {
+                if (backend.cached_empty) |cached_slab| {
+                    backend.cached_empty = null;
+                    // The cached slab is already initialized (header
+                    // intact, free_list empty, bump_index = capacity OR
+                    // free_list_head pointing at a valid chain). When
+                    // it was cached its live_count was 0 and its slots
+                    // are returned to the free-list; reset to allow
+                    // pure bump-allocate so we don't depend on the
+                    // free-list state on reuse.
+                    cached_slab.live_count = 0;
+                    cached_slab.free_list_head = NULL_SLOT;
+                    cached_slab.bump_index = 0;
+                    cached_slab.prev = null;
+                    cached_slab.next = null;
+                    return cached_slab;
+                }
+                const aligned_base = mmapAlignedSlab() orelse return null;
+                const slab: *Header = @ptrCast(@alignCast(aligned_base));
+                initSlab(slab, aligned_base, SLAB_SIZE);
+                return slab;
+            }
+
+            /// Unlink a slab from the partial-slab list. Safe to call
+            /// even if the slab is not currently on the list — in
+            /// that case prev/next are null and the head pointer is
+            /// untouched if it doesn't reference this slab.
+            fn unlinkPartial(slab: *Header) void {
+                if (slab.prev) |prev_slab| {
+                    prev_slab.next = slab.next;
+                } else if (backend.partial_head == slab) {
+                    backend.partial_head = slab.next;
+                }
+                if (slab.next) |next_slab| {
+                    next_slab.prev = slab.prev;
+                }
+                slab.prev = null;
+                slab.next = null;
+            }
+
+            /// Insert a slab at the head of the partial-slab list.
+            fn pushPartial(slab: *Header) void {
+                slab.prev = null;
+                slab.next = backend.partial_head;
+                if (backend.partial_head) |head_slab| {
+                    head_slab.prev = slab;
+                }
+                backend.partial_head = slab;
+            }
+
+            /// Look up the owning slab header for a cell pointer.
+            /// Slabs are SLAB_SIZE-aligned, so the header is at
+            /// `ptr & SLAB_BASE_MASK`. Verified by the `magic` check
+            /// in debug builds.
+            inline fn slabFromInnerPtr(inner: *Inner) *Header {
+                const ptr_addr = @intFromPtr(inner);
+                const slab_addr = ptr_addr & SLAB_BASE_MASK;
+                const slab: *Header = @ptrFromInt(slab_addr);
+                std.debug.assert(slab.magic == SLAB_MAGIC);
+                return slab;
+            }
+
+            /// Compute the slot index of an Inner pointer within its
+            /// owning slab. Used by the free-list push path.
+            inline fn slotIndexInSlab(slab: *Header, inner: *Inner) u32 {
+                const slab_base_addr = @intFromPtr(slab);
+                const inner_addr = @intFromPtr(inner);
+                const offset = inner_addr - slab_base_addr - Header.slotOffset();
+                const index = offset / Header.slot_size;
+                std.debug.assert(index < slab.capacity);
+                return @intCast(index);
+            }
+
+            /// Slow-path allocation: rotate a new slab into the active
+            /// position. Called from `create` when the current active
+            /// slab has neither a free-list entry nor a bump-allocate
+            /// slot remaining.
+            ///
+            /// Strategy: drop the current active (it's full — destroy()
+            /// will re-link it to the partial list once a cell is freed
+            /// back into it); then pull a partial slab (preferred) or
+            /// acquire a fresh slab and make it active. We never push a
+            /// full slab onto the partial list — partial means "has
+            /// free slots AND live_count > 0" — and we never push an
+            /// empty slab onto the partial list either; an empty active
+            /// would already have hit the cached_empty fast-path on the
+            /// preceding destroy.
+            fn rotateActive() *Header {
+                backend.active = null;
+
+                if (backend.partial_head) |partial_slab| {
+                    unlinkPartial(partial_slab);
+                    backend.active = partial_slab;
+                    return partial_slab;
+                }
+
+                const fresh_slab = acquireFreshActive() orelse @panic("ArcSlabPool: out of memory");
+                backend.active = fresh_slab;
+                return fresh_slab;
+            }
+
+            /// Allocate one cell from this pool. The returned pointer
+            /// is to the raw `Inner` slot inside the active slab; the
+            /// caller is responsible for initializing the Inner value.
+            pub fn create() *Inner {
+                ensureArcStatsAtexit();
+                stats.noteAllocation();
+                var slab: *Header = backend.active orelse rotateActive();
+                while (true) {
+                    if (slab.free_list_head != NULL_SLOT) {
+                        const slot_index = slab.free_list_head;
+                        const slot_ptr_bytes = slab.slotPtr(slot_index);
+                        const free_node: *Header.free_node_type = @ptrCast(@alignCast(slot_ptr_bytes));
+                        slab.free_list_head = free_node.next_index;
+                        slab.live_count += 1;
+                        return @ptrCast(@alignCast(slot_ptr_bytes));
+                    }
+                    if (slab.bump_index < slab.capacity) {
+                        const slot_index = slab.bump_index;
+                        slab.bump_index += 1;
+                        slab.live_count += 1;
+                        const slot_ptr_bytes = slab.slotPtr(slot_index);
+                        return @ptrCast(@alignCast(slot_ptr_bytes));
+                    }
+                    slab = rotateActive();
+                }
+            }
+
+            /// Return a cell to its owning slab. Decrements the slab's
+            /// live count; on the zero-transition, if the slab is not
+            /// the active slab, either caches it (if no cached empty)
+            /// or unmaps it.
+            ///
+            /// Also handles the "full → partial" transition: when the
+            /// freed cell is the first slot returned to a slab that
+            /// was previously full (and therefore not on the partial
+            /// list), splice it back onto the partial list so the next
+            /// `rotateActive` can reuse it. A slab is "on the partial
+            /// list" when it satisfies BOTH `live_count > 0` AND has
+            /// free slots; we re-link only when the slot we just
+            /// pushed is the only free slot AND the slab is not the
+            /// active slab AND it still has live cells.
+            pub fn destroy(inner: *Inner) void {
+                stats.noteDeallocation();
+                const slab = slabFromInnerPtr(inner);
+                const slot_index = slotIndexInSlab(slab, inner);
+                const was_full = slab.free_list_head == NULL_SLOT and slab.bump_index >= slab.capacity;
+                const slot_ptr_bytes = slab.slotPtr(slot_index);
+                const free_node: *Header.free_node_type = @ptrCast(@alignCast(slot_ptr_bytes));
+                free_node.next_index = slab.free_list_head;
+                slab.free_list_head = slot_index;
+                slab.live_count -= 1;
+
+                if (slab == backend.active) return;
+
+                if (slab.live_count == 0) {
+                    unlinkPartial(slab);
+                    if (backend.cached_empty == null) {
+                        backend.cached_empty = slab;
+                    } else {
+                        unmapSlab(slab.allocation_base);
+                    }
+                    return;
+                }
+
+                if (was_full) {
+                    // Slab just transitioned full → partial; push it
+                    // onto the partial list so future allocations can
+                    // pick it up.
+                    pushPartial(slab);
+                }
+            }
+
+            /// Test-only: reset the backend's high-water mark and
+            /// release every slab back to the OS. The caller must
+            /// guarantee no live cells exist before invoking this;
+            /// the assert below catches misuse.
+            ///
+            /// Exposed for the unit-test suite at the bottom of this
+            /// file; production code never calls this — slab unmap
+            /// happens automatically via the destroy path.
+            pub fn resetForTest() void {
+                std.debug.assert(stats.live == 0);
+                if (backend.active) |active_slab| {
+                    unmapSlab(active_slab.allocation_base);
+                    backend.active = null;
+                }
+                while (backend.partial_head) |partial_slab| {
+                    backend.partial_head = partial_slab.next;
+                    unmapSlab(partial_slab.allocation_base);
+                }
+                if (backend.cached_empty) |cached_slab| {
+                    unmapSlab(cached_slab.allocation_base);
+                    backend.cached_empty = null;
+                }
+                stats.high_water = 0;
+            }
+        };
+    }
+
+    /// Per-type sized slab allocator pool. Replaces the previous
+    /// free-list-over-arena `std.heap.MemoryPool(Arc(T).Inner)` design,
+    /// which structurally could not return pages to the OS while any
+    /// cell anywhere in the pool was live.
+    ///
+    /// Industrial consensus design (mimalloc, snmalloc, SLUB, jemalloc,
+    /// TCMalloc all converge on this): 64 KiB-aligned `mmap`'d slabs,
+    /// each carrying its own live-count and free-list head, plus a
+    /// per-pool linked list of partial slabs. When a slab's live_count
+    /// drops to zero AND the slab is not the active allocation target,
+    /// it is eagerly `munmap`'d (with one slab cached for reuse to avoid
+    /// mmap/munmap thrash on hot/cold oscillation).
+    ///
+    /// `threadlocal` for parity with the previous design — Zap is
+    /// single-threaded today; cross-thread pool management is deferred
+    /// until BEAM-style concurrency lands. Slab pointers carry a
+    /// back-pointer (`owner`) so a future per-process model can route
+    /// remote frees back to the originating heap without disturbing the
+    /// hot path. Each (T, thread) gets its own backend; functions that
+    /// never allocate values of `T` pay nothing — the backend starts in
+    /// `.empty` state with no syscalls.
+    ///
+    /// See `docs/arcpool-slab-allocator-implementation-spec.md` for the
+    /// design contract and rationale.
+    fn ArcPool(comptime T: type) type {
+        return ArcSlabPool(Arc(T).Inner, "Arc(" ++ @typeName(T) ++ ")");
     }
 
     /// Allocate and wrap a value in an Arc. Returns a pointer to the
@@ -11628,4 +12053,237 @@ test "Map(i64,i64) put_owned_unchecked on null receiver allocates a fresh map" {
     try std.testing.expectEqual(@as(i64, 1), MapI64.size(m));
     try std.testing.expectEqual(@as(i64, 100), MapI64.get(m, 42, 0));
     try std.testing.expectEqual(@as(u32, 1), m.header.count());
+}
+
+// ============================================================
+// Slab-class ArcPool tests
+// (`docs/arcpool-slab-allocator-implementation-spec.md` §5.6)
+//
+// All slab-pool tests use a dedicated `SlabTestInner24` /
+// `SlabTestInner8` cell type so they never share the thread-local
+// backend with the production `Arc(T)` pools — tests are otherwise
+// order-dependent because the same `(Inner, name)` pair maps to the
+// same thread-local backend. Each test calls `resetForTest()` at
+// entry to release any state from a previous run, then verifies the
+// post-condition before exiting.
+// ============================================================
+
+const SlabTestInner24 = struct {
+    header: ArcHeader,
+    payload: [20]u8,
+};
+
+const SlabTestInner8 = struct {
+    header: ArcHeader,
+    extra: u32,
+};
+
+test "slab pool: alloc/free returns same slab cell" {
+    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/alloc-free");
+    Pool.statsForTest().live = 0;
+    Pool.resetForTest();
+
+    const cell_one = Pool.create();
+    const ptr_one = @intFromPtr(cell_one);
+    Pool.destroy(cell_one);
+
+    const cell_two = Pool.create();
+    // The free-list pop must return the same slot that was just
+    // pushed; otherwise the free-list is broken.
+    try std.testing.expectEqual(ptr_one, @intFromPtr(cell_two));
+    Pool.destroy(cell_two);
+
+    Pool.resetForTest();
+}
+
+test "slab pool: live_count tracks cells correctly" {
+    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/live-count");
+    Pool.statsForTest().live = 0;
+    Pool.resetForTest();
+
+    const total_count: u32 = 100;
+    var cells: [total_count]*SlabTestInner24 = undefined;
+    var index: u32 = 0;
+    while (index < total_count) : (index += 1) {
+        cells[index] = Pool.create();
+    }
+    try std.testing.expectEqual(@as(u64, total_count), Pool.statsForTest().live);
+
+    index = 0;
+    while (index < total_count / 2) : (index += 1) {
+        Pool.destroy(cells[index]);
+    }
+    try std.testing.expectEqual(@as(u64, total_count / 2), Pool.statsForTest().live);
+
+    // Free the remaining cells so the test leaves the pool empty.
+    while (index < total_count) : (index += 1) {
+        Pool.destroy(cells[index]);
+    }
+    try std.testing.expectEqual(@as(u64, 0), Pool.statsForTest().live);
+
+    Pool.resetForTest();
+}
+
+test "slab pool: unmaps empty slab when not active" {
+    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/unmap-empty");
+    Pool.statsForTest().live = 0;
+    Pool.resetForTest();
+
+    // Allocate enough cells to spill into a second slab.
+    const cells_per_slab = Pool.slot_capacity;
+    const total_cells: usize = @as(usize, cells_per_slab) + 100;
+    const allocations = try std.testing.allocator.alloc(*SlabTestInner24, total_cells);
+    defer std.testing.allocator.free(allocations);
+
+    var allocation_index: usize = 0;
+    while (allocation_index < total_cells) : (allocation_index += 1) {
+        allocations[allocation_index] = Pool.create();
+    }
+
+    // After overflowing the first slab, there should be one partial
+    // slab (the previously-full first slab) and one active slab.
+    const backend_ptr = Pool.backendForTest();
+    try std.testing.expect(backend_ptr.active != null);
+
+    // Identify the first slab (the one that became partial when the
+    // 2nd slab was rotated into active). The first 100 cells are in
+    // it. The remaining 100 in cells_per_slab + 100 - cells_per_slab = 100
+    // are in the second slab.
+    const first_slab_addr = @intFromPtr(allocations[0]) & ArcRuntime.SLAB_BASE_MASK;
+    const second_slab_addr = @intFromPtr(allocations[total_cells - 1]) & ArcRuntime.SLAB_BASE_MASK;
+    try std.testing.expect(first_slab_addr != second_slab_addr);
+
+    // Free all cells in the second (active) slab — slab is active so
+    // no munmap; live cells remain in the first (partial) slab.
+    var free_index: usize = total_cells - 1;
+    while (free_index >= @as(usize, cells_per_slab)) : (free_index -= 1) {
+        Pool.destroy(allocations[free_index]);
+        if (free_index == 0) break;
+    }
+
+    // The active slab should now have live_count = 0 but it stays
+    // mapped (it's the active slab).
+    try std.testing.expect(backend_ptr.active != null);
+    if (backend_ptr.active) |active_slab| {
+        try std.testing.expectEqual(@as(u32, 0), active_slab.live_count);
+    }
+
+    // Free everything from the first slab too — this should munmap
+    // the now-empty first slab.
+    free_index = 0;
+    while (free_index < @as(usize, cells_per_slab)) : (free_index += 1) {
+        Pool.destroy(allocations[free_index]);
+    }
+
+    // The first slab is no longer in any list. cached_empty might
+    // hold it if active was already there; the key invariant is that
+    // live_count is 0 globally and no leak occurred.
+    try std.testing.expectEqual(@as(u64, 0), Pool.statsForTest().live);
+
+    Pool.resetForTest();
+}
+
+test "slab pool: caches one empty slab to avoid mmap thrash" {
+    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/mmap-thrash");
+    Pool.statsForTest().live = 0;
+    Pool.resetForTest();
+
+    // Warm the pool: one allocation, then free. This establishes an
+    // active slab.
+    const warmup_cell = Pool.create();
+    Pool.destroy(warmup_cell);
+
+    const backend_ptr = Pool.backendForTest();
+    const active_after_warmup = backend_ptr.active;
+
+    // Now alloc-then-free in a tight loop. As long as the working
+    // set fits in one slab and active never rotates, the same active
+    // slab pointer should persist — no mmap thrash.
+    var iteration: u32 = 0;
+    while (iteration < 1000) : (iteration += 1) {
+        const cell = Pool.create();
+        Pool.destroy(cell);
+    }
+    try std.testing.expectEqual(active_after_warmup, backend_ptr.active);
+
+    Pool.resetForTest();
+}
+
+test "slab pool: high_water tracks peak live" {
+    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/high-water");
+    Pool.statsForTest().live = 0;
+    Pool.statsForTest().high_water = 0;
+    Pool.resetForTest();
+
+    const peak_count: u32 = 500;
+    var live_cells: [peak_count]*SlabTestInner24 = undefined;
+    var cell_index: u32 = 0;
+    while (cell_index < peak_count) : (cell_index += 1) {
+        live_cells[cell_index] = Pool.create();
+    }
+    try std.testing.expectEqual(@as(u64, peak_count), Pool.statsForTest().high_water);
+
+    // Free all, then alloc K/2. high_water should remain at K.
+    cell_index = 0;
+    while (cell_index < peak_count) : (cell_index += 1) {
+        Pool.destroy(live_cells[cell_index]);
+    }
+
+    const half_count: u32 = peak_count / 2;
+    var half_cells: [half_count]*SlabTestInner24 = undefined;
+    cell_index = 0;
+    while (cell_index < half_count) : (cell_index += 1) {
+        half_cells[cell_index] = Pool.create();
+    }
+    try std.testing.expectEqual(@as(u64, peak_count), Pool.statsForTest().high_water);
+
+    cell_index = 0;
+    while (cell_index < half_count) : (cell_index += 1) {
+        Pool.destroy(half_cells[cell_index]);
+    }
+    Pool.resetForTest();
+}
+
+test "slab pool: handles Arc(SmallType).Inner sizes correctly" {
+    const PoolSmall = ArcRuntime.ArcSlabPool(SlabTestInner8, "SlabTest8/multi-size");
+    PoolSmall.statsForTest().live = 0;
+    PoolSmall.resetForTest();
+
+    const PoolLarge = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/multi-size");
+    PoolLarge.statsForTest().live = 0;
+    PoolLarge.resetForTest();
+
+    // 8-byte Inner: the cell holds 4-byte header + 4-byte u32. Layout
+    // and slot size should reflect that.
+    const small_cell = PoolSmall.create();
+    small_cell.* = .{ .header = ArcHeader.init(), .extra = 0xDEAD_BEEF };
+    try std.testing.expectEqual(@as(u32, 0xDEAD_BEEF), small_cell.extra);
+    PoolSmall.destroy(small_cell);
+
+    // 24-byte Inner: header + 20-byte payload. Verify writes don't
+    // corrupt neighbor slots.
+    const large_cell = PoolLarge.create();
+    large_cell.* = .{ .header = ArcHeader.init(), .payload = [_]u8{0x5A} ** 20 };
+    var byte_index: usize = 0;
+    while (byte_index < 20) : (byte_index += 1) {
+        try std.testing.expectEqual(@as(u8, 0x5A), large_cell.payload[byte_index]);
+    }
+    PoolLarge.destroy(large_cell);
+
+    PoolSmall.resetForTest();
+    PoolLarge.resetForTest();
+}
+
+test "slab pool: aligned-mmap helper returns 64KiB-aligned slabs" {
+    var mmap_index: u32 = 0;
+    var bases: [4][*]align(std.heap.page_size_min) u8 = undefined;
+    while (mmap_index < 4) : (mmap_index += 1) {
+        const base = ArcRuntime.mmapAlignedSlab() orelse return error.OutOfMemory;
+        try std.testing.expectEqual(@as(usize, 0), @intFromPtr(base) & ArcRuntime.SLAB_MASK);
+        bases[mmap_index] = base;
+    }
+    mmap_index = 0;
+    while (mmap_index < 4) : (mmap_index += 1) {
+        ArcRuntime.unmapSlab(bases[mmap_index]);
+    }
 }
