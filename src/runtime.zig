@@ -3054,6 +3054,31 @@ test "String.compare orders bytes lexicographically" {
 // String — String utilities
 // ============================================================
 
+/// Interned 256-byte table for single-byte string returns. Indexed by
+/// the byte value, each `byte_intern_table[b..b+1]` is a stable
+/// `[]const u8` slice of length 1 holding the byte `b`. Used by
+/// `String.byte_at`, `String.from_byte`, and `String.next` to avoid
+/// allocating a fresh 1-byte slice through `bumpAlloc` on every call
+/// — a load-bearing optimization for benchmarks that walk a string
+/// byte-by-byte (e.g., k-nucleotide reads each base of a ~250 KB
+/// FASTA sequence 46×, producing ~11.5M would-be arena allocations
+/// that pin pages until process exit on macOS where `mremap` is
+/// absent and the arena's `realloc` orphans nodes instead of growing
+/// them).
+///
+/// Lives in `.rodata` (constant initializer evaluated at compile
+/// time), so it costs zero startup work and has a process-lifetime
+/// lifetime — slices into it are safe to return from any helper
+/// because the table itself never moves or expires.
+const byte_intern_table: [256]u8 = init: {
+    var table: [256]u8 = undefined;
+    var b: u32 = 0;
+    while (b < 256) : (b += 1) {
+        table[b] = @intCast(b);
+    }
+    break :init table;
+};
+
 pub const String = struct {
     /// Convert a string to an atom, creating it if it doesn't exist.
     pub fn to_atom(name: []const u8) u32 {
@@ -3118,10 +3143,14 @@ pub const String = struct {
     pub fn byte_at(s: []const u8, index: i64) []const u8 {
         const i: usize = if (index >= 0) @intCast(index) else return "";
         if (i >= s.len) return "";
-        const result = bumpAlloc(1);
-        if (result.len == 0) return "";
-        result[0] = s[i];
-        return result;
+        // Return a slice into the process-lifetime interned table so
+        // walking a string byte-by-byte does not pin one bump-arena
+        // page per byte. The slice is byte-identical to a fresh
+        // `bumpAlloc(1)` result — same content, same length — but
+        // shared across all `byte_at` invocations for the same byte
+        // value.
+        const b = s[i];
+        return byte_intern_table[b .. b + 1];
     }
 
     /// Construct a one-byte string from an integer 0..255. The inverse
@@ -3130,10 +3159,8 @@ pub const String = struct {
     /// range input. Lets Zap code emit raw binary (e.g., PBM image
     /// data) without needing a Zig primitive at the call site.
     pub fn from_byte(byte: i64) []const u8 {
-        const result = bumpAlloc(1);
-        if (result.len == 0) return "";
-        result[0] = @intCast(@as(u64, @bitCast(byte)) & 0xFF);
-        return result;
+        const b: u8 = @intCast(@as(u64, @bitCast(byte)) & 0xFF);
+        return byte_intern_table[b .. b + 1];
     }
 
     /// Lexicographic byte-wise comparison. Returns a negative integer
@@ -3155,12 +3182,14 @@ pub const String = struct {
     /// state — each call returns the first byte (as a single-character
     /// string) and the remaining slice. This lets `for ch <- "hello"`
     /// dispatch through `Enumerable.next/1` like every other container.
+    ///
+    /// Returns a slice into the process-lifetime interned table for
+    /// the head byte (see `byte_intern_table`) so iterators don't
+    /// pin one bump-arena page per character.
     pub fn next(s: []const u8) struct { u32, []const u8, []const u8 } {
         if (s.len == 0) return .{ ATOM_DONE, "", s };
-        const head = bumpAlloc(1);
-        if (head.len == 0) return .{ ATOM_DONE, "", s };
-        head[0] = s[0];
-        return .{ ATOM_CONT, head, s[1..] };
+        const b = s[0];
+        return .{ ATOM_CONT, byte_intern_table[b .. b + 1], s[1..] };
     }
 
     pub fn upcase(s: []const u8) []const u8 {
