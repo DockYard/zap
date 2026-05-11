@@ -1017,9 +1017,22 @@ pub const PerceusAnalyzer = struct {
 
         switch (instr.*) {
             .case_block => |cb| {
-                // For each arm, generate a specialized drop for the known constructor
+                // For each arm, generate a specialized drop for the
+                // known constructor. The drops must run only when the
+                // arm matches — they release the field bindings the
+                // arm extracted — so the InsertionPoint targets the
+                // *arm's body stream* at its end, not the parent
+                // stream after the case_block.
                 for (cb.arms, 0..) |arm, arm_idx| {
                     const field_drops = try self.extractFieldDropsFromArm(func, &arm);
+                    var arm_path: std.ArrayListUnmanaged(lattice.StreamStep) = .empty;
+                    defer arm_path.deinit(self.allocator);
+                    try arm_path.appendSlice(self.allocator, decon.path);
+                    try arm_path.append(self.allocator, .{
+                        .parent_instr_index = decon.instr_index,
+                        .child = .{ .case_block_arm_body = @intCast(arm_idx) },
+                    });
+                    const arm_body_len: u32 = @intCast(arm.body_instrs.len);
                     try self.drop_specializations.append(self.allocator, .{
                         .match_site = decon.match_site_id,
                         .constructor_tag = @intCast(arm_idx),
@@ -1028,13 +1041,16 @@ pub const PerceusAnalyzer = struct {
                         .insertion_point = .{
                             .function = func.id,
                             .block = decon.block,
-                            .path = try self.allocator.dupe(lattice.StreamStep, decon.path),
-                            .instr_index = decon.instr_index,
-                            .position = .after,
+                            .path = try self.allocator.dupe(lattice.StreamStep, arm_path.items),
+                            .instr_index = arm_body_len,
+                            .position = .before,
                         },
                     });
 
-                    // Generate ARC release operations for each field drop
+                    // Per-field arc_ops mirror the spec: they fire
+                    // at the end of the matching arm body so the
+                    // unmatched arms' field bindings never observe a
+                    // spurious release.
                     for (field_drops) |_| {
                         try self.arc_ops.append(self.allocator, .{
                             .kind = .release,
@@ -1042,9 +1058,9 @@ pub const PerceusAnalyzer = struct {
                             .insertion_point = .{
                                 .function = func.id,
                                 .block = decon.block,
-                                .path = try self.allocator.dupe(lattice.StreamStep, decon.path),
-                                .instr_index = decon.instr_index,
-                                .position = .after,
+                                .path = try self.allocator.dupe(lattice.StreamStep, arm_path.items),
+                                .instr_index = arm_body_len,
+                                .position = .before,
                             },
                             .reason = .perceus_drop,
                         });

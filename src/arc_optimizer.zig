@@ -195,14 +195,19 @@ pub const ArcOptimizer = struct {
             }
         }
 
-        // Apply removals.
+        // Apply removals. Each dropped ArcOperation owns an
+        // `insertion_point.path` slice — free it before discarding
+        // the op, otherwise the path leaks (the context's deinit
+        // only walks the surviving entries in `arc_ops`).
         if (remove_set.count() > 0) {
             var kept: std.ArrayList(lattice.ArcOperation) = .empty;
             defer kept.deinit(self.allocator);
             for (ops, 0..) |op, i| {
-                if (!remove_set.contains(i)) {
-                    try kept.append(self.allocator, op);
+                if (remove_set.contains(i)) {
+                    self.allocator.free(op.insertion_point.path);
+                    continue;
                 }
+                try kept.append(self.allocator, op);
             }
             self.ctx.arc_ops.clearRetainingCapacity();
             for (kept.items) |op| {
@@ -282,8 +287,10 @@ pub const ArcOptimizer = struct {
     // --------------------------------------------------------
 
     fn computeOptimizedPlacements(self: *ArcOptimizer) !void {
-        // For each existing ARC operation in the context, check if it can
-        // be eliminated or moved.
+        // For each existing ARC operation in the context, check if
+        // it can be eliminated or moved. Dropped ops own their
+        // `insertion_point.path` slice — free it before discarding
+        // so the context's deinit doesn't miss them.
         for (self.ctx.arc_ops.items) |op| {
             const vkey = lattice.ValueKey{
                 .function = op.insertion_point.function,
@@ -291,7 +298,10 @@ pub const ArcOptimizer = struct {
             };
 
             // If this value can skip ARC, don't emit the operation.
-            if (self.skip_arc.contains(vkey)) continue;
+            if (self.skip_arc.contains(vkey)) {
+                self.allocator.free(op.insertion_point.path);
+                continue;
+            }
 
             // Otherwise, keep the operation as-is.
             try self.optimized_ops.append(self.allocator, op);
