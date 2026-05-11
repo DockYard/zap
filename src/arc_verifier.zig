@@ -853,6 +853,24 @@ fn verifyInstruction(
         // (.copy_value, .move_value, .share_value) above DO require
         // ARC-managed sources/dests.
         .borrow_value => {},
+        // Perceus reset/reuse_alloc: the `.reset` op produces a fresh
+        // reuse-token local (allocated by arc_materialize's
+        // LocalAllocator as `.owned`) and consumes the deconstruction
+        // site's scrutinee local. The `.reuse_alloc` op produces the
+        // newly-allocated construction destination and (optionally)
+        // consumes a reuse token. Source/dest LocalIds must be non-
+        // trivial for the seed walk in arc_liveness.identifyArcLocals
+        // to find them.
+        .reset => |r| {
+            try checkLocalIsArcManaged(function, r.dest, "reset", "dest");
+            try checkLocalIsArcManaged(function, r.source, "reset", "source");
+        },
+        .reuse_alloc => |ra| {
+            try checkLocalIsArcManaged(function, ra.dest, "reuse_alloc", "dest");
+            if (ra.token) |token| {
+                try checkLocalIsArcManaged(function, token, "reuse_alloc", "token");
+            }
+        },
         else => {},
     }
     // V1-V7 follow on the same instruction. Re-dispatch on a separate
