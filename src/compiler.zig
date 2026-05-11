@@ -2305,6 +2305,13 @@ fn runArcOwnershipAndVerify(
 /// struct merged (`compileStructByStruct`) pipelines so both
 /// entry points lower analysis records into canonical IR before
 /// ZIR emission.
+///
+/// After materialization mutates each function's IR, re-runs the
+/// V1-V11 invariants + V8/V9 reachability checks so any defect
+/// introduced by the rewrite (wrong-path placement, fresh-LocalId
+/// classification drift, retains without matching releases in
+/// nested arms) is caught at compile time instead of leaking into
+/// ZIR.
 fn materializeAnalysisArcOps(
     alloc: std.mem.Allocator,
     program: *ir.Program,
@@ -2313,6 +2320,33 @@ fn materializeAnalysisArcOps(
     for (program.functions, 0..) |_, fi| {
         const function: *ir.Function = @constCast(&program.functions[fi]);
         zap.arc_materialize.materializeAnalysisArcOps(alloc, function, analysis_context) catch return error.IrFailed;
+    }
+    try runArcVerifier(alloc, program);
+}
+
+/// Run V1-V11 (fixpoint) + V8/V9 (post-drop reachability) over
+/// every function in `program`. Recomputes the interprocedural
+/// uniqueness summary fresh against the current IR shape, so it's
+/// safe to call after any pass that mutates the IR (drop insertion,
+/// analysis-record materialization, etc.).
+fn runArcVerifier(
+    alloc: std.mem.Allocator,
+    program: *ir.Program,
+) CompileError!void {
+    var program_uniqueness = zap.uniqueness_interprocedural.analyzeProgram(alloc, program) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer program_uniqueness.deinit(alloc);
+
+    for (program.functions) |*function| {
+        zap.arc_verifier.verifyWithFixpoint(alloc, function, program, &program_uniqueness) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ArcInvariantViolation => return error.IrFailed,
+        };
+        zap.arc_verifier.verifyPostDropInsertion(alloc, function, program) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ArcInvariantViolation => return error.IrFailed,
+        };
     }
 }
 
