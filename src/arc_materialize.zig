@@ -172,15 +172,6 @@ pub fn materializeAnalysisArcOps(
     // stay out of the consumed set and land in the remainder.
     for (analysis_context.arc_ops.items, 0..) |op, src_idx| {
         if (op.insertion_point.function != function.id) continue;
-        // `perceus_drop` arc_ops are vestigial duplicates of
-        // `drop_specializations` — they target the whole scrutinee
-        // and would double-emit a release that the spec's per-field
-        // drops already cover. The legacy emit helper
-        // (`emitAnalysisArcOps`) skipped them via the explicit
-        // `op.reason == .perceus_drop` filter; preserve that
-        // semantics here so deleting the helper is a no-op net
-        // change to the produced IR.
-        if (op.reason == .perceus_drop) continue;
         const new_instr: ir.Instruction = switch (op.kind) {
             .retain => .{ .retain = .{ .value = op.value } },
             .release => .{ .release = .{ .value = op.value } },

@@ -3649,15 +3649,15 @@ fn v10CountForbiddenEmissions(source: []const u8, verbose: bool) usize {
 ///        (zir_builder.zig)
 ///
 ///   Class C-residual violations (Phase 3 Part B — pending):
-///     7. early `.struct_init` reuse path: 1 × "reuseAllocByType"
-///        — emitted INLINE during struct_init lowering when a
+///     7. `.tuple_init` reuse path: 1 × "reuseAllocByType"
+///        — emitted INLINE during tuple_init lowering when a
 ///        matching `reuse_pair` is found. Needs to be replaced
-///        by a pre-pass that rewrites the `struct_init`
+///        by a pre-pass that rewrites the `tuple_init`
 ///        instruction itself to `.reuse_alloc` + per-field stores
 ///        in IR.
-///     8. `.struct_init` reuse-pair (typed): same shape as #7,
-///        named-struct path.
-///     9. `.union_init` reuse-pair: same shape as #7 for union
+///     8. `.struct_init` reuse path: same shape as #7 for named
+///        struct types.
+///     9. `.union_init` reuse path: same shape as #7 for union
 ///        variants.
 ///
 ///   `.release` IR handler also emits `noteReturnElision` (a counter

@@ -1046,25 +1046,6 @@ pub const PerceusAnalyzer = struct {
                             .position = .before,
                         },
                     });
-
-                    // Per-field arc_ops mirror the spec: they fire
-                    // at the end of the matching arm body so the
-                    // unmatched arms' field bindings never observe a
-                    // spurious release.
-                    for (field_drops) |_| {
-                        try self.arc_ops.append(self.allocator, .{
-                            .kind = .release,
-                            .value = decon.scrutinee,
-                            .insertion_point = .{
-                                .function = func.id,
-                                .block = decon.block,
-                                .path = try self.allocator.dupe(lattice.StreamStep, arm_path.items),
-                                .instr_index = arm_body_len,
-                                .position = .before,
-                            },
-                            .reason = .perceus_drop,
-                        });
-                    }
                 }
             },
             .if_expr => {
