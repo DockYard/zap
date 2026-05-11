@@ -72,6 +72,68 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const escape_lattice = @import("escape_lattice.zig");
 
+/// Allocator for fresh `LocalId`s materialized into a function during
+/// the ARC-record lowering pass. Mirrors `Lean 4`'s `mkFresh`, Roc's
+/// `gen_unique`, Cranelift's `declare_var`, and Swift `SILBuilder`'s
+/// fresh-variable mechanism: a single source of new IDs that grows the
+/// function's local-slot space monotonically and extends the dense
+/// `local_ownership` slice in lock-step so every downstream pass that
+/// indexes by LocalId still sees a well-formed function.
+///
+/// Usage: `init(function, allocator)` → `alloc(ownership)` per fresh ID
+/// → `commit()` once after all allocations land. The `commit` step
+/// rewrites `function.local_ownership` to a freshly-allocated slice
+/// holding the original ownership entries plus one entry per
+/// allocated ID. Without `commit`, `local_count` is bumped but the
+/// ownership table stays stale.
+pub const LocalAllocator = struct {
+    function: *ir.Function,
+    allocator: std.mem.Allocator,
+    new_ownerships: std.ArrayListUnmanaged(ir.OwnershipClass),
+
+    pub fn init(function: *ir.Function, allocator: std.mem.Allocator) LocalAllocator {
+        return .{
+            .function = function,
+            .allocator = allocator,
+            .new_ownerships = .empty,
+        };
+    }
+
+    pub fn deinit(self: *LocalAllocator) void {
+        self.new_ownerships.deinit(self.allocator);
+    }
+
+    /// Allocate a fresh `LocalId` and record its `OwnershipClass`.
+    /// The returned ID is unique within the function and dense — it
+    /// equals the previous `local_count`, so subsequent allocations
+    /// produce consecutive IDs.
+    pub fn alloc(self: *LocalAllocator, ownership: ir.OwnershipClass) !ir.LocalId {
+        const id = self.function.local_count;
+        self.function.local_count += 1;
+        try self.new_ownerships.append(self.allocator, ownership);
+        return id;
+    }
+
+    /// Apply the accumulated ownership entries to the function's
+    /// `local_ownership` slice. Must be called once after the last
+    /// `alloc` and before any pass that reads `local_ownership`.
+    ///
+    /// Allocates a new slice of length `old_len + count` and copies
+    /// the old contents in front of the new entries. The old slice
+    /// belonged to the IR builder's arena and is left untouched —
+    /// freeing it here would conflict with the arena's lifetime.
+    pub fn commit(self: *LocalAllocator) !void {
+        if (self.new_ownerships.items.len == 0) return;
+        const old = self.function.local_ownership;
+        const new_len = old.len + self.new_ownerships.items.len;
+        const new_buf = try self.allocator.alloc(ir.OwnershipClass, new_len);
+        @memcpy(new_buf[0..old.len], old);
+        @memcpy(new_buf[old.len..], self.new_ownerships.items);
+        self.function.local_ownership = new_buf;
+        self.new_ownerships.clearRetainingCapacity();
+    }
+};
+
 /// Top-level entry point. Walks `analysis_context.arc_ops` and
 /// `analysis_context.drop_specializations`, materializing every
 /// record whose `(function, block, path, instr_index)` can be
@@ -84,6 +146,14 @@ pub fn materializeAnalysisArcOps(
     function: *ir.Function,
     analysis_context: *escape_lattice.AnalysisContext,
 ) !void {
+    // Phase 3 prelude: replace the synthetic-LocalId scheme that
+    // perceus uses for reset tokens (`10000 + match_site_id`) with
+    // real LocalIds allocated against the function's slot space. The
+    // legacy emitter in `zir_builder.zig` continues to consume
+    // `pair.reset.dest` / `pair.reuse.token` and now references real
+    // LocalIds in the `local_to_ref` table.
+    try rewriteReuseTokensToRealLocals(allocator, function, analysis_context);
+
     var pending = PendingTree.init(allocator);
     defer pending.deinit();
 
@@ -200,6 +270,64 @@ pub fn materializeAnalysisArcOps(
 
     analysis_context.drop_specializations.clearRetainingCapacity();
     try analysis_context.drop_specializations.appendSlice(allocator, unconsumed_specs.items);
+}
+
+/// Walk `analysis_context.reuse_pairs` and replace every reset
+/// token's synthetic LocalId (`10000 + match_site_id` per
+/// `perceus.zig:940`) with a fresh real LocalId allocated against
+/// the function's local-slot space. Updates both `pair.reset.dest`
+/// and `pair.reuse.token` in place, plus any `arc_op` whose
+/// `value` references the same synthetic ID so the legacy
+/// `emitPerceusResetForCase` continues to function while we
+/// transition off the synthetic encoding.
+///
+/// Token ownership is `.owned` — `resetAny` returns an opaque
+/// pointer that downstream `reuseAllocByType` either reuses (the
+/// RC=1 path returns the same pointer back) or discards (null
+/// token triggers fresh allocation). Either way the SSA value
+/// owns the slot.
+fn rewriteReuseTokensToRealLocals(
+    allocator: std.mem.Allocator,
+    function: *ir.Function,
+    analysis_context: *escape_lattice.AnalysisContext,
+) !void {
+    var token_remap: std.AutoHashMapUnmanaged(ir.LocalId, ir.LocalId) = .empty;
+    defer token_remap.deinit(allocator);
+
+    var local_allocator = LocalAllocator.init(function, allocator);
+    defer local_allocator.deinit();
+
+    // Pass 1: rewrite every reuse_pair belonging to this function.
+    // Use a single fresh LocalId per match_site so a reset followed
+    // by its paired reuse_alloc share the same token slot.
+    for (analysis_context.reuse_pairs.items) |*pair| {
+        if (pair.reuse.insertion_point.function != function.id) continue;
+        const old_token = pair.reset.dest;
+        const gop = try token_remap.getOrPut(allocator, old_token);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = try local_allocator.alloc(.owned);
+        }
+        const new_token = gop.value_ptr.*;
+        pair.reset.dest = new_token;
+        if (pair.reuse.token) |_| pair.reuse.token = new_token;
+    }
+
+    if (token_remap.count() == 0) return;
+
+    // Pass 2: rewrite arc_ops in the same function whose `value`
+    // references one of the remapped tokens. Perceus does not
+    // currently emit such arc_ops directly — the synthetic token
+    // appears only in reuse_pairs — but rewriting is safe and
+    // future-proofs the pass against new emitters that key on the
+    // same shared LocalId.
+    for (analysis_context.arc_ops.items) |*op| {
+        if (op.insertion_point.function != function.id) continue;
+        if (token_remap.get(op.value)) |new_id| {
+            op.value = new_id;
+        }
+    }
+
+    try local_allocator.commit();
 }
 
 // ============================================================
