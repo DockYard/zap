@@ -468,37 +468,45 @@ pub const PerceusAnalyzer = struct {
         switch (instr.*) {
             .case_block => |cb| {
                 for (cb.arms, 0..) |arm, arm_idx| {
-                    const step: lattice.StreamStep = .{
+                    const cond_step: lattice.StreamStep = .{
+                        .parent_instr_index = parent_index,
+                        .child = .{ .case_block_arm_cond = @intCast(arm_idx) },
+                    };
+                    try path_builder.append(self.allocator, cond_step);
+                    for (arm.cond_instrs, 0..) |nested, idx| {
+                        try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
+                        try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
+                    }
+                    _ = path_builder.pop();
+
+                    const body_step: lattice.StreamStep = .{
                         .parent_instr_index = parent_index,
                         .child = .{ .case_block_arm_body = @intCast(arm_idx) },
                     };
-                    try path_builder.append(self.allocator, step);
+                    try path_builder.append(self.allocator, body_step);
                     for (arm.body_instrs, 0..) |nested, idx| {
-                        try self.checkInstructionForDeconstruction(
-                            &nested,
-                            function_id,
-                            block_label,
-                            path_builder.items,
-                            @intCast(idx),
-                        );
-                        // Recurse one more level for nested-in-nested.
+                        try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
                         try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
                     }
                     _ = path_builder.pop();
                 }
+                const pre_step: lattice.StreamStep = .{
+                    .parent_instr_index = parent_index,
+                    .child = .case_block_pre,
+                };
+                try path_builder.append(self.allocator, pre_step);
+                for (cb.pre_instrs, 0..) |nested, idx| {
+                    try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
+                    try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
+                }
+                _ = path_builder.pop();
                 const default_step: lattice.StreamStep = .{
                     .parent_instr_index = parent_index,
                     .child = .case_block_default,
                 };
                 try path_builder.append(self.allocator, default_step);
                 for (cb.default_instrs, 0..) |nested, idx| {
-                    try self.checkInstructionForDeconstruction(
-                        &nested,
-                        function_id,
-                        block_label,
-                        path_builder.items,
-                        @intCast(idx),
-                    );
+                    try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
                     try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
                 }
                 _ = path_builder.pop();
@@ -510,13 +518,7 @@ pub const PerceusAnalyzer = struct {
                 };
                 try path_builder.append(self.allocator, then_step);
                 for (ie.then_instrs, 0..) |nested, idx| {
-                    try self.checkInstructionForDeconstruction(
-                        &nested,
-                        function_id,
-                        block_label,
-                        path_builder.items,
-                        @intCast(idx),
-                    );
+                    try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
                     try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
                 }
                 _ = path_builder.pop();
@@ -527,13 +529,141 @@ pub const PerceusAnalyzer = struct {
                 };
                 try path_builder.append(self.allocator, else_step);
                 for (ie.else_instrs, 0..) |nested, idx| {
-                    try self.checkInstructionForDeconstruction(
-                        &nested,
-                        function_id,
-                        block_label,
-                        path_builder.items,
-                        @intCast(idx),
-                    );
+                    try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
+                    try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
+                }
+                _ = path_builder.pop();
+            },
+            .switch_literal => |sl| {
+                for (sl.cases, 0..) |sc, case_idx| {
+                    const case_step: lattice.StreamStep = .{
+                        .parent_instr_index = parent_index,
+                        .child = .{ .switch_literal_case = @intCast(case_idx) },
+                    };
+                    try path_builder.append(self.allocator, case_step);
+                    for (sc.body_instrs, 0..) |nested, idx| {
+                        try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
+                        try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
+                    }
+                    _ = path_builder.pop();
+                }
+                const default_step: lattice.StreamStep = .{
+                    .parent_instr_index = parent_index,
+                    .child = .switch_literal_default,
+                };
+                try path_builder.append(self.allocator, default_step);
+                for (sl.default_instrs, 0..) |nested, idx| {
+                    try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
+                    try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
+                }
+                _ = path_builder.pop();
+            },
+            .switch_return => |sr| {
+                for (sr.cases, 0..) |sc, case_idx| {
+                    const case_step: lattice.StreamStep = .{
+                        .parent_instr_index = parent_index,
+                        .child = .{ .switch_return_case = @intCast(case_idx) },
+                    };
+                    try path_builder.append(self.allocator, case_step);
+                    for (sc.body_instrs, 0..) |nested, idx| {
+                        try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
+                        try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
+                    }
+                    _ = path_builder.pop();
+                }
+                const default_step: lattice.StreamStep = .{
+                    .parent_instr_index = parent_index,
+                    .child = .switch_return_default,
+                };
+                try path_builder.append(self.allocator, default_step);
+                for (sr.default_instrs, 0..) |nested, idx| {
+                    try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
+                    try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
+                }
+                _ = path_builder.pop();
+            },
+            .union_switch => |us| {
+                for (us.cases, 0..) |uc, case_idx| {
+                    const case_step: lattice.StreamStep = .{
+                        .parent_instr_index = parent_index,
+                        .child = .{ .union_switch_case = @intCast(case_idx) },
+                    };
+                    try path_builder.append(self.allocator, case_step);
+                    for (uc.body_instrs, 0..) |nested, idx| {
+                        try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
+                        try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
+                    }
+                    _ = path_builder.pop();
+                }
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases, 0..) |uc, case_idx| {
+                    const case_step: lattice.StreamStep = .{
+                        .parent_instr_index = parent_index,
+                        .child = .{ .union_switch_return_case = @intCast(case_idx) },
+                    };
+                    try path_builder.append(self.allocator, case_step);
+                    for (uc.body_instrs, 0..) |nested, idx| {
+                        try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
+                        try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
+                    }
+                    _ = path_builder.pop();
+                }
+            },
+            .try_call_named => |tc| {
+                const success_step: lattice.StreamStep = .{
+                    .parent_instr_index = parent_index,
+                    .child = .try_call_named_success,
+                };
+                try path_builder.append(self.allocator, success_step);
+                for (tc.success_instrs, 0..) |nested, idx| {
+                    try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
+                    try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
+                }
+                _ = path_builder.pop();
+
+                const handler_step: lattice.StreamStep = .{
+                    .parent_instr_index = parent_index,
+                    .child = .try_call_named_handler,
+                };
+                try path_builder.append(self.allocator, handler_step);
+                for (tc.handler_instrs, 0..) |nested, idx| {
+                    try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
+                    try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
+                }
+                _ = path_builder.pop();
+            },
+            .guard_block => |gb| {
+                const body_step: lattice.StreamStep = .{
+                    .parent_instr_index = parent_index,
+                    .child = .guard_block_body,
+                };
+                try path_builder.append(self.allocator, body_step);
+                for (gb.body, 0..) |nested, idx| {
+                    try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
+                    try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
+                }
+                _ = path_builder.pop();
+            },
+            .optional_dispatch => |od| {
+                const nil_step: lattice.StreamStep = .{
+                    .parent_instr_index = parent_index,
+                    .child = .optional_dispatch_nil,
+                };
+                try path_builder.append(self.allocator, nil_step);
+                for (od.nil_instrs, 0..) |nested, idx| {
+                    try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
+                    try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
+                }
+                _ = path_builder.pop();
+
+                const struct_step: lattice.StreamStep = .{
+                    .parent_instr_index = parent_index,
+                    .child = .optional_dispatch_struct,
+                };
+                try path_builder.append(self.allocator, struct_step);
+                for (od.struct_instrs, 0..) |nested, idx| {
+                    try self.checkInstructionForDeconstruction(&nested, function_id, block_label, path_builder.items, @intCast(idx));
                     try self.scanNestedInstructions(&nested, function_id, block_label, path_builder, @intCast(idx));
                 }
                 _ = path_builder.pop();
@@ -829,6 +959,18 @@ pub const PerceusAnalyzer = struct {
                 for (cb.arms, 0..) |arm, arm_idx| {
                     try path_builder.append(self.allocator, .{
                         .parent_instr_index = instr_index,
+                        .child = .{ .case_block_arm_cond = @intCast(arm_idx) },
+                    });
+                    for (arm.cond_instrs, 0..) |nested, idx| {
+                        try self.scanInstructionForConstructions(
+                            nested, decon, function_id, block_label,
+                            path_builder, @intCast(idx), results,
+                        );
+                    }
+                    _ = path_builder.pop();
+
+                    try path_builder.append(self.allocator, .{
+                        .parent_instr_index = instr_index,
                         .child = .{ .case_block_arm_body = @intCast(arm_idx) },
                     });
                     for (arm.body_instrs, 0..) |nested, idx| {
@@ -918,6 +1060,71 @@ pub const PerceusAnalyzer = struct {
                     }
                     _ = path_builder.pop();
                 }
+            },
+            .union_switch => |us| {
+                for (us.cases, 0..) |case, case_idx| {
+                    try path_builder.append(self.allocator, .{
+                        .parent_instr_index = instr_index,
+                        .child = .{ .union_switch_case = @intCast(case_idx) },
+                    });
+                    for (case.body_instrs, 0..) |nested, idx| {
+                        try self.scanInstructionForConstructions(
+                            nested, decon, function_id, block_label,
+                            path_builder, @intCast(idx), results,
+                        );
+                    }
+                    _ = path_builder.pop();
+                }
+            },
+            .try_call_named => |tc| {
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = instr_index,
+                    .child = .try_call_named_success,
+                });
+                for (tc.success_instrs, 0..) |nested, idx| {
+                    try self.scanInstructionForConstructions(
+                        nested, decon, function_id, block_label,
+                        path_builder, @intCast(idx), results,
+                    );
+                }
+                _ = path_builder.pop();
+
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = instr_index,
+                    .child = .try_call_named_handler,
+                });
+                for (tc.handler_instrs, 0..) |nested, idx| {
+                    try self.scanInstructionForConstructions(
+                        nested, decon, function_id, block_label,
+                        path_builder, @intCast(idx), results,
+                    );
+                }
+                _ = path_builder.pop();
+            },
+            .optional_dispatch => |od| {
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = instr_index,
+                    .child = .optional_dispatch_nil,
+                });
+                for (od.nil_instrs, 0..) |nested, idx| {
+                    try self.scanInstructionForConstructions(
+                        nested, decon, function_id, block_label,
+                        path_builder, @intCast(idx), results,
+                    );
+                }
+                _ = path_builder.pop();
+
+                try path_builder.append(self.allocator, .{
+                    .parent_instr_index = instr_index,
+                    .child = .optional_dispatch_struct,
+                });
+                for (od.struct_instrs, 0..) |nested, idx| {
+                    try self.scanInstructionForConstructions(
+                        nested, decon, function_id, block_label,
+                        path_builder, @intCast(idx), results,
+                    );
+                }
+                _ = path_builder.pop();
             },
             else => {},
         }
