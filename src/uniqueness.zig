@@ -93,6 +93,20 @@ const uniqueness_signature = @import("uniqueness_signature.zig");
 //
 // ============================================================
 
+/// Per-call-site per-arg uniqueness witness. Recorded only for call
+/// sites whose callee resolves to a known program function (i.e.,
+/// `call_named` / `call_direct` / `try_call_named` / `tail_call` whose
+/// name maps to a `FunctionId`). Used by the interprocedural fixpoint
+/// to demote callee slots whose caller passed a non-unique argument.
+///
+/// `target` is the resolved callee FunctionId. `per_arg` is `true` for
+/// each arg index whose value was provably unique at the call site
+/// (snapshot of `unique` BEFORE the call's own effect runs).
+pub const ArgUniqueness = struct {
+    target: ir.FunctionId,
+    per_arg: []bool,
+};
+
 /// Output of `analyzeUniqueness`. Maps owned-mutating call sites to
 /// whether the receiver is provably uniquely owned at the call.
 ///
@@ -114,8 +128,20 @@ pub const Uniqueness = struct {
     /// must fire.
     sites: std.AutoHashMapUnmanaged(arc_liveness.InstructionId, bool) = .empty,
 
+    /// Per-call-site per-arg uniqueness, recorded only when the
+    /// dataflow is run with `record_arg_sites = true`. Used by the
+    /// interprocedural fixpoint (`uniqueness_interprocedural.analyzeProgram`)
+    /// to drive per-callee parameter demotion. Empty (and unused) for
+    /// the per-function rewrite pass.
+    arg_sites: std.AutoHashMapUnmanaged(arc_liveness.InstructionId, ArgUniqueness) = .empty,
+
     pub fn deinit(self: *Uniqueness, allocator: std.mem.Allocator) void {
         self.sites.deinit(allocator);
+        var iter = self.arg_sites.iterator();
+        while (iter.next()) |entry| {
+            allocator.free(entry.value_ptr.per_arg);
+        }
+        self.arg_sites.deinit(allocator);
     }
 
     /// Look up the predicate for a specific owned-mutating call site.
@@ -196,6 +222,27 @@ pub fn analyzeUniquenessFull(
     signatures: ?*const uniqueness_signature.ProgramSignatures,
     ownership: ?*const arc_liveness.ArcOwnership,
 ) !Uniqueness {
+    return analyzeUniquenessFullEx(allocator, function, program, fixpoint, signatures, ownership, false);
+}
+
+/// Extended variant of `analyzeUniquenessFull` that additionally lets the
+/// caller request per-call-site per-arg uniqueness recording in the
+/// returned `Uniqueness.arg_sites` map.
+///
+/// `record_arg_sites = true` is used exclusively by the interprocedural
+/// fixpoint (`uniqueness_interprocedural.analyzeProgram`) which needs
+/// per-arg uniqueness at every resolvable call site to drive per-callee
+/// parameter demotion. The per-function rewrite pass (codegen / verifier)
+/// passes `false` and pays no overhead.
+pub fn analyzeUniquenessFullEx(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: ?*const ir.Program,
+    fixpoint: ?*const uniqueness_interprocedural.ProgramUniqueness,
+    signatures: ?*const uniqueness_signature.ProgramSignatures,
+    ownership: ?*const arc_liveness.ArcOwnership,
+    record_arg_sites: bool,
+) !Uniqueness {
     var analyzer = Analyzer{
         .allocator = allocator,
         .function = function,
@@ -203,6 +250,7 @@ pub fn analyzeUniquenessFull(
         .fixpoint = fixpoint,
         .signatures = signatures,
         .ownership = ownership,
+        .record_arg_sites = record_arg_sites,
         .unique = .empty,
         .tuple_pending = .empty,
         .extracted = .empty,
@@ -293,6 +341,15 @@ const Analyzer = struct {
     /// implicit scope-exit release would otherwise reclaim from the
     /// tuple).
     ownership: ?*const arc_liveness.ArcOwnership,
+    /// When true, every call site whose callee resolves to a program
+    /// function records a per-arg uniqueness snapshot in
+    /// `result.arg_sites`. This is the input the interprocedural
+    /// fixpoint consumes to demote callee parameter slots whose
+    /// arguments are not unique at one of their call sites.
+    ///
+    /// The per-function rewrite pass (codegen / verifier) sets this
+    /// to false; only the interprocedural fixpoint enables it.
+    record_arg_sites: bool,
     /// Set of LocalIds proven `definitely_unique` at the current
     /// program point. Updated by `applyEffect` as the walker visits
     /// each instruction in depth-first order.
@@ -665,6 +722,11 @@ const Analyzer = struct {
     /// site. If so, snapshot the receiver's uniqueness as observed
     /// in the PRE-call dataflow state and store it in the result map.
     ///
+    /// When `record_arg_sites` is enabled, additionally snapshot per-arg
+    /// uniqueness for every call site that resolves to a known program
+    /// function. The interprocedural fixpoint consumes this to demote
+    /// callee parameter slots whose argument was non-unique at the call.
+    ///
     /// Why classify pre-effect: uniqueness asks "was the receiver unique when
     /// it entered the call?" The call's own effect (consume the
     /// receiver, produce a fresh result) is applied AFTER this
@@ -675,15 +737,73 @@ const Analyzer = struct {
         instr: *const ir.Instruction,
         my_id: arc_liveness.InstructionId,
     ) error{OutOfMemory}!void {
-        const slot_and_recv = self.callSiteOwnedMutating(instr) orelse return;
-        const recv = slot_and_recv.receiver;
-        const is_unique = self.unique.contains(recv);
-        try self.result.sites.put(self.allocator, my_id, is_unique);
+        if (self.callSiteOwnedMutating(instr)) |slot_and_recv| {
+            const is_unique = self.unique.contains(slot_and_recv.receiver);
+            try self.result.sites.put(self.allocator, my_id, is_unique);
+        }
+
+        if (self.record_arg_sites) {
+            if (self.callSiteArgs(instr)) |info| {
+                const per_arg = try self.allocator.alloc(bool, info.args.len);
+                for (info.args, 0..) |arg, idx| {
+                    per_arg[idx] = self.unique.contains(arg);
+                }
+                try self.result.arg_sites.put(self.allocator, my_id, .{
+                    .target = info.target,
+                    .per_arg = per_arg,
+                });
+            }
+        }
     }
 
     const CallSiteInfo = struct {
         receiver: ir.LocalId,
     };
+
+    /// Args-info for a call site whose callee resolves to a known
+    /// program function. Used only when `record_arg_sites` is true.
+    const CallSiteArgsInfo = struct {
+        target: ir.FunctionId,
+        args: []const ir.LocalId,
+    };
+
+    /// For any call site that resolves to a known program function,
+    /// return the target FunctionId and the args slice. This covers
+    /// the callee-bound demotion case — even non-owned-mutating calls
+    /// can demote a callee's slot if their arg isn't unique at the
+    /// call site.
+    fn callSiteArgs(
+        self: *const Analyzer,
+        instr: *const ir.Instruction,
+    ) ?CallSiteArgsInfo {
+        switch (instr.*) {
+            .call_named => |cn| {
+                const target = self.lookupByName(cn.name) orelse return null;
+                return .{ .target = target, .args = cn.args };
+            },
+            .call_direct => |cd| {
+                return .{ .target = cd.function, .args = cd.args };
+            },
+            .try_call_named => |tcn| {
+                const target = self.lookupByName(tcn.name) orelse return null;
+                return .{ .target = target, .args = tcn.args };
+            },
+            .tail_call => |tc| {
+                const target = self.lookupByName(tc.name) orelse return null;
+                return .{ .target = target, .args = tc.args };
+            },
+            else => return null,
+        }
+    }
+
+    fn lookupByName(self: *const Analyzer, name: []const u8) ?ir.FunctionId {
+        const program = self.program orelse return null;
+        for (program.functions) |func| {
+            if (std.mem.eql(u8, func.name, name)) return func.id;
+            if (func.local_name.len != 0 and std.mem.eql(u8, func.local_name, name)) return func.id;
+        }
+        return null;
+    }
 
     /// If `instr` is an owned-mutating call site, return the receiver
     /// LocalId at the receiver slot. Otherwise null.

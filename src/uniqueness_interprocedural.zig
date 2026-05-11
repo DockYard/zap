@@ -2,6 +2,7 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
 const uniqueness = @import("uniqueness.zig");
+const uniqueness_signature = @import("uniqueness_signature.zig");
 
 // ============================================================
 // uniqueness Interprocedural — whole-program uniqueness fixpoint.
@@ -179,6 +180,43 @@ pub fn analyzeProgram(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
 ) !ProgramUniqueness {
+    return analyzeProgramFull(allocator, program, null, null);
+}
+
+/// Full-information variant of `analyzeProgram`. The optional
+/// `signatures` and `ownerships` inputs let the per-function intraprocedural
+/// uniqueness pass propagate per-component uniqueness through tuple
+/// destructure idioms (see `uniqueness.zig`'s Phase 2.5 logic):
+///
+///   * `signatures` (Phase 2.1 per-callee return witnesses) lets the
+///     intraprocedural walk synthesize a `tuple_pending` entry on the
+///     dest of a tuple-returning call whose callee's
+///     `return_components` table records per-component PU witnesses.
+///     Without this, `pp_flips = count_flips(pp, 0)` followed by
+///     `{pp', _} = pp_flips` fails to propagate `pp`'s uniqueness
+///     through the destructure, and the subsequent tail call's per-arg
+///     uniqueness is incorrectly reported as `false`, demoting the
+///     callee's slot.
+///
+///   * `ownerships` (per-function last-use side table) lets the
+///     intraprocedural walk recognise the `index_get + retain` destructure
+///     idiom as a uniqueness-preserving move at the parent tuple's
+///     last-use.
+///
+/// Passing `null` for either falls back to the conservative
+/// intraprocedural behaviour (the legacy pre-Phase-2.5 form) for the
+/// affected dataflow shapes.
+///
+/// Both inputs MUST have been computed against the same post-classify
+/// IR shape the fixpoint walks. The `compiler.zig` pipeline orders
+/// these passes correctly: `runProgramArcOwnership` and
+/// `computeSignaturesWithOwnership` run BEFORE `analyzeProgramFull`.
+pub fn analyzeProgramFull(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    signatures: ?*const uniqueness_signature.ProgramSignatures,
+    ownerships: ?*const arc_liveness.ProgramArcOwnership,
+) !ProgramUniqueness {
     var result: ProgramUniqueness = .{};
     errdefer result.deinit(allocator);
 
@@ -259,14 +297,24 @@ pub fn analyzeProgram(
         const caller = lookupFunction(program, func_id) orelse continue;
 
         // Run intraprocedural uniqueness on `caller`, parameterised by the
-        // current fixpoint state. This produces a call-site→bool map
-        // AND, via the extended interface, an arg-level uniqueness
-        // query at every call site.
-        var caller_uniqueness = try analyzeFunctionWithFixpoint(
+        // current fixpoint state. The shared dataflow in `uniqueness.zig`
+        // produces a call-site→bool `sites` map AND a per-call-site
+        // per-arg `arg_sites` map when `record_arg_sites=true`. The
+        // Phase 2.5 logic (tuple_pending, index_get propagation,
+        // callee return-component synthesis) runs automatically when
+        // `signatures` and `ownerships` are provided.
+        const fn_ownership: ?*const arc_liveness.ArcOwnership = blk: {
+            if (ownerships) |program_ownership| break :blk program_ownership.get(caller.id);
+            break :blk null;
+        };
+        var caller_uniqueness = try uniqueness.analyzeUniquenessFullEx(
             allocator,
             caller,
             program,
             &result,
+            signatures,
+            fn_ownership,
+            true,
         );
         defer caller_uniqueness.deinit(allocator);
 
@@ -301,539 +349,45 @@ fn lookupFunction(program: *const ir.Program, function_id: ir.FunctionId) ?*cons
     return null;
 }
 
-/// Per-function intraprocedural uniqueness parameterised by the fixpoint
-/// state. Re-implements the dataflow walk from `uniqueness.zig`
-/// but with an extended interface:
+/// Per-function intraprocedural uniqueness output used inside the
+/// fixpoint. Aliased to `uniqueness.Uniqueness` so the same dataflow
+/// produces both the per-call-site receiver `sites` map AND the per-
+/// call-site per-arg `arg_sites` map. The fixpoint enables the
+/// `record_arg_sites` knob on the shared analyzer so the latter is
+/// populated; the per-function rewrite pass leaves it disabled.
+pub const FunctionUniqueness = uniqueness.Uniqueness;
+
+/// Re-export for callers that want to refer to the per-arg witness
+/// type by the historical `uniqueness_interprocedural` name.
+pub const ArgUniqueness = uniqueness.ArgUniqueness;
+
+/// Run the shared intraprocedural uniqueness dataflow on `function`
+/// with `record_arg_sites=true`. The fixpoint uses this to obtain
+/// per-call-site per-arg uniqueness for callee-slot demotion.
 ///
-///   - On `param_get`: if the fixpoint says the slot is unique-on-
-///     entry, mark `dest` unique. Otherwise clear it (the original
-///     conservative behaviour).
-///   - Records per-call-site receiver uniqueness AS BEFORE (so
-///     callers can use `result.sites` for the rewrite pass).
-///   - Records per-call-site PER-ARG uniqueness in `result.arg_sites`.
-///     This is new — needed by the fixpoint to demote a callee's slot
-///     if the caller couldn't prove the arg unique.
-///
-/// The per-arg map is keyed by call site `InstructionId` and maps to
-/// a slice of `bool` matching the call's `args.len`. Each entry is
-/// `true` iff that arg is provably unique at the call site.
-pub const FunctionUniqueness = struct {
-    /// Per-call-site receiver uniqueness, mirroring the existing uniqueness
-    /// `Uniqueness.sites` field. A `true` value means uniqueness holds for the
-    /// owned-mutating call's receiver.
-    sites: std.AutoHashMapUnmanaged(arc_liveness.InstructionId, bool) = .empty,
-
-    /// Per-call-site per-arg uniqueness. Only populated for call sites
-    /// where the callee resolves to a function in the program (i.e.,
-    /// `call_named`/`call_direct`/`try_call_named`/`tail_call` whose
-    /// name maps to a known FunctionId). The slice length matches the
-    /// call's `args.len` at the time of the walk.
-    ///
-    /// Caller owns the slices via `deinit`.
-    arg_sites: std.AutoHashMapUnmanaged(arc_liveness.InstructionId, ArgUniqueness) = .empty,
-
-    pub const ArgUniqueness = struct {
-        target: ir.FunctionId,
-        per_arg: []bool,
-    };
-
-    pub fn deinit(self: *FunctionUniqueness, allocator: std.mem.Allocator) void {
-        self.sites.deinit(allocator);
-        var iter = self.arg_sites.iterator();
-        while (iter.next()) |entry| {
-            allocator.free(entry.value_ptr.per_arg);
-        }
-        self.arg_sites.deinit(allocator);
-    }
-
-    pub fn isUnique(self: *const FunctionUniqueness, instr_id: arc_liveness.InstructionId) bool {
-        return self.sites.get(instr_id) orelse false;
-    }
-};
-
+/// `signatures` and `ownership` are forwarded so Phase 2.5 (tuple
+/// destructure / callee return-component synthesis) fires inside the
+/// fixpoint exactly as it does for the per-function rewrite pass.
+/// Without them the fixpoint observes the legacy conservative
+/// behaviour and incorrectly demotes any callee slot that depends
+/// on a destructured tuple component flowing through.
 pub fn analyzeFunctionWithFixpoint(
     allocator: std.mem.Allocator,
     function: *const ir.Function,
     program: *const ir.Program,
     fixpoint: *const ProgramUniqueness,
 ) !FunctionUniqueness {
-    var analyzer = ParameterizedAnalyzer{
-        .allocator = allocator,
-        .function = function,
-        .program = program,
-        .fixpoint = fixpoint,
-        .unique = .empty,
-        .next_id = 0,
-        .result = .{},
-    };
-    defer analyzer.unique.deinit(allocator);
-
-    errdefer analyzer.result.deinit(allocator);
-
-    for (function.body) |block| {
-        try analyzer.walkStream(block.instructions);
-    }
-
-    return analyzer.result;
+    return uniqueness.analyzeUniquenessFullEx(
+        allocator,
+        function,
+        program,
+        fixpoint,
+        null,
+        null,
+        true,
+    );
 }
 
-const ParameterizedAnalyzer = struct {
-    allocator: std.mem.Allocator,
-    function: *const ir.Function,
-    program: *const ir.Program,
-    fixpoint: *const ProgramUniqueness,
-    unique: std.AutoHashMapUnmanaged(ir.LocalId, void),
-    next_id: arc_liveness.InstructionId,
-    result: FunctionUniqueness,
-
-    fn walkStream(
-        self: *ParameterizedAnalyzer,
-        stream: []const ir.Instruction,
-    ) error{OutOfMemory}!void {
-        for (stream) |*instr| {
-            const my_id = self.next_id;
-            self.next_id += 1;
-            try self.classifyCallSite(instr, my_id);
-            try self.applyEffect(instr);
-            try self.walkChildren(instr);
-        }
-    }
-
-    fn walkChildren(
-        self: *ParameterizedAnalyzer,
-        instr: *const ir.Instruction,
-    ) error{OutOfMemory}!void {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                try self.walkStream(ie.then_instrs);
-                try self.restore(&snap);
-                try self.walkStream(ie.else_instrs);
-                try self.restore(&snap);
-            },
-            .case_block => |cb| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                try self.walkStream(cb.pre_instrs);
-                const post_pre = try self.snapshot();
-                defer post_pre.deinit(self.allocator);
-                for (cb.arms) |arm| {
-                    try self.walkStream(arm.cond_instrs);
-                    try self.walkStream(arm.body_instrs);
-                    try self.restore(&post_pre);
-                }
-                try self.walkStream(cb.default_instrs);
-                try self.restore(&snap);
-            },
-            .switch_literal => |sl| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                for (sl.cases) |c| {
-                    try self.walkStream(c.body_instrs);
-                    try self.restore(&snap);
-                }
-                try self.walkStream(sl.default_instrs);
-                try self.restore(&snap);
-            },
-            .switch_return => |sr| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                for (sr.cases) |c| {
-                    try self.walkStream(c.body_instrs);
-                    try self.restore(&snap);
-                }
-                try self.walkStream(sr.default_instrs);
-                try self.restore(&snap);
-            },
-            .union_switch => |us| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                for (us.cases) |c| {
-                    try self.walkStream(c.body_instrs);
-                    try self.restore(&snap);
-                }
-            },
-            .union_switch_return => |usr| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                for (usr.cases) |c| {
-                    try self.walkStream(c.body_instrs);
-                    try self.restore(&snap);
-                }
-            },
-            .try_call_named => |tcn| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                try self.walkStream(tcn.handler_instrs);
-                try self.restore(&snap);
-                try self.walkStream(tcn.success_instrs);
-                try self.restore(&snap);
-            },
-            .guard_block => |gb| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                try self.walkStream(gb.body);
-                try self.restore(&snap);
-            },
-            .optional_dispatch => |od| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                try self.walkStream(od.nil_instrs);
-                try self.restore(&snap);
-                try self.walkStream(od.struct_instrs);
-                try self.restore(&snap);
-            },
-            else => {},
-        }
-    }
-
-    /// Classify whether this instruction is an owned-mutating call
-    /// site AND whether it has a resolvable callee — and snapshot the
-    /// uniqueness of every arg if so.
-    fn classifyCallSite(
-        self: *ParameterizedAnalyzer,
-        instr: *const ir.Instruction,
-        my_id: arc_liveness.InstructionId,
-    ) error{OutOfMemory}!void {
-        // First: receiver-uniqueness for owned-mutating builtin calls.
-        if (self.callSiteOwnedMutating(instr)) |info| {
-            const is_unique = self.unique.contains(info.receiver);
-            try self.result.sites.put(self.allocator, my_id, is_unique);
-        }
-
-        // Second: per-arg uniqueness when the callee resolves to a
-        // program function. This is what the fixpoint consumes to
-        // demote callee slots.
-        if (self.callSiteArgs(instr)) |info| {
-            const per_arg = try self.allocator.alloc(bool, info.args.len);
-            for (info.args, 0..) |arg, idx| {
-                per_arg[idx] = self.unique.contains(arg);
-            }
-            try self.result.arg_sites.put(self.allocator, my_id, .{
-                .target = info.target,
-                .per_arg = per_arg,
-            });
-        }
-    }
-
-    const ReceiverInfo = struct {
-        receiver: ir.LocalId,
-    };
-
-    const ArgsInfo = struct {
-        target: ir.FunctionId,
-        args: []const ir.LocalId,
-    };
-
-    fn callSiteOwnedMutating(
-        self: *ParameterizedAnalyzer,
-        instr: *const ir.Instruction,
-    ) ?ReceiverInfo {
-        switch (instr.*) {
-            .call_builtin => |cb| {
-                const slot = arc_liveness.ownedMutatingBuiltinSlot(cb.name) orelse return null;
-                if (slot >= cb.args.len) return null;
-                return .{ .receiver = cb.args[slot] };
-            },
-            .call_named => |cn| {
-                if (arc_liveness.ownedMutatingBuiltinSlot(cn.name)) |slot| {
-                    if (slot >= cn.args.len) return null;
-                    return .{ .receiver = cn.args[slot] };
-                }
-                if (self.calleeOwnedReceiverSlot(cn.name)) |slot| {
-                    if (slot >= cn.args.len) return null;
-                    return .{ .receiver = cn.args[slot] };
-                }
-                return null;
-            },
-            .call_direct => |cd| {
-                const callee = lookupFunction(self.program, cd.function) orelse return null;
-                if (arc_liveness.ownedMutatingBuiltinSlot(callee.name)) |slot| {
-                    if (slot >= cd.args.len) return null;
-                    return .{ .receiver = cd.args[slot] };
-                }
-                if (calleeFunctionOwnedReceiverSlot(callee)) |slot| {
-                    if (slot >= cd.args.len) return null;
-                    return .{ .receiver = cd.args[slot] };
-                }
-                return null;
-            },
-            .try_call_named => |tcn| {
-                if (arc_liveness.ownedMutatingBuiltinSlot(tcn.name)) |slot| {
-                    if (slot >= tcn.args.len) return null;
-                    return .{ .receiver = tcn.args[slot] };
-                }
-                if (self.calleeOwnedReceiverSlot(tcn.name)) |slot| {
-                    if (slot >= tcn.args.len) return null;
-                    return .{ .receiver = tcn.args[slot] };
-                }
-                return null;
-            },
-            else => return null,
-        }
-    }
-
-    /// For any call site that resolves to a known program function,
-    /// return the target FunctionId and the args slice. This covers
-    /// the callee-bound demotion case — even non-owned-mutating calls
-    /// can demote a callee's slot if their arg isn't unique.
-    fn callSiteArgs(
-        self: *ParameterizedAnalyzer,
-        instr: *const ir.Instruction,
-    ) ?ArgsInfo {
-        switch (instr.*) {
-            .call_named => |cn| {
-                const target = self.lookupByName(cn.name) orelse return null;
-                return .{ .target = target, .args = cn.args };
-            },
-            .call_direct => |cd| {
-                return .{ .target = cd.function, .args = cd.args };
-            },
-            .try_call_named => |tcn| {
-                const target = self.lookupByName(tcn.name) orelse return null;
-                return .{ .target = target, .args = tcn.args };
-            },
-            .tail_call => |tc| {
-                const target = self.lookupByName(tc.name) orelse return null;
-                return .{ .target = target, .args = tc.args };
-            },
-            else => return null,
-        }
-    }
-
-    fn lookupByName(self: *const ParameterizedAnalyzer, name: []const u8) ?ir.FunctionId {
-        for (self.program.functions) |func| {
-            if (std.mem.eql(u8, func.name, name)) return func.id;
-            if (func.local_name.len != 0 and std.mem.eql(u8, func.local_name, name)) return func.id;
-        }
-        return null;
-    }
-
-    fn calleeOwnedReceiverSlot(self: *const ParameterizedAnalyzer, name: []const u8) ?usize {
-        for (self.program.functions) |*func| {
-            if (std.mem.eql(u8, func.name, name)) {
-                return calleeFunctionOwnedReceiverSlot(func);
-            }
-        }
-        return null;
-    }
-
-    fn applyEffect(
-        self: *ParameterizedAnalyzer,
-        instr: *const ir.Instruction,
-    ) error{OutOfMemory}!void {
-        switch (instr.*) {
-            .tuple_init => |ti| {
-                for (ti.elements) |elem| _ = self.unique.remove(elem);
-                try self.unique.put(self.allocator, ti.dest, {});
-            },
-            .list_init => |li| {
-                for (li.elements) |elem| _ = self.unique.remove(elem);
-                try self.unique.put(self.allocator, li.dest, {});
-            },
-            .list_cons => |lc| {
-                _ = self.unique.remove(lc.head);
-                _ = self.unique.remove(lc.tail);
-                try self.unique.put(self.allocator, lc.dest, {});
-            },
-            .map_init => |mi| {
-                for (mi.entries) |entry| {
-                    _ = self.unique.remove(entry.key);
-                    _ = self.unique.remove(entry.value);
-                }
-                try self.unique.put(self.allocator, mi.dest, {});
-            },
-            .struct_init => |si| {
-                for (si.fields) |f| _ = self.unique.remove(f.value);
-                try self.unique.put(self.allocator, si.dest, {});
-            },
-            .union_init => |ui| {
-                _ = self.unique.remove(ui.value);
-                try self.unique.put(self.allocator, ui.dest, {});
-            },
-            .call_builtin => |cb| {
-                if (arc_liveness.ownedMutatingBuiltinSlot(cb.name) != null) {
-                    if (cb.args.len > 0) {
-                        const slot = arc_liveness.ownedMutatingBuiltinSlot(cb.name).?;
-                        if (slot < cb.args.len) {
-                            _ = self.unique.remove(cb.args[slot]);
-                        }
-                    }
-                    try self.unique.put(self.allocator, cb.dest, {});
-                } else if (arc_liveness.isFreshAllocatorBuiltin(cb.name)) {
-                    try self.unique.put(self.allocator, cb.dest, {});
-                } else {
-                    _ = self.unique.remove(cb.dest);
-                }
-            },
-            .call_named => |cn| {
-                try self.applyCalleeEffect(cn.name, cn.args, cn.dest);
-            },
-            .call_direct => |cd| {
-                const callee = lookupFunction(self.program, cd.function);
-                if (callee) |func| {
-                    try self.applyCalleeEffectWithFunction(func, cd.args, cd.dest);
-                } else {
-                    _ = self.unique.remove(cd.dest);
-                }
-            },
-            .try_call_named => |tcn| {
-                try self.applyCalleeEffect(tcn.name, tcn.args, tcn.dest);
-            },
-            .move_value => |mv| {
-                if (self.unique.contains(mv.source)) {
-                    _ = self.unique.remove(mv.source);
-                    try self.unique.put(self.allocator, mv.dest, {});
-                } else {
-                    _ = self.unique.remove(mv.dest);
-                }
-            },
-            .share_value => |sv| {
-                _ = self.unique.remove(sv.source);
-                _ = self.unique.remove(sv.dest);
-            },
-            .copy_value => |cv| {
-                _ = self.unique.remove(cv.source);
-                _ = self.unique.remove(cv.dest);
-            },
-            .borrow_value => |bv| {
-                _ = self.unique.remove(bv.dest);
-            },
-            .local_get => |lg| {
-                if (self.unique.contains(lg.source)) {
-                    _ = self.unique.remove(lg.source);
-                    try self.unique.put(self.allocator, lg.dest, {});
-                } else {
-                    _ = self.unique.remove(lg.dest);
-                }
-            },
-            .local_set => |ls| {
-                if (self.unique.contains(ls.value)) {
-                    _ = self.unique.remove(ls.value);
-                    try self.unique.put(self.allocator, ls.dest, {});
-                } else {
-                    _ = self.unique.remove(ls.dest);
-                }
-            },
-            .param_get => |pg| {
-                // INTERPROCEDURAL EXTENSION: consult the fixpoint.
-                // If this function's slot pg.index is proven
-                // unique-on-entry by the fixpoint, mark dest as unique.
-                // Otherwise fall back to the conservative default.
-                if (self.fixpoint.isUniqueOnEntry(self.function.id, pg.index)) {
-                    try self.unique.put(self.allocator, pg.dest, {});
-                } else {
-                    _ = self.unique.remove(pg.dest);
-                }
-            },
-            .release,
-            .retain,
-            .ret,
-            .cond_return,
-            .switch_tag,
-            .branch,
-            .cond_branch,
-            .jump,
-            .match_fail,
-            .match_error_return,
-            .case_break,
-            .tail_call,
-            .set_safety,
-            => {},
-            else => {},
-        }
-    }
-
-    fn applyCalleeEffect(
-        self: *ParameterizedAnalyzer,
-        name: []const u8,
-        args: []const ir.LocalId,
-        dest: ir.LocalId,
-    ) error{OutOfMemory}!void {
-        if (arc_liveness.ownedMutatingBuiltinSlot(name)) |slot| {
-            if (slot < args.len) {
-                _ = self.unique.remove(args[slot]);
-            }
-            try self.unique.put(self.allocator, dest, {});
-            return;
-        }
-        if (self.calleeOwnedReceiverSlot(name)) |slot| {
-            if (slot < args.len) {
-                _ = self.unique.remove(args[slot]);
-            }
-            try self.unique.put(self.allocator, dest, {});
-            return;
-        }
-        if (self.calleeIsFreshAllocatorWrapper(name)) {
-            try self.unique.put(self.allocator, dest, {});
-            return;
-        }
-        _ = self.unique.remove(dest);
-    }
-
-    fn applyCalleeEffectWithFunction(
-        self: *ParameterizedAnalyzer,
-        function: *const ir.Function,
-        args: []const ir.LocalId,
-        dest: ir.LocalId,
-    ) error{OutOfMemory}!void {
-        if (arc_liveness.ownedMutatingBuiltinSlot(function.name)) |slot| {
-            if (slot < args.len) {
-                _ = self.unique.remove(args[slot]);
-            }
-            try self.unique.put(self.allocator, dest, {});
-            return;
-        }
-        if (calleeFunctionOwnedReceiverSlot(function)) |slot| {
-            if (slot < args.len) {
-                _ = self.unique.remove(args[slot]);
-            }
-            try self.unique.put(self.allocator, dest, {});
-            return;
-        }
-        if (uniqueness.functionIsFreshAllocatorWrapper(function)) {
-            try self.unique.put(self.allocator, dest, {});
-            return;
-        }
-        _ = self.unique.remove(dest);
-    }
-
-    fn calleeIsFreshAllocatorWrapper(self: *const ParameterizedAnalyzer, name: []const u8) bool {
-        for (self.program.functions) |*func| {
-            if (std.mem.eql(u8, func.name, name)) {
-                return uniqueness.functionIsFreshAllocatorWrapper(func);
-            }
-        }
-        return false;
-    }
-
-    fn snapshot(self: *ParameterizedAnalyzer) error{OutOfMemory}!Snapshot {
-        var copy: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
-        var iter = self.unique.keyIterator();
-        while (iter.next()) |k| {
-            try copy.put(self.allocator, k.*, {});
-        }
-        return Snapshot{ .set = copy };
-    }
-
-    fn restore(self: *ParameterizedAnalyzer, snap: *const Snapshot) error{OutOfMemory}!void {
-        self.unique.clearRetainingCapacity();
-        var iter = snap.set.keyIterator();
-        while (iter.next()) |k| {
-            try self.unique.put(self.allocator, k.*, {});
-        }
-    }
-};
-
-const Snapshot = struct {
-    set: std.AutoHashMapUnmanaged(ir.LocalId, void),
-
-    fn deinit(self: *const Snapshot, allocator: std.mem.Allocator) void {
-        var mut = self.*;
-        mut.set.deinit(allocator);
-    }
-};
 
 fn calleeFunctionOwnedReceiverSlot(function: *const ir.Function) ?usize {
     if (function.result_convention != .owned) return null;

@@ -649,7 +649,7 @@ pub fn compileForCtfe(
     // `.retain { kind }` / `.release { kind }` IR instructions so
     // the whole-program codegen path consumes the same canonical
     // IR shape as `compileStructByStruct`'s merged path.
-    try materializeAnalysisArcOps(alloc, &ir_program, &analysis_result.context);
+    try materializeAnalysisArcOps(alloc, &ir_program, &analysis_result.context, type_checker.store);
 
     // Second type-check pass — borrow / move diagnostics live behind
     // the analysis context, so they only fire on this re-check.
@@ -1000,7 +1000,7 @@ const Pipeline = struct {
         // drop-insertion to `compileStructByStruct`'s Phase 5b so the
         // post-merge uniqueness inference sees a clean `last_use_map` (see
         // the note in `runIrLoweringWithTryIdSeed`).
-        runArcDropInsertion(self.alloc, &program, &ownership) catch
+        runArcDropInsertion(self.alloc, &program, &ownership, type_store) catch
             return self.failWith("Error during ARC drop insertion", error.IrFailed);
         return .{ .program = program, .arc_ownership = ownership };
     }
@@ -2079,7 +2079,7 @@ pub fn compileStructByStruct(
         merged_ownership.deinit();
         merged_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, &merged_ir, shared_store) catch
             return error.IrFailed;
-        runArcDropInsertion(alloc, &merged_ir, &merged_ownership) catch {
+        runArcDropInsertion(alloc, &merged_ir, &merged_ownership, shared_store) catch {
             merged_ownership.deinit();
             return error.IrFailed;
         };
@@ -2089,7 +2089,7 @@ pub fn compileStructByStruct(
         // inserted directly into the function body. Records that
         // can't be resolved against the merged IR remain in the
         // analysis context for the V10 audit to surface.
-        materializeAnalysisArcOps(alloc, &merged_ir, &analysis_result.context) catch {
+        materializeAnalysisArcOps(alloc, &merged_ir, &analysis_result.context, shared_store) catch {
             merged_ownership.deinit();
             return error.IrFailed;
         };
@@ -2205,36 +2205,44 @@ fn runArcOwnershipAndVerify(
     // BEFORE `arc_verifier.verify` so the uniqueness invariant in the
     // verifier sees this pass's rewrites and catches any mistake.
     //
-    // A1 (interprocedural uniqueness): before the per-function uniqueness, run the
-    // whole-program fixpoint to compute per-callee per-param
-    // unique-on-entry contracts. The per-function pass then consults
-    // the fixpoint when classifying `param_get`: a slot proven
-    // unique-on-entry across every reachable caller produces a
-    // unique dest, propagating into the function's owned-mutating
-    // call sites. This activates uniqueness on accumulator-recursion patterns
-    // (fannkuch-redux, k-nucleotide) where the receiver is passed
-    // through tail-recursive calls.
-    var program_uniqueness = zap.uniqueness_interprocedural.analyzeProgram(alloc, program) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-    };
-    defer program_uniqueness.deinit(alloc);
-
-    // Phase 2.5: compute uniqueness_signature signatures and recompute per-
-    // function ARC ownership so the uniqueness dataflow can synthesize
-    // tuple_pending entries for callee tuple-returns and recognise
-    // the `index_get + retain` destructure idiom as a uniqueness-
-    // preserving move at the parent tuple's last-use.
+    // Phase 2.5 + A1: compute the inputs the interprocedural fixpoint
+    // (`uniqueness_interprocedural.analyzeProgramFull`) and the per-
+    // function uniqueness dataflow both need:
     //
-    // Signatures are computed against the post-rewrite IR (after
-    // `rewriteOwnedConsumeBuiltinSites`/`classifyAndNormalize`/
-    // `rewriteOwnedConsumeSites`), so the witness propagation
-    // matches the IR shape the uniqueness dataflow walks.
+    //   1. `post_ownership` — per-function ARC ownership recomputed
+    //      against the post-rewrite IR (after
+    //      `rewriteOwnedConsumeBuiltinSites` / `classifyAndNormalize` /
+    //      `rewriteOwnedConsumeSites`). The recompute is necessary so
+    //      `last_use_sites` keys align with the InstructionIds the
+    //      uniqueness dataflow assigns; `classifyAndNormalize` strips
+    //      `local_get`/`retain` pairs which shifts the id space.
     //
-    // ARC ownership is recomputed against the post-rewrite IR so
-    // the `last_use_sites` keys align with the InstructionIds that
-    // the uniqueness dataflow assigns. Without the recompute, the original
-    // `ownership` carries pre-rewrite ids which `classifyAndNormalize`
-    // shifted by stripping `local_get`/`retain` pairs.
+    //   2. `signatures` — per-callee parameter uniqueness signatures
+    //      (Phase 2.1 PU/CU/AL lattice + per-component return witness).
+    //      Computed against the post-rewrite IR so the witness
+    //      propagation matches the shape the uniqueness dataflow walks.
+    //
+    // Both inputs are produced BEFORE the fixpoint so the fixpoint's
+    // per-iteration intraprocedural pass can synthesize `tuple_pending`
+    // entries for callee tuple-returns and recognise the
+    // `index_get + retain` destructure idiom as a uniqueness-preserving
+    // move at the parent tuple's last-use. Without these in scope, the
+    // fixpoint's intraprocedural pass would observe destructured tuple
+    // components as non-unique and incorrectly demote the receiver
+    // slot of every tail call fed by such a destructure — the cause of
+    // the 28-50% COW rate that fannkuch's `pp_flips = count_flips(pp)
+    // ; {pp, flips} = pp_flips; main_loop(p, pp, ...)` pattern exhibits.
+    //
+    // Architectural note: signatures and ownership are computed
+    // against the same post-classify IR shape the fixpoint sees, and
+    // neither depends on the fixpoint's output. The dependency chain
+    // is therefore:
+    //
+    //   post_ownership  →  signatures  →  interprocedural fixpoint  →
+    //   per-function uniqueness rewrite
+    //
+    // All three are then consumed by `analyzeUniquenessFull` for the
+    // per-function rewrite pass.
     var post_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, program, type_store) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -2244,6 +2252,28 @@ fn runArcOwnershipAndVerify(
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer signatures.deinit(alloc);
+
+    // A1 (interprocedural uniqueness): run the whole-program fixpoint
+    // to compute per-callee per-param unique-on-entry contracts. The
+    // per-function pass then consults the fixpoint when classifying
+    // `param_get`: a slot proven unique-on-entry across every
+    // reachable caller produces a unique dest, propagating into the
+    // function's owned-mutating call sites. This activates uniqueness
+    // on accumulator-recursion patterns (fannkuch-redux, k-nucleotide)
+    // where the receiver is passed through tail-recursive calls.
+    //
+    // Pass `signatures` and `post_ownership` so the fixpoint's
+    // per-iteration intraprocedural pass propagates per-component
+    // uniqueness through tuple destructure (Phase 2.5).
+    var program_uniqueness = zap.uniqueness_interprocedural.analyzeProgramFull(
+        alloc,
+        program,
+        &signatures,
+        &post_ownership,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer program_uniqueness.deinit(alloc);
 
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
@@ -2281,7 +2311,15 @@ fn runArcOwnershipAndVerify(
         }
     }
     for (program.functions) |*function| {
-        zap.arc_verifier.verifyWithFixpoint(alloc, function, program, &program_uniqueness) catch |err| switch (err) {
+        const fn_ownership = post_ownership.get(function.id);
+        zap.arc_verifier.verifyFull(
+            alloc,
+            function,
+            program,
+            &program_uniqueness,
+            &signatures,
+            fn_ownership,
+        ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // Phase E (Phase 6 redux plan §3.E): the verifier rejects
             // IR that violates an ARC ownership invariant. The plan
@@ -2316,12 +2354,13 @@ fn materializeAnalysisArcOps(
     alloc: std.mem.Allocator,
     program: *ir.Program,
     analysis_context: *zap.escape_lattice.AnalysisContext,
+    type_store: *const zap.types.TypeStore,
 ) CompileError!void {
     for (program.functions, 0..) |_, fi| {
         const function: *ir.Function = @constCast(&program.functions[fi]);
         zap.arc_materialize.materializeAnalysisArcOps(alloc, function, analysis_context) catch return error.IrFailed;
     }
-    try runArcVerifier(alloc, program);
+    try runArcVerifier(alloc, program, type_store);
 }
 
 /// Run V1-V11 (fixpoint) + V8/V9 (post-drop reachability) over
@@ -2332,14 +2371,42 @@ fn materializeAnalysisArcOps(
 fn runArcVerifier(
     alloc: std.mem.Allocator,
     program: *ir.Program,
+    type_store: *const zap.types.TypeStore,
 ) CompileError!void {
-    var program_uniqueness = zap.uniqueness_interprocedural.analyzeProgram(alloc, program) catch |err| switch (err) {
+    // Recompute Phase-2.5 inputs against the post-materialize IR so the
+    // fixpoint and verifier observe the same Phase 2.5 semantics the
+    // Phase 5b rewriter observed. Without this the verifier rejects
+    // unchecked sites the rewriter legitimately produced.
+    var post_materialize_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, program, type_store) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer post_materialize_ownership.deinit();
+
+    var post_materialize_signatures = zap.uniqueness_fixpoint.computeSignaturesWithOwnership(alloc, program, &post_materialize_ownership) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer post_materialize_signatures.deinit(alloc);
+
+    var program_uniqueness = zap.uniqueness_interprocedural.analyzeProgramFull(
+        alloc,
+        program,
+        &post_materialize_signatures,
+        &post_materialize_ownership,
+    ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer program_uniqueness.deinit(alloc);
 
     for (program.functions) |*function| {
-        zap.arc_verifier.verifyWithFixpoint(alloc, function, program, &program_uniqueness) catch |err| switch (err) {
+        const fn_ownership = post_materialize_ownership.get(function.id);
+        zap.arc_verifier.verifyFull(
+            alloc,
+            function,
+            program,
+            &program_uniqueness,
+            &post_materialize_signatures,
+            fn_ownership,
+        ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ArcInvariantViolation => return error.IrFailed,
         };
@@ -2354,6 +2421,7 @@ fn runArcDropInsertion(
     alloc: std.mem.Allocator,
     program: *ir.Program,
     ownership: *const zap.arc_liveness.ProgramArcOwnership,
+    type_store: *const zap.types.TypeStore,
 ) CompileError!void {
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
@@ -2369,13 +2437,43 @@ fn runArcDropInsertion(
         zap.arc_drop_insertion.insertTupleComponentReleases(alloc, function, fn_ownership) catch return error.OutOfMemory;
     }
 
-    var program_uniqueness = zap.uniqueness_interprocedural.analyzeProgram(alloc, program) catch |err| switch (err) {
+    // Recompute Phase-2.5 inputs (post_ownership + signatures) against
+    // the post-drop-insertion IR and pass them into the fixpoint and
+    // the verifier so the post-drop check observes the same Phase 2.5
+    // semantics the Phase 5b rewriter observed. Without this the
+    // verifier rejects unchecked sites that the rewriter legitimately
+    // produced — Phase 2.5 tuple-destructure propagation only fires
+    // when both signatures and ownership are threaded through.
+    var post_drop_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, program, type_store) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer post_drop_ownership.deinit();
+
+    var post_drop_signatures = zap.uniqueness_fixpoint.computeSignaturesWithOwnership(alloc, program, &post_drop_ownership) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer post_drop_signatures.deinit(alloc);
+
+    var program_uniqueness = zap.uniqueness_interprocedural.analyzeProgramFull(
+        alloc,
+        program,
+        &post_drop_signatures,
+        &post_drop_ownership,
+    ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer program_uniqueness.deinit(alloc);
 
     for (program.functions) |*function| {
-        zap.arc_verifier.verifyWithFixpoint(alloc, function, program, &program_uniqueness) catch |err| switch (err) {
+        const fn_ownership = post_drop_ownership.get(function.id);
+        zap.arc_verifier.verifyFull(
+            alloc,
+            function,
+            program,
+            &program_uniqueness,
+            &post_drop_signatures,
+            fn_ownership,
+        ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ArcInvariantViolation => return error.IrFailed,
         };

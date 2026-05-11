@@ -3,6 +3,7 @@ const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
 const uniqueness_analysis = @import("uniqueness.zig");
 const uniqueness_interprocedural = @import("uniqueness_interprocedural.zig");
+const uniqueness_signature = @import("uniqueness_signature.zig");
 
 // ============================================================
 // ARC ownership verifier.
@@ -148,11 +149,34 @@ pub fn verifyWithFixpoint(
     program: *const ir.Program,
     fixpoint: ?*const uniqueness_interprocedural.ProgramUniqueness,
 ) VerifyError!void {
+    return verifyFull(allocator, function, program, fixpoint, null, null);
+}
+
+/// Full-context variant of `verifyWithFixpoint`. Threads the same
+/// `signatures` and per-function `ownership` table that the per-
+/// function uniqueness rewrite pass (`analyzeUniquenessFull`) used to
+/// decide which `_owned_unchecked` sites to emit. Without these the
+/// verifier observes the legacy intraprocedural conservative form and
+/// rejects every site whose uniqueness depends on Phase 2.5 tuple
+/// destructure propagation or callee return-component synthesis.
+///
+/// The verifier and the rewriter must observe the same information,
+/// otherwise the verifier flags sites the rewriter legitimately
+/// produced. The rewriter's `signatures` and `fn_ownership` inputs
+/// are the canonical witness; pass-through here keeps both in lockstep.
+pub fn verifyFull(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: *const ir.Program,
+    fixpoint: ?*const uniqueness_interprocedural.ProgramUniqueness,
+    signatures: ?*const uniqueness_signature.ProgramSignatures,
+    ownership: ?*const arc_liveness.ArcOwnership,
+) VerifyError!void {
     var ctx = VerifyContext{ .function = function, .program = program };
     for (function.body) |block| {
         try verifyStream(&ctx, block.instructions);
     }
-    try runUniquenessCheck(allocator, function, program, fixpoint);
+    try runUniquenessCheckFull(allocator, function, program, fixpoint, signatures, ownership);
 }
 
 /// Per-verification context. Phase E.9 V7 added the `program`
@@ -1079,13 +1103,31 @@ fn runUniquenessCheck(
     program: *const ir.Program,
     fixpoint: ?*const uniqueness_interprocedural.ProgramUniqueness,
 ) VerifyError!void {
+    return runUniquenessCheckFull(allocator, function, program, fixpoint, null, null);
+}
+
+fn runUniquenessCheckFull(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: *const ir.Program,
+    fixpoint: ?*const uniqueness_interprocedural.ProgramUniqueness,
+    signatures: ?*const uniqueness_signature.ProgramSignatures,
+    ownership: ?*const arc_liveness.ArcOwnership,
+) VerifyError!void {
     // Fast path: scan the function for any unchecked call before
     // running the analysis. Most functions have no unchecked sites
     // (Phase 3 codegen hasn't landed yet); skipping the analysis on
     // those keeps verifier overhead minimal.
     if (!hasUncheckedCallSite(function)) return;
 
-    var uniqueness = uniqueness_analysis.analyzeUniquenessWithFixpoint(allocator, function, program, fixpoint) catch |err| switch (err) {
+    var uniqueness = uniqueness_analysis.analyzeUniquenessFull(
+        allocator,
+        function,
+        program,
+        fixpoint,
+        signatures,
+        ownership,
+    ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer uniqueness.deinit(allocator);
