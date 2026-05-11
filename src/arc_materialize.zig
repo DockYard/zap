@@ -148,11 +148,17 @@ pub fn materializeAnalysisArcOps(
 ) !void {
     // Phase 3 prelude: replace the synthetic-LocalId scheme that
     // perceus uses for reset tokens (`10000 + match_site_id`) with
-    // real LocalIds allocated against the function's slot space. The
-    // legacy emitter in `zir_builder.zig` continues to consume
-    // `pair.reset.dest` / `pair.reuse.token` and now references real
-    // LocalIds in the `local_to_ref` table.
+    // real LocalIds allocated against the function's slot space.
     try rewriteReuseTokensToRealLocals(allocator, function, analysis_context);
+
+    // Phase 3: rewrite each reuse_pair's construction instruction
+    // (tuple_init / struct_init / union_init) to carry the
+    // `reuse_token` field so the ZIR backend's canonical handler
+    // takes the reuse-aware lowering path. This removes the need
+    // for `findReusePairForDest` in zir_builder, eliminating three
+    // Class C `reuseAllocByType` emissions outside the canonical
+    // `.reuse_alloc` IR handler.
+    try rewriteReuseConstructions(allocator, function, analysis_context);
 
     var pending = PendingTree.init(allocator);
     defer pending.deinit();
@@ -175,9 +181,22 @@ pub fn materializeAnalysisArcOps(
         const new_instr: ir.Instruction = switch (op.kind) {
             .retain => .{ .retain = .{ .value = op.value } },
             .release => .{ .release = .{ .value = op.value } },
-            // Phase 3 / dataflow-only kinds stay in the analysis
-            // context — they're not materializable as IR yet.
-            .reset, .reuse_alloc, .move_transfer, .share => continue,
+            // `.reset` materializes to an IR `.reset { dest, source }`
+            // where `dest` is the token LocalId allocated by
+            // `rewriteReuseTokensToRealLocals` (looked up via
+            // `analysis_context.reuse_pairs` keyed on this arc_op's
+            // source local).
+            .reset => blk: {
+                const token_dest = findResetTokenForSource(analysis_context, function.id, op.value) orelse continue;
+                break :blk ir.Instruction{ .reset = .{ .dest = token_dest, .source = op.value } };
+            },
+            // `.reuse_alloc` is consumed by `rewriteReuseConstructions`
+            // (per-construction-instruction mutation, not insertion).
+            // Skip it here.
+            .reuse_alloc => continue,
+            // Dataflow-only kinds stay in the analysis context — they're
+            // markers, not IR-emitting.
+            .move_transfer, .share => continue,
         };
         try pending.add(.{
             .block = op.insertion_point.block,
@@ -328,6 +347,293 @@ fn rewriteReuseTokensToRealLocals(
     }
 
     try local_allocator.commit();
+}
+
+/// Find the reset-token LocalId for the reuse_pair whose
+/// `reset.source` matches `source_local` in `function_id`. Returns
+/// `null` if no matching pair exists (no reuse opportunity for
+/// this deconstruction).
+fn findResetTokenForSource(
+    analysis_context: *const escape_lattice.AnalysisContext,
+    function_id: ir.FunctionId,
+    source_local: ir.LocalId,
+) ?ir.LocalId {
+    for (analysis_context.reuse_pairs.items) |pair| {
+        if (pair.reuse.insertion_point.function != function_id) continue;
+        if (pair.reset.source != source_local) continue;
+        return pair.reset.dest;
+    }
+    return null;
+}
+
+/// Walk `analysis_context.reuse_pairs` and rewrite each matching
+/// construction instruction (tuple_init / struct_init / union_init)
+/// to carry the pair's reuse token in its `reuse_token` field. After
+/// this pass, the ZIR backend's canonical lowering reads
+/// `instruction.reuse_token` directly — no more side-table lookup
+/// via the deleted `findReusePairForDest` helper. Construction sites
+/// can live at any nesting depth; the rewrite walks the
+/// `pair.reuse.insertion_point.path` the same way
+/// `materializeAnalysisArcOps` does for retain/release records.
+fn rewriteReuseConstructions(
+    allocator: std.mem.Allocator,
+    function: *ir.Function,
+    analysis_context: *const escape_lattice.AnalysisContext,
+) !void {
+    for (analysis_context.reuse_pairs.items) |pair| {
+        if (pair.reuse.insertion_point.function != function.id) continue;
+        const token = pair.reuse.token orelse continue;
+        const block_index = findBlockByLabel(function, pair.reuse.insertion_point.block) orelse continue;
+        const block_ptr: *ir.Block = @constCast(&function.body[block_index]);
+        const new_stream = try rewriteOneConstructionInStream(
+            allocator,
+            block_ptr.instructions,
+            pair.reuse.insertion_point.path,
+            pair.reuse.insertion_point.instr_index,
+            pair.reuse.dest,
+            token,
+        );
+        if (new_stream) |s| block_ptr.instructions = s;
+    }
+}
+
+/// Walk `stream` along `path` until we reach the innermost stream
+/// containing the construction at `instr_index`. Rewrite that
+/// instruction's `reuse_token` field. Returns a rebuilt slice
+/// (heap-allocated) or `null` if no rewrite happened.
+fn rewriteOneConstructionInStream(
+    allocator: std.mem.Allocator,
+    stream: []const ir.Instruction,
+    path: []const escape_lattice.StreamStep,
+    instr_index: u32,
+    expected_dest: ir.LocalId,
+    token: ir.LocalId,
+) error{OutOfMemory}!?[]const ir.Instruction {
+    if (path.len == 0) {
+        // Leaf stream: mutate the target instruction at `instr_index`.
+        if (instr_index >= stream.len) return null;
+        const target = stream[instr_index];
+        const rewritten = rewriteConstructionInstruction(target, expected_dest, token) orelse return null;
+        const new_slice = try allocator.alloc(ir.Instruction, stream.len);
+        @memcpy(new_slice, stream);
+        new_slice[instr_index] = rewritten;
+        return new_slice;
+    }
+
+    // Descend one level into the path.
+    const step = path[0];
+    const parent_idx = step.parent_instr_index;
+    if (parent_idx >= stream.len) return null;
+    const parent = stream[parent_idx];
+    const rebuilt_parent = try rewriteParentChild(allocator, parent, step.child, path[1..], instr_index, expected_dest, token) orelse return null;
+    const new_slice = try allocator.alloc(ir.Instruction, stream.len);
+    @memcpy(new_slice, stream);
+    new_slice[parent_idx] = rebuilt_parent;
+    return new_slice;
+}
+
+/// Recurse into one specific child slot of `parent`, replacing the
+/// matched nested stream with one whose innermost construction has
+/// been rewritten to carry the reuse_token. Returns the rebuilt
+/// parent (a copy with its sub-stream slice updated) or `null` if
+/// the rewrite couldn't be applied.
+fn rewriteParentChild(
+    allocator: std.mem.Allocator,
+    parent: ir.Instruction,
+    slot: escape_lattice.ChildSlot,
+    rest_path: []const escape_lattice.StreamStep,
+    instr_index: u32,
+    expected_dest: ir.LocalId,
+    token: ir.LocalId,
+) error{OutOfMemory}!?ir.Instruction {
+    return switch (slot) {
+        .if_expr_then => blk: {
+            if (parent != .if_expr) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, parent.if_expr.then_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            var copy = parent.if_expr;
+            copy.then_instrs = new_stream.?;
+            break :blk ir.Instruction{ .if_expr = copy };
+        },
+        .if_expr_else => blk: {
+            if (parent != .if_expr) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, parent.if_expr.else_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            var copy = parent.if_expr;
+            copy.else_instrs = new_stream.?;
+            break :blk ir.Instruction{ .if_expr = copy };
+        },
+        .case_block_pre => blk: {
+            if (parent != .case_block) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, parent.case_block.pre_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            var copy = parent.case_block;
+            copy.pre_instrs = new_stream.?;
+            break :blk ir.Instruction{ .case_block = copy };
+        },
+        .case_block_arm_cond => |arm_idx| blk: {
+            if (parent != .case_block) break :blk null;
+            const arms = parent.case_block.arms;
+            if (arm_idx >= arms.len) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, arms[arm_idx].cond_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            const new_arms = try cloneArmsWithReplacedStream(allocator, arms, arm_idx, .cond, new_stream.?);
+            var copy = parent.case_block;
+            copy.arms = new_arms;
+            break :blk ir.Instruction{ .case_block = copy };
+        },
+        .case_block_arm_body => |arm_idx| blk: {
+            if (parent != .case_block) break :blk null;
+            const arms = parent.case_block.arms;
+            if (arm_idx >= arms.len) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, arms[arm_idx].body_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            const new_arms = try cloneArmsWithReplacedStream(allocator, arms, arm_idx, .body, new_stream.?);
+            var copy = parent.case_block;
+            copy.arms = new_arms;
+            break :blk ir.Instruction{ .case_block = copy };
+        },
+        .case_block_default => blk: {
+            if (parent != .case_block) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, parent.case_block.default_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            var copy = parent.case_block;
+            copy.default_instrs = new_stream.?;
+            break :blk ir.Instruction{ .case_block = copy };
+        },
+        .switch_literal_case => |case_idx| blk: {
+            if (parent != .switch_literal) break :blk null;
+            const cases = parent.switch_literal.cases;
+            if (case_idx >= cases.len) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, cases[case_idx].body_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            const new_cases = try cloneLitCasesWithReplacedBody(allocator, cases, case_idx, new_stream.?);
+            var copy = parent.switch_literal;
+            copy.cases = new_cases;
+            break :blk ir.Instruction{ .switch_literal = copy };
+        },
+        .switch_literal_default => blk: {
+            if (parent != .switch_literal) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, parent.switch_literal.default_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            var copy = parent.switch_literal;
+            copy.default_instrs = new_stream.?;
+            break :blk ir.Instruction{ .switch_literal = copy };
+        },
+        .switch_return_case => |case_idx| blk: {
+            if (parent != .switch_return) break :blk null;
+            const cases = parent.switch_return.cases;
+            if (case_idx >= cases.len) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, cases[case_idx].body_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            const new_cases = try cloneReturnCasesWithReplacedBody(allocator, cases, case_idx, new_stream.?);
+            var copy = parent.switch_return;
+            copy.cases = new_cases;
+            break :blk ir.Instruction{ .switch_return = copy };
+        },
+        .switch_return_default => blk: {
+            if (parent != .switch_return) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, parent.switch_return.default_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            var copy = parent.switch_return;
+            copy.default_instrs = new_stream.?;
+            break :blk ir.Instruction{ .switch_return = copy };
+        },
+        .union_switch_case => |case_idx| blk: {
+            if (parent != .union_switch) break :blk null;
+            const cases = parent.union_switch.cases;
+            if (case_idx >= cases.len) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, cases[case_idx].body_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            const new_cases = try cloneUnionCasesWithReplacedBody(allocator, cases, case_idx, new_stream.?);
+            var copy = parent.union_switch;
+            copy.cases = new_cases;
+            break :blk ir.Instruction{ .union_switch = copy };
+        },
+        .union_switch_return_case => |case_idx| blk: {
+            if (parent != .union_switch_return) break :blk null;
+            const cases = parent.union_switch_return.cases;
+            if (case_idx >= cases.len) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, cases[case_idx].body_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            const new_cases = try cloneUnionCasesWithReplacedBody(allocator, cases, case_idx, new_stream.?);
+            var copy = parent.union_switch_return;
+            copy.cases = new_cases;
+            break :blk ir.Instruction{ .union_switch_return = copy };
+        },
+        .try_call_named_success => blk: {
+            if (parent != .try_call_named) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, parent.try_call_named.success_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            var copy = parent.try_call_named;
+            copy.success_instrs = new_stream.?;
+            break :blk ir.Instruction{ .try_call_named = copy };
+        },
+        .try_call_named_handler => blk: {
+            if (parent != .try_call_named) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, parent.try_call_named.handler_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            var copy = parent.try_call_named;
+            copy.handler_instrs = new_stream.?;
+            break :blk ir.Instruction{ .try_call_named = copy };
+        },
+        .guard_block_body => blk: {
+            if (parent != .guard_block) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, parent.guard_block.body, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            var copy = parent.guard_block;
+            copy.body = new_stream.?;
+            break :blk ir.Instruction{ .guard_block = copy };
+        },
+        .optional_dispatch_nil => blk: {
+            if (parent != .optional_dispatch) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, parent.optional_dispatch.nil_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            var copy = parent.optional_dispatch;
+            copy.nil_instrs = new_stream.?;
+            break :blk ir.Instruction{ .optional_dispatch = copy };
+        },
+        .optional_dispatch_struct => blk: {
+            if (parent != .optional_dispatch) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, parent.optional_dispatch.struct_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            var copy = parent.optional_dispatch;
+            copy.struct_instrs = new_stream.?;
+            break :blk ir.Instruction{ .optional_dispatch = copy };
+        },
+    };
+}
+
+/// Set the `reuse_token` field of `instr` if it's a tuple_init,
+/// struct_init, or union_init whose `dest` matches `expected_dest`.
+/// Returns the rewritten instruction or `null` if the shape didn't
+/// match.
+fn rewriteConstructionInstruction(
+    instr: ir.Instruction,
+    expected_dest: ir.LocalId,
+    token: ir.LocalId,
+) ?ir.Instruction {
+    switch (instr) {
+        .tuple_init => |ti| {
+            if (ti.dest != expected_dest) return null;
+            var copy = ti;
+            copy.reuse_token = token;
+            return ir.Instruction{ .tuple_init = copy };
+        },
+        .struct_init => |si| {
+            if (si.dest != expected_dest) return null;
+            var copy = si;
+            copy.reuse_token = token;
+            return ir.Instruction{ .struct_init = copy };
+        },
+        .union_init => |ui| {
+            if (ui.dest != expected_dest) return null;
+            var copy = ui;
+            copy.reuse_token = token;
+            return ir.Instruction{ .union_init = copy };
+        },
+        else => return null,
+    }
 }
 
 // ============================================================

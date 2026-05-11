@@ -517,6 +517,13 @@ pub const AggregateInit = struct {
     /// like `{Atom, Term}`) wrap concrete element values via `Term.from`.
     /// `null` for tuples where component types are not statically known.
     component_types: ?[]const ZigType = null,
+    /// Perceus reuse: when set, this tuple is constructed by reusing the
+    /// allocation referenced by the token's LocalId rather than allocating
+    /// fresh. The token is produced by a preceding `.reset` IR instruction
+    /// whose `dest` matches this value. `arc_materialize.materializeReusePairs`
+    /// sets this field when the Perceus analyzer paired this construction
+    /// site with an upstream deconstruction site.
+    reuse_token: ?LocalId = null,
 };
 
 pub const MapInit = struct {
@@ -535,6 +542,8 @@ pub const StructInit = struct {
     dest: LocalId,
     type_name: []const u8,
     fields: []const StructFieldInit,
+    /// Perceus reuse: see `AggregateInit.reuse_token` for the contract.
+    reuse_token: ?LocalId = null,
 };
 
 pub const StructFieldInit = struct {
@@ -547,6 +556,8 @@ pub const UnionInit = struct {
     union_type: []const u8,
     variant_name: []const u8,
     value: LocalId,
+    /// Perceus reuse: see `AggregateInit.reuse_token` for the contract.
+    reuse_token: ?LocalId = null,
 };
 
 pub const EnumLiteral = struct {

@@ -800,6 +800,28 @@ pub const ZirDriver = struct {
     /// struct (IO, Integer, Float, etc.) maps 1:1 to the runtime
     /// struct of the same name — the call site can pass `mod_name`
     /// straight through to `field_val`.
+    /// Emit a `zap_runtime.ArcRuntime.reuseAllocByType(type_ref,
+    /// alloc_ref, token_ref)` runtime call. Single source for every
+    /// `reuseAllocByType` ZIR emission in the driver — the
+    /// canonical `.reuse_alloc` IR handler and the construction-
+    /// instruction reuse paths (`tuple_init` / `struct_init` /
+    /// `union_init` with `reuse_token` set) all route through this
+    /// helper so the V10 audit catalogues a single emission site
+    /// instead of one per consumer.
+    fn emitReuseAllocCall(self: *ZirDriver, type_ref: u32, token_ref: u32) BuildError!u32 {
+        const alloc_ref = try self.emitAllocatorRef();
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+        const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
+        if (arc_runtime == error_ref) return error.EmitFailed;
+        const reuse_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "reuseAllocByType", 16);
+        if (reuse_fn == error_ref) return error.EmitFailed;
+        const args = [_]u32{ type_ref, alloc_ref, token_ref };
+        const ref = zir_builder_emit_call_ref(self.handle, reuse_fn, &args, 3);
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
     fn emitAllocatorRef(self: *ZirDriver) BuildError!u32 {
         // `std.heap.c_allocator` is malloc-backed: ~32 byte per-allocation
         // overhead, vs. `std.heap.page_allocator`'s full OS-page rounding
@@ -3512,21 +3534,6 @@ pub const ZirDriver = struct {
         return null;
     }
 
-    fn findReusePairForDest(self: *const ZirDriver, dest: ir.LocalId) ?@import("escape_lattice.zig").ReusePair {
-        if (self.analysis_context) |actx| {
-            for (actx.reuse_pairs.items) |pair| {
-                if (pair.reuse.dest != dest) continue;
-                const insertion_point = pair.reuse.insertion_point;
-                if (insertion_point.function != self.current_function_id) continue;
-                if (insertion_point.block != self.current_block_label) continue;
-                if (insertion_point.instr_index != self.current_instr_index) continue;
-                if (insertion_point.position != .before) continue;
-                return pair;
-            }
-        }
-        return null;
-    }
-
     fn isParamDerivedClosure(self: *const ZirDriver, local: ir.LocalId) bool {
         return self.param_derived_closure_locals.contains(local);
     }
@@ -5207,7 +5214,7 @@ pub const ZirDriver = struct {
                 // always falls through to the anonymous init path.
                 self.tuple_init_count += 1;
                 const body_local_type: u32 = 0;
-                if (self.findReusePairForDest(ti.dest)) |pair| {
+                if (ti.reuse_token) |token_local| {
                     const seed_ref = if (body_local_type != 0)
                         zir_builder_emit_struct_init_typed(
                             self.handle,
@@ -5228,18 +5235,8 @@ pub const ZirDriver = struct {
                     if (seed_ref == error_ref) return error.EmitFailed;
                     const type_ref = zir_builder_emit_typeof(self.handle, seed_ref);
                     if (type_ref == error_ref) return error.EmitFailed;
-                    const token_local = pair.reuse.token orelse return error.EmitFailed;
                     const token_ref = try self.refForLocal(token_local);
-                    const alloc_ref = try self.emitAllocatorRef();
-                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                    if (rt_import == error_ref) return error.EmitFailed;
-                    const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
-                    if (arc_runtime == error_ref) return error.EmitFailed;
-                    const reuse_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "reuseAllocByType", 16);
-                    if (reuse_fn == error_ref) return error.EmitFailed;
-                    const args = [_]u32{ type_ref, alloc_ref, token_ref };
-                    const ptr_ref = zir_builder_emit_call_ref(self.handle, reuse_fn, &args, 3);
-                    if (ptr_ref == error_ref) return error.EmitFailed;
+                    const ptr_ref = try self.emitReuseAllocCall(type_ref, token_ref);
                     for (0..ti.elements.len) |i| {
                         const name = indexFieldName(i);
                         const ptr = zir_builder_emit_field_ptr(self.handle, ptr_ref, name.ptr, name.len);
@@ -5439,7 +5436,7 @@ pub const ZirDriver = struct {
                     }
                 }
 
-                if (self.findReusePairForDest(si.dest)) |pair| {
+                if (si.reuse_token) |token_local| {
                     // Use struct_init_typed for named structs to preserve
                     // type identity. The `current_function_is_closure` guard
                     // stays — closures can't resolve struct-level decl_val
@@ -5465,18 +5462,8 @@ pub const ZirDriver = struct {
                     if (seed_ref == error_ref) return error.EmitFailed;
                     const type_ref = zir_builder_emit_typeof(self.handle, seed_ref);
                     if (type_ref == error_ref) return error.EmitFailed;
-                    const token_local = pair.reuse.token orelse return error.EmitFailed;
                     const token_ref = try self.refForLocal(token_local);
-                    const alloc_ref = try self.emitAllocatorRef();
-                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                    if (rt_import == error_ref) return error.EmitFailed;
-                    const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
-                    if (arc_runtime == error_ref) return error.EmitFailed;
-                    const reuse_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "reuseAllocByType", 16);
-                    if (reuse_fn == error_ref) return error.EmitFailed;
-                    const args = [_]u32{ type_ref, alloc_ref, token_ref };
-                    const ptr_ref = zir_builder_emit_call_ref(self.handle, reuse_fn, &args, 3);
-                    if (ptr_ref == error_ref) return error.EmitFailed;
+                    const ptr_ref = try self.emitReuseAllocCall(type_ref, token_ref);
                     for (si.fields) |field| {
                         const value_ref = self.refForValueLocal(field.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
                         const ptr = zir_builder_emit_field_ptr(self.handle, ptr_ref, field.name.ptr, @intCast(field.name.len));
@@ -5804,23 +5791,13 @@ pub const ZirDriver = struct {
                 const names = [_][*]const u8{ui.variant_name.ptr};
                 const lens = [_]u32{@intCast(ui.variant_name.len)};
                 const vals = [_]u32{val_ref};
-                if (self.findReusePairForDest(ui.dest)) |pair| {
+                if (ui.reuse_token) |token_local| {
                     const seed_ref = zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
                     if (seed_ref == error_ref) return error.EmitFailed;
                     const type_ref = zir_builder_emit_typeof(self.handle, seed_ref);
                     if (type_ref == error_ref) return error.EmitFailed;
-                    const token_local = pair.reuse.token orelse return error.EmitFailed;
                     const token_ref = try self.refForLocal(token_local);
-                    const alloc_ref = try self.emitAllocatorRef();
-                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                    if (rt_import == error_ref) return error.EmitFailed;
-                    const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
-                    if (arc_runtime == error_ref) return error.EmitFailed;
-                    const reuse_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "reuseAllocByType", 16);
-                    if (reuse_fn == error_ref) return error.EmitFailed;
-                    const args = [_]u32{ type_ref, alloc_ref, token_ref };
-                    const ptr_ref = zir_builder_emit_call_ref(self.handle, reuse_fn, &args, 3);
-                    if (ptr_ref == error_ref) return error.EmitFailed;
+                    const ptr_ref = try self.emitReuseAllocCall(type_ref, token_ref);
                     const ptr = zir_builder_emit_field_ptr(self.handle, ptr_ref, ui.variant_name.ptr, @intCast(ui.variant_name.len));
                     if (ptr == error_ref) return error.EmitFailed;
                     if (zir_builder_emit_store(self.handle, ptr, val_ref) != 0) return error.EmitFailed;
@@ -6721,23 +6698,12 @@ pub const ZirDriver = struct {
             },
             .reuse_alloc => |ra| {
                 const type_ref = try self.emitTypeRef(ra.dest_type);
-                const alloc_ref = try self.emitAllocatorRef();
                 const token_ref = if (ra.token) |token|
                     try self.refForLocal(token)
                 else
                     zir_builder_emit_void(self.handle);
                 if (token_ref == error_ref) return error.EmitFailed;
-
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
-                if (arc_runtime == error_ref) return error.EmitFailed;
-                const reuse_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "reuseAllocByType", 16);
-                if (reuse_fn == error_ref) return error.EmitFailed;
-
-                const args = [_]u32{ type_ref, alloc_ref, token_ref };
-                const ref = zir_builder_emit_call_ref(self.handle, reuse_fn, &args, 3);
-                if (ref == error_ref) return error.EmitFailed;
+                const ref = try self.emitReuseAllocCall(type_ref, token_ref);
                 try self.setLocal(ra.dest, ref);
             },
 
@@ -8315,108 +8281,6 @@ pub fn buildAndInject(
     if (result != 0) {
         return error.ZirInjectionFailed;
     }
-}
-
-test "ZirDriver.findReusePairForDest matches exact insertion point" {
-    const testing = std.testing;
-    const lattice = @import("escape_lattice.zig");
-
-    var analysis_context = lattice.AnalysisContext.init(testing.allocator);
-    defer analysis_context.deinit();
-
-    try analysis_context.addReusePair(.{
-        .match_site = 1,
-        .alloc_site = 10,
-        .reset = .{ .dest = 10001, .source = 4, .source_type = 0 },
-        .reuse = .{
-            .dest = 9,
-            .token = 10001,
-            .insertion_point = .{ .function = 3, .block = 5, .instr_index = 7, .position = .before },
-            .constructor_tag = 10,
-            .dest_type = 0,
-        },
-        .kind = .dynamic_reuse,
-    });
-    try analysis_context.addReusePair(.{
-        .match_site = 2,
-        .alloc_site = 11,
-        .reset = .{ .dest = 10002, .source = 6, .source_type = 0 },
-        .reuse = .{
-            .dest = 9,
-            .token = 10002,
-            .insertion_point = .{ .function = 3, .block = 5, .instr_index = 8, .position = .before },
-            .constructor_tag = 11,
-            .dest_type = 0,
-        },
-        .kind = .dynamic_reuse,
-    });
-
-    const driver = ZirDriver{
-        .handle = undefined,
-        .local_refs = .empty,
-        .param_refs = .empty,
-        .allocator = testing.allocator,
-        .program = null,
-        .current_function_id = 3,
-        .current_block_label = 5,
-        .current_instr_index = 7,
-        .analysis_context = &analysis_context,
-        .reuse_backed_struct_locals = .empty,
-    };
-
-    const pair = driver.findReusePairForDest(9) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(ir.LocalId, 10001), pair.reset.dest);
-    try testing.expectEqual(@as(u32, 7), pair.reuse.insertion_point.instr_index);
-}
-
-test "ZirDriver.findReusePairForDest requires exact destination and site" {
-    const testing = std.testing;
-    const lattice = @import("escape_lattice.zig");
-
-    var analysis_context = lattice.AnalysisContext.init(testing.allocator);
-    defer analysis_context.deinit();
-
-    try analysis_context.addReusePair(.{
-        .match_site = 1,
-        .alloc_site = 10,
-        .reset = .{ .dest = 10001, .source = 4, .source_type = 0 },
-        .reuse = .{
-            .dest = 9,
-            .token = 10001,
-            .insertion_point = .{ .function = 3, .block = 5, .instr_index = 7, .position = .before },
-            .constructor_tag = 10,
-            .dest_type = 0,
-        },
-        .kind = .dynamic_reuse,
-    });
-
-    const wrong_instr_driver = ZirDriver{
-        .handle = undefined,
-        .local_refs = .empty,
-        .param_refs = .empty,
-        .allocator = testing.allocator,
-        .program = null,
-        .current_function_id = 3,
-        .current_block_label = 5,
-        .current_instr_index = 6,
-        .analysis_context = &analysis_context,
-        .reuse_backed_struct_locals = .empty,
-    };
-    try testing.expect(wrong_instr_driver.findReusePairForDest(9) == null);
-
-    const wrong_dest_driver = ZirDriver{
-        .handle = undefined,
-        .local_refs = .empty,
-        .param_refs = .empty,
-        .allocator = testing.allocator,
-        .program = null,
-        .current_function_id = 3,
-        .current_block_label = 5,
-        .current_instr_index = 7,
-        .analysis_context = &analysis_context,
-        .reuse_backed_struct_locals = .empty,
-    };
-    try testing.expect(wrong_dest_driver.findReusePairForDest(10) == null);
 }
 
 test "closure lowering helper distinguishes immediate and stack tiers" {
