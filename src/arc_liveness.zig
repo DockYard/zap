@@ -1651,6 +1651,48 @@ const Analyzer = struct {
                     }
                 }
             },
+            .switch_return => |sr| {
+                // Each arm of a switch_return contributes a return
+                // value at the function-exit boundary. Mirror the
+                // single-`.ret` discipline: when `last_use_local`
+                // matches an arm's return value (and elision is
+                // safe), record it in `return_source_locals` so the
+                // matching `dropsForTerminator` release is suppressed
+                // and `shouldRetainReturnValue` skips the
+                // retain-on-ret — ownership transfers from the
+                // arm-local destination directly to the caller's
+                // return slot without a refcount round-trip. Without
+                // these cases the arm-local return value's retain
+                // fires inside the arm body while the (no-op) release
+                // fires at the parent level on an unset slot — a +1
+                // leak per return that scales catastrophically for
+                // recursive constructors like binarytrees' `make`.
+                for (sr.cases) |case| {
+                    if (case.return_value) |v| {
+                        if (v == last_use_local and self.canElideReturnSource(v)) {
+                            try ownership.return_source_locals.put(self.allocator, last_use_local, {});
+                        }
+                    }
+                }
+                if (sr.default_result) |v| {
+                    if (v == last_use_local and self.canElideReturnSource(v)) {
+                        try ownership.return_source_locals.put(self.allocator, last_use_local, {});
+                    }
+                }
+            },
+            .union_switch_return => |usr| {
+                // Same discipline as `.switch_return` above — per-arm
+                // return values are arm-local and transfer directly
+                // to the caller's return slot. `union_switch_return`
+                // has no default arm in the IR shape.
+                for (usr.cases) |case| {
+                    if (case.return_value) |v| {
+                        if (v == last_use_local and self.canElideReturnSource(v)) {
+                            try ownership.return_source_locals.put(self.allocator, last_use_local, {});
+                        }
+                    }
+                }
+            },
             else => {},
         }
     }
