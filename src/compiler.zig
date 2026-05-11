@@ -1053,27 +1053,41 @@ const Pipeline = struct {
         // visible.
         zap.arc_param_convention.inferConventions(self.alloc, &program, &ownership, type_store) catch
             return self.failWith("Error during ARC parameter convention inference", error.IrFailed);
-        // Phase A of the Phase 6 redux plan: same wiring as
-        // `runIrLowering` so per-struct and whole-program lowering
-        // exercise the identical pass list.
-        runArcOwnershipAndVerify(self.alloc, &program, &ownership, type_store) catch
-            return self.failWith("Error during ARC ownership classification or verification", error.IrFailed);
-        // NOTE: drop-insertion is intentionally SKIPPED here so that
-        // the per-struct IR enters the merge with NO scope-exit
-        // releases on parameter locals. This is a soundness
-        // requirement for the post-merge `arc_param_convention` re-run:
-        // drop-insertion adds explicit `release value=L` instructions
-        // before terminators, and `arc_liveness` counts those releases
-        // as "uses" of L, polluting `last_use_map[L]`. The post-merge
-        // uniqueness inference then sees `last_use_map[share_source] != share_id`
-        // (because the release is now the last use) and refuses to
-        // promote — locking in the per-struct `.borrowed` decision
-        // and defeating the entire point of the merged re-run.
+        // NOTE: `runArcOwnershipAndVerify` (which runs
+        // `rewriteOwnedConsumeBuiltinSites`, `classifyAndNormalize`, and
+        // `rewriteOwnedConsumeSites`) is intentionally SKIPPED here.
+        // These passes rewrite `local_get` instructions into
+        // `borrow_value`/`copy_value`/`move_value` based on the CURRENT
+        // (per-struct) `param_conventions`. The per-struct convention
+        // pass cannot see cross-struct callers, so it leaves slots
+        // `.borrowed` that the merged convention pass (run later in
+        // `compileStructByStruct`'s Phase 5b) will promote to `.owned`.
         //
-        // Drop-insertion is run exactly once in `compileStructByStruct`'s
-        // Phase 5b, AFTER the merged convention inference + ownership
-        // rewrite, so the releases land on top of the final
-        // post-merge convention assignment.
+        // If classification ran here, the `borrow_value` shapes emitted
+        // under the stale per-struct conventions would still be baked
+        // into the IR when the merged convention pass runs. The merged
+        // classifier is NOT bidirectional — it only re-classifies
+        // `local_get`, never pre-emitted `borrow_value`. Callees whose
+        // conventions are promoted by the merged pass would then receive
+        // args via `borrow_value → share_value`, and the merged
+        // `rewriteOwnedConsumeSites` would turn the share into a
+        // `move_value` whose source (the borrow) does not own +1. The
+        // soundness verifier rejects this in the merged uniqueness
+        // pre-flight, blocking promotion entirely.
+        //
+        // Deferring classification to the merged stage ensures the
+        // classifier sees the FINAL conventions across the whole
+        // program, so its borrow/copy/move decisions are correct.
+        //
+        // Drop-insertion is also skipped here (same reason as previously
+        // documented): explicit releases pollute `last_use_map` so the
+        // merged convention pass's last-use checks would refuse
+        // promotions that depend on the release-free shape.
+        //
+        // Both `runArcOwnershipAndVerify` and `runArcDropInsertion` run
+        // exactly once in `compileStructByStruct`'s Phase 5b, AFTER the
+        // merged convention inference, so the rewrites and releases
+        // land on top of the final convention assignment.
         return .{ .program = program, .arc_ownership = ownership };
     }
 
@@ -2492,7 +2506,7 @@ fn runArcDropInsertion(
         const glob = std.mem.span(glob_z);
         for (program.functions) |*function| {
             if (std.mem.indexOf(u8, function.name, glob)) |_| {
-                std.debug.print("=== IR dump (post-drop-insertion): {s} ===\n", .{function.name});
+                std.debug.print("=== IR dump (post-drop-insertion): {s} (id={d}) ===\n", .{ function.name, function.id });
                 std.debug.print("  param_conventions=[", .{});
                 for (function.param_conventions, 0..) |c, ci| {
                     if (ci > 0) std.debug.print(", ", .{});

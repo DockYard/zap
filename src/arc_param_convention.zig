@@ -1888,12 +1888,44 @@ const TentativeAnalyzer = struct {
                 try self.copyTuplePending(bv.dest, bv.source);
             },
             .local_get => |lg| {
-                try self.propagateTuplePending(lg.dest, lg.source);
-                try self.propagateExtractedAlias(lg.dest, lg.source);
-                if (self.unique.contains(lg.source)) {
-                    _ = self.unique.remove(lg.source);
-                    try self.unique.put(self.allocator, lg.dest, {});
+                // `local_get` is a load. The classifier later decides
+                // whether to lower it as `move_value` (when source is
+                // at last-use), `copy_value` (retain), or
+                // `borrow_value` (non-owning alias). The pre-flight
+                // must mirror the path-sensitive classification:
+                //
+                //   * Source at last-use → classifier will emit
+                //     `move_value`: propagate (move) tuple_pending,
+                //     extracted, and uniqueness from source to dest.
+                //   * Source NOT at last-use → classifier will emit
+                //     `copy_value` or `borrow_value`: COPY
+                //     tuple_pending so subsequent loads in the same
+                //     stream still see the source's pending entry,
+                //     and uniqueness does NOT transfer.
+                //
+                // The destructure pattern (`{v, tmp} = v_tmp`) reads
+                // the tuple binding via multiple `local_get`s — one
+                // per component. Without the copy-on-non-last-use
+                // rule, the first load would consume the pending
+                // entry, and the second load's `index_get` would see
+                // no parent pending — losing the extracted-component
+                // uniqueness witness that drives the spectral-norm
+                // `iterate` chain.
+                const source_at_last_use = blk: {
+                    const ownership = self.ownership orelse break :blk false;
+                    break :blk ownership.isLastUseAt(lg.source, my_id);
+                };
+                if (source_at_last_use) {
+                    try self.propagateTuplePending(lg.dest, lg.source);
+                    try self.propagateExtractedAlias(lg.dest, lg.source);
+                    if (self.unique.contains(lg.source)) {
+                        _ = self.unique.remove(lg.source);
+                        try self.unique.put(self.allocator, lg.dest, {});
+                    } else {
+                        _ = self.unique.remove(lg.dest);
+                    }
                 } else {
+                    try self.copyTuplePending(lg.dest, lg.source);
                     _ = self.unique.remove(lg.dest);
                 }
             },
