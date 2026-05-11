@@ -6788,6 +6788,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
         pub fn hasKey(map: ?*const Self, key: K) bool {
             if (map) |m| {
+                if (m.capacity == 0) @panic("Map.hasKey: received MapIter cell; iter cells are only valid as Map.next state");
                 if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
             }
             return findEntry(map, key) != null;
@@ -6795,6 +6796,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
         pub fn get(map: ?*const Self, key: K, default: V) V {
             if (map) |m| {
+                if (m.capacity == 0) @panic("Map.get: received MapIter cell; iter cells are only valid as Map.next state");
                 if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
             }
             const self = map orelse {
@@ -7045,10 +7047,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
         pub fn merge(map_a: ?*const Self, map_b: ?*const Self) ?*const Self {
             if (map_a) |m| {
-                if (m.capacity == 0) @panic("Map.merge: received MapIter cell; iter cells are only valid as Map.next state");
+                if (m.capacity == 0) @panic("Map.merge: received MapIter cell; iter cells are only valid as Map.next state: map_a");
             }
             if (map_b) |m| {
-                if (m.capacity == 0) @panic("Map.merge: received MapIter cell; iter cells are only valid as Map.next state");
+                if (m.capacity == 0) @panic("Map.merge: received MapIter cell; iter cells are only valid as Map.next state: map_b");
             }
             if (comptime instrument_map) {
                 if (map_a) |m| _ = mapInstrumentationBumpMutation(@intFromPtr(m), .merge);
@@ -7163,10 +7165,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// transparent resize).
         pub fn merge_owned_unchecked(map_a: ?*const Self, map_b: ?*const Self) ?*const Self {
             if (map_a) |m| {
-                if (m.capacity == 0) @panic("Map.merge_owned_unchecked: received MapIter cell; iter cells are only valid as Map.next state");
+                if (m.capacity == 0) @panic("Map.merge_owned_unchecked: received MapIter cell; iter cells are only valid as Map.next state: map_a");
             }
             if (map_b) |m| {
-                if (m.capacity == 0) @panic("Map.merge_owned_unchecked: received MapIter cell; iter cells are only valid as Map.next state");
+                if (m.capacity == 0) @panic("Map.merge_owned_unchecked: received MapIter cell; iter cells are only valid as Map.next state: map_b");
             }
             if (map_a == null and map_b == null) return null;
             if (map_b == null) return map_a;
@@ -13407,6 +13409,102 @@ test "slab pool: partial-slab telemetry tracks count and live-sum through push/u
     // Slab 1 is still the active slab with one cell live. Free it
     // — active slabs don't go partial, so the counters stay at 0.
     Pool.destroy(slab_one_first);
+    try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_count);
+    try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_live_sum);
+
+    Pool.resetForTest();
+}
+
+test "slab pool: rotateActive partial->active transition zeros partial telemetry" {
+    // Cover the only counter-update path that the prior telemetry test
+    // did not exercise: `rotateActive`'s call to `unlinkPartial` when a
+    // partial slab is promoted back to active because the prior active
+    // slab filled up. This is the steady-state recycling path that keeps
+    // peak slab count low under churning workloads — a regression that
+    // failed to decrement `slab_active_partial_count` /
+    // `slab_active_partial_live_sum` here would silently grow the
+    // telemetry over time even though the partial list itself was
+    // correctly walked.
+    const Pool = ArcRuntime.ArcSlabPool(SlabTestInner24, "SlabTest24/rotate-active-partial", false);
+    Pool.statsForTest().live = 0;
+    Pool.statsForTest().slab_active_partial_count = 0;
+    Pool.statsForTest().slab_active_partial_live_sum = 0;
+    Pool.resetForTest();
+
+    const slab_capacity = Pool.slot_capacity;
+
+    // Fill slab 0 (the first active slab).
+    const slab_zero_cells = try std.testing.allocator.alloc(*SlabTestInner24, slab_capacity);
+    defer std.testing.allocator.free(slab_zero_cells);
+
+    var fill_zero_index: usize = 0;
+    while (fill_zero_index < slab_capacity) : (fill_zero_index += 1) {
+        slab_zero_cells[fill_zero_index] = Pool.create();
+    }
+    const slab_zero_base = @intFromPtr(slab_zero_cells[0]) & ArcRuntime.SLAB_BASE_MASK;
+
+    // One more allocation rotates a fresh slab 1 in as active. Slab 0 is
+    // still FULL, so the partial list is empty.
+    const slab_one_first = Pool.create();
+    const slab_one_base = @intFromPtr(slab_one_first) & ArcRuntime.SLAB_BASE_MASK;
+    try std.testing.expect(slab_one_base != slab_zero_base);
+    try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_count);
+    try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_live_sum);
+
+    // Free one cell from slab 0. It transitions full -> partial and is
+    // pushed onto the partial list with live_count = slab_capacity - 1.
+    Pool.destroy(slab_zero_cells[0]);
+    try std.testing.expectEqual(@as(usize, 1), Pool.statsForTest().slab_active_partial_count);
+    try std.testing.expectEqual(@as(usize, slab_capacity - 1), Pool.statsForTest().slab_active_partial_live_sum);
+
+    // Fill slab 1 completely. It already holds one cell (`slab_one_first`),
+    // so allocate `slab_capacity - 1` more to saturate it.
+    const slab_one_remaining = try std.testing.allocator.alloc(*SlabTestInner24, slab_capacity - 1);
+    defer std.testing.allocator.free(slab_one_remaining);
+
+    var fill_one_index: usize = 0;
+    while (fill_one_index < slab_capacity - 1) : (fill_one_index += 1) {
+        slab_one_remaining[fill_one_index] = Pool.create();
+        // All these allocations must land in slab 1 — slab 0 is on the
+        // partial list, but the active slab is what `create` allocates
+        // from until it fills.
+        try std.testing.expectEqual(slab_one_base, @intFromPtr(slab_one_remaining[fill_one_index]) & ArcRuntime.SLAB_BASE_MASK);
+    }
+
+    // Partial telemetry is unchanged: slab 0 is still on the partial list,
+    // slab 1 is the active slab and not counted.
+    try std.testing.expectEqual(@as(usize, 1), Pool.statsForTest().slab_active_partial_count);
+    try std.testing.expectEqual(@as(usize, slab_capacity - 1), Pool.statsForTest().slab_active_partial_live_sum);
+
+    // Now allocate one more cell. Slab 1 is full, so `create` calls
+    // `rotateActive`, which pulls slab 0 off the partial list (via
+    // `unlinkPartial`) and promotes it to active. The pulled slab fills
+    // its one free slot with this allocation, so afterwards:
+    //   * partial_count must be 0 (slab 0 left the partial list)
+    //   * partial_live_sum must be 0 (slab 0's live_count was removed
+    //     from the sum)
+    //   * the new cell must live in slab 0
+    const promoted_cell = Pool.create();
+    try std.testing.expectEqual(slab_zero_base, @intFromPtr(promoted_cell) & ArcRuntime.SLAB_BASE_MASK);
+    try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_count);
+    try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_live_sum);
+
+    // Drain everything for a clean reset. Slab 0 has slab_capacity cells
+    // (the rotate filled its one free slot), slab 1 has slab_capacity.
+    // `slab_zero_cells[0]` is now the promoted cell's payload — its
+    // pointer was reused from the free-list pop, so reuse it.
+    slab_zero_cells[0] = promoted_cell;
+
+    var drain_zero_index: usize = 0;
+    while (drain_zero_index < slab_capacity) : (drain_zero_index += 1) {
+        Pool.destroy(slab_zero_cells[drain_zero_index]);
+    }
+    Pool.destroy(slab_one_first);
+    var drain_one_index: usize = 0;
+    while (drain_one_index < slab_capacity - 1) : (drain_one_index += 1) {
+        Pool.destroy(slab_one_remaining[drain_one_index]);
+    }
+
     try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_count);
     try std.testing.expectEqual(@as(usize, 0), Pool.statsForTest().slab_active_partial_live_sum);
 

@@ -144,6 +144,40 @@ Slabs are 64 KiB aligned, so `slab_base = ptr & ~0xFFFF`. Cast to `*SlabHeader`.
 
 Slot index: `(ptr - slab_base - header_size) / slot_size`. Computed only on debug paths.
 
+### 2.7 Telemetry: partial-slab fragmentation read
+
+Two `PoolStats` fields surface the partial-slab fragmentation state of every registered pool. They are bumped/decremented in lockstep with the backend's intrusive `partial_head` list so a downstream consumer can compute a single fragmentation ratio without walking the list itself.
+
+| Field | Type | Updated by | Definition |
+|---|---|---|---|
+| `slab_active_partial_count` | `usize` | `pushPartial`, `unlinkPartial` | Number of slabs currently linked into `backend.partial_head` (`live_count > 0` AND at least one free slot). |
+| `slab_active_partial_live_sum` | `usize` | `pushPartial`, `unlinkPartial`, `destroy` | Running sum of `live_count` across every slab in the partial list. |
+
+**Invariants:**
+
+- `slab_active_partial_live_sum >= slab_active_partial_count` whenever `slab_active_partial_count > 0` — every partial slab carries at least one live cell by construction.
+- `slab_active_partial_live_sum <= slab_active_partial_count * slot_capacity` — each partial slab also has at least one free slot, so it cannot contribute the full slot capacity to the sum (in practice the inequality is strict).
+- Both counters return to 0 when the partial list is empty.
+
+**Fragmentation formula:**
+
+```
+mean_partial_occupancy = slab_active_partial_live_sum
+                      / (slab_active_partial_count * slot_capacity)
+```
+
+A low ratio across many partial slabs signals fragmentation: the pool is holding mostly-empty slabs that could be unmapped if the deep-release pattern were more aggressive. `slot_capacity` is comptime-known per `(Inner, side_table)` pair, so the downstream consumer derives it from `name` plus the runtime's type table rather than from this struct.
+
+**`ZAP_ARC_STATS=1` output column format:**
+
+When the `ZAP_ARC_STATS=1` env-var is set on process entry, the runtime registers an `atexit` hook that dumps the global ARC counters and every registered pool's high-water mark to stderr. The per-pool line is emitted in `dumpArcStats` as:
+
+```
+[zap-arc-stats] pool=<name> live=<u64> high_water=<u64> partial_slabs=<usize> partial_live_sum=<usize>
+```
+
+The `partial_slabs` and `partial_live_sum` columns expose `slab_active_partial_count` and `slab_active_partial_live_sum` respectively. The columns are positional and stable — downstream log scrapers may depend on the field order.
+
 ---
 
 ## 3. Concurrency model
@@ -287,6 +321,12 @@ Side-table mode (`side_table=true`), shipped in `077467e`:
 15. **`side-table slab pool: refcount table sized correctly per slab capacity`** — `HeaderType.fixed_capacity == capacityFor()`.
 16. **`ArcSlabPool side-table: cached_empty preserves refcount slot integrity across slab reuse`** — added later; covers refcount-slot freshness when a `cached_empty` slab is rotated back into active.
 
+Partial-slab telemetry coverage (added with the §2.7 telemetry contract):
+
+17. **`slab pool: partial-slab telemetry tracks count and live-sum through push/unlink`** — exercises the full→partial→empty state machine on a single slab; verifies `slab_active_partial_count` and `slab_active_partial_live_sum` are bumped on `pushPartial`, decremented per cell on `destroy`, and unlinked back to 0 when the partial slab drains to `live_count == 0`.
+18. **`slab pool: rotateActive partial->active transition zeros partial telemetry`** — exercises the only counter-update path the test above misses: `unlinkPartial` called from inside `rotateActive` when the active slab fills and a partial slab is promoted back to active. Verifies both counters drop to 0 after the promotion.
+19. **`side-table slab pool: tight slab-occupancy bound for representative tree workload`** — pins the architectural per-slab occupancy floor for the binarytrees N=21 RSS budget; asserts `slot_capacity ∈ [3200, 3280]` for a 16-byte `Inner` in side-table mode and walks the 16-byte slot stride across a 1024-cell representative tree.
+
 ### 5.7 Commit policy
 
 **One atomic commit at the end.** No intermediate commits. The commit message must include:
@@ -319,7 +359,7 @@ If a non-goal becomes necessary during implementation, STOP and discuss before p
 
 **Acceptance criteria met:**
 
-- `zig build test --summary all`: 1035+ tests passing after the side-table refcount layout shipped.
+- `zig build test --summary all`: 1040+ tests passing after the side-table refcount layout and the partial-slab telemetry coverage shipped.
 - `binarytrees N=21` peak memory footprint: **~162 MB** measured (the previous projection of 140 MB underestimated the cost; the architectural floor of 16 bytes/T + 4 bytes/refcount + slab/header overhead + libc heap fragmentation + bump-arena temporaries lands the steady-state RSS at ~162 MB, with run-to-run noise of a few MB).
 - `binarytrees N=21` wall time: within budget (~6.5s baseline preserved).
 - All other benchmarks unchanged.
