@@ -848,7 +848,13 @@ fn largeAlloc(size: usize, alignment: u32, init_refcount: u32) ?[*]u8 {
 
 fn largeFree(ptr: [*]u8) void {
     const header_ptr: *LargeHeader = @ptrCast(@alignCast(ptr - @sizeOf(LargeHeader)));
-    std.debug.assert(header_ptr.magic == LARGE_MAGIC);
+    // Magic mismatch is fatal corruption — the pointer either does
+    // not belong to this manager or its header was overwritten.
+    // Continuing would `munmap` an arbitrary memory range and bring
+    // down the process with a SEGV at the next access. Panic loudly
+    // even in release builds so the diagnostic surfaces with the
+    // failing pointer rather than as a downstream memory corruption.
+    if (header_ptr.magic != LARGE_MAGIC) @panic("zap.arc: largeFree: corrupt LargeHeader magic (pointer not owned by this manager or double-free)");
     const alignment = header_ptr.alignment;
     const leading = largeLeadingFor(alignment);
     const total = leading + header_ptr.size;
@@ -888,10 +894,19 @@ const ArcContext = struct {
 // `LOCK XADD` (x86_64). The externalised helper is no longer
 // necessary and added ~3 ns per retain/release through an extra
 // C-ABI call hop. This file now emits the atomic op inline.
+//
+// Ordering policy (spec §8.2): retains use `.monotonic` (relaxed) —
+// the spec mandates only that the count be atomic, and a retain has
+// no prior writeback to publish (it's a pure ownership-share
+// operation). Releases use `.acq_rel` so the final decrement that
+// observes the zero-transition synchronises with every prior
+// retain/release on the same cell, ensuring the deep-walk and free
+// see a consistent view of the object. Same convention as the C++
+// `std::shared_ptr` implementation.
 // ---------------------------------------------------------------------------
 
-inline fn atomicAdd32AcqRel(ptr: *u32, delta: u32) u32 {
-    return @atomicRmw(u32, ptr, .Add, delta, .acq_rel);
+inline fn atomicAddU32(ptr: *u32, delta: u32, comptime ordering: std.builtin.AtomicOrder) u32 {
+    return @atomicRmw(u32, ptr, .Add, delta, ordering);
 }
 
 // ---------------------------------------------------------------------------
@@ -965,9 +980,10 @@ fn arcDeallocate(
     const arc_ctx: *ArcContext = @ptrCast(@alignCast(ctx));
     std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
     if (size == 0) return;
-    if (lookupClass(size, alignment)) |_| {
+    if (lookupClass(size, alignment)) |class_index| {
         const slab = slabFromSlotPtr(ptr);
         std.debug.assert(slab.magic == SLAB_MAGIC);
+        std.debug.assert(slab.class_index == class_index);
         const slot_index = slotIndexInSlab(slab, ptr);
         slabFreeSlot(&arc_ctx.slab_pool, slab, slot_index);
         return;
@@ -1002,16 +1018,19 @@ fn arcGetCapabilityDesc(
 
 /// REFCOUNT_V1 `retain` (spec §8). Atomic increment on the 4-byte
 /// refcount at offset 0 of an inline-header cell. Used by Map/List/
-/// MapIter.
+/// MapIter. `.monotonic` ordering — see the ordering policy comment
+/// above `atomicAddU32`.
 fn arcRetain(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
     _ = ctx;
     const refcount_ptr: *u32 = @ptrCast(@alignCast(object));
-    _ = atomicAdd32AcqRel(refcount_ptr, 1);
+    _ = atomicAddU32(refcount_ptr, 1, .monotonic);
 }
 
 /// REFCOUNT_V1 `release` (spec §8). Atomic decrement on the inline
 /// header; on the zero-transition invokes `deep_walk(object)` (which
 /// performs the cell's full teardown for inline-header types).
+/// `.acq_rel` ordering so the zero-observing decrement synchronises
+/// with every prior retain/release.
 fn arcRelease(
     ctx: *anyopaque,
     object: *anyopaque,
@@ -1019,7 +1038,8 @@ fn arcRelease(
 ) callconv(.c) void {
     _ = ctx;
     const refcount_ptr: *u32 = @ptrCast(@alignCast(object));
-    const prev = atomicAdd32AcqRel(refcount_ptr, @bitCast(@as(i32, -1)));
+    const prev = atomicAddU32(refcount_ptr, @bitCast(@as(i32, -1)), .acq_rel);
+    std.debug.assert(prev > 0);
     if (prev == 1) {
         if (deep_walk) |walk| walk(object);
     }
@@ -1037,17 +1057,31 @@ fn arcRetainSized(
     alignment: u32,
 ) callconv(.c) void {
     _ = ctx;
-    if (lookupClass(size, alignment)) |_| {
+    // Defensive parameter validation. `alignment` must be a power of
+    // two per spec §4.2 (matches `core.allocate`'s contract). A zero-
+    // size cell is meaningless — a soundness bug in the dispatcher
+    // would route here with size == 0; return cleanly rather than
+    // index a class that doesn't exist.
+    std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
+    if (size == 0) return;
+    if (lookupClass(size, alignment)) |class_index| {
         const slab = slabFromSlotPtr(object);
         std.debug.assert(slab.magic == SLAB_MAGIC);
+        // Cross-check that the (size, alignment) the caller passed
+        // matches the slab the pointer actually lives in. A mismatch
+        // means the caller computed `size` from the wrong type — a
+        // soundness violation. Catch it in debug builds where the
+        // bug is cheapest to diagnose; release builds elide the
+        // assert and trust the caller's `(size, alignment)` pair.
+        std.debug.assert(slab.class_index == class_index);
         const slot_index = slotIndexInSlab(slab, object);
         const refcount_ptr = slabRefcountPtr(slab, slot_index);
-        _ = atomicAdd32AcqRel(refcount_ptr, 1);
+        _ = atomicAddU32(refcount_ptr, 1, .monotonic);
         return;
     }
     const header = largeHeader(object);
-    std.debug.assert(header.magic == LARGE_MAGIC);
-    _ = atomicAdd32AcqRel(&header.refcount, 1);
+    if (header.magic != LARGE_MAGIC) @panic("zap.arc: retain_sized large path: corrupt LargeHeader magic");
+    _ = atomicAddU32(&header.refcount, 1, .monotonic);
 }
 
 /// REFCOUNT_V1 `release_sized` (Phase 4.x extension). Locates the
@@ -1062,12 +1096,21 @@ fn arcReleaseSized(
     deep_walk: ?ZapDeepWalkFn,
 ) callconv(.c) void {
     const arc_ctx: *ArcContext = @ptrCast(@alignCast(ctx));
-    if (lookupClass(size, alignment)) |_| {
+    // Mirror the `retain_sized` parameter validation. Zero-size
+    // release is a no-op (mirrors the no-op zero-size alloc).
+    std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
+    if (size == 0) return;
+    if (lookupClass(size, alignment)) |class_index| {
         const slab = slabFromSlotPtr(object);
         std.debug.assert(slab.magic == SLAB_MAGIC);
+        std.debug.assert(slab.class_index == class_index);
         const slot_index = slotIndexInSlab(slab, object);
         const refcount_ptr = slabRefcountPtr(slab, slot_index);
-        const prev = atomicAdd32AcqRel(refcount_ptr, @bitCast(@as(i32, -1)));
+        const prev = atomicAddU32(refcount_ptr, @bitCast(@as(i32, -1)), .acq_rel);
+        // Spec §8.2: a release that drops to zero is the sole owner.
+        // A prev == 0 result means the caller released a cell with
+        // rc=0 already — a double-release. Catch in debug.
+        std.debug.assert(prev > 0);
         if (prev == 1) {
             // Children walk runs BEFORE the slot returns to the free
             // list — `deep_walk` may dereference fields of the cell to
@@ -1079,8 +1122,13 @@ fn arcReleaseSized(
         return;
     }
     const header = largeHeader(object);
-    std.debug.assert(header.magic == LARGE_MAGIC);
-    const prev = atomicAdd32AcqRel(&header.refcount, @bitCast(@as(i32, -1)));
+    // Magic mismatch on a large allocation is a fatal corruption: the
+    // caller's pointer either doesn't belong to this manager or was
+    // already freed and the header was overwritten. Continuing would
+    // free arbitrary memory. Panic even in release builds.
+    if (header.magic != LARGE_MAGIC) @panic("zap.arc: release_sized large path: corrupt LargeHeader magic");
+    const prev = atomicAddU32(&header.refcount, @bitCast(@as(i32, -1)), .acq_rel);
+    std.debug.assert(prev > 0);
     if (prev == 1) {
         if (deep_walk) |walk| walk(object);
         const byte_ptr: [*]u8 = @ptrCast(object);
@@ -1102,15 +1150,18 @@ fn arcRefcountSized(
     alignment: u32,
 ) callconv(.c) u32 {
     _ = ctx;
-    if (lookupClass(size, alignment)) |_| {
+    std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
+    if (size == 0) return 0;
+    if (lookupClass(size, alignment)) |class_index| {
         const slab = slabFromSlotPtr(object);
         std.debug.assert(slab.magic == SLAB_MAGIC);
+        std.debug.assert(slab.class_index == class_index);
         const slot_index = slotIndexInSlab(slab, object);
         const refcount_ptr = slabRefcountPtr(slab, slot_index);
         return @atomicLoad(u32, refcount_ptr, .acquire);
     }
     const header = largeHeader(object);
-    std.debug.assert(header.magic == LARGE_MAGIC);
+    if (header.magic != LARGE_MAGIC) @panic("zap.arc: refcount_sized large path: corrupt LargeHeader magic");
     return @atomicLoad(u32, &header.refcount, .acquire);
 }
 

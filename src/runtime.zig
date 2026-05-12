@@ -1354,7 +1354,10 @@ const TestOnlyArcSlabPool = if (builtin.is_test) struct {
 
     pub fn largeFree(ptr: [*]u8) void {
         const header_ptr: *LargeHeader = @ptrCast(@alignCast(ptr - @sizeOf(LargeHeader)));
-        std.debug.assert(header_ptr.magic == LARGE_MAGIC);
+        // Mirror the production manager: magic mismatch is fatal
+        // corruption — panic even in release rather than munmap an
+        // arbitrary memory range.
+        if (header_ptr.magic != LARGE_MAGIC) @panic("zap.test_arc: largeFree: corrupt LargeHeader magic (pointer not owned by this manager or double-free)");
         const alignment = header_ptr.alignment;
         const leading = largeLeadingFor(alignment);
         const total = leading + header_ptr.size;
@@ -1482,9 +1485,16 @@ fn testOnlyArcRetainSized(
 ) callconv(.c) void {
     _ = ctx;
     if (!builtin.is_test) return;
-    if (TestOnlyArcSlabPool.lookupClass(size, alignment)) |_| {
+    // Mirror the production manager's defensive checks
+    // (`arcRetainSized` in `src/memory/arc/manager.zig`). The
+    // testOnly pool exists to exercise the exact same vtable surface
+    // as production, so the param-validation contract must match.
+    std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
+    if (size == 0) return;
+    if (TestOnlyArcSlabPool.lookupClass(size, alignment)) |class_index| {
         const slab = TestOnlyArcSlabPool.slabFromSlotPtr(object);
         std.debug.assert(slab.magic == TestOnlyArcSlabPool.SLAB_MAGIC);
+        std.debug.assert(slab.class_index == class_index);
         const slot_index = TestOnlyArcSlabPool.slotIndexInSlab(slab, object);
         const refcount_ptr = TestOnlyArcSlabPool.slabRefcountPtr(slab, slot_index);
         const atomic_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(refcount_ptr));
@@ -1492,7 +1502,7 @@ fn testOnlyArcRetainSized(
         return;
     }
     const header = TestOnlyArcSlabPool.largeHeader(object);
-    std.debug.assert(header.magic == TestOnlyArcSlabPool.LARGE_MAGIC);
+    if (header.magic != TestOnlyArcSlabPool.LARGE_MAGIC) @panic("zap.test_arc: retain_sized large path: corrupt LargeHeader magic");
     const atomic_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(&header.refcount));
     _ = atomic_ptr.fetchAdd(1, .monotonic);
 }
@@ -1506,13 +1516,17 @@ fn testOnlyArcReleaseSized(
 ) callconv(.c) void {
     if (!builtin.is_test) return;
     const tctx: *@TypeOf(test_only_arc_context_storage) = @ptrCast(@alignCast(ctx));
-    if (TestOnlyArcSlabPool.lookupClass(size, alignment)) |_| {
+    std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
+    if (size == 0) return;
+    if (TestOnlyArcSlabPool.lookupClass(size, alignment)) |class_index| {
         const slab = TestOnlyArcSlabPool.slabFromSlotPtr(object);
         std.debug.assert(slab.magic == TestOnlyArcSlabPool.SLAB_MAGIC);
+        std.debug.assert(slab.class_index == class_index);
         const slot_index = TestOnlyArcSlabPool.slotIndexInSlab(slab, object);
         const refcount_ptr = TestOnlyArcSlabPool.slabRefcountPtr(slab, slot_index);
         const atomic_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(refcount_ptr));
         const prev = atomic_ptr.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
         if (prev == 1) {
             if (deep_walk) |walk| walk(object);
             TestOnlyArcSlabPool.slabFreeSlot(&tctx.slab_pool, slab, slot_index);
@@ -1520,9 +1534,10 @@ fn testOnlyArcReleaseSized(
         return;
     }
     const header = TestOnlyArcSlabPool.largeHeader(object);
-    std.debug.assert(header.magic == TestOnlyArcSlabPool.LARGE_MAGIC);
+    if (header.magic != TestOnlyArcSlabPool.LARGE_MAGIC) @panic("zap.test_arc: release_sized large path: corrupt LargeHeader magic");
     const atomic_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(&header.refcount));
     const prev = atomic_ptr.fetchSub(1, .acq_rel);
+    std.debug.assert(prev > 0);
     if (prev == 1) {
         if (deep_walk) |walk| walk(object);
         const byte_ptr: [*]u8 = @ptrCast(object);
@@ -1538,16 +1553,19 @@ fn testOnlyArcRefcountSized(
 ) callconv(.c) u32 {
     _ = ctx;
     if (!builtin.is_test) return 0;
-    if (TestOnlyArcSlabPool.lookupClass(size, alignment)) |_| {
+    std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
+    if (size == 0) return 0;
+    if (TestOnlyArcSlabPool.lookupClass(size, alignment)) |class_index| {
         const slab = TestOnlyArcSlabPool.slabFromSlotPtr(object);
         std.debug.assert(slab.magic == TestOnlyArcSlabPool.SLAB_MAGIC);
+        std.debug.assert(slab.class_index == class_index);
         const slot_index = TestOnlyArcSlabPool.slotIndexInSlab(slab, object);
         const refcount_ptr = TestOnlyArcSlabPool.slabRefcountPtr(slab, slot_index);
         const atomic_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(refcount_ptr));
         return atomic_ptr.load(.acquire);
     }
     const header = TestOnlyArcSlabPool.largeHeader(object);
-    std.debug.assert(header.magic == TestOnlyArcSlabPool.LARGE_MAGIC);
+    if (header.magic != TestOnlyArcSlabPool.LARGE_MAGIC) @panic("zap.test_arc: refcount_sized large path: corrupt LargeHeader magic");
     const atomic_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(&header.refcount));
     return atomic_ptr.load(.acquire);
 }
