@@ -2262,6 +2262,268 @@ test "Phase 5 integration: Arena manager resolves end-to-end through driver (Mac
     std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
 }
 
+test "Phase 7 integration: Leak manager resolves end-to-end through driver (ELF)" {
+    // Phase 7 ships the real `src/memory/leak/manager.zig` implementation
+    // (the diagnostic leak-everything CI tool). Like Phase 5 Arena, this
+    // test asserts:
+    //   1. The driver discovers `Zap.Memory.Leak` from a stdlib-shaped
+    //      `lib/zap/memory/leak.zap`.
+    //   2. The mock fork synthesises a Leak-style object whose `.zapmem`
+    //      section declares zero capabilities (Leak's section layout is
+    //      byte-compatible with NoOp/Arena at the metadata level — all
+    //      three pass `declared_caps = 0` — so we reuse
+    //      `mockForkCompileNoOp` rather than introducing a synthesiser
+    //      that would be a verbatim duplicate).
+    //   3. `resolve` produces a `ResolvedManager` with a real
+    //      `object_path` and `declared_caps == 0`.
+    //
+    // The integration target is the section/symbol pipeline, not the
+    // runtime allocator behaviour — the latter is exercised by the
+    // `test_leak_manager_compile.sh` smoke test, which compiles the
+    // real source with system zig and inspects the produced bytes, and
+    // the "real Leak manager source compiles..." test below that runs
+    // the system-zig path in-process during `zig build test`.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/zap/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/leak") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+
+    const stdlib_decl =
+        \\@memory_manager_source = "src/memory/leak/manager.zig"
+        \\
+        \\pub struct Zap.Memory.Leak {
+        \\}
+        \\
+    ;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/zap/memory/leak.zap", .data = stdlib_decl }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/leak/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(stdlib_root);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var resolved = try resolve(
+        allocator,
+        .{
+            .manager_name = "Zap.Memory.Leak",
+            .source_roots = &.{
+                .{ .name = "zap_stdlib", .path = stdlib_root },
+            },
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = cache_root,
+            .fork_compile_fn = mockForkCompileNoOp,
+        },
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expectEqualStrings("Zap.Memory.Leak", resolved.name);
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
+    try std.testing.expect(resolved.object_path != null);
+    // Leak declares no REFCOUNT_V1 capability — explicit check guards
+    // against a future regression that mistakenly turns the bit on at
+    // the section level.
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps & abi.REFCOUNT_V1_BIT);
+
+    // The object the mock wrote must still be on disk under the cache.
+    std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
+}
+
+test "Phase 7 integration: Leak manager resolves end-to-end through driver (Mach-O)" {
+    // Mach-O sibling of the Phase 7 Leak ELF integration test.
+    // Exercises the same source-discovery + compile + parse + validate
+    // pipeline but with a Mach-O 64-bit object whose `__DATA,__zapmem`
+    // section declares zero capabilities. This catches Mach-O-specific
+    // drift in the section parser and symbol-table inspector — neither
+    // of which the Linux-only ELF path can exercise.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/zap/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/leak") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+
+    const stdlib_decl =
+        \\@memory_manager_source = "src/memory/leak/manager.zig"
+        \\
+        \\pub struct Zap.Memory.Leak {
+        \\}
+        \\
+    ;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/zap/memory/leak.zap", .data = stdlib_decl }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/leak/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(stdlib_root);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var resolved = try resolve(
+        allocator,
+        .{
+            .manager_name = "Zap.Memory.Leak",
+            .source_roots = &.{
+                .{ .name = "zap_stdlib", .path = stdlib_root },
+            },
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = cache_root,
+            .fork_compile_fn = mockForkCompileNoOpMacho,
+        },
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expectEqualStrings("Zap.Memory.Leak", resolved.name);
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
+    try std.testing.expect(resolved.object_path != null);
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps & abi.REFCOUNT_V1_BIT);
+    std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
+}
+
+test "Phase 7 integration: Tracking manager resolves end-to-end through driver (ELF)" {
+    // Phase 7 ships the real `src/memory/tracking/manager.zig`
+    // implementation (the diagnostic leak/UAF/OOB tracking CI tool).
+    // Same shape as the Leak integration test above — Tracking declares
+    // zero capabilities at the section level (its REFCOUNT-style
+    // bookkeeping is internal, not declared via `REFCOUNT_V1`), so
+    // `mockForkCompileNoOp` produces the correct synthesised payload.
+    //
+    // The integration target is the section/symbol pipeline. The
+    // runtime allocator behaviour (canary fill/check, hashmap insert/
+    // remove, leak reporting on deinit) is exercised by the
+    // `test_tracking_manager_compile.sh` smoke test that compiles the
+    // real source, and by the "real Tracking manager source compiles..."
+    // test below that runs the system-zig path in-process during
+    // `zig build test`.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/zap/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/tracking") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+
+    const stdlib_decl =
+        \\@memory_manager_source = "src/memory/tracking/manager.zig"
+        \\
+        \\pub struct Zap.Memory.Tracking {
+        \\}
+        \\
+    ;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/zap/memory/tracking.zap", .data = stdlib_decl }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/tracking/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(stdlib_root);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var resolved = try resolve(
+        allocator,
+        .{
+            .manager_name = "Zap.Memory.Tracking",
+            .source_roots = &.{
+                .{ .name = "zap_stdlib", .path = stdlib_root },
+            },
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = cache_root,
+            .fork_compile_fn = mockForkCompileNoOp,
+        },
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expectEqualStrings("Zap.Memory.Tracking", resolved.name);
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
+    try std.testing.expect(resolved.object_path != null);
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps & abi.REFCOUNT_V1_BIT);
+    std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
+}
+
+test "Phase 7 integration: Tracking manager resolves end-to-end through driver (Mach-O)" {
+    // Mach-O sibling of the Phase 7 Tracking ELF integration test.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/zap/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/tracking") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+
+    const stdlib_decl =
+        \\@memory_manager_source = "src/memory/tracking/manager.zig"
+        \\
+        \\pub struct Zap.Memory.Tracking {
+        \\}
+        \\
+    ;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/zap/memory/tracking.zap", .data = stdlib_decl }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/tracking/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(stdlib_root);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var resolved = try resolve(
+        allocator,
+        .{
+            .manager_name = "Zap.Memory.Tracking",
+            .source_roots = &.{
+                .{ .name = "zap_stdlib", .path = stdlib_root },
+            },
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = cache_root,
+            .fork_compile_fn = mockForkCompileNoOpMacho,
+        },
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expectEqualStrings("Zap.Memory.Tracking", resolved.name);
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
+    try std.testing.expect(resolved.object_path != null);
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps & abi.REFCOUNT_V1_BIT);
+    std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
+}
+
 test "assertExportsManagerSymbol passes for synthesized NoOp ELF" {
     // The ELF synthesiser emits a symbol table with `zap_memory_section`;
     // the symbol-presence check must accept it.
@@ -2901,5 +3163,37 @@ test "real ARC manager source compiles and exports a valid section (system zig)"
         "real_arc",
         "src/memory/arc/manager.zig",
         abi.REFCOUNT_V1_BIT,
+    );
+}
+
+test "real Leak manager source compiles and exports a valid section (system zig)" {
+    // Phase 7 verification gap: `scripts/test_leak_manager_compile.sh`
+    // exercises this exact pipeline against the real
+    // `src/memory/leak/manager.zig` source, but the script is not
+    // wired into `zig build test`. This in-process test closes that
+    // gap so any drift between the real Leak source and the driver's
+    // section parser / symbol-table inspector is caught the next time
+    // a contributor runs `zig build test`.
+    //
+    // Leak declares no capabilities (`declared_caps == 0`). The
+    // expected value below matches the section's literal
+    // `declared_caps` field in `src/memory/leak/manager.zig`.
+    try verifyRealManagerObject(
+        "real_leak",
+        "src/memory/leak/manager.zig",
+        0,
+    );
+}
+
+test "real Tracking manager source compiles and exports a valid section (system zig)" {
+    // Sibling of the Leak test above for the production Tracking
+    // manager at `src/memory/tracking/manager.zig`. Tracking is the
+    // diagnostic leak/UAF/OOB CI tool; like Leak it declares zero
+    // capabilities at the section level (its hash-map bookkeeping and
+    // canary checks are internal, not declared via `REFCOUNT_V1`).
+    try verifyRealManagerObject(
+        "real_tracking",
+        "src/memory/tracking/manager.zig",
+        0,
     );
 }
