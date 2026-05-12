@@ -74,6 +74,23 @@ pub fn build(b: *std.Build) void {
     const run_boundary_guard_tests = b.addRunArtifact(boundary_guard_tests);
     test_step.dependOn(&run_boundary_guard_tests.step);
 
+    // Cross-check that the byte-keyed slab pool's layout constants in
+    // `src/runtime.zig`'s `TestOnlyArcSlabPool` block agree byte-for-
+    // byte with the production manager (`src/memory/arc/manager.zig`).
+    // Phase 4.x duplicated the pool implementation because the
+    // manager (compiled by `zap_fork_compile_zig_to_object` as a
+    // standalone object) cannot share Zig modules with the runtime —
+    // this test fails the build when either side drifts unilaterally.
+    const slab_pool_drift_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/slab_pool_drift_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_slab_pool_drift_tests = b.addRunArtifact(slab_pool_drift_tests);
+    test_step.dependOn(&run_slab_pool_drift_tests.step);
+
     // -----------------------------------------------------------------------
     // Dependency paths
     // -----------------------------------------------------------------------

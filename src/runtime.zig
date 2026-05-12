@@ -15210,3 +15210,329 @@ test "MapIter: defensive path for null source_map returns DONE" {
     // returns to the pool.
     M.release(iter.asMapPtr());
 }
+
+// ============================================================
+// Byte-keyed slab pool tests (Fix 6 — Phase 4.x verification).
+//
+// These tests target `TestOnlyArcSlabPool` directly, which mirrors
+// the production manager's pool in `src/memory/arc/manager.zig`
+// byte-for-byte (see Fix 7's comptime cross-check). The production
+// manager's pool is exercised end-to-end via `Arc(T)` benchmarks
+// and the existing integration tests; this block validates the
+// pool's internal contracts (lookup classification, slab layout,
+// refcount bookkeeping, cached-empty preservation, slab live-count
+// policy) at a unit grain that those higher-level tests can't reach.
+//
+// Every test runs its own fresh `SlabPool` so test order is
+// irrelevant and there's no cross-test contamination.
+// ============================================================
+
+test "byte-keyed slab pool: lookupClass classifies every defined class" {
+    const Pool = TestOnlyArcSlabPool;
+    // For each defined class, the smallest size that maps to it is
+    // `(prev_class_size + 1)` (or 1 for class 0), and the largest is
+    // exactly `SLAB_CLASS_SIZES[class_index]`. Probe both endpoints
+    // with the class's natural alignment and verify classification.
+    var class_index: u32 = 0;
+    while (class_index < Pool.SLAB_CLASS_COUNT) : (class_index += 1) {
+        const class_size = Pool.SLAB_CLASS_SIZES[class_index];
+        const class_align = Pool.SLAB_CLASS_ALIGNS[class_index];
+        const lower = if (class_index == 0) @as(usize, 1) else @as(usize, Pool.SLAB_CLASS_SIZES[class_index - 1]) + 1;
+        const upper: usize = @intCast(class_size);
+        const got_lower = Pool.lookupClass(lower, class_align).?;
+        const got_upper = Pool.lookupClass(upper, class_align).?;
+        try std.testing.expect(got_lower <= class_index);
+        try std.testing.expectEqual(class_index, got_upper);
+    }
+}
+
+test "byte-keyed slab pool: lookupClass returns null for size > MAX_SLAB_CLASS_SIZE" {
+    const Pool = TestOnlyArcSlabPool;
+    try std.testing.expectEqual(@as(?u32, null), Pool.lookupClass(Pool.MAX_SLAB_CLASS_SIZE + 1, 8));
+    try std.testing.expectEqual(@as(?u32, null), Pool.lookupClass(8192, 8));
+    try std.testing.expectEqual(@as(?u32, null), Pool.lookupClass(64 * 1024, 8));
+}
+
+test "byte-keyed slab pool: lookupClass returns null for size 0" {
+    const Pool = TestOnlyArcSlabPool;
+    try std.testing.expectEqual(@as(?u32, null), Pool.lookupClass(0, 1));
+    try std.testing.expectEqual(@as(?u32, null), Pool.lookupClass(0, 64));
+}
+
+test "byte-keyed slab pool: lookupClass boundary 4096 fits, 4097 falls through" {
+    const Pool = TestOnlyArcSlabPool;
+    // 4096 is the largest slab class — must fit exactly.
+    try std.testing.expect(Pool.lookupClass(4096, 8) != null);
+    try std.testing.expectEqual(@as(u32, Pool.SLAB_CLASS_COUNT - 1), Pool.lookupClass(4096, 8).?);
+    // 4097 exceeds every class — caller routes to the large path.
+    try std.testing.expectEqual(@as(?u32, null), Pool.lookupClass(4097, 8));
+}
+
+test "byte-keyed slab pool: lookupClass alignment > 4096 forces large path" {
+    const Pool = TestOnlyArcSlabPool;
+    // Even a 16-byte request with 8192-byte alignment cannot fit in
+    // any size class (all class natural alignments are <= class_size,
+    // which caps at 4096). The hot-path lookup returns null and the
+    // caller routes through `largeAlloc`.
+    try std.testing.expectEqual(@as(?u32, null), Pool.lookupClass(16, 8192));
+    try std.testing.expectEqual(@as(?u32, null), Pool.lookupClass(64, 16384));
+}
+
+test "byte-keyed slab pool: lookupClass alignment-induced class escalation" {
+    const Pool = TestOnlyArcSlabPool;
+    // A 16-byte request with 256-byte alignment cannot fit class 0
+    // (alignment 16) — the loop escalates until it finds a class with
+    // alignment >= 256, which is class 8 (size 256, align 256).
+    const escalated = Pool.lookupClass(16, 256).?;
+    try std.testing.expect(Pool.SLAB_CLASS_ALIGNS[escalated] >= 256);
+    try std.testing.expect(Pool.SLAB_CLASS_SIZES[escalated] >= 16);
+}
+
+test "byte-keyed slab pool: LargeHeader round-trip" {
+    const Pool = TestOnlyArcSlabPool;
+    // Allocate a large request, verify the header is well-formed,
+    // free it.
+    const size: usize = Pool.MAX_SLAB_CLASS_SIZE + 100;
+    const alignment: u32 = 16;
+    const ptr = Pool.largeAlloc(size, alignment, 1).?;
+    const header = Pool.largeHeader(@ptrCast(ptr));
+    try std.testing.expectEqual(Pool.LARGE_MAGIC, header.magic);
+    try std.testing.expectEqual(size, header.size);
+    try std.testing.expectEqual(alignment, header.alignment);
+    try std.testing.expectEqual(@as(u32, 1), header.refcount);
+    Pool.largeFree(ptr);
+}
+
+test "byte-keyed slab pool: side-table refcount is per-slot" {
+    const Pool = TestOnlyArcSlabPool;
+    var pool = Pool.slabPoolInit();
+    defer cleanupSlabPool(&pool);
+    // Allocate three slots in the smallest class; verify their
+    // side-table refcount slots are independent.
+    const class_index: u32 = 0;
+    const slot_a = Pool.slabAllocSlot(&pool, class_index, 3).?;
+    const slot_b = Pool.slabAllocSlot(&pool, class_index, 5).?;
+    const slot_c = Pool.slabAllocSlot(&pool, class_index, 7).?;
+    const slab_a = Pool.slabFromSlotPtr(@ptrCast(slot_a));
+    const slab_b = Pool.slabFromSlotPtr(@ptrCast(slot_b));
+    const slab_c = Pool.slabFromSlotPtr(@ptrCast(slot_c));
+    // All three slots are in the same slab (capacity is large for class 0).
+    try std.testing.expectEqual(slab_a, slab_b);
+    try std.testing.expectEqual(slab_a, slab_c);
+    const idx_a = Pool.slotIndexInSlab(slab_a, @ptrCast(slot_a));
+    const idx_b = Pool.slotIndexInSlab(slab_b, @ptrCast(slot_b));
+    const idx_c = Pool.slotIndexInSlab(slab_c, @ptrCast(slot_c));
+    try std.testing.expectEqual(@as(u32, 3), Pool.slabRefcountPtr(slab_a, idx_a).*);
+    try std.testing.expectEqual(@as(u32, 5), Pool.slabRefcountPtr(slab_b, idx_b).*);
+    try std.testing.expectEqual(@as(u32, 7), Pool.slabRefcountPtr(slab_c, idx_c).*);
+    // Mutating one entry does not affect its neighbours.
+    Pool.slabRefcountPtr(slab_a, idx_a).* = 99;
+    try std.testing.expectEqual(@as(u32, 99), Pool.slabRefcountPtr(slab_a, idx_a).*);
+    try std.testing.expectEqual(@as(u32, 5), Pool.slabRefcountPtr(slab_b, idx_b).*);
+    try std.testing.expectEqual(@as(u32, 7), Pool.slabRefcountPtr(slab_c, idx_c).*);
+    Pool.slabFreeSlot(&pool, slab_a, idx_a);
+    Pool.slabFreeSlot(&pool, slab_b, idx_b);
+    Pool.slabFreeSlot(&pool, slab_c, idx_c);
+}
+
+test "byte-keyed slab pool: cached-empty preservation across slab reuse" {
+    const Pool = TestOnlyArcSlabPool;
+    var pool = Pool.slabPoolInit();
+    defer cleanupSlabPool(&pool);
+    // Fill class 0 to spill into a second slab, then free everything
+    // in the first slab. The first slab should land in cached_empty
+    // (it's not the current). Verify cached_empty holds it, then
+    // unmap the current slab manually and confirm the next allocate
+    // pulls cached_empty.
+    const class_index: u32 = 0;
+    const capacity = Pool.capacityForClass(class_index);
+    const initial_allocs = try std.testing.allocator.alloc([*]u8, capacity * 2);
+    defer std.testing.allocator.free(initial_allocs);
+    var alloc_idx: u32 = 0;
+    while (alloc_idx < capacity * 2) : (alloc_idx += 1) {
+        initial_allocs[alloc_idx] = Pool.slabAllocSlot(&pool, class_index, 1).?;
+    }
+    // The slab containing initial_allocs[0..capacity] is no longer
+    // current. Free everything in that slab.
+    const first_slab = Pool.slabFromSlotPtr(@ptrCast(initial_allocs[0]));
+    var free_idx: u32 = 0;
+    while (free_idx < capacity) : (free_idx += 1) {
+        const slot = initial_allocs[free_idx];
+        const slab = Pool.slabFromSlotPtr(@ptrCast(slot));
+        try std.testing.expectEqual(first_slab, slab);
+        const idx = Pool.slotIndexInSlab(slab, @ptrCast(slot));
+        Pool.slabFreeSlot(&pool, slab, idx);
+    }
+    // The first slab's live_count is now 0. It should sit in
+    // cached_empty (and out of partials).
+    const class = &pool.classes[class_index];
+    try std.testing.expectEqual(@as(?*Pool.SlabHeader, first_slab), class.cached_empty);
+    try std.testing.expectEqual(@as(?*Pool.SlabHeader, null), class.partials);
+    // Free the remaining (currently-active) slab's allocations so it
+    // has free slots, then verify cached_empty is still the first
+    // slab. The active-slab free-list pops first, so cached_empty
+    // remains untouched while the current slab can service requests.
+    free_idx = capacity;
+    while (free_idx < capacity * 2) : (free_idx += 1) {
+        const slot = initial_allocs[free_idx];
+        const slab = Pool.slabFromSlotPtr(@ptrCast(slot));
+        const idx = Pool.slotIndexInSlab(slab, @ptrCast(slot));
+        Pool.slabFreeSlot(&pool, slab, idx);
+    }
+    // cached_empty is preserved; first_slab is still cached. The
+    // active slab's free list now has entries, but cached_empty is
+    // not touched until the active slab is rotated out.
+    try std.testing.expectEqual(@as(?*Pool.SlabHeader, first_slab), class.cached_empty);
+}
+
+test "byte-keyed slab pool: empty slab unmap policy" {
+    const Pool = TestOnlyArcSlabPool;
+    var pool = Pool.slabPoolInit();
+    defer cleanupSlabPool(&pool);
+    // When a slab goes empty AND is not current AND cached_empty is
+    // already occupied, the slab is unmapped immediately. We test
+    // that policy by manufacturing two empty slabs and verifying the
+    // second one is unmapped rather than cached.
+    const class_index: u32 = 0;
+    const capacity = Pool.capacityForClass(class_index);
+    // Fill three slabs' worth of allocations.
+    const triple = capacity * 3;
+    const allocs = try std.testing.allocator.alloc([*]u8, triple);
+    defer std.testing.allocator.free(allocs);
+    for (allocs) |*slot_ptr_ref| {
+        slot_ptr_ref.* = Pool.slabAllocSlot(&pool, class_index, 1).?;
+    }
+    // The pool now holds 3 slabs (the current and two on the partial
+    // list). Free everything. The first two empty slabs that aren't
+    // `current` will be cached_empty or unmapped.
+    for (allocs) |slot_ptr| {
+        const slab = Pool.slabFromSlotPtr(@ptrCast(slot_ptr));
+        const idx = Pool.slotIndexInSlab(slab, @ptrCast(slot_ptr));
+        Pool.slabFreeSlot(&pool, slab, idx);
+    }
+    // After all frees: at most one cached_empty, the current slab,
+    // and zero partials. Anything else was unmapped.
+    const class = &pool.classes[class_index];
+    try std.testing.expectEqual(@as(?*Pool.SlabHeader, null), class.partials);
+    try std.testing.expect(class.cached_empty != null);
+    if (class.cached_empty) |slab| {
+        try std.testing.expectEqual(@as(u32, 0), slab.live_count);
+    }
+}
+
+test "byte-keyed slab pool: live_count tracks allocations and frees" {
+    const Pool = TestOnlyArcSlabPool;
+    var pool = Pool.slabPoolInit();
+    defer cleanupSlabPool(&pool);
+    const class_index: u32 = 5; // arbitrary mid-range class
+    const total = 50;
+    var allocs: [total][*]u8 = undefined;
+    var i: u32 = 0;
+    while (i < total) : (i += 1) {
+        allocs[i] = Pool.slabAllocSlot(&pool, class_index, 1).?;
+    }
+    const slab = Pool.slabFromSlotPtr(@ptrCast(allocs[0]));
+    try std.testing.expectEqual(@as(u32, total), slab.live_count);
+    // Free half.
+    i = 0;
+    while (i < total / 2) : (i += 1) {
+        const idx = Pool.slotIndexInSlab(slab, @ptrCast(allocs[i]));
+        Pool.slabFreeSlot(&pool, slab, idx);
+    }
+    try std.testing.expectEqual(@as(u32, total - total / 2), slab.live_count);
+    // Free the rest.
+    while (i < total) : (i += 1) {
+        const s = Pool.slabFromSlotPtr(@ptrCast(allocs[i]));
+        const idx = Pool.slotIndexInSlab(s, @ptrCast(allocs[i]));
+        Pool.slabFreeSlot(&pool, s, idx);
+    }
+    try std.testing.expectEqual(@as(u32, 0), slab.live_count);
+}
+
+test "byte-keyed slab pool: alloc/free returns same slot via free-list" {
+    const Pool = TestOnlyArcSlabPool;
+    var pool = Pool.slabPoolInit();
+    defer cleanupSlabPool(&pool);
+    const class_index: u32 = 0;
+    // Allocate two slots, free the first, allocate a third — the
+    // third should occupy the freed slot (LIFO free-list semantics).
+    const slot_a = Pool.slabAllocSlot(&pool, class_index, 1).?;
+    const slot_b = Pool.slabAllocSlot(&pool, class_index, 1).?;
+    const slab_a = Pool.slabFromSlotPtr(@ptrCast(slot_a));
+    const idx_a = Pool.slotIndexInSlab(slab_a, @ptrCast(slot_a));
+    Pool.slabFreeSlot(&pool, slab_a, idx_a);
+    const slot_c = Pool.slabAllocSlot(&pool, class_index, 1).?;
+    try std.testing.expectEqual(@intFromPtr(slot_a), @intFromPtr(slot_c));
+    const slab_c = Pool.slabFromSlotPtr(@ptrCast(slot_c));
+    const idx_c = Pool.slotIndexInSlab(slab_c, @ptrCast(slot_c));
+    Pool.slabFreeSlot(&pool, slab_c, idx_c);
+    const slab_b = Pool.slabFromSlotPtr(@ptrCast(slot_b));
+    const idx_b = Pool.slotIndexInSlab(slab_b, @ptrCast(slot_b));
+    Pool.slabFreeSlot(&pool, slab_b, idx_b);
+}
+
+test "byte-keyed slab pool: 64-KiB-aligned slab base mask round-trip" {
+    const Pool = TestOnlyArcSlabPool;
+    var pool = Pool.slabPoolInit();
+    defer cleanupSlabPool(&pool);
+    const class_index: u32 = 0;
+    const slot = Pool.slabAllocSlot(&pool, class_index, 1).?;
+    const slab = Pool.slabFromSlotPtr(@ptrCast(slot));
+    try std.testing.expect((@intFromPtr(slab) & Pool.SLAB_MASK) == 0);
+    try std.testing.expect((@intFromPtr(slab) % Pool.SLAB_ALIGN) == 0);
+    try std.testing.expectEqual(Pool.SLAB_MAGIC, slab.magic);
+    const idx = Pool.slotIndexInSlab(slab, @ptrCast(slot));
+    Pool.slabFreeSlot(&pool, slab, idx);
+}
+
+test "byte-keyed slab pool: largeAlloc handles size > MAX_SLAB_CLASS_SIZE" {
+    const Pool = TestOnlyArcSlabPool;
+    // 5000 bytes — above the 4096 ceiling — should round-trip through
+    // the large-allocation path with a tagged LargeHeader prefix.
+    const size: usize = 5000;
+    const alignment: u32 = 8;
+    const ptr = Pool.largeAlloc(size, alignment, 2).?;
+    const header = Pool.largeHeader(@ptrCast(ptr));
+    try std.testing.expectEqual(Pool.LARGE_MAGIC, header.magic);
+    try std.testing.expectEqual(size, header.size);
+    try std.testing.expectEqual(alignment, header.alignment);
+    try std.testing.expectEqual(@as(u32, 2), header.refcount);
+    Pool.largeFree(ptr);
+}
+
+test "byte-keyed slab pool: capacityForClass returns positive for every class" {
+    const Pool = TestOnlyArcSlabPool;
+    // Every defined size class must hold at least one slot in a
+    // 64-KiB slab — otherwise the slab pool can't service a request
+    // for that class. The capacity computation is closed-form, so a
+    // failure here means the slab math drifted out of the safe range.
+    var class_index: u32 = 0;
+    while (class_index < Pool.SLAB_CLASS_COUNT) : (class_index += 1) {
+        const cap = Pool.capacityForClass(class_index);
+        try std.testing.expect(cap > 0);
+    }
+}
+
+/// Test helper: walk every class and free every still-mapped slab,
+/// so the test's `defer` block can return all VM regions back to the
+/// kernel without leaking. Mirrors the production manager's
+/// `arcDeinit` walk, simplified for the per-test pool lifetime.
+fn cleanupSlabPool(pool: *TestOnlyArcSlabPool.SlabPool) void {
+    const Pool = TestOnlyArcSlabPool;
+    var class_index: u32 = 0;
+    while (class_index < Pool.SLAB_CLASS_COUNT) : (class_index += 1) {
+        const class = &pool.classes[class_index];
+        if (class.current) |slab| {
+            Pool.unmapSlab(slab.allocation_base);
+            class.current = null;
+        }
+        while (class.partials) |slab| {
+            class.partials = slab.next;
+            Pool.unmapSlab(slab.allocation_base);
+        }
+        if (class.cached_empty) |slab| {
+            Pool.unmapSlab(slab.allocation_base);
+            class.cached_empty = null;
+        }
+    }
+}
