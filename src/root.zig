@@ -120,4 +120,18 @@ test {
     _ = @import("memory/abi.zig");
     _ = @import("memory/driver.zig");
     _ = @import("memory/elision.zig");
+    // The tracking manager carries inline behavioural tests for canary
+    // detection, leak reporting, invalid-free, and size/alignment
+    // mismatch. The integration tests in `memory/driver.zig` validate
+    // the section/symbol pipeline using synthesised objects; this
+    // import drives the manager's actual runtime behaviour through the
+    // capturing diagnostic-writer hook declared in `tracking/manager.zig`.
+    //
+    // Importing the manager into the test binary pulls in its
+    // `pub export const zap_memory_section` — the only `zap_memory_section`
+    // export in the test binary. `runtime.zig`'s `externalMemorySection`
+    // early-returns null in `builtin.is_test` mode, so the symbol's
+    // presence is harmless: the test-only ARC fallback continues to
+    // drive every test allocation.
+    _ = @import("memory/tracking/manager.zig");
 }
