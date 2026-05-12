@@ -445,6 +445,50 @@ pub const instrument_map: bool = blk: {
 };
 
 // ============================================================
+// Phase 6 — ARC stat-counter collection comptime flag
+//
+// Every `retainAny` / `releaseAny` / `headerRetain` / `headerRelease`
+// dispatcher historically unconditionally bumped a global `u64`
+// counter (`arc_retains_total`, `arc_releases_total`,
+// `arc_consumes_total`, `arc_return_elisions_total`). The store costs
+// one memory write per ARC op — at ~600 M ops in the binarytrees
+// benchmark this adds ~0.5-1.0s of measured overhead under no observer.
+//
+// `collect_arc_stats` gates every counter store behind
+// `if (comptime collect_arc_stats) ...` so the store is dead-code-
+// eliminated in release user binaries. Tests in `runtime.zig`'s test
+// block depend on the counters reflecting real op counts and so the
+// host-correct default below is `true` when `builtin.is_test`.
+//
+// Resolution:
+//   * The source-level `COLLECT_ARC_STATS_DEFAULT` constant defaults
+//     to `builtin.is_test`, so the host test suite (which loads
+//     `runtime.zig` as a Zig module under `zig build test`) keeps the
+//     counter increments — every existing counter-delta assertion in
+//     the test block continues to observe per-op increments. Production
+//     Zap user binaries have `builtin.is_test == false`, so the
+//     embedded runtime resolves to `false` and the LLVM DCE pass elides
+//     every counter store.
+//
+// `@import("root")` is intentionally NOT used here for the same reason
+// as `runtime_declared_caps`: Zig 0.16's test runner makes
+// `@import("root")` resolve to its own root in test builds, so a
+// `root.zig` override would not be visible to runtime tests. The
+// host-correct `builtin.is_test` default solves the same problem
+// without the `@hasDecl` fragility.
+//
+// `noteConsume` / `noteReturnElision` are emitted by the compiler as
+// explicit ZIR calls (not inline) and ARE gated by this flag — the
+// counter store inside each function is dead-code-eliminated in
+// release builds, leaving only the ensureArcStatsAtexit() guard
+// (which is itself a single boolean compare after the first call).
+// ============================================================
+
+const COLLECT_ARC_STATS_DEFAULT: bool = builtin.is_test;
+
+pub const collect_arc_stats: bool = COLLECT_ARC_STATS_DEFAULT;
+
+// ============================================================
 // Phase 6 — Active manager capability bitmask exposed to runtime
 //
 // Each Zap binary is compiled with exactly one memory manager whose
@@ -1015,91 +1059,128 @@ pub const AbiV1 = struct {
 // `AbiV1` extern types.
 // ----------------------------------------------------------------
 
-/// Per-process context returned by the active manager's `init()`.
-/// Populated by `zapMemoryStartup`; consumed by every dispatched
-/// vtable call as the manager's opaque state pointer. Null before
-/// startup completes; the dispatchers panic on null access.
+/// Consolidated state for the active memory manager binding.
 ///
-/// Declared `pub export var` so the same global symbol is visible to
-/// any future translation unit emitted by the build pipeline that
-/// needs to participate in the manager-binding handshake.
-pub export var zap_memory_manager_context: ?*anyopaque = null;
+/// Phase 6 consolidation: the six loose globals that previously held the
+/// dispatcher's state (`zap_memory_manager_context`,
+/// `zap_active_manager_core`, `zap_active_refcount_capability`,
+/// `zap_active_refcount_has_sized_extension`, `zap_memory_started`,
+/// `zap_memory_shutdown_complete`) are now packed into one
+/// module-private struct. Every previous field is preserved verbatim;
+/// only the storage location changes.
+///
+/// ## Why a single struct
+///
+/// Before Phase 6 the dispatchers loaded each field via a separate
+/// global load, and several of those globals were `pub export var`
+/// because spec §10.2 historically described `zap_memory_manager_context`
+/// as a cross-TU surface. In Zap's current architecture the runtime is
+/// embedded as source into every user binary (the runtime is `@embedFile`'d
+/// at compile time and the entire ARC dispatch graph compiles into one
+/// translation unit — see `src/compiler.zig`). The runtime is therefore
+/// the SOLE consumer of these globals at link time. With no external
+/// consumers, exporting them prevents LLVM from CSE-ing the loads
+/// across calls and from hoisting them out of loops. Consolidating into
+/// a module-private struct removes that visibility constraint and lets
+/// the optimizer treat the loads as ordinary internal-linkage memory.
+///
+/// ## Why this struct is "effectively const" after startup
+///
+/// `zapMemoryStartup` writes every field exactly once at first dispatch
+/// (or at the first `ensureMemoryStartup` call from any other entry
+/// point). After that, only `shutdown_complete` is updated, and only
+/// when the atexit handler runs — strictly AFTER any user-visible ARC
+/// dispatch could have happened. Spec §10.2 normatively guarantees that
+/// the binding is written exactly once during the program's lifetime;
+/// the runtime preserves observability of the post-shutdown state by
+/// flipping `shutdown_complete` instead of nulling `core` / `context`
+/// (so a misuse panics with a clear diagnostic instead of a null
+/// dereference).
+///
+/// ## Threading
+///
+/// All fields are non-atomic. Zap is single-threaded today; if
+/// concurrency lands later, `shutdown_complete` and `started` would
+/// need to become atomics. The other fields are write-once-then-read-
+/// only and so do not require atomicity even under concurrency — once
+/// the startup write retires the value is publishable to readers via
+/// any subsequent memory barrier in the runtime's atexit dance.
+const ActiveManagerState = struct {
+    /// Per-process context returned by the active manager's `init()`.
+    /// Populated by `zapMemoryStartup` once startup completes;
+    /// consumed by every dispatched vtable call as the manager's
+    /// opaque state pointer. Null before startup; the dispatchers
+    /// panic on null access. Written exactly once per spec §10.2.
+    context: ?*anyopaque,
 
-/// The active manager's core vtable. In production this is bound at
-/// startup by `maybeBindExternalManager` from the linked-in `.zapmem`
-/// section. In test builds the compile-time default points at the
-/// in-source `test_only_arc_core` fallback so the dispatchers have
-/// a valid vtable from the moment `ensureMemoryStartup` runs.
-///
-/// The default initialiser forward-references `test_only_arc_core`
-/// in test builds; the symbol resolves through Zig's top-level-decl
-/// lazy resolution (top-level decls form a single comptime scope, so
-/// reference order does not matter as long as the type checker can
-/// resolve every name in the dependency graph before codegen). In
-/// production builds the default is `null` and `maybeBindExternalManager`
-/// must succeed or `zapMemoryStartup` panics with the
-/// "no active memory manager bound at startup" diagnostic.
-pub var zap_active_manager_core: ?*const AbiV1.ZapMemoryManagerCoreV1 =
-    if (builtin.is_test) &test_only_arc_core else null;
+    /// The active manager's core vtable. In production this is bound
+    /// at startup by `maybeBindExternalManager` from the linked-in
+    /// `.zapmem` section. In test builds the compile-time default
+    /// (`&test_only_arc_core`) is set in the initialiser below so
+    /// dispatchers have a valid vtable from the moment
+    /// `ensureMemoryStartup` runs.
+    core: ?*const AbiV1.ZapMemoryManagerCoreV1,
 
-/// The active manager's REFCOUNT_V1 capability vtable, populated by
-/// `zapMemoryStartup` when the manager declares the bit. Null when
-/// the active manager does not implement refcounting (Arena and
-/// similar managers in future phases).
-///
-/// Only the leading two slots (`retain` and `release`) are guaranteed
-/// to be populated when this pointer is non-null. The trailing four
-/// slots (the v1.1 side-table extension) are valid ONLY when
-/// `zap_active_refcount_has_sized_extension == true`. Dispatchers that
-/// route generic `Arc(T)` allocations through `allocate_refcounted` /
-/// `retain_sized` / `release_sized` / `refcount_sized` MUST consult
-/// the extension flag first; under a v1.0 manager those calls must be
-/// routed through `core.allocate` / `core.deallocate` instead.
-pub var zap_active_refcount_capability: ?*const AbiV1.ZapRefcountCapabilityV1 = null;
+    /// The active manager's REFCOUNT_V1 capability vtable, populated
+    /// by `zapMemoryStartup` when the manager declares the bit. Null
+    /// when the active manager does not implement refcounting.
+    ///
+    /// Only the leading two slots (`retain`, `release`) are guaranteed
+    /// to be populated when non-null. The trailing four slots (the
+    /// v1.1 side-table extension) are valid ONLY when
+    /// `refcount_has_sized_extension == true`. Dispatchers that route
+    /// generic `Arc(T)` allocations through `allocate_refcounted` /
+    /// `retain_sized` / `release_sized` / `refcount_sized` MUST consult
+    /// the extension flag first; under a v1.0 manager those calls must
+    /// be routed through `core.allocate` / `core.deallocate` instead.
+    refcount_capability: ?*const AbiV1.ZapRefcountCapabilityV1,
 
-/// Set to `true` by `zapMemoryStartup` when the active manager's
-/// REFCOUNT_V1 descriptor advertises `size >= sizeof(v1.1 vtable)` —
-/// i.e., the manager provides the side-table extension slots in
-/// addition to the v1.0 inline-header `retain` / `release` slots.
-///
-/// `false` when the active manager either declares no REFCOUNT_V1
-/// capability at all (Arena, NoOp, Leak, Tracking) or declares only
-/// the v1.0 vtable (`desc.size == 16`). Generic `Arc(T)` dispatchers
-/// consult this flag to decide between the side-table fast path and
-/// the v1.0 fallback that routes through `core.allocate` /
-/// `core.deallocate`.
-pub var zap_active_refcount_has_sized_extension: bool = false;
+    /// Set to `true` by `zapMemoryStartup` when the active manager's
+    /// REFCOUNT_V1 descriptor advertises `size >= sizeof(v1.1 vtable)` —
+    /// i.e., the manager provides the side-table extension slots in
+    /// addition to the v1.0 inline-header `retain` / `release` slots.
+    refcount_has_sized_extension: bool,
 
-/// Idempotency guard for `zapMemoryStartup`. The dispatchers ensure
-/// startup runs exactly once on the first ARC-touching call from a
-/// Zap binary's main path; subsequent calls bypass the init path
-/// with a single boolean compare. The startup hook also registers
-/// `zapMemoryShutdownAtexit` via `atexit` so the matching deinit
-/// runs on process exit without compiler-emitted shutdown code.
-///
-/// This flag is NEVER reset on shutdown. Shutdown sets the separate
-/// `zap_memory_shutdown_complete` flag instead — see the comment
-/// above that flag for the rationale.
-var zap_memory_started: bool = false;
+    /// Idempotency guard for `zapMemoryStartup`. Dispatchers ensure
+    /// startup runs exactly once on the first ARC-touching call from a
+    /// Zap binary's main path; subsequent calls bypass the init path
+    /// with a single boolean compare. NEVER reset on shutdown —
+    /// `shutdown_complete` below is the post-shutdown discriminator.
+    started: bool,
 
-/// Set to `true` after `zapMemoryShutdown` has completed the
-/// manager's `core.deinit(ctx)` call. Used by every dispatcher to
-/// detect the bug where a code path dispatches an ARC operation AFTER
-/// the memory shutdown atexit hook has already run (e.g., another
-/// atexit handler that issues a retain/release after this handler).
+    /// Set to `true` after `zapMemoryShutdown` has completed the
+    /// manager's `core.deinit(ctx)` call. Checked ahead of any other
+    /// state in each dispatcher to detect the post-shutdown-dispatch
+    /// bug. Setting it (instead of nulling `core` / `context`) preserves
+    /// spec §10.2's "written exactly once" guarantee — the context
+    /// keeps pointing at its last-known value so the post-shutdown
+    /// state is observable rather than masked by null.
+    shutdown_complete: bool,
+};
+
+/// Module-private storage for the active manager's binding. NOT `pub`,
+/// NOT `export` — by keeping the symbol's linkage internal to the
+/// runtime TU, LLVM can CSE loads across consecutive dispatcher calls
+/// and hoist loads out of loops. Pre-Phase-6 the same fields were
+/// declared as separate `pub export var` globals; every retain/release
+/// in a hot loop forced a fresh memory load because external consumers
+/// could in principle observe interleaved writes. Consolidation removes
+/// that constraint.
 ///
-/// This flag is checked AHEAD of any other state in each dispatcher.
-/// Setting it (instead of resetting `zap_memory_started` and nulling
-/// `zap_active_manager_core` / `zap_memory_manager_context`) preserves
-/// the spec's guarantee (§10.2) that `zap_memory_manager_context` is
-/// "written exactly once... never reassigned during the program's
-/// lifetime" — the context keeps pointing at its last-known value so
-/// the post-shutdown state is observable rather than masked by null.
-///
-/// Single-threaded today; if concurrency lands, this must become
-/// atomic (matches the pattern already documented for `arc_stats`
-/// and `instrumentation_state` elsewhere in this file).
-var zap_memory_shutdown_complete: bool = false;
+/// Test builds default `core` to `&test_only_arc_core` so the
+/// dispatchers have a working vtable from the moment of the first call;
+/// `bindRefcountCapability` populates `refcount_capability` and
+/// `refcount_has_sized_extension` during `zapMemoryStartup`. Production
+/// builds null-initialise both and rely on `maybeBindExternalManager`
+/// to discover the manager from the linked-in `.zapmem` section.
+var active_manager_state: ActiveManagerState = .{
+    .context = null,
+    .core = if (builtin.is_test) &test_only_arc_core else null,
+    .refcount_capability = null,
+    .refcount_has_sized_extension = false,
+    .started = false,
+    .shutdown_complete = false,
+};
 
 // ----------------------------------------------------------------
 // v1.0 REFCOUNT_V1 trap-stub plumbing.
@@ -1224,8 +1305,8 @@ fn bindRefcountCapability(desc: *const AbiV1.ZapCapabilityDescV1) void {
     // by the manager. Bind directly.
     if (desc.size >= AbiV1.REFCOUNT_V1_SIZE_V1_1) {
         const cap_ptr: *const AbiV1.ZapRefcountCapabilityV1 = @ptrCast(@alignCast(desc.vtable));
-        zap_active_refcount_capability = cap_ptr;
-        zap_active_refcount_has_sized_extension = true;
+        active_manager_state.refcount_capability = cap_ptr;
+        active_manager_state.refcount_has_sized_extension = true;
         return;
     }
     // v1.0 path: only `retain` + `release` are guaranteed to be valid
@@ -1250,8 +1331,8 @@ fn bindRefcountCapability(desc: *const AbiV1.ZapCapabilityDescV1) void {
         .allocate_refcounted = v1_0_trap_allocate_refcounted,
         .refcount_sized = v1_0_trap_refcount_sized,
     };
-    zap_active_refcount_capability = &v1_0_composed_refcount_vtable;
-    zap_active_refcount_has_sized_extension = false;
+    active_manager_state.refcount_capability = &v1_0_composed_refcount_vtable;
+    active_manager_state.refcount_has_sized_extension = false;
 }
 
 // ----------------------------------------------------------------
@@ -1958,16 +2039,16 @@ var test_only_arc_capability_save_slot: TestOnlyArcCapabilitySaveSlot = undefine
 /// failure path — so the next test sees the pre-swap state.
 fn saveActiveRefcountCapabilityForTest() void {
     test_only_arc_capability_save_slot = .{
-        .capability = zap_active_refcount_capability,
-        .has_sized_extension = zap_active_refcount_has_sized_extension,
+        .capability = active_manager_state.refcount_capability,
+        .has_sized_extension = active_manager_state.refcount_has_sized_extension,
         .composed_vtable_snapshot = v1_0_composed_refcount_vtable,
     };
 }
 
 fn restoreActiveRefcountCapabilityForTest() void {
     v1_0_composed_refcount_vtable = test_only_arc_capability_save_slot.composed_vtable_snapshot;
-    zap_active_refcount_capability = test_only_arc_capability_save_slot.capability;
-    zap_active_refcount_has_sized_extension = test_only_arc_capability_save_slot.has_sized_extension;
+    active_manager_state.refcount_capability = test_only_arc_capability_save_slot.capability;
+    active_manager_state.refcount_has_sized_extension = test_only_arc_capability_save_slot.has_sized_extension;
 }
 
 fn installRefcountCapabilityForTest(desc: *const AbiV1.ZapCapabilityDescV1) void {
@@ -2131,7 +2212,7 @@ fn maybeBindExternalManager() void {
     // compile-time default pointed at `&test_only_arc_core`; this
     // function returns early on the `is_test` branch (via
     // `externalMemorySection`), so the test-only fallback survives.
-    zap_active_manager_core = &section.core;
+    active_manager_state.core = &section.core;
 }
 
 /// FourCC `ZMEM` in the target's native byte order. Identical to the
@@ -2160,7 +2241,7 @@ const ZMEM_MAGIC_NATIVE: u32 = switch (builtin.target.cpu.arch.endian()) {
 // ----------------------------------------------------------------
 
 fn zapMemoryStartup() void {
-    if (zap_memory_started) return;
+    if (active_manager_state.started) return;
 
     // Spec §10.2: walk the linked-in `.zapmem` section to discover
     // the active manager's vtable. Phase 4 removed the built-in ARC
@@ -2172,7 +2253,7 @@ fn zapMemoryStartup() void {
     // not linked under `zig build test`).
     maybeBindExternalManager();
 
-    const core = zap_active_manager_core orelse {
+    const core = active_manager_state.core orelse {
         @panic("zap runtime: no active memory manager bound at startup");
     };
     if (core.abi_major != 1) {
@@ -2206,7 +2287,7 @@ fn zapMemoryStartup() void {
     const ctx = core.init(null) orelse {
         @panic("zap runtime: active memory manager's init() returned null");
     };
-    zap_memory_manager_context = ctx;
+    active_manager_state.context = ctx;
 
     if ((core.declared_caps & AbiV1.REFCOUNT_V1_BIT) != 0) {
         const desc = core.get_capability_desc(ctx, AbiV1.REFC_TAG) orelse {
@@ -2275,7 +2356,7 @@ fn zapMemoryStartup() void {
     // observed in practice on hosted Linux/macOS, where the slot
     // table is bounded only by available memory.
     std.debug.assert(atexit(zapMemoryShutdownAtexit) == 0);
-    zap_memory_started = true;
+    active_manager_state.started = true;
 }
 
 /// Atexit ordering contract for memory shutdown
@@ -2318,10 +2399,10 @@ fn zapMemoryShutdownAtexit() callconv(.c) void {
 }
 
 fn zapMemoryShutdown() void {
-    if (!zap_memory_started) return;
-    if (zap_memory_shutdown_complete) return;
-    const core = zap_active_manager_core orelse return;
-    const ctx = zap_memory_manager_context orelse @panic(
+    if (!active_manager_state.started) return;
+    if (active_manager_state.shutdown_complete) return;
+    const core = active_manager_state.core orelse return;
+    const ctx = active_manager_state.context orelse @panic(
         "zap runtime: shutdown invoked with a started manager but no live context (internal bug)",
     );
     core.deinit(ctx);
@@ -2332,7 +2413,7 @@ fn zapMemoryShutdown() void {
     // post-shutdown state is preserved by leaving the globals at
     // their last-known values. The dispatchers detect post-shutdown
     // dispatch via `zap_memory_shutdown_complete` instead.
-    zap_memory_shutdown_complete = true;
+    active_manager_state.shutdown_complete = true;
 }
 
 /// Idempotent first-call self-arming wrapper used by every ARC
@@ -2368,7 +2449,7 @@ fn zapMemoryShutdown() void {
 ///     (typically `main` or the first ARC-touching call from main),
 ///     not from a hidden module-level initialiser.
 inline fn ensureMemoryStartup() void {
-    if (!zap_memory_started) zapMemoryStartup();
+    if (!active_manager_state.started) zapMemoryStartup();
 }
 
 // ============================================================
@@ -3356,7 +3437,9 @@ pub const ArcRuntime = struct {
     /// is one boolean compare-branch on every consume after the first.
     pub fn noteConsume() void {
         ensureArcStatsAtexit();
-        arc_consumes_total += 1;
+        if (comptime collect_arc_stats) {
+            arc_consumes_total += 1;
+        }
     }
 
     /// Increment the runtime `arc_return_elisions_total` counter.
@@ -3376,7 +3459,9 @@ pub const ArcRuntime = struct {
     /// (one that never fires a consume site) still dumps stats.
     pub fn noteReturnElision() void {
         ensureArcStatsAtexit();
-        arc_return_elisions_total += 1;
+        if (comptime collect_arc_stats) {
+            arc_return_elisions_total += 1;
+        }
     }
 
 
@@ -3427,20 +3512,20 @@ pub const ArcRuntime = struct {
             // startup binding only happens inside `ensureMemoryStartup`)
             // and crash before the null-check below could produce a
             // useful panic message.
-            if (zap_memory_shutdown_complete) {
+            if (active_manager_state.shutdown_complete) {
                 @panic("zap runtime: memory dispatch after shutdown");
             }
             ensureMemoryStartup();
-            if (zap_active_manager_core == null) {
+            if (active_manager_state.core == null) {
                 @panic("zap runtime: allocAny dispatched with no active memory manager");
             }
-            const ctx = zap_memory_manager_context orelse
+            const ctx = active_manager_state.context orelse
                 @panic("zap runtime: allocAny dispatched with null manager context");
             const size = @sizeOf(T);
             const alignment_bytes = @alignOf(T);
             const raw = blk: {
                 if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-                    const core = zap_active_manager_core orelse
+                    const core = active_manager_state.core orelse
                         @panic("zap runtime: allocAny dispatched with no active memory manager");
                     break :blk core.allocate(ctx, size, @intCast(alignment_bytes)) orelse
                         @panic("zap runtime: out of memory: manager.allocate returned null");
@@ -3453,14 +3538,14 @@ pub const ArcRuntime = struct {
             slot.* = value;
             return slot;
         }
-        if (zap_memory_shutdown_complete) {
+        if (active_manager_state.shutdown_complete) {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (zap_active_manager_core == null) {
+        if (active_manager_state.core == null) {
             @panic("zap runtime: allocAny dispatched with no active memory manager");
         }
-        if (zap_active_refcount_capability == null) {
+        if (active_manager_state.refcount_capability == null) {
             // `Arc(T)` cells are inherently refcounted; allocating one under a
             // manager that does not declare REFCOUNT_V1 would silently succeed
             // here and only blow up on the eventual `release` path, leaving a
@@ -3482,14 +3567,14 @@ pub const ArcRuntime = struct {
     /// per-cell refcount has somewhere to live.
     fn dispatcherAllocImpl(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
         _ = allocator;
-        if (zap_active_refcount_has_sized_extension) {
-            const ctx = zap_memory_manager_context orelse
+        if (active_manager_state.refcount_has_sized_extension) {
+            const ctx = active_manager_state.context orelse
                 @panic("zap runtime: allocAny dispatched with null manager context");
             const size = @sizeOf(T);
             const alignment_bytes = @alignOf(T);
             const raw = blk: {
                 if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-                    const cap = zap_active_refcount_capability orelse
+                    const cap = active_manager_state.refcount_capability orelse
                         @panic("zap runtime: allocAny dispatched but active manager does not declare REFCOUNT_V1");
                     break :blk cap.allocate_refcounted(ctx, size, @intCast(alignment_bytes));
                 } else if (comptime managerHasRefcountV1(ACTIVE_MANAGER_TAG)) {
@@ -3513,15 +3598,15 @@ pub const ArcRuntime = struct {
     /// every byte of the side-table optimisation is forfeit — but
     /// keeps generic `Arc(T)` working under third-party v1.0 managers.
     fn dispatcherAllocLegacyV1_0(comptime T: type, value: T) *T {
-        if (zap_active_manager_core == null) {
+        if (active_manager_state.core == null) {
             @panic("zap runtime: allocAny dispatched with no active memory manager");
         }
-        const ctx = zap_memory_manager_context orelse
+        const ctx = active_manager_state.context orelse
             @panic("zap runtime: allocAny dispatched with null manager context");
         const layout = LegacyArcInnerLayout(T);
         const raw = blk: {
             if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-                const core = zap_active_manager_core orelse
+                const core = active_manager_state.core orelse
                     @panic("zap runtime: allocAny dispatched with no active memory manager");
                 break :blk core.allocate(ctx, layout.size, @intCast(layout.alignment));
             } else {
@@ -3624,20 +3709,20 @@ pub const ArcRuntime = struct {
     /// observe every inline-header cell allocation through their
     /// `core.allocate` interception hook.
     pub fn allocInlineHeaderCell(comptime T: type) *T {
-        if (zap_memory_shutdown_complete) {
+        if (active_manager_state.shutdown_complete) {
             @panic("zap runtime: allocInlineHeaderCell dispatched after shutdown");
         }
         ensureMemoryStartup();
-        if (zap_active_manager_core == null) {
+        if (active_manager_state.core == null) {
             @panic("zap runtime: allocInlineHeaderCell dispatched with no active memory manager");
         }
-        const ctx = zap_memory_manager_context orelse
+        const ctx = active_manager_state.context orelse
             @panic("zap runtime: allocInlineHeaderCell dispatched with null manager context");
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
         const raw = blk: {
             if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-                const core = zap_active_manager_core orelse
+                const core = active_manager_state.core orelse
                     @panic("zap runtime: allocInlineHeaderCell dispatched with no active memory manager");
                 break :blk core.allocate(ctx, size, @intCast(alignment_bytes));
             } else {
@@ -3660,20 +3745,20 @@ pub const ArcRuntime = struct {
     /// still needs the active vtable bound before dispatch. Cheap —
     /// after the first invocation it is a single boolean compare.
     pub fn freeInlineHeaderCell(comptime T: type, ptr: *T) void {
-        if (zap_memory_shutdown_complete) {
+        if (active_manager_state.shutdown_complete) {
             @panic("zap runtime: freeInlineHeaderCell dispatched after shutdown");
         }
         ensureMemoryStartup();
-        if (zap_active_manager_core == null) {
+        if (active_manager_state.core == null) {
             @panic("zap runtime: freeInlineHeaderCell dispatched with no active memory manager");
         }
-        const ctx = zap_memory_manager_context orelse
+        const ctx = active_manager_state.context orelse
             @panic("zap runtime: freeInlineHeaderCell dispatched with null manager context");
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
         const raw: [*]u8 = @ptrCast(@alignCast(ptr));
         if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-            const core = zap_active_manager_core orelse
+            const core = active_manager_state.core orelse
                 @panic("zap runtime: freeInlineHeaderCell dispatched with no active memory manager");
             core.deallocate(ctx, raw, size, @intCast(alignment_bytes));
         } else {
@@ -3791,14 +3876,14 @@ pub const ArcRuntime = struct {
             // leave the parameter untouched.
             return freeAnyNonRefcountedImpl(allocator, ptr);
         }
-        if (zap_memory_shutdown_complete) {
+        if (active_manager_state.shutdown_complete) {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (zap_active_manager_core == null) {
+        if (active_manager_state.core == null) {
             @panic("zap runtime: freeAny dispatched with no active memory manager");
         }
-        if (zap_active_refcount_capability == null) {
+        if (active_manager_state.refcount_capability == null) {
             @panic("zap runtime: freeAny dispatched but active manager does not declare REFCOUNT_V1");
         }
         dispatcherFreeImpl(allocator, ptr);
@@ -3848,7 +3933,7 @@ pub const ArcRuntime = struct {
         // managers see balanced alloc/free pairs. For Arena (no-op
         // deallocate) and NoOp (no-op deallocate) this is free; for
         // future tracking managers it's the observable hook.
-        if (zap_memory_shutdown_complete) {
+        if (active_manager_state.shutdown_complete) {
             // Memory dispatch after shutdown is a soundness violation
             // (spec §4.6). Panic loudly even under the lifecycle-only
             // path so the diagnostic surfaces at the call site rather
@@ -3856,16 +3941,16 @@ pub const ArcRuntime = struct {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (zap_active_manager_core == null) {
+        if (active_manager_state.core == null) {
             @panic("zap runtime: freeAny dispatched with no active memory manager");
         }
-        const ctx = zap_memory_manager_context orelse
+        const ctx = active_manager_state.context orelse
             @panic("zap runtime: freeAny dispatched with null manager context");
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
         const raw: [*]u8 = @ptrCast(@constCast(ptr));
         if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-            const core = zap_active_manager_core orelse
+            const core = active_manager_state.core orelse
                 @panic("zap runtime: freeAny dispatched with no active memory manager");
             core.deallocate(ctx, raw, size, @intCast(alignment_bytes));
         } else {
@@ -3906,15 +3991,15 @@ pub const ArcRuntime = struct {
         // manager observes the refcount decrement and on the zero-
         // transition returns the slot to the slab pool. Public entry
         // already validated globals.
-        const ctx = zap_memory_manager_context orelse unreachable;
-        if (!zap_active_refcount_has_sized_extension) {
+        const ctx = active_manager_state.context orelse unreachable;
+        if (!active_manager_state.refcount_has_sized_extension) {
             // v1.0 fallback: dispatch through `release` on the inline
             // ArcHeader at the cell base. The shallow-free closure
             // deallocates the cell without walking children (matching
             // the side-table path's shallow-free semantics).
             const header_ptr = legacyArcInnerHeaderFromValuePtr(T, @constCast(ptr));
             if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-                const cap = zap_active_refcount_capability orelse unreachable;
+                const cap = active_manager_state.refcount_capability orelse unreachable;
                 cap.release(ctx, header_ptr, LegacyV1_0ShallowFreeClosure(T).run);
             } else if (comptime managerHasRefcountV1(ACTIVE_MANAGER_TAG)) {
                 active_manager.release(ctx, header_ptr, LegacyV1_0ShallowFreeClosure(T).run);
@@ -3927,7 +4012,7 @@ pub const ArcRuntime = struct {
         const alignment_bytes = @alignOf(T);
         const slot_ptr: *T = @constCast(ptr);
         if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-            const cap = zap_active_refcount_capability orelse unreachable;
+            const cap = active_manager_state.refcount_capability orelse unreachable;
             cap.release_sized(ctx, slot_ptr, size, @intCast(alignment_bytes), null);
         } else if (comptime managerHasRefcountV1(ACTIVE_MANAGER_TAG)) {
             active_manager.releaseSized(ctx, slot_ptr, size, @intCast(alignment_bytes), null);
@@ -3950,15 +4035,15 @@ pub const ArcRuntime = struct {
                 // for `LegacyArcInnerLayout(T).size` bytes starting at
                 // that address; deallocate the whole range.
                 const layout = LegacyArcInnerLayout(T);
-                if (zap_active_manager_core == null) {
+                if (active_manager_state.core == null) {
                     @panic("zap runtime: v1.0 legacy freeAny: no active manager core");
                 }
-                const ctx = zap_memory_manager_context orelse @panic(
+                const ctx = active_manager_state.context orelse @panic(
                     "zap runtime: v1.0 legacy freeAny: null manager context",
                 );
                 const raw: [*]u8 = @ptrCast(@alignCast(header_obj));
                 if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-                    const core = zap_active_manager_core orelse @panic(
+                    const core = active_manager_state.core orelse @panic(
                         "zap runtime: v1.0 legacy freeAny: no active manager core",
                     );
                     core.deallocate(ctx, raw, layout.size, @intCast(layout.alignment));
@@ -3997,14 +4082,14 @@ pub const ArcRuntime = struct {
             // diagnostic managers depend on this.
             return freeAnyNonRefcountedImpl(allocator, ptr);
         }
-        if (zap_memory_shutdown_complete) {
+        if (active_manager_state.shutdown_complete) {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (zap_active_manager_core == null) {
+        if (active_manager_state.core == null) {
             @panic("zap runtime: releaseAny dispatched with no active memory manager");
         }
-        if (zap_active_refcount_capability == null) {
+        if (active_manager_state.refcount_capability == null) {
             // Spec: when the active manager does not declare REFCOUNT_V1,
             // the compiler statically elides retain/release at HIR
             // elaboration time (section 8.5). Reaching this dispatcher
@@ -4041,7 +4126,7 @@ pub const ArcRuntime = struct {
         // the inner `T.release(...)` call inside `releaseArcAny`
         // accounts for this release. For Arc(T)-wrapped values the
         // wrapper is the only counter site, so the bump stays.
-        if (comptime !hasInlineArcHeader(T)) {
+        if (comptime collect_arc_stats and !hasInlineArcHeader(T)) {
             arc_releases_total += 1;
         }
     }
@@ -4083,8 +4168,8 @@ pub const ArcRuntime = struct {
         // releases children) and then frees the slot. The outer
         // `releaseAny` already validated globals before reaching this
         // type-specific dispatcher.
-        const ctx = zap_memory_manager_context orelse unreachable;
-        if (!zap_active_refcount_has_sized_extension) {
+        const ctx = active_manager_state.context orelse unreachable;
+        if (!active_manager_state.refcount_has_sized_extension) {
             // v1.0 fallback: the cell was allocated via
             // `dispatcherAllocLegacyV1_0` with an inline ArcHeader at
             // offset 0 of the cell, followed by the user payload at
@@ -4096,7 +4181,7 @@ pub const ArcRuntime = struct {
             const header_ptr = legacyArcInnerHeaderFromValuePtr(T, @constCast(ptr));
             const deep_walk: AbiV1.ZapDeepWalkFn = LegacyV1_0ReleaseClosure(T).run;
             if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-                const cap = zap_active_refcount_capability orelse unreachable;
+                const cap = active_manager_state.refcount_capability orelse unreachable;
                 cap.release(ctx, header_ptr, deep_walk);
             } else if (comptime managerHasRefcountV1(ACTIVE_MANAGER_TAG)) {
                 active_manager.release(ctx, header_ptr, deep_walk);
@@ -4113,7 +4198,7 @@ pub const ArcRuntime = struct {
         else
             null;
         if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-            const cap = zap_active_refcount_capability orelse unreachable;
+            const cap = active_manager_state.refcount_capability orelse unreachable;
             cap.release_sized(ctx, slot_ptr, size, @intCast(alignment_bytes), deep_walk);
         } else if (comptime managerHasRefcountV1(ACTIVE_MANAGER_TAG)) {
             active_manager.releaseSized(ctx, slot_ptr, size, @intCast(alignment_bytes), deep_walk);
@@ -4145,14 +4230,14 @@ pub const ArcRuntime = struct {
                     const value_ptr: *T = @ptrCast(@alignCast(base_byte_ptr + layout.value_offset));
                     releaseChildrenAny(T, std.heap.page_allocator, value_ptr.*);
                 }
-                if (zap_active_manager_core == null) {
+                if (active_manager_state.core == null) {
                     @panic("zap runtime: v1.0 legacy release: no active manager core");
                 }
-                const ctx = zap_memory_manager_context orelse @panic(
+                const ctx = active_manager_state.context orelse @panic(
                     "zap runtime: v1.0 legacy release: null manager context",
                 );
                 if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-                    const core = zap_active_manager_core orelse @panic(
+                    const core = active_manager_state.core orelse @panic(
                         "zap runtime: v1.0 legacy release: no active manager core",
                     );
                     core.deallocate(ctx, base_byte_ptr, layout.size, @intCast(layout.alignment));
@@ -4253,17 +4338,23 @@ pub const ArcRuntime = struct {
     /// the cell), and the Arc(T) family uses `retain_sized` /
     /// `release_sized` (slab-lookup via 64-KiB-aligned pointer mask
     /// + size class).
-    pub fn retainAny(ptr: anytype) void {
+    pub inline fn retainAny(ptr: anytype) void {
         // Phase 6: codegen elides every retainAny call under no-REFCOUNT_V1.
         if (comptime !refcount_v1_active) return;
-        if (zap_memory_shutdown_complete) {
+        // Phase 6 inline: the body is small enough (5 loads + 3 panics +
+        // a tail call) that forcing the compiler to inline it lets LLVM
+        // fold each consecutive call's preflight loads through CSE on
+        // `active_manager_state`. Marked `inline` rather than `inline
+        // callconv(.@"inline")` so the compiler can still split the
+        // cold panic paths out of the inlined body.
+        if (active_manager_state.shutdown_complete) {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (zap_active_manager_core == null) {
+        if (active_manager_state.core == null) {
             @panic("zap runtime: retainAny dispatched with no active memory manager");
         }
-        if (zap_active_refcount_capability == null) {
+        if (active_manager_state.refcount_capability == null) {
             // See note in `releaseAny` on REFCOUNT_V1 absence; the same
             // soundness argument applies symmetrically here.
             @panic("zap runtime: retainAny dispatched but active manager does not declare REFCOUNT_V1");
@@ -4295,34 +4386,38 @@ pub const ArcRuntime = struct {
         // Arc(T) side-table path. The public entry has already validated
         // both globals; the orelse unreachable lets release builds
         // elide the second null check.
-        const ctx = zap_memory_manager_context orelse unreachable;
-        if (!zap_active_refcount_has_sized_extension) {
+        const ctx = active_manager_state.context orelse unreachable;
+        if (!active_manager_state.refcount_has_sized_extension) {
             // v1.0 fallback: dispatch through `retain` on the inline
             // header at the cell base.
             const header_ptr = legacyArcInnerHeaderFromValuePtr(T, @constCast(ptr));
             if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-                const cap = zap_active_refcount_capability orelse unreachable;
+                const cap = active_manager_state.refcount_capability orelse unreachable;
                 cap.retain(ctx, header_ptr);
             } else if (comptime managerHasRefcountV1(ACTIVE_MANAGER_TAG)) {
                 active_manager.retain(ctx, header_ptr);
             } else {
                 @panic("zap runtime: retainAny dispatched but active manager does not declare REFCOUNT_V1");
             }
-            arc_retains_total += 1;
+            if (comptime collect_arc_stats) {
+                arc_retains_total += 1;
+            }
             return;
         }
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
         const slot_ptr: *T = @constCast(ptr);
         if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-            const cap = zap_active_refcount_capability orelse unreachable;
+            const cap = active_manager_state.refcount_capability orelse unreachable;
             cap.retain_sized(ctx, slot_ptr, size, @intCast(alignment_bytes));
         } else if (comptime managerHasRefcountV1(ACTIVE_MANAGER_TAG)) {
             active_manager.retainSized(ctx, slot_ptr, size, @intCast(alignment_bytes));
         } else {
             @panic("zap runtime: retainAny dispatched but active manager does not declare REFCOUNT_V1");
         }
-        arc_retains_total += 1;
+        if (comptime collect_arc_stats) {
+            arc_retains_total += 1;
+        }
     }
 
     /// Retain for *persistent* container ownership: the caller is
@@ -4335,17 +4430,20 @@ pub const ArcRuntime = struct {
     /// the symmetric transient case.
     ///
     /// Validation pattern mirrors `retainAny`.
-    pub fn retainAnyPersistent(ptr: anytype) void {
+    pub inline fn retainAnyPersistent(ptr: anytype) void {
         // Phase 6: codegen elides every retainAnyPersistent call under no-REFCOUNT_V1.
         if (comptime !refcount_v1_active) return;
-        if (zap_memory_shutdown_complete) {
+        // Phase 6 inline: same rationale as `retainAny`. Preflight body
+        // is small enough that inlining lets LLVM CSE the
+        // `active_manager_state` loads across consecutive calls.
+        if (active_manager_state.shutdown_complete) {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (zap_active_manager_core == null) {
+        if (active_manager_state.core == null) {
             @panic("zap runtime: retainAnyPersistent dispatched with no active memory manager");
         }
-        if (zap_active_refcount_capability == null) {
+        if (active_manager_state.refcount_capability == null) {
             @panic("zap runtime: retainAnyPersistent dispatched but active manager does not declare REFCOUNT_V1");
         }
         dispatcherRetainAnyPersistentImpl(ptr);
@@ -4374,34 +4472,38 @@ pub const ArcRuntime = struct {
             return;
         }
         // Arc(T) side-table path. Public entry already validated globals.
-        const ctx = zap_memory_manager_context orelse unreachable;
-        if (!zap_active_refcount_has_sized_extension) {
+        const ctx = active_manager_state.context orelse unreachable;
+        if (!active_manager_state.refcount_has_sized_extension) {
             // v1.0 fallback — same dispatch as the transient retain
             // path but with the persistent counter convention.
             const header_ptr = legacyArcInnerHeaderFromValuePtr(T, @constCast(ptr));
             if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-                const cap = zap_active_refcount_capability orelse unreachable;
+                const cap = active_manager_state.refcount_capability orelse unreachable;
                 cap.retain(ctx, header_ptr);
             } else if (comptime managerHasRefcountV1(ACTIVE_MANAGER_TAG)) {
                 active_manager.retain(ctx, header_ptr);
             } else {
                 @panic("zap runtime: retainAnyPersistent dispatched but active manager does not declare REFCOUNT_V1");
             }
-            arc_retains_total += 1;
+            if (comptime collect_arc_stats) {
+                arc_retains_total += 1;
+            }
             return;
         }
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
         const slot_ptr: *T = @constCast(ptr);
         if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-            const cap = zap_active_refcount_capability orelse unreachable;
+            const cap = active_manager_state.refcount_capability orelse unreachable;
             cap.retain_sized(ctx, slot_ptr, size, @intCast(alignment_bytes));
         } else if (comptime managerHasRefcountV1(ACTIVE_MANAGER_TAG)) {
             active_manager.retainSized(ctx, slot_ptr, size, @intCast(alignment_bytes));
         } else {
             @panic("zap runtime: retainAnyPersistent dispatched but active manager does not declare REFCOUNT_V1");
         }
-        arc_retains_total += 1;
+        if (comptime collect_arc_stats) {
+            arc_retains_total += 1;
+        }
     }
 
     /// Retain through an optional Arc pointer: `?*const T` becomes a no-op
@@ -4435,7 +4537,7 @@ pub const ArcRuntime = struct {
     /// requiring those types to take a `comptime T: type` parameter.
     /// The dispatcher bumps `arc_retains_total` so callers no longer
     /// need to do it themselves.
-    pub fn headerRetain(header_ptr: *ArcHeader) void {
+    pub inline fn headerRetain(header_ptr: *ArcHeader) void {
         // Phase 6: under a manager that does not declare REFCOUNT_V1
         // the inline `ArcHeader` field is omitted from cell layout
         // (`@sizeOf(ArcHeader) == 0`) and the codegen pipeline elides
@@ -4443,6 +4545,11 @@ pub const ArcRuntime = struct {
         // (`Map.retain`, `List.retain`, `MapIter.create`, ...) is
         // comptime-eliminated here. The function body that remains is
         // unchanged for the REFCOUNT_V1 path.
+        //
+        // Phase 6 inline: the post-elision body is small enough (a few
+        // loads + a tail call) that forcing inlining lets LLVM CSE the
+        // `active_manager_state` loads across consecutive call sites
+        // (e.g., inside `Map.retain`'s rc=1 fast path).
         if (comptime !refcount_v1_active) return;
 
         // Coverage note: the shutdown-complete and capability-null guard
@@ -4461,18 +4568,18 @@ pub const ArcRuntime = struct {
         // switch the read pattern to a single atomic acquire-load of a
         // manager-state record that holds (core, ctx, cap) as a triple;
         // v1.x is single-manager-per-binary and pays no such cost.
-        if (zap_memory_shutdown_complete) {
+        if (active_manager_state.shutdown_complete) {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (zap_active_manager_core == null) {
+        if (active_manager_state.core == null) {
             @panic("zap runtime: headerRetain dispatched with no active memory manager");
         }
-        const ctx = zap_memory_manager_context orelse {
+        const ctx = active_manager_state.context orelse {
             @panic("zap runtime: headerRetain dispatched with null manager context");
         };
         if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-            const cap = zap_active_refcount_capability orelse {
+            const cap = active_manager_state.refcount_capability orelse {
                 @panic("zap runtime: headerRetain dispatched but active manager does not declare REFCOUNT_V1");
             };
             cap.retain(ctx, @ptrCast(header_ptr));
@@ -4481,7 +4588,9 @@ pub const ArcRuntime = struct {
         } else {
             @panic("zap runtime: headerRetain dispatched but active manager does not declare REFCOUNT_V1");
         }
-        arc_retains_total += 1;
+        if (comptime collect_arc_stats) {
+            arc_retains_total += 1;
+        }
     }
 
     /// Dispatch a refcount release on an inline-header cell through the
@@ -4500,7 +4609,7 @@ pub const ArcRuntime = struct {
     ///
     /// The dispatcher bumps `arc_releases_total` so callers no longer
     /// need to do it themselves.
-    pub fn headerRelease(
+    pub inline fn headerRelease(
         header_ptr: *ArcHeader,
         deep_walk: ?AbiV1.ZapDeepWalkFn,
     ) void {
@@ -4512,23 +4621,30 @@ pub const ArcRuntime = struct {
         // `bufferFreeDeep` would attempt to walk children that may
         // themselves require a non-existent allocator; freeing is
         // deferred to the arena's bulk reclamation at process exit.
+        //
+        // Phase 6 inline: the post-elision body is small (a few loads,
+        // a vtable call, and a counter bump). Forcing inlining lets
+        // LLVM CSE the `active_manager_state` loads across consecutive
+        // call sites — important because release sites cluster (e.g.,
+        // recursive `Tree` release fires every node's `headerRelease`
+        // on the inline-header `List`-of-children).
         if (comptime !refcount_v1_active) return;
 
         // Same (core, ctx, cap) non-snapshot rationale as
         // `headerRetain` — manager binding is fixed for the program's
         // lifetime in ABI v1.x, so the three loads cannot tear.
-        if (zap_memory_shutdown_complete) {
+        if (active_manager_state.shutdown_complete) {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (zap_active_manager_core == null) {
+        if (active_manager_state.core == null) {
             @panic("zap runtime: headerRelease dispatched with no active memory manager");
         }
-        const ctx = zap_memory_manager_context orelse {
+        const ctx = active_manager_state.context orelse {
             @panic("zap runtime: headerRelease dispatched with null manager context");
         };
         if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-            const cap = zap_active_refcount_capability orelse {
+            const cap = active_manager_state.refcount_capability orelse {
                 @panic("zap runtime: headerRelease dispatched but active manager does not declare REFCOUNT_V1");
             };
             cap.release(ctx, @ptrCast(header_ptr), deep_walk);
@@ -4541,7 +4657,9 @@ pub const ArcRuntime = struct {
         // when the operation actually happened. Matches the convention
         // used by `dispatcherRetainImpl` (counter bump after
         // `ArcPool(T).retain`).
-        arc_releases_total += 1;
+        if (comptime collect_arc_stats) {
+            arc_releases_total += 1;
+        }
     }
 
     /// Get the refcount of an Arc-managed value. Phase 4.x: inline-
@@ -4565,9 +4683,9 @@ pub const ArcRuntime = struct {
         // REFCOUNT_V1 vtable yet. First-party builds always have the
         // capability wired (or it's a static `false` under managerHasRefcountV1
         // which short-circuits earlier).
-        if (zap_active_refcount_capability == null) return 0;
-        const ctx = zap_memory_manager_context orelse return 0;
-        if (!zap_active_refcount_has_sized_extension) {
+        if (active_manager_state.refcount_capability == null) return 0;
+        const ctx = active_manager_state.context orelse return 0;
+        if (!active_manager_state.refcount_has_sized_extension) {
             // v1.0 fallback: the inline ArcHeader at the cell base
             // carries the refcount. Read it directly — v1.0 has no
             // `refcount_sized` slot.
@@ -4578,7 +4696,7 @@ pub const ArcRuntime = struct {
         const alignment_bytes = @alignOf(T);
         const slot_ptr: *const T = ptr;
         if (comptime ACTIVE_MANAGER_TAG == .third_party) {
-            const cap = zap_active_refcount_capability orelse return 0;
+            const cap = active_manager_state.refcount_capability orelse return 0;
             return cap.refcount_sized(ctx, @ptrCast(@constCast(slot_ptr)), size, @intCast(alignment_bytes));
         } else if (comptime managerHasRefcountV1(ACTIVE_MANAGER_TAG)) {
             return active_manager.refcountSized(ctx, @ptrCast(@constCast(slot_ptr)), size, @intCast(alignment_bytes));
@@ -4817,7 +4935,9 @@ pub fn List(comptime T: type) type {
             const mut: *Self = @constCast(v);
             // Optimistically count as kept-alive; the deep_walk callback
             // rolls this back to "freed" on the zero-transition.
-            list_release_kept_alive_total += 1;
+            if (comptime collect_arc_stats) {
+                list_release_kept_alive_total += 1;
+            }
             ArcRuntime.headerRelease(&mut.header, listDeepWalk);
         }
 
@@ -4828,8 +4948,10 @@ pub fn List(comptime T: type) type {
         /// freeing the buffer.
         fn listDeepWalk(ptr: *anyopaque) callconv(.c) void {
             const mut: *Self = @ptrCast(@alignCast(ptr));
-            list_release_kept_alive_total -= 1;
-            list_release_freed_total += 1;
+            if (comptime collect_arc_stats) {
+                list_release_kept_alive_total -= 1;
+                list_release_freed_total += 1;
+            }
             mut.bufferFreeDeep();
         }
 
@@ -13262,8 +13384,8 @@ test "Phase 4 ABI: ARC manager is bound by default in test builds" {
     // The pre-decrement is the only side effect we care about — we
     // can't `freeAny` here without first validating that the manager
     // is initialised.
-    try std.testing.expect(zap_active_manager_core != null);
-    try std.testing.expect(zap_memory_manager_context != null);
+    try std.testing.expect(active_manager_state.core != null);
+    try std.testing.expect(active_manager_state.context != null);
 }
 
 test "Phase 6: runtime_declared_caps defaults to REFCOUNT_V1 in host tests" {
@@ -13303,16 +13425,70 @@ test "Phase 6: ArcHeaderEmpty method shapes match ArcHeaderRefcounted's surface"
     try std.testing.expectEqual(@as(u32, 0), empty.count());
 }
 
+test "Phase 6: active_manager_state startup invariants" {
+    // Phase 6 packed the six loose dispatcher globals into a single
+    // module-private struct (`ActiveManagerState`). This test pins the
+    // post-startup invariants every ARC dispatcher depends on:
+    //
+    //   1. `started == true` (startup ran exactly once).
+    //   2. `shutdown_complete == false` (no atexit handler has fired).
+    //   3. `core` is non-null — the active manager's core vtable is
+    //      bound (test build: `&test_only_arc_core`).
+    //   4. `context` is non-null — `core.init()` returned a live
+    //      context pointer per spec §4.2.
+    //   5. `refcount_capability` is non-null — the test-only manager
+    //      declares REFCOUNT_V1 so the dispatcher's refcount path is
+    //      armed.
+    //   6. `refcount_has_sized_extension` reflects whether the bound
+    //      vtable advertises the v1.1 side-table extension. The
+    //      test-only manager registers a v1.1 vtable so this is true.
+    //
+    // The struct is module-private so the dispatcher reads ride on the
+    // optimizer's CSE/hoist for `active_manager_state.<field>` loads;
+    // this test merely asserts the field-level binding is correct so
+    // that drift in the struct shape (e.g., a field rename, a field
+    // type change, an init-order regression in `zapMemoryStartup`)
+    // surfaces as a test failure rather than as a silent crash on the
+    // next ARC dispatch.
+    ensureMemoryStartup();
+    try std.testing.expect(active_manager_state.started);
+    try std.testing.expect(!active_manager_state.shutdown_complete);
+    try std.testing.expect(active_manager_state.core != null);
+    try std.testing.expect(active_manager_state.context != null);
+    try std.testing.expect(active_manager_state.refcount_capability != null);
+    // The test-only manager registers the v1.1 surface
+    // (`test_only_arc_capability_descriptor` advertises
+    // `size == REFCOUNT_V1_SIZE_V1_1`), so the dispatcher's side-table
+    // extension flag is set. Under a future test-only manager that
+    // declares only the v1.0 surface this assertion would flip; the
+    // assertion serves as a witness that startup correctly distinguishes
+    // the two surfaces.
+    try std.testing.expect(active_manager_state.refcount_has_sized_extension);
+}
+
+test "Phase 6: collect_arc_stats default for host tests" {
+    // The host test build uses `builtin.is_test == true`, so the
+    // source-level `COLLECT_ARC_STATS_DEFAULT` resolves to `true` and
+    // every ARC counter increment is compiled in. Every test below in
+    // this file that compares counter deltas (e.g.,
+    // "Phase 4 ABI: ARC retain/release dispatches through capability")
+    // depends on this resolution. A future regression that flips the
+    // default surfaces here at the start of the suite instead of as a
+    // mid-suite "expected 1, found 0" failure with no breadcrumb.
+    try std.testing.expect(collect_arc_stats);
+    try std.testing.expect(builtin.is_test);
+}
+
 test "Phase 4 ABI: ARC manager declares REFCOUNT_V1 capability" {
     // Force startup if it hasn't run yet.
     ensureMemoryStartup();
-    const core = zap_active_manager_core orelse {
+    const core = active_manager_state.core orelse {
         try std.testing.expect(false);
         return;
     };
     try std.testing.expectEqual(@as(u16, 1), core.abi_major);
     try std.testing.expect((core.declared_caps & AbiV1.REFCOUNT_V1_BIT) != 0);
-    try std.testing.expect(zap_active_refcount_capability != null);
+    try std.testing.expect(active_manager_state.refcount_capability != null);
 }
 
 test "Phase 4 ABI: ARC retain/release dispatches through capability" {
@@ -13391,7 +13567,7 @@ test "Phase 4 ABI: test-only ARC core vtable shape matches spec" {
     // Reuse the live context populated by `zapMemoryStartup` (which
     // earlier tests will have armed via their own ARC dispatches).
     ensureMemoryStartup();
-    const ctx = zap_memory_manager_context orelse {
+    const ctx = active_manager_state.context orelse {
         try std.testing.expect(false);
         return;
     };
@@ -16299,7 +16475,7 @@ test "v1.0 fallback: allocate routes through dispatcherAllocLegacyV1_0" {
     saveActiveRefcountCapabilityForTest();
     defer restoreActiveRefcountCapabilityForTest();
     installRefcountCapabilityForTest(&test_only_arc_v1_0_refcount_descriptor);
-    try std.testing.expect(!zap_active_refcount_has_sized_extension);
+    try std.testing.expect(!active_manager_state.refcount_has_sized_extension);
 
     // Allocate an Arc(i64) under the v1.0 manager. The allocator
     // must request `@sizeOf(LegacyArcInner(i64))` from
@@ -16323,7 +16499,7 @@ test "v1.0 fallback: retainAny increments inline-header refcount" {
     saveActiveRefcountCapabilityForTest();
     defer restoreActiveRefcountCapabilityForTest();
     installRefcountCapabilityForTest(&test_only_arc_v1_0_refcount_descriptor);
-    try std.testing.expect(!zap_active_refcount_has_sized_extension);
+    try std.testing.expect(!active_manager_state.refcount_has_sized_extension);
 
     const val_ptr = legacyArcAllocForTest(i64, 99);
     try std.testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(val_ptr));
@@ -16482,7 +16658,7 @@ test "v1.0 fallback: retainAnyPersistent routes through legacy retain slot" {
     saveActiveRefcountCapabilityForTest();
     defer restoreActiveRefcountCapabilityForTest();
     installRefcountCapabilityForTest(&test_only_arc_v1_0_refcount_descriptor);
-    try std.testing.expect(!zap_active_refcount_has_sized_extension);
+    try std.testing.expect(!active_manager_state.refcount_has_sized_extension);
 
     // `retainAnyPersistent` mirrors `retainAny` on the v1.0 path —
     // both dispatch through `cap.retain(ctx, &inner.header)` because
@@ -16511,7 +16687,7 @@ test "v1.0 fallback: trap stubs panic when sized slots are dispatched (compile-t
     // but we verify their function-pointer identity to guard against
     // a regression that leaves slots 2-5 pointing at out-of-bounds
     // memory or at the v1.1 implementations.
-    const cap = zap_active_refcount_capability orelse {
+    const cap = active_manager_state.refcount_capability orelse {
         try std.testing.expect(false);
         return;
     };
