@@ -119,6 +119,58 @@ comptime {
     );
 }
 
+/// Stub registered as `zap_active_manager` when the build selects a
+/// third-party memory manager. The runtime's `.third_party` comptime
+/// branch never references symbols from this module; it routes through
+/// the manager `.o`'s `.zapmem`-registered vtable instead. This stub
+/// exists solely so the runtime's top-level
+/// `@import("zap_active_manager")` resolves cleanly under every
+/// user-binary build, regardless of which manager the manifest
+/// selected.
+///
+/// The bytes MUST parse as valid Zig — they are handed straight to
+/// `zir_compilation_add_struct_source`, which feeds them to the Zig
+/// compiler's parser. A regression that emits non-Zig text (or empty
+/// bytes) would surface as a Sema parse error during every
+/// third-party user-binary build.
+const THIRD_PARTY_ACTIVE_MANAGER_STUB =
+    \\//! Stub registered as `zap_active_manager` when the build selects a
+    \\//! third-party memory manager. The runtime's `.third_party` comptime
+    \\//! branch never references symbols from this module; it routes
+    \\//! through the manager `.o`'s `.zapmem`-registered vtable instead.
+    \\//! This stub exists solely so the runtime's top-level
+    \\//! `@import("zap_active_manager")` resolves cleanly.
+    \\
+    \\const std = @import("std");
+;
+
+/// Return the Zig source bytes to register as the user binary's
+/// `zap_active_manager` module. For first-party tags this is the
+/// active manager's embedded `manager.zig` source (Phase 4's comptime
+/// branches in `runtime.zig` call into it directly so LLVM can inline
+/// across the boundary, which is the whole motivation behind Phases
+/// 3-5 of the perf-recovery plan). For `.third_party` it is the
+/// minimal `THIRD_PARTY_ACTIVE_MANAGER_STUB`; the runtime's
+/// `.third_party` branch never references the stub's symbols, so the
+/// stub only needs to be valid Zig for parsing/registration purposes.
+///
+/// Non-nullable return: every user-binary build MUST register
+/// `zap_active_manager` (the runtime's top-level
+/// `@import("zap_active_manager")` would otherwise fail to resolve,
+/// failing every Zap user binary's compile). Returning a sentinel
+/// instead of a nullable value forces the caller to wire the bytes
+/// through end-to-end. The returned slice is a borrowed view into the
+/// compiler binary's read-only data (either an `@embedFile` blob or
+/// the constant stub literal above), so the call is zero-cost and the
+/// slice is valid for the full process lifetime — callers do not need
+/// to free it.
+pub fn getActiveManagerSourceBytes(tag: zap.memory_driver.BuiltinManagerTag) []const u8 {
+    return switch (tag) {
+        .arc, .arena, .no_op, .leak, .tracking => getBuiltinManagerSource(tag).?,
+        .third_party => THIRD_PARTY_ACTIVE_MANAGER_STUB,
+    };
+}
+
 /// Per-stage timing diagnostic. Gated by `ZAP_PROFILE`: production builds
 /// stay quiet, but `ZAP_PROFILE=1 zap test` (or any compile-driving
 /// command) emits `[stage NAME] ms=N` lines so a regression hunt can
@@ -3248,7 +3300,7 @@ pub fn validateOneStructPerFile(
 
 /// Get the embedded runtime source, applying the toolchain's
 /// compile-time rewrites that should affect every Zap user binary it
-/// produces. Two independent rewrites layer here, in order:
+/// produces. Three independent rewrites layer here, in order:
 ///
 ///   1. The Phase A Map workload instrumentation flag
 ///      (`INSTRUMENT_MAP_DEFAULT`). Flipped on when the host compiler
@@ -3259,6 +3311,13 @@ pub fn validateOneStructPerFile(
 ///      `runtime.refcount_v1_active` resolve correctly without
 ///      pulling in `@import("root")` (the user binary's root has no
 ///      such override).
+///   3. The Phase 3 active-manager identity tag
+///      (`RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT`). Rewritten with the
+///      resolved manager's `builtin_tag` so Phase 4's comptime
+///      branches in `runtime.zig` see the right case at compile time;
+///      a first-party manager build then resolves through
+///      `@import("zap_active_manager")` directly (LLVM-inlineable),
+///      while a `.third_party` build routes through the vtable.
 ///
 /// The host test suite uses separate `@import("root")` overrides
 /// inside `runtime.zig` for both flags (see `src/root.zig`), so
@@ -3273,14 +3332,29 @@ pub fn validateOneStructPerFile(
 /// Defaults to `0` would leave the source unchanged at the caps
 /// marker; rather than relying on that, the rewrite always runs so
 /// the user-binary's runtime reflects the exact resolved value.
-pub fn getRuntimeSource(declared_caps: u64) []const u8 {
+///
+/// `builtin_tag` is the resolved manager's identity classification
+/// (`.arc` / `.arena` / `.no_op` / `.leak` / `.tracking` for the
+/// first-party managers, `.third_party` for everything else). The
+/// rewrite always runs so the third-party path is self-validating
+/// (a no-op rewrite for `.third_party` would silently leave a future
+/// bug in the rewrite path uncaught on third-party builds).
+pub fn getRuntimeSource(
+    declared_caps: u64,
+    builtin_tag: zap.memory_driver.BuiltinManagerTag,
+) []const u8 {
     const instrumented = @import("build_options").instrument_map;
-    return rewriteRuntimeSource(.{ .instrumented = instrumented, .declared_caps = declared_caps });
+    return rewriteRuntimeSource(.{
+        .instrumented = instrumented,
+        .declared_caps = declared_caps,
+        .builtin_tag = builtin_tag,
+    });
 }
 
 const RuntimeRewrite = struct {
     instrumented: bool,
     declared_caps: u64,
+    builtin_tag: zap.memory_driver.BuiltinManagerTag,
 };
 
 /// Lazily-built rewritten runtime source. Keyed by the rewrite
@@ -3289,9 +3363,25 @@ const RuntimeRewrite = struct {
 /// compile) return the same stable pointer.
 var rewritten_runtime_cache: std.AutoHashMapUnmanaged(u128, []const u8) = .empty;
 
+/// Pack the rewrite parameters into a single 128-bit cache key. The
+/// layout is intentionally explicit:
+///
+///   * bits  0..63 — `declared_caps` (the full u64 bitmask).
+///   * bit   64    — `instrumented` (Map workload instrumentation flag).
+///   * bits 65..71 — reserved for future single-bit rewrite flags.
+///   * bits 72..79 — `builtin_tag` ordinal (u8; the enum is declared
+///                  `enum(u8)` in `runtime.zig`'s `ActiveManagerTag`
+///                  and mirrored unannotated here via `@intFromEnum`).
+///
+/// The (instrumented, declared_caps, builtin_tag) triple must produce
+/// a unique key — two builds that differ in any one of the three MUST
+/// alias to two distinct cache entries, otherwise the second build's
+/// rewrite would silently inject the first build's source.
 fn rewriteCacheKey(req: RuntimeRewrite) u128 {
     var key: u128 = req.declared_caps;
     if (req.instrumented) key |= (@as(u128, 1) << 64);
+    const tag_ordinal: u128 = @intFromEnum(req.builtin_tag);
+    key |= (tag_ordinal << 72);
     return key;
 }
 
@@ -3350,9 +3440,72 @@ fn rewriteRuntimeSource(req: RuntimeRewrite) []const u8 {
         std.heap.page_allocator.free(@constCast(staged));
     }
 
-    rewritten_runtime_cache.put(std.heap.page_allocator, key, caps_buf) catch
+    // Stage 3: active-manager identity marker rewrite. The source-level
+    // default is `.third_party` so the host test suite (which loads
+    // `runtime.zig` as a Zig module without going through this
+    // rewrite) naturally exercises the vtable path — the same path a
+    // third-party-manager build follows. For every Zap user binary we
+    // always rewrite (even on `.third_party` builds, which re-encode
+    // the same value) so the rewrite path is self-validating end-to-end.
+    const tag_needle = "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .third_party;";
+    const tag_name = activeManagerTagName(req.builtin_tag);
+    var tag_replacement_buf: [128]u8 = undefined;
+    const tag_replacement = std.fmt.bufPrint(
+        &tag_replacement_buf,
+        "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .{s};",
+        .{tag_name},
+    ) catch @panic("runtime active-manager-tag rewrite: formatted replacement overflows fixed buffer");
+    const tag_idx = std.mem.indexOf(u8, caps_buf, tag_needle) orelse {
+        @panic("runtime.zig is missing the RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT marker; Phase 3 tag rewrite cannot proceed");
+    };
+    const tag_total_len = caps_buf.len - tag_needle.len + tag_replacement.len;
+    var tag_buf = std.heap.page_allocator.alloc(u8, tag_total_len) catch
+        @panic("out of memory rewriting runtime source for active-manager tag");
+    @memcpy(tag_buf[0..tag_idx], caps_buf[0..tag_idx]);
+    @memcpy(tag_buf[tag_idx .. tag_idx + tag_replacement.len], tag_replacement);
+    @memcpy(tag_buf[tag_idx + tag_replacement.len ..], caps_buf[tag_idx + tag_needle.len ..]);
+
+    // Stage-2's buffer is no longer needed once stage-3 produces its
+    // own owned copy. Free it back to the page allocator so we don't
+    // leak per (instrumented, caps, tag) shape triple.
+    std.heap.page_allocator.free(caps_buf);
+
+    rewritten_runtime_cache.put(std.heap.page_allocator, key, tag_buf) catch
         @panic("out of memory caching rewritten runtime source");
-    return caps_buf;
+    return tag_buf;
+}
+
+/// Map a `BuiltinManagerTag` to its lowercase identifier as it appears
+/// in the runtime's `ActiveManagerTag` enum source. The names MUST
+/// match `runtime.zig`'s enum-field identifiers verbatim because the
+/// Phase 3 marker rewrite splices the result directly into Zig source
+/// at the `.<name>` literal — a mismatch would compile but bind the
+/// runtime to the wrong arm at every user-binary build. Kept in
+/// lock-step with `runtime.zig:ActiveManagerTag` via the comptime
+/// exhaustiveness assert directly below.
+fn activeManagerTagName(tag: zap.memory_driver.BuiltinManagerTag) []const u8 {
+    return switch (tag) {
+        .arc => "arc",
+        .arena => "arena",
+        .no_op => "no_op",
+        .leak => "leak",
+        .tracking => "tracking",
+        .third_party => "third_party",
+    };
+}
+
+// Compile-time guard for the symmetry obligation between
+// `activeManagerTagName`'s switch and `BuiltinManagerTag`'s shape.
+// The Phase 3 tag-marker rewrite treats the tag as a closed set; a
+// silent shape drift would surface as a Sema parse error at every
+// user-binary build (the rewritten `.<missing_name>` literal would
+// not be a valid `ActiveManagerTag` field), so we fail the build at
+// this site instead.
+comptime {
+    const fields = @typeInfo(zap.memory_driver.BuiltinManagerTag).@"enum".fields;
+    if (fields.len != 6) @compileError(
+        "activeManagerTagName: switch must be updated when adding a BuiltinManagerTag case",
+    );
 }
 
 // ============================================================
@@ -5199,7 +5352,7 @@ test "Phase 6: getRuntimeSource rewrites RUNTIME_DECLARED_CAPS_DEFAULT for REFCO
     // level default already encodes the right value, so a drift in
     // the default value cannot mask a rewrite-path bug.
     const arc_caps: u64 = 0x0000_0000_0000_0001;
-    const src = getRuntimeSource(arc_caps);
+    const src = getRuntimeSource(arc_caps, .arc);
     // The rewritten source must contain the resolved caps literal.
     const expected = "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x1;";
     try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
@@ -5217,7 +5370,7 @@ test "Phase 6: getRuntimeSource rewrites RUNTIME_DECLARED_CAPS_DEFAULT to 0 unde
     // runtime's comptime `refcount_v1_active` resolves to `false` and
     // the inline `ArcHeader` field collapses to `@sizeOf == 0`.
     const arena_caps: u64 = 0;
-    const src = getRuntimeSource(arena_caps);
+    const src = getRuntimeSource(arena_caps, .arena);
     const expected = "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x0;";
     try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
 }
@@ -5228,7 +5381,7 @@ test "Phase 6: getRuntimeSource rewrite encodes arbitrary caps bitmasks" {
     // pure string substitution — it must reproduce whatever
     // `declared_caps` the caller passes, verbatim as a hex literal.
     const multi_caps: u64 = 0xDEADBEEFCAFEBABE;
-    const src = getRuntimeSource(multi_caps);
+    const src = getRuntimeSource(multi_caps, .third_party);
     const expected = "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0xdeadbeefcafebabe;";
     try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
 }
@@ -5337,4 +5490,119 @@ test "Phase 2: every first-party manager source opens with a doc-comment header 
         try std.testing.expect(std.mem.startsWith(u8, source, doc_comment_needle));
         try std.testing.expect(std.mem.indexOf(u8, source, std_import_needle) != null);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — per-user-binary active-manager source registration. Each Zap
+// user binary registers exactly one Zig module named `zap_active_manager`
+// alongside the runtime: for a first-party manager the module IS the
+// manager's `manager.zig` source (Phase 4's comptime branches call into
+// it directly so LLVM can inline through the boundary); for third-party
+// managers it is a minimal stub (Phase 4's comptime branches route
+// through the manager-`.o`'s vtable instead and never touch the stub's
+// symbols). These tests pin the registration contract end-to-end:
+//   * `getActiveManagerSourceBytes` returns the right bytes for every tag.
+//   * `getRuntimeSource` rewrites the runtime's `ACTIVE_MANAGER_TAG`
+//     marker per resolved manager and treats the tag as part of the
+//     cache key so two builds with different tags never alias the same
+//     rewritten source slice.
+// ---------------------------------------------------------------------------
+
+test "Phase 3: getActiveManagerSourceBytes returns embedded source for first-party tags" {
+    // Phase 3's first-party path simply forwards to
+    // `getBuiltinManagerSource`'s embedded bytes — the active-manager
+    // registration MUST hand the Zig compiler the same backing storage
+    // the embed-time switch produced so the test suite, the build
+    // pipeline, and the watch-mode incremental path all see the same
+    // bytes. Pointer equality (not just slice equality) pins that there
+    // is no hidden copy or allocator buffer on the first-party path —
+    // any divergence would mean a future caller could pass a stale
+    // pointer through to `zir_compilation_add_struct_source`.
+    const tags = [_]zap.memory_driver.BuiltinManagerTag{ .arc, .arena, .no_op, .leak, .tracking };
+    for (tags) |tag| {
+        const embedded = getBuiltinManagerSource(tag).?;
+        const active = getActiveManagerSourceBytes(tag);
+        try std.testing.expectEqual(embedded.ptr, active.ptr);
+        try std.testing.expectEqual(embedded.len, active.len);
+    }
+}
+
+test "Phase 3: getActiveManagerSourceBytes returns a valid Zig stub for third_party" {
+    // Third-party managers route every retain/release through the
+    // manager `.o`'s `.zapmem`-registered vtable, but the runtime's
+    // top-level `@import("zap_active_manager")` still needs to resolve
+    // — so Phase 3 registers a minimal Zig stub under that name. The
+    // stub must be (a) non-empty and (b) a valid Zig source unit (it
+    // gets fed to the Zig compiler via `zir_compilation_add_struct_source`).
+    // We pin both invariants here: a regression that emits empty bytes
+    // would break the `addStructSource` call, and a regression that
+    // emits non-Zig text would surface as a Sema parse error during
+    // every third-party user-binary build.
+    const stub = getActiveManagerSourceBytes(.third_party);
+    try std.testing.expect(stub.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, stub, "const std = @import(\"std\")") != null);
+}
+
+test "Phase 3: getRuntimeSource rewrites RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT to the requested tag" {
+    // The runtime ships with `.third_party` as the source-level default
+    // so the host test suite — which loads `runtime.zig` as a Zig
+    // module without going through `getRuntimeSource` — naturally
+    // exercises the vtable path. For every Zap user binary the rewrite
+    // replaces the marker with the resolved tag so Phase 4's comptime
+    // branches in `runtime.zig` see the right case at compile time.
+    // The rewrite must produce the exact `.<tag>` literal AND drop the
+    // original `.third_party` literal — a no-op rewrite would silently
+    // leave every first-party build dispatching through the vtable
+    // path, defeating the whole inlining motivation behind Phases 3-4.
+    const cases = [_]struct {
+        tag: zap.memory_driver.BuiltinManagerTag,
+        name: []const u8,
+    }{
+        .{ .tag = .arc, .name = "arc" },
+        .{ .tag = .arena, .name = "arena" },
+        .{ .tag = .no_op, .name = "no_op" },
+        .{ .tag = .leak, .name = "leak" },
+        .{ .tag = .tracking, .name = "tracking" },
+    };
+    for (cases) |c| {
+        const src = getRuntimeSource(0, c.tag);
+        var expected_buf: [256]u8 = undefined;
+        const expected = std.fmt.bufPrint(
+            &expected_buf,
+            "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .{s};",
+            .{c.name},
+        ) catch unreachable;
+        try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
+        const original = "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .third_party;";
+        try std.testing.expect(std.mem.indexOf(u8, src, original) == null);
+    }
+}
+
+test "Phase 3: getRuntimeSource preserves the .third_party marker for third-party builds" {
+    // The third-party path is a deliberate identity rewrite: the
+    // resolved tag IS `.third_party`, so the rewritten source must
+    // still contain the original marker verbatim. We test this
+    // explicitly (rather than skipping the rewrite for `.third_party`)
+    // because the rewrite path is self-validating only when it always
+    // runs — a future bug that silently no-ops the rewrite on
+    // `.third_party` would not be caught by the first-party assertions
+    // alone.
+    const src = getRuntimeSource(0, .third_party);
+    const expected = "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .third_party;";
+    try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
+}
+
+test "Phase 3: getRuntimeSource cache key separates by builtin_tag" {
+    // The rewrite cache keys on (instrumented, declared_caps, builtin_tag).
+    // Two builds with identical declared_caps but different tags MUST
+    // produce distinct cached buffers — otherwise the builder and full-
+    // build phases would alias the wrong rewrite for the second build
+    // in a multi-target run (a `zap build foo` followed by
+    // `zap build bar` from the same compiler process), silently
+    // injecting the wrong manager source into one of them. Pointer
+    // inequality is the strongest invariant the cache layer can
+    // expose to a black-box test.
+    const arc_src = getRuntimeSource(0, .arc);
+    const arena_src = getRuntimeSource(0, .arena);
+    try std.testing.expect(arc_src.ptr != arena_src.ptr);
 }

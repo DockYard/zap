@@ -1226,7 +1226,10 @@ fn buildTarget(
         .global_cache_dir = ".zap-cache",
         .output_path = output_path,
         .name = output_name,
-        .runtime_source = compiler.getRuntimeSource(resolved_manager.declared_caps),
+        .runtime_source = compiler.getRuntimeSource(
+            resolved_manager.declared_caps,
+            resolved_manager.builtin_tag,
+        ),
         .output_mode = output_mode_val,
         .optimize_mode = optimize_mode,
         .target = compile_target,
@@ -1245,6 +1248,14 @@ fn buildTarget(
         // branch on it to inline through a comptime-dispatched fast
         // path for first-party managers.
         .builtin_tag = resolved_manager.builtin_tag,
+        // Phase 3: register the active manager's Zig source as the
+        // `zap_active_manager` sibling module so the runtime's
+        // top-level `@import("zap_active_manager")` resolves at every
+        // user-binary compile. First-party tags hand the manager's
+        // embedded `manager.zig` source through; `.third_party` hands
+        // the minimal stub through. See
+        // `compiler.getActiveManagerSourceBytes`.
+        .active_manager_source = compiler.getActiveManagerSourceBytes(resolved_manager.builtin_tag),
         // Zig 0.16 error formatting options from manifest
         .error_style = config.error_style,
         .multiline_errors = config.multiline_errors,
@@ -1493,7 +1504,13 @@ const IncrementalWatchState = struct {
     /// see the same classification the initial backend context was
     /// created with. Later phases of the perf-recovery work branch
     /// on this tag to inline through a comptime-dispatched fast path.
-    builtin_tag: @import("memory/driver.zig").BuiltinManagerTag = .third_party,
+    ///
+    /// The type is reached through the `zap` module's re-export rather
+    /// than a direct `@import("memory/driver.zig")` so the same file
+    /// is not pulled into two modules (`root` and `zap`) at once —
+    /// Zig 0.16 forbids that and the resulting "file exists in modules
+    /// 'root' and 'zap'" error blocks the whole `zig build` step.
+    builtin_tag: zap.memory_driver.BuiltinManagerTag = .third_party,
 
     fn deinit(self: *IncrementalWatchState) void {
         zir_backend.destroyContext(self.zir_ctx);
@@ -1687,7 +1704,7 @@ const IncrementalWatchState = struct {
             .global_cache_dir = ".zap-cache",
             .output_path = output_path_duped,
             .name = output_name_duped,
-            .runtime_source = compiler.getRuntimeSource(declared_caps),
+            .runtime_source = compiler.getRuntimeSource(declared_caps, resolved_manager.builtin_tag),
             .output_mode = output_mode_val,
             .optimize_mode = optimize_mode_val,
             .target = compile_target,
@@ -1695,6 +1712,13 @@ const IncrementalWatchState = struct {
             .memory_manager_object = memory_manager_object_owned,
             .declared_caps = declared_caps,
             .builtin_tag = resolved_manager.builtin_tag,
+            // Phase 3: register the active manager's Zig source as the
+            // `zap_active_manager` sibling module for the watch session's
+            // persistent context. The tag is pinned for the lifetime of
+            // the watcher (the manifest's `memory:` field cannot change
+            // without tearing the session down — see `watchAndRebuild`),
+            // so a single registration at `init` time is sound.
+            .active_manager_source = compiler.getActiveManagerSourceBytes(resolved_manager.builtin_tag),
         }) catch {
             allocator.free(zig_lib_duped);
             allocator.free(output_path_duped);
@@ -1925,7 +1949,7 @@ const IncrementalWatchState = struct {
             .global_cache_dir = ".zap-cache",
             .output_path = self.output_path,
             .name = self.output_name,
-            .runtime_source = compiler.getRuntimeSource(self.declared_caps),
+            .runtime_source = compiler.getRuntimeSource(self.declared_caps, self.builtin_tag),
             .output_mode = self.output_mode,
             .optimize_mode = self.optimize_mode,
             .link_libc = self.link_libc,
@@ -1934,6 +1958,16 @@ const IncrementalWatchState = struct {
             .memory_manager_object = self.memory_manager_object,
             .declared_caps = self.declared_caps,
             .builtin_tag = self.builtin_tag,
+            // The persistent context already registered
+            // `zap_active_manager` at `createContext` time
+            // (`IncrementalWatchState.init`); `injectAndUpdate` only
+            // reads the file-registration slots it owns
+            // (`zap_active_manager_source` is for fresh registration
+            // only, not re-registration). Pass it through so the
+            // `CompileOptions` shape stays consistent across the two
+            // entry points; the persistent context's existing
+            // registration wins.
+            .active_manager_source = compiler.getActiveManagerSourceBytes(self.builtin_tag),
         }) catch return error.BackendError;
 
         self.baseline_established = true;

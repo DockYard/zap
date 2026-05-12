@@ -1,6 +1,25 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// The active memory manager's Zig source registered alongside this
+/// runtime in the user-binary build. For first-party managers this
+/// resolves to the actual manager source (so Phase 4's comptime branches
+/// can call directly into the manager's hot paths and let LLVM inline
+/// through the boundary); for third-party managers it resolves to a
+/// stub registered by `compiler.getActiveManagerSourceBytes`, and the
+/// runtime's `.third_party` comptime branch routes through the vtable
+/// instead so the stub's symbols are never referenced.
+///
+/// The host test build (which loads `runtime.zig` as a Zig module via
+/// `zig build test`) registers the same stub against this name through
+/// `build.zig`'s `addAnonymousImport`, so the import resolves cleanly
+/// in both contexts — there is no `if (builtin.is_test)` conditional
+/// around the import itself. Zig 0.16 does NOT elide top-level
+/// `@import` declarations during semantic analysis even when the bound
+/// name is unused, so a missing registration would surface as a
+/// "module not found" error at every user-binary compile.
+const active_manager = @import("zap_active_manager");
+
 /// Read an environment variable for a runtime-known name. The runtime
 /// can't `@import("env.zig")` because runtime.zig is injected into Zap
 /// binaries as standalone source — it has no sibling files in the
@@ -671,6 +690,71 @@ export fn zap_runtime_atomic_add_u32_acq_rel(ptr: *u32, delta: u32) callconv(.c)
 // coverage note. A Phase 6 fault-injection harness will exercise
 // the panic paths under a child-process model.)
 // ============================================================
+
+// ============================================================
+// Phase 3 — Active manager identity (mirrors `BuiltinManagerTag`)
+//
+// `ActiveManagerTag` mirrors `src/memory/driver.zig:BuiltinManagerTag`.
+// The runtime can't `@import("memory/driver.zig")` because runtime.zig
+// is injected into each Zap user binary as a standalone source unit
+// with no sibling files (it can only `@import("std")`,
+// `@import("builtin")`, and the per-build `@import("zap_active_manager")`
+// stub registered by Phase 3). The mirror, the explicit `u8` ordinals,
+// and the comptime tripwire below collectively pin the wire encoding:
+// both sides must agree, and any drift in `BuiltinManagerTag`'s shape
+// (adding, removing, or renaming a case) MUST be matched by a
+// simultaneous change here and a bump of the expected count.
+//
+// Resolution:
+//   * The source-level `RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT` constant
+//     defaults to `.third_party` so the host test suite (which loads
+//     `runtime.zig` as a Zig module without going through the
+//     user-binary `@embedFile` rewrite) naturally exercises the
+//     vtable path — the same path a third-party manager build follows.
+//   * For each Zap user binary, `compiler.getRuntimeSource(caps, tag)`
+//     rewrites the marker to the resolved manager's tag before
+//     injecting the source into the build. A binary built against
+//     `Zap.Memory.ARC` therefore sees `ACTIVE_MANAGER_TAG == .arc`,
+//     which lets Phase 4's comptime branches call into the active
+//     manager's hot paths directly through `@import("zap_active_manager")`.
+// ============================================================
+
+pub const ActiveManagerTag = enum(u8) {
+    arc = 0,
+    arena = 1,
+    no_op = 2,
+    leak = 3,
+    tracking = 4,
+    third_party = 5,
+};
+
+// Compile-time guard mirroring the `BuiltinManagerTag` symmetry assert
+// in `src/memory/driver.zig`. The Phase 3 marker rewrite and the
+// Phase 4 comptime dispatch both treat the tag as a closed set; a
+// silent shape drift between the two enums would either alias a
+// first-party manager to the wrong arm (incorrect codegen) or break
+// the rewrite altogether (the user binary would fail to compile).
+// Both failure modes are catastrophic, so the count is asserted at
+// the runtime-module compile site.
+comptime {
+    if (@typeInfo(ActiveManagerTag).@"enum".fields.len != 6) @compileError(
+        "runtime.ActiveManagerTag: case count drifted from BuiltinManagerTag — " ++
+            "update both enums and the explicit ordinals in lock-step.",
+    );
+}
+
+const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .third_party;
+
+/// The active memory manager's identity, comptime-visible inside
+/// `runtime.zig`. Phase 4's hot-path dispatchers branch on this so a
+/// first-party-manager build can call directly through
+/// `@import("zap_active_manager")` (letting LLVM inline across the
+/// boundary) while a `.third_party` build routes through the
+/// `.zapmem`-registered vtable the way today's code does. The
+/// indirect default-via-marker pattern mirrors
+/// `RUNTIME_DECLARED_CAPS_DEFAULT` so the compiler's
+/// `rewriteRuntimeSource` can edit a single literal per user binary.
+pub const ACTIVE_MANAGER_TAG: ActiveManagerTag = RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT;
 
 pub const AbiV1 = struct {
     /// `REFC` capability tag (spec section 7.1) read at the target's
