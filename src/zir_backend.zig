@@ -241,16 +241,23 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
     // `compiler.getActiveManagerSourceBytes` for the per-tag dispatch
     // and `runtime.zig`'s top-level `active_manager` declaration for
     // the consumer side.
-    if (options.active_manager_source.len > 0) {
-        if (zir_compilation_add_struct_source(
-            ctx,
-            "zap_active_manager",
-            options.active_manager_source.ptr,
-            @intCast(options.active_manager_source.len),
-        ) != 0) {
-            zir_compilation_destroy(ctx);
-            return error.CompilationFailed;
-        }
+    //
+    // Registration is unconditional: `active_manager_source` is a
+    // non-optional field on `CompileOptions` and every production
+    // call site wires it through `compiler.getActiveManagerSourceBytes`,
+    // which never returns empty bytes (first-party tags return the
+    // embedded `manager.zig`, `.third_party` returns the embedded
+    // stub). A silent skip on empty bytes would mask a regression as a
+    // far-removed "module not found" Sema error at every user-binary
+    // build.
+    if (zir_compilation_add_struct_source(
+        ctx,
+        "zap_active_manager",
+        options.active_manager_source.ptr,
+        @intCast(options.active_manager_source.len),
+    ) != 0) {
+        zir_compilation_destroy(ctx);
+        return error.CompilationFailed;
     }
 
     // Splice the memory-manager object file into the link inputs if the

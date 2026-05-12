@@ -1962,7 +1962,7 @@ const IncrementalWatchState = struct {
             // `zap_active_manager` at `createContext` time
             // (`IncrementalWatchState.init`); `injectAndUpdate` only
             // reads the file-registration slots it owns
-            // (`zap_active_manager_source` is for fresh registration
+            // (`active_manager_source` is for fresh registration
             // only, not re-registration). Pass it through so the
             // `CompileOptions` shape stays consistent across the two
             // entry points; the persistent context's existing

@@ -625,7 +625,9 @@ export fn zap_runtime_atomic_add_u32_acq_rel(ptr: *u32, delta: u32) callconv(.c)
 // live in `src/memory/abi.zig`; the shapes are redeclared here because
 // `runtime.zig` is `@embedFile`'d into the Zap compiler and injected
 // into every Zap user binary as a standalone source unit with no
-// sibling files (it can only `@import("std")` / `@import("builtin")`).
+// sibling files (it can `@import("std")`, `@import("builtin")`, and
+// the per-build `@import("zap_active_manager")` sibling registered by
+// Phase 3 of the perf-recovery work).
 // Any change to the canonical types in `src/memory/abi.zig` must be
 // mirrored here; the `comptime` size asserts on each shape are the
 // drift tripwire.

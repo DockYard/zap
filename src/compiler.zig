@@ -133,16 +133,7 @@ comptime {
 /// compiler's parser. A regression that emits non-Zig text (or empty
 /// bytes) would surface as a Sema parse error during every
 /// third-party user-binary build.
-const THIRD_PARTY_ACTIVE_MANAGER_STUB =
-    \\//! Stub registered as `zap_active_manager` when the build selects a
-    \\//! third-party memory manager. The runtime's `.third_party` comptime
-    \\//! branch never references symbols from this module; it routes
-    \\//! through the manager `.o`'s `.zapmem`-registered vtable instead.
-    \\//! This stub exists solely so the runtime's top-level
-    \\//! `@import("zap_active_manager")` resolves cleanly.
-    \\
-    \\const std = @import("std");
-;
+const THIRD_PARTY_ACTIVE_MANAGER_STUB = @embedFile("zap_active_manager_stub.zig");
 
 /// Return the Zig source bytes to register as the user binary's
 /// `zap_active_manager` module. For first-party tags this is the
@@ -3508,6 +3499,44 @@ comptime {
     );
 }
 
+// Phase 3 — ordinal-pair tripwire pinning `runtime.zig`'s
+// `ActiveManagerTag(enum(u8))` ordinals to `driver.zig`'s
+// `BuiltinManagerTag` ordinals.
+//
+// The runtime enum cannot be referenced from this site because
+// `runtime.zig` is `@embedFile`'d into the compiler (it is a source
+// blob, not a Zig module in scope here). The runtime side is the
+// canonical wire encoding — the embedded source is what every Zap
+// user binary sees, with `ActiveManagerTag` declared as
+// `enum(u8) { arc = 0, arena = 1, no_op = 2, leak = 3, tracking = 4, third_party = 5 }`.
+// `BuiltinManagerTag` must agree on every (name, ordinal) pair so
+// that the `@intFromEnum` value packed into `rewriteCacheKey`'s
+// `bits 72..79` slot resolves to the same comptime arm at every
+// user-binary build.
+//
+// Adding a case to either enum without matching the other (in name,
+// position, AND ordinal) breaks the wire encoding. This block fails
+// the build before that drift can ship.
+comptime {
+    const DriverTag = zap.memory_driver.BuiltinManagerTag;
+    const expected = [_]struct { name: []const u8, ord: u8 }{
+        .{ .name = "arc", .ord = 0 },
+        .{ .name = "arena", .ord = 1 },
+        .{ .name = "no_op", .ord = 2 },
+        .{ .name = "leak", .ord = 3 },
+        .{ .name = "tracking", .ord = 4 },
+        .{ .name = "third_party", .ord = 5 },
+    };
+    for (expected) |e| {
+        const driver_field = @field(DriverTag, e.name);
+        if (@intFromEnum(driver_field) != e.ord) @compileError(
+            "Phase 3: BuiltinManagerTag ordinals drifted from runtime.zig's ActiveManagerTag — " ++
+                "both enums must agree on (name, ordinal) because the runtime's enum(u8) " ++
+                "wire encoding is consumed by `rewriteCacheKey` via @intFromEnum.",
+        );
+    }
+}
+
 // ============================================================
 // Parallel parsing support
 // ============================================================
@@ -5605,4 +5634,19 @@ test "Phase 3: getRuntimeSource cache key separates by builtin_tag" {
     const arc_src = getRuntimeSource(0, .arc);
     const arena_src = getRuntimeSource(0, .arena);
     try std.testing.expect(arc_src.ptr != arena_src.ptr);
+}
+
+test "Phase 3: getRuntimeSource applies both caps and tag rewrites in one pass" {
+    // The Phase 6 caps rewrite (stage 2) and the Phase 3 tag rewrite
+    // (stage 3) chain through the same allocator-owned buffer in a
+    // single `rewriteRuntimeSource` call. A regression that drops
+    // either stage — or runs them against the wrong intermediate
+    // buffer — would let the other stage's marker survive untouched
+    // in the returned slice. Pin the end-to-end invariant by asserting
+    // BOTH rewritten literals appear together for an ARC build with
+    // `REFCOUNT_V1` set: the caps literal `0x1` from stage 2 AND the
+    // matching `.arc` tag literal from stage 3 must both be present.
+    const src = getRuntimeSource(0x1, .arc);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .arc;") != null);
 }

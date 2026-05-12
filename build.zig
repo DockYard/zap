@@ -42,28 +42,20 @@ pub fn build(b: *std.Build) void {
     // top-level `@import` decls during semantic analysis even when
     // the bound name is unused.
     //
-    // The stub registered here mirrors `compiler.THIRD_PARTY_ACTIVE_MANAGER_STUB`
-    // verbatim — under the host test build the runtime's source-level
-    // default (`ACTIVE_MANAGER_TAG == .third_party`) routes every hot
-    // path through the vtable (no symbols from `zap_active_manager`
-    // are referenced), so a minimal `const std = @import("std");`
-    // body is sufficient. Production user binaries register the real
+    // The stub file `src/zap_active_manager_stub.zig` is the single
+    // source of truth: `src/compiler.zig` `@embedFile`'s it as
+    // `THIRD_PARTY_ACTIVE_MANAGER_STUB` (for the per-user-binary
+    // third-party registration path), and the same file is registered
+    // here as the sibling module for the host test build. Under the
+    // host test build the runtime's source-level default
+    // (`ACTIVE_MANAGER_TAG == .third_party`) routes every hot path
+    // through the vtable (no symbols from `zap_active_manager` are
+    // referenced), so the minimal `const std = @import("std");` body
+    // is sufficient. Production user binaries register the real
     // per-tag source through `compiler.getActiveManagerSourceBytes`
     // and `zir_compilation_add_struct_source`; see
     // `src/zir_backend.zig:createContext`.
     // ----------------------------------------------------------------
-    const active_manager_stub_wf = b.addWriteFiles();
-    const active_manager_stub_source = active_manager_stub_wf.add("zap_active_manager.zig",
-        \\//! Host-test stub registered as `zap_active_manager`. The runtime's
-        \\//! `.third_party` comptime branch never references symbols from this
-        \\//! module; it routes through the manager `.o`'s `.zapmem`-registered
-        \\//! vtable instead. This stub exists solely so the runtime's top-level
-        \\//! `@import("zap_active_manager")` resolves cleanly under `zig build
-        \\//! test`. Kept byte-equivalent to `compiler.THIRD_PARTY_ACTIVE_MANAGER_STUB`.
-        \\
-        \\const std = @import("std");
-        \\
-    );
 
     // Library import unit — no native deps needed
     const mod = b.addModule("zap", .{
@@ -72,7 +64,7 @@ pub fn build(b: *std.Build) void {
     });
     mod.addOptions("build_options", build_options);
     mod.addAnonymousImport("zap_active_manager", .{
-        .root_source_file = active_manager_stub_source,
+        .root_source_file = b.path("src/zap_active_manager_stub.zig"),
     });
 
     // -----------------------------------------------------------------------
