@@ -532,6 +532,27 @@ export fn zap_runtime_atomic_add_u32_acq_rel(ptr: *u32, delta: u32) callconv(.c)
 // rework deferred to a Phase 4.x byte-level slab redesign.
 // `prepareReleaseAny` / `destroyPreparedAny` (split-phase borrow-
 // elision API) follow the same Phase 4.x deferral.
+//
+// ## Capability-missing panic contract
+//
+// When a dispatcher (`allocAny`, `freeAny`, `releaseAny`,
+// `retainAny`, `retainAnyPersistent`, `headerRetain`,
+// `headerRelease`) is invoked under a manager that does NOT declare
+// REFCOUNT_V1, the dispatcher MUST panic with a message that names
+// the missing capability literally as `REFCOUNT_V1` so the user can
+// trace the failure back to the manifest's `memory:` selection. This
+// is a normative source-side invariant: tooling (e.g. the
+// `Zap.Memory.Arena` structdoc, the Phase 6 codegen-elision plan,
+// any future diagnostics layer) relies on the `REFCOUNT_V1` token
+// appearing verbatim in the panic text. Every panic site in this
+// file that gates on `zap_active_refcount_capability == null` is
+// audited to honor this contract; grep for `REFCOUNT_V1` to verify.
+//
+// (These panic paths cannot be exercised in standard `zig build
+// test` because `@panic` aborts the test process. Coverage of the
+// panic message text is by inspection — see the `headerRetain`
+// coverage note. A Phase 6 fault-injection harness will exercise
+// the panic paths under a child-process model.)
 // ============================================================
 
 pub const AbiV1 = struct {

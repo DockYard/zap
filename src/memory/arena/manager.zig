@@ -252,6 +252,21 @@ fn arenaInit(options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque {
 /// trivially satisfies that constraint: on abnormal exit the OS
 /// reclaims every `mmap`'d chunk, so the only resource that would
 /// "leak" is bookkeeping data the OS would have reclaimed anyway.
+///
+/// ### Thread-safety of `arena.deinit()`
+///
+/// Zig 0.16's `std.heap.ArenaAllocator.deinit` is documented as "not
+/// threadsafe" — it walks `used_list`/`free_list` without atomic
+/// fences because the deinit path assumes exclusive access. This is
+/// nonetheless safe to call here because spec §4.4 makes `deinit` a
+/// **single-threaded normal-exit-only** call: the runtime invokes
+/// `core.deinit` exactly once, from the main thread, after all
+/// program-spawned threads have either joined or been terminated by
+/// the normal-shutdown path. No concurrent `arenaAllocate` or
+/// `arenaDeallocate` can be in flight when this function runs, so the
+/// "not threadsafe" caveat does not apply. On abnormal-exit paths
+/// (`abort`, `panic`, `std.process.exit`) this function is never
+/// invoked at all — the OS reclaims the `mmap`'d chunks directly.
 fn arenaDeinit(ctx: *anyopaque) callconv(.c) void {
     const arena_ctx: *ArenaContext = @ptrCast(@alignCast(ctx));
     arena_ctx.arena.deinit();
@@ -272,16 +287,18 @@ fn arenaDeinit(ctx: *anyopaque) callconv(.c) void {
 /// in `arenaDeinit`.
 fn arenaAllocate(ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8 {
     const arena_ctx: *ArenaContext = @ptrCast(@alignCast(ctx));
-    // `std.mem.Alignment.fromByteUnits` requires a power-of-two byte
-    // count. The runtime guarantees that contract (spec §4.2: "always
-    // a power of two and at least `@alignOf(usize)`"); we clamp to 1
-    // defensively to avoid a 0-byte alignment producing an invalid
-    // log2 value. Zero-size allocations are forwarded as-is — the
-    // arena's `alloc` asserts `n > 0`, matching the spec contract that
-    // size > 0 is the runtime's responsibility, so this is purely
-    // belt-and-braces.
-    const align_bytes: usize = if (alignment == 0) 1 else alignment;
-    const arena_alignment: std.mem.Alignment = .fromByteUnits(align_bytes);
+    // Spec §4.2 contract: `alignment` is "always a power of two and at
+    // least `@alignOf(usize)`". The runtime is responsible for enforcing
+    // that — papering over a contract violation here would silently
+    // round invalid alignments up to 1 and hide the bug. Assert the
+    // contract directly so a regression surfaces immediately in
+    // `Debug` / `ReleaseSafe` builds (the only modes the fork primitive
+    // compiles managers under; see spec §10.3.1). Zero-size allocations
+    // are forwarded as-is — the arena's `alloc` asserts `n > 0`,
+    // matching the spec contract that `size > 0` is the runtime's
+    // responsibility.
+    std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
+    const arena_alignment: std.mem.Alignment = .fromByteUnits(alignment);
     const allocator = arena_ctx.arena.allocator();
     return allocator.rawAlloc(size, arena_alignment, @returnAddress());
 }

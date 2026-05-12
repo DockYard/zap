@@ -151,12 +151,22 @@ EOF
 # Build the driver-check program. Both the probe and `driver.zig` sit in
 # the same directory, so the import resolves without extra config.
 if zig build-exe "$PROBE_SRC" -femit-bin="$PROBE_BIN" 2>"$TMPDIR_PATH/driver_build.log"; then
-    if "$PROBE_BIN" "$OBJECT_PATH"; then
+    # Propagate the probe's exit code verbatim. The probe encodes the
+    # script's documented distinction: exit 1 = driver-side validation
+    # rejection (test failure), exit 2 = usage error (toolchain /
+    # environment issue). Collapsing both to `exit 1` here would hide
+    # the latter under the former and break the script's exit-code
+    # contract documented at the top of this file.
+    set +e
+    "$PROBE_BIN" "$OBJECT_PATH"
+    PROBE_RC=$?
+    set -e
+    if [ "$PROBE_RC" -eq 0 ]; then
         echo "    OK: driver.assertExportsManagerSymbol accepted the object"
     else
-        echo "ERROR: driver.assertExportsManagerSymbol rejected the object" >&2
+        echo "ERROR: driver.assertExportsManagerSymbol rejected the object (probe exit $PROBE_RC)" >&2
         rm -f "$PROBE_SRC"
-        exit 1
+        exit "$PROBE_RC"
     fi
 else
     echo "ERROR: could not build driver-check probe — see log:" >&2

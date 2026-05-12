@@ -2666,3 +2666,240 @@ test "resolve passes NATIVE sentinel when compile_target is null" {
     try std.testing.expectEqual(@as(u16, 0), captured_target_state.target.abi_tag);
     try std.testing.expectEqual(@as(u16, 0), captured_target_state.target._reserved);
 }
+
+// ---------------------------------------------------------------------------
+// Real-toolchain smoke tests
+//
+// These tests close the verification gap left by the shell scripts in
+// `scripts/test_{arena,arc}_manager_compile.sh`. The shell scripts
+// exercise the real manager source through the host's `zig` compiler
+// and the driver's symbol/section validator, but they are not wired
+// into `zig build test`, so contributors and CI that run only
+// `zig build test` would miss drift between the real source and the
+// driver's parser.
+//
+// The tests below invoke the system `zig` compiler via
+// `std.process.run`, recompile the manager into a fresh temp-dir
+// object file, then re-validate the result with the exact same
+// production code paths the driver uses at link time
+// (`section_parser.extractSection`, `validateSection`, and
+// `assertExportsManagerSymbol`). The result is end-to-end coverage of
+// the parser, validator, and the manager source itself, without any
+// shell-script choreography.
+//
+// **Skip semantics.** When the host has no `zig` on PATH (CI without
+// system zig, sandboxed environments, etc.) the spawn returns
+// `error.FileNotFound`. The tests catch that and `return
+// error.SkipZigTest` so the suite still passes on those hosts. Any
+// other failure is a real test failure.
+//
+// **Cost.** Each test compiles a single `std`-only Zig source file at
+// `-O ReleaseSafe`. Local measurement: ~0.3-0.6 seconds per test,
+// well under the budget for `zig build test`.
+// ---------------------------------------------------------------------------
+
+/// Skip-marker returned when the host has no working `zig` on PATH.
+/// Reused by every system-zig probe in this file so the catch-and-skip
+/// pattern stays in one place.
+const SystemZigSkipError = error{
+    /// The system `zig` binary could not be spawned. Most commonly
+    /// `error.FileNotFound` (no `zig` on PATH) on bare CI runners.
+    SystemZigUnavailable,
+};
+
+/// Run `zig build-obj <source_abs> -O ReleaseSafe -femit-bin=<obj_abs>`
+/// and return on success. Maps the spawn-side errors that indicate
+/// "no working `zig` on this host" to `SystemZigUnavailable` so the
+/// caller can `return error.SkipZigTest`; every other failure mode
+/// (compilation error, non-zero exit, etc.) is surfaced as the
+/// underlying error and fails the test loudly.
+///
+/// Uses `std.testing.io` for the spawn — that is the threaded-IO
+/// instance the test runner sets up with a real allocator backing
+/// `fork`/`execve` argument marshalling. `std.Options.debug_io` is
+/// initialised with a `failing` allocator (see `Io.Threaded.init_single_threaded`)
+/// and crashes on the first `arena.allocSentinel` for argv-building.
+fn invokeSystemZigBuildObj(
+    allocator: std.mem.Allocator,
+    source_abs: []const u8,
+    obj_abs: []const u8,
+) !void {
+    const femit_arg = try std.fmt.allocPrint(allocator, "-femit-bin={s}", .{obj_abs});
+    defer allocator.free(femit_arg);
+
+    const argv = [_][]const u8{
+        "zig",
+        "build-obj",
+        source_abs,
+        "-O",
+        "ReleaseSafe",
+        femit_arg,
+    };
+
+    const result = std.process.run(allocator, std.testing.io, .{
+        .argv = &argv,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    }) catch |err| switch (err) {
+        // `FileNotFound` means PATH lookup turned up no `zig` binary —
+        // the documented skip trigger. `OperationUnsupported` means
+        // the host kernel forbids `fork`/spawn (some seccomp sandboxes);
+        // we treat that the same way because it is environmental, not
+        // a defect in the manager source.
+        error.FileNotFound, error.OperationUnsupported => return SystemZigSkipError.SystemZigUnavailable,
+        else => return err,
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            std.debug.print(
+                "system `zig build-obj` exited with code {d}\nstderr:\n{s}\n",
+                .{ code, result.stderr },
+            );
+            return error.SystemZigCompileFailed;
+        },
+        else => {
+            std.debug.print(
+                "system `zig build-obj` terminated abnormally: {any}\nstderr:\n{s}\n",
+                .{ result.term, result.stderr },
+            );
+            return error.SystemZigCompileFailed;
+        },
+    }
+}
+
+/// Shared body for the two real-toolchain probes below. Compiles
+/// `manager_source_rel` (resolved relative to the test's cwd, which is
+/// the project root when invoked via `zig build test`) into a fresh
+/// object file inside `tmp_dir`, then parses the result through the
+/// production driver helpers. Asserts:
+///
+///   * `section_parser.extractSection` finds the `.zapmem` payload.
+///   * `validateSection` accepts the meta + core header.
+///   * `assertExportsManagerSymbolForTest` accepts the `zap_memory_section`
+///     symbol export.
+///   * `declared_caps` matches `expected_caps` exactly.
+///
+/// Returns `error.SkipZigTest` (preserved through the caller) when the
+/// host has no working `zig` on PATH.
+fn verifyRealManagerObject(
+    manager_label: []const u8,
+    manager_source_rel: []const u8,
+    expected_caps: u64,
+) !void {
+    const allocator = std.testing.allocator;
+
+    // Resolve `manager_source_rel` against the test cwd (project root
+    // when invoked via `zig build test`). Using the absolute path
+    // sidesteps any cwd ambiguity if a sub-test changes directories.
+    const source_abs = std.Io.Dir.cwd().realPathFileAlloc(
+        std.Options.debug_io,
+        manager_source_rel,
+        allocator,
+    ) catch |err| {
+        // The manager source not existing on the host is itself a
+        // build-tree corruption — fail loudly rather than skip.
+        std.debug.print(
+            "could not resolve manager source '{s}': {any}\n",
+            .{ manager_source_rel, err },
+        );
+        return err;
+    };
+    defer allocator.free(source_abs);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_abs = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_abs);
+
+    const obj_abs = std.fs.path.join(allocator, &.{ tmp_abs, "manager.o" }) catch return error.OutOfMemory;
+    defer allocator.free(obj_abs);
+
+    invokeSystemZigBuildObj(allocator, source_abs, obj_abs) catch |err| switch (err) {
+        SystemZigSkipError.SystemZigUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+
+    // Read the freshly-compiled object back into memory and feed it
+    // through the production driver helpers, exactly as `resolve()`
+    // does at link time.
+    const object_bytes = std.Io.Dir.cwd().readFileAlloc(
+        std.Options.debug_io,
+        obj_abs,
+        allocator,
+        .limited(64 * 1024 * 1024),
+    ) catch return error.Unexpected;
+    defer allocator.free(object_bytes);
+
+    const section_bytes = section_parser.extractSection(object_bytes) catch |err| {
+        std.debug.print(
+            "section_parser.extractSection rejected real {s} manager object: {any}\n",
+            .{ manager_label, err },
+        );
+        return err;
+    };
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    const validated = validateSection(manager_label, section_bytes, &diag) catch |err| {
+        std.debug.print(
+            "validateSection rejected real {s} manager object: {any} - {s}\n",
+            .{ manager_label, err, diag.text() },
+        );
+        return err;
+    };
+
+    try std.testing.expectEqual(expected_caps, validated.declared_caps);
+
+    // The smoke scripts call `assertExportsManagerSymbolForTest` after
+    // section validation; mirror that here so the in-process test
+    // exercises the same code path as the shell test for the symbol
+    // table check.
+    assertExportsManagerSymbolForTest(manager_label, object_bytes, &diag) catch |err| {
+        std.debug.print(
+            "assertExportsManagerSymbol rejected real {s} manager object: {any} - {s}\n",
+            .{ manager_label, err, diag.text() },
+        );
+        return err;
+    };
+}
+
+test "real Arena manager source compiles and exports a valid section (system zig)" {
+    // Phase 5 verification gap: `scripts/test_arena_manager_compile.sh`
+    // exercises this exact pipeline against the real
+    // `src/memory/arena/manager.zig` source, but the script is not
+    // wired into `zig build test`. This in-process test closes that
+    // gap so any drift between the real Arena source and the driver's
+    // section parser / symbol-table inspector is caught the next time
+    // a contributor runs `zig build test`.
+    //
+    // Arena declares no capabilities (`declared_caps == 0` — see spec
+    // §4.5 on capability-free managers). The expected value below
+    // matches the section's literal `declared_caps` field in
+    // `src/memory/arena/manager.zig`.
+    try verifyRealManagerObject(
+        "real_arena",
+        "src/memory/arena/manager.zig",
+        0,
+    );
+}
+
+test "real ARC manager source compiles and exports a valid section (system zig)" {
+    // Sibling of the Arena test above for the production ARC manager
+    // at `src/memory/arc/manager.zig`. ARC is the default
+    // (`DEFAULT_MANAGER`) so any drift here would break every Zap
+    // binary built without an explicit `memory:` selection.
+    //
+    // ARC declares the `REFCOUNT_V1` capability bit (0x1) in its
+    // `.zapmem` section's `declared_caps` field; the expected value
+    // below pins that contract.
+    try verifyRealManagerObject(
+        "real_arc",
+        "src/memory/arc/manager.zig",
+        abi.REFCOUNT_V1_BIT,
+    );
+}
