@@ -35,10 +35,7 @@ pub const ZMEM_MAGIC_LE: u32 = 0x4D454D5A;
 /// endianness. The spec mandates that managers use `std.mem.readInt(u32,
 /// "REFC", target_endianness)` rather than hand-computed hex literals so
 /// the constant resolves correctly on either byte order.
-pub const REFC_TAG: u32 = switch (builtin.target.cpu.arch.endian()) {
-    .little => 0x4346_4552,
-    .big => 0x5245_4643,
-};
+pub const REFC_TAG: u32 = std.mem.readInt(u32, "REFC", builtin.target.cpu.arch.endian());
 
 /// `REFCOUNT_V1` bit in `declared_caps` (spec section 7.1). Bit 0.
 pub const REFCOUNT_V1_BIT: u64 = 0x0000_0000_0000_0001;
@@ -62,6 +59,33 @@ comptime {
     if (@sizeOf(ZapMemoryManagerMetaV1) != 32) @compileError(
         "abi: ZapMemoryManagerMetaV1 v1.0 must be exactly 32 bytes",
     );
+    if (@offsetOf(ZapMemoryManagerMetaV1, "magic") != 0) @compileError(
+        "abi: ZapMemoryManagerMetaV1.magic must be at offset 0",
+    );
+    if (@offsetOf(ZapMemoryManagerMetaV1, "abi_major") != 4) @compileError(
+        "abi: ZapMemoryManagerMetaV1.abi_major must be at offset 4",
+    );
+    if (@offsetOf(ZapMemoryManagerMetaV1, "abi_minor") != 6) @compileError(
+        "abi: ZapMemoryManagerMetaV1.abi_minor must be at offset 6",
+    );
+    if (@offsetOf(ZapMemoryManagerMetaV1, "size") != 8) @compileError(
+        "abi: ZapMemoryManagerMetaV1.size must be at offset 8",
+    );
+    if (@offsetOf(ZapMemoryManagerMetaV1, "_reserved2") != 10) @compileError(
+        "abi: ZapMemoryManagerMetaV1._reserved2 must be at offset 10",
+    );
+    if (@offsetOf(ZapMemoryManagerMetaV1, "desc_count") != 12) @compileError(
+        "abi: ZapMemoryManagerMetaV1.desc_count must be at offset 12",
+    );
+    if (@offsetOf(ZapMemoryManagerMetaV1, "declared_caps") != 16) @compileError(
+        "abi: ZapMemoryManagerMetaV1.declared_caps must be at offset 16",
+    );
+    if (@offsetOf(ZapMemoryManagerMetaV1, "core_vtable_offset") != 24) @compileError(
+        "abi: ZapMemoryManagerMetaV1.core_vtable_offset must be at offset 24",
+    );
+    if (@offsetOf(ZapMemoryManagerMetaV1, "reserved") != 28) @compileError(
+        "abi: ZapMemoryManagerMetaV1.reserved must be at offset 28",
+    );
 }
 
 /// Options passed to the manager's `init` entry point. Spec section 4.1.
@@ -84,6 +108,12 @@ comptime {
     if (@sizeOf(ZapInitOptions) != 8) @compileError(
         "abi: ZapInitOptions v1.0 must be exactly 8 bytes",
     );
+    if (@offsetOf(ZapInitOptions, "size") != 0) @compileError(
+        "abi: ZapInitOptions.size must be at offset 0",
+    );
+    if (@offsetOf(ZapInitOptions, "reserved") != 4) @compileError(
+        "abi: ZapInitOptions.reserved must be at offset 4",
+    );
 }
 
 /// Capability descriptor record embedded in the manager's `.zapmem`
@@ -99,6 +129,21 @@ pub const ZapCapabilityDescV1 = extern struct {
 comptime {
     if (@sizeOf(ZapCapabilityDescV1) != 24) @compileError(
         "abi: ZapCapabilityDescV1 v1.0 must be exactly 24 bytes",
+    );
+    if (@offsetOf(ZapCapabilityDescV1, "id") != 0) @compileError(
+        "abi: ZapCapabilityDescV1.id must be at offset 0",
+    );
+    if (@offsetOf(ZapCapabilityDescV1, "version") != 4) @compileError(
+        "abi: ZapCapabilityDescV1.version must be at offset 4",
+    );
+    if (@offsetOf(ZapCapabilityDescV1, "size") != 6) @compileError(
+        "abi: ZapCapabilityDescV1.size must be at offset 6",
+    );
+    if (@offsetOf(ZapCapabilityDescV1, "flags") != 8) @compileError(
+        "abi: ZapCapabilityDescV1.flags must be at offset 8",
+    );
+    if (@offsetOf(ZapCapabilityDescV1, "vtable") != 16) @compileError(
+        "abi: ZapCapabilityDescV1.vtable must be at offset 16",
     );
 }
 
@@ -133,6 +178,33 @@ comptime {
     if (@sizeOf(ZapMemoryManagerCoreV1) != 56) @compileError(
         "abi: ZapMemoryManagerCoreV1 v1.0 must be exactly 56 bytes",
     );
+    if (@offsetOf(ZapMemoryManagerCoreV1, "abi_major") != 0) @compileError(
+        "abi: ZapMemoryManagerCoreV1.abi_major must be at offset 0",
+    );
+    if (@offsetOf(ZapMemoryManagerCoreV1, "abi_minor") != 2) @compileError(
+        "abi: ZapMemoryManagerCoreV1.abi_minor must be at offset 2",
+    );
+    if (@offsetOf(ZapMemoryManagerCoreV1, "size") != 4) @compileError(
+        "abi: ZapMemoryManagerCoreV1.size must be at offset 4",
+    );
+    if (@offsetOf(ZapMemoryManagerCoreV1, "declared_caps") != 8) @compileError(
+        "abi: ZapMemoryManagerCoreV1.declared_caps must be at offset 8",
+    );
+    if (@offsetOf(ZapMemoryManagerCoreV1, "init") != 16) @compileError(
+        "abi: ZapMemoryManagerCoreV1.init must be at offset 16",
+    );
+    if (@offsetOf(ZapMemoryManagerCoreV1, "deinit") != 24) @compileError(
+        "abi: ZapMemoryManagerCoreV1.deinit must be at offset 24",
+    );
+    if (@offsetOf(ZapMemoryManagerCoreV1, "allocate") != 32) @compileError(
+        "abi: ZapMemoryManagerCoreV1.allocate must be at offset 32",
+    );
+    if (@offsetOf(ZapMemoryManagerCoreV1, "deallocate") != 40) @compileError(
+        "abi: ZapMemoryManagerCoreV1.deallocate must be at offset 40",
+    );
+    if (@offsetOf(ZapMemoryManagerCoreV1, "get_capability_desc") != 48) @compileError(
+        "abi: ZapMemoryManagerCoreV1.get_capability_desc must be at offset 48",
+    );
 }
 
 /// `REFCOUNT_V1` capability vtable. Spec section 8. Pointed at by a
@@ -150,6 +222,12 @@ pub const ZapRefcountCapabilityV1 = extern struct {
 comptime {
     if (@sizeOf(ZapRefcountCapabilityV1) != 16) @compileError(
         "abi: ZapRefcountCapabilityV1 v1.0 must be exactly 16 bytes",
+    );
+    if (@offsetOf(ZapRefcountCapabilityV1, "retain") != 0) @compileError(
+        "abi: ZapRefcountCapabilityV1.retain must be at offset 0",
+    );
+    if (@offsetOf(ZapRefcountCapabilityV1, "release") != 8) @compileError(
+        "abi: ZapRefcountCapabilityV1.release must be at offset 8",
     );
 }
 
