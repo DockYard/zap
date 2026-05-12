@@ -865,6 +865,124 @@ pub const builtin_arc_core: AbiV1.ZapMemoryManagerCoreV1 = .{
 };
 
 // ----------------------------------------------------------------
+// External-manager bootstrap (Phase 3, spec section 10.2).
+//
+// When the Zap-side memory driver compiles and links a non-default
+// manager `.o` (anything other than `Zap.Memory.ARC`), that object's
+// `.zapmem` section ships in the binary as a single composite
+// `ZapMemorySection` symbol exported under the conventional name
+// `zap_memory_section`. The runtime detects the symbol via a weakly-
+// linked extern reference: when the symbol resolves, its `core` field
+// becomes the active manager's core vtable; when it does not resolve,
+// the weak pointer is null and the runtime falls through to the built-
+// in ARC stub.
+//
+// We model only the leading prefix of the section here — the meta
+// header followed by the core vtable — because the runtime never
+// touches the trailing descriptor array; the build-time driver in
+// `src/memory/driver.zig` validates the descriptor table before the
+// link step, so the runtime treats `core` as the authoritative
+// entrypoint.
+//
+// Weak linkage is critical: a default-ARC build links no external
+// manager and the symbol is genuinely absent. A strong extern would
+// produce an unresolved-symbol link error. Weak references resolve to
+// null when the symbol is missing — exactly the discrimination the
+// bootstrap needs.
+//
+// The Phase 3 bootstrap path is deliberately minimal: detect, validate,
+// re-point. Phase 4 will use the rebinding as the pivot for ripping
+// out the built-in stub entirely once `Zap.Memory.ARC` is its own
+// linkable manager package.
+// ----------------------------------------------------------------
+
+/// Shape of the external manager's `.zapmem` section payload. Mirrors
+/// the composite struct documented in spec section 3.2 and the layout
+/// the no-op manager at `src/memory/no_op/manager.zig` emits.
+const ExternalMemorySectionPrefix = extern struct {
+    meta: extern struct {
+        magic: u32,
+        abi_major: u16,
+        abi_minor: u16,
+        size: u16,
+        _reserved2: u16,
+        desc_count: u32,
+        declared_caps: u64,
+        core_vtable_offset: u32,
+        reserved: u32,
+    },
+    core: AbiV1.ZapMemoryManagerCoreV1,
+};
+
+/// Weakly-linked external symbol exported by the active memory manager
+/// object file (the build driver compiles and links one when the
+/// manifest selects a non-default manager). The pointer resolves to
+/// null in default-ARC builds where no manager `.o` is linked.
+///
+/// Declared via `@extern` with `.linkage = .weak` so the linker accepts
+/// "symbol not found" as a valid resolution that yields null.
+///
+/// In test builds (`zig build test`) the runtime module is compiled
+/// without linking against the libzap_compiler.a-driven binary
+/// pipeline, so the weak symbol's "missing → null" semantics aren't
+/// available — the link step would still reject the undefined ref.
+/// The `is_test` gate substitutes a literal `null` so test builds
+/// uniformly take the built-in ARC path. The compiler-driven binary
+/// pipeline retains the real weak extern.
+fn externalMemorySection() ?*const ExternalMemorySectionPrefix {
+    if (builtin.is_test) return null;
+    return @extern(
+        ?*const ExternalMemorySectionPrefix,
+        .{ .name = "zap_memory_section", .linkage = .weak },
+    );
+}
+
+/// Re-point `zap_active_manager_core` at the externally-linked manager
+/// if one is present. Called once at the top of `zapMemoryStartup`
+/// before any vtable function fires.
+///
+/// Validates the section header just enough to refuse to dispatch
+/// against an obviously-corrupt manager — magic, ABI major, and core
+/// size. The build-time driver already performed the full validation
+/// matrix per spec section 3.5; this is a defensive double-check that
+/// catches link-time mis-splicing (wrong file linked, accidental data
+/// corruption, etc.).
+fn maybeBindExternalManager() void {
+    const section = externalMemorySection() orelse return;
+
+    // The Phase 1 spike's `section_parser` writes the magic value at
+    // section offset 0; reuse the same comparison here. Mismatches in
+    // a binary that DID resolve the weak symbol indicate either a
+    // build-driver bug or a deliberate corruption — neither path is
+    // recoverable from at runtime.
+    if (section.meta.magic != ZMEM_MAGIC_NATIVE) {
+        @panic("zap runtime: external memory manager section has invalid magic");
+    }
+    if (section.meta.abi_major != 1) {
+        @panic("zap runtime: external memory manager declares unsupported ABI major");
+    }
+    if (section.core.abi_major != 1) {
+        @panic("zap runtime: external memory manager core declares unsupported ABI major");
+    }
+    if (section.core.size < @sizeOf(AbiV1.ZapMemoryManagerCoreV1)) {
+        @panic("zap runtime: external memory manager core vtable is smaller than v1.0");
+    }
+
+    // Re-point the active core vtable. The runtime's previous
+    // initialiser pointed it at `&builtin_arc_core`; from here on every
+    // dispatch routes through the external manager's vtable.
+    zap_active_manager_core = &section.core;
+}
+
+/// FourCC `ZMEM` in the target's native byte order. Identical to the
+/// constant the manager emits so the comparison is endianness-correct
+/// without endian-conversion overhead at every check.
+const ZMEM_MAGIC_NATIVE: u32 = switch (builtin.target.cpu.arch.endian()) {
+    .little => 0x4D454D5A,
+    .big => 0x5A4D454D,
+};
+
+// ----------------------------------------------------------------
 // Startup / shutdown hooks.
 //
 // The Zap compiler does not yet emit a call to `zapMemoryStartup`
@@ -883,6 +1001,14 @@ pub const builtin_arc_core: AbiV1.ZapMemoryManagerCoreV1 = .{
 
 fn zapMemoryStartup() void {
     if (zap_memory_started) return;
+
+    // Phase 3 (spec section 10.2): if the build linked an external
+    // memory manager `.o`, its `zap_memory_section` symbol resolves
+    // through the weak `external_memory_section_ptr` and we re-point
+    // `zap_active_manager_core` at the linked-in vtable BEFORE running
+    // init. When no external manager is linked, the weak symbol is
+    // null and the runtime stays bound to `builtin_arc_core`.
+    maybeBindExternalManager();
 
     const core = zap_active_manager_core orelse {
         @panic("zap runtime: no active memory manager bound at startup");

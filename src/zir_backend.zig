@@ -66,6 +66,8 @@ extern "c" fn zir_compilation_invalidate_file(ctx: *ZirContext, name: [*:0]const
 
 extern "c" fn zir_compilation_add_link_lib(ctx: *ZirContext, name: [*:0]const u8) i32;
 
+extern "c" fn zir_compilation_add_link_object_file(ctx: *ZirContext, path: [*:0]const u8) i32;
+
 // ---------------------------------------------------------------------------
 // High-level API
 // ---------------------------------------------------------------------------
@@ -123,6 +125,13 @@ pub const CompileOptions = struct {
     /// matching `share_value`/`ret` pair, suppressing the function's
     /// scope-exit release on the returned local.
     arc_ownership: ?*const @import("arc_liveness.zig").ProgramArcOwnership = null,
+    /// Path to an additional object file the Memory Manager ABI v1.0
+    /// build pipeline produces (see `docs/memory-manager-abi.md` section
+    /// 10). Spliced into the link line via
+    /// `zir_compilation_add_link_object_file` so the manager's `.zapmem`
+    /// section survives static linking. Null for the built-in default
+    /// (`Zap.Memory.ARC`), which uses the runtime's static stub.
+    memory_manager_object: ?[]const u8 = null,
 };
 
 /// Create a ZirContext compilation context from the given options.
@@ -171,6 +180,16 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
         }
     }
 
+    // Splice the memory-manager object file into the link inputs if the
+    // build pipeline produced one. See `docs/memory-manager-abi.md` and
+    // `src/memory/driver.zig` for the contract.
+    if (options.memory_manager_object) |obj_path| {
+        addLinkObjectFile(ctx, obj_path, allocator) catch |err| {
+            zir_compilation_destroy(ctx);
+            return err;
+        };
+    }
+
     return ctx;
 }
 
@@ -215,6 +234,20 @@ pub fn addLinkLib(ctx: *ZirContext, name: []const u8, allocator: std.mem.Allocat
     const name_z = allocator.dupeZ(u8, name) catch return error.OutOfMemory;
     defer allocator.free(name_z);
     if (zir_compilation_add_link_lib(ctx, name_z) != 0) {
+        return error.CompilationFailed;
+    }
+}
+
+/// Add a precompiled object file at `path` to the final binary's link
+/// inputs. Used by the Memory Manager ABI v1.0 build pipeline
+/// (`docs/memory-manager-abi.md` section 10) to splice the manager `.o`
+/// compiled by `src/memory/driver.zig` into the binary alongside Zap-
+/// generated code. Must be called after createContext and before
+/// injectAndUpdate.
+pub fn addLinkObjectFile(ctx: *ZirContext, path: []const u8, allocator: std.mem.Allocator) CompileError!void {
+    const path_z = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+    defer allocator.free(path_z);
+    if (zir_compilation_add_link_object_file(ctx, path_z) != 0) {
         return error.CompilationFailed;
     }
 }

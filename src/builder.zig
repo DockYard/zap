@@ -20,6 +20,13 @@ pub const BuildConfig = struct {
     paths: []const []const u8 = &.{},
     deps: []const Dep = &.{},
     build_opts: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Dotted memory-manager name parsed from the manifest's `memory:`
+    /// field. Empty when omitted; the Zap-side memory driver
+    /// (`src/memory/driver.zig`) then applies the default
+    /// `Zap.Memory.ARC`. A non-empty value names a Zap struct that
+    /// declares a `@memory_manager_source` attribute pointing at the
+    /// manager's Zig source.
+    memory_manager: ?[]const u8 = null,
     /// Test timeout in milliseconds (0 = no timeout). Zig 0.16 supports
     /// native unit test timeouts in the build system.
     test_timeout: i64 = 0,
@@ -347,6 +354,8 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                         },
                         else => {},
                     }
+                } else if (std.mem.eql(u8, field.name, "memory")) {
+                    config.memory_manager = try parseStructRefField(alloc, field.value);
                 } else if (std.mem.eql(u8, field.name, "build_opts")) {
                     try loadBuildOpts(alloc, &config.build_opts, field.value);
                 } else if (std.mem.eql(u8, field.name, "source_url")) {
@@ -556,6 +565,52 @@ fn loadBuildOpts(
     }
 }
 
+/// Extract a dotted struct name from a manifest field whose value may be
+/// any of:
+///   * a 3-tuple `{:__aliases__, [], [:Foo, :Bar, :Baz]}` (the canonical
+///     CTFE representation of a struct reference);
+///   * an atom or string carrying the dotted name directly;
+///   * a struct value (the CTFE form a `pub struct` evaluates to once
+///     captured into a variable).
+///
+/// Returns null when the value is `nil` or any unsupported shape — the
+/// caller treats this as "field absent" and falls back to defaults.
+fn parseStructRefField(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !?[]const u8 {
+    return switch (val) {
+        .nil => null,
+        .string => |s| if (s.len > 0) try alloc.dupe(u8, s) else null,
+        .atom => |s| if (s.len > 0) try alloc.dupe(u8, s) else null,
+        .tuple => |elems| blk: {
+            if (elems.len != 3) break :blk null;
+            if (elems[0] != .atom or !std.mem.eql(u8, elems[0].atom, "__aliases__")) break :blk null;
+            if (elems[2] != .list) break :blk null;
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            for (elems[2].list, 0..) |part, idx| {
+                const text = switch (part) {
+                    .atom => |s| s,
+                    .string => |s| s,
+                    else => break :blk null,
+                };
+                if (idx > 0) try buf.append(alloc, '.');
+                try buf.appendSlice(alloc, text);
+            }
+            break :blk try buf.toOwnedSlice(alloc);
+        },
+        .struct_val => |sv| if (sv.type_name.len > 0) blk: {
+            // The CTFE pipeline may surface a `Zap.Memory.NoOp` reference as
+            // a struct value carrying the type name in dotted-underscore form
+            // (e.g., `Zap_Memory_NoOp`). Normalise underscores back to dots
+            // so the downstream driver sees the canonical dotted name.
+            var out = try alloc.alloc(u8, sv.type_name.len);
+            for (sv.type_name, 0..) |c, i| {
+                out[i] = if (c == '_') '.' else c;
+            }
+            break :blk out;
+        } else null,
+        else => null,
+    };
+}
+
 fn constStringField(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) ![]const u8 {
     return switch (val) {
         .string => |s| try alloc.dupe(u8, s),
@@ -626,3 +681,70 @@ test "constValueToBuildConfig parses deps and build opts" {
     try testing.expectEqualStrings("release_fast", config.build_opts.get("optimize").?);
     try testing.expectEqualStrings("true", config.build_opts.get("feature_x").?);
 }
+
+test "constValueToBuildConfig parses memory: struct reference (aliases form)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap_Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "app" } },
+            .{ .name = "version", .value = .{ .string = "0.1.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+            .{ .name = "memory", .value = .{ .tuple = &.{
+                .{ .atom = "__aliases__" },
+                .{ .list = &.{} },
+                .{ .list = &.{
+                    .{ .atom = "Zap" },
+                    .{ .atom = "Memory" },
+                    .{ .atom = "NoOp" },
+                } },
+            } } },
+        },
+    } };
+
+    const config = try constValueToBuildConfig(alloc, val);
+    try testing.expect(config.memory_manager != null);
+    try testing.expectEqualStrings("Zap.Memory.NoOp", config.memory_manager.?);
+}
+
+test "constValueToBuildConfig parses memory: as a struct value with dotted-underscore type_name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap_Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "app" } },
+            .{ .name = "version", .value = .{ .string = "0.1.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+            .{ .name = "memory", .value = .{ .struct_val = .{
+                .type_name = "Zap_Memory_ARC",
+                .fields = &.{},
+            } } },
+        },
+    } };
+
+    const config = try constValueToBuildConfig(alloc, val);
+    try testing.expect(config.memory_manager != null);
+    try testing.expectEqualStrings("Zap.Memory.ARC", config.memory_manager.?);
+}
+
+test "constValueToBuildConfig leaves memory: null when omitted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap_Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "app" } },
+            .{ .name = "version", .value = .{ .string = "0.1.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+        },
+    } };
+
+    const config = try constValueToBuildConfig(alloc, val);
+    try testing.expectEqual(@as(?[]const u8, null), config.memory_manager);
+}
+

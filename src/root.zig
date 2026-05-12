@@ -64,6 +64,7 @@ pub const signature = @import("signature.zig");
 pub const wyhash = @import("wyhash.zig");
 pub const memory_section_parser = @import("memory/section_parser.zig");
 pub const memory_abi = @import("memory/abi.zig");
+pub const memory_driver = @import("memory/driver.zig");
 
 test {
     _ = @import("token.zig");
@@ -116,4 +117,5 @@ test {
     _ = @import("wyhash.zig");
     _ = @import("memory/section_parser.zig");
     _ = @import("memory/abi.zig");
+    _ = @import("memory/driver.zig");
 }

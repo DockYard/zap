@@ -1145,6 +1145,63 @@ fn buildTarget(
         .release_small => 3,
     };
 
+    // ------------------------------------------------------------------
+    // Memory Manager ABI v1.0 — Phase 3 driver invocation.
+    //
+    // Translates the manifest's `memory:` field (e.g.,
+    // `Zap.Memory.NoOp`) into a compiled manager object file plus a
+    // validated capability bitmask. The default `Zap.Memory.ARC` short-
+    // circuits — no external compile is performed and the runtime's
+    // built-in stub continues to provide the active vtable, so existing
+    // projects build unchanged.
+    //
+    // The driver writes its object into `.zap-cache/memory/`; downstream
+    // the path is threaded into `zir_backend.CompileOptions
+    // .memory_manager_object`, where the fork primitive
+    // `zir_compilation_add_link_object_file` splices it into the final
+    // binary's link inputs.
+    //
+    // The `fork_compile_fn` is left null so the driver uses the linked-
+    // in default (`libzap_compiler.a`'s `zap_fork_compile_zig_to_object`).
+    // ------------------------------------------------------------------
+
+    const memory_cache_dir = ".zap-cache/memory";
+
+    // Map the manifest optimize to the fork primitive's enum. v1.0 of the
+    // Memory Manager ABI does not yet thread optimize through HIR/codegen,
+    // so we match Zap's selection so debug/safe/fast produce a manager
+    // built with the same optimization level as the rest of the binary.
+    const driver_optimize: zap.memory_driver.ZapForkOptimize = switch (config.optimize) {
+        .debug => .Debug,
+        .release_safe => .ReleaseSafe,
+        .release_fast => .ReleaseFast,
+        .release_small => .ReleaseSmall,
+    };
+
+    var driver_diag_buf: [4096]u8 = undefined;
+    var driver_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &driver_diag_buf };
+
+    var resolved_manager = zap.memory_driver.resolve(
+        alloc,
+        .{
+            .manager_name = config.memory_manager orelse "",
+            .source_roots = sourceRootsForMemoryDriver(alloc, source_roots.items) catch return error.OutOfMemory,
+            .project_root = project_root,
+            .zap_source_root = zap_lib_dir orelse project_root,
+            .cache_dir = memory_cache_dir,
+            .zig_lib_dir = zig_lib_dir,
+            .optimize = driver_optimize,
+        },
+        &driver_diag,
+    ) catch |err| {
+        std.debug.print("Error: memory manager resolution failed: {s}\n", .{@errorName(err)});
+        if (driver_diag.text().len > 0) {
+            std.debug.print("  {s}\n", .{driver_diag.text()});
+        }
+        std.process.exit(1);
+    };
+    defer zap.memory_driver.freeResolved(alloc, &resolved_manager);
+
     // Compile through ZIR backend (zig_lib_dir already resolved above)
     const output_mode_val: u8 = switch (config.kind) {
         .bin => 0,
@@ -1163,6 +1220,7 @@ fn buildTarget(
         .target = compile_target,
         .analysis_context = if (result.analysis_context) |*ctx| ctx else null,
         .arc_ownership = if (result.arc_ownership) |*ownership| ownership else null,
+        .memory_manager_object = if (resolved_manager.is_builtin_default) null else resolved_manager.object_path,
         // Zig 0.16 error formatting options from manifest
         .error_style = config.error_style,
         .multiline_errors = config.multiline_errors,
@@ -1214,6 +1272,23 @@ fn compileProjectFrontend(
     }
 
     return try compiler.compileStructByStruct(alloc, &ctx, names.items, options);
+}
+
+/// Translate the per-build accumulated `zap.discovery.SourceRoot` slice
+/// into the `zap.memory_driver.SourceRoot` shape used by the Memory
+/// Manager ABI driver. The driver lives one module-level deeper than
+/// `discovery.zig` to keep dependency direction clean, so it can't
+/// import discovery's struct directly — this helper performs the
+/// purely-syntactic field-by-field copy.
+fn sourceRootsForMemoryDriver(
+    alloc: std.mem.Allocator,
+    discovery_roots: []const zap.discovery.SourceRoot,
+) ![]const zap.memory_driver.SourceRoot {
+    const out = try alloc.alloc(zap.memory_driver.SourceRoot, discovery_roots.len);
+    for (discovery_roots, 0..) |root, i| {
+        out[i] = .{ .name = root.name, .path = root.path };
+    }
+    return out;
 }
 
 /// Compute a build cache key using SHA-256 (Zig 0.16 std.crypto) for
