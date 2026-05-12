@@ -6,18 +6,16 @@
 
   ## `memory:` field
 
-  Selects the memory manager for the binary. The value is a struct
-  reference (e.g. `Zap.Memory.ARC`, `Zap.Memory.Arena`,
-  `Zap.Memory.NoOp`, or any third-party manager struct that carries a
-  `@memory_manager_source` attribute).
+  Selects the memory manager for the binary. The value is a string
+  holding the fully-qualified manager struct name (e.g.
+  `"Zap.Memory.ARC"`, `"Zap.Memory.Arena"`, `"Zap.Memory.NoOp"`, or any
+  third-party manager struct that carries a `@memory_manager_source`
+  attribute). String syntax is required because Zap's CTFE does not
+  currently support struct-type references as values.
 
-  When omitted, the manifest defaults to `Zap.Memory.ARC`. The Zap-side
-  driver short-circuits the built-in ARC default — no external manager
-  `.o` is compiled — so existing projects continue to work without any
-  manifest change.
-
-  See `docs/memory-manager-abi.md` for the Memory Manager ABI v1.0
-  contract every manager must conform to.
+  When omitted (or set to `""`), the manifest defaults to
+  `Zap.Memory.ARC`. See `docs/memory-manager-abi.md` for the Memory
+  Manager ABI v1.0 contract every manager must conform to.
   """
 
 pub struct Zap.Manifest {
@@ -29,7 +27,7 @@ pub struct Zap.Manifest {
   optimize :: Atom = :release_safe
   paths :: [String] = []
   deps :: [Zap.Dep] = []
-  memory :: Zap.Memory.ARC = Zap.Memory.ARC
+  memory :: String = ""
   build_opts :: [{String, String}] = []
   test_timeout :: i64 = 0
   error_style :: String = ""
