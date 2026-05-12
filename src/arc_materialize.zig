@@ -71,6 +71,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const escape_lattice = @import("escape_lattice.zig");
+const elision = @import("memory/elision.zig");
 
 /// Allocator for fresh `LocalId`s materialized into a function during
 /// the ARC-record lowering pass. Mirrors `Lean 4`'s `mkFresh`, Roc's
@@ -141,11 +142,21 @@ pub const LocalAllocator = struct {
 /// whose path can't be resolved (other function, non-existent
 /// block, out-of-bounds path step, deferred kind) remain in
 /// the analysis context.
+///
+/// `declared_caps` carries the active manager's `.zapmem` capability
+/// bitmask. When the manager does not declare `REFCOUNT_V1` (Phase 6
+/// elision), no `.retain` / `.release` / `.reset` IR is materialized
+/// and the reuse-token rewrite is skipped — `Map(K,V)` / `List(T)` /
+/// `Arc(T)` cells in that mode have no refcount, so Perceus-style
+/// reuse and retain/release sequencing has no semantic meaning.
 pub fn materializeAnalysisArcOps(
     allocator: std.mem.Allocator,
     function: *ir.Function,
     analysis_context: *escape_lattice.AnalysisContext,
+    declared_caps: u64,
 ) !void {
+    const emit_refcount_ops = elision.shouldEmitRefcountOps(declared_caps);
+
     // Replace the synthetic-LocalId placeholder perceus emits for
     // reset tokens (`10000 + match_site_id`) with real LocalIds
     // allocated against the function's slot space. After this
@@ -153,7 +164,13 @@ pub fn materializeAnalysisArcOps(
     // downstream consumer (the `.reset` IR materialization below,
     // the construction-instruction rewrite, the ZIR backend's
     // `refForLocal`) sees real, dense IDs.
-    try rewriteReuseTokensToRealLocals(allocator, function, analysis_context);
+    //
+    // Skip under Phase 6 elision: with no REFCOUNT_V1, `.reset` IR
+    // is not materialized, so reuse_pairs' tokens go un-consumed and
+    // the construction-instruction rewrite below is a no-op.
+    if (emit_refcount_ops) {
+        try rewriteReuseTokensToRealLocals(allocator, function, analysis_context);
+    }
 
     // Rewrite each reuse_pair's construction instruction
     // (tuple_init / struct_init / union_init) to carry the
@@ -161,7 +178,9 @@ pub fn materializeAnalysisArcOps(
     // struct_init / union_init handlers dispatch on this field,
     // routing through `emitReuseAllocCall` when set — the single
     // canonical `reuseAllocByType` emission site.
-    try rewriteReuseConstructions(allocator, function, analysis_context);
+    if (emit_refcount_ops) {
+        try rewriteReuseConstructions(allocator, function, analysis_context);
+    }
 
     var pending = PendingTree.init(allocator);
     defer pending.deinit();
@@ -179,66 +198,74 @@ pub fn materializeAnalysisArcOps(
     // promote any origin whose insertion site was actually applied
     // into the consumed set. Records that failed or were deferred
     // stay out of the consumed set and land in the remainder.
-    for (analysis_context.arc_ops.items, 0..) |op, src_idx| {
-        if (op.insertion_point.function != function.id) continue;
-        const new_instr: ir.Instruction = switch (op.kind) {
-            .retain => .{ .retain = .{ .value = op.value } },
-            .release => .{ .release = .{ .value = op.value } },
-            // `.reset` materializes to an IR `.reset { dest, source }`
-            // where `dest` is the token LocalId allocated by
-            // `rewriteReuseTokensToRealLocals` (looked up via
-            // `analysis_context.reuse_pairs` keyed on this arc_op's
-            // source local).
-            .reset => blk: {
-                const token_dest = findResetTokenForSource(analysis_context, function.id, op.value) orelse continue;
-                break :blk ir.Instruction{ .reset = .{ .dest = token_dest, .source = op.value } };
-            },
-            // `.reuse_alloc` is consumed by `rewriteReuseConstructions`
-            // (per-construction-instruction mutation, not insertion).
-            // Skip it here.
-            .reuse_alloc => continue,
-            // Dataflow-only kinds stay in the analysis context — they're
-            // markers, not IR-emitting.
-            .move_transfer, .share => continue,
-        };
-        try pending.add(.{
-            .block = op.insertion_point.block,
-            .path = op.insertion_point.path,
-            .instr_index = op.insertion_point.instr_index,
-            .position = if (op.insertion_point.position == .before) .before else .after,
-            .new_instr = new_instr,
-            .origin = .{ .kind = .arc_op, .src_index = src_idx },
-        });
-    }
-
-    for (analysis_context.drop_specializations.items, 0..) |spec, src_idx| {
-        if (spec.function != function.id) continue;
-        // A specialization materializes only if every field_drop
-        // has an explicit `local`. Partial materialization would
-        // split the spec across two backends, which the IR-source-
-        // of-truth invariant forbids.
-        var all_materializable = true;
-        for (spec.field_drops) |fd| {
-            if (fd.local == null) {
-                all_materializable = false;
-                break;
-            }
-        }
-        if (!all_materializable) continue;
-        for (spec.field_drops) |fd| {
-            const target_local = fd.local.?;
-            const release_kind: ir.ReleaseKind = switch (fd.kind) {
-                .deep => .release,
-                .shallow => .free,
+    //
+    // Phase 6 elision: under a non-REFCOUNT_V1 manager, no retain/
+    // release/reset IR is materialized — the analysis-context
+    // records still flow through (so other passes that inspect
+    // them keep working) but nothing lands in the IR stream and
+    // the ZIR backend emits zero refcount ops.
+    if (emit_refcount_ops) {
+        for (analysis_context.arc_ops.items, 0..) |op, src_idx| {
+            if (op.insertion_point.function != function.id) continue;
+            const new_instr: ir.Instruction = switch (op.kind) {
+                .retain => .{ .retain = .{ .value = op.value } },
+                .release => .{ .release = .{ .value = op.value } },
+                // `.reset` materializes to an IR `.reset { dest, source }`
+                // where `dest` is the token LocalId allocated by
+                // `rewriteReuseTokensToRealLocals` (looked up via
+                // `analysis_context.reuse_pairs` keyed on this arc_op's
+                // source local).
+                .reset => blk: {
+                    const token_dest = findResetTokenForSource(analysis_context, function.id, op.value) orelse continue;
+                    break :blk ir.Instruction{ .reset = .{ .dest = token_dest, .source = op.value } };
+                },
+                // `.reuse_alloc` is consumed by `rewriteReuseConstructions`
+                // (per-construction-instruction mutation, not insertion).
+                // Skip it here.
+                .reuse_alloc => continue,
+                // Dataflow-only kinds stay in the analysis context — they're
+                // markers, not IR-emitting.
+                .move_transfer, .share => continue,
             };
             try pending.add(.{
-                .block = spec.insertion_point.block,
-                .path = spec.insertion_point.path,
-                .instr_index = spec.insertion_point.instr_index,
-                .position = if (spec.insertion_point.position == .before) .before else .after,
-                .new_instr = .{ .release = .{ .value = target_local, .kind = release_kind } },
-                .origin = .{ .kind = .drop_spec, .src_index = src_idx },
+                .block = op.insertion_point.block,
+                .path = op.insertion_point.path,
+                .instr_index = op.insertion_point.instr_index,
+                .position = if (op.insertion_point.position == .before) .before else .after,
+                .new_instr = new_instr,
+                .origin = .{ .kind = .arc_op, .src_index = src_idx },
             });
+        }
+
+        for (analysis_context.drop_specializations.items, 0..) |spec, src_idx| {
+            if (spec.function != function.id) continue;
+            // A specialization materializes only if every field_drop
+            // has an explicit `local`. Partial materialization would
+            // split the spec across two backends, which the IR-source-
+            // of-truth invariant forbids.
+            var all_materializable = true;
+            for (spec.field_drops) |fd| {
+                if (fd.local == null) {
+                    all_materializable = false;
+                    break;
+                }
+            }
+            if (!all_materializable) continue;
+            for (spec.field_drops) |fd| {
+                const target_local = fd.local.?;
+                const release_kind: ir.ReleaseKind = switch (fd.kind) {
+                    .deep => .release,
+                    .shallow => .free,
+                };
+                try pending.add(.{
+                    .block = spec.insertion_point.block,
+                    .path = spec.insertion_point.path,
+                    .instr_index = spec.insertion_point.instr_index,
+                    .position = if (spec.insertion_point.position == .before) .before else .after,
+                    .new_instr = .{ .release = .{ .value = target_local, .kind = release_kind } },
+                    .origin = .{ .kind = .drop_spec, .src_index = src_idx },
+                });
+            }
         }
     }
 

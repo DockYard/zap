@@ -112,6 +112,15 @@ pub const CompileOptions = struct {
     /// structs within the same dependency level are compiled concurrently
     /// using Io.Group.
     io: ?std.Io = null,
+    /// Memory Manager ABI v1.0 capability bitmask declared by the
+    /// active manager (`docs/memory-manager-abi.md` section 7). Read
+    /// by `arc_materialize.materializeAnalysisArcOps` so Phase 6
+    /// codegen elision can skip retain/release/reset/reuse-alloc IR
+    /// materialization under managers that do not declare
+    /// `REFCOUNT_V1`. Defaults to 0 (no caps); the build pipeline
+    /// (`src/main.zig:compileProjectFrontend`) wires the real value
+    /// from the resolved manager's `.zapmem` core vtable.
+    declared_caps: u64 = 0,
 };
 
 fn ctfeCompileOptionsHash(options: CompileOptions) u64 {
@@ -649,7 +658,7 @@ pub fn compileForCtfe(
     // `.retain { kind }` / `.release { kind }` IR instructions so
     // the whole-program codegen path consumes the same canonical
     // IR shape as `compileStructByStruct`'s merged path.
-    try materializeAnalysisArcOps(alloc, &ir_program, &analysis_result.context, type_checker.store);
+    try materializeAnalysisArcOps(alloc, &ir_program, &analysis_result.context, type_checker.store, options.declared_caps);
 
     // Second type-check pass — borrow / move diagnostics live behind
     // the analysis context, so they only fire on this re-check.
@@ -2103,7 +2112,7 @@ pub fn compileStructByStruct(
         // inserted directly into the function body. Records that
         // can't be resolved against the merged IR remain in the
         // analysis context for the V10 audit to surface.
-        materializeAnalysisArcOps(alloc, &merged_ir, &analysis_result.context, shared_store) catch {
+        materializeAnalysisArcOps(alloc, &merged_ir, &analysis_result.context, shared_store, options.declared_caps) catch {
             merged_ownership.deinit();
             return error.IrFailed;
         };
@@ -2393,10 +2402,11 @@ fn materializeAnalysisArcOps(
     program: *ir.Program,
     analysis_context: *zap.escape_lattice.AnalysisContext,
     type_store: *const zap.types.TypeStore,
+    declared_caps: u64,
 ) CompileError!void {
     for (program.functions, 0..) |_, fi| {
         const function: *ir.Function = @constCast(&program.functions[fi]);
-        zap.arc_materialize.materializeAnalysisArcOps(alloc, function, analysis_context) catch return error.IrFailed;
+        zap.arc_materialize.materializeAnalysisArcOps(alloc, function, analysis_context, declared_caps) catch return error.IrFailed;
     }
     try runArcVerifier(alloc, program, type_store);
 }
@@ -3131,52 +3141,113 @@ pub fn validateOneStructPerFile(
     return null;
 }
 
-/// Get the embedded runtime source, with the Phase A Map workload
-/// instrumentation flag flipped on when the host compiler was built
-/// with `-Dinstrument-map=true`. The runtime source contains a single
-/// `INSTRUMENT_MAP_DEFAULT` constant that drives the comptime
-/// `instrument_map` flag — when this compiler was built with
-/// instrumentation enabled, every Zap user binary it produces should
-/// inherit the same flag, which we achieve via a one-line textual
-/// rewrite at registration time. The host test suite uses a separate
-/// `build_options` import path inside `runtime.zig` (see the comment
-/// on `instrument_map` there) so this rewrite is unrelated to the
-/// host-side flag plumbing.
+/// Get the embedded runtime source, applying the toolchain's
+/// compile-time rewrites that should affect every Zap user binary it
+/// produces. Two independent rewrites layer here, in order:
+///
+///   1. The Phase A Map workload instrumentation flag
+///      (`INSTRUMENT_MAP_DEFAULT`). Flipped on when the host compiler
+///      was built with `-Dinstrument-map=true`.
+///   2. The Phase 6 active-manager capability bitmask
+///      (`RUNTIME_DECLARED_CAPS_DEFAULT`). Rewritten with the resolved
+///      manager's `declared_caps` so the user binary's runtime sees
+///      `runtime.refcount_v1_active` resolve correctly without
+///      pulling in `@import("root")` (the user binary's root has no
+///      such override).
+///
+/// The host test suite uses separate `@import("root")` overrides
+/// inside `runtime.zig` for both flags (see `src/root.zig`), so
+/// neither rewrite affects the host's own build.
 ///
 /// The returned slice is either a borrowed view of the embedded source
-/// (when the flag is off) or a freshly-allocated owned buffer (when
-/// the flag is on). Callers that hold onto the slice past the
+/// (no rewrites required) or a freshly-allocated owned buffer (one or
+/// both rewrites applied). Callers that hold onto the slice past the
 /// allocator's lifetime must duplicate.
-pub fn getRuntimeSource() []const u8 {
-    if (!@import("build_options").instrument_map) {
-        return runtime_source;
-    }
-    return rewriteRuntimeForInstrumentation();
+///
+/// `declared_caps` is the active manager's capability bitmask.
+/// Defaults to `0` would leave the source unchanged at the caps
+/// marker; rather than relying on that, the rewrite always runs so
+/// the user-binary's runtime reflects the exact resolved value.
+pub fn getRuntimeSource(declared_caps: u64) []const u8 {
+    const instrumented = @import("build_options").instrument_map;
+    return rewriteRuntimeSource(.{ .instrumented = instrumented, .declared_caps = declared_caps });
 }
 
-/// Lazily-built rewritten runtime source. Built once per process and
-/// cached so repeated invocations of `getRuntimeSource()` (the builder
-/// and full-build paths each call it) return a stable pointer.
-var rewritten_runtime_source: ?[]const u8 = null;
+const RuntimeRewrite = struct {
+    instrumented: bool,
+    declared_caps: u64,
+};
 
-fn rewriteRuntimeForInstrumentation() []const u8 {
-    if (rewritten_runtime_source) |cached| return cached;
-    const needle = "const INSTRUMENT_MAP_DEFAULT: bool = false;";
-    const replacement = "const INSTRUMENT_MAP_DEFAULT: bool = true;";
-    const idx = std.mem.indexOf(u8, runtime_source, needle) orelse {
-        // Embedded runtime is missing the marker — fail loud rather
-        // than silently shipping an un-instrumented user binary when
-        // the toolchain promised instrumentation.
-        @panic("runtime.zig is missing the INSTRUMENT_MAP_DEFAULT marker; instrumentation rewrite cannot proceed");
+/// Lazily-built rewritten runtime source. Keyed by the rewrite
+/// parameters so repeated invocations with the same shape (the
+/// builder and full-build phases both call it during a single
+/// compile) return the same stable pointer.
+var rewritten_runtime_cache: std.AutoHashMapUnmanaged(u128, []const u8) = .empty;
+
+fn rewriteCacheKey(req: RuntimeRewrite) u128 {
+    var key: u128 = req.declared_caps;
+    if (req.instrumented) key |= (@as(u128, 1) << 64);
+    return key;
+}
+
+fn rewriteRuntimeSource(req: RuntimeRewrite) []const u8 {
+    const key = rewriteCacheKey(req);
+    if (rewritten_runtime_cache.get(key)) |cached| return cached;
+
+    // Stage 1: instrumentation marker rewrite (cheap string-substitute).
+    var staged: []const u8 = runtime_source;
+    var staged_owned = false;
+    if (req.instrumented) {
+        const needle = "const INSTRUMENT_MAP_DEFAULT: bool = false;";
+        const replacement = "const INSTRUMENT_MAP_DEFAULT: bool = true;";
+        const idx = std.mem.indexOf(u8, staged, needle) orelse {
+            @panic("runtime.zig is missing the INSTRUMENT_MAP_DEFAULT marker; instrumentation rewrite cannot proceed");
+        };
+        const total_len = staged.len - needle.len + replacement.len;
+        var buf = std.heap.page_allocator.alloc(u8, total_len) catch
+            @panic("out of memory rewriting runtime source for instrumentation");
+        @memcpy(buf[0..idx], staged[0..idx]);
+        @memcpy(buf[idx .. idx + replacement.len], replacement);
+        @memcpy(buf[idx + replacement.len ..], staged[idx + needle.len ..]);
+        staged = buf;
+        staged_owned = true;
+    }
+
+    // Stage 2: declared_caps marker rewrite. The source-level default
+    // is `REFCOUNT_V1_BIT` (`0x0000_0000_0000_0001`) so the host test
+    // suite — which loads `runtime.zig` as a Zig module without going
+    // through this rewrite — observes an ARC-shaped runtime. We
+    // always rewrite for user binaries so the embedded runtime
+    // matches the manager the build actually resolved. Even ARC
+    // builds go through the rewrite (re-encoding the same value) to
+    // keep the rewrite path self-validating.
+    const caps_needle = "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x0000_0000_0000_0001;";
+    var caps_replacement_buf: [128]u8 = undefined;
+    const caps_replacement = std.fmt.bufPrint(
+        &caps_replacement_buf,
+        "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x{x};",
+        .{req.declared_caps},
+    ) catch @panic("runtime caps rewrite: formatted replacement overflows fixed buffer");
+    const caps_idx = std.mem.indexOf(u8, staged, caps_needle) orelse {
+        @panic("runtime.zig is missing the RUNTIME_DECLARED_CAPS_DEFAULT marker; Phase 6 caps rewrite cannot proceed");
     };
-    const total_len = runtime_source.len - needle.len + replacement.len;
-    var buf = std.heap.page_allocator.alloc(u8, total_len) catch
-        @panic("out of memory rewriting runtime source for instrumentation");
-    @memcpy(buf[0..idx], runtime_source[0..idx]);
-    @memcpy(buf[idx .. idx + replacement.len], replacement);
-    @memcpy(buf[idx + replacement.len ..], runtime_source[idx + needle.len ..]);
-    rewritten_runtime_source = buf;
-    return buf;
+    const caps_total_len = staged.len - caps_needle.len + caps_replacement.len;
+    var caps_buf = std.heap.page_allocator.alloc(u8, caps_total_len) catch
+        @panic("out of memory rewriting runtime source for declared_caps");
+    @memcpy(caps_buf[0..caps_idx], staged[0..caps_idx]);
+    @memcpy(caps_buf[caps_idx .. caps_idx + caps_replacement.len], caps_replacement);
+    @memcpy(caps_buf[caps_idx + caps_replacement.len ..], staged[caps_idx + caps_needle.len ..]);
+
+    // Stage-1's buffer is no longer needed once stage-2 produces its
+    // own owned copy. Free it back to the page allocator so we don't
+    // leak per (instrumented, caps) shape pair.
+    if (staged_owned) {
+        std.heap.page_allocator.free(@constCast(staged));
+    }
+
+    rewritten_runtime_cache.put(std.heap.page_allocator, key, caps_buf) catch
+        @panic("out of memory caching rewritten runtime source");
+    return caps_buf;
 }
 
 // ============================================================
@@ -5014,4 +5085,45 @@ test "staged macro provider rejects direct underscore-prefixed call before compi
             .struct_order = &struct_order,
         }),
     );
+}
+
+test "Phase 6: getRuntimeSource rewrites RUNTIME_DECLARED_CAPS_DEFAULT for REFCOUNT_V1" {
+    // User binaries built against a REFCOUNT_V1 manager (Zap.Memory.ARC)
+    // see the same `runtime.refcount_v1_active = true` shape the host
+    // tests see — the rewrite path is exercised even when the source-
+    // level default already encodes the right value, so a drift in
+    // the default value cannot mask a rewrite-path bug.
+    const arc_caps: u64 = 0x0000_0000_0000_0001;
+    const src = getRuntimeSource(arc_caps);
+    // The rewritten source must contain the resolved caps literal.
+    const expected = "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x1;";
+    try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
+    // And must NOT still carry the source-level default (the original
+    // literal would short-circuit the runtime's comptime caps query
+    // and the rewrite would be silently no-op).
+    const original = "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x0000_0000_0000_0001;";
+    try std.testing.expect(std.mem.indexOf(u8, src, original) == null);
+}
+
+test "Phase 6: getRuntimeSource rewrites RUNTIME_DECLARED_CAPS_DEFAULT to 0 under Arena/NoOp" {
+    // Arena and NoOp managers declare zero capabilities. The rewrite
+    // must produce a runtime source whose embedded
+    // `RUNTIME_DECLARED_CAPS_DEFAULT == 0`, so the user-binary
+    // runtime's comptime `refcount_v1_active` resolves to `false` and
+    // the inline `ArcHeader` field collapses to `@sizeOf == 0`.
+    const arena_caps: u64 = 0;
+    const src = getRuntimeSource(arena_caps);
+    const expected = "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x0;";
+    try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
+}
+
+test "Phase 6: getRuntimeSource rewrite encodes arbitrary caps bitmasks" {
+    // A hypothetical multi-capability manager would declare a
+    // bitmask with more than one bit set. The rewrite path is
+    // pure string substitution — it must reproduce whatever
+    // `declared_caps` the caller passes, verbatim as a hex literal.
+    const multi_caps: u64 = 0xDEADBEEFCAFEBABE;
+    const src = getRuntimeSource(multi_caps);
+    const expected = "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0xdeadbeefcafebabe;";
+    try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
 }

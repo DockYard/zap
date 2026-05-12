@@ -1064,6 +1064,71 @@ fn buildTarget(
     // Determine lib_mode from manifest kind
     const lib_mode = config.kind == .lib;
 
+    // ------------------------------------------------------------------
+    // Memory Manager ABI v1.0 — Phase 6 needs `declared_caps` BEFORE the
+    // front-end so codegen elision can drop retain/release IR
+    // materialization under managers that don't declare REFCOUNT_V1.
+    // The resolution is therefore hoisted above the front-end compile;
+    // the resolved object path is still consumed later when the ZIR
+    // backend assembles the link line.
+    // ------------------------------------------------------------------
+
+    const memory_cache_dir = ".zap-cache/memory";
+
+    // Map the manifest optimize to the fork primitive's enum. v1.0 of the
+    // Memory Manager ABI does not yet thread optimize through HIR/codegen,
+    // so we match Zap's selection so debug/safe/fast produce a manager
+    // built with the same optimization level as the rest of the binary.
+    const driver_optimize: zap.memory_driver.ZapForkOptimize = switch (config.optimize) {
+        .debug => .Debug,
+        .release_safe => .ReleaseSafe,
+        .release_fast => .ReleaseFast,
+        .release_small => .ReleaseSmall,
+    };
+
+    var driver_diag_buf: [4096]u8 = undefined;
+    var driver_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &driver_diag_buf };
+
+    // First-party `@memory_manager_source` paths are relative to the
+    // Zap source tree root (e.g., `src/memory/arc/manager.zig`).
+    // `detectZapLibDir` returns the path to the stdlib `lib/`
+    // subdirectory (which contains `kernel.zap`); the source tree root
+    // is the parent of that directory. When running from a checked-out
+    // Zap repository the parent contains `src/memory/arc/manager.zig`;
+    // when running from an installed `zig-out/`, the parent contains
+    // the bundled `src/memory/...` tree shipped alongside `lib/`.
+    const zap_source_tree_root: []const u8 = if (zap_lib_dir) |lib_dir|
+        (std.fs.path.dirname(lib_dir) orelse project_root)
+    else
+        project_root;
+
+    var resolved_manager = zap.memory_driver.resolve(
+        alloc,
+        .{
+            .manager_name = config.memory_manager orelse "",
+            .source_roots = sourceRootsForMemoryDriver(alloc, source_roots.items) catch return error.OutOfMemory,
+            .project_root = project_root,
+            .zap_source_root = zap_source_tree_root,
+            .cache_dir = memory_cache_dir,
+            .zig_lib_dir = zig_lib_dir,
+            .optimize = driver_optimize,
+            // Thread the build's cross-compile target through so the
+            // manager `.o` is built for the same target as the final
+            // binary. Null means "native"; a non-null triple flows
+            // through `parseTargetTriple` into the fork primitive's
+            // `ZapForkTarget`.
+            .target = compile_target,
+        },
+        &driver_diag,
+    ) catch |err| {
+        std.debug.print("Error: memory manager resolution failed: {s}\n", .{@errorName(err)});
+        if (driver_diag.text().len > 0) {
+            std.debug.print("  {s}\n", .{driver_diag.text()});
+        }
+        std.process.exit(1);
+    };
+    defer zap.memory_driver.freeResolved(alloc, &resolved_manager);
+
     // Compile through frontend
     // Use per-file pipeline for import-driven discovery, legacy pipeline for glob
     const mod_order_slice: ?[]const []const u8 = if (struct_order.items.len > 0)
@@ -1083,6 +1148,7 @@ fn buildTarget(
         .ctfe_target = target_name,
         .ctfe_optimize = @tagName(config.optimize),
         .io = global_io,
+        .declared_caps = resolved_manager.declared_caps,
     }) catch {
         std.process.exit(1);
     };
@@ -1144,81 +1210,9 @@ fn buildTarget(
         .release_small => 3,
     };
 
-    // ------------------------------------------------------------------
-    // Memory Manager ABI v1.0 — Phase 3 driver invocation.
-    //
-    // Translates the manifest's `memory:` field (e.g.,
-    // `Zap.Memory.NoOp`) into a compiled manager object file plus a
-    // validated capability bitmask. The default `Zap.Memory.ARC` short-
-    // circuits — no external compile is performed and the runtime's
-    // built-in stub continues to provide the active vtable, so existing
-    // projects build unchanged.
-    //
-    // The driver writes its object into `.zap-cache/memory/`; downstream
-    // the path is threaded into `zir_backend.CompileOptions
-    // .memory_manager_object`, where the fork primitive
-    // `zir_compilation_add_link_object_file` splices it into the final
-    // binary's link inputs.
-    //
-    // The `fork_compile_fn` is left null so the driver uses the linked-
-    // in default (`libzap_compiler.a`'s `zap_fork_compile_zig_to_object`).
-    // ------------------------------------------------------------------
-
-    const memory_cache_dir = ".zap-cache/memory";
-
-    // Map the manifest optimize to the fork primitive's enum. v1.0 of the
-    // Memory Manager ABI does not yet thread optimize through HIR/codegen,
-    // so we match Zap's selection so debug/safe/fast produce a manager
-    // built with the same optimization level as the rest of the binary.
-    const driver_optimize: zap.memory_driver.ZapForkOptimize = switch (config.optimize) {
-        .debug => .Debug,
-        .release_safe => .ReleaseSafe,
-        .release_fast => .ReleaseFast,
-        .release_small => .ReleaseSmall,
-    };
-
-    var driver_diag_buf: [4096]u8 = undefined;
-    var driver_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &driver_diag_buf };
-
-    // First-party `@memory_manager_source` paths are relative to the
-    // Zap source tree root (e.g., `src/memory/arc/manager.zig`).
-    // `detectZapLibDir` returns the path to the stdlib `lib/`
-    // subdirectory (which contains `kernel.zap`); the source tree root
-    // is the parent of that directory. When running from a checked-out
-    // Zap repository the parent contains `src/memory/arc/manager.zig`;
-    // when running from an installed `zig-out/`, the parent contains
-    // the bundled `src/memory/...` tree shipped alongside `lib/`.
-    const zap_source_tree_root: []const u8 = if (zap_lib_dir) |lib_dir|
-        (std.fs.path.dirname(lib_dir) orelse project_root)
-    else
-        project_root;
-
-    var resolved_manager = zap.memory_driver.resolve(
-        alloc,
-        .{
-            .manager_name = config.memory_manager orelse "",
-            .source_roots = sourceRootsForMemoryDriver(alloc, source_roots.items) catch return error.OutOfMemory,
-            .project_root = project_root,
-            .zap_source_root = zap_source_tree_root,
-            .cache_dir = memory_cache_dir,
-            .zig_lib_dir = zig_lib_dir,
-            .optimize = driver_optimize,
-            // Thread the build's cross-compile target through so the
-            // manager `.o` is built for the same target as the final
-            // binary. Null means "native"; a non-null triple flows
-            // through `parseTargetTriple` into the fork primitive's
-            // `ZapForkTarget`.
-            .target = compile_target,
-        },
-        &driver_diag,
-    ) catch |err| {
-        std.debug.print("Error: memory manager resolution failed: {s}\n", .{@errorName(err)});
-        if (driver_diag.text().len > 0) {
-            std.debug.print("  {s}\n", .{driver_diag.text()});
-        }
-        std.process.exit(1);
-    };
-    defer zap.memory_driver.freeResolved(alloc, &resolved_manager);
+    // Memory manager resolution happened above (Phase 6 needs the
+    // resulting `declared_caps` before the front-end). The object path
+    // and capability bitmask flow into the ZIR backend below.
 
     // Compile through ZIR backend (zig_lib_dir already resolved above)
     const output_mode_val: u8 = switch (config.kind) {
@@ -1232,7 +1226,7 @@ fn buildTarget(
         .global_cache_dir = ".zap-cache",
         .output_path = output_path,
         .name = output_name,
-        .runtime_source = compiler.getRuntimeSource(),
+        .runtime_source = compiler.getRuntimeSource(resolved_manager.declared_caps),
         .output_mode = output_mode_val,
         .optimize_mode = optimize_mode,
         .target = compile_target,
@@ -1528,14 +1522,25 @@ const IncrementalWatchState = struct {
             return null;
         };
 
-        // Create persistent ZirContext
+        // Create persistent ZirContext.
+        //
+        // Watch mode does not currently re-resolve the memory manager
+        // between rebuilds (the active manager binding is fixed for a
+        // watch session, matching the spec's single-manager-per-binary
+        // contract). For Phase 6, pass `REFCOUNT_V1_BIT` here so the
+        // runtime source rewrite matches the in-tree ARC manager that
+        // production builds use by default. A watch-mode session that
+        // selects a non-ARC manager via `memory:` in the manifest is
+        // out of scope for v1.0; the regular `buildTarget` path
+        // exercises every supported manager.
+        const watch_caps: u64 = zap.memory_abi.REFCOUNT_V1_BIT;
         const ctx = zir_backend.createContext(allocator, .{
             .zig_lib_dir = zig_lib_duped,
             .cache_dir = ".zap-cache",
             .global_cache_dir = ".zap-cache",
             .output_path = output_path_duped,
             .name = output_name_duped,
-            .runtime_source = compiler.getRuntimeSource(),
+            .runtime_source = compiler.getRuntimeSource(watch_caps),
             .output_mode = output_mode_val,
             .optimize_mode = optimize_mode_val,
             .target = compile_target,
@@ -1748,18 +1753,23 @@ const IncrementalWatchState = struct {
         }
 
         // Inject new ZIR and run Sema+codegen+link
+        // Watch mode caps: see `IncrementalWatchState.init` for the
+        // rationale. The watch session is pinned to the same caps the
+        // initial context was created with.
+        const watch_caps: u64 = zap.memory_abi.REFCOUNT_V1_BIT;
         zir_backend.injectAndUpdate(alloc, result.ir_program, self.zir_ctx, .{
             .zig_lib_dir = self.zig_lib_dir,
             .cache_dir = ".zap-cache",
             .global_cache_dir = ".zap-cache",
             .output_path = self.output_path,
             .name = self.output_name,
-            .runtime_source = compiler.getRuntimeSource(),
+            .runtime_source = compiler.getRuntimeSource(watch_caps),
             .output_mode = self.output_mode,
             .optimize_mode = self.optimize_mode,
             .link_libc = self.link_libc,
             .analysis_context = if (result.analysis_context) |*ctx| ctx else null,
             .arc_ownership = if (result.arc_ownership) |*ownership| ownership else null,
+            .declared_caps = watch_caps,
         }) catch return error.BackendError;
 
         self.baseline_established = true;

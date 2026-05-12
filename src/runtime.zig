@@ -426,21 +426,87 @@ pub const instrument_map: bool = blk: {
 };
 
 // ============================================================
+// Phase 6 — Active manager capability bitmask exposed to runtime
+//
+// Each Zap binary is compiled with exactly one memory manager whose
+// `.zapmem` section declares a `declared_caps` bitmask (spec §3.5 /
+// §7). Phase 6 makes that bitmask comptime-visible inside `runtime.zig`
+// so the inline-header types (`Map(K,V)`, `List(T)`, `MapIter(K,V)`)
+// can drop their `ArcHeader` field under managers that do not declare
+// `REFCOUNT_V1`, and so the runtime's internal retain/release hot
+// paths can comptime-elide their dispatch.
+//
+// Resolution:
+//   * The source-level `RUNTIME_DECLARED_CAPS_DEFAULT` constant
+//     defaults to `REFCOUNT_V1_BIT` so the host test suite (which
+//     pulls `runtime.zig` in as a Zig module without going through
+//     the user-binary `@embedFile` rewrite) sees the full inline-
+//     header layout and the existing retain/release semantics — a
+//     `Zap.Memory.ARC` build, byte-for-byte.
+//   * For each Zap user binary, `compiler.getRuntimeSource(caps)`
+//     rewrites the literal to the resolved manager's `declared_caps`
+//     before injecting the source into the build. A binary that
+//     selects `Zap.Memory.Arena` or `Zap.Memory.NoOp` therefore sees
+//     `RUNTIME_DECLARED_CAPS_DEFAULT == 0`, which collapses
+//     `refcount_v1_active` to `false` and drops the inline header
+//     plus every internal retain/release dispatch.
+//
+// `@import("root")` is intentionally NOT used here. Zig 0.16's test
+// runner makes `@import("root")` resolve to its own root in test
+// builds, so a `root.zig` override would not be visible to runtime
+// tests. The host-correct default solves the same problem without
+// the `@hasDecl` fragility.
+// ============================================================
+
+const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x0000_0000_0000_0001;
+
+pub const runtime_declared_caps: u64 = RUNTIME_DECLARED_CAPS_DEFAULT;
+
+/// Phase 6 codegen-elision predicate (mirrors `src/memory/elision.zig`).
+/// Comptime-true when the active manager declares `REFCOUNT_V1`. Used
+/// inside the runtime to gate retain/release method bodies and inline-
+/// header struct layout.
+pub const refcount_v1_active: bool = (runtime_declared_caps & 0x0000_0000_0000_0001) != 0;
+
+// ============================================================
 // ARC — Atomic Reference Counting (spec §31.4)
 // ============================================================
 
-pub const ArcHeader = extern struct {
+/// Inline refcount header for `Map(K,V)` / `List(T)` / `MapIter(K,V)`
+/// cells. Phase 6 makes the header's *shape* conditional on the active
+/// manager: under a manager that declares `REFCOUNT_V1` the header is
+/// a 4-byte atomic counter at cell offset 0 (the historical layout);
+/// under a manager that does NOT declare `REFCOUNT_V1` the header
+/// resolves to an empty struct (`@sizeOf == 0`) and the inline field
+/// drops out of every cell's binary layout, satisfying the spec's
+/// "cell-overhead-free under no REFCOUNT_V1" contract (§8.1, §8.5).
+///
+/// The atomic-counter variant retains its v1.x semantics: `init()`
+/// produces rc=1, `retain()` is a `.monotonic` increment, `release()`
+/// is an `.acq_rel` decrement returning `true` on the zero-transition.
+/// The empty variant exposes the same method names with no-op bodies
+/// so call-site source code can stay manager-agnostic.
+///
+/// The conditional struct definition keeps every consumer (Map/List/
+/// MapIter, the AbiV1 dispatchers, the ARC manager's
+/// `headerRetainOffsetZero` / `headerReleaseOffsetZero`) sourcing the
+/// same `ArcHeader` symbol regardless of mode — there is no type-
+/// switch upstream, only the implementation contracts shift between
+/// modes.
+pub const ArcHeader = if (refcount_v1_active) ArcHeaderRefcounted else ArcHeaderEmpty;
+
+pub const ArcHeaderRefcounted = extern struct {
     ref_count: std.atomic.Value(u32),
 
-    pub fn init() ArcHeader {
+    pub fn init() ArcHeaderRefcounted {
         return .{ .ref_count = std.atomic.Value(u32).init(1) };
     }
 
-    pub fn retain(self: *ArcHeader) void {
+    pub fn retain(self: *ArcHeaderRefcounted) void {
         _ = self.ref_count.fetchAdd(1, .monotonic);
     }
 
-    pub fn release(self: *ArcHeader) bool {
+    pub fn release(self: *ArcHeaderRefcounted) bool {
         const prev = self.ref_count.fetchSub(1, .acq_rel);
         if (prev == 1) {
             return true; // caller should free
@@ -448,11 +514,53 @@ pub const ArcHeader = extern struct {
         return false;
     }
 
-    pub fn count(self: *const ArcHeader) u32 {
+    pub fn count(self: *const ArcHeaderRefcounted) u32 {
         return self.ref_count.load(.acquire);
     }
-
 };
+
+/// Empty-shape `ArcHeader` used under a manager that does not declare
+/// `REFCOUNT_V1`. `@sizeOf(ArcHeaderEmpty) == 0`, so the inline
+/// `header: ArcHeader` field on `Map(K,V)`, `List(T)`, and
+/// `MapIter(K,V)` collapses to zero bytes — the spec's cell-overhead-
+/// free shape (§8.1 last paragraph). The method bodies are all
+/// no-ops; callers that still invoke them (e.g. construction-time
+/// `ArcHeader.init()`) compile away to nothing.
+pub const ArcHeaderEmpty = extern struct {
+    pub fn init() ArcHeaderEmpty {
+        return .{};
+    }
+
+    pub fn retain(self: *ArcHeaderEmpty) void {
+        _ = self;
+    }
+
+    pub fn release(self: *ArcHeaderEmpty) bool {
+        _ = self;
+        return false;
+    }
+
+    pub fn count(self: *const ArcHeaderEmpty) u32 {
+        _ = self;
+        return 0;
+    }
+};
+
+comptime {
+    // Phase 6 layout invariants. The REFCOUNT_V1 shape is the
+    // historical 4-byte atomic counter; the no-REFCOUNT_V1 shape is
+    // a 0-byte empty struct so Map/List/MapIter cells lose the
+    // inline header entirely.
+    if (refcount_v1_active) {
+        if (@sizeOf(ArcHeader) != 4) @compileError(
+            "runtime: ArcHeader under REFCOUNT_V1 must be exactly 4 bytes",
+        );
+    } else {
+        if (@sizeOf(ArcHeader) != 0) @compileError(
+            "runtime: ArcHeader under no-REFCOUNT_V1 must be a 0-byte empty struct",
+        );
+    }
+}
 
 // ============================================================
 // Atomic helper exposed to external memory managers.
@@ -3090,6 +3198,31 @@ pub const ArcRuntime = struct {
     /// ABI v1.0" comment block for the broader Phase 4.x deferral
     /// rationale.
     pub fn allocAny(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
+        // Phase 6: under no-REFCOUNT_V1 the slab pool's side-table
+        // refcount layout has no semantic meaning, but the value
+        // ITSELF still needs heap-backed storage so the indirect-
+        // storage / boxed-recursive pointer remains live across
+        // frames. Route through the active manager's `core.allocate`
+        // — the manager's `core.deallocate` is the matching free
+        // path (or, for an Arena manager, a no-op until program
+        // exit). Phase 6 step 5 plan (b).
+        if (comptime !refcount_v1_active) {
+            // The `allocator` parameter is vestigial in the manager-
+            // routed path. We don't `_ = allocator;` because the
+            // REFCOUNT_V1 branch below uses it, and Zig errors on a
+            // discard-of-used-param. Leave it untouched.
+            const core = zap_active_manager_core orelse
+                @panic("zap runtime: allocAny dispatched with no active memory manager");
+            const ctx = zap_memory_manager_context orelse
+                @panic("zap runtime: allocAny dispatched with null manager context");
+            const size = @sizeOf(T);
+            const alignment_bytes = @alignOf(T);
+            const raw = core.allocate(ctx, size, @intCast(alignment_bytes)) orelse
+                @panic("zap runtime: out of memory: manager.allocate returned null");
+            const slot: *T = @ptrCast(@alignCast(raw));
+            slot.* = value;
+            return slot;
+        }
         if (zap_memory_shutdown_complete) {
             @panic("zap runtime: memory dispatch after shutdown");
         }
@@ -3170,6 +3303,8 @@ pub const ArcRuntime = struct {
     /// Validation mirrors `releaseAny` — the dispatcher refuses to
     /// dispatch against a manager that does not declare REFCOUNT_V1.
     pub fn freeAny(allocator: std.mem.Allocator, ptr: anytype) void {
+        // Phase 6: codegen elides every freeAny call under no-REFCOUNT_V1.
+        if (comptime !refcount_v1_active) return;
         if (zap_memory_shutdown_complete) {
             @panic("zap runtime: memory dispatch after shutdown");
         }
@@ -3238,6 +3373,8 @@ pub const ArcRuntime = struct {
     /// for why the typed slab-pool path still uses the typed impl
     /// directly rather than the byte-level vtable.
     pub fn releaseAny(allocator: std.mem.Allocator, ptr: anytype) void {
+        // Phase 6: codegen elides every releaseAny call under no-REFCOUNT_V1.
+        if (comptime !refcount_v1_active) return;
         if (zap_memory_shutdown_complete) {
             @panic("zap runtime: memory dispatch after shutdown");
         }
@@ -3307,6 +3444,11 @@ pub const ArcRuntime = struct {
             if (hasInlineArcHeader(T))
                 @compileError("prepareReleaseAny: inline-header types must release via T.release, not the generic Arc pool");
         }
+        // Phase 6: codegen elides every prepareReleaseAny call under
+        // no-REFCOUNT_V1. Without refcount tracking there is no
+        // "last owner" notion; the caller's deep-release walk path
+        // never fires.
+        if (comptime !refcount_v1_active) return null;
         // Dispatcher consistency: every other public Arc(T) entry point
         // panics on memory dispatch after shutdown; the split-phase pair
         // honours the same contract. (The Phase 4.x vtable-bypass note
@@ -3333,6 +3475,11 @@ pub const ArcRuntime = struct {
     /// argument is vestigial — see `allocAny` and `ArcPool`.
     pub fn destroyPreparedAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) void {
         _ = allocator;
+        // Phase 6: codegen elides every destroyPreparedAny call under
+        // no-REFCOUNT_V1 (it pairs with `prepareReleaseAny` which
+        // always returns null in that mode, so this branch is
+        // unreachable from emitted code).
+        if (comptime !refcount_v1_active) return;
         // Dispatcher consistency: every other public Arc(T) entry point
         // panics on memory dispatch after shutdown; the split-phase pair
         // honours the same contract. (The Phase 4.x vtable-bypass note
@@ -3466,6 +3613,8 @@ pub const ArcRuntime = struct {
     /// families once the typed slab-pool path can be driven by the
     /// vtable's runtime-sized `core.allocate(size, alignment)` slot.
     pub fn retainAny(ptr: anytype) void {
+        // Phase 6: codegen elides every retainAny call under no-REFCOUNT_V1.
+        if (comptime !refcount_v1_active) return;
         if (zap_memory_shutdown_complete) {
             @panic("zap runtime: memory dispatch after shutdown");
         }
@@ -3520,6 +3669,8 @@ pub const ArcRuntime = struct {
     ///
     /// Validation pattern mirrors `retainAny`.
     pub fn retainAnyPersistent(ptr: anytype) void {
+        // Phase 6: codegen elides every retainAnyPersistent call under no-REFCOUNT_V1.
+        if (comptime !refcount_v1_active) return;
         if (zap_memory_shutdown_complete) {
             @panic("zap runtime: memory dispatch after shutdown");
         }
@@ -3597,6 +3748,15 @@ pub const ArcRuntime = struct {
     /// The dispatcher bumps `arc_retains_total` so callers no longer
     /// need to do it themselves.
     pub fn headerRetain(header_ptr: *ArcHeader) void {
+        // Phase 6: under a manager that does not declare REFCOUNT_V1
+        // the inline `ArcHeader` field is omitted from cell layout
+        // (`@sizeOf(ArcHeader) == 0`) and the codegen pipeline elides
+        // every retain. Any *internal* call from runtime methods
+        // (`Map.retain`, `List.retain`, `MapIter.create`, ...) is
+        // comptime-eliminated here. The function body that remains is
+        // unchanged for the REFCOUNT_V1 path.
+        if (comptime !refcount_v1_active) return;
+
         // Coverage note: the shutdown-complete and capability-null guard
         // paths below trigger `@panic`, which aborts the test process,
         // so they cannot be exercised under standard `zig build test`.
@@ -3650,6 +3810,16 @@ pub const ArcRuntime = struct {
         header_ptr: *ArcHeader,
         deep_walk: ?AbiV1.ZapDeepWalkFn,
     ) void {
+        // Phase 6: under a manager that does not declare REFCOUNT_V1
+        // the inline `ArcHeader` field is omitted from cell layout
+        // and the codegen pipeline elides every release. Any internal
+        // call from runtime methods is comptime-eliminated here. The
+        // deep-walk callback never fires in that mode either —
+        // `bufferFreeDeep` would attempt to walk children that may
+        // themselves require a non-existent allocator; freeing is
+        // deferred to the arena's bulk reclamation at process exit.
+        if (comptime !refcount_v1_active) return;
+
         // Same (core, ctx, cap) non-snapshot rationale as
         // `headerRetain` — manager binding is fixed for the program's
         // lifetime in ABI v1.x, so the three loads cannot tear.
@@ -12354,6 +12524,43 @@ test "Phase 4 ABI: ARC manager is bound by default in test builds" {
     // is initialised.
     try std.testing.expect(zap_active_manager_core != null);
     try std.testing.expect(zap_memory_manager_context != null);
+}
+
+test "Phase 6: runtime_declared_caps defaults to REFCOUNT_V1 in host tests" {
+    // The source-level default of `RUNTIME_DECLARED_CAPS_DEFAULT` is
+    // `REFCOUNT_V1_BIT` so the host test suite (which loads
+    // `runtime.zig` as a Zig module, bypassing the user-binary
+    // `compiler.getRuntimeSource()` rewrite) sees the historical ARC-
+    // shaped runtime. If this constant ever drifts to `0`, every
+    // inline-header test would fail because `Map`/`List`/`MapIter`
+    // would lose their `header: ArcHeader` field.
+    try std.testing.expectEqual(@as(u64, 1), runtime_declared_caps);
+    try std.testing.expect(refcount_v1_active);
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(ArcHeader));
+}
+
+test "Phase 6: ArcHeaderRefcounted has the REFCOUNT_V1 4-byte shape" {
+    // Independent of which variant `ArcHeader` aliases at host-test
+    // time, verify the refcounted shape is exactly 4 bytes and the
+    // empty shape is exactly 0 bytes. This pair of asserts is the
+    // structural invariant the conditional layout depends on: any
+    // future field rename, atomic-type swap, or padding drift in
+    // either variant breaks Phase 6's layout switch.
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(ArcHeaderRefcounted));
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(ArcHeaderEmpty));
+}
+
+test "Phase 6: ArcHeaderEmpty method shapes match ArcHeaderRefcounted's surface" {
+    // Both variants must expose the same method set with the same
+    // signatures so call sites can be written manager-agnostically.
+    // Verify by exercising each method on a stack instance — under
+    // the empty shape they are comptime-no-ops; this test guards
+    // against accidental signature drift.
+    var empty = ArcHeaderEmpty.init();
+    empty.retain();
+    const did_free = empty.release();
+    try std.testing.expect(!did_free);
+    try std.testing.expectEqual(@as(u32, 0), empty.count());
 }
 
 test "Phase 4 ABI: ARC manager declares REFCOUNT_V1 capability" {

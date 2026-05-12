@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ir = @import("ir.zig");
+const elision = @import("memory/elision.zig");
 const Allocator = std.mem.Allocator;
 
 const native_endian: std.builtin.Endian = builtin.cpu.arch.endian();
@@ -667,6 +668,13 @@ pub const ZirDriver = struct {
     }
 
     fn shouldSkipArc(self: *const ZirDriver, local: ir.LocalId) bool {
+        // Phase 6: when the active manager does not declare REFCOUNT_V1
+        // the compiler statically elides every retain/release call
+        // (spec §8.5). The skip is unconditional in that mode — escape
+        // analysis and the ARC-managed-locals invariant only matter
+        // when refcount ops are being emitted in the first place.
+        if (!elision.shouldEmitRefcountOps(self.declared_caps)) return true;
+
         // ARC-managed types live on heap pools and must always
         // participate in retain/release. The escape lattice's
         // `.no_escape` / `.function_local` classifications describe
@@ -690,6 +698,24 @@ pub const ZirDriver = struct {
             }
         }
         return false;
+    }
+
+    /// Phase 6 codegen-elision predicate (see `src/memory/elision.zig`).
+    /// Returns `true` when the active manager declares `REFCOUNT_V1`
+    /// and refcount-aware instructions should be emitted at retain /
+    /// release / freeAny / prepareReleaseAny / destroyPreparedAny /
+    /// resetAny / reuseAllocByType / noteConsume / noteReturnElision
+    /// call sites.
+    ///
+    /// Call this from emission sites that aren't already routed through
+    /// `shouldSkipArc` (which folds the elision check into the local-
+    /// keyed skip decision). Sites that emit a ZIR call to one of the
+    /// `ArcRuntime` helpers must check this — under a manager that does
+    /// not declare REFCOUNT_V1 the call's target (`ArcRuntime.retainAny`
+    /// etc.) would `@panic` at runtime per the spec's capability-
+    /// missing panic contract.
+    fn shouldEmitRefcountOps(self: *const ZirDriver) bool {
+        return elision.shouldEmitRefcountOps(self.declared_caps);
     }
 
     // -- Helpers --------------------------------------------------------------
@@ -4197,14 +4223,21 @@ pub const ZirDriver = struct {
                             // runtime via `ZAP_ARC_STATS=1`; this is the
                             // load-bearing signal that proves consume
                             // sites fired during program execution.
-                            const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                            if (rt_import == error_ref) return error.EmitFailed;
-                            const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
-                            if (arc_runtime == error_ref) return error.EmitFailed;
-                            const note_consume_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "noteConsume", 11);
-                            if (note_consume_fn == error_ref) return error.EmitFailed;
-                            const args = [_]u32{};
-                            _ = zir_builder_emit_call_ref(self.handle, note_consume_fn, &args, 0);
+                            //
+                            // Phase 6 elision: the consume counter is
+                            // part of the refcount instrumentation; an
+                            // arena/no-op manager neither emits retains
+                            // to elide nor maintains the counter.
+                            if (self.shouldEmitRefcountOps()) {
+                                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                                if (rt_import == error_ref) return error.EmitFailed;
+                                const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
+                                if (arc_runtime == error_ref) return error.EmitFailed;
+                                const note_consume_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "noteConsume", 11);
+                                if (note_consume_fn == error_ref) return error.EmitFailed;
+                                const args = [_]u32{};
+                                _ = zir_builder_emit_call_ref(self.handle, note_consume_fn, &args, 0);
+                            }
                         },
                         .retain => {
                             // Phase 1 Class A item 2: the retain that
@@ -6647,7 +6680,12 @@ pub const ZirDriver = struct {
                     // analyzer's `checkSoundness` further asserts
                     // consume and return are disjoint), so no double-
                     // counting is possible.
-                    if (self.arc_returned_locals.contains(rel.value)) {
+                    if (self.arc_returned_locals.contains(rel.value) and self.shouldEmitRefcountOps()) {
+                        // Phase 6 elision: the `noteReturnElision`
+                        // counter belongs to the refcount instrumentation
+                        // pathway; under a non-REFCOUNT_V1 manager there
+                        // are no releases to elide and the counter is
+                        // not maintained.
                         const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                         if (rt_import == error_ref) return error.EmitFailed;
                         const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
