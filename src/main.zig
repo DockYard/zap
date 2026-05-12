@@ -1180,13 +1180,26 @@ fn buildTarget(
     var driver_diag_buf: [4096]u8 = undefined;
     var driver_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &driver_diag_buf };
 
+    // First-party `@memory_manager_source` paths are relative to the
+    // Zap source tree root (e.g., `src/memory/arc/manager.zig`).
+    // `detectZapLibDir` returns the path to the stdlib `lib/`
+    // subdirectory (which contains `kernel.zap`); the source tree root
+    // is the parent of that directory. When running from a checked-out
+    // Zap repository the parent contains `src/memory/arc/manager.zig`;
+    // when running from an installed `zig-out/`, the parent contains
+    // the bundled `src/memory/...` tree shipped alongside `lib/`.
+    const zap_source_tree_root: []const u8 = if (zap_lib_dir) |lib_dir|
+        (std.fs.path.dirname(lib_dir) orelse project_root)
+    else
+        project_root;
+
     var resolved_manager = zap.memory_driver.resolve(
         alloc,
         .{
             .manager_name = config.memory_manager orelse "",
             .source_roots = sourceRootsForMemoryDriver(alloc, source_roots.items) catch return error.OutOfMemory,
             .project_root = project_root,
-            .zap_source_root = zap_lib_dir orelse project_root,
+            .zap_source_root = zap_source_tree_root,
             .cache_dir = memory_cache_dir,
             .zig_lib_dir = zig_lib_dir,
             .optimize = driver_optimize,
@@ -1225,7 +1238,7 @@ fn buildTarget(
         .target = compile_target,
         .analysis_context = if (result.analysis_context) |*ctx| ctx else null,
         .arc_ownership = if (result.arc_ownership) |*ownership| ownership else null,
-        .memory_manager_object = if (resolved_manager.is_builtin_default) null else resolved_manager.object_path,
+        .memory_manager_object = resolved_manager.object_path,
         // Capability bitmask from the resolved manager's `.zapmem`
         // core vtable. Threaded into ZIR codegen so Phase 6 can elide
         // retain/release calls when the active manager omits

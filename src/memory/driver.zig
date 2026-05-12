@@ -3,21 +3,28 @@
 //! Phase 3 of the pluggable memory manager rollout — see
 //! `docs/memory-manager-abi.md` section 10 for the normative build pipeline.
 //!
+//! Phase 4 removed the built-in `Zap.Memory.ARC` short-circuit: every
+//! manager — first-party (`Zap.Memory.ARC`, `Zap.Memory.NoOp`,
+//! `Zap.Memory.Arena`) and third-party — now flows through the same
+//! pipeline. The runtime no longer carries a built-in default vtable;
+//! the manager `.o` is always compiled and linked, and its `.zapmem`
+//! section is the sole source of the active manager's vtable at
+//! runtime.
+//!
 //! The driver:
 //!   1. Receives the manifest's `memory:` selection (a struct reference
-//!      resolved to a dotted name like `"Zap.Memory.NoOp"`).
+//!      resolved to a dotted name like `"Zap.Memory.NoOp"`). When the
+//!      manifest does not set `memory:`, the driver applies
+//!      `DEFAULT_MANAGER` (`Zap.Memory.ARC`).
 //!   2. Locates the matching `.zap` stdlib struct and reads its
 //!      `@memory_manager_source` attribute to find the manager's Zig source.
-//!   3. For the built-in default `Zap.Memory.ARC`, short-circuits: no
-//!      external compile is invoked and the runtime's built-in ARC stub
-//!      continues to provide the active vtable.
-//!   4. For non-default managers, invokes the Zig-fork primitive
-//!      `zap_fork_compile_zig_to_object` to compile the manager's source
-//!      into an object file in `.zap-cache/memory/`.
-//!   5. Reads the object file, extracts the `.zapmem` section via the
+//!   3. Invokes the Zig-fork primitive `zap_fork_compile_zig_to_object`
+//!      to compile the manager's source into an object file in
+//!      `.zap-cache/memory/`.
+//!   4. Reads the object file, extracts the `.zapmem` section via the
 //!      Phase 1 section parser, and validates the meta header + core vtable
 //!      + embedded descriptors per spec section 3.5.
-//!   6. Exposes the resulting `ResolvedManager` to the compiler driver:
+//!   5. Exposes the resulting `ResolvedManager` to the compiler driver:
 //!      the object path goes onto the link line; `declared_caps` flows
 //!      through to HIR / codegen (Phase 6 will branch on it); the manager
 //!      name appears in diagnostics.
@@ -153,15 +160,11 @@ pub const ResolvedManager = struct {
     /// `"Zap.Memory.ARC"`, `"Zap.Memory.NoOp"`). Always non-empty.
     name: []const u8,
 
-    /// `true` when the manager is `Zap.Memory.ARC` and the driver elected
-    /// to use the runtime's built-in stub instead of compiling and
-    /// linking an external manager `.o`. In this mode `object_path` is
-    /// `null` and the link step ignores the manager.
-    is_builtin_default: bool,
-
-    /// Absolute or relative path to the compiled manager object file. Only
-    /// populated when `is_builtin_default == false`. The compiler driver
-    /// appends this to the final binary's link line.
+    /// Absolute or relative path to the compiled manager object file.
+    /// Always populated after Phase 4 — every manager (including
+    /// `Zap.Memory.ARC`) flows through the same compile-and-link
+    /// pipeline. The compiler driver appends this to the final
+    /// binary's link line.
     object_path: ?[]const u8,
 
     /// Capability bitmask read from the validated `.zapmem` core vtable.
@@ -291,10 +294,11 @@ pub const DEFAULT_MANAGER: []const u8 = "Zap.Memory.ARC";
 /// Resolve the active memory manager for the build. Returns a
 /// `ResolvedManager` whose lifetime is bound to the caller's allocator.
 ///
-/// The driver short-circuits the built-in ARC default to keep existing
-/// projects building unchanged. For any other manager it walks the full
-/// pipeline: source discovery → external compile → section parse →
-/// validation.
+/// Phase 4 made every manager flow through the same pipeline:
+/// source discovery → external compile → section parse → validation.
+/// There is no longer a short-circuit for `Zap.Memory.ARC`; the
+/// runtime depends on the externally-linked `.zapmem` section as the
+/// sole source of the active manager's vtable.
 pub fn resolve(
     allocator: std.mem.Allocator,
     options: ResolveOptions,
@@ -304,21 +308,6 @@ pub fn resolve(
         DEFAULT_MANAGER
     else
         options.manager_name;
-
-    // Short-circuit the built-in ARC default — the runtime's static
-    // `builtin_arc_core` provides the active vtable; no external compile
-    // is needed and no `.o` is appended to the link line.
-    if (std.mem.eql(u8, manager_name, "Zap.Memory.ARC")) {
-        return .{
-            .name = try allocator.dupe(u8, manager_name),
-            .is_builtin_default = true,
-            .object_path = null,
-            // The built-in stub declares REFCOUNT_V1. Phase 6 reads this
-            // bit to know that retain/release calls should be emitted.
-            .declared_caps = abi.REFCOUNT_V1_BIT,
-            .abi_minor = 0,
-        };
-    }
 
     // Find the .zap source that declares the manager struct so we can
     // read its `@memory_manager_source` attribute.
@@ -416,13 +405,13 @@ pub fn resolve(
     // under that symbol name. A manager that emitted the section bytes
     // under a different symbol (or as an unnamed payload) would pass
     // the section-content validation above but silently resolve the
-    // weak extern to null at runtime, falling back to the built-in ARC
-    // vtable. The check below catches that mis-emission at build time.
+    // weak extern to null at runtime, causing the runtime to panic at
+    // startup ("no active memory manager bound at startup"). The check
+    // below catches that mis-emission at build time.
     try assertExportsManagerSymbol(manager_name, object_bytes, diag);
 
     return .{
         .name = try allocator.dupe(u8, manager_name),
-        .is_builtin_default = false,
         .object_path = object_path,
         .declared_caps = validated.declared_caps,
         .abi_minor = validated.abi_minor,
@@ -1215,11 +1204,18 @@ fn bitForTag(tag: u32) ?u6 {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "default short-circuit returns built-in ARC marker" {
-    var diag_buf: [256]u8 = undefined;
+test "empty manager name falls back to DEFAULT_MANAGER" {
+    // Phase 4 removed the built-in ARC short-circuit; resolving the
+    // default with empty source roots now fails the same way as
+    // resolving any other unknown manager (`ManagerStructNotFound`)
+    // because there's no .zap file to discover. The unit test asserts
+    // that the empty `manager_name` is mapped to `DEFAULT_MANAGER`
+    // before discovery runs, by observing the diagnostic mentions
+    // `Zap.Memory.ARC` (not the empty string).
+    var diag_buf: [512]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
 
-    var resolved = try resolve(
+    const result = resolve(
         std.testing.allocator,
         .{
             .manager_name = "",
@@ -1230,33 +1226,8 @@ test "default short-circuit returns built-in ARC marker" {
         },
         &diag,
     );
-    defer freeResolved(std.testing.allocator, &resolved);
-
-    try std.testing.expect(resolved.is_builtin_default);
-    try std.testing.expectEqualStrings("Zap.Memory.ARC", resolved.name);
-    try std.testing.expectEqual(@as(?[]const u8, null), resolved.object_path);
-    try std.testing.expectEqual(abi.REFCOUNT_V1_BIT, resolved.declared_caps);
-}
-
-test "explicit ARC selection also short-circuits" {
-    var diag_buf: [256]u8 = undefined;
-    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-
-    var resolved = try resolve(
-        std.testing.allocator,
-        .{
-            .manager_name = "Zap.Memory.ARC",
-            .source_roots = &.{},
-            .project_root = ".",
-            .zap_source_root = ".",
-            .cache_dir = "/tmp/zap-driver-test-arc",
-        },
-        &diag,
-    );
-    defer freeResolved(std.testing.allocator, &resolved);
-
-    try std.testing.expect(resolved.is_builtin_default);
-    try std.testing.expectEqualStrings("Zap.Memory.ARC", resolved.name);
+    try std.testing.expectError(ResolveError.ManagerStructNotFound, result);
+    try std.testing.expect(std.mem.indexOf(u8, diag.text(), DEFAULT_MANAGER) != null);
 }
 
 test "unknown manager name returns ManagerStructNotFound" {
@@ -1429,6 +1400,15 @@ test "validateSection rejects bad magic" {
 /// pointers. The validator only inspects layout/version fields and
 /// never invokes the pointers, so storing address-of-stub is safe.
 fn synthesizeNoOpPayload() [88]u8 {
+    return synthesizePayloadWithCaps(0);
+}
+
+/// Helper underlying both `synthesizeNoOpPayload` and the ARC-specific
+/// variant used by the Phase 4 ARC integration test. `declared_caps`
+/// goes into both the meta and the core's `declared_caps` field; the
+/// stub function pointers are no-ops because the section parser only
+/// inspects layout fields (the runtime never reaches these stubs).
+fn synthesizePayloadWithCaps(declared_caps: u64) [88]u8 {
     var payload: [88]u8 = undefined;
     const meta: abi.ZapMemoryManagerMetaV1 = .{
         .magic = abi.ZMEM_MAGIC_LE,
@@ -1437,7 +1417,7 @@ fn synthesizeNoOpPayload() [88]u8 {
         .size = @sizeOf(abi.ZapMemoryManagerMetaV1),
         ._reserved2 = 0,
         .desc_count = 0,
-        .declared_caps = 0,
+        .declared_caps = declared_caps,
         .core_vtable_offset = @sizeOf(abi.ZapMemoryManagerMetaV1),
         .reserved = 0,
     };
@@ -1471,7 +1451,7 @@ fn synthesizeNoOpPayload() [88]u8 {
         .abi_major = 1,
         .abi_minor = 0,
         .size = @sizeOf(abi.ZapMemoryManagerCoreV1),
-        .declared_caps = 0,
+        .declared_caps = declared_caps,
         .init = stubs.cInit,
         .deinit = stubs.cDeinit,
         .allocate = stubs.cAlloc,
@@ -1487,11 +1467,20 @@ fn synthesizeNoOpPayload() [88]u8 {
 }
 
 /// Build a complete ELF object file in `buffer` whose `.zapmem` section
-/// carries a NoOp-style metadata payload AND whose symbol table exports
+/// carries a NoOp-style metadata payload (declared_caps = 0). Wraps
+/// `synthesizeElfWithCaps`.
+fn synthesizeNoOpElf(buffer: []u8) usize {
+    return synthesizeElfWithCaps(buffer, 0);
+}
+
+/// Build a complete ELF object file in `buffer` whose `.zapmem` section
+/// declares `declared_caps` AND whose symbol table exports
 /// `zap_memory_section` for the section's offset. Returns the number
 /// of bytes written. The symbol-table emission is what lets the
 /// driver's `assertExportsManagerSymbol` pass in the integration test.
-fn synthesizeNoOpElf(buffer: []u8) usize {
+/// Used by both the Phase 3 NoOp integration test (`declared_caps = 0`)
+/// and the Phase 4 ARC integration test (`declared_caps = REFCOUNT_V1_BIT`).
+fn synthesizeElfWithCaps(buffer: []u8, declared_caps: u64) usize {
     // shstrtab layout: index 0 = '\0', then ".shstrtab\0", then
     // ".zapmem\0", then ".symtab\0", then ".strtab\0".
     const shstrtab = "\x00.shstrtab\x00.zapmem\x00.symtab\x00.strtab\x00";
@@ -1506,7 +1495,7 @@ fn synthesizeNoOpElf(buffer: []u8) usize {
     const shdr_table_offset = ehdr_size;
     const shstrtab_offset = shdr_table_offset + shdr_size * @as(u64, shdr_count);
     const zapmem_offset = shstrtab_offset + shstrtab.len;
-    const payload = synthesizeNoOpPayload();
+    const payload = synthesizePayloadWithCaps(declared_caps);
     const symtab_offset = zapmem_offset + payload.len;
     // Two symbols: STN_UNDEF (zero) and `zap_memory_section`.
     const sym_count: u64 = 2;
@@ -1805,6 +1794,105 @@ fn mockForkCompileNoOpMacho(
     return .Ok;
 }
 
+test "Phase 4 integration: ARC manager resolves end-to-end (no short-circuit)" {
+    // Phase 4 removed the built-in ARC short-circuit. Selecting
+    // `Zap.Memory.ARC` (explicitly or via the empty-name default)
+    // now flows through the same source-discovery + compile + parse
+    // + validate pipeline as every other manager. This test asserts:
+    //   1. The driver discovers `Zap.Memory.ARC` from a stdlib-shaped
+    //      `lib/zap/memory/arc.zap`.
+    //   2. The mock fork synthesises an ARC-style object whose
+    //      `.zapmem` section declares REFCOUNT_V1.
+    //   3. `resolve` produces a `ResolvedManager` with a real
+    //      `object_path` (no longer the `null` the short-circuit
+    //      emitted) and `declared_caps == REFCOUNT_V1_BIT`.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/zap/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/arc") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+
+    const stdlib_decl =
+        \\@memory_manager_source = "src/memory/arc/manager.zig"
+        \\
+        \\pub struct Zap.Memory.ARC {
+        \\}
+        \\
+    ;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/zap/memory/arc.zap", .data = stdlib_decl }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/arc/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(stdlib_root);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var resolved = try resolve(
+        allocator,
+        .{
+            .manager_name = "Zap.Memory.ARC",
+            .source_roots = &.{
+                .{ .name = "zap_stdlib", .path = stdlib_root },
+            },
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = cache_root,
+            .fork_compile_fn = mockForkCompileArc,
+        },
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expectEqualStrings("Zap.Memory.ARC", resolved.name);
+    try std.testing.expectEqual(abi.REFCOUNT_V1_BIT, resolved.declared_caps);
+    try std.testing.expect(resolved.object_path != null);
+    std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
+}
+
+/// Mock `ForkCompileFn` for the Phase 4 ARC integration test. Writes
+/// a Phase 4 ARC-style ELF object whose `.zapmem` section declares
+/// REFCOUNT_V1 (matching the production `src/memory/arc/manager.zig`).
+fn mockForkCompileArc(
+    source_path: [*:0]const u8,
+    target: *const ZapForkTarget,
+    optimize: ZapForkOptimize,
+    out_object_path: [*:0]const u8,
+    out_diagnostic_buffer: ?[*]u8,
+    out_diagnostic_capacity: usize,
+    zig_lib_dir_opt: ?[*:0]const u8,
+    local_cache_dir_opt: ?[*:0]const u8,
+    global_cache_dir_opt: ?[*:0]const u8,
+) callconv(.c) ZapForkResult {
+    _ = source_path;
+    _ = target;
+    _ = optimize;
+    _ = out_diagnostic_buffer;
+    _ = out_diagnostic_capacity;
+    _ = zig_lib_dir_opt;
+    _ = local_cache_dir_opt;
+    _ = global_cache_dir_opt;
+
+    var buffer: [4096]u8 = undefined;
+    const written = synthesizeElfWithCaps(&buffer, abi.REFCOUNT_V1_BIT);
+    const path_slice = std.mem.span(out_object_path);
+    if (std.fs.path.dirname(path_slice)) |dir| {
+        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir) catch return .InternalError;
+    }
+    var file = std.Io.Dir.cwd().createFile(std.Options.debug_io, path_slice, .{}) catch return .InternalError;
+    defer file.close(std.Options.debug_io);
+    file.writeStreamingAll(std.Options.debug_io, buffer[0..written]) catch return .InternalError;
+    return .Ok;
+}
+
 test "Phase 3 integration: NoOp manager resolves end-to-end through driver" {
     const allocator = std.testing.allocator;
 
@@ -1859,7 +1947,6 @@ test "Phase 3 integration: NoOp manager resolves end-to-end through driver" {
     );
     defer freeResolved(allocator, &resolved);
 
-    try std.testing.expect(!resolved.is_builtin_default);
     try std.testing.expectEqualStrings("Zap.Memory.NoOp", resolved.name);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
     try std.testing.expect(resolved.object_path != null);
@@ -1920,7 +2007,6 @@ test "Phase 3 integration: NoOp manager resolves end-to-end through driver (Mach
     );
     defer freeResolved(allocator, &resolved);
 
-    try std.testing.expect(!resolved.is_builtin_default);
     try std.testing.expectEqualStrings("Zap.Memory.NoOp", resolved.name);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
     try std.testing.expect(resolved.object_path != null);

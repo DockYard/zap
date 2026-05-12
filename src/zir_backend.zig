@@ -138,8 +138,11 @@ pub const CompileOptions = struct {
     /// build pipeline produces (see `docs/memory-manager-abi.md` section
     /// 10). Spliced into the link line via
     /// `zir_compilation_add_link_object_file` so the manager's `.zapmem`
-    /// section survives static linking. Null for the built-in default
-    /// (`Zap.Memory.ARC`), which uses the runtime's static stub.
+    /// section survives static linking. Phase 4 made this non-optional
+    /// in practice — every Zap binary links a manager `.o`, including
+    /// builds that select the first-party `Zap.Memory.ARC`. The field
+    /// stays nullable so unit tests that bypass the driver can leave
+    /// it unset; production builds always populate it.
     memory_manager_object: ?[]const u8 = null,
     /// Memory Manager ABI v1.0 capability bitmask declared by the
     /// active manager (`docs/memory-manager-abi.md` section 7). Read
