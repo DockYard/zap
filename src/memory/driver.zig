@@ -764,8 +764,13 @@ const MANAGER_SYMBOL_NAME = "zap_memory_section";
 /// entry. The section validator above only inspects the section
 /// contents; without this complementary check, a manager that emitted
 /// the section bytes under a different symbol name would link cleanly
-/// but resolve the runtime weak-extern to null at startup, silently
-/// falling back to the built-in ARC vtable.
+/// but resolve the runtime weak-extern to null at startup. Phase 4
+/// ripped the in-runtime ARC stub out entirely, so a null weak
+/// extern in a production binary now means the first
+/// `ArcRuntime.allocAny` / `retainAny` / `releaseAny` / `headerRetain`
+/// / `headerRelease` dispatch panics with "dispatched with no active
+/// memory manager". Catching the symbol-name mismatch at build time
+/// gives a much better diagnostic than that runtime panic.
 fn assertExportsManagerSymbol(
     manager_name: []const u8,
     object_bytes: []const u8,
@@ -1601,12 +1606,22 @@ fn synthesizeElfWithCaps(buffer: []u8, declared_caps: u64) usize {
     return @intCast(total);
 }
 
-/// Build a complete Mach-O 64-bit object file whose `__DATA,__zapmem`
-/// section carries a NoOp-style metadata payload AND whose symbol table
-/// exports `_zap_memory_section` (Mach-O prefixes external C symbols
-/// with a leading underscore). Returns the number of bytes written.
-/// Used by the Mach-O sibling integration test.
+/// Build a complete Mach-O 64-bit object file in `buffer` whose
+/// `__DATA,__zapmem` section carries a NoOp-style metadata payload
+/// (declared_caps = 0). Wraps `synthesizeMachoWithCaps`.
 fn synthesizeNoOpMacho(buffer: []u8) usize {
+    return synthesizeMachoWithCaps(buffer, 0);
+}
+
+/// Build a complete Mach-O 64-bit object file whose `__DATA,__zapmem`
+/// section carries a metadata payload declaring `declared_caps` AND
+/// whose symbol table exports `_zap_memory_section` (Mach-O prefixes
+/// external C symbols with a leading underscore). Returns the number
+/// of bytes written. Used by both the Phase 3 NoOp Mach-O integration
+/// test (`declared_caps = 0`) and the Phase 4 ARC Mach-O integration
+/// test (`declared_caps = REFCOUNT_V1_BIT`). Sibling of
+/// `synthesizeElfWithCaps`.
+fn synthesizeMachoWithCaps(buffer: []u8, declared_caps: u64) usize {
     const header_size: usize = @sizeOf(std.macho.mach_header_64);
     const seg_size: usize = @sizeOf(std.macho.segment_command_64);
     const sect_size: usize = @sizeOf(std.macho.section_64);
@@ -1624,7 +1639,7 @@ fn synthesizeNoOpMacho(buffer: []u8) usize {
     @memcpy(strtab_buf[1..][0..sym_name.len], sym_name);
     strtab_buf[1 + sym_name.len] = 0;
 
-    const payload = synthesizeNoOpPayload();
+    const payload = synthesizePayloadWithCaps(declared_caps);
 
     // Layout: header → LC_SEGMENT_64(__DATA + 1 section) → LC_SYMTAB →
     // payload bytes → symbol table → string table.
@@ -1891,6 +1906,104 @@ fn mockForkCompileArc(
     defer file.close(std.Options.debug_io);
     file.writeStreamingAll(std.Options.debug_io, buffer[0..written]) catch return .InternalError;
     return .Ok;
+}
+
+/// Mach-O sibling of `mockForkCompileArc`. Writes a Phase 4 ARC-style
+/// Mach-O 64-bit object whose `__DATA,__zapmem` section declares
+/// REFCOUNT_V1 (matching the production `src/memory/arc/manager.zig`)
+/// and whose symbol table exports `_zap_memory_section`. Drives the
+/// Phase 4 ARC Mach-O integration test so the macOS dev-host code path
+/// has parity with the Linux ELF path.
+fn mockForkCompileArcMacho(
+    source_path: [*:0]const u8,
+    target: *const ZapForkTarget,
+    optimize: ZapForkOptimize,
+    out_object_path: [*:0]const u8,
+    out_diagnostic_buffer: ?[*]u8,
+    out_diagnostic_capacity: usize,
+    zig_lib_dir_opt: ?[*:0]const u8,
+    local_cache_dir_opt: ?[*:0]const u8,
+    global_cache_dir_opt: ?[*:0]const u8,
+) callconv(.c) ZapForkResult {
+    _ = source_path;
+    _ = target;
+    _ = optimize;
+    _ = out_diagnostic_buffer;
+    _ = out_diagnostic_capacity;
+    _ = zig_lib_dir_opt;
+    _ = local_cache_dir_opt;
+    _ = global_cache_dir_opt;
+
+    var buffer: [4096]u8 = undefined;
+    const written = synthesizeMachoWithCaps(&buffer, abi.REFCOUNT_V1_BIT);
+    const path_slice = std.mem.span(out_object_path);
+    if (std.fs.path.dirname(path_slice)) |dir| {
+        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir) catch return .InternalError;
+    }
+    var file = std.Io.Dir.cwd().createFile(std.Options.debug_io, path_slice, .{}) catch return .InternalError;
+    defer file.close(std.Options.debug_io);
+    file.writeStreamingAll(std.Options.debug_io, buffer[0..written]) catch return .InternalError;
+    return .Ok;
+}
+
+test "Phase 4 integration: ARC manager resolves end-to-end (Mach-O)" {
+    // Mach-O sibling of the Phase 4 ELF integration test above. Walks
+    // the same source-discovery + compile + parse + validate pipeline
+    // but with a Mach-O 64-bit object whose `__DATA,__zapmem` section
+    // declares REFCOUNT_V1. This catches Mach-O-specific drift in the
+    // section parser, the symbol-table inspector, and the REFCOUNT_V1
+    // capability discovery path — none of which the Linux-only ELF
+    // path can exercise.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/zap/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/arc") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+
+    const stdlib_decl =
+        \\@memory_manager_source = "src/memory/arc/manager.zig"
+        \\
+        \\pub struct Zap.Memory.ARC {
+        \\}
+        \\
+    ;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/zap/memory/arc.zap", .data = stdlib_decl }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/arc/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(stdlib_root);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var resolved = try resolve(
+        allocator,
+        .{
+            .manager_name = "Zap.Memory.ARC",
+            .source_roots = &.{
+                .{ .name = "zap_stdlib", .path = stdlib_root },
+            },
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = cache_root,
+            .fork_compile_fn = mockForkCompileArcMacho,
+        },
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expectEqualStrings("Zap.Memory.ARC", resolved.name);
+    try std.testing.expectEqual(abi.REFCOUNT_V1_BIT, resolved.declared_caps);
+    try std.testing.expect(resolved.object_path != null);
+    std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
 }
 
 test "Phase 3 integration: NoOp manager resolves end-to-end through driver" {

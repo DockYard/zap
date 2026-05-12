@@ -452,17 +452,6 @@ pub const ArcHeader = extern struct {
         return self.ref_count.load(.acquire);
     }
 
-    /// Non-generic retain for use from ZIR — takes an opaque pointer to an ArcHeader.
-    pub fn retainOpaque(ptr: *anyopaque) void {
-        const header: *ArcHeader = @ptrCast(@alignCast(ptr));
-        header.retain();
-    }
-
-    /// Non-generic release for use from ZIR — returns true if the caller should free.
-    pub fn releaseOpaque(ptr: *anyopaque) bool {
-        const header: *ArcHeader = @ptrCast(@alignCast(ptr));
-        return header.release();
-    }
 };
 
 // ============================================================
@@ -497,9 +486,7 @@ export fn zap_runtime_atomic_add_u32_acq_rel(ptr: *u32, delta: u32) callconv(.c)
     // ordering for the cell's final-release semantics. The runtime's
     // `ArcHeader.release` uses the same ordering (`acq_rel`) when
     // it operates directly on `header.ref_count` without dispatching
-    // through the active manager (currently a vestigial path —
-    // `ArcHeader.releaseOpaque` is only called from atexit/test
-    // paths after Phase 4).
+    // through the active manager.
     const atomic_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(ptr));
     return atomic_ptr.fetchAdd(delta, .acq_rel);
 }
@@ -779,13 +766,24 @@ var zap_memory_shutdown_complete: bool = false;
 // equivalent of the external ARC manager, guarded by
 // `builtin.is_test`.
 //
-// `test_only_arc_*` mirrors `src/memory/arc/manager.zig` byte-for-
-// byte: the same REFCOUNT_V1 declaration, the same atomic-on-offset-0
-// retain/release semantics, the same `c_allocator`-backed raw
-// `allocate` / `deallocate`. Production builds compile this code
-// out via the `is_test` guard; the symbol references survive because
-// `zap_active_manager_core`'s default initialiser depends on
-// `test_only_arc_core` only when `builtin.is_test` is true.
+// `test_only_arc_*` mirrors `src/memory/arc/manager.zig`: the same
+// REFCOUNT_V1 declaration and the same atomic-on-offset-0 retain/
+// release semantics. The retain path uses `monotonic` ordering on the
+// `std.atomic.Value(u32)` wrapper here, which lowers to the same
+// `LDADD` / `LOCK XADD` instruction as the production manager's
+// `acq_rel` `zap_runtime_atomic_add_u32_acq_rel` helper modulo the
+// fence (the release fence in `acq_rel` is a no-op on the increment
+// path because there is no prior writeback to publish); the divergence
+// is documented because the test path cannot call into the production
+// helper without re-entering its own atomic-helper export. The raw
+// `allocate` / `deallocate` slots return null / no-op exactly like
+// the production manager (the runtime never dispatches user-visible
+// allocations through these slots in v1.0 — see the architecture
+// note in `src/memory/arc/manager.zig`). Production builds compile
+// this code out via the `is_test` guard; the symbol references
+// survive because `zap_active_manager_core`'s default initialiser
+// depends on `test_only_arc_core` only when `builtin.is_test` is
+// true.
 //
 // Drift risk: if `src/memory/arc/manager.zig` changes its retain or
 // release semantics in a way that breaks observability in tests,
@@ -816,13 +814,25 @@ fn testOnlyArcDeinit(ctx: *anyopaque) callconv(.c) void {
     _ = ctx;
 }
 
+/// Raw allocation slot mirroring `src/memory/arc/manager.zig`'s
+/// `arcAllocate`: always returns `null` (the spec's documented OOM
+/// signal). The runtime never dispatches user-visible allocations
+/// through this slot in v1.0 — inline-header types own their
+/// allocator selection and the typed slab pool uses `mmap` directly —
+/// so any caller that does reach it triggers the spec §4.3.1
+/// OOM-abort diagnostic. Returning `null` here keeps the test-only
+/// manager byte-faithful with the production manager and avoids any
+/// libc / page-allocator dependency for the test build.
 fn testOnlyArcAllocateRaw(ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8 {
     _ = ctx;
-    if (size == 0) return null;
-    const align_mem = std.mem.Alignment.fromByteUnits(@max(alignment, 1));
-    return std.heap.c_allocator.rawAlloc(size, align_mem, @returnAddress());
+    _ = size;
+    _ = alignment;
+    return null;
 }
 
+/// Raw deallocation slot mirroring `src/memory/arc/manager.zig`'s
+/// `arcDeallocate`: no-op because `testOnlyArcAllocateRaw` never
+/// returns a non-null pointer.
 fn testOnlyArcDeallocateRaw(
     ctx: *anyopaque,
     ptr: [*]u8,
@@ -830,9 +840,9 @@ fn testOnlyArcDeallocateRaw(
     alignment: u32,
 ) callconv(.c) void {
     _ = ctx;
-    if (size == 0) return;
-    const align_mem = std.mem.Alignment.fromByteUnits(@max(alignment, 1));
-    std.heap.c_allocator.rawFree(ptr[0..size], align_mem, @returnAddress());
+    _ = ptr;
+    _ = size;
+    _ = alignment;
 }
 
 fn testOnlyArcGetCapabilityDesc(
@@ -846,8 +856,20 @@ fn testOnlyArcGetCapabilityDesc(
 
 /// REFCOUNT_V1 `retain` for cells with the refcount at offset 0.
 /// Atomic increment on the 4-byte refcount with `monotonic` ordering
-/// (the release fence lives in `testOnlyArcRelease`). Mirrors
-/// `src/memory/arc/manager.zig`'s `arcRetain`.
+/// (the release fence lives in `testOnlyArcRelease`).
+///
+/// Ordering note: the production manager in `src/memory/arc/manager.zig`
+/// emits `acq_rel` on retain too, by calling the externalised
+/// `zap_runtime_atomic_add_u32_acq_rel` helper. This test-only path
+/// uses `monotonic` because `acq_rel` ⊇ `monotonic` (every observation
+/// the strict ordering would establish is also established by the
+/// release path's `acq_rel` fence) — the two paths are observationally
+/// equivalent for the spec's refcount contract. Calling the production
+/// helper from this function would re-enter the same compilation unit,
+/// inflating test build time and offering no observable benefit. A
+/// future Phase 4.x convergence is to unify both paths on a shared
+/// `acq_rel` helper once the test-only manager can dlopen the same
+/// object the production build links against.
 fn testOnlyArcRetain(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
     _ = ctx;
     const refcount_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(object));
@@ -905,15 +927,20 @@ pub const test_only_arc_core: AbiV1.ZapMemoryManagerCoreV1 = .{
 // ----------------------------------------------------------------
 // External-manager bootstrap (Phase 3, spec section 10.2).
 //
-// When the Zap-side memory driver compiles and links a non-default
-// manager `.o` (anything other than `Zap.Memory.ARC`), that object's
-// `.zapmem` section ships in the binary as a single composite
+// Every production Zap binary links an external manager `.o` — the
+// first-party `src/memory/arc/manager.zig` by default, or whatever
+// the manifest's `memory:` field selects. That object's `.zapmem`
+// section ships in the binary as a single composite
 // `ZapMemorySection` symbol exported under the conventional name
 // `zap_memory_section`. The runtime detects the symbol via a weakly-
 // linked extern reference: when the symbol resolves, its `core` field
-// becomes the active manager's core vtable; when it does not resolve,
-// the weak pointer is null and the runtime falls through to the built-
-// in ARC stub.
+// becomes the active manager's core vtable. The weak-linkage choice
+// is what makes the test-build path possible: `zig build test`
+// compiles the runtime module directly without going through the
+// production build pipeline, so no manager `.o` is linked and the
+// weak symbol resolves to null. In that case the runtime falls
+// through to the `test_only_arc_*` fallback defined above (see the
+// "Test-only ARC manager fallback" block).
 //
 // We model only the leading prefix of the section here — the meta
 // header followed by the core vtable — because the runtime never
@@ -922,16 +949,15 @@ pub const test_only_arc_core: AbiV1.ZapMemoryManagerCoreV1 = .{
 // link step, so the runtime treats `core` as the authoritative
 // entrypoint.
 //
-// Weak linkage is critical: a default-ARC build links no external
-// manager and the symbol is genuinely absent. A strong extern would
-// produce an unresolved-symbol link error. Weak references resolve to
-// null when the symbol is missing — exactly the discrimination the
-// bootstrap needs.
+// Weak linkage is critical: in a test build the symbol is genuinely
+// absent. A strong extern would produce an unresolved-symbol link
+// error. Weak references resolve to null when the symbol is missing —
+// exactly the discrimination the bootstrap needs to fall back to the
+// `test_only_arc_*` path.
 //
-// The Phase 3 bootstrap path is deliberately minimal: detect, validate,
-// re-point. Phase 4 will use the rebinding as the pivot for ripping
-// out the built-in stub entirely once `Zap.Memory.ARC` is its own
-// linkable manager package.
+// Phase 4 ripped the in-runtime ARC stub out entirely; the rebinding
+// here is now the only path through which a production binary
+// acquires a refcount-capable manager.
 // ----------------------------------------------------------------
 
 /// Shape of the external manager's `.zapmem` section payload. Mirrors
@@ -953,19 +979,24 @@ const ExternalMemorySectionPrefix = extern struct {
 };
 
 /// Weakly-linked external symbol exported by the active memory manager
-/// object file (the build driver compiles and links one when the
-/// manifest selects a non-default manager). The pointer resolves to
-/// null in default-ARC builds where no manager `.o` is linked.
+/// object file. Every production Zap binary links exactly one such
+/// `.o` — the first-party `src/memory/arc/manager.zig` by default,
+/// or whatever the manifest's `memory:` field selects — so in
+/// production this pointer always resolves to a real section.
 ///
 /// Declared via `@extern` with `.linkage = .weak` so the linker accepts
-/// "symbol not found" as a valid resolution that yields null.
+/// "symbol not found" as a valid resolution that yields null. The
+/// "yields null" branch is exercised only by `zig build test`, where
+/// the runtime module compiles directly without going through the
+/// libzap_compiler.a-driven binary pipeline that would otherwise
+/// produce and link a manager `.o`.
 ///
-/// In test builds (`zig build test`) the runtime module is compiled
-/// without linking against the libzap_compiler.a-driven binary
-/// pipeline, so the weak symbol's "missing → null" semantics aren't
-/// available — the link step would still reject the undefined ref.
-/// The `is_test` gate substitutes a literal `null` so test builds
-/// uniformly take the built-in ARC path. The compiler-driven binary
+/// In test builds the link step would still reject an undefined weak
+/// reference, so the `is_test` gate substitutes a literal `null`.
+/// The test path then falls through to the `test_only_arc_*` vtable
+/// declared in the "Test-only ARC manager fallback" block above
+/// (`zap_active_manager_core` is initialised to `&test_only_arc_core`
+/// when `builtin.is_test` is true). The compiler-driven binary
 /// pipeline retains the real weak extern.
 fn externalMemorySection() ?*const ExternalMemorySectionPrefix {
     if (builtin.is_test) return null;
@@ -3045,6 +3076,15 @@ pub const ArcRuntime = struct {
         if (zap_active_manager_core == null) {
             @panic("zap runtime: allocAny dispatched with no active memory manager");
         }
+        if (zap_active_refcount_capability == null) {
+            // `Arc(T)` cells are inherently refcounted; allocating one under a
+            // manager that does not declare REFCOUNT_V1 would silently succeed
+            // here and only blow up on the eventual `release` path, leaving a
+            // misleading stack trace far from the original allocation site.
+            // Panic loudly at the alloc-time call site instead — the same
+            // soundness argument as `releaseAny` / `retainAny`.
+            @panic("zap runtime: allocAny dispatched but active manager does not declare REFCOUNT_V1");
+        }
         return dispatcherAllocImpl(T, allocator, value);
     }
 
@@ -3246,6 +3286,13 @@ pub const ArcRuntime = struct {
             if (hasInlineArcHeader(T))
                 @compileError("prepareReleaseAny: inline-header types must release via T.release, not the generic Arc pool");
         }
+        // Dispatcher consistency: every other public Arc(T) entry point
+        // panics on memory dispatch after shutdown; the split-phase pair
+        // honours the same contract. (The Phase 4.x vtable-bypass note
+        // below is a separate concern about the typed-slab path.)
+        if (zap_memory_shutdown_complete) {
+            @panic("zap runtime: memory dispatch after shutdown");
+        }
         // Phase 4.x deferral: this split-phase entry point bypasses
         // the REFCOUNT_V1 vtable. The split-phase borrow-elision API
         // is not part of the spec's vtable surface yet — a future
@@ -3265,6 +3312,13 @@ pub const ArcRuntime = struct {
     /// argument is vestigial — see `allocAny` and `ArcPool`.
     pub fn destroyPreparedAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) void {
         _ = allocator;
+        // Dispatcher consistency: every other public Arc(T) entry point
+        // panics on memory dispatch after shutdown; the split-phase pair
+        // honours the same contract. (The Phase 4.x vtable-bypass note
+        // below is a separate concern about the typed-slab path.)
+        if (zap_memory_shutdown_complete) {
+            @panic("zap runtime: memory dispatch after shutdown");
+        }
         // Phase 4.x deferral: pairs with `prepareReleaseAny` — the
         // storage-free half of the split-phase API also bypasses the
         // core vtable. The future Phase 4.x rework routes this
@@ -8834,7 +8888,9 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
             if (source) |src| {
                 // The source's `Map.release` handles its own rc;
                 // recursively dispatches back through the active
-                // manager (Phase 2: still the built-in ARC stub).
+                // manager — the external manager `.o` linked at build
+                // time (`src/memory/arc/manager.zig` by default) in
+                // production, or `test_only_arc_*` in test builds.
                 MapT.release(src);
             }
         }
@@ -12342,6 +12398,25 @@ test "Phase 4 ABI: test-only ARC core vtable shape matches spec" {
     try std.testing.expectEqual(@as(u16, 0), core.abi_minor);
     try std.testing.expectEqual(@as(u32, @sizeOf(AbiV1.ZapMemoryManagerCoreV1)), core.size);
     try std.testing.expectEqual(@as(u64, 1), core.declared_caps);
+
+    // Function-pointer identity asserts: catch a reorder of the
+    // struct-field initialiser in `test_only_arc_core`'s declaration.
+    // Without these, swapping (say) `init`'s slot with `deinit`'s
+    // initialiser would compile cleanly — both have callconv(.c)
+    // signatures the field types coerce into — and pass every
+    // shape-level assertion above; only an actual dispatch would
+    // surface the swap, and even then only on a slot that's invoked
+    // in test (`init` runs via `zapMemoryStartup`, `deinit` only via
+    // atexit, etc.). Comparing the function-pointer identity here
+    // catches the drift at the next test pass.
+    try std.testing.expectEqual(@as(@TypeOf(core.init), testOnlyArcInit), core.init);
+    try std.testing.expectEqual(@as(@TypeOf(core.deinit), testOnlyArcDeinit), core.deinit);
+    try std.testing.expectEqual(@as(@TypeOf(core.allocate), testOnlyArcAllocateRaw), core.allocate);
+    try std.testing.expectEqual(@as(@TypeOf(core.deallocate), testOnlyArcDeallocateRaw), core.deallocate);
+    try std.testing.expectEqual(
+        @as(@TypeOf(core.get_capability_desc), testOnlyArcGetCapabilityDesc),
+        core.get_capability_desc,
+    );
 
     // Confirm that `get_capability_desc(REFC_TAG)` returns a
     // well-formed descriptor and that an unknown tag yields null.
