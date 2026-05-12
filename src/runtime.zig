@@ -676,16 +676,17 @@ export fn zap_runtime_atomic_add_u32_acq_rel(ptr: *u32, delta: u32) callconv(.c)
 // mirrored here; the `comptime` size asserts on each shape are the
 // drift tripwire.
 //
-// The indirection layer:
-//   * `zap_memory_manager_context` — populated by the active manager's
-//     `init()` at startup, consumed by every call site as the
-//     manager's per-process state pointer.
-//   * `zap_active_manager_core` — the active core vtable, validated
-//     and bound at startup from the externally-linked manager's
-//     `.zapmem` section.
-//   * `zap_active_refcount_capability` — the active REFCOUNT_V1
-//     capability vtable when the manager declares the bit; null
-//     otherwise.
+// The indirection layer (all fields of the module-private
+// `active_manager_state` struct introduced in Phase 6):
+//   * `active_manager_state.context` — populated by the active
+//     manager's `init()` at startup, consumed by every call site as
+//     the manager's per-process state pointer.
+//   * `active_manager_state.core` — the active core vtable,
+//     validated and bound at startup from the externally-linked
+//     manager's `.zapmem` section.
+//   * `active_manager_state.refcount_capability` — the active
+//     REFCOUNT_V1 capability vtable when the manager declares the
+//     bit; null otherwise.
 //
 // After Phase 4 there is no built-in ARC stub in the runtime: every
 // Zap binary links a manager `.o` (the first-party
@@ -727,7 +728,7 @@ export fn zap_runtime_atomic_add_u32_acq_rel(ptr: *u32, delta: u32) callconv(.c)
 // `Zap.Memory.Arena` structdoc, the Phase 6 codegen-elision plan,
 // any future diagnostics layer) relies on the `REFCOUNT_V1` token
 // appearing verbatim in the panic text. Every panic site in this
-// file that gates on `zap_active_refcount_capability == null` is
+// file that gates on `active_manager_state.refcount_capability == null` is
 // audited to honor this contract; grep for `REFCOUNT_V1` to verify.
 //
 // **Refcount-read exemption.** `refCountAny` and similar refcount-READ
@@ -831,7 +832,7 @@ pub const ACTIVE_MANAGER_TAG: ActiveManagerTag = RUNTIME_ACTIVE_MANAGER_TAG_DEFA
 ///
 /// The `.third_party` arm intentionally returns `false`: third-party
 /// builds always route through the vtable, where the capability's
-/// presence is checked dynamically via the `zap_active_refcount_capability`
+/// presence is checked dynamically via the `active_manager_state.refcount_capability`
 /// global. The dispatcher uses that runtime check instead of this
 /// comptime predicate under `.third_party`.
 pub fn managerHasRefcountV1(comptime tag: ActiveManagerTag) bool {
@@ -839,7 +840,7 @@ pub fn managerHasRefcountV1(comptime tag: ActiveManagerTag) bool {
         .arc => true,
         .arena, .no_op, .leak, .tracking => false,
         // Third-party builds dispatch through the vtable and check the
-        // capability dynamically via `zap_active_refcount_capability`.
+        // capability dynamically via `active_manager_state.refcount_capability`.
         .third_party => false,
     };
 }
@@ -1065,8 +1066,10 @@ pub const AbiV1 = struct {
 /// dispatcher's state (`zap_memory_manager_context`,
 /// `zap_active_manager_core`, `zap_active_refcount_capability`,
 /// `zap_active_refcount_has_sized_extension`, `zap_memory_started`,
-/// `zap_memory_shutdown_complete`) are now packed into one
-/// module-private struct. Every previous field is preserved verbatim;
+/// `zap_memory_shutdown_complete`) are now packed into this single
+/// module-private struct as the fields `context`, `core`,
+/// `refcount_capability`, `refcount_has_sized_extension`, `started`,
+/// and `shutdown_complete`. Every previous field is preserved verbatim;
 /// only the storage location changes.
 ///
 /// ## Why a single struct
@@ -1193,7 +1196,7 @@ var active_manager_state: ActiveManagerState = .{
 // `*const AbiV1.ZapRefcountCapabilityV1` cast over a 16-byte image
 // would alias slots 2-5 over out-of-bounds memory; the current
 // dispatchers gate every v1.1 slot access on
-// `zap_active_refcount_has_sized_extension` so the aliased bytes are
+// `active_manager_state.refcount_has_sized_extension` so the aliased bytes are
 // never actually read, but a future code change that drops the gate
 // would dereference garbage.
 //
@@ -1205,7 +1208,7 @@ var active_manager_state: ActiveManagerState = .{
 // the regression at the dispatch site rather than at the corruption
 // downstream.
 //
-// `zap_active_refcount_capability` is then pointed at this composed
+// `active_manager_state.refcount_capability` is then pointed at this composed
 // buffer instead of at the raw user vtable. All dispatchers that
 // consult the cap pointer therefore see a fully-populated 48-byte
 // struct, and dropping the `has_sized_extension` gate would surface
@@ -1224,7 +1227,7 @@ var v1_0_composed_refcount_vtable: AbiV1.ZapRefcountCapabilityV1 = undefined;
 /// Trap stub for the v1.1 `retain_sized` slot under a v1.0 manager.
 /// Reaching this stub means a dispatcher consulted slot 2 of the
 /// refcount capability vtable despite
-/// `zap_active_refcount_has_sized_extension == false` — either the
+/// `active_manager_state.refcount_has_sized_extension == false` — either the
 /// dispatcher's gate is missing or a build-pipeline bug routed a
 /// generic `Arc(T)` allocation through `retain_sized` under a v1.0
 /// manager. Both cases are unrecoverable; panic loudly so the
@@ -1293,7 +1296,7 @@ fn v1_0_trap_refcount_sized(
 /// REFCOUNT_V1_SIZE_V1_1`), copy the user-provided `retain` /
 /// `release` slots into `v1_0_composed_refcount_vtable` and stuff
 /// trap stubs into the v1.1 extension slots. Points
-/// `zap_active_refcount_capability` at the composed buffer in that
+/// `active_manager_state.refcount_capability` at the composed buffer in that
 /// case; otherwise points it directly at the user vtable.
 ///
 /// Hoisted out of `zapMemoryStartup` so the test-only descriptor swap
@@ -1363,7 +1366,7 @@ fn bindRefcountCapability(desc: *const AbiV1.ZapCapabilityDescV1) void {
 // allocations through these slots in v1.0 — see the architecture
 // note in `src/memory/arc/manager.zig`). Production builds compile
 // this code out via the `is_test` guard; the symbol references
-// survive because `zap_active_manager_core`'s default initialiser
+// survive because `active_manager_state.core`'s default initialiser
 // depends on `test_only_arc_core` only when `builtin.is_test` is
 // true.
 //
@@ -1973,7 +1976,7 @@ const test_only_arc_refcount_descriptor: AbiV1.ZapCapabilityDescV1 = .{
 /// `release`. The struct is exactly 16 bytes — matches
 /// `REFCOUNT_V1_SIZE_V1_0` — so a descriptor referencing it
 /// exercises the runtime's v1.0 forward-compatibility branch
-/// (`!zap_active_refcount_has_sized_extension`).
+/// (`!active_manager_state.refcount_has_sized_extension`).
 ///
 /// The two slot functions are reused from the v1.1 vtable above
 /// because the v1.0 contract is a subset: `retain(ctx, object)` /
@@ -2056,7 +2059,7 @@ fn installRefcountCapabilityForTest(desc: *const AbiV1.ZapCapabilityDescV1) void
 }
 
 /// Test-only ARC core vtable. The compile-time default value of
-/// `zap_active_manager_core` points here in test builds; in
+/// `active_manager_state.core` points here in test builds; in
 /// production builds the default is `null` and the externally-linked
 /// manager `.o` provides the active vtable via the `.zapmem` section.
 pub const test_only_arc_core: AbiV1.ZapMemoryManagerCoreV1 = .{
@@ -2142,7 +2145,7 @@ const ExternalMemorySectionPrefix = extern struct {
 /// reference, so the `is_test` gate substitutes a literal `null`.
 /// The test path then falls through to the `test_only_arc_*` vtable
 /// declared in the "Test-only ARC manager fallback" block above
-/// (`zap_active_manager_core` is initialised to `&test_only_arc_core`
+/// (`active_manager_state.core` is initialised to `&test_only_arc_core`
 /// when `builtin.is_test` is true). The compiler-driven binary
 /// pipeline retains the real weak extern.
 fn externalMemorySection() ?*const ExternalMemorySectionPrefix {
@@ -2153,7 +2156,7 @@ fn externalMemorySection() ?*const ExternalMemorySectionPrefix {
     );
 }
 
-/// Re-point `zap_active_manager_core` at the externally-linked manager
+/// Re-point `active_manager_state.core` at the externally-linked manager
 /// if one is present. Called once at the top of `zapMemoryStartup`
 /// before any vtable function fires.
 ///
@@ -2207,7 +2210,7 @@ fn maybeBindExternalManager() void {
     }
 
     // Re-point the active core vtable. In production builds the
-    // runtime had `zap_active_manager_core` initialised to null and
+    // runtime had `active_manager_state.core` initialised to null and
     // this is the first non-null assignment. In test builds the
     // compile-time default pointed at `&test_only_arc_core`; this
     // function returns early on the `is_test` branch (via
@@ -2247,7 +2250,7 @@ fn zapMemoryStartup() void {
     // the active manager's vtable. Phase 4 removed the built-in ARC
     // stub from the runtime so this binding is the SOLE source of
     // the active manager in production builds. In test builds the
-    // compile-time default of `zap_active_manager_core` points at
+    // compile-time default of `active_manager_state.core` points at
     // the in-source `test_only_arc_core` fallback and
     // `maybeBindExternalManager` returns early (the weak extern is
     // not linked under `zig build test`).
@@ -2406,13 +2409,13 @@ fn zapMemoryShutdown() void {
         "zap runtime: shutdown invoked with a started manager but no live context (internal bug)",
     );
     core.deinit(ctx);
-    // Deliberately do NOT reset `zap_memory_started`, null
-    // `zap_active_manager_core`, or null `zap_memory_manager_context`.
+    // Deliberately do NOT reset `active_manager_state.started`, null
+    // `active_manager_state.core`, or null `active_manager_state.context`.
     // The spec (§10.2) requires that the context be written exactly
     // once during the program's lifetime; observability of the
-    // post-shutdown state is preserved by leaving the globals at
+    // post-shutdown state is preserved by leaving the fields at
     // their last-known values. The dispatchers detect post-shutdown
-    // dispatch via `zap_memory_shutdown_complete` instead.
+    // dispatch via `active_manager_state.shutdown_complete` instead.
     active_manager_state.shutdown_complete = true;
 }
 
@@ -2424,13 +2427,13 @@ fn zapMemoryShutdown() void {
 /// Reentrancy and static initialisation guarantees:
 ///
 ///  1. Reentrancy: the first call enters `zapMemoryStartup`, which
-///     guards its own body with `if (zap_memory_started) return`
+///     guards its own body with `if (active_manager_state.started) return`
 ///     placed BEFORE any work runs. If anything inside
 ///     `zapMemoryStartup` (for example, the manager's `init()` or its
 ///     descriptor lookup) somehow re-entered `ensureMemoryStartup`,
-///     the recursive call would observe `zap_memory_started == false`
+///     the recursive call would observe `active_manager_state.started == false`
 ///     and re-enter `zapMemoryStartup` — at which point that nested
-///     call would also see `zap_memory_started == false` and proceed
+///     call would also see `active_manager_state.started == false` and proceed
 ///     to call `core.init()` a SECOND time. The flag is set at the
 ///     END of `zapMemoryStartup`, so the recursion guard is currently
 ///     defensive but does NOT prevent a misbehaved manager from being
@@ -3487,7 +3490,7 @@ pub const ArcRuntime = struct {
     /// Phase 4.x closed the previous typed-slab-pool bypass: every
     /// `Arc(T)` allocation now flows through the manager's vtable so
     /// tracking managers can observe the cell's lifecycle end-to-end.
-    pub fn allocAny(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
+    pub inline fn allocAny(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
         // Phase 6: under no-REFCOUNT_V1 the slab pool's side-table
         // refcount layout has no semantic meaning, but the value
         // ITSELF still needs heap-backed storage so the indirect-
@@ -3508,7 +3511,7 @@ pub const ArcRuntime = struct {
             // `ensureMemoryStartup` call binds the active manager
             // lazily on first dispatch. Without these guards, the
             // first `allocAny` call in an Arena/NoOp build would
-            // observe `zap_active_manager_core == null` (because
+            // observe `active_manager_state.core == null` (because
             // startup binding only happens inside `ensureMemoryStartup`)
             // and crash before the null-check below could produce a
             // useful panic message.
@@ -3559,7 +3562,7 @@ pub const ArcRuntime = struct {
 
     /// Runtime-side dispatcher implementation of `allocAny`. Phase 4.x:
     /// when the active manager exposes the v1.1 side-table extension
-    /// (`zap_active_refcount_has_sized_extension`), routes through
+    /// (`active_manager_state.refcount_has_sized_extension`), routes through
     /// `allocate_refcounted` — the manager initialises the side-table
     /// refcount to 1 and returns a slot whose bytes are 100% user
     /// payload. Under a v1.0 manager (no extension) routes through
@@ -3857,7 +3860,7 @@ pub const ArcRuntime = struct {
     ///
     /// Validation mirrors `releaseAny` — the dispatcher refuses to
     /// dispatch against a manager that does not declare REFCOUNT_V1.
-    pub fn freeAny(allocator: std.mem.Allocator, ptr: anytype) void {
+    pub inline fn freeAny(allocator: std.mem.Allocator, ptr: anytype) void {
         if (comptime !refcount_v1_active) {
             // Phase 6 lifecycle pairing: under no-REFCOUNT_V1, every
             // `allocAny` call routed through `core.allocate` (see the
@@ -4368,8 +4371,8 @@ pub const ArcRuntime = struct {
     /// active manager's `retain_sized` slot, which locates the cell's
     /// slab via pointer masking and atomic-increments the side-table
     /// refcount. The public entry (`retainAny`) has already validated
-    /// `zap_active_refcount_capability != null` and
-    /// `zap_memory_manager_context != null`; the dispatcher therefore
+    /// `active_manager_state.refcount_capability != null` and
+    /// `active_manager_state.context != null`; the dispatcher therefore
     /// reads both via unchecked unwrap with `.?`, letting the compiler
     /// fold the redundant null guard.
     fn dispatcherRetainImpl(ptr: anytype) void {
@@ -13375,7 +13378,7 @@ test "ArcRuntime.releaseAny invokes per-type deep-walk on the zero-transition" {
 }
 
 test "Phase 4 ABI: ARC manager is bound by default in test builds" {
-    // The compile-time default of `zap_active_manager_core` points at
+    // The compile-time default of `active_manager_state.core` points at
     // the test-only ARC fallback in test builds (production binaries
     // bind the externally-linked manager via `maybeBindExternalManager`).
     // Touching any ARC entry point arms the startup hook, validates
@@ -13592,7 +13595,7 @@ test "Phase 4 dispatch: managerHasRefcountV1 partitions tags by capability decla
     // other first-party manager (Arena, NoOp, Leak, Tracking) exposes
     // the uniform interface with panic stubs. The `.third_party` arm
     // also returns false — third-party builds dispatch through the
-    // vtable and consult `zap_active_refcount_capability` dynamically
+    // vtable and consult `active_manager_state.refcount_capability` dynamically
     // rather than relying on this comptime predicate. A change to any
     // of these answers would silently miscompile the runtime under one
     // of the affected managers; pin the classifier here so a future
@@ -16442,7 +16445,7 @@ fn cleanupSlabPool(pool: *TestOnlyArcSlabPool.SlabPool) void {
 //     and `refCountAny`
 //
 // In a default `zig build test` run the test-only manager always
-// advertises `desc.size = 48`, so `zap_active_refcount_has_sized_extension`
+// advertises `desc.size = 48`, so `active_manager_state.refcount_has_sized_extension`
 // is true and the v1.0 branches never fire. These tests install a
 // parallel v1.0 descriptor (`test_only_arc_v1_0_refcount_descriptor`,
 // size = 16) via `installRefcountCapabilityForTest`, exercise the
