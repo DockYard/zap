@@ -682,6 +682,20 @@ pub const AbiV1 = struct {
     /// `REFCOUNT_V1` bit in `declared_caps` (spec section 7.1). Bit 0.
     pub const REFCOUNT_V1_BIT: u64 = 0x0000_0000_0000_0001;
 
+    /// The legacy v1.0 byte length of `ZapRefcountCapabilityV1` —
+    /// `retain` + `release` only (spec section 8.0). A v1.0 manager
+    /// advertises `desc.size == REFCOUNT_V1_SIZE_V1_0`; the runtime
+    /// falls back to `core.allocate` / `core.deallocate` for generic
+    /// `Arc(T)` allocations under such a manager.
+    pub const REFCOUNT_V1_SIZE_V1_0: u16 = 16;
+
+    /// The v1.1 byte length of `ZapRefcountCapabilityV1`, including
+    /// the side-table extension slots (`retain_sized`, `release_sized`,
+    /// `allocate_refcounted`, `refcount_sized`). A v1.1+ manager
+    /// advertises `desc.size >= REFCOUNT_V1_SIZE_V1_1`; the runtime
+    /// routes generic `Arc(T)` allocations through the sized API.
+    pub const REFCOUNT_V1_SIZE_V1_1: u16 = 48;
+
     /// Options passed to the manager's `init` entry point (spec
     /// section 4.1). Evolves in place via the leading `size` field.
     pub const ZapInitOptions = extern struct {
@@ -827,6 +841,12 @@ pub const AbiV1 = struct {
         if (@offsetOf(ZapRefcountCapabilityV1, "refcount_sized") != 40) @compileError(
             "runtime.AbiV1: ZapRefcountCapabilityV1.refcount_sized must be at offset 40",
         );
+        if (REFCOUNT_V1_SIZE_V1_0 != 16) @compileError(
+            "runtime.AbiV1: REFCOUNT_V1_SIZE_V1_0 must equal 16 (v1.0 vtable length)",
+        );
+        if (REFCOUNT_V1_SIZE_V1_1 != @sizeOf(ZapRefcountCapabilityV1)) @compileError(
+            "runtime.AbiV1: REFCOUNT_V1_SIZE_V1_1 must match the current ZapRefcountCapabilityV1 size",
+        );
     }
 };
 
@@ -882,7 +902,29 @@ pub var zap_active_manager_core: ?*const AbiV1.ZapMemoryManagerCoreV1 =
 /// `zapMemoryStartup` when the manager declares the bit. Null when
 /// the active manager does not implement refcounting (Arena and
 /// similar managers in future phases).
+///
+/// Only the leading two slots (`retain` and `release`) are guaranteed
+/// to be populated when this pointer is non-null. The trailing four
+/// slots (the v1.1 side-table extension) are valid ONLY when
+/// `zap_active_refcount_has_sized_extension == true`. Dispatchers that
+/// route generic `Arc(T)` allocations through `allocate_refcounted` /
+/// `retain_sized` / `release_sized` / `refcount_sized` MUST consult
+/// the extension flag first; under a v1.0 manager those calls must be
+/// routed through `core.allocate` / `core.deallocate` instead.
 pub var zap_active_refcount_capability: ?*const AbiV1.ZapRefcountCapabilityV1 = null;
+
+/// Set to `true` by `zapMemoryStartup` when the active manager's
+/// REFCOUNT_V1 descriptor advertises `size >= sizeof(v1.1 vtable)` —
+/// i.e., the manager provides the side-table extension slots in
+/// addition to the v1.0 inline-header `retain` / `release` slots.
+///
+/// `false` when the active manager either declares no REFCOUNT_V1
+/// capability at all (Arena, NoOp, Leak, Tracking) or declares only
+/// the v1.0 vtable (`desc.size == 16`). Generic `Arc(T)` dispatchers
+/// consult this flag to decide between the side-table fast path and
+/// the v1.0 fallback that routes through `core.allocate` /
+/// `core.deallocate`.
+pub var zap_active_refcount_has_sized_extension: bool = false;
 
 /// Idempotency guard for `zapMemoryStartup`. The dispatchers ensure
 /// startup runs exactly once on the first ARC-touching call from a
@@ -1771,17 +1813,39 @@ fn zapMemoryStartup() void {
         if (desc.version != 1) {
             @panic("zap runtime: REFCOUNT_V1 descriptor has unsupported version (expected 1)");
         }
-        // Mirror the `core.size` lower/upper bounds for the
-        // capability vtable size — same forward-compat semantics
-        // and the same absurd-size guard.
-        if (desc.size < @sizeOf(AbiV1.ZapRefcountCapabilityV1)) {
-            @panic("zap runtime: REFCOUNT_V1 vtable is smaller than v1.0");
+        // The spec (§8.0) defines two valid `desc.size` floors:
+        //   * `REFCOUNT_V1_SIZE_V1_0` (16): the v1.0 base — just
+        //     `retain` and `release`. The runtime falls back to
+        //     `core.allocate` / `core.deallocate` for generic `Arc(T)`
+        //     under a v1.0 manager.
+        //   * `REFCOUNT_V1_SIZE_V1_1` (48): the v1.1 extension —
+        //     adds the side-table refcount slots. The runtime routes
+        //     generic `Arc(T)` through `allocate_refcounted` /
+        //     `retain_sized` / `release_sized` / `refcount_sized`.
+        //
+        // A descriptor smaller than the v1.0 floor is malformed;
+        // a descriptor between the two floors (e.g., 32 bytes) is
+        // also malformed because there's no valid intermediate ABI
+        // shape. The build-time driver in `src/memory/driver.zig`
+        // rejects both, but the runtime mirrors the checks as a
+        // defence-in-depth tripwire that catches any path that
+        // bypasses driver validation (e.g., a future plugin loader).
+        if (desc.size < AbiV1.REFCOUNT_V1_SIZE_V1_0) {
+            @panic("zap runtime: REFCOUNT_V1 vtable is smaller than v1.0 (16 bytes)");
         }
         if (desc.size > 8 * @sizeOf(AbiV1.ZapRefcountCapabilityV1)) {
             @panic("zap runtime: REFCOUNT_V1 vtable exceeds v1.x upper bound (corrupt binary?)");
         }
         const cap_ptr: *const AbiV1.ZapRefcountCapabilityV1 = @ptrCast(@alignCast(desc.vtable));
         zap_active_refcount_capability = cap_ptr;
+        // The v1.1 extension threshold: the manager must advertise
+        // at least the full v1.1 vtable size to participate in the
+        // side-table refcount path. A v1.0 manager (size == 16)
+        // stays compatible — the runtime falls back to
+        // `core.allocate` / `core.deallocate` for generic `Arc(T)`
+        // and uses only the v1.0 `retain` / `release` slots for
+        // inline-header types.
+        zap_active_refcount_has_sized_extension = desc.size >= AbiV1.REFCOUNT_V1_SIZE_V1_1;
     }
 
     // libc's `atexit` returns 0 on success and non-zero on failure;
@@ -3747,25 +3811,75 @@ pub const ArcRuntime = struct {
         return dispatcherAllocImpl(T, allocator, value);
     }
 
-    /// Runtime-side dispatcher implementation of `allocAny`. Routes
-    /// through the active manager's REFCOUNT_V1 `allocate_refcounted`
-    /// slot, which acquires a slot from the manager's byte-keyed
-    /// size-class slab pool, initialises the side-table refcount to 1,
-    /// and returns the slot pointer. The runtime then writes `value`
-    /// into the slot.
+    /// Runtime-side dispatcher implementation of `allocAny`. Phase 4.x:
+    /// when the active manager exposes the v1.1 side-table extension
+    /// (`zap_active_refcount_has_sized_extension`), routes through
+    /// `allocate_refcounted` — the manager initialises the side-table
+    /// refcount to 1 and returns a slot whose bytes are 100% user
+    /// payload. Under a v1.0 manager (no extension) routes through
+    /// `core.allocate` and embeds an inline `ArcHeader` so the
+    /// per-cell refcount has somewhere to live.
     fn dispatcherAllocImpl(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
         _ = allocator;
-        const cap = zap_active_refcount_capability orelse
-            @panic("zap runtime: allocAny dispatched but active manager does not declare REFCOUNT_V1");
+        if (zap_active_refcount_has_sized_extension) {
+            const cap = zap_active_refcount_capability orelse
+                @panic("zap runtime: allocAny dispatched but active manager does not declare REFCOUNT_V1");
+            const ctx = zap_memory_manager_context orelse
+                @panic("zap runtime: allocAny dispatched with null manager context");
+            const size = @sizeOf(T);
+            const alignment_bytes = @alignOf(T);
+            const raw = cap.allocate_refcounted(ctx, size, @intCast(alignment_bytes)) orelse
+                @panic("zap runtime: out of memory: manager.allocate_refcounted returned null");
+            const slot: *T = @ptrCast(@alignCast(raw));
+            slot.* = value;
+            return slot;
+        }
+        return dispatcherAllocLegacyV1_0(T, value);
+    }
+
+    /// Legacy v1.0 fallback for generic `Arc(T)` allocation: when the
+    /// active manager advertises only the v1.0 vtable (no side-table
+    /// extension), the runtime allocates an inline-header layout via
+    /// `core.allocate` and writes `(rc=1, value)` into the slot. The
+    /// matching `release` path is `releaseAnyLegacyV1_0`. Slow path —
+    /// every byte of the side-table optimisation is forfeit — but
+    /// keeps generic `Arc(T)` working under third-party v1.0 managers.
+    fn dispatcherAllocLegacyV1_0(comptime T: type, value: T) *T {
+        const core = zap_active_manager_core orelse
+            @panic("zap runtime: allocAny dispatched with no active memory manager");
         const ctx = zap_memory_manager_context orelse
             @panic("zap runtime: allocAny dispatched with null manager context");
-        const size = @sizeOf(T);
-        const alignment_bytes = @alignOf(T);
-        const raw = cap.allocate_refcounted(ctx, size, @intCast(alignment_bytes)) orelse
-            @panic("zap runtime: out of memory: manager.allocate_refcounted returned null");
-        const slot: *T = @ptrCast(@alignCast(raw));
-        slot.* = value;
-        return slot;
+        const LegacyInner = LegacyArcInner(T);
+        const size = @sizeOf(LegacyInner);
+        const alignment_bytes = @alignOf(LegacyInner);
+        const raw = core.allocate(ctx, size, @intCast(alignment_bytes)) orelse
+            @panic("zap runtime: out of memory: manager.allocate returned null");
+        const inner: *LegacyInner = @ptrCast(@alignCast(raw));
+        inner.* = .{ .header = ArcHeader.init(), .value = value };
+        return &inner.value;
+    }
+
+    /// Inline-header layout the runtime falls back to under a v1.0
+    /// manager (no side-table extension). The header is at offset 0
+    /// so the manager's `retain` / `release` slots can address it
+    /// directly; the user-visible pointer skips past the header and
+    /// addresses `value` so the rest of the runtime sees a normal
+    /// `*T` regardless of which vtable shape the manager exposes.
+    fn LegacyArcInner(comptime T: type) type {
+        return extern struct {
+            header: ArcHeader,
+            value: T,
+        };
+    }
+
+    /// Recover the inline `LegacyArcInner(T)` from a user-visible
+    /// `*T`. Used by `releaseAnyLegacyV1_0` / `retainAnyLegacyV1_0`
+    /// when dispatching against a v1.0 manager.
+    fn legacyArcInnerFromValuePtr(comptime T: type, value_ptr: *T) *LegacyArcInner(T) {
+        const Inner = LegacyArcInner(T);
+        const value_addr = @intFromPtr(value_ptr);
+        const inner_addr = value_addr - @offsetOf(Inner, "value");
+        return @ptrFromInt(inner_addr);
     }
 
     /// Generate a per-type deep-walk callback that the active manager's
@@ -3988,10 +4102,44 @@ pub const ArcRuntime = struct {
         // already validated globals.
         const cap = zap_active_refcount_capability orelse unreachable;
         const ctx = zap_memory_manager_context orelse unreachable;
+        if (!zap_active_refcount_has_sized_extension) {
+            // v1.0 fallback: dispatch through `release` on the inline
+            // ArcHeader of the `LegacyArcInner(T)` allocation. The
+            // shallow-free closure deallocates the inner allocation
+            // without walking children (matching the side-table path's
+            // shallow-free semantics).
+            const inner = legacyArcInnerFromValuePtr(T, @constCast(ptr));
+            cap.release(ctx, &inner.header, LegacyV1_0ShallowFreeClosure(T).run);
+            return;
+        }
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
         const slot_ptr: *T = @constCast(ptr);
         cap.release_sized(ctx, slot_ptr, size, @intCast(alignment_bytes), null);
+    }
+
+    /// Comptime-generated shallow-free callback for the v1.0 fallback
+    /// `release` path. Mirrors `LegacyV1_0ReleaseClosure` but skips
+    /// the children walk — used by `freeAny` whose contract is shallow
+    /// (the caller has already released children, or the type has
+    /// none).
+    fn LegacyV1_0ShallowFreeClosure(comptime T: type) type {
+        return struct {
+            fn run(header_obj: *anyopaque) callconv(.c) void {
+                const Inner = LegacyArcInner(T);
+                const inner: *Inner = @ptrCast(@alignCast(header_obj));
+                const core = zap_active_manager_core orelse @panic(
+                    "zap runtime: v1.0 legacy freeAny: no active manager core",
+                );
+                const ctx = zap_memory_manager_context orelse @panic(
+                    "zap runtime: v1.0 legacy freeAny: null manager context",
+                );
+                const size = @sizeOf(Inner);
+                const alignment_bytes = @alignOf(Inner);
+                const raw: [*]u8 = @ptrCast(@alignCast(inner));
+                core.deallocate(ctx, raw, size, @intCast(alignment_bytes));
+            }
+        };
     }
 
     /// Release (decrement refcount) an Arc-managed value given a pointer to the
@@ -4110,6 +4258,20 @@ pub const ArcRuntime = struct {
         // type-specific dispatcher.
         const cap = zap_active_refcount_capability orelse unreachable;
         const ctx = zap_memory_manager_context orelse unreachable;
+        if (!zap_active_refcount_has_sized_extension) {
+            // v1.0 fallback: the cell was allocated via
+            // `dispatcherAllocLegacyV1_0` with an inline ArcHeader at
+            // offset 0 of a `LegacyArcInner(T)`. Dispatch through the
+            // v1.0 `release` slot which operates on the inline header,
+            // and on the zero-transition the manager calls
+            // `LegacyV1_0ReleaseClosure(T).run` to walk children and
+            // free the backing `LegacyArcInner(T)` allocation via
+            // `core.deallocate`.
+            const inner = legacyArcInnerFromValuePtr(T, @constCast(ptr));
+            const deep_walk: AbiV1.ZapDeepWalkFn = LegacyV1_0ReleaseClosure(T).run;
+            cap.release(ctx, &inner.header, deep_walk);
+            return;
+        }
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
         const slot_ptr: *T = @constCast(ptr);
@@ -4118,6 +4280,38 @@ pub const ArcRuntime = struct {
         else
             null;
         cap.release_sized(ctx, slot_ptr, size, @intCast(alignment_bytes), deep_walk);
+    }
+
+    /// Comptime-generated callback for the v1.0 fallback `release`
+    /// path. The v1.0 vtable's `release` slot accepts only `(ctx,
+    /// object, deep_walk)` — no `size` / `alignment`. The runtime
+    /// therefore wires the per-T deep-walk + `core.deallocate` of the
+    /// inline `LegacyArcInner(T)` allocation into a single closure
+    /// that the manager invokes on the zero-transition. The closure
+    /// reaches `core.allocate`/`core.deallocate` through the runtime
+    /// globals — same pattern as `DeepWalkFnFor`.
+    fn LegacyV1_0ReleaseClosure(comptime T: type) type {
+        return struct {
+            fn run(header_obj: *anyopaque) callconv(.c) void {
+                const Inner = LegacyArcInner(T);
+                const inner: *Inner = @ptrCast(@alignCast(header_obj));
+                // Children walk first so they observe a still-valid
+                // parent; mirrors the spec §8.2 ordering.
+                if (comptime typeHasArcChildren(T)) {
+                    releaseChildrenAny(T, std.heap.page_allocator, inner.value);
+                }
+                const core = zap_active_manager_core orelse @panic(
+                    "zap runtime: v1.0 legacy release: no active manager core",
+                );
+                const ctx = zap_memory_manager_context orelse @panic(
+                    "zap runtime: v1.0 legacy release: null manager context",
+                );
+                const size = @sizeOf(Inner);
+                const alignment_bytes = @alignOf(Inner);
+                const raw: [*]u8 = @ptrCast(@alignCast(inner));
+                core.deallocate(ctx, raw, size, @intCast(alignment_bytes));
+            }
+        };
     }
 
     /// Walk every field of an aggregate value at comptime and deep-release
@@ -4254,6 +4448,14 @@ pub const ArcRuntime = struct {
         // elide the second null check.
         const cap = zap_active_refcount_capability orelse unreachable;
         const ctx = zap_memory_manager_context orelse unreachable;
+        if (!zap_active_refcount_has_sized_extension) {
+            // v1.0 fallback: dispatch through `retain` on the inline
+            // header of `LegacyArcInner(T)`.
+            const inner = legacyArcInnerFromValuePtr(T, @constCast(ptr));
+            cap.retain(ctx, &inner.header);
+            arc_retains_total += 1;
+            return;
+        }
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
         const slot_ptr: *T = @constCast(ptr);
@@ -4312,6 +4514,14 @@ pub const ArcRuntime = struct {
         // Arc(T) side-table path. Public entry already validated globals.
         const cap = zap_active_refcount_capability orelse unreachable;
         const ctx = zap_memory_manager_context orelse unreachable;
+        if (!zap_active_refcount_has_sized_extension) {
+            // v1.0 fallback — same dispatch as the transient retain
+            // path but with the persistent counter convention.
+            const inner = legacyArcInnerFromValuePtr(T, @constCast(ptr));
+            cap.retain(ctx, &inner.header);
+            arc_retains_total += 1;
+            return;
+        }
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
         const slot_ptr: *T = @constCast(ptr);
@@ -4464,6 +4674,13 @@ pub const ArcRuntime = struct {
         if (comptime !refcount_v1_active) return 0;
         const cap = zap_active_refcount_capability orelse return 0;
         const ctx = zap_memory_manager_context orelse return 0;
+        if (!zap_active_refcount_has_sized_extension) {
+            // v1.0 fallback: the inline ArcHeader at offset 0 of the
+            // `LegacyArcInner(T)` carries the refcount. Read it
+            // directly — v1.0 has no `refcount_sized` slot.
+            const inner = legacyArcInnerFromValuePtr(T, @constCast(ptr));
+            return inner.header.count();
+        }
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
         const slot_ptr: *const T = ptr;

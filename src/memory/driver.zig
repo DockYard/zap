@@ -1188,6 +1188,30 @@ fn validateSection(
                 );
                 return ResolveError.ValidationFailed;
             }
+            // Per-descriptor vtable size bounds. Each capability has
+            // its own minimum size (the v1.0 base of that capability's
+            // vtable) and the same upper bound applies (8× the v1.x
+            // vtable size, mirroring the bound applied to `core.size`
+            // and `meta.size`). The runtime tripwire at
+            // `zapMemoryStartup` mirrors these checks as defence-in-
+            // depth; rejecting at the driver gives a clearer build-
+            // time diagnostic instead of a runtime panic.
+            const cap_size_min = capabilityVtableMinSize(desc.id);
+            const cap_size_max = capabilityVtableMaxSize(desc.id);
+            if (desc.size < cap_size_min) {
+                diag.write(
+                    "manager '{s}' descriptor for capability 0x{x:0>8} has size {d}, less than the minimum {d} bytes",
+                    .{ manager_name, desc.id, desc.size, cap_size_min },
+                );
+                return ResolveError.ValidationFailed;
+            }
+            if (desc.size > cap_size_max) {
+                diag.write(
+                    "manager '{s}' descriptor for capability 0x{x:0>8} has size {d}, exceeding the v1.x upper bound {d}; the manager was built against a future ABI version",
+                    .{ manager_name, desc.id, desc.size, cap_size_max },
+                );
+                return ResolveError.ValidationFailed;
+            }
         }
     }
 
@@ -1195,6 +1219,29 @@ fn validateSection(
         .declared_caps = meta.declared_caps,
         .abi_minor = meta.abi_minor,
     };
+}
+
+/// Minimum legal byte length for `desc.size`, per capability. For
+/// `REFCOUNT_V1` this is the v1.0 vtable size (16 bytes); a manager
+/// that advertises a smaller size cannot satisfy even the v1.0
+/// `retain`/`release` contract.
+fn capabilityVtableMinSize(id: u32) usize {
+    if (id == abi.REFC_TAG) return abi.REFCOUNT_V1_SIZE_V1_0;
+    // Unknown / future capabilities have no defined minimum in v1.0;
+    // they are rejected earlier in the loop (`bitForTag` returns
+    // null), so this branch is unreachable for v1.0 inputs. Provide
+    // a conservative floor of 1 byte for forward compatibility.
+    return 1;
+}
+
+/// Maximum legal byte length for `desc.size`, per capability. Same
+/// rationale as the `core.size` upper bound: an absurdly large
+/// descriptor is treated as corrupt rather than an enormous future
+/// ABI shape. For `REFCOUNT_V1` the bound is 8× the v1.1 vtable size
+/// (8 × 48 = 384 bytes).
+fn capabilityVtableMaxSize(id: u32) usize {
+    if (id == abi.REFC_TAG) return 8 * @as(usize, abi.REFCOUNT_V1_SIZE_V1_1);
+    return 8 * @sizeOf(abi.ZapCapabilityDescV1);
 }
 
 /// Translate a FourCC tag (in target endianness) to its bit position in
@@ -2584,6 +2631,127 @@ test "validateSection rejects reserved capability bit" {
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
     const result = validateSection("ReservedBit", &bytes, &diag);
     try std.testing.expectError(ResolveError.ReservedCapabilityDeclared, result);
+}
+
+/// Helper for the descriptor-bounds tests. Builds a section that
+/// declares REFCOUNT_V1 with a single embedded descriptor at the given
+/// vtable size. Returns the bytes and the offset at which the
+/// validator will inspect them.
+fn synthesizeRefcountDescriptorSection(buffer: []u8, vtable_size: u16) usize {
+    const stubs = struct {
+        fn cInit(opts: ?*const abi.ZapInitOptions) callconv(.c) ?*anyopaque {
+            _ = opts;
+            return null;
+        }
+        fn cDeinit(c: *anyopaque) callconv(.c) void {
+            _ = c;
+        }
+        fn cAlloc(c: *anyopaque, sz: usize, al: u32) callconv(.c) ?[*]u8 {
+            _ = c;
+            _ = sz;
+            _ = al;
+            return null;
+        }
+        fn cFree(c: *anyopaque, p: [*]u8, sz: usize, al: u32) callconv(.c) void {
+            _ = c;
+            _ = p;
+            _ = sz;
+            _ = al;
+        }
+        fn cDesc(c: *anyopaque, id: u32) callconv(.c) ?*const abi.ZapCapabilityDescV1 {
+            _ = c;
+            _ = id;
+            return null;
+        }
+    };
+    const meta: abi.ZapMemoryManagerMetaV1 = .{
+        .magic = abi.ZMEM_MAGIC_LE,
+        .abi_major = 1,
+        .abi_minor = 0,
+        .size = @sizeOf(abi.ZapMemoryManagerMetaV1),
+        ._reserved2 = 0,
+        .desc_count = 1,
+        .declared_caps = abi.REFCOUNT_V1_BIT,
+        .core_vtable_offset = @sizeOf(abi.ZapMemoryManagerMetaV1),
+        .reserved = 0,
+    };
+    const core: abi.ZapMemoryManagerCoreV1 = .{
+        .abi_major = 1,
+        .abi_minor = 0,
+        .size = @sizeOf(abi.ZapMemoryManagerCoreV1),
+        .declared_caps = abi.REFCOUNT_V1_BIT,
+        .init = stubs.cInit,
+        .deinit = stubs.cDeinit,
+        .allocate = stubs.cAlloc,
+        .deallocate = stubs.cFree,
+        .get_capability_desc = stubs.cDesc,
+    };
+    // The validator inspects only desc.size / desc.id / desc.flags;
+    // the vtable pointer is never dereferenced. Use a dummy non-null
+    // pointer so the field is well-defined.
+    const dummy_vtable: *const anyopaque = @ptrCast(&core);
+    const desc: abi.ZapCapabilityDescV1 = .{
+        .id = abi.REFC_TAG,
+        .version = 1,
+        .size = vtable_size,
+        .flags = 0,
+        .vtable = dummy_vtable,
+    };
+
+    const meta_size = @sizeOf(abi.ZapMemoryManagerMetaV1);
+    const core_size = @sizeOf(abi.ZapMemoryManagerCoreV1);
+    const desc_size = @sizeOf(abi.ZapCapabilityDescV1);
+    @memcpy(buffer[0..meta_size], std.mem.asBytes(&meta));
+    @memcpy(buffer[meta_size..][0..core_size], std.mem.asBytes(&core));
+    @memcpy(buffer[meta_size + core_size ..][0..desc_size], std.mem.asBytes(&desc));
+    return meta_size + core_size + desc_size;
+}
+
+test "validateSection accepts REFCOUNT_V1 descriptor at v1.0 size (16 bytes)" {
+    var bytes: [256]u8 = undefined;
+    const len = synthesizeRefcountDescriptorSection(&bytes, abi.REFCOUNT_V1_SIZE_V1_0);
+    var diag_buf: [512]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const v = try validateSection("V1_0_Refc", bytes[0..len], &diag);
+    try std.testing.expectEqual(abi.REFCOUNT_V1_BIT, v.declared_caps);
+}
+
+test "validateSection accepts REFCOUNT_V1 descriptor at v1.1 size (48 bytes)" {
+    var bytes: [256]u8 = undefined;
+    const len = synthesizeRefcountDescriptorSection(&bytes, abi.REFCOUNT_V1_SIZE_V1_1);
+    var diag_buf: [512]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const v = try validateSection("V1_1_Refc", bytes[0..len], &diag);
+    try std.testing.expectEqual(abi.REFCOUNT_V1_BIT, v.declared_caps);
+}
+
+test "validateSection rejects REFCOUNT_V1 descriptor smaller than 16 bytes" {
+    var bytes: [256]u8 = undefined;
+    const len = synthesizeRefcountDescriptorSection(&bytes, 8); // half of v1.0
+    var diag_buf: [512]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const result = validateSection("TooSmall", bytes[0..len], &diag);
+    try std.testing.expectError(ResolveError.ValidationFailed, result);
+    try std.testing.expect(std.mem.indexOf(u8, diag.text(), "less than the minimum") != null);
+}
+
+test "validateSection rejects REFCOUNT_V1 descriptor larger than 384 bytes" {
+    var bytes: [256]u8 = undefined;
+    const len = synthesizeRefcountDescriptorSection(&bytes, 385);
+    var diag_buf: [512]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const result = validateSection("TooLarge", bytes[0..len], &diag);
+    try std.testing.expectError(ResolveError.ValidationFailed, result);
+    try std.testing.expect(std.mem.indexOf(u8, diag.text(), "exceeding the v1.x upper bound") != null);
+}
+
+test "validateSection accepts REFCOUNT_V1 descriptor at exact upper bound (384 bytes)" {
+    var bytes: [256]u8 = undefined;
+    const len = synthesizeRefcountDescriptorSection(&bytes, 384);
+    var diag_buf: [512]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const v = try validateSection("AtBound", bytes[0..len], &diag);
+    try std.testing.expectEqual(abi.REFCOUNT_V1_BIT, v.declared_caps);
 }
 
 /// Synthesize an ELF object whose total section count exceeds 256 to
