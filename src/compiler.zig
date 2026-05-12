@@ -94,7 +94,7 @@ pub fn getBuiltinManagerSource(tag: zap.memory_driver.BuiltinManagerTag) ?[]cons
 /// compiler, names the third-party module — the runtime does not
 /// `@import("zap_active_manager")` under a third-party manager;
 /// it links the manager's object file the way it does today.
-pub fn manager_source_unit_name(tag: zap.memory_driver.BuiltinManagerTag) ?[]const u8 {
+pub fn managerSourceUnitName(tag: zap.memory_driver.BuiltinManagerTag) ?[]const u8 {
     return switch (tag) {
         .arc, .arena, .no_op, .leak, .tracking => "zap_active_manager",
         .third_party => null,
@@ -115,8 +115,7 @@ pub fn manager_source_unit_name(tag: zap.memory_driver.BuiltinManagerTag) ?[]con
 comptime {
     const fields = @typeInfo(zap.memory_driver.BuiltinManagerTag).@"enum".fields;
     if (fields.len != 6) @compileError(
-        "getBuiltinManagerSource: switch must be updated when adding a BuiltinManagerTag case " ++
-            "(also add a sibling `@embedFile` for the new manager's `.zig` source).",
+        "getBuiltinManagerSource and managerSourceUnitName: switches must be updated when adding a BuiltinManagerTag case; also add a matching @embedFile constant",
     );
 }
 
@@ -5269,7 +5268,7 @@ test "Phase 2: getBuiltinManagerSource returns null for .third_party" {
     try std.testing.expect(getBuiltinManagerSource(.third_party) == null);
 }
 
-test "Phase 2: manager_source_unit_name returns 'zap_active_manager' for every first-party tag" {
+test "Phase 2: managerSourceUnitName returns 'zap_active_manager' for every first-party tag" {
     // The accessor returns a single canonical import name across all
     // first-party tags so the runtime's `@import("zap_active_manager")`
     // works uniformly without a conditional import surface per tag —
@@ -5278,39 +5277,52 @@ test "Phase 2: manager_source_unit_name returns 'zap_active_manager' for every f
     const expected = "zap_active_manager";
     const tags = [_]zap.memory_driver.BuiltinManagerTag{ .arc, .arena, .no_op, .leak, .tracking };
     for (tags) |tag| {
-        const name = manager_source_unit_name(tag);
+        const name = managerSourceUnitName(tag);
         try std.testing.expect(name != null);
         try std.testing.expectEqualStrings(expected, name.?);
     }
 }
 
-test "Phase 2: manager_source_unit_name returns null for .third_party" {
+test "Phase 2: managerSourceUnitName returns null for .third_party" {
     // Symmetric with `getBuiltinManagerSource(.third_party) == null`:
     // third-party managers do not participate in the embedded-source
     // import-name surface — the manifest names the module instead.
-    try std.testing.expect(manager_source_unit_name(.third_party) == null);
+    try std.testing.expect(managerSourceUnitName(.third_party) == null);
 }
 
-test "Phase 2: embedded ARC source matches the on-disk file" {
+test "Phase 2: each embedded first-party manager source matches the on-disk file" {
     // `@embedFile` is path-relative to the caller's file. A typo in
     // the embed path would silently grab the wrong bytes — every
     // `manager.zig` opens with the same `//! ` doc-comment shape, so
     // substring asserts alone cannot detect a swap. Byte-equality
-    // against the on-disk source pins the path verbatim. ARC is the
-    // canary because it's the default manager and the perf-critical
-    // first-party path.
-    const on_disk = try std.Io.Dir.cwd().readFileAlloc(
-        std.Options.debug_io,
-        "src/memory/arc/manager.zig",
-        std.testing.allocator,
-        .limited(16 * 1024 * 1024),
-    );
-    defer std.testing.allocator.free(on_disk);
-    const embedded = getBuiltinManagerSource(.arc).?;
-    try std.testing.expectEqualSlices(u8, on_disk, embedded);
+    // against the on-disk source pins each embed path verbatim across
+    // all five first-party managers — not just ARC — so any
+    // single-path drift surfaces here before reaching Phase 3's
+    // emission step.
+    const cases = [_]struct {
+        tag: zap.memory_driver.BuiltinManagerTag,
+        path: []const u8,
+    }{
+        .{ .tag = .arc, .path = "src/memory/arc/manager.zig" },
+        .{ .tag = .arena, .path = "src/memory/arena/manager.zig" },
+        .{ .tag = .no_op, .path = "src/memory/no_op/manager.zig" },
+        .{ .tag = .leak, .path = "src/memory/leak/manager.zig" },
+        .{ .tag = .tracking, .path = "src/memory/tracking/manager.zig" },
+    };
+    for (cases) |c| {
+        const on_disk = try std.Io.Dir.cwd().readFileAlloc(
+            std.Options.debug_io,
+            c.path,
+            std.testing.allocator,
+            .limited(16 * 1024 * 1024),
+        );
+        defer std.testing.allocator.free(on_disk);
+        const embedded = getBuiltinManagerSource(c.tag).?;
+        try std.testing.expectEqualSlices(u8, on_disk, embedded);
+    }
 }
 
-test "Phase 2: every first-party manager source declares pub const ABI_MAJOR or imports std" {
+test "Phase 2: every first-party manager source opens with a doc-comment header and imports std" {
     // Pins the file-shape contract documented in every first-party
     // `manager.zig` header: the file is self-contained (imports std)
     // and is a Zig source file (opens with a doc-comment). Both
