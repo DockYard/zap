@@ -460,6 +460,369 @@ pub const ArcHeader = extern struct {
 };
 
 // ============================================================
+// Memory Manager ABI v1.0 — pluggable manager indirection layer.
+//
+// Spec: `docs/memory-manager-abi.md`. Canonical Zig-side definitions
+// live in `src/memory/abi.zig`; the shapes are redeclared here because
+// `runtime.zig` is `@embedFile`'d into the Zap compiler and injected
+// into every Zap user binary as a standalone source unit with no
+// sibling files (it can only `@import("std")` / `@import("builtin")`).
+// Any change to the canonical types in `src/memory/abi.zig` must be
+// mirrored here; the `comptime` size asserts on each shape are the
+// drift tripwire.
+//
+// Phase 2 installs the indirection layer:
+//   * `zap_memory_manager_context` — populated by the active manager's
+//     `init()` at startup, consumed by every call site as the
+//     manager's per-process state pointer.
+//   * `zap_active_manager_core` — the active core vtable, validated
+//     and bound at startup.
+//   * `zap_active_refcount_capability` — the active REFCOUNT_V1
+//     capability vtable when the manager declares the bit; null
+//     otherwise.
+//
+// The Phase 2 default active manager is the built-in ARC stub
+// (`builtin_arc_core`) below — it points the vtable function pointers
+// at thin wrappers around the existing slab-pool helpers so semantics
+// are unchanged. Phase 4 will replace this with a self-contained
+// external `Zap.Memory.ARC` package.
+//
+// The `allocAny` / `retainAny` / `releaseAny` dispatchers in
+// `ArcRuntime` validate the active vtable on every call. The typed
+// slab-pool path retains comptime `T`, so the dispatcher still calls
+// into the typed implementation directly — the byte-level vtable
+// functions are wired and validated but only invoked for the
+// inline-header retain/release path in Phase 2. Phase 4 redesigns the
+// slab pool to a byte-level layout the vtable can drive without `T`.
+// `prepareReleaseAny` / `destroyPreparedAny` (split-phase borrow-
+// elision API) continue to call the implementation directly: they
+// are not part of the spec's vtable surface yet. Phase 4 will
+// reconcile.
+// ============================================================
+
+pub const AbiV1 = struct {
+    /// `REFC` capability tag (spec section 7.1) read at the target's
+    /// native endianness.
+    pub const REFC_TAG: u32 = switch (builtin.target.cpu.arch.endian()) {
+        .little => 0x4346_4552,
+        .big => 0x5245_4643,
+    };
+
+    /// `REFCOUNT_V1` bit in `declared_caps` (spec section 7.1). Bit 0.
+    pub const REFCOUNT_V1_BIT: u64 = 0x0000_0000_0000_0001;
+
+    /// Options passed to the manager's `init` entry point (spec
+    /// section 4.1). Evolves in place via the leading `size` field.
+    pub const ZapInitOptions = extern struct {
+        size: u32,
+        reserved: u32,
+    };
+
+    /// Capability descriptor record (spec section 3.6). Embedded in
+    /// the manager's `.zapmem` metadata block; also returned from
+    /// `core.get_capability_desc(tag)` for runtime-only discovery.
+    pub const ZapCapabilityDescV1 = extern struct {
+        id: u32,
+        version: u16,
+        size: u16,
+        flags: u32,
+        vtable: *const anyopaque,
+    };
+
+    /// Compiler-emitted deep-walk callback (spec section 8). The
+    /// runtime/compiler passes a per-type walk function (or null when
+    /// the cell has no refcounted children) to `release`. The manager
+    /// invokes it once on the final zero-transition before freeing.
+    pub const ZapDeepWalkFn = *const fn (object: *anyopaque) callconv(.c) void;
+
+    /// Core capability vtable (spec section 4.2). All Phase 2 dispatch
+    /// goes through a pointer to one of these.
+    pub const ZapMemoryManagerCoreV1 = extern struct {
+        abi_major: u16,
+        abi_minor: u16,
+        size: u32,
+        declared_caps: u64,
+        init: *const fn (options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque,
+        deinit: *const fn (ctx: *anyopaque) callconv(.c) void,
+        allocate: *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8,
+        deallocate: *const fn (ctx: *anyopaque, ptr: [*]u8, size: usize, alignment: u32) callconv(.c) void,
+        get_capability_desc: *const fn (ctx: *anyopaque, id: u32) callconv(.c) ?*const ZapCapabilityDescV1,
+    };
+
+    /// `REFCOUNT_V1` capability vtable (spec section 8). `retain`
+    /// increments. `release` decrements and invokes `deep_walk` on the
+    /// zero-transition (if non-null), then frees the cell.
+    pub const ZapRefcountCapabilityV1 = extern struct {
+        retain: *const fn (ctx: *anyopaque, object: *anyopaque) callconv(.c) void,
+        release: *const fn (ctx: *anyopaque, object: *anyopaque, deep_walk: ?ZapDeepWalkFn) callconv(.c) void,
+    };
+
+    // Tripwire asserts mirroring `src/memory/abi.zig`. Any drift in
+    // the canonical Zig-side types must be reflected here; these
+    // asserts catch a missed sync at runtime-binary compile time.
+    comptime {
+        if (@sizeOf(ZapInitOptions) != 8) @compileError(
+            "runtime.AbiV1: ZapInitOptions v1.0 must be exactly 8 bytes",
+        );
+        if (@sizeOf(ZapCapabilityDescV1) != 24) @compileError(
+            "runtime.AbiV1: ZapCapabilityDescV1 v1.0 must be exactly 24 bytes",
+        );
+        if (@sizeOf(ZapMemoryManagerCoreV1) != 56) @compileError(
+            "runtime.AbiV1: ZapMemoryManagerCoreV1 v1.0 must be exactly 56 bytes",
+        );
+        if (@sizeOf(ZapRefcountCapabilityV1) != 16) @compileError(
+            "runtime.AbiV1: ZapRefcountCapabilityV1 v1.0 must be exactly 16 bytes",
+        );
+    }
+};
+
+// ----------------------------------------------------------------
+// Active manager globals (spec section 10).
+//
+// Phase 2 binds these to the built-in ARC stub at startup. Phase 3
+// will make the active manager configurable via the build manifest.
+// The compiler-emitted retain/release/alloc call sites consult these
+// indirectly through the `ArcRuntime` dispatchers below.
+// ----------------------------------------------------------------
+
+/// Per-process context returned by the active manager's `init()`.
+/// Populated by `zapMemoryStartup`; consumed by every dispatched
+/// vtable call as the manager's opaque state pointer. Null before
+/// startup completes; the dispatchers panic on null access.
+pub export var zap_memory_manager_context: ?*anyopaque = null;
+
+/// The active manager's core vtable. Bound at compile time to the
+/// built-in ARC stub; validated at startup. Future phases will make
+/// this configurable via the build manifest.
+pub var zap_active_manager_core: ?*const AbiV1.ZapMemoryManagerCoreV1 = &builtin_arc_core;
+
+/// The active manager's REFCOUNT_V1 capability vtable, populated by
+/// `zapMemoryStartup` when the manager declares the bit. Null when
+/// the active manager does not implement refcounting (Arena and
+/// similar managers in future phases).
+pub var zap_active_refcount_capability: ?*const AbiV1.ZapRefcountCapabilityV1 = null;
+
+/// Idempotency guard for `zapMemoryStartup`. The dispatchers ensure
+/// startup runs exactly once on the first ARC-touching call from a
+/// Zap binary's main path; subsequent calls bypass the init path
+/// with a single boolean compare. The startup hook also registers
+/// `zapMemoryShutdownAtexit` via `atexit` so the matching deinit
+/// runs on process exit without compiler-emitted shutdown code.
+var zap_memory_started: bool = false;
+
+// ----------------------------------------------------------------
+// Built-in ARC manager stub.
+//
+// Phase 2 installs this as the default active manager so existing ARC
+// tests continue to work while the ABI indirection layer is wired in.
+// Phase 4 replaces this with a self-contained external `Zap.Memory.ARC`
+// package that ships as a separate manager artifact.
+//
+// The vtable function pointers here call into thin wrappers around the
+// existing `ArcRuntime` slab-pool helpers (see `builtinArcAllocateRaw`
+// / `builtinArcDeallocateRaw` for the byte-level path used by the
+// `core.allocate` / `core.deallocate` slots). The retain/release
+// vtable functions operate on inline-header cells (cells whose first
+// 4 bytes carry an `ArcHeader`) using `ArcHeader.retainOpaque` /
+// `ArcHeader.releaseOpaque`; the typed slab-pool side-table path is
+// driven by the typed dispatcher in `ArcRuntime` until Phase 4
+// redesigns the slab layout.
+// ----------------------------------------------------------------
+
+/// Sentinel pointer returned by the built-in ARC stub's `init`. The
+/// built-in manager has no per-process state; the spec accepts any
+/// non-null pointer as a valid context. Pointing at a static byte
+/// gives every `ctx` dereference a real address without allocating.
+var builtin_arc_context_sentinel: u8 = 0;
+
+fn builtinArcInit(options: ?*const AbiV1.ZapInitOptions) callconv(.c) ?*anyopaque {
+    _ = options;
+    return @ptrCast(&builtin_arc_context_sentinel);
+}
+
+fn builtinArcDeinit(ctx: *anyopaque) callconv(.c) void {
+    _ = ctx;
+    // Built-in ARC has no per-process state to tear down; slab pools
+    // are released lazily via `resetForTest` (test-only) or by the
+    // OS at process exit. Existing atexit hooks (`arcStatsAtexit`,
+    // `mapInstrumentationAtexit`) still run independently.
+}
+
+/// Byte-level allocation backing the `core.allocate` vtable slot. The
+/// Phase 2 typed dispatchers do NOT call through this for `Arc(T)`
+/// cells (those still go through the slab pool); this is here so the
+/// vtable is fully wired for any future raw-allocation call site and
+/// so future managers that genuinely route through `core.allocate`
+/// can be swapped in without changing call sites.
+fn builtinArcAllocateRaw(ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8 {
+    _ = ctx;
+    if (size == 0) return null;
+    const align_mem = std.mem.Alignment.fromByteUnits(@max(alignment, 1));
+    return std.heap.c_allocator.rawAlloc(size, align_mem, @returnAddress());
+}
+
+fn builtinArcDeallocateRaw(
+    ctx: *anyopaque,
+    ptr: [*]u8,
+    size: usize,
+    alignment: u32,
+) callconv(.c) void {
+    _ = ctx;
+    if (size == 0) return;
+    const align_mem = std.mem.Alignment.fromByteUnits(@max(alignment, 1));
+    std.heap.c_allocator.rawFree(ptr[0..size], align_mem, @returnAddress());
+}
+
+fn builtinArcGetCapabilityDesc(
+    ctx: *anyopaque,
+    id: u32,
+) callconv(.c) ?*const AbiV1.ZapCapabilityDescV1 {
+    _ = ctx;
+    if (id == AbiV1.REFC_TAG) return &builtin_arc_refcount_descriptor;
+    return null;
+}
+
+/// REFCOUNT_V1 `retain` for cells with an inline `ArcHeader` at offset 0.
+/// Phase 2's only vtable-routed retain path: inline-header types
+/// (`Map(K,V)`, `List(T)`, `MapIter`, ...) dispatch their refcount
+/// bumps through this entry point. The side-table slab-pool retain
+/// path is driven by the typed dispatcher in `ArcRuntime`.
+fn builtinArcRetain(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
+    _ = ctx;
+    ArcHeader.retainOpaque(object);
+}
+
+/// REFCOUNT_V1 `release` for cells with an inline `ArcHeader` at offset 0.
+/// Decrements the refcount; on the zero transition invokes
+/// `deep_walk(object)` (if non-null) which is responsible for deep
+/// teardown including the cell's payload free. The manager-owned
+/// freeing path described in spec section 8.2 is, for the Phase 2
+/// stub, embedded in the per-type `deep_walk` callback (which today
+/// is the inline-header type's own `release` method); Phase 4 will
+/// separate the deep-walk and free responsibilities.
+fn builtinArcRelease(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    deep_walk: ?AbiV1.ZapDeepWalkFn,
+) callconv(.c) void {
+    _ = ctx;
+    if (ArcHeader.releaseOpaque(object)) {
+        if (deep_walk) |walk| walk(object);
+    }
+}
+
+const builtin_arc_refcount_vtable: AbiV1.ZapRefcountCapabilityV1 = .{
+    .retain = builtinArcRetain,
+    .release = builtinArcRelease,
+};
+
+const builtin_arc_refcount_descriptor: AbiV1.ZapCapabilityDescV1 = .{
+    .id = AbiV1.REFC_TAG,
+    .version = 1,
+    .size = @sizeOf(AbiV1.ZapRefcountCapabilityV1),
+    .flags = 0,
+    .vtable = @ptrCast(&builtin_arc_refcount_vtable),
+};
+
+/// Built-in ARC core vtable. The compile-time default value of
+/// `zap_active_manager_core` points here so a Zap binary has a valid
+/// active manager from the moment startup runs without requiring any
+/// configuration. Phase 3 will lift this binding into the build
+/// manifest so user-selected managers can replace it.
+pub const builtin_arc_core: AbiV1.ZapMemoryManagerCoreV1 = .{
+    .abi_major = 1,
+    .abi_minor = 0,
+    .size = @sizeOf(AbiV1.ZapMemoryManagerCoreV1),
+    .declared_caps = AbiV1.REFCOUNT_V1_BIT,
+    .init = builtinArcInit,
+    .deinit = builtinArcDeinit,
+    .allocate = builtinArcAllocateRaw,
+    .deallocate = builtinArcDeallocateRaw,
+    .get_capability_desc = builtinArcGetCapabilityDesc,
+};
+
+// ----------------------------------------------------------------
+// Startup / shutdown hooks.
+//
+// The Zap compiler does not yet emit a call to `zapMemoryStartup`
+// at the top of user `main` (Phase 3 wires that). Phase 2 makes the
+// startup hook self-arming: the `ArcRuntime` dispatchers below call
+// `ensureMemoryStartup()` on entry, which runs init exactly once and
+// registers `zapMemoryShutdownAtexit` via libc `atexit` so the
+// matching deinit runs on process exit without any compiler help.
+// Subsequent dispatcher calls pay a single boolean compare.
+//
+// This is the same pattern existing runtime subsystems use
+// (`ensureStdoutAtexit`, `ensureArcStatsAtexit`) — the runtime opts
+// into atexit registration on first use rather than requiring the
+// compiler to emit an explicit `init` call.
+// ----------------------------------------------------------------
+
+fn zapMemoryStartup() void {
+    if (zap_memory_started) return;
+
+    const core = zap_active_manager_core orelse {
+        @panic("zap runtime: no active memory manager bound at startup");
+    };
+    if (core.abi_major != 1) {
+        @panic("zap runtime: active memory manager declares an unsupported ABI major version (expected 1)");
+    }
+    if (core.size < @sizeOf(AbiV1.ZapMemoryManagerCoreV1)) {
+        @panic("zap runtime: active memory manager's core vtable is smaller than v1.0 (corrupt binary?)");
+    }
+
+    const ctx = core.init(null) orelse {
+        @panic("zap runtime: active memory manager's init() returned null");
+    };
+    zap_memory_manager_context = ctx;
+
+    if ((core.declared_caps & AbiV1.REFCOUNT_V1_BIT) != 0) {
+        const desc = core.get_capability_desc(ctx, AbiV1.REFC_TAG) orelse {
+            @panic("zap runtime: active manager declares REFCOUNT_V1 but get_capability_desc(REFC) returned null");
+        };
+        if (desc.id != AbiV1.REFC_TAG) {
+            @panic("zap runtime: REFCOUNT_V1 descriptor has wrong tag");
+        }
+        if (desc.version != 1) {
+            @panic("zap runtime: REFCOUNT_V1 descriptor has unsupported version (expected 1)");
+        }
+        if (desc.size < @sizeOf(AbiV1.ZapRefcountCapabilityV1)) {
+            @panic("zap runtime: REFCOUNT_V1 vtable is smaller than v1.0");
+        }
+        const cap_ptr: *const AbiV1.ZapRefcountCapabilityV1 = @ptrCast(@alignCast(desc.vtable));
+        zap_active_refcount_capability = cap_ptr;
+    }
+
+    _ = atexit(zapMemoryShutdownAtexit);
+    zap_memory_started = true;
+}
+
+fn zapMemoryShutdownAtexit() callconv(.c) void {
+    zapMemoryShutdown();
+}
+
+fn zapMemoryShutdown() void {
+    if (!zap_memory_started) return;
+    const core = zap_active_manager_core orelse return;
+    const ctx = zap_memory_manager_context orelse @panic(
+        "zap runtime: shutdown invoked with a started manager but no live context (internal bug)",
+    );
+    core.deinit(ctx);
+    zap_memory_manager_context = null;
+    zap_active_manager_core = null;
+    zap_active_refcount_capability = null;
+    zap_memory_started = false;
+}
+
+/// Idempotent first-call self-arming wrapper used by every ARC
+/// dispatcher. After the first call this is one boolean compare on
+/// the hot path; the LLVM optimizer collapses repeated calls inside
+/// the same function further.
+inline fn ensureMemoryStartup() void {
+    if (!zap_memory_started) zapMemoryStartup();
+}
+
+// ============================================================
 // ARC instrumentation counters (Phase 1 of the k-nucleotide RSS
 // roadmap — see `docs/k-nucleotide-rss-gap-implementation-plan.md`).
 //
@@ -2224,7 +2587,28 @@ pub const ArcRuntime = struct {
     /// pool removes one libc-allocator round-trip per Arc node, which
     /// dominates Arc-heavy workloads (e.g., binarytrees `make`/`check`
     /// at ~600 M nodes per N=21 run).
+    ///
+    /// Phase 2 indirection layer: dispatch validates that the active
+    /// manager is bound and its core vtable is healthy before invoking
+    /// the impl. The slab-pool path retains comptime `T`, so the
+    /// dispatcher calls into the typed implementation directly rather
+    /// than through the byte-level `core.allocate` vtable slot. Phase
+    /// 4 will redesign the slab pool to a byte-level layout the vtable
+    /// can drive without type knowledge.
     pub fn allocAny(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
+        ensureMemoryStartup();
+        if (zap_active_manager_core == null) {
+            @panic("zap runtime: allocAny dispatched with no active memory manager");
+        }
+        return builtinAllocImpl(T, allocator, value);
+    }
+
+    /// Built-in ARC implementation of `allocAny`. Phase 4 will move
+    /// this into the self-contained `Zap.Memory.ARC` manager package;
+    /// in Phase 2 it lives alongside the dispatcher and the dispatcher
+    /// calls it directly when the active manager is the built-in ARC
+    /// stub.
+    fn builtinAllocImpl(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
         _ = allocator;
         const ptr = ArcPool(T).create();
         ptr.* = value;
@@ -2277,10 +2661,27 @@ pub const ArcRuntime = struct {
     /// Decrements the refcount and frees the inner allocation when it reaches zero.
     /// The `allocator` argument is vestigial — the inner allocation is owned
     /// by the per-type `ArcPool` and returns there on destruction.
+    ///
+    /// Phase 2 indirection layer: same validation pattern as
+    /// `releaseAny`. The impl is split out for documentation parity
+    /// with `releaseAny`/`builtinReleaseImpl`.
     pub fn freeAny(allocator: std.mem.Allocator, ptr: anytype) void {
+        ensureMemoryStartup();
+        if (zap_active_manager_core == null) {
+            @panic("zap runtime: freeAny dispatched with no active memory manager");
+        }
+        if (zap_active_refcount_capability == null) {
+            @panic("zap runtime: freeAny dispatched but active manager does not declare REFCOUNT_V1");
+        }
+        builtinFreeImpl(allocator, ptr);
+    }
+
+    /// Built-in ARC implementation of `freeAny`. Phase 4 moves this
+    /// into the `Zap.Memory.ARC` manager package.
+    fn builtinFreeImpl(allocator: std.mem.Allocator, ptr: anytype) void {
         if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
             const unwrapped = ptr orelse return;
-            return freeAny(allocator, unwrapped);
+            return builtinFreeImpl(allocator, unwrapped);
         }
         @setEvalBranchQuota(2000);
         // `allocator` retained for ABI; pool-owned allocations don't use it.
@@ -2314,10 +2715,36 @@ pub const ArcRuntime = struct {
     /// call site (`releaseAny(allocator, ptr)`) compiles — Zig cannot infer
     /// a leading `comptime T: type` parameter from the runtime ptr argument.
     /// The element type is recovered via `@typeInfo`.
+    ///
+    /// Phase 2 indirection layer: the dispatcher validates the active
+    /// manager and (for managers declaring REFCOUNT_V1) the active
+    /// refcount capability before dispatching to the impl. See the
+    /// header comment on `allocAny` for why the typed slab-pool path
+    /// still uses the typed impl directly rather than the byte-level
+    /// vtable.
     pub fn releaseAny(allocator: std.mem.Allocator, ptr: anytype) void {
+        ensureMemoryStartup();
+        if (zap_active_manager_core == null) {
+            @panic("zap runtime: releaseAny dispatched with no active memory manager");
+        }
+        if (zap_active_refcount_capability == null) {
+            // Spec: when the active manager does not declare REFCOUNT_V1,
+            // the compiler statically elides retain/release at HIR
+            // elaboration time (section 8.5). Reaching this dispatcher
+            // with no active refcount capability means the compiler
+            // failed to elide, or a non-refcount manager is active and
+            // an old call site survived — a soundness bug either way.
+            @panic("zap runtime: releaseAny dispatched but active manager does not declare REFCOUNT_V1");
+        }
+        builtinReleaseImpl(allocator, ptr);
+    }
+
+    /// Built-in ARC implementation of `releaseAny`. Phase 4 moves
+    /// this into the `Zap.Memory.ARC` manager package.
+    fn builtinReleaseImpl(allocator: std.mem.Allocator, ptr: anytype) void {
         if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
             const unwrapped = ptr orelse return;
-            return releaseAny(allocator, unwrapped);
+            return builtinReleaseImpl(allocator, unwrapped);
         }
         const T = arcPtrChild(@TypeOf(ptr));
         // Inline-header types (`Map(K, V)`, `List(T)`, ...) own
@@ -2474,16 +2901,42 @@ pub const ArcRuntime = struct {
     /// retain represents a new long-lived owner — for example a List
     /// element slot, a Map entry's retained value, or a struct field
     /// assignment.
+    ///
+    /// Phase 2 indirection layer: the dispatcher validates the active
+    /// manager + refcount capability before dispatching. See the
+    /// header comment on `allocAny` for why the typed slab-pool path
+    /// still uses the typed impl directly.
     pub fn retainAny(ptr: anytype) void {
+        ensureMemoryStartup();
+        if (zap_active_manager_core == null) {
+            @panic("zap runtime: retainAny dispatched with no active memory manager");
+        }
+        if (zap_active_refcount_capability == null) {
+            // See note in `releaseAny` on REFCOUNT_V1 absence; the same
+            // soundness argument applies symmetrically here.
+            @panic("zap runtime: retainAny dispatched but active manager does not declare REFCOUNT_V1");
+        }
+        builtinRetainImpl(ptr);
+    }
+
+    /// Built-in ARC implementation of `retainAny`. Phase 4 moves
+    /// this into the `Zap.Memory.ARC` manager package.
+    ///
+    /// Inline-header branch routes through `headerRetain` so the
+    /// retain actually flows through the active manager's vtable.
+    /// Side-table branch calls the typed `ArcPool(T).retain` directly
+    /// because the slab pool's per-slot side-table refcount requires
+    /// comptime `T` (Phase 4 redesigns the slab layout to a byte-level
+    /// shape the vtable can drive without type knowledge).
+    fn builtinRetainImpl(ptr: anytype) void {
         if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
             const unwrapped = ptr orelse return;
-            return retainAny(unwrapped);
+            return builtinRetainImpl(unwrapped);
         }
         const T = arcPtrChild(@TypeOf(ptr));
         if (comptime hasInlineArcHeader(T)) {
             const mut: *T = @constCast(ptr);
-            mut.header.retain();
-            arc_retains_total += 1;
+            headerRetain(&mut.header);
             return;
         }
         ArcPool(T).retain(@constCast(ptr));
@@ -2498,10 +2951,32 @@ pub const ArcRuntime = struct {
     /// retain path the Map workload instrumentation classifies as a
     /// real concurrent-owner share event. `retainAny` (above) covers
     /// the symmetric transient case.
+    ///
+    /// Phase 2 indirection layer: same validation pattern as
+    /// `retainAny`; see that helper's documentation.
     pub fn retainAnyPersistent(ptr: anytype) void {
+        ensureMemoryStartup();
+        if (zap_active_manager_core == null) {
+            @panic("zap runtime: retainAnyPersistent dispatched with no active memory manager");
+        }
+        if (zap_active_refcount_capability == null) {
+            @panic("zap runtime: retainAnyPersistent dispatched but active manager does not declare REFCOUNT_V1");
+        }
+        builtinRetainAnyPersistentImpl(ptr);
+    }
+
+    /// Built-in ARC implementation of `retainAnyPersistent`. Phase 4
+    /// moves this into the `Zap.Memory.ARC` manager package.
+    ///
+    /// Inline-header branch: prefers the type's public `retain` method
+    /// (which itself routes through `headerRetain` plus any
+    /// type-specific bookkeeping like Map's share-event hook); falls
+    /// back to `headerRetain` directly when the type does not expose
+    /// a public `retain`.
+    fn builtinRetainAnyPersistentImpl(ptr: anytype) void {
         if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
             const unwrapped = ptr orelse return;
-            return retainAnyPersistent(unwrapped);
+            return builtinRetainAnyPersistentImpl(unwrapped);
         }
         const T = arcPtrChild(@TypeOf(ptr));
         if (comptime hasInlineArcHeader(T)) {
@@ -2510,8 +2985,7 @@ pub const ArcRuntime = struct {
                 return;
             }
             const mut: *T = @constCast(ptr);
-            mut.header.retain();
-            arc_retains_total += 1;
+            headerRetain(&mut.header);
             return;
         }
         ArcPool(T).retain(@constCast(ptr));
@@ -2531,6 +3005,62 @@ pub const ArcRuntime = struct {
             .pointer => retainAny(ptr),
             else => @compileError("retainAnyOpt expects pointer or optional pointer; got " ++ @typeName(PtrT)),
         }
+    }
+
+    /// Dispatch a refcount retain on an inline-header cell through the
+    /// active manager's REFCOUNT_V1 capability vtable. `header_ptr`
+    /// must point at the `ArcHeader` at offset 0 of an inline-header
+    /// cell (`Map(K,V)`, `List(T)`, `MapIter`, ...). The vtable's
+    /// `retain(ctx, ptr)` slot, for the built-in ARC stub, increments
+    /// `ArcHeader.retainOpaque(ptr)`; future managers may use a
+    /// completely different mechanism (e.g., generational refcounts).
+    ///
+    /// This is the inline-header counterpart to `retainAny` / typed
+    /// dispatch. It exists so `Map.retain` and friends can route
+    /// through the same vtable indirection that Phase 6 will need
+    /// for codegen elision under non-refcounting managers — without
+    /// requiring those types to take a `comptime T: type` parameter.
+    /// The dispatcher bumps `arc_retains_total` so callers no longer
+    /// need to do it themselves.
+    pub fn headerRetain(header_ptr: *ArcHeader) void {
+        ensureMemoryStartup();
+        const cap = zap_active_refcount_capability orelse {
+            @panic("zap runtime: headerRetain dispatched but active manager does not declare REFCOUNT_V1");
+        };
+        const ctx = zap_memory_manager_context orelse {
+            @panic("zap runtime: headerRetain dispatched with null manager context");
+        };
+        cap.retain(ctx, @ptrCast(header_ptr));
+        arc_retains_total += 1;
+    }
+
+    /// Dispatch a refcount release on an inline-header cell through the
+    /// active manager's REFCOUNT_V1 capability vtable, invoking
+    /// `deep_walk(header_ptr)` on the final zero-transition.
+    ///
+    /// `deep_walk` is the per-type callback the caller wants the
+    /// manager to invoke once when the refcount reaches zero — typically
+    /// the inline-header type's "deep teardown including buffer free"
+    /// routine. For the built-in ARC stub this is the only mechanism
+    /// the manager uses to free the cell; Phase 4 introduces an
+    /// explicit storage-free step inside the manager and demotes
+    /// `deep_walk` to "children only" per the spec.
+    ///
+    /// The dispatcher bumps `arc_releases_total` so callers no longer
+    /// need to do it themselves.
+    pub fn headerRelease(
+        header_ptr: *ArcHeader,
+        deep_walk: ?AbiV1.ZapDeepWalkFn,
+    ) void {
+        ensureMemoryStartup();
+        const cap = zap_active_refcount_capability orelse {
+            @panic("zap runtime: headerRelease dispatched but active manager does not declare REFCOUNT_V1");
+        };
+        const ctx = zap_memory_manager_context orelse {
+            @panic("zap runtime: headerRelease dispatched with null manager context");
+        };
+        arc_releases_total += 1;
+        cap.release(ctx, @ptrCast(header_ptr), deep_walk);
     }
 
     /// Get the refcount of an Arc-managed value.
@@ -2746,27 +3276,48 @@ pub fn List(comptime T: type) type {
 
         /// Increment the refcount and return the same handle. Mirrors
         /// `Map(K, V).retain`.
+        ///
+        /// Routes through `ArcRuntime.headerRetain`, which dispatches
+        /// to the active manager's REFCOUNT_V1 capability vtable.
+        /// `arc_retains_total` is bumped inside the dispatcher.
         pub fn retain(vec: ?*const Self) ?*const Self {
             if (vec) |v| {
                 const mut: *Self = @constCast(v);
-                mut.header.retain();
-                arc_retains_total += 1;
+                ArcRuntime.headerRetain(&mut.header);
             }
             return vec;
         }
 
         /// Decrement the refcount; on the zero-transition deep-release
-        /// every element and free the buffer. Mirrors Map's pattern of
-        /// bumping `arc_releases_total` unconditionally.
+        /// every element and free the buffer.
+        ///
+        /// Routes through `ArcRuntime.headerRelease`, passing a
+        /// per-type `deep_walk` callback that performs the cell's
+        /// teardown when the manager observes the final
+        /// zero-transition. The dispatcher bumps `arc_releases_total`
+        /// unconditionally; `list_release_kept_alive_total` /
+        /// `list_release_freed_total` are adjusted inside this method
+        /// — counting every release as "kept alive" optimistically
+        /// and rolling it back to "freed" when the deep_walk callback
+        /// actually fires.
         pub fn release(vec: ?*const Self) void {
             if (vec == null) return;
             const v = vec.?;
             const mut: *Self = @constCast(v);
-            arc_releases_total += 1;
-            if (!mut.header.release()) {
-                list_release_kept_alive_total += 1;
-                return;
-            }
+            // Optimistically count as kept-alive; the deep_walk callback
+            // rolls this back to "freed" on the zero-transition.
+            list_release_kept_alive_total += 1;
+            ArcRuntime.headerRelease(&mut.header, listDeepWalk);
+        }
+
+        /// Deep-walk callback invoked by the manager's `release` on
+        /// the final zero-transition. Reverses the optimistic
+        /// kept-alive bump in `release` and performs the cell's full
+        /// teardown: deep-release of every element followed by
+        /// freeing the buffer.
+        fn listDeepWalk(ptr: *anyopaque) callconv(.c) void {
+            const mut: *Self = @ptrCast(@alignCast(ptr));
+            list_release_kept_alive_total -= 1;
             list_release_freed_total += 1;
             mut.bufferFreeDeep();
         }
@@ -6635,9 +7186,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 // matching release path here — a leak. Panic instead.
                 if (m.capacity == 0) @panic("Map.retain: received MapIter cell; iter cells are only valid as Map.next state");
                 const mut: *Self = @constCast(m);
-                mut.header.retain();
-                arc_retains_total += 1;
+                ArcRuntime.headerRetain(&mut.header);
                 if (comptime instrument_map) {
+                    // The dispatcher just incremented the count; observe
+                    // the post-retain value for instrumentation.
                     const new_count = mut.header.count();
                     mapInstrumentationOnRetain(@intFromPtr(m), new_count);
                 }
@@ -6659,10 +7211,17 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 return;
             }
             const mut: *Self = @constCast(m);
-            arc_releases_total += 1;
-            if (!mut.header.release()) return;
+            ArcRuntime.headerRelease(&mut.header, mapDeepWalk);
+        }
+
+        /// Deep-walk callback invoked by the manager's `release` on
+        /// the final zero-transition. Performs the cell's full
+        /// teardown: instrumentation notification (when compiled in),
+        /// deep-release of every K/V pair, and freeing the buffer.
+        fn mapDeepWalk(ptr: *anyopaque) callconv(.c) void {
+            const mut: *Self = @ptrCast(@alignCast(ptr));
             if (comptime instrument_map) {
-                mapInstrumentationOnRelease(@intFromPtr(m), m.len);
+                mapInstrumentationOnRelease(@intFromPtr(mut), mut.len);
             }
             mut.bufferFreeDeep();
         }
@@ -7628,10 +8187,14 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
         /// the iter with rc=1, `next_idx = 0`, and `source.rc += 1`.
         /// The iter owns the +1 on `source` for its entire lifetime;
         /// on rc=0 the `releaseFromMapPtr` path drops that +1.
+        ///
+        /// Routes the source-map retain through `ArcRuntime.headerRetain`
+        /// rather than `MapT.retain` so the Map instrumentation hook is
+        /// not triggered on iter creation (matches pre-Phase-2 behavior
+        /// where the bare `header.retain()` skipped the hook).
         pub fn create(source: *const MapT) ?*Self {
             const mut_source: *MapT = @constCast(source);
-            mut_source.header.retain();
-            arc_retains_total += 1;
+            ArcRuntime.headerRetain(&mut_source.header);
             dense_map_iter_alloc_total += 1;
 
             const cell: *Self = SelfPool.create();
@@ -7712,16 +8275,21 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
         }
 
         /// Release path entered from `Map.release` when its argument
-        /// is identified as an iter cell via `capacity == 0`. The
-        /// header's release transition triggers iter cleanup: drop
-        /// the retained source-map reference and return the cell
-        /// to its slab pool.
+        /// is identified as an iter cell via `capacity == 0`. Dispatches
+        /// the refcount drop through `ArcRuntime.headerRelease`; the
+        /// `iterDeepWalk` callback performs the cleanup when the
+        /// manager observes the zero-transition (drop the retained
+        /// source-map reference and return the cell to its slab pool).
         pub fn releaseFromMapPtr(map_ptr: *const MapT) void {
             const self = fromMapPtr(map_ptr);
-            arc_releases_total += 1;
-            if (!self.header.release()) return;
-            // RC hit zero. Drop the source reference and free the
-            // iter cell back to the pool.
+            ArcRuntime.headerRelease(&self.header, iterDeepWalk);
+        }
+
+        /// Deep-walk callback invoked by the manager's `release` on
+        /// the final zero-transition. Drops the retained source-map
+        /// reference and returns the iter cell to its slab pool.
+        fn iterDeepWalk(ptr: *anyopaque) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
             const source = self.source_map;
             self.source_map = null;
             self.next_idx = 0;
@@ -7729,11 +8297,8 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
             SelfPool.destroy(self);
             if (source) |src| {
                 // The source's `Map.release` handles its own rc;
-                // for an iter we just bump the right counter once
-                // and let `Map.release` complete the work (including
-                // the recursive iter-cell case if the source itself
-                // happens to be an iter, which today is impossible
-                // but the code remains correct).
+                // recursively dispatches back through the active
+                // manager (Phase 2: still the built-in ARC stub).
                 MapT.release(src);
             }
         }
@@ -11162,6 +11727,83 @@ test "ArcRuntime.prepareReleaseAny returns ptr only on the zero-transition" {
     try std.testing.expectEqual(@as(i64, 7), owned.*);
     // Children would be walked here in a deep-release helper. Then:
     ArcRuntime.destroyPreparedAny(i64, alloc, owned);
+}
+
+test "Phase 2 ABI: built-in ARC manager is bound by default" {
+    // The compile-time default of `zap_active_manager_core` points at
+    // the built-in ARC stub. Touching any ARC entry point arms the
+    // startup hook, validates the vtable, and populates the context.
+    _ = ArcRuntime.allocAny(i64, std.testing.allocator, 0);
+    // The pre-decrement is the only side effect we care about — we
+    // can't `freeAny` here without first validating that the manager
+    // is initialised.
+    try std.testing.expect(zap_active_manager_core != null);
+    try std.testing.expect(zap_memory_manager_context != null);
+}
+
+test "Phase 2 ABI: built-in ARC declares REFCOUNT_V1 capability" {
+    // Force startup if it hasn't run yet.
+    ensureMemoryStartup();
+    const core = zap_active_manager_core orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(@as(u16, 1), core.abi_major);
+    try std.testing.expect((core.declared_caps & AbiV1.REFCOUNT_V1_BIT) != 0);
+    try std.testing.expect(zap_active_refcount_capability != null);
+}
+
+test "Phase 2 ABI: built-in ARC retain/release dispatches through capability" {
+    const alloc = std.testing.allocator;
+
+    // List uses the inline-header retain/release path, which Phase 2
+    // routes through the active refcount capability vtable. Build a
+    // List, retain, release, release — observe the runtime counters
+    // bumped by the dispatcher.
+    const start_retains = arc_retains_total;
+    const start_releases = arc_releases_total;
+    const start_freed = list_release_freed_total;
+    const start_kept = list_release_kept_alive_total;
+
+    const ListI64 = List(i64);
+    const lst = ListI64.bufferAlloc(1, 0).?;
+    _ = ListI64.retain(@as(?*const ListI64, lst));
+    ListI64.release(@as(?*const ListI64, lst));
+    ListI64.release(@as(?*const ListI64, lst));
+
+    try std.testing.expectEqual(@as(u64, 1), arc_retains_total - start_retains);
+    try std.testing.expectEqual(@as(u64, 2), arc_releases_total - start_releases);
+    try std.testing.expectEqual(@as(u64, 1), list_release_freed_total - start_freed);
+    try std.testing.expectEqual(@as(u64, 1), list_release_kept_alive_total - start_kept);
+
+    _ = alloc;
+}
+
+test "Phase 2 ABI: built-in ARC core vtable shape matches spec" {
+    // Compile-time invariants on the static vtable that backs the
+    // built-in ARC stub. These are runtime asserts on values whose
+    // shape is locked by `AbiV1`'s `comptime` size checks, but
+    // running them here makes drift fail loud on the next test pass.
+    const core = &builtin_arc_core;
+    try std.testing.expectEqual(@as(u16, 1), core.abi_major);
+    try std.testing.expectEqual(@as(u16, 0), core.abi_minor);
+    try std.testing.expectEqual(@as(u32, @sizeOf(AbiV1.ZapMemoryManagerCoreV1)), core.size);
+    try std.testing.expectEqual(@as(u64, 1), core.declared_caps);
+
+    // Confirm that `get_capability_desc(REFC_TAG)` returns a
+    // well-formed descriptor and that an unknown tag yields null.
+    const ctx_sentinel: *anyopaque = @ptrCast(&builtin_arc_context_sentinel);
+    const refc_desc = core.get_capability_desc(ctx_sentinel, AbiV1.REFC_TAG) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(AbiV1.REFC_TAG, refc_desc.id);
+    try std.testing.expectEqual(@as(u16, 1), refc_desc.version);
+    try std.testing.expectEqual(@as(u16, @sizeOf(AbiV1.ZapRefcountCapabilityV1)), refc_desc.size);
+    try std.testing.expectEqual(@as(u32, 0), refc_desc.flags);
+
+    const unknown_tag: u32 = 0xDEADBEEF;
+    try std.testing.expect(core.get_capability_desc(ctx_sentinel, unknown_tag) == null);
 }
 
 test "releaseChildrenAny releases ?*const Map(K, V) field" {

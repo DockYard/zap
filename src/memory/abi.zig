@@ -11,16 +11,37 @@
 //! built against the C ABI rather than against this Zig module. Future
 //! first-party managers should depend on this module directly.
 //!
+//! `runtime.zig` ALSO redeclares the same shapes — but for a different
+//! reason: `runtime.zig` is `@embedFile`'d into the Zap compiler and
+//! injected into every Zap user binary as a standalone source unit with
+//! no sibling files (it can only import `std` and `builtin`). The
+//! redeclaration there is unavoidable; the `comptime` size asserts in
+//! both modules tripwire any accidental drift.
+//!
 //! Any field rename, reorder, or size change here must be accompanied by
-//! a corresponding update to the spec doc and an ABI minor/major bump
-//! per spec section 2.3.
+//! a corresponding update to the spec doc, the matching runtime-side
+//! shape in `src/runtime.zig` (search for `pub const AbiV1 = struct`),
+//! and an ABI minor/major bump per spec section 2.3.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// `ZMEM` FourCC magic, read as a little-endian u32. The byte sequence
 /// `5A 4D 45 4D` spells `Z`, `M`, `E`, `M` in either byte order; the
 /// integer constant below is the little-endian interpretation.
 pub const ZMEM_MAGIC_LE: u32 = 0x4D454D5A;
+
+/// `REFC` capability tag (spec section 7.1) read at the target's native
+/// endianness. The spec mandates that managers use `std.mem.readInt(u32,
+/// "REFC", target_endianness)` rather than hand-computed hex literals so
+/// the constant resolves correctly on either byte order.
+pub const REFC_TAG: u32 = switch (builtin.target.cpu.arch.endian()) {
+    .little => 0x4346_4552,
+    .big => 0x5245_4643,
+};
+
+/// `REFCOUNT_V1` bit in `declared_caps` (spec section 7.1). Bit 0.
+pub const REFCOUNT_V1_BIT: u64 = 0x0000_0000_0000_0001;
 
 /// `.zapmem` metadata header. Spec section 3.5. The exact 32-byte
 /// layout is normative for ABI v1.0; the `comptime` assertion below
@@ -81,22 +102,54 @@ comptime {
     );
 }
 
+/// Compiler-emitted deep-walk callback. When the refcount of an object
+/// drops to zero, the manager's release function invokes this callback
+/// (if non-null) to release the object's children. Spec section 8.
+///
+/// Calling convention is `callconv(.c)` so the callback pointer is
+/// ABI-stable and can be stored in cell headers alongside type tags.
+pub const ZapDeepWalkFn = *const fn (object: *anyopaque) callconv(.c) void;
+
 /// Core capability vtable. Spec section 4.2.
+///
+/// Function-pointer fields are typed (rather than `*const anyopaque`)
+/// so callers obtain compile-time argument and return-type checking at
+/// every dispatch site. The `extern struct` layout still matches the
+/// ABI: typed function pointers occupy the same 8 bytes as a raw
+/// `*const anyopaque` on the supported 64-bit targets.
 pub const ZapMemoryManagerCoreV1 = extern struct {
     abi_major: u16,
     abi_minor: u16,
     size: u32,
     declared_caps: u64,
-    init_fn: *const anyopaque,
-    deinit_fn: *const anyopaque,
-    allocate_fn: *const anyopaque,
-    deallocate_fn: *const anyopaque,
-    get_capability_desc_fn: *const anyopaque,
+    init: *const fn (options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque,
+    deinit: *const fn (ctx: *anyopaque) callconv(.c) void,
+    allocate: *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8,
+    deallocate: *const fn (ctx: *anyopaque, ptr: [*]u8, size: usize, alignment: u32) callconv(.c) void,
+    get_capability_desc: *const fn (ctx: *anyopaque, id: u32) callconv(.c) ?*const ZapCapabilityDescV1,
 };
 
 comptime {
     if (@sizeOf(ZapMemoryManagerCoreV1) != 56) @compileError(
         "abi: ZapMemoryManagerCoreV1 v1.0 must be exactly 56 bytes",
+    );
+}
+
+/// `REFCOUNT_V1` capability vtable. Spec section 8. Pointed at by a
+/// `ZapCapabilityDescV1` whose `id == REFC_TAG` and `version == 1`.
+///
+/// `retain` increments the reference count. `release` decrements and,
+/// on the zero-transition, invokes `deep_walk(object)` (if non-null)
+/// before freeing the cell's storage. The manager owns the full
+/// freeing path for refcounted cells — see spec section 8.2.
+pub const ZapRefcountCapabilityV1 = extern struct {
+    retain: *const fn (ctx: *anyopaque, object: *anyopaque) callconv(.c) void,
+    release: *const fn (ctx: *anyopaque, object: *anyopaque, deep_walk: ?ZapDeepWalkFn) callconv(.c) void,
+};
+
+comptime {
+    if (@sizeOf(ZapRefcountCapabilityV1) != 16) @compileError(
+        "abi: ZapRefcountCapabilityV1 v1.0 must be exactly 16 bytes",
     );
 }
 
@@ -116,8 +169,22 @@ test "ZapMemoryManagerCoreV1 layout is exactly 56 bytes" {
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(ZapMemoryManagerCoreV1));
 }
 
+test "ZapRefcountCapabilityV1 layout is exactly 16 bytes" {
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(ZapRefcountCapabilityV1));
+}
+
 test "ZMEM_MAGIC_LE is little-endian 'ZMEM'" {
     var buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &buf, ZMEM_MAGIC_LE, .little);
     try std.testing.expectEqualStrings("ZMEM", &buf);
+}
+
+test "REFC_TAG round-trips through native endian" {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, REFC_TAG, builtin.target.cpu.arch.endian());
+    try std.testing.expectEqualStrings("REFC", &buf);
+}
+
+test "REFCOUNT_V1_BIT is bit 0" {
+    try std.testing.expectEqual(@as(u64, 1), REFCOUNT_V1_BIT);
 }
