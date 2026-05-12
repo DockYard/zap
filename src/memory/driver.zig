@@ -160,18 +160,27 @@ fn resolveDefaultForkFn() ?ForkCompileFn {
 /// third-party managers shipped by user projects — collapses to
 /// `.third_party`.
 ///
-/// The tag exists to support the perf-recovery work documented in
-/// `docs/memory-manager-perf-recovery.md`: first-party managers can be
-/// inlined through a comptime-dispatched fast path, while third-party
-/// managers continue to flow through the v1.0 vtable. Phase 1 only
-/// classifies and threads the tag through the build pipeline; later
-/// phases branch on it in the runtime and codegen layers.
+/// The tag exists so later phases of the memory-manager perf-recovery
+/// work can comptime-dispatch direct calls into first-party manager
+/// source while keeping the v1.0 vtable for third-party managers.
+/// Phase 1 only classifies and threads the tag through the build
+/// pipeline; later phases branch on it in the runtime and codegen
+/// layers. The classifier is intentionally pure and runs before any
+/// I/O so downstream code can rely on the tag without first having to
+/// succeed in resolution.
 ///
-/// note: adding a sixth first-party manager requires landing the new
-/// `lib/zap/memory/<name>.zap` declaration, the new tag case here, AND
-/// the matching mapping in `classifyBuiltinManager` in the same
-/// commit. Skipping any one of those three pieces breaks the contract
-/// that the tag set mirrors the stdlib declaration set exactly.
+/// Symmetry obligation — the case set of this enum MUST remain in 1:1
+/// correspondence with the `pub struct Zap.Memory.{...}` declarations
+/// in `lib/zap/memory/*.zap`. Adding a sixth first-party manager
+/// requires landing in one commit:
+///   (a) the new `lib/zap/memory/<name>.zap` stdlib declaration,
+///   (b) the new `BuiltinManagerTag` case here,
+///   (c) the new arm in `classifyBuiltinManager`,
+///   (d) the new `src/memory/<name>/manager.zig` Zig source.
+/// Skipping any one of those four pieces breaks the contract that the
+/// tag set mirrors the stdlib declaration set exactly, and the
+/// comptime exhaustiveness assertion below will fire if the enum and
+/// classifier drift apart.
 pub const BuiltinManagerTag = enum {
     arc,
     arena,
@@ -180,6 +189,22 @@ pub const BuiltinManagerTag = enum {
     tracking,
     third_party,
 };
+
+// Compile-time guard for the symmetry obligation documented above:
+// the classifier hard-codes one arm per first-party tag plus the
+// implicit `.third_party` fallthrough, so any change to the enum's
+// shape (adding, removing, or renaming a case) MUST be accompanied by
+// a matching change in `classifyBuiltinManager`. Bumping this expected
+// count without updating the classifier — or vice versa — will fail
+// the build at this site instead of silently degrading a first-party
+// manager to `.third_party` and losing the perf-recovery fast path.
+comptime {
+    const fields = @typeInfo(BuiltinManagerTag).@"enum".fields;
+    if (fields.len != 6) @compileError(
+        "BuiltinManagerTag: case count changed — update `classifyBuiltinManager` " ++
+            "and this assertion together (see the symmetry obligation comment above).",
+    );
+}
 
 /// Pure classifier: map a dotted manager name to its `BuiltinManagerTag`.
 /// The five recognised names correspond to `lib/zap/memory/arc.zap`,
@@ -839,63 +864,6 @@ test "resolve populates builtin_tag for the default ARC manager before discovery
     // before the discovery walk so future callers can branch on the
     // tag without first having to succeed in resolution.
     try std.testing.expectEqual(BuiltinManagerTag.arc, classifyBuiltinManager(DEFAULT_MANAGER));
-}
-
-test "Phase 4 integration: ARC manager resolves end-to-end with builtin_tag set" {
-    // Mirror of "Phase 4 integration: ARC manager resolves end-to-end
-    // (no short-circuit)" below, with one extra assertion: the
-    // resolved manager carries `builtin_tag == .arc`. Phase 1 only
-    // populates the field; later phases branch on it. This test
-    // pins the field's value on the canonical success path.
-    const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/zap/memory") catch return error.Unexpected;
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/arc") catch return error.Unexpected;
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
-
-    const stdlib_decl =
-        \\@memory_manager_source = "src/memory/arc/manager.zig"
-        \\
-        \\pub struct Zap.Memory.ARC {
-        \\}
-        \\
-    ;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/zap/memory/arc.zap", .data = stdlib_decl }) catch return error.Unexpected;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/arc/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
-
-    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
-    defer allocator.free(tmp_path);
-
-    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
-    defer allocator.free(stdlib_root);
-    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
-    defer allocator.free(cache_root);
-
-    var diag_buf: [1024]u8 = undefined;
-    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-
-    var resolved = try resolve(
-        allocator,
-        .{
-            .manager_name = "Zap.Memory.ARC",
-            .source_roots = &.{
-                .{ .name = "zap_stdlib", .path = stdlib_root },
-            },
-            .project_root = tmp_path,
-            .zap_source_root = tmp_path,
-            .cache_dir = cache_root,
-            .fork_compile_fn = mockForkCompileArc,
-        },
-        &diag,
-    );
-    defer freeResolved(allocator, &resolved);
-
-    try std.testing.expectEqualStrings("Zap.Memory.ARC", resolved.name);
-    try std.testing.expectEqual(BuiltinManagerTag.arc, resolved.builtin_tag);
-    try std.testing.expectEqual(abi.REFCOUNT_V1_BIT, resolved.declared_caps);
 }
 
 test "resolve populates builtin_tag for third-party managers as .third_party" {
@@ -2093,6 +2061,13 @@ test "Phase 4 integration: ARC manager resolves end-to-end (no short-circuit)" {
     defer freeResolved(allocator, &resolved);
 
     try std.testing.expectEqualStrings("Zap.Memory.ARC", resolved.name);
+    // Pin the Phase 1 `builtin_tag` classification on the canonical
+    // success path. Later phases (Phase 4 comptime dispatch) branch on
+    // this — a regression that silently misclassified ARC as
+    // `.third_party` would route every ARC build through the v1.0
+    // vtable and lose the perf-recovery win without breaking the
+    // declared_caps/object_path observables, so we assert it here.
+    try std.testing.expectEqual(BuiltinManagerTag.arc, resolved.builtin_tag);
     try std.testing.expectEqual(abi.REFCOUNT_V1_BIT, resolved.declared_caps);
     try std.testing.expect(resolved.object_path != null);
     std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
@@ -2226,6 +2201,9 @@ test "Phase 4 integration: ARC manager resolves end-to-end (Mach-O)" {
     defer freeResolved(allocator, &resolved);
 
     try std.testing.expectEqualStrings("Zap.Memory.ARC", resolved.name);
+    // Mach-O parity for the Phase 1 tag pin (see the ELF sibling above
+    // for the rationale).
+    try std.testing.expectEqual(BuiltinManagerTag.arc, resolved.builtin_tag);
     try std.testing.expectEqual(abi.REFCOUNT_V1_BIT, resolved.declared_caps);
     try std.testing.expect(resolved.object_path != null);
     std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
@@ -2286,6 +2264,10 @@ test "Phase 3 integration: NoOp manager resolves end-to-end through driver" {
     defer freeResolved(allocator, &resolved);
 
     try std.testing.expectEqualStrings("Zap.Memory.NoOp", resolved.name);
+    // Pin the Phase 1 `builtin_tag` classification: NoOp is a canonical
+    // first-party manager and must classify as `.no_op` so future
+    // phases can dispatch to its specialised fast path.
+    try std.testing.expectEqual(BuiltinManagerTag.no_op, resolved.builtin_tag);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
     try std.testing.expect(resolved.object_path != null);
 
@@ -2346,6 +2328,8 @@ test "Phase 3 integration: NoOp manager resolves end-to-end through driver (Mach
     defer freeResolved(allocator, &resolved);
 
     try std.testing.expectEqualStrings("Zap.Memory.NoOp", resolved.name);
+    // Mach-O parity for the NoOp Phase 1 tag pin.
+    try std.testing.expectEqual(BuiltinManagerTag.no_op, resolved.builtin_tag);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
     try std.testing.expect(resolved.object_path != null);
     std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
@@ -2416,6 +2400,10 @@ test "Phase 5 integration: Arena manager resolves end-to-end through driver (ELF
     defer freeResolved(allocator, &resolved);
 
     try std.testing.expectEqualStrings("Zap.Memory.Arena", resolved.name);
+    // Pin the Phase 1 `builtin_tag` classification: Arena is a
+    // canonical first-party manager and must classify as `.arena` so
+    // future phases can dispatch to its bump-pointer fast path.
+    try std.testing.expectEqual(BuiltinManagerTag.arena, resolved.builtin_tag);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
     try std.testing.expect(resolved.object_path != null);
     // Arena declares no REFCOUNT_V1 capability — explicit check guards
@@ -2481,6 +2469,8 @@ test "Phase 5 integration: Arena manager resolves end-to-end through driver (Mac
     defer freeResolved(allocator, &resolved);
 
     try std.testing.expectEqualStrings("Zap.Memory.Arena", resolved.name);
+    // Mach-O parity for the Arena Phase 1 tag pin.
+    try std.testing.expectEqual(BuiltinManagerTag.arena, resolved.builtin_tag);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
     try std.testing.expect(resolved.object_path != null);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps & abi.REFCOUNT_V1_BIT);
@@ -2555,6 +2545,10 @@ test "Phase 7 integration: Leak manager resolves end-to-end through driver (ELF)
     defer freeResolved(allocator, &resolved);
 
     try std.testing.expectEqualStrings("Zap.Memory.Leak", resolved.name);
+    // Pin the Phase 1 `builtin_tag` classification: Leak is a
+    // canonical first-party manager and must classify as `.leak` so
+    // future phases can dispatch to its leak-everything fast path.
+    try std.testing.expectEqual(BuiltinManagerTag.leak, resolved.builtin_tag);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
     try std.testing.expect(resolved.object_path != null);
     // Leak declares no REFCOUNT_V1 capability — explicit check guards
@@ -2620,6 +2614,8 @@ test "Phase 7 integration: Leak manager resolves end-to-end through driver (Mach
     defer freeResolved(allocator, &resolved);
 
     try std.testing.expectEqualStrings("Zap.Memory.Leak", resolved.name);
+    // Mach-O parity for the Leak Phase 1 tag pin.
+    try std.testing.expectEqual(BuiltinManagerTag.leak, resolved.builtin_tag);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
     try std.testing.expect(resolved.object_path != null);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps & abi.REFCOUNT_V1_BIT);
@@ -2688,6 +2684,11 @@ test "Phase 7 integration: Tracking manager resolves end-to-end through driver (
     defer freeResolved(allocator, &resolved);
 
     try std.testing.expectEqualStrings("Zap.Memory.Tracking", resolved.name);
+    // Pin the Phase 1 `builtin_tag` classification: Tracking is a
+    // canonical first-party manager and must classify as `.tracking`
+    // so future phases can dispatch to its diagnostic-bookkeeping fast
+    // path.
+    try std.testing.expectEqual(BuiltinManagerTag.tracking, resolved.builtin_tag);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
     try std.testing.expect(resolved.object_path != null);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps & abi.REFCOUNT_V1_BIT);
@@ -2743,6 +2744,8 @@ test "Phase 7 integration: Tracking manager resolves end-to-end through driver (
     defer freeResolved(allocator, &resolved);
 
     try std.testing.expectEqualStrings("Zap.Memory.Tracking", resolved.name);
+    // Mach-O parity for the Tracking Phase 1 tag pin.
+    try std.testing.expectEqual(BuiltinManagerTag.tracking, resolved.builtin_tag);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
     try std.testing.expect(resolved.object_path != null);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps & abi.REFCOUNT_V1_BIT);
