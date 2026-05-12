@@ -343,3 +343,102 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
         .get_capability_desc = leakGetCapabilityDesc,
     },
 };
+
+// ---------------------------------------------------------------------------
+// REFCOUNT_V1 panic stubs (Phase 4)
+//
+// Leak declares zero capabilities. The runtime's Phase 6 codegen elides
+// every retain/release call site under a manager that omits the
+// capability, so the stubs below are never invoked in practice. They
+// exist solely to give the uniform first-party manager interface a
+// complete set of symbols — see the matching section in
+// `src/memory/arc/manager.zig` for the full rationale.
+// ---------------------------------------------------------------------------
+
+fn leakRetainStub(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn leakReleaseStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    deep_walk: ?*const fn (object: *anyopaque) callconv(.c) void,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = deep_walk;
+    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn leakRetainSizedStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn leakReleaseSizedStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+    deep_walk: ?*const fn (object: *anyopaque) callconv(.c) void,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    _ = deep_walk;
+    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn leakAllocateRefcountedStub(
+    ctx: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) ?[*]u8 {
+    _ = ctx;
+    _ = size;
+    _ = alignment;
+    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn leakRefcountSizedStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) u32 {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+// ---------------------------------------------------------------------------
+// Uniform first-party manager interface (Phase 4)
+//
+// See the matching section in `src/memory/arc/manager.zig` for the full
+// rationale.
+// ---------------------------------------------------------------------------
+
+pub const init = leakInit;
+pub const deinit = leakDeinit;
+pub const allocate = leakAllocate;
+pub const deallocate = leakDeallocate;
+pub const allocateRefcounted = leakAllocateRefcountedStub;
+pub const retain = leakRetainStub;
+pub const release = leakReleaseStub;
+pub const retainSized = leakRetainSizedStub;
+pub const releaseSized = leakReleaseSizedStub;
+pub const refcountSized = leakRefcountSizedStub;
+pub const getCapabilityDesc = leakGetCapabilityDesc;

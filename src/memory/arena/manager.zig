@@ -388,3 +388,114 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
         .get_capability_desc = arenaGetCapabilityDesc,
     },
 };
+
+// ---------------------------------------------------------------------------
+// REFCOUNT_V1 panic stubs (Phase 4)
+//
+// Arena declares zero capabilities (`declared_caps = 0`) — it does NOT
+// implement REFCOUNT_V1. The runtime's Phase 6 codegen elides every
+// retain/release call site under a manager that omits the capability,
+// so the stubs below are never invoked in practice. They exist solely
+// to give the uniform first-party manager interface a complete set of
+// symbols: Phase 4's comptime dispatch in `src/runtime.zig` calls into
+// `@import("zap_active_manager").<fn>(...)` through the same alias
+// surface for every first-party manager, and a missing symbol would
+// break the user-binary compile even though codegen would never emit
+// a call to it.
+//
+// Each stub `@panic`s with a diagnostic that names the manager and the
+// missing capability — if a future runtime regression somehow bypasses
+// codegen elision and reaches one of these, the panic surfaces the
+// bug immediately at the call site rather than masking it as a typed
+// pointer dereference into uninitialised vtable bytes.
+// ---------------------------------------------------------------------------
+
+fn arenaRetainStub(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn arenaReleaseStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    deep_walk: ?*const fn (object: *anyopaque) callconv(.c) void,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = deep_walk;
+    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn arenaRetainSizedStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn arenaReleaseSizedStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+    deep_walk: ?*const fn (object: *anyopaque) callconv(.c) void,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    _ = deep_walk;
+    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn arenaAllocateRefcountedStub(
+    ctx: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) ?[*]u8 {
+    _ = ctx;
+    _ = size;
+    _ = alignment;
+    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn arenaRefcountSizedStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) u32 {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+// ---------------------------------------------------------------------------
+// Uniform first-party manager interface (Phase 4)
+//
+// See the matching section in `src/memory/arc/manager.zig` for the full
+// rationale. Every first-party manager exposes the same set of `pub`
+// names so the runtime's comptime dispatch can call into the active
+// manager's hot paths through `@import("zap_active_manager")` uniformly.
+// ---------------------------------------------------------------------------
+
+pub const init = arenaInit;
+pub const deinit = arenaDeinit;
+pub const allocate = arenaAllocate;
+pub const deallocate = arenaDeallocate;
+pub const allocateRefcounted = arenaAllocateRefcountedStub;
+pub const retain = arenaRetainStub;
+pub const release = arenaReleaseStub;
+pub const retainSized = arenaRetainSizedStub;
+pub const releaseSized = arenaReleaseSizedStub;
+pub const refcountSized = arenaRefcountSizedStub;
+pub const getCapabilityDesc = arenaGetCapabilityDesc;

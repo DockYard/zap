@@ -1226,3 +1226,40 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
         .get_capability_desc = arcGetCapabilityDesc,
     },
 };
+
+// ---------------------------------------------------------------------------
+// Uniform first-party manager interface (Phase 4)
+//
+// Phase 4's comptime dispatch in `src/runtime.zig` calls into the active
+// first-party manager through `@import("zap_active_manager")` rather than
+// through the vtable, so LLVM can inline the manager's hot paths across
+// the module boundary. The dispatch path requires every first-party
+// manager to expose the SAME set of `pub` names — listed below — so the
+// runtime's `active_manager.<fn>(...)` call sites compile against a
+// uniform shape regardless of which manager the build resolved to.
+//
+// The aliases below are not redundant with the vtable's function-pointer
+// fields: the vtable still routes third-party managers and the runtime's
+// fallback path. These aliases give the runtime a direct symbol to call,
+// without an indirect load through `core.allocate`/`cap.retain_sized`/...
+// — which is the exact construct LLVM needs to inline through.
+//
+// ARC implements the REFCOUNT_V1 capability fully, so every alias below
+// resolves to a real function. Managers that do not declare REFCOUNT_V1
+// (Arena, NoOp, Leak, Tracking) expose the same interface but stub the
+// refcount entries with panicking bodies — codegen elides those call
+// sites under no-REFCOUNT_V1 builds, so the stubs are never invoked in
+// practice.
+// ---------------------------------------------------------------------------
+
+pub const init = arcInit;
+pub const deinit = arcDeinit;
+pub const allocate = arcAllocate;
+pub const deallocate = arcDeallocate;
+pub const allocateRefcounted = arcAllocateRefcounted;
+pub const retain = arcRetain;
+pub const release = arcRelease;
+pub const retainSized = arcRetainSized;
+pub const releaseSized = arcReleaseSized;
+pub const refcountSized = arcRefcountSized;
+pub const getCapabilityDesc = arcGetCapabilityDesc;

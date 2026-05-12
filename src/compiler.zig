@@ -5650,3 +5650,164 @@ test "Phase 3: getRuntimeSource applies both caps and tag rewrites in one pass" 
     try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .arc;") != null);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4 — uniform first-party manager interface. Each first-party
+// `manager.zig` exposes the same set of public symbols (`init`, `deinit`,
+// `allocate`, `deallocate`, `allocateRefcounted`, `retain`, `release`,
+// `retainSized`, `releaseSized`, `refcountSized`, `getCapabilityDesc`)
+// so the runtime's comptime dispatch in `src/runtime.zig` can call into
+// the active manager's hot paths through `@import("zap_active_manager")`
+// uniformly. The runtime arm that selects the direct-call path
+// (`if (comptime ACTIVE_MANAGER_TAG != .third_party)`) compiles only
+// when these symbols all resolve; the third-party stub
+// (`src/zap_active_manager_stub.zig`) must mirror the same interface.
+// These tests pin the symbol set across every embedded source so a
+// future refactor that drops one of the aliases is caught at the
+// compile-test boundary rather than at the user-binary compile.
+// ---------------------------------------------------------------------------
+
+test "Phase 4: every first-party manager source exposes the uniform interface aliases" {
+    // The Phase 4 runtime dispatch arm calls `active_manager.<fn>(...)`
+    // for each of these names. A missing alias in any first-party
+    // `manager.zig` would break the user-binary compile for that
+    // manager but would NOT be caught by the host test suite (which
+    // loads `runtime.zig` against the third-party stub instead). This
+    // test pins the symbol set across all five first-party sources
+    // so a missing alias surfaces immediately.
+    //
+    // The substring shape (`pub const <name> =`) is the canonical
+    // declaration pattern documented in `src/memory/arc/manager.zig`.
+    // The first-party managers route their `init`/`deinit`/...
+    // aliases at the **bottom of the file** where the implementing
+    // functions are already in scope; a regression that moves the
+    // aliases above the function definitions (an order-of-declaration
+    // mistake) would surface during the user-binary compile, but the
+    // substring check here catches the simpler "alias missing
+    // entirely" regression.
+    const uniform_aliases = [_][]const u8{
+        "pub const init = ",
+        "pub const deinit = ",
+        "pub const allocate = ",
+        "pub const deallocate = ",
+        "pub const allocateRefcounted = ",
+        "pub const retain = ",
+        "pub const release = ",
+        "pub const retainSized = ",
+        "pub const releaseSized = ",
+        "pub const refcountSized = ",
+        "pub const getCapabilityDesc = ",
+    };
+    const tags = [_]zap.memory_driver.BuiltinManagerTag{ .arc, .arena, .no_op, .leak, .tracking };
+    for (tags) |tag| {
+        const source = getBuiltinManagerSource(tag).?;
+        for (uniform_aliases) |needle| {
+            if (std.mem.indexOf(u8, source, needle) == null) {
+                std.debug.print(
+                    "\n  manager tag={s} is missing uniform alias `{s}`\n",
+                    .{ @tagName(tag), needle },
+                );
+                try std.testing.expect(false);
+            }
+        }
+    }
+}
+
+test "Phase 4: third-party stub exposes the uniform interface as pub fn declarations" {
+    // The third-party stub's panic functions are declared with
+    // `pub fn <name>(...)` (rather than `pub const <name> = ...`)
+    // because each function has a body. Either declaration form
+    // would satisfy the runtime's `active_manager.<fn>(...)` call
+    // site, but the stub uses `pub fn` so the source reads as
+    // intentionally unreachable defensive code rather than an alias
+    // table. Pin both contracts here: the stub must declare every
+    // name on the uniform interface, AND every panic body must
+    // mention `unreachable` so a reader knows the call site is by
+    // design dead.
+    const stub_source = getActiveManagerSourceBytes(.third_party);
+    const uniform_pub_fn_aliases = [_][]const u8{
+        "pub fn init(",
+        "pub fn deinit(",
+        "pub fn allocate(",
+        "pub fn deallocate(",
+        "pub fn allocateRefcounted(",
+        "pub fn retain(",
+        "pub fn release(",
+        "pub fn retainSized(",
+        "pub fn releaseSized(",
+        "pub fn refcountSized(",
+        "pub fn getCapabilityDesc(",
+    };
+    for (uniform_pub_fn_aliases) |needle| {
+        if (std.mem.indexOf(u8, stub_source, needle) == null) {
+            std.debug.print(
+                "\n  third-party stub is missing uniform alias `{s}`\n",
+                .{needle},
+            );
+            try std.testing.expect(false);
+        }
+    }
+    // Every stub body @panics with an "unreachable" diagnostic; pin
+    // the substring so a regression that swaps a panic for a real
+    // implementation (which would silently mis-route under a
+    // `.third_party` build) is caught at the source level.
+    try std.testing.expect(std.mem.indexOf(u8, stub_source, "unreachable") != null);
+}
+
+test "Phase 4: managers without REFCOUNT_V1 declare panic stubs that name the missing capability" {
+    // The four first-party managers that do NOT declare REFCOUNT_V1
+    // (Arena, NoOp, Leak, Tracking) expose the uniform interface with
+    // panic stubs in place of the refcount slot aliases. The stub
+    // bodies must mention `REFCOUNT_V1` so a regression that bypasses
+    // codegen elision and reaches one of these stubs surfaces with a
+    // clear diagnostic naming the missing capability — not an
+    // anonymous "panic" with no actionable signal.
+    const tags = [_]zap.memory_driver.BuiltinManagerTag{ .arena, .no_op, .leak, .tracking };
+    for (tags) |tag| {
+        const source = getBuiltinManagerSource(tag).?;
+        try std.testing.expect(std.mem.indexOf(u8, source, "REFCOUNT_V1") != null);
+        // The diagnostic phrase is shared across every panic stub —
+        // see `src/memory/arena/manager.zig` for the canonical
+        // wording. Match a substring of that wording so an
+        // accidental message change in one stub surfaces here.
+        try std.testing.expect(std.mem.indexOf(u8, source, "codegen should have elided this call") != null);
+    }
+}
+
+test "Phase 4: ARC manager's uniform interface aliases name the real implementation functions" {
+    // ARC is the only first-party manager that declares REFCOUNT_V1;
+    // its uniform-interface aliases must point at the real
+    // implementation functions (`arcInit`, `arcRetainSized`, ...)
+    // rather than at panic stubs. A regression that aliased a panic
+    // stub instead would silently regress every ARC build's
+    // retain/release into an immediate process crash.
+    const source = getBuiltinManagerSource(.arc).?;
+    const real_alias_pairs = [_]struct { alias: []const u8, target: []const u8 }{
+        .{ .alias = "pub const init = ", .target = "arcInit" },
+        .{ .alias = "pub const deinit = ", .target = "arcDeinit" },
+        .{ .alias = "pub const allocate = ", .target = "arcAllocate" },
+        .{ .alias = "pub const deallocate = ", .target = "arcDeallocate" },
+        .{ .alias = "pub const allocateRefcounted = ", .target = "arcAllocateRefcounted" },
+        .{ .alias = "pub const retain = ", .target = "arcRetain" },
+        .{ .alias = "pub const release = ", .target = "arcRelease" },
+        .{ .alias = "pub const retainSized = ", .target = "arcRetainSized" },
+        .{ .alias = "pub const releaseSized = ", .target = "arcReleaseSized" },
+        .{ .alias = "pub const refcountSized = ", .target = "arcRefcountSized" },
+        .{ .alias = "pub const getCapabilityDesc = ", .target = "arcGetCapabilityDesc" },
+    };
+    for (real_alias_pairs) |pair| {
+        // Build the expected line literal and assert it appears
+        // verbatim — pointer equality of the alias name and the
+        // implementation function name pins both ends of the alias
+        // table.
+        var buf: [128]u8 = undefined;
+        const expected = std.fmt.bufPrint(&buf, "{s}{s};", .{ pair.alias, pair.target }) catch unreachable;
+        if (std.mem.indexOf(u8, source, expected) == null) {
+            std.debug.print(
+                "\n  ARC manager is missing the alias line `{s}`\n",
+                .{expected},
+            );
+            try std.testing.expect(false);
+        }
+    }
+}

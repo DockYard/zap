@@ -219,3 +219,102 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
         .get_capability_desc = noOpGetCapabilityDesc,
     },
 };
+
+// ---------------------------------------------------------------------------
+// REFCOUNT_V1 panic stubs (Phase 4)
+//
+// NoOp declares zero capabilities. The runtime's Phase 6 codegen elides
+// every retain/release call site under a manager that omits the
+// capability, so the stubs below are never invoked in practice. They
+// exist solely to give the uniform first-party manager interface a
+// complete set of symbols — see the matching section in
+// `src/memory/arc/manager.zig` for the full rationale.
+// ---------------------------------------------------------------------------
+
+fn noOpRetainStub(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn noOpReleaseStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    deep_walk: ?*const fn (object: *anyopaque) callconv(.c) void,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = deep_walk;
+    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn noOpRetainSizedStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn noOpReleaseSizedStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+    deep_walk: ?*const fn (object: *anyopaque) callconv(.c) void,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    _ = deep_walk;
+    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn noOpAllocateRefcountedStub(
+    ctx: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) ?[*]u8 {
+    _ = ctx;
+    _ = size;
+    _ = alignment;
+    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn noOpRefcountSizedStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) u32 {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+// ---------------------------------------------------------------------------
+// Uniform first-party manager interface (Phase 4)
+//
+// See the matching section in `src/memory/arc/manager.zig` for the full
+// rationale.
+// ---------------------------------------------------------------------------
+
+pub const init = noOpInit;
+pub const deinit = noOpDeinit;
+pub const allocate = noOpAllocate;
+pub const deallocate = noOpDeallocate;
+pub const allocateRefcounted = noOpAllocateRefcountedStub;
+pub const retain = noOpRetainStub;
+pub const release = noOpReleaseStub;
+pub const retainSized = noOpRetainSizedStub;
+pub const releaseSized = noOpReleaseSizedStub;
+pub const refcountSized = noOpRefcountSizedStub;
+pub const getCapabilityDesc = noOpGetCapabilityDesc;

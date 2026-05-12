@@ -791,6 +791,105 @@ const ZapMemorySection = extern struct {
 /// `src/memory/driver.zig`'s post-link symbol check (`assertExportsManagerSymbol`).
 /// Spec section 3.2 + section 10.5 codify the requirement; this comment
 /// pins the implementation-side invariant in source.
+// ---------------------------------------------------------------------------
+// REFCOUNT_V1 panic stubs (Phase 4)
+//
+// Tracking declares zero capabilities. The runtime's Phase 6 codegen
+// elides every retain/release call site under a manager that omits the
+// capability, so the stubs below are never invoked in practice. They
+// exist solely to give the uniform first-party manager interface a
+// complete set of symbols — see the matching section in
+// `src/memory/arc/manager.zig` for the full rationale.
+// ---------------------------------------------------------------------------
+
+fn trackingRetainStub(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn trackingReleaseStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    deep_walk: ?*const fn (object: *anyopaque) callconv(.c) void,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = deep_walk;
+    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn trackingRetainSizedStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn trackingReleaseSizedStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+    deep_walk: ?*const fn (object: *anyopaque) callconv(.c) void,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    _ = deep_walk;
+    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn trackingAllocateRefcountedStub(
+    ctx: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) ?[*]u8 {
+    _ = ctx;
+    _ = size;
+    _ = alignment;
+    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+fn trackingRefcountSizedStub(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) u32 {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+// ---------------------------------------------------------------------------
+// Uniform first-party manager interface (Phase 4)
+//
+// See the matching section in `src/memory/arc/manager.zig` for the full
+// rationale.
+// ---------------------------------------------------------------------------
+
+pub const init = trackingInit;
+pub const deinit = trackingDeinit;
+pub const allocate = trackingAllocate;
+pub const deallocate = trackingDeallocate;
+pub const allocateRefcounted = trackingAllocateRefcountedStub;
+pub const retain = trackingRetainStub;
+pub const release = trackingReleaseStub;
+pub const retainSized = trackingRetainSizedStub;
+pub const releaseSized = trackingReleaseSizedStub;
+pub const refcountSized = trackingRefcountSizedStub;
+pub const getCapabilityDesc = trackingGetCapabilityDesc;
+
 pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) = .{
     .meta = .{
         .magic = ZMEM_MAGIC,
