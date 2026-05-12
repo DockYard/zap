@@ -18,6 +18,21 @@
 //! binary uses. This test compares the constant declarations
 //! textually so any unilateral edit fails at build time with a clear
 //! diagnostic.
+//!
+//! Limitations: this is a textual cross-check of layout constants.
+//! It does NOT catch drift in function bodies (`lookupClass`,
+//! `slabAllocSlot`, `slabFreeSlot`, the cached-empty / partial-list
+//! policy, the `LargeHeader` layout helpers, etc.) or comptime-derived
+//! tables (`SLAB_CLASS_ALIGNS`, `SLAB_CLASS_LOOKUP_TABLE`). Behavioural
+//! parity is exercised through the 15 byte-keyed slab pool tests in
+//! `src/runtime.zig`, which call into `TestOnlyArcSlabPool`'s functions;
+//! the production manager's slab functions are exercised end-to-end via
+//! the manager-driven `Arc(T)` integration tests. A property-based
+//! parity test that exercises both pool instances in lockstep with the
+//! same operation sequence would close the residual gap; deferred — it
+//! requires teaching the test runner to link the production manager
+//! object directly, which is non-trivial because the manager TU has its
+//! own atomics-helper export and a duplicate slab-pool block.
 
 const std = @import("std");
 

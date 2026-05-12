@@ -958,6 +958,159 @@ var zap_memory_started: bool = false;
 var zap_memory_shutdown_complete: bool = false;
 
 // ----------------------------------------------------------------
+// v1.0 REFCOUNT_V1 trap-stub plumbing.
+//
+// Under a v1.0 manager the REFCOUNT_V1 descriptor advertises only the
+// first 16 bytes of `ZapRefcountCapabilityV1` (`retain` + `release`).
+// The compiler-side struct is 48 bytes long because v1.1 added four
+// trailing slots (`retain_sized`, `release_sized`,
+// `allocate_refcounted`, `refcount_sized`). A typed
+// `*const AbiV1.ZapRefcountCapabilityV1` cast over a 16-byte image
+// would alias slots 2-5 over out-of-bounds memory; the current
+// dispatchers gate every v1.1 slot access on
+// `zap_active_refcount_has_sized_extension` so the aliased bytes are
+// never actually read, but a future code change that drops the gate
+// would dereference garbage.
+//
+// Defense-in-depth: when binding a v1.0 manager, the runtime copies
+// the user-provided 16-byte head into a process-local writable v1.1-
+// shaped vtable buffer (`v1_0_composed_refcount_vtable`) and stuffs
+// trap stubs into slots 2-5. The trap stubs panic with a diagnostic
+// that names the missing extension slot; the panic message catches
+// the regression at the dispatch site rather than at the corruption
+// downstream.
+//
+// `zap_active_refcount_capability` is then pointed at this composed
+// buffer instead of at the raw user vtable. All dispatchers that
+// consult the cap pointer therefore see a fully-populated 48-byte
+// struct, and dropping the `has_sized_extension` gate would surface
+// the trap-stub panic instead of arbitrary-memory dereference.
+// ----------------------------------------------------------------
+
+/// Process-local writable buffer that holds the composed v1.1-shaped
+/// REFCOUNT_V1 vtable when the active manager advertises only the
+/// v1.0 surface. Populated by `bindRefcountCapability` during
+/// `zapMemoryStartup` and never reassigned for the program's lifetime
+/// (spec §10.2's write-once binding contract). The buffer lives in
+/// `.bss` so the trap-stub function pointers stabilise at program
+/// load; subsequent runs see the same addresses.
+var v1_0_composed_refcount_vtable: AbiV1.ZapRefcountCapabilityV1 = undefined;
+
+/// Trap stub for the v1.1 `retain_sized` slot under a v1.0 manager.
+/// Reaching this stub means a dispatcher consulted slot 2 of the
+/// refcount capability vtable despite
+/// `zap_active_refcount_has_sized_extension == false` — either the
+/// dispatcher's gate is missing or a build-pipeline bug routed a
+/// generic `Arc(T)` allocation through `retain_sized` under a v1.0
+/// manager. Both cases are unrecoverable; panic loudly so the
+/// regression is caught at the next test pass instead of as a silent
+/// memory corruption.
+fn v1_0_trap_retain_sized(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    @panic("zap runtime: REFCOUNT_V1 retain_sized invoked under v1.0 manager (missing has_sized_extension gate)");
+}
+
+/// Trap stub for the v1.1 `release_sized` slot under a v1.0 manager.
+/// See `v1_0_trap_retain_sized` for the gating rationale.
+fn v1_0_trap_release_sized(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+    deep_walk: ?AbiV1.ZapDeepWalkFn,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    _ = deep_walk;
+    @panic("zap runtime: REFCOUNT_V1 release_sized invoked under v1.0 manager (missing has_sized_extension gate)");
+}
+
+/// Trap stub for the v1.1 `allocate_refcounted` slot under a v1.0
+/// manager. See `v1_0_trap_retain_sized` for the gating rationale.
+fn v1_0_trap_allocate_refcounted(
+    ctx: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) ?[*]u8 {
+    _ = ctx;
+    _ = size;
+    _ = alignment;
+    @panic("zap runtime: REFCOUNT_V1 allocate_refcounted invoked under v1.0 manager (missing has_sized_extension gate)");
+}
+
+/// Trap stub for the v1.1 `refcount_sized` slot under a v1.0 manager.
+/// See `v1_0_trap_retain_sized` for the gating rationale.
+fn v1_0_trap_refcount_sized(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) u32 {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    @panic("zap runtime: REFCOUNT_V1 refcount_sized invoked under v1.0 manager (missing has_sized_extension gate)");
+}
+
+/// Bind the active manager's REFCOUNT_V1 capability. When the
+/// descriptor advertises only the v1.0 surface (`desc.size <
+/// REFCOUNT_V1_SIZE_V1_1`), copy the user-provided `retain` /
+/// `release` slots into `v1_0_composed_refcount_vtable` and stuff
+/// trap stubs into the v1.1 extension slots. Points
+/// `zap_active_refcount_capability` at the composed buffer in that
+/// case; otherwise points it directly at the user vtable.
+///
+/// Hoisted out of `zapMemoryStartup` so the test-only descriptor swap
+/// (`setActiveRefcountCapabilityForTest`) can reuse the same composition
+/// path without duplicating the trap-stub plumbing.
+fn bindRefcountCapability(desc: *const AbiV1.ZapCapabilityDescV1) void {
+    // For a v1.1+ descriptor the typed cast safely aliases the full
+    // 48-byte image — slots 2-5 are real function pointers populated
+    // by the manager. Bind directly.
+    if (desc.size >= AbiV1.REFCOUNT_V1_SIZE_V1_1) {
+        const cap_ptr: *const AbiV1.ZapRefcountCapabilityV1 = @ptrCast(@alignCast(desc.vtable));
+        zap_active_refcount_capability = cap_ptr;
+        zap_active_refcount_has_sized_extension = true;
+        return;
+    }
+    // v1.0 path: only `retain` + `release` are guaranteed to be valid
+    // in the user-supplied 16-byte image. Read those two slots
+    // through a minimal v1.0-shaped cast that touches exactly the
+    // first 16 bytes — the safe portion of the user vtable.
+    const V1_0Head = extern struct {
+        retain: *const fn (ctx: *anyopaque, object: *anyopaque) callconv(.c) void,
+        release: *const fn (ctx: *anyopaque, object: *anyopaque, deep_walk: ?AbiV1.ZapDeepWalkFn) callconv(.c) void,
+    };
+    comptime {
+        if (@sizeOf(V1_0Head) != AbiV1.REFCOUNT_V1_SIZE_V1_0) @compileError(
+            "v1_0 head shape must match REFCOUNT_V1_SIZE_V1_0",
+        );
+    }
+    const head_ptr: *const V1_0Head = @ptrCast(@alignCast(desc.vtable));
+    v1_0_composed_refcount_vtable = .{
+        .retain = head_ptr.retain,
+        .release = head_ptr.release,
+        .retain_sized = v1_0_trap_retain_sized,
+        .release_sized = v1_0_trap_release_sized,
+        .allocate_refcounted = v1_0_trap_allocate_refcounted,
+        .refcount_sized = v1_0_trap_refcount_sized,
+    };
+    zap_active_refcount_capability = &v1_0_composed_refcount_vtable;
+    zap_active_refcount_has_sized_extension = false;
+}
+
+// ----------------------------------------------------------------
 // Test-only ARC manager fallback.
 //
 // Phase 4 ripped the built-in ARC stub out of the runtime so every
@@ -1463,7 +1616,10 @@ fn testOnlyArcRetain(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
 
 /// REFCOUNT_V1 `release` for cells with the refcount at offset 0.
 /// Atomic decrement; on the zero-transition invoke `deep_walk(object)`
-/// if non-null.
+/// if non-null. Asserts `prev > 0` for symmetry with the production
+/// `arcRelease` in `src/memory/arc/manager.zig`: releasing a cell whose
+/// refcount is already zero is undefined under spec §8.2, so catch the
+/// regression at the call site rather than at the corruption downstream.
 fn testOnlyArcRelease(
     ctx: *anyopaque,
     object: *anyopaque,
@@ -1472,6 +1628,7 @@ fn testOnlyArcRelease(
     _ = ctx;
     const refcount_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(object));
     const prev = refcount_ptr.fetchSub(1, .acq_rel);
+    std.debug.assert(prev > 0);
     if (prev == 1) {
         if (deep_walk) |walk| walk(object);
     }
@@ -1586,6 +1743,92 @@ const test_only_arc_refcount_descriptor: AbiV1.ZapCapabilityDescV1 = .{
     .flags = 0,
     .vtable = @ptrCast(&test_only_arc_refcount_vtable),
 };
+
+/// Test-only v1.0 REFCOUNT_V1 vtable shape: just `retain` and
+/// `release`. The struct is exactly 16 bytes — matches
+/// `REFCOUNT_V1_SIZE_V1_0` — so a descriptor referencing it
+/// exercises the runtime's v1.0 forward-compatibility branch
+/// (`!zap_active_refcount_has_sized_extension`).
+///
+/// The two slot functions are reused from the v1.1 vtable above
+/// because the v1.0 contract is a subset: `retain(ctx, object)` /
+/// `release(ctx, object, deep_walk)` operate on the inline 4-byte
+/// refcount at offset 0 of the cell, which under the runtime's
+/// v1.0 fallback is the `ArcHeader` at the cell base (laid out by
+/// `LegacyArcInnerLayout`). The same functions service both
+/// vtables without re-implementation.
+const TestOnlyArcRefcountV1_0Vtable = extern struct {
+    retain: *const fn (ctx: *anyopaque, object: *anyopaque) callconv(.c) void,
+    release: *const fn (ctx: *anyopaque, object: *anyopaque, deep_walk: ?AbiV1.ZapDeepWalkFn) callconv(.c) void,
+};
+
+comptime {
+    if (@sizeOf(TestOnlyArcRefcountV1_0Vtable) != AbiV1.REFCOUNT_V1_SIZE_V1_0) @compileError(
+        "TestOnlyArcRefcountV1_0Vtable must be exactly REFCOUNT_V1_SIZE_V1_0 (16 bytes)",
+    );
+}
+
+const test_only_arc_v1_0_refcount_vtable: TestOnlyArcRefcountV1_0Vtable = .{
+    .retain = testOnlyArcRetain,
+    .release = testOnlyArcRelease,
+};
+
+const test_only_arc_v1_0_refcount_descriptor: AbiV1.ZapCapabilityDescV1 = .{
+    .id = AbiV1.REFC_TAG,
+    .version = 1,
+    .size = AbiV1.REFCOUNT_V1_SIZE_V1_0,
+    .flags = 0,
+    .vtable = @ptrCast(&test_only_arc_v1_0_refcount_vtable),
+};
+
+/// Test-only saved state for swapping the active REFCOUNT_V1
+/// descriptor between v1.0 and v1.1 shapes during a single test.
+/// `saveActiveRefcountCapabilityForTest` records the current
+/// (cap_ptr, has_sized_extension) tuple into this storage so the
+/// test's `defer` block can call
+/// `restoreActiveRefcountCapabilityForTest` and put the runtime
+/// back exactly the way the surrounding tests expect to find it.
+///
+/// Single-threaded by design — tests share a process. If parallel
+/// tests are ever enabled, the swap APIs must take a per-thread
+/// override map instead.
+const TestOnlyArcCapabilitySaveSlot = struct {
+    capability: ?*const AbiV1.ZapRefcountCapabilityV1,
+    has_sized_extension: bool,
+    composed_vtable_snapshot: AbiV1.ZapRefcountCapabilityV1,
+};
+
+var test_only_arc_capability_save_slot: TestOnlyArcCapabilitySaveSlot = undefined;
+
+/// Test-only helper: install a new active REFCOUNT_V1 descriptor for
+/// the duration of a test. Hooks into the same `bindRefcountCapability`
+/// path the runtime startup uses, so v1.0 / v1.1 selection follows
+/// the production logic. The save slot snapshots
+/// `v1_0_composed_refcount_vtable` because the next bind call will
+/// overwrite that buffer; restoring copies the snapshot back so any
+/// dispatch that captured the cap pointer earlier in startup keeps
+/// seeing the original bytes.
+///
+/// Returns a save token whose `restoreActiveRefcountCapabilityForTest`
+/// call MUST run inside the test's `defer` block — even on a test
+/// failure path — so the next test sees the pre-swap state.
+fn saveActiveRefcountCapabilityForTest() void {
+    test_only_arc_capability_save_slot = .{
+        .capability = zap_active_refcount_capability,
+        .has_sized_extension = zap_active_refcount_has_sized_extension,
+        .composed_vtable_snapshot = v1_0_composed_refcount_vtable,
+    };
+}
+
+fn restoreActiveRefcountCapabilityForTest() void {
+    v1_0_composed_refcount_vtable = test_only_arc_capability_save_slot.composed_vtable_snapshot;
+    zap_active_refcount_capability = test_only_arc_capability_save_slot.capability;
+    zap_active_refcount_has_sized_extension = test_only_arc_capability_save_slot.has_sized_extension;
+}
+
+fn installRefcountCapabilityForTest(desc: *const AbiV1.ZapCapabilityDescV1) void {
+    bindRefcountCapability(desc);
+}
 
 /// Test-only ARC core vtable. The compile-time default value of
 /// `zap_active_manager_core` points here in test builds; in
@@ -1831,7 +2074,7 @@ fn zapMemoryStartup() void {
         if (desc.version != 1) {
             @panic("zap runtime: REFCOUNT_V1 descriptor has unsupported version (expected 1)");
         }
-        // The spec (§8.0) defines two valid `desc.size` floors:
+        // The spec (§8.0) defines two named `desc.size` shapes:
         //   * `REFCOUNT_V1_SIZE_V1_0` (16): the v1.0 base — just
         //     `retain` and `release`. The runtime falls back to
         //     `core.allocate` / `core.deallocate` for generic `Arc(T)`
@@ -1841,29 +2084,36 @@ fn zapMemoryStartup() void {
         //     generic `Arc(T)` through `allocate_refcounted` /
         //     `retain_sized` / `release_sized` / `refcount_sized`.
         //
-        // A descriptor smaller than the v1.0 floor is malformed;
-        // a descriptor between the two floors (e.g., 32 bytes) is
-        // also malformed because there's no valid intermediate ABI
-        // shape. The build-time driver in `src/memory/driver.zig`
-        // rejects both, but the runtime mirrors the checks as a
-        // defence-in-depth tripwire that catches any path that
-        // bypasses driver validation (e.g., a future plugin loader).
+        // Per spec §2.3 forward-extension, any `desc.size` in the
+        // closed interval [REFCOUNT_V1_SIZE_V1_0, 8 × sizeof(v1.1)]
+        // is accepted. Sizes between v1.0 and v1.1 (e.g., 32 bytes)
+        // are unusual but legal — the runtime treats them as v1.0
+        // (sized extension absent) via the v1.1 threshold check
+        // below (`desc.size >= REFCOUNT_V1_SIZE_V1_1`), so any vtable
+        // shorter than the full v1.1 surface stays on the legacy
+        // path. The build-time driver in `src/memory/driver.zig`
+        // applies the identical bounds; the runtime mirrors the
+        // checks as a defence-in-depth tripwire that catches any
+        // path that bypasses driver validation (e.g., a future
+        // plugin loader).
         if (desc.size < AbiV1.REFCOUNT_V1_SIZE_V1_0) {
             @panic("zap runtime: REFCOUNT_V1 vtable is smaller than v1.0 (16 bytes)");
         }
         if (desc.size > 8 * @sizeOf(AbiV1.ZapRefcountCapabilityV1)) {
             @panic("zap runtime: REFCOUNT_V1 vtable exceeds v1.x upper bound (corrupt binary?)");
         }
-        const cap_ptr: *const AbiV1.ZapRefcountCapabilityV1 = @ptrCast(@alignCast(desc.vtable));
-        zap_active_refcount_capability = cap_ptr;
         // The v1.1 extension threshold: the manager must advertise
         // at least the full v1.1 vtable size to participate in the
         // side-table refcount path. A v1.0 manager (size == 16)
         // stays compatible — the runtime falls back to
         // `core.allocate` / `core.deallocate` for generic `Arc(T)`
         // and uses only the v1.0 `retain` / `release` slots for
-        // inline-header types.
-        zap_active_refcount_has_sized_extension = desc.size >= AbiV1.REFCOUNT_V1_SIZE_V1_1;
+        // inline-header types. `bindRefcountCapability` materialises a
+        // composed 48-byte vtable image with trap stubs in slots 2-5
+        // when the manager is v1.0, so a future code change that
+        // drops the `has_sized_extension` gate would surface a clear
+        // diagnostic panic instead of arbitrary-memory dereference.
+        bindRefcountCapability(desc);
     }
 
     // libc's `atexit` returns 0 on success and non-zero on failure;
@@ -3106,37 +3356,83 @@ pub const ArcRuntime = struct {
             @panic("zap runtime: allocAny dispatched with no active memory manager");
         const ctx = zap_memory_manager_context orelse
             @panic("zap runtime: allocAny dispatched with null manager context");
-        const LegacyInner = LegacyArcInner(T);
-        const size = @sizeOf(LegacyInner);
-        const alignment_bytes = @alignOf(LegacyInner);
-        const raw = core.allocate(ctx, size, @intCast(alignment_bytes)) orelse
+        const layout = LegacyArcInnerLayout(T);
+        const raw = core.allocate(ctx, layout.size, @intCast(layout.alignment)) orelse
             @panic("zap runtime: out of memory: manager.allocate returned null");
-        const inner: *LegacyInner = @ptrCast(@alignCast(raw));
-        inner.* = .{ .header = ArcHeader.init(), .value = value };
-        return &inner.value;
+        // Header at offset 0, value at `value_offset`. Write each
+        // field through its own typed pointer so the user payload's
+        // alignment / layout requirements are honoured without
+        // round-tripping through an `extern struct` (which would
+        // refuse to compile when `T` has automatic layout — every
+        // user-defined Zap struct).
+        const header_ptr: *ArcHeader = @ptrCast(@alignCast(raw));
+        header_ptr.* = ArcHeader.init();
+        const value_ptr: *T = @ptrCast(@alignCast(raw + layout.value_offset));
+        value_ptr.* = value;
+        return value_ptr;
     }
 
-    /// Inline-header layout the runtime falls back to under a v1.0
-    /// manager (no side-table extension). The header is at offset 0
-    /// so the manager's `retain` / `release` slots can address it
-    /// directly; the user-visible pointer skips past the header and
-    /// addresses `value` so the rest of the runtime sees a normal
-    /// `*T` regardless of which vtable shape the manager exposes.
-    fn LegacyArcInner(comptime T: type) type {
-        return extern struct {
-            header: ArcHeader,
-            value: T,
+    /// Byte-level layout description of the v1.0 fallback's inline-
+    /// header cell. Stored as a value (not a type) so the runtime can
+    /// host arbitrary `T` — including user-defined Zap structs whose
+    /// automatic-layout shape forbids `extern struct` containment.
+    ///
+    /// Fields:
+    ///   * `size` — total cell size in bytes
+    ///                 (`value_offset + @sizeOf(T)`)
+    ///   * `alignment` — cell alignment, the max of `@alignOf(ArcHeader)`
+    ///                   (4 in REFCOUNT_V1 mode) and `@alignOf(T)`
+    ///   * `value_offset` — byte offset of the user payload after the
+    ///                      inline header (header lives at offset 0)
+    ///
+    /// The header sits at offset 0 so the v1.0 manager's `retain` /
+    /// `release` slots — which operate on a 4-byte refcount at offset
+    /// 0 of the supplied object pointer — can address it without any
+    /// per-T fixup. The user-visible pointer points at the value;
+    /// `legacyArcInnerHeaderFromValuePtr` walks back to the header
+    /// via the same offset math.
+    const LegacyArcInnerLayout_Info = struct {
+        size: usize,
+        alignment: u32,
+        value_offset: usize,
+    };
+
+    fn LegacyArcInnerLayout(comptime T: type) LegacyArcInnerLayout_Info {
+        const header_align: usize = @alignOf(ArcHeader);
+        const value_align: usize = @alignOf(T);
+        const cell_align: usize = if (value_align > header_align) value_align else header_align;
+        const header_size: usize = @sizeOf(ArcHeader);
+        const value_offset: usize = std.mem.alignForward(usize, header_size, value_align);
+        const total: usize = value_offset + @sizeOf(T);
+        return .{
+            .size = total,
+            .alignment = @intCast(cell_align),
+            .value_offset = value_offset,
         };
     }
 
-    /// Recover the inline `LegacyArcInner(T)` from a user-visible
-    /// `*T`. Used by `releaseAnyLegacyV1_0` / `retainAnyLegacyV1_0`
-    /// when dispatching against a v1.0 manager.
-    fn legacyArcInnerFromValuePtr(comptime T: type, value_ptr: *T) *LegacyArcInner(T) {
-        const Inner = LegacyArcInner(T);
+    /// Recover the inline `ArcHeader` from a user-visible `*T` under
+    /// the v1.0 fallback. Mirrors the old `legacyArcInnerFromValuePtr`
+    /// but returns the header directly instead of an `extern struct *`
+    /// (which can't host non-extern `T`). The full cell base is
+    /// `value_ptr - LegacyArcInnerLayout(T).value_offset` — that
+    /// address is what `core.deallocate` receives in the deep-walk
+    /// and shallow-free closures below.
+    fn legacyArcInnerHeaderFromValuePtr(comptime T: type, value_ptr: *T) *ArcHeader {
+        const layout = LegacyArcInnerLayout(T);
         const value_addr = @intFromPtr(value_ptr);
-        const inner_addr = value_addr - @offsetOf(Inner, "value");
-        return @ptrFromInt(inner_addr);
+        const inner_base = value_addr - layout.value_offset;
+        return @ptrFromInt(inner_base);
+    }
+
+    /// Recover the base address of the v1.0 fallback cell from a
+    /// user-visible `*T`. Used by the deep-walk / shallow-free
+    /// closures when they need to call `core.deallocate(base, size,
+    /// alignment)` on the whole allocation.
+    fn legacyArcInnerBaseFromValuePtr(comptime T: type, value_ptr: *T) [*]u8 {
+        const layout = LegacyArcInnerLayout(T);
+        const value_addr = @intFromPtr(value_ptr);
+        return @ptrFromInt(value_addr - layout.value_offset);
     }
 
     /// Allocate a fixed-size inline-header cell `T` through the active
@@ -3178,10 +3474,19 @@ pub const ArcRuntime = struct {
     /// manager's `core.deallocate` slot. Mirror of
     /// `allocInlineHeaderCell` — the caller has already deep-released
     /// the cell's children (if any) before invoking this entry.
+    ///
+    /// `ensureMemoryStartup()` is called for symmetry with
+    /// `allocInlineHeaderCell`. In practice a free always follows an
+    /// alloc that already armed startup, but a future code path that
+    /// reaches this entry without a prior alloc (e.g., a tracking
+    /// manager that buffers cell handles across atexit boundaries)
+    /// still needs the active vtable bound before dispatch. Cheap —
+    /// after the first invocation it is a single boolean compare.
     pub fn freeInlineHeaderCell(comptime T: type, ptr: *T) void {
         if (zap_memory_shutdown_complete) {
             @panic("zap runtime: freeInlineHeaderCell dispatched after shutdown");
         }
+        ensureMemoryStartup();
         const core = zap_active_manager_core orelse
             @panic("zap runtime: freeInlineHeaderCell dispatched with no active memory manager");
         const ctx = zap_memory_manager_context orelse
@@ -3414,12 +3719,11 @@ pub const ArcRuntime = struct {
         const ctx = zap_memory_manager_context orelse unreachable;
         if (!zap_active_refcount_has_sized_extension) {
             // v1.0 fallback: dispatch through `release` on the inline
-            // ArcHeader of the `LegacyArcInner(T)` allocation. The
-            // shallow-free closure deallocates the inner allocation
-            // without walking children (matching the side-table path's
-            // shallow-free semantics).
-            const inner = legacyArcInnerFromValuePtr(T, @constCast(ptr));
-            cap.release(ctx, &inner.header, LegacyV1_0ShallowFreeClosure(T).run);
+            // ArcHeader at the cell base. The shallow-free closure
+            // deallocates the cell without walking children (matching
+            // the side-table path's shallow-free semantics).
+            const header_ptr = legacyArcInnerHeaderFromValuePtr(T, @constCast(ptr));
+            cap.release(ctx, header_ptr, LegacyV1_0ShallowFreeClosure(T).run);
             return;
         }
         const size = @sizeOf(T);
@@ -3436,18 +3740,20 @@ pub const ArcRuntime = struct {
     fn LegacyV1_0ShallowFreeClosure(comptime T: type) type {
         return struct {
             fn run(header_obj: *anyopaque) callconv(.c) void {
-                const Inner = LegacyArcInner(T);
-                const inner: *Inner = @ptrCast(@alignCast(header_obj));
+                // `header_obj` aliases the inline `ArcHeader` at the
+                // cell base — the manager passed in exactly the same
+                // pointer we handed to `cap.release`. The cell extends
+                // for `LegacyArcInnerLayout(T).size` bytes starting at
+                // that address; deallocate the whole range.
+                const layout = LegacyArcInnerLayout(T);
                 const core = zap_active_manager_core orelse @panic(
                     "zap runtime: v1.0 legacy freeAny: no active manager core",
                 );
                 const ctx = zap_memory_manager_context orelse @panic(
                     "zap runtime: v1.0 legacy freeAny: null manager context",
                 );
-                const size = @sizeOf(Inner);
-                const alignment_bytes = @alignOf(Inner);
-                const raw: [*]u8 = @ptrCast(@alignCast(inner));
-                core.deallocate(ctx, raw, size, @intCast(alignment_bytes));
+                const raw: [*]u8 = @ptrCast(@alignCast(header_obj));
+                core.deallocate(ctx, raw, layout.size, @intCast(layout.alignment));
             }
         };
     }
@@ -3571,15 +3877,15 @@ pub const ArcRuntime = struct {
         if (!zap_active_refcount_has_sized_extension) {
             // v1.0 fallback: the cell was allocated via
             // `dispatcherAllocLegacyV1_0` with an inline ArcHeader at
-            // offset 0 of a `LegacyArcInner(T)`. Dispatch through the
-            // v1.0 `release` slot which operates on the inline header,
-            // and on the zero-transition the manager calls
-            // `LegacyV1_0ReleaseClosure(T).run` to walk children and
-            // free the backing `LegacyArcInner(T)` allocation via
+            // offset 0 of the cell, followed by the user payload at
+            // `value_offset`. Dispatch through the v1.0 `release` slot
+            // which operates on the inline header; on the zero-
+            // transition the manager calls `LegacyV1_0ReleaseClosure(T).run`
+            // to walk children and free the backing cell via
             // `core.deallocate`.
-            const inner = legacyArcInnerFromValuePtr(T, @constCast(ptr));
+            const header_ptr = legacyArcInnerHeaderFromValuePtr(T, @constCast(ptr));
             const deep_walk: AbiV1.ZapDeepWalkFn = LegacyV1_0ReleaseClosure(T).run;
-            cap.release(ctx, &inner.header, deep_walk);
+            cap.release(ctx, header_ptr, deep_walk);
             return;
         }
         const size = @sizeOf(T);
@@ -3596,19 +3902,24 @@ pub const ArcRuntime = struct {
     /// path. The v1.0 vtable's `release` slot accepts only `(ctx,
     /// object, deep_walk)` — no `size` / `alignment`. The runtime
     /// therefore wires the per-T deep-walk + `core.deallocate` of the
-    /// inline `LegacyArcInner(T)` allocation into a single closure
-    /// that the manager invokes on the zero-transition. The closure
-    /// reaches `core.allocate`/`core.deallocate` through the runtime
-    /// globals — same pattern as `DeepWalkFnFor`.
+    /// inline cell into a single closure that the manager invokes on
+    /// the zero-transition. The closure reaches
+    /// `core.allocate`/`core.deallocate` through the runtime globals —
+    /// same pattern as `DeepWalkFnFor`.
     fn LegacyV1_0ReleaseClosure(comptime T: type) type {
         return struct {
             fn run(header_obj: *anyopaque) callconv(.c) void {
-                const Inner = LegacyArcInner(T);
-                const inner: *Inner = @ptrCast(@alignCast(header_obj));
+                // `header_obj` aliases the inline `ArcHeader` at the
+                // cell base. Recover the user-payload pointer via the
+                // layout-derived value offset, walk children, then
+                // deallocate the whole cell.
+                const layout = LegacyArcInnerLayout(T);
+                const base_byte_ptr: [*]u8 = @ptrCast(@alignCast(header_obj));
                 // Children walk first so they observe a still-valid
                 // parent; mirrors the spec §8.2 ordering.
                 if (comptime typeHasArcChildren(T)) {
-                    releaseChildrenAny(T, std.heap.page_allocator, inner.value);
+                    const value_ptr: *T = @ptrCast(@alignCast(base_byte_ptr + layout.value_offset));
+                    releaseChildrenAny(T, std.heap.page_allocator, value_ptr.*);
                 }
                 const core = zap_active_manager_core orelse @panic(
                     "zap runtime: v1.0 legacy release: no active manager core",
@@ -3616,10 +3927,7 @@ pub const ArcRuntime = struct {
                 const ctx = zap_memory_manager_context orelse @panic(
                     "zap runtime: v1.0 legacy release: null manager context",
                 );
-                const size = @sizeOf(Inner);
-                const alignment_bytes = @alignOf(Inner);
-                const raw: [*]u8 = @ptrCast(@alignCast(inner));
-                core.deallocate(ctx, raw, size, @intCast(alignment_bytes));
+                core.deallocate(ctx, base_byte_ptr, layout.size, @intCast(layout.alignment));
             }
         };
     }
@@ -3760,9 +4068,9 @@ pub const ArcRuntime = struct {
         const ctx = zap_memory_manager_context orelse unreachable;
         if (!zap_active_refcount_has_sized_extension) {
             // v1.0 fallback: dispatch through `retain` on the inline
-            // header of `LegacyArcInner(T)`.
-            const inner = legacyArcInnerFromValuePtr(T, @constCast(ptr));
-            cap.retain(ctx, &inner.header);
+            // header at the cell base.
+            const header_ptr = legacyArcInnerHeaderFromValuePtr(T, @constCast(ptr));
+            cap.retain(ctx, header_ptr);
             arc_retains_total += 1;
             return;
         }
@@ -3827,8 +4135,8 @@ pub const ArcRuntime = struct {
         if (!zap_active_refcount_has_sized_extension) {
             // v1.0 fallback — same dispatch as the transient retain
             // path but with the persistent counter convention.
-            const inner = legacyArcInnerFromValuePtr(T, @constCast(ptr));
-            cap.retain(ctx, &inner.header);
+            const header_ptr = legacyArcInnerHeaderFromValuePtr(T, @constCast(ptr));
+            cap.retain(ctx, header_ptr);
             arc_retains_total += 1;
             return;
         }
@@ -3985,11 +4293,11 @@ pub const ArcRuntime = struct {
         const cap = zap_active_refcount_capability orelse return 0;
         const ctx = zap_memory_manager_context orelse return 0;
         if (!zap_active_refcount_has_sized_extension) {
-            // v1.0 fallback: the inline ArcHeader at offset 0 of the
-            // `LegacyArcInner(T)` carries the refcount. Read it
-            // directly — v1.0 has no `refcount_sized` slot.
-            const inner = legacyArcInnerFromValuePtr(T, @constCast(ptr));
-            return inner.header.count();
+            // v1.0 fallback: the inline ArcHeader at the cell base
+            // carries the refcount. Read it directly — v1.0 has no
+            // `refcount_sized` slot.
+            const header_ptr = legacyArcInnerHeaderFromValuePtr(T, @constCast(ptr));
+            return header_ptr.count();
         }
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
@@ -15553,4 +15861,296 @@ fn cleanupSlabPool(pool: *TestOnlyArcSlabPool.SlabPool) void {
             class.cached_empty = null;
         }
     }
+}
+
+// ============================================================
+// v1.0 REFCOUNT_V1 legacy-fallback tests (Gap A — round-2 verification).
+//
+// The runtime exposes a complete v1.0 backward-compat path:
+//   * `dispatcherAllocLegacyV1_0`
+//   * `LegacyArcInnerLayout(T)` / `legacyArcInnerHeaderFromValuePtr` /
+//     `legacyArcInnerBaseFromValuePtr`
+//   * `LegacyV1_0ShallowFreeClosure(T)`
+//   * `LegacyV1_0ReleaseClosure(T)`
+//   * v1.0 branches in `dispatcherFreeImpl`, `dispatcherReleaseImpl`,
+//     `dispatcherRetainImpl`, `dispatcherRetainAnyPersistentImpl`,
+//     and `refCountAny`
+//
+// In a default `zig build test` run the test-only manager always
+// advertises `desc.size = 48`, so `zap_active_refcount_has_sized_extension`
+// is true and the v1.0 branches never fire. These tests install a
+// parallel v1.0 descriptor (`test_only_arc_v1_0_refcount_descriptor`,
+// size = 16) via `installRefcountCapabilityForTest`, exercise the
+// legacy path end-to-end, then restore the pre-test capability state
+// so subsequent tests see the v1.1 default. Without this coverage a
+// regression in any v1.0 branch — alloc, retain, release, refcount
+// query, deep-release closure, shallow-free closure, alignment math —
+// would slip through CI.
+//
+// Test ordering: each test saves capability state on entry and
+// restores it on exit via `defer`. The `defer` must run even on a
+// test failure so the next test sees a clean v1.1 binding.
+//
+// Concurrency: single-threaded test runner. If parallel tests are
+// ever enabled, these tests must move to a dedicated serial test
+// file because they mutate process-global state.
+// ============================================================
+
+/// Helper used by the v1.0 fallback tests to allocate an Arc(T)
+/// through `dispatcherAllocImpl` (which routes through
+/// `dispatcherAllocLegacyV1_0` when the active descriptor is v1.0).
+/// Returns the user-visible value pointer; the caller must release
+/// (or `freeAny`) through the same dispatcher to balance the alloc.
+fn legacyArcAllocForTest(comptime T: type, value: T) *T {
+    return ArcRuntime.allocAny(T, std.testing.allocator, value);
+}
+
+test "v1.0 fallback: allocate routes through dispatcherAllocLegacyV1_0" {
+    ensureMemoryStartup();
+    saveActiveRefcountCapabilityForTest();
+    defer restoreActiveRefcountCapabilityForTest();
+    installRefcountCapabilityForTest(&test_only_arc_v1_0_refcount_descriptor);
+    try std.testing.expect(!zap_active_refcount_has_sized_extension);
+
+    // Allocate an Arc(i64) under the v1.0 manager. The allocator
+    // must request `@sizeOf(LegacyArcInner(i64))` from
+    // `core.allocate` and return the pointer past the inline header.
+    const val_ptr = legacyArcAllocForTest(i64, 7);
+    defer ArcRuntime.releaseAny(std.testing.allocator, val_ptr);
+
+    // The user pointer is `&inner.value`. Walk back to the
+    // `LegacyArcInner(i64).header` and verify it sits at offset 0
+    // (refcount initialised to 1).
+    const Inner = extern struct { header: ArcHeader, value: i64 };
+    const value_addr = @intFromPtr(val_ptr);
+    const inner_addr = value_addr - @offsetOf(Inner, "value");
+    const inner: *Inner = @ptrFromInt(inner_addr);
+    try std.testing.expectEqual(@as(u32, 1), inner.header.count());
+    try std.testing.expectEqual(@as(i64, 7), val_ptr.*);
+}
+
+test "v1.0 fallback: retainAny increments inline-header refcount" {
+    ensureMemoryStartup();
+    saveActiveRefcountCapabilityForTest();
+    defer restoreActiveRefcountCapabilityForTest();
+    installRefcountCapabilityForTest(&test_only_arc_v1_0_refcount_descriptor);
+    try std.testing.expect(!zap_active_refcount_has_sized_extension);
+
+    const val_ptr = legacyArcAllocForTest(i64, 99);
+    try std.testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(val_ptr));
+
+    ArcRuntime.retainAny(val_ptr);
+    try std.testing.expectEqual(@as(u32, 2), ArcRuntime.refCountAny(val_ptr));
+
+    ArcRuntime.retainAny(val_ptr);
+    try std.testing.expectEqual(@as(u32, 3), ArcRuntime.refCountAny(val_ptr));
+
+    // Three releases bring the refcount to zero and invoke the
+    // deep-release closure, which frees the `LegacyArcInner` via
+    // `core.deallocate`.
+    ArcRuntime.releaseAny(std.testing.allocator, val_ptr);
+    ArcRuntime.releaseAny(std.testing.allocator, val_ptr);
+    ArcRuntime.releaseAny(std.testing.allocator, val_ptr);
+}
+
+test "v1.0 fallback: deep release fires LegacyV1_0ReleaseClosure on zero transition" {
+    ensureMemoryStartup();
+    saveActiveRefcountCapabilityForTest();
+    defer restoreActiveRefcountCapabilityForTest();
+    installRefcountCapabilityForTest(&test_only_arc_v1_0_refcount_descriptor);
+
+    // Allocate, retain so refcount = 2, then call `releaseAny` twice.
+    // The first release decrements to 1 (no free). The second
+    // transitions to 0 and the manager's `release` slot invokes
+    // `LegacyV1_0ReleaseClosure(i64).run`, which calls
+    // `core.deallocate`. We can't directly observe the deallocate
+    // call (the test-only manager's `core.deallocate` is a side-
+    // effecting slab return), but we can re-allocate immediately
+    // afterward and verify the same slot is recycled — proving the
+    // deep-release path returned the slot to the pool.
+    const first = legacyArcAllocForTest(i64, 42);
+    ArcRuntime.retainAny(first);
+    try std.testing.expectEqual(@as(u32, 2), ArcRuntime.refCountAny(first));
+
+    const first_inner_addr = @intFromPtr(first) - @offsetOf(extern struct { header: ArcHeader, value: i64 }, "value");
+
+    ArcRuntime.releaseAny(std.testing.allocator, first);
+    try std.testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(first));
+    ArcRuntime.releaseAny(std.testing.allocator, first);
+    // After zero-transition the slot is freed. Allocate again to
+    // confirm pool reuse — the test-only slab pool uses LIFO
+    // free-list semantics, so a same-size alloc following a free in
+    // the same slab returns the just-freed slot.
+    const second = legacyArcAllocForTest(i64, 1234);
+    defer ArcRuntime.releaseAny(std.testing.allocator, second);
+    const second_inner_addr = @intFromPtr(second) - @offsetOf(extern struct { header: ArcHeader, value: i64 }, "value");
+    try std.testing.expectEqual(first_inner_addr, second_inner_addr);
+    try std.testing.expectEqual(@as(i64, 1234), second.*);
+}
+
+test "v1.0 fallback: freeAny invokes LegacyV1_0ShallowFreeClosure (no deep walk)" {
+    ensureMemoryStartup();
+    saveActiveRefcountCapabilityForTest();
+    defer restoreActiveRefcountCapabilityForTest();
+    installRefcountCapabilityForTest(&test_only_arc_v1_0_refcount_descriptor);
+
+    // `freeAny` is the shallow-free path: the caller has already
+    // released children (or the type has none), so the manager
+    // skips the deep walk and just deallocates the inner. Verify
+    // observable slot reuse with the same LIFO trick as the deep-
+    // release test.
+    const first = legacyArcAllocForTest(i64, 555);
+    const first_inner_addr = @intFromPtr(first) - @offsetOf(extern struct { header: ArcHeader, value: i64 }, "value");
+
+    // Single owner — refcount transitions 1 -> 0 directly. The
+    // dispatcher routes through `cap.release(ctx, &inner.header,
+    // LegacyV1_0ShallowFreeClosure(i64).run)` which calls
+    // `core.deallocate` without walking children.
+    ArcRuntime.freeAny(std.testing.allocator, first);
+
+    const second = legacyArcAllocForTest(i64, 999);
+    defer ArcRuntime.releaseAny(std.testing.allocator, second);
+    const second_inner_addr = @intFromPtr(second) - @offsetOf(extern struct { header: ArcHeader, value: i64 }, "value");
+    try std.testing.expectEqual(first_inner_addr, second_inner_addr);
+    try std.testing.expectEqual(@as(i64, 999), second.*);
+}
+
+test "v1.0 fallback: legacy alloc honors LegacyArcInner alignment for varied T sizes" {
+    ensureMemoryStartup();
+    saveActiveRefcountCapabilityForTest();
+    defer restoreActiveRefcountCapabilityForTest();
+    installRefcountCapabilityForTest(&test_only_arc_v1_0_refcount_descriptor);
+
+    // The inline-header layout's natural alignment is
+    // `@alignOf(LegacyArcInner(T)) = max(@alignOf(ArcHeader=u32),
+    // @alignOf(T))`. The manager's `core.allocate` must hand back a
+    // pointer aligned to that bound. Probe a range of T sizes /
+    // alignments to make sure the layout math survives in every
+    // class.
+    const Cases = struct { name: []const u8, run: *const fn () anyerror!void };
+
+    const probes = [_]Cases{
+        .{
+            .name = "u8",
+            .run = struct {
+                fn run() !void {
+                    const val_ptr = ArcRuntime.allocAny(u8, std.testing.allocator, 0xAB);
+                    defer ArcRuntime.releaseAny(std.testing.allocator, val_ptr);
+                    const Inner = extern struct { header: ArcHeader, value: u8 };
+                    try std.testing.expect(@intFromPtr(val_ptr) % @alignOf(u8) == 0);
+                    const inner_addr = @intFromPtr(val_ptr) - @offsetOf(Inner, "value");
+                    try std.testing.expect(inner_addr % @alignOf(Inner) == 0);
+                    try std.testing.expectEqual(@as(u8, 0xAB), val_ptr.*);
+                }
+            }.run,
+        },
+        .{
+            .name = "[7]u8",
+            .run = struct {
+                fn run() !void {
+                    const T = [7]u8;
+                    const val_ptr = ArcRuntime.allocAny(T, std.testing.allocator, [_]u8{ 1, 2, 3, 4, 5, 6, 7 });
+                    defer ArcRuntime.releaseAny(std.testing.allocator, val_ptr);
+                    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7 }, val_ptr[0..]);
+                }
+            }.run,
+        },
+        .{
+            .name = "u128",
+            .run = struct {
+                fn run() !void {
+                    const val_ptr = ArcRuntime.allocAny(u128, std.testing.allocator, 0xDEADBEEF_CAFEBABE_12345678_90ABCDEF);
+                    defer ArcRuntime.releaseAny(std.testing.allocator, val_ptr);
+                    try std.testing.expect(@intFromPtr(val_ptr) % @alignOf(u128) == 0);
+                    try std.testing.expectEqual(@as(u128, 0xDEADBEEF_CAFEBABE_12345678_90ABCDEF), val_ptr.*);
+                }
+            }.run,
+        },
+        .{
+            .name = "[64]u8",
+            .run = struct {
+                fn run() !void {
+                    const T = [64]u8;
+                    var seed: T = undefined;
+                    for (0..64) |i| seed[i] = @intCast(i);
+                    const val_ptr = ArcRuntime.allocAny(T, std.testing.allocator, seed);
+                    defer ArcRuntime.releaseAny(std.testing.allocator, val_ptr);
+                    try std.testing.expectEqualSlices(u8, &seed, val_ptr[0..]);
+                }
+            }.run,
+        },
+    };
+    for (probes) |probe| {
+        probe.run() catch |err| {
+            std.debug.print("v1.0 fallback alignment probe failed for {s}: {s}\n", .{ probe.name, @errorName(err) });
+            return err;
+        };
+    }
+}
+
+test "v1.0 fallback: retainAnyPersistent routes through legacy retain slot" {
+    ensureMemoryStartup();
+    saveActiveRefcountCapabilityForTest();
+    defer restoreActiveRefcountCapabilityForTest();
+    installRefcountCapabilityForTest(&test_only_arc_v1_0_refcount_descriptor);
+    try std.testing.expect(!zap_active_refcount_has_sized_extension);
+
+    // `retainAnyPersistent` mirrors `retainAny` on the v1.0 path —
+    // both dispatch through `cap.retain(ctx, &inner.header)` because
+    // the v1.0 vtable has no separate persistent-share slot. This
+    // test exercises the dispatcher branch in
+    // `dispatcherRetainAnyPersistentImpl` so a regression that drops
+    // the v1.0 fallback there surfaces immediately.
+    const val_ptr = legacyArcAllocForTest(i64, 5150);
+    defer ArcRuntime.releaseAny(std.testing.allocator, val_ptr);
+    defer ArcRuntime.releaseAny(std.testing.allocator, val_ptr);
+
+    ArcRuntime.retainAnyPersistent(val_ptr);
+    try std.testing.expectEqual(@as(u32, 2), ArcRuntime.refCountAny(val_ptr));
+    try std.testing.expectEqual(@as(i64, 5150), val_ptr.*);
+}
+
+test "v1.0 fallback: trap stubs panic when sized slots are dispatched (compile-time wiring check)" {
+    ensureMemoryStartup();
+    saveActiveRefcountCapabilityForTest();
+    defer restoreActiveRefcountCapabilityForTest();
+    installRefcountCapabilityForTest(&test_only_arc_v1_0_refcount_descriptor);
+
+    // After v1.0 binding, the composed capability vtable's slots 2-5
+    // must be the trap stubs (Gap D's defense-in-depth). We don't
+    // actually invoke them — that would abort the test process —
+    // but we verify their function-pointer identity to guard against
+    // a regression that leaves slots 2-5 pointing at out-of-bounds
+    // memory or at the v1.1 implementations.
+    const cap = zap_active_refcount_capability orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(
+        @as(@TypeOf(cap.retain_sized), v1_0_trap_retain_sized),
+        cap.retain_sized,
+    );
+    try std.testing.expectEqual(
+        @as(@TypeOf(cap.release_sized), v1_0_trap_release_sized),
+        cap.release_sized,
+    );
+    try std.testing.expectEqual(
+        @as(@TypeOf(cap.allocate_refcounted), v1_0_trap_allocate_refcounted),
+        cap.allocate_refcounted,
+    );
+    try std.testing.expectEqual(
+        @as(@TypeOf(cap.refcount_sized), v1_0_trap_refcount_sized),
+        cap.refcount_sized,
+    );
+
+    // Slots 0 and 1 must mirror the v1.0 descriptor's user-supplied
+    // function pointers (the test-only retain/release).
+    try std.testing.expectEqual(
+        @as(@TypeOf(cap.retain), testOnlyArcRetain),
+        cap.retain,
+    );
+    try std.testing.expectEqual(
+        @as(@TypeOf(cap.release), testOnlyArcRelease),
+        cap.release,
+    );
 }
