@@ -713,6 +713,10 @@ var zap_memory_started: bool = false;
 /// "written exactly once... never reassigned during the program's
 /// lifetime" — the context keeps pointing at its last-known value so
 /// the post-shutdown state is observable rather than masked by null.
+///
+/// Single-threaded today; if concurrency lands, this must become
+/// atomic (matches the pattern already documented for `arc_stats`
+/// and `instrumentation_state` elsewhere in this file).
 var zap_memory_shutdown_complete: bool = false;
 
 // ----------------------------------------------------------------
@@ -938,6 +942,13 @@ fn zapMemoryStartup() void {
     // `ensure*Atexit` registration sites in this file likewise discard
     // the return value; this site asserts because shutdown is the only
     // hook that the spec mandates run before process exit (§10.2).
+    //
+    // Note: `std.debug.assert` is elided in `ReleaseFast` and
+    // `ReleaseSmall`. In those modes a failing `atexit` registration
+    // is silently tolerated and the shutdown handler is lost.
+    // Acceptable trade-off — atexit failure is extreme and never
+    // observed in practice on hosted Linux/macOS, where the slot
+    // table is bounded only by available memory.
     std.debug.assert(atexit(zapMemoryShutdownAtexit) == 0);
     zap_memory_started = true;
 }
@@ -3000,6 +3011,12 @@ pub const ArcRuntime = struct {
             return builtinReleaseImpl(allocator, unwrapped);
         }
         const T = arcPtrChild(@TypeOf(ptr));
+        releaseArcAny(T, allocator, ptr);
+        // Counter increments AFTER `releaseArcAny` returns so it only
+        // ticks when the operation actually happened. Matches the
+        // post-dispatch convention used by `headerRelease` and
+        // `builtinRetainImpl`.
+        //
         // Inline-header types (`Map(K, V)`, `List(T)`, ...) own
         // their own pool and bump `arc_releases_total` inside their
         // dedicated `release` method; if the generic wrapper also
@@ -3011,7 +3028,6 @@ pub const ArcRuntime = struct {
         if (comptime !hasInlineArcHeader(T)) {
             arc_releases_total += 1;
         }
-        releaseArcAny(T, allocator, ptr);
     }
 
     /// Phase 1 of split-phase release: atomically decrement the refcount and
@@ -3317,6 +3333,15 @@ pub const ArcRuntime = struct {
     /// The dispatcher bumps `arc_retains_total` so callers no longer
     /// need to do it themselves.
     pub fn headerRetain(header_ptr: *ArcHeader) void {
+        // Coverage note: the shutdown-complete and capability-null guard
+        // paths below trigger `@panic`, which aborts the test process,
+        // so they cannot be exercised under standard `zig build test`.
+        // Coverage of these guards is by inspection today; if regression
+        // testing becomes necessary, a separate fault-injection harness
+        // that spawns child processes and asserts on the panic message
+        // would be required. The same caveat applies to `headerRelease`
+        // and the other `*Any` dispatchers in this file.
+        //
         // PHASE 4: dispatcher does NOT snapshot (core, ctx, cap)
         // atomically. In Phase 2 the active manager is bound once at
         // startup and never reassigned during the program's lifetime
