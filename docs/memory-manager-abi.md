@@ -77,8 +77,15 @@ Third-party managers may live anywhere on the filesystem; the `@memory_manager_s
 
 The ABI is identified by an `(abi_major, abi_minor)` pair, both `u16`.
 
-- **Major version (`abi_major`)** changes when an incompatible change to the wire format or core vtable is made. The Zap compiler refuses to load a manager whose `abi_major` differs from its own. v1.0 has `abi_major = 1`.
+- **Major version (`abi_major`)** changes when an incompatible change to the wire format or core vtable is made. The Zap compiler refuses to load a manager whose `abi_major` differs from its own. All v1.x releases have `abi_major = 1`.
 - **Minor version (`abi_minor`)** changes when a backward-compatible change is made — for example, adding a new optional field to the end of a structure (using the `size` field convention; see 2.3). The Zap compiler accepts any manager whose `abi_minor` is less than or equal to its own.
+
+Known v1.x minors:
+
+| `abi_minor` | Date     | Change                                                                                                    |
+|-------------|----------|-----------------------------------------------------------------------------------------------------------|
+| 0           | initial  | Baseline ABI: meta header + core vtable + `REFCOUNT_V1` with two slots (`retain`, `release`).             |
+| 1           | Phase 4.x | Extends `ZapRefcountCapabilityV1` to six slots (adds `retain_sized`, `release_sized`, `allocate_refcounted`, `refcount_sized`) for the side-table refcount path used by generic `Arc(T)`. Purely additive — a v1.0 manager remains valid; a v1.1 consumer reading a v1.0 manager observes `desc.size = 16` for the REFC descriptor and routes generic `Arc(T)` allocations through `core.allocate` instead of `allocate_refcounted`. See section 8 for details. |
 
 ### 2.2 Capability versioning
 
@@ -727,7 +734,14 @@ A hash-mod-64 scheme would risk collisions as the namespace grows; sequential ha
 
 ## 8. `ZapRefcountCapabilityV1`
 
-This is the only fully-defined capability in v1.0. A manager that supports atomic reference counting declares the `REFC` bit and exposes a `ZapRefcountCapabilityV1` vtable.
+This is the only fully-defined capability in v1.x. A manager that supports atomic reference counting declares the `REFC` bit and exposes a `ZapRefcountCapabilityV1` vtable.
+
+The vtable evolved across two ABI minors:
+
+- **v1.0** (`abi_minor = 0`) defines two function-pointer slots — `retain` and `release` — totalling 16 bytes. These cover the inline-header refcount path: the manager reads the refcount from a known offset inside the cell pointer the runtime passes in.
+- **v1.1** (`abi_minor = 1`) appends four additional slots — `retain_sized`, `release_sized`, `allocate_refcounted`, and `refcount_sized` — totalling 48 bytes. These cover the side-table refcount path used by the runtime's generic `Arc(T)` cells (the cell's pointer addresses the user payload directly with no inline refcount header; the refcount lives in a separate side-table keyed by the cell's owning slab base).
+
+The extension is purely additive. The first 16 bytes of the vtable are bit-identical between v1.0 and v1.1. A v1.0 consumer reading only the first two slots remains compatible with a v1.1 manager (per the size-field forward-extension contract in section 2.3). A v1.1+ consumer that loads a v1.0 manager observes `desc.size = 16`, treats the four trailing slots as absent, and routes generic `Arc(T)` allocations through `core.allocate` instead of `allocate_refcounted`.
 
 ```zig
 /// Compiler-emitted deep-walk callback. When the refcount of an object
@@ -746,14 +760,21 @@ pub const ZapDeepWalkFn = *const fn (object: *anyopaque) callconv(.c) void;
 
 /// The REFCOUNT_V1 capability vtable. Pointed at by ZapCapabilityDescV1
 /// when descriptor.id == 'REFC' and descriptor.version == 1.
+///
+/// Slots 0 and 1 (`retain`, `release`) are mandatory and define ABI v1.0.
+/// Slots 2 through 5 (`retain_sized`, `release_sized`, `allocate_refcounted`,
+/// `refcount_sized`) are the ABI v1.1 forward-extension; managers built
+/// against v1.0 omit them and advertise `desc.size = 16`.
 pub const ZapRefcountCapabilityV1 = extern struct {
     /// Increment the reference count of `object`. Must be atomic
-    /// (relaxed ordering is sufficient for retain; the release fence
-    /// is in `release`).
+    /// (relaxed/monotonic ordering is sufficient for retain; the
+    /// release fence is in `release`).
     ///
-    /// Behavior is undefined if `object` was not produced by this
-    /// manager's `allocate` (cross-manager retains are forbidden;
-    /// see section 13).
+    /// `object` points at an inline-header cell: the manager reads the
+    /// refcount from a fixed offset within the cell. Behavior is
+    /// undefined if `object` was not produced by this manager's
+    /// `allocate` (cross-manager retains are forbidden; see section
+    /// 13). Side-table cells use `retain_sized` instead (v1.1+).
     ///
     /// Thread-safety: may be called concurrently from any thread on
     /// the same object.
@@ -772,6 +793,10 @@ pub const ZapRefcountCapabilityV1 = extern struct {
     ///      path; the runtime will not call `core.deallocate` on the
     ///      cell after release returns. See section 4.5.
     ///
+    /// `object` points at an inline-header cell — see the discussion
+    /// in `retain` above. Side-table cells use `release_sized` instead
+    /// (v1.1+).
+    ///
     /// The `deep_walk` callback may be null when the cell type has
     /// no refcounted children (e.g., a flat String).
     ///
@@ -788,15 +813,101 @@ pub const ZapRefcountCapabilityV1 = extern struct {
         object: *anyopaque,
         deep_walk: ?ZapDeepWalkFn,
     ) callconv(.c) void,
+
+    // -----------------------------------------------------------------
+    // ABI v1.1 extension (slots 2-5). Managers built against v1.0 omit
+    // these fields entirely and advertise `desc.size = 16`. Managers
+    // built against v1.1+ MUST provide all four slots and advertise
+    // `desc.size >= 48`.
+    // -----------------------------------------------------------------
+
+    /// Increment the side-table refcount for `object`. The runtime
+    /// passes the cell's allocation size and alignment so the manager
+    /// can locate the owning slab (e.g., via pointer mask) and the
+    /// per-slot side-table entry. Atomic; monotonic ordering is
+    /// sufficient.
+    ///
+    /// Used for generic `Arc(T)` cells whose layout omits the inline
+    /// refcount header (the cell's bytes are entirely user payload).
+    /// Inline-header cells (Map, List, MapIter under v1.x) continue
+    /// to use `retain` instead.
+    retain_sized: *const fn (
+        ctx: *anyopaque,
+        object: *anyopaque,
+        size: usize,
+        alignment: u32,
+    ) callconv(.c) void,
+
+    /// Decrement the side-table refcount for `object`. On the zero-
+    /// transition, the manager invokes `deep_walk(object)` (if non-null)
+    /// and frees the cell's storage — same semantics as `release` for
+    /// inline-header cells. Acquire-release ordering is required.
+    ///
+    /// `size` and `alignment` are the original allocation parameters
+    /// passed to `allocate_refcounted`. The manager uses them to
+    /// recover the cell's slab and side-table slot.
+    release_sized: *const fn (
+        ctx: *anyopaque,
+        object: *anyopaque,
+        size: usize,
+        alignment: u32,
+        deep_walk: ?ZapDeepWalkFn,
+    ) callconv(.c) void,
+
+    /// Allocate `size` bytes with at least `alignment` byte alignment
+    /// and initialise the cell's side-table refcount to 1 atomically.
+    /// Returns null on OOM. The returned pointer addresses the user
+    /// payload directly (no inline header).
+    ///
+    /// Distinct from `core.allocate`: that path returns a slot with
+    /// refcount 0 (used for raw, non-refcounted scratch allocations).
+    /// `allocate_refcounted` is the canonical entry point for
+    /// constructing a refcounted cell with the side-table layout —
+    /// every Zap `Arc(T)` cell originates here.
+    allocate_refcounted: *const fn (
+        ctx: *anyopaque,
+        size: usize,
+        alignment: u32,
+    ) callconv(.c) ?[*]u8,
+
+    /// Read the side-table refcount for `object` atomically (acquire
+    /// ordering). Used by the runtime's `resetAny` / Perceus reuse
+    /// path: a uniquely-owned cell (rc == 1) can be reused in place
+    /// rather than freed and reallocated.
+    ///
+    /// The result is a snapshot; subsequent retains/releases from
+    /// other threads may invalidate it. Callers that depend on the
+    /// value must synchronise externally.
+    refcount_sized: *const fn (
+        ctx: *anyopaque,
+        object: *anyopaque,
+        size: usize,
+        alignment: u32,
+    ) callconv(.c) u32,
 };
 
 comptime {
-    if (@sizeOf(ZapRefcountCapabilityV1) != 16) @compileError(
-        "ZapRefcountCapabilityV1 v1.0 must be exactly 16 bytes on a " ++
+    if (@sizeOf(ZapRefcountCapabilityV1) != 48) @compileError(
+        "ZapRefcountCapabilityV1 (ABI v1.1) must be exactly 48 bytes on a " ++
         "64-bit target with 8-byte function-pointer alignment",
     );
 }
 ```
+
+### 8.0 Vtable versioning
+
+A manager advertises which slots it provides through the `size` field of its `ZapCapabilityDescV1`:
+
+| `desc.size` (bytes) | ABI minor | Slots provided                                                                                  |
+|---------------------|-----------|-------------------------------------------------------------------------------------------------|
+| `16`                | v1.0      | `retain`, `release`                                                                             |
+| `48`                | v1.1      | `retain`, `release`, `retain_sized`, `release_sized`, `allocate_refcounted`, `refcount_sized`   |
+| `> 48`              | future    | All v1.1 slots plus additional trailing fields. Consumers read up to their known size and ignore the trailer per section 2.3. |
+| `< 16`              | invalid   | The compiler rejects the manager at section-validation time (`ValidationFailed`).               |
+
+A v1.1+ consumer (the current Zap runtime) inspects `desc.size` at startup. When `desc.size >= 48` the runtime takes the side-table path for generic `Arc(T)` allocations: `allocate_refcounted` → `retain_sized` → `release_sized` → `refcount_sized`. When `desc.size == 16` (a v1.0 manager) the runtime instead routes those allocations through `core.allocate` (with the v1.0 manager owning whichever inline-header layout it prefers). The first two slots — `retain` and `release` — are used identically in both modes for inline-header cells (Map, List, MapIter).
+
+Reserved upper bound: the compiler caps the accepted `desc.size` at `8 * sizeof(ZapRefcountCapabilityV1) = 384` bytes. A larger value is treated as a corrupt manager image and rejected at validation time. This matches the same upper-bound discipline applied to `meta.size` and `core.size` (see sections 3.5 and 4).
 
 ### 8.1 Object header expectations
 
@@ -1913,8 +2024,8 @@ Offset  Size  Field               Notes
 ------  ----  ------------------  ------------------------------------------
 0x00    4     magic               'ZMEM' as u32 (target-endianness)
 0x04    2     abi_major           1
-0x06    2     abi_minor           0
-0x08    2     size                32 in v1.0 (sizeof(ZapMemoryManagerMetaV1))
+0x06    2     abi_minor           0 (v1.0) or 1 (v1.1; see section 2.1)
+0x08    2     size                32 in v1.x (sizeof(ZapMemoryManagerMetaV1))
 0x0A    2     _reserved2          Reserved; must be 0
 0x0C    4     desc_count          Number of embedded ZapCapabilityDescV1
 0x10    8     declared_caps       Bitmask, see Appendix A
@@ -1955,13 +2066,42 @@ Starting at section offset `meta.core_vtable_offset + core.size` (= 0x58 in the 
 Entry offset relative to start of entry:
 0x00    4     id              FourCC tag as u32 (target-endianness)
 0x04    2     version         Per-capability version
-0x06    2     size            sizeof(vtable struct)
+0x06    2     size            sizeof(vtable struct). For REFCOUNT_V1: 16
+                                (v1.0) or 48 (v1.1). See section 8.
 0x08    4     flags           Capability-specific; SHOULD be 0 in v1.0
                                 (unknown bits are silently ignored)
 0x0C    4     (padding)       Zero-filled; required for 8-byte align
 0x10    8     vtable          Pointer to capability vtable
 0x18    -     -               (end of entry; total 24 bytes)
 ```
+
+### B.3a `ZapRefcountCapabilityV1` vtable byte layout
+
+The `vtable` field of a REFCOUNT_V1 descriptor points at an out-of-section vtable whose length is given by `desc.size`. The byte layout of the vtable proper:
+
+```
+v1.0 (desc.size = 16, abi_minor = 0):
+Offset  Size  Field        Notes
+------  ----  -----------  -----------------------------------------
+0x00    8     retain       Function pointer (callconv(.c))
+0x08    8     release      Function pointer (callconv(.c))
+0x10    -     -            (end of v1.0 vtable; total 16 bytes)
+
+v1.1 (desc.size = 48, abi_minor = 1):
+Offset  Size  Field                Notes
+------  ----  -------------------  -----------------------------------------
+0x00    8     retain               Function pointer (callconv(.c)). Identical
+                                   to v1.0 slot 0.
+0x08    8     release              Function pointer (callconv(.c)). Identical
+                                   to v1.0 slot 1.
+0x10    8     retain_sized         Function pointer (callconv(.c)). v1.1+.
+0x18    8     release_sized        Function pointer (callconv(.c)). v1.1+.
+0x20    8     allocate_refcounted  Function pointer (callconv(.c)). v1.1+.
+0x28    8     refcount_sized       Function pointer (callconv(.c)). v1.1+.
+0x30    -     -                    (end of v1.1 vtable; total 48 bytes)
+```
+
+The first 16 bytes are bit-identical across both minors — v1.1 is an additive extension. A consumer that knows only v1.0 reads `desc.size = 16` for a v1.0 manager (or `desc.size = 48` for a v1.1 manager and ignores the trailer per section 2.3). A v1.1+ consumer reads up to the slot count it understands and routes generic `Arc(T)` allocations to `allocate_refcounted` only when `desc.size >= 48`.
 
 ### B.4 Total `.zapmem` section size
 

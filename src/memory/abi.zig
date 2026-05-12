@@ -1,10 +1,10 @@
-//! Memory Manager ABI v1.0 — canonical Zig source for shared extern types.
+//! Memory Manager ABI v1.x — canonical Zig source for shared extern types.
 //!
 //! This module is the single source of truth on the Zig side for the
 //! `.zapmem` metadata structures defined in `docs/memory-manager-abi.md`
-//! sections 3 and 4. Both the section parser (`section_parser.zig`) and
-//! any future Zig-side manager runtime should import these types from
-//! here rather than redeclaring them locally.
+//! sections 3, 4, and 8. Both the section parser (`section_parser.zig`)
+//! and any future Zig-side manager runtime should import these types
+//! from here rather than redeclaring them locally.
 //!
 //! The spike's no-op manager (`spike/manager_v1/src/manager.zig`)
 //! intentionally redeclares its own copies because it is throwaway code
@@ -22,6 +22,17 @@
 //! a corresponding update to the spec doc, the matching runtime-side
 //! shape in `src/runtime.zig` (search for `pub const AbiV1 = struct`),
 //! and an ABI minor/major bump per spec section 2.3.
+//!
+//! ## Version history
+//!
+//! - `abi_major = 1`, `abi_minor = 0` (initial v1.0 release): `retain`
+//!   and `release` only — `ZapRefcountCapabilityV1` is 16 bytes.
+//! - `abi_major = 1`, `abi_minor = 1` (Phase 4.x extension): appends
+//!   `retain_sized`, `release_sized`, `allocate_refcounted`, and
+//!   `refcount_sized` to `ZapRefcountCapabilityV1`. Bytes 0..16 are
+//!   layout-identical to v1.0 so a v1.0 consumer that reads only the
+//!   first two slots (per the `size`-field forward-extension contract
+//!   in spec §2.3) remains compatible.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -210,24 +221,78 @@ comptime {
 /// `REFCOUNT_V1` capability vtable. Spec section 8. Pointed at by a
 /// `ZapCapabilityDescV1` whose `id == REFC_TAG` and `version == 1`.
 ///
-/// `retain` increments the reference count. `release` decrements and,
+/// The first two slots are the original v1.0 inline-header path:
+/// `retain` increments the reference count, `release` decrements and,
 /// on the zero-transition, invokes `deep_walk(object)` (if non-null)
 /// before freeing the cell's storage. The manager owns the full
 /// freeing path for refcounted cells — see spec section 8.2.
+///
+/// The trailing four slots are the Phase 4.x (ABI v1.1) extension for
+/// generic `Arc(T)` cells whose storage lives in a side-table slab
+/// pool rather than inline with the user payload:
+///
+///   * `retain_sized` / `release_sized` — locate the cell's slab from
+///     a 64-KiB-aligned base mask, read the size class from the slab
+///     header, and operate on a side-table refcount entry.
+///   * `allocate_refcounted` — allocate a fresh side-table cell with
+///     refcount initialised to 1.
+///   * `refcount_sized` — read the side-table refcount (used by the
+///     Perceus reuse path so a uniquely-owned cell can be reused in
+///     place rather than freed and reallocated).
+///
+/// A v1.0 manager remains compatible: its descriptor advertises `size
+/// = 16` and the runtime reads only the first two slots, dispatching
+/// generic `Arc(T)` allocations through `core.allocate` instead. A
+/// v1.1+ manager advertises `size = 48` (or larger if it appends
+/// further trailing fields) and the runtime takes the fast path through
+/// `allocate_refcounted` / `retain_sized` / `release_sized` / `refcount_sized`.
 pub const ZapRefcountCapabilityV1 = extern struct {
+    // v1.0 base (16 bytes, slots 0–1):
     retain: *const fn (ctx: *anyopaque, object: *anyopaque) callconv(.c) void,
     release: *const fn (ctx: *anyopaque, object: *anyopaque, deep_walk: ?ZapDeepWalkFn) callconv(.c) void,
+    // v1.1 extension (32 additional bytes, slots 2–5; total 48 bytes):
+    retain_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void,
+    release_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32, deep_walk: ?ZapDeepWalkFn) callconv(.c) void,
+    allocate_refcounted: *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8,
+    refcount_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32,
 };
 
+/// The legacy v1.0 byte length of `ZapRefcountCapabilityV1`. A manager
+/// built against ABI v1.0 advertises `desc.size == REFCOUNT_V1_SIZE_V1_0`
+/// (16 bytes). The runtime accepts any `desc.size >= REFCOUNT_V1_SIZE_V1_0`
+/// per the size-field forward-extension contract in spec §2.3.
+pub const REFCOUNT_V1_SIZE_V1_0: u16 = 16;
+
+/// The v1.1 byte length of `ZapRefcountCapabilityV1`, including the
+/// side-table extension slots. A v1.1+ manager advertises
+/// `desc.size >= REFCOUNT_V1_SIZE_V1_1` so the runtime can dispatch
+/// generic `Arc(T)` allocations through the sized API path.
+pub const REFCOUNT_V1_SIZE_V1_1: u16 = 48;
+
 comptime {
-    if (@sizeOf(ZapRefcountCapabilityV1) != 16) @compileError(
-        "abi: ZapRefcountCapabilityV1 v1.0 must be exactly 16 bytes",
+    if (@sizeOf(ZapRefcountCapabilityV1) != 48) @compileError(
+        "abi: ZapRefcountCapabilityV1 (ABI v1.1, Phase 4.x extension) must be exactly 48 bytes",
     );
     if (@offsetOf(ZapRefcountCapabilityV1, "retain") != 0) @compileError(
         "abi: ZapRefcountCapabilityV1.retain must be at offset 0",
     );
     if (@offsetOf(ZapRefcountCapabilityV1, "release") != 8) @compileError(
         "abi: ZapRefcountCapabilityV1.release must be at offset 8",
+    );
+    if (@offsetOf(ZapRefcountCapabilityV1, "retain_sized") != 16) @compileError(
+        "abi: ZapRefcountCapabilityV1.retain_sized must be at offset 16",
+    );
+    if (@offsetOf(ZapRefcountCapabilityV1, "release_sized") != 24) @compileError(
+        "abi: ZapRefcountCapabilityV1.release_sized must be at offset 24",
+    );
+    if (@offsetOf(ZapRefcountCapabilityV1, "allocate_refcounted") != 32) @compileError(
+        "abi: ZapRefcountCapabilityV1.allocate_refcounted must be at offset 32",
+    );
+    if (@offsetOf(ZapRefcountCapabilityV1, "refcount_sized") != 40) @compileError(
+        "abi: ZapRefcountCapabilityV1.refcount_sized must be at offset 40",
+    );
+    if (REFCOUNT_V1_SIZE_V1_1 != @sizeOf(ZapRefcountCapabilityV1)) @compileError(
+        "abi: REFCOUNT_V1_SIZE_V1_1 must match the current ZapRefcountCapabilityV1 size",
     );
 }
 
@@ -247,8 +312,27 @@ test "ZapMemoryManagerCoreV1 layout is exactly 56 bytes" {
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(ZapMemoryManagerCoreV1));
 }
 
-test "ZapRefcountCapabilityV1 layout is exactly 16 bytes" {
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(ZapRefcountCapabilityV1));
+test "ZapRefcountCapabilityV1 layout is exactly 48 bytes (ABI v1.1)" {
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(ZapRefcountCapabilityV1));
+}
+
+test "ZapRefcountCapabilityV1 retain/release prefix matches v1.0 byte layout" {
+    // The v1.1 extension is purely additive — the first 16 bytes must
+    // remain bit-identical to v1.0 so a v1.0 manager binary (which only
+    // emits the retain + release slots) is byte-compatible with a v1.1
+    // consumer reading just the prefix.
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(ZapRefcountCapabilityV1, "retain"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(ZapRefcountCapabilityV1, "release"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(ZapRefcountCapabilityV1, "retain_sized"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(ZapRefcountCapabilityV1, "release_sized"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(ZapRefcountCapabilityV1, "allocate_refcounted"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(ZapRefcountCapabilityV1, "refcount_sized"));
+}
+
+test "REFCOUNT_V1 size constants" {
+    try std.testing.expectEqual(@as(u16, 16), REFCOUNT_V1_SIZE_V1_0);
+    try std.testing.expectEqual(@as(u16, 48), REFCOUNT_V1_SIZE_V1_1);
+    try std.testing.expectEqual(@as(u16, @intCast(@sizeOf(ZapRefcountCapabilityV1))), REFCOUNT_V1_SIZE_V1_1);
 }
 
 test "ZMEM_MAGIC_LE is little-endian 'ZMEM'" {

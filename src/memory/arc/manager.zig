@@ -1145,11 +1145,17 @@ const ZapMemorySection = extern struct {
 };
 
 /// The section payload. Exported so the linker does not dead-strip it.
+///
+/// `abi_minor = 1` because this manager exposes the v1.1 extended
+/// `ZapRefcountCapabilityV1` vtable (6 slots / 48 bytes — see spec
+/// section 8). A consumer that only knows v1.0 reads the vtable's
+/// `desc.size = 48` and ignores the trailing four slots per spec
+/// section 2.3.
 pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) = .{
     .meta = .{
         .magic = ZMEM_MAGIC,
         .abi_major = 1,
-        .abi_minor = 0,
+        .abi_minor = 1,
         .size = @sizeOf(ZapMemoryManagerMetaV1),
         ._reserved2 = 0,
         .desc_count = 0,
@@ -1159,7 +1165,7 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
     },
     .core = .{
         .abi_major = 1,
-        .abi_minor = 0,
+        .abi_minor = 1,
         .size = @sizeOf(ZapMemoryManagerCoreV1),
         .declared_caps = CAP_REFCOUNT_V1_BIT,
         .init = arcInit,
