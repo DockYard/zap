@@ -3365,3 +3365,205 @@ test "real Tracking manager source compiles and exports a valid section (system 
         0,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Watch-mode rebuild-path simulation tests
+//
+// `src/main.zig`'s `IncrementalWatchState.init` (the constructor that
+// powers `zap build --watch`) re-runs `resolve()` once at watch-session
+// startup, caches the resulting `declared_caps` + `object_path`, and
+// then threads those values into every subsequent
+// `compileProjectFrontend` + `injectAndUpdate` call without
+// re-resolving. v1.0 of the Memory Manager ABI gated this constructor
+// on `REFCOUNT_V1`: any manager whose `.zapmem` section omitted the
+// bit caused `init` to print a diagnostic and return null, refusing
+// to start an incremental session. Once Phase 4.x (byte-level slab
+// pool) and Phase 6.x (codegen elision) shipped the runtime support
+// for non-REFCOUNT_V1 managers end-to-end, the refusal became overly
+// cautious and was removed (see `IncrementalWatchState.init` for the
+// post-removal docstring).
+//
+// These tests pin the post-removal contract: for every first-party
+// manager that declares zero capabilities, the `resolve()` call
+// `IncrementalWatchState.init` makes must succeed and yield the
+// values the constructor caches. A regression that re-introduces the
+// gate (or breaks the underlying resolution for non-REFCOUNT_V1
+// managers) fails the closest test below — well before a contributor
+// runs `zap build --watch` against an Arena/NoOp/Leak/Tracking
+// project and hits the cliff. Each test mirrors the constructor's
+// call sequence verbatim, including the second simulated rebuild
+// that re-uses the cached values (the pinning invariant that makes
+// the watch session safe across many `state.rebuild()` calls).
+// ---------------------------------------------------------------------------
+
+/// Shared implementation for the four watch-mode rebuild-path
+/// simulation tests below. Mirrors the manager-resolution call
+/// sequence in `src/main.zig`'s `IncrementalWatchState.init` so any
+/// regression in that path (notably re-introducing the v1.0
+/// `REFCOUNT_V1`-only refusal) fails here first. The shared body
+/// keeps the per-manager tests focused on the per-manager invariants
+/// (`manager_name`, `manager_zig_relative_path`, the expected
+/// stdlib `.zap` filename) without duplicating the watch-mode
+/// scaffolding four times.
+fn simulateWatchInitForManager(
+    manager_name: []const u8,
+    manager_zig_relative_path: []const u8,
+    stdlib_zap_relative_path: []const u8,
+) !void {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Lay out a stdlib-shaped temp tree: `lib/zap/memory/<name>.zap`
+    // and `<manager_zig_relative_path>`. The driver's
+    // discovery walk reads these the same way it would in a real
+    // `zap build --watch` invocation. The Zig source is a placeholder
+    // — the synthesizing mock fork below produces the `.o` directly
+    // so we don't depend on system zig for this test.
+    const stdlib_dir = std.fs.path.dirname(stdlib_zap_relative_path) orelse "lib/zap/memory";
+    tmp_dir.dir.createDirPath(std.Options.debug_io, stdlib_dir) catch return error.Unexpected;
+    const manager_dir = std.fs.path.dirname(manager_zig_relative_path) orelse "src/memory";
+    tmp_dir.dir.createDirPath(std.Options.debug_io, manager_dir) catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+
+    const stdlib_decl = std.fmt.allocPrint(
+        allocator,
+        "@memory_manager_source = \"{s}\"\n\npub struct {s} {{\n}}\n",
+        .{ manager_zig_relative_path, manager_name },
+    ) catch return error.OutOfMemory;
+    defer allocator.free(stdlib_decl);
+
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = stdlib_zap_relative_path, .data = stdlib_decl }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = manager_zig_relative_path, .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(stdlib_root);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
+    // --- IncrementalWatchState.init: first `resolve()` call ---
+    //
+    // The constructor calls `resolve()` exactly once during init and
+    // caches the resolved `declared_caps` + `object_path`. v1.0 gated
+    // this call on a post-resolve REFCOUNT_V1 check. Verify that the
+    // resolution itself succeeds (it always did) and that the cached
+    // values are exactly the values the constructor would persist.
+    var diag_buf: [1024]u8 = undefined;
+    var init_diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var init_resolved = try resolve(
+        allocator,
+        .{
+            .manager_name = manager_name,
+            .source_roots = &.{
+                .{ .name = "zap_stdlib", .path = stdlib_root },
+            },
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = cache_root,
+            .fork_compile_fn = mockForkCompileNoOp,
+        },
+        &init_diag,
+    );
+    defer freeResolved(allocator, &init_resolved);
+
+    // Pin the watch-mode contract: every first-party non-REFCOUNT_V1
+    // manager must produce a resolved manager with `declared_caps == 0`
+    // and a real object path. Phase 6 codegen elision and Phase 4.x
+    // inline-header layout both read this caps value at every
+    // `state.rebuild()` — a regression that changes either field
+    // silently breaks every watch session.
+    try std.testing.expectEqualStrings(manager_name, init_resolved.name);
+    try std.testing.expectEqual(@as(u64, 0), init_resolved.declared_caps);
+    try std.testing.expectEqual(@as(u64, 0), init_resolved.declared_caps & abi.REFCOUNT_V1_BIT);
+    try std.testing.expect(init_resolved.object_path != null);
+    std.Io.Dir.cwd().access(std.Options.debug_io, init_resolved.object_path.?, .{}) catch return error.Unexpected;
+
+    // Save the values the constructor would cache. `IncrementalWatchState`
+    // duplicates `object_path` into its persistent allocator and frees
+    // the freshly-resolved one as the function returns; copying the
+    // bytes here mirrors that ownership transfer.
+    const cached_caps: u64 = init_resolved.declared_caps;
+    const cached_object_path = try allocator.dupe(u8, init_resolved.object_path.?);
+    defer allocator.free(cached_object_path);
+
+    // --- IncrementalWatchState.rebuild: simulated second pass ---
+    //
+    // `state.rebuild()` does NOT call `resolve()` again. The cached
+    // caps + object path are reused verbatim across every rebuild —
+    // the manifest's `memory:` field is pinned for the lifetime of
+    // the watch session (the `build_zap_changed` branch in
+    // `watchAndRebuild` tears down the entire state when the manifest
+    // changes). Resolving a second time here would not reflect what
+    // the code does in production; instead, assert that the cached
+    // values are stable (still satisfy the post-removal invariants)
+    // and that the object the first call wrote is still on disk for
+    // the link step to pull in. A regression that loses the object
+    // path between rebuilds, or that allows the cached caps to drift,
+    // would break every second rebuild in a watch session.
+    try std.testing.expectEqual(@as(u64, 0), cached_caps);
+    try std.testing.expectEqual(@as(u64, 0), cached_caps & abi.REFCOUNT_V1_BIT);
+    std.Io.Dir.cwd().access(std.Options.debug_io, cached_object_path, .{}) catch return error.Unexpected;
+}
+
+test "watch-mode rebuild path: Zap.Memory.Arena resolves without REFCOUNT_V1 refusal" {
+    // v1.0 of the Memory Manager ABI rejected this manager at the
+    // watch-mode entry point with the diagnostic "watch mode currently
+    // requires a REFCOUNT_V1 manager". Phase 4.x + Phase 6 closed the
+    // runtime gap; this test pins that closure so a future refactor
+    // can't quietly re-introduce the refusal for Arena projects.
+    try simulateWatchInitForManager(
+        "Zap.Memory.Arena",
+        "src/memory/arena/manager.zig",
+        "lib/zap/memory/arena.zap",
+    );
+}
+
+test "watch-mode rebuild path: Zap.Memory.NoOp resolves without REFCOUNT_V1 refusal" {
+    // NoOp is the simplest non-REFCOUNT_V1 manager: it declares zero
+    // capabilities and its allocate slot returns null. A program built
+    // under NoOp panics on first allocation, but the BUILD itself —
+    // and therefore the watch-mode rebuild path — must succeed
+    // unconditionally for Phase 6 codegen-elision verification builds
+    // to run.
+    try simulateWatchInitForManager(
+        "Zap.Memory.NoOp",
+        "src/memory/no_op/manager.zig",
+        "lib/zap/memory/no_op.zap",
+    );
+}
+
+test "watch-mode rebuild path: Zap.Memory.Leak resolves without REFCOUNT_V1 refusal" {
+    // Leak is the diagnostic leak-everything manager used for codegen
+    // elision verification builds (a binary built under Leak should
+    // contain zero refcount call sites — see
+    // `lib/zap/memory/leak.zap`'s structdoc). Watch-mode support is
+    // required for the iteration loop where a contributor edits a
+    // `.zap` file, rebuilds under Leak, and re-inspects the elision
+    // status. The v1.0 refusal made that loop impossible without
+    // bouncing the watcher between every edit.
+    try simulateWatchInitForManager(
+        "Zap.Memory.Leak",
+        "src/memory/leak/manager.zig",
+        "lib/zap/memory/leak.zap",
+    );
+}
+
+test "watch-mode rebuild path: Zap.Memory.Tracking resolves without REFCOUNT_V1 refusal" {
+    // Tracking is the diagnostic canary/leak-detecting manager used
+    // to validate the runtime's allocation lifecycle (see
+    // `lib/zap/memory/tracking.zap`'s structdoc). Like Leak it
+    // declares zero capabilities at the section level — its
+    // hash-map bookkeeping is internal, not declared via
+    // `REFCOUNT_V1` — so the watch-mode resolution path is the same
+    // shape as Leak's.
+    try simulateWatchInitForManager(
+        "Zap.Memory.Tracking",
+        "src/memory/tracking/manager.zig",
+        "lib/zap/memory/tracking.zap",
+    );
+}

@@ -1471,10 +1471,11 @@ const IncrementalWatchState = struct {
     /// from `zap.memory_driver.resolve` and threaded into every
     /// `compileProjectFrontend` / `injectAndUpdate` call so Phase 6
     /// codegen elision uses the same bitmask the initial backend
-    /// context was created with. Phase 6 watch mode currently
-    /// requires REFCOUNT_V1 (see `init` for the diagnostic) — the
-    /// cache exists so a future relaxation can carry per-session caps
-    /// without rebuilding it on every rebuild.
+    /// context was created with. The cache means a watch session
+    /// services every rebuild against the same capability surface
+    /// without re-resolving the manager — the manifest's `memory:`
+    /// field is pinned for the lifetime of the watcher (see
+    /// `watchAndRebuild` for the teardown-on-build.zap-change flow).
     declared_caps: u64,
     /// Resolved manager object path. Owned by `allocator`; freed in
     /// `deinit`. Threaded into every `injectAndUpdate` call so the
@@ -1496,14 +1497,13 @@ const IncrementalWatchState = struct {
     /// session. `init` re-runs the same `zap.memory_driver.resolve`
     /// flow `buildTarget` uses, caches the resolved `declared_caps`,
     /// and persists the object path so every rebuild's link step
-    /// picks up the same manager `.o`. Phase 6 ships watch mode as
-    /// REFCOUNT_V1-only: a manager whose `declared_caps` omits
-    /// `REFCOUNT_V1_BIT` causes `init` to print a diagnostic and
-    /// return null, falling back to non-incremental rebuilds (the
-    /// regular `buildTarget` path supports every manager). The
-    /// incremental backend's interaction with elided refcount IR
-    /// remains incomplete; refusing to start is the only safe
-    /// option until that work lands.
+    /// picks up the same manager `.o`. All first-party managers
+    /// (`Zap.Memory.ARC`, `Zap.Memory.Arena`, `Zap.Memory.NoOp`,
+    /// `Zap.Memory.Leak`, `Zap.Memory.Tracking`) and third-party
+    /// managers flow through the same path — the cached caps drive
+    /// codegen elision and the runtime-source rewrite so every
+    /// rebuild produces a binary against the manager the manifest
+    /// resolved at `init` time.
     fn init(
         allocator: std.mem.Allocator,
         project_root: []const u8,
@@ -1610,26 +1610,17 @@ const IncrementalWatchState = struct {
         };
         defer zap.memory_driver.freeResolved(alloc, &resolved_manager);
 
-        // Spec section 8.5 / Phase 6 codegen elision: watch mode does
-        // not yet support managers whose `declared_caps` omits
-        // `REFCOUNT_V1_BIT`. The incremental backend's interaction
-        // with the lifecycle-pairing-only code path (no retain/release
-        // IR, only `core.deallocate` matching) is genuinely incomplete
-        // — refusing to start is the only sound behavior. The full
-        // `buildTarget` rebuild path remains the supported way to
-        // build under Arena / NoOp managers.
-        if ((resolved_manager.declared_caps & zap.memory_abi.REFCOUNT_V1_BIT) == 0) {
-            std.debug.print(
-                "Error: watch mode currently requires a REFCOUNT_V1 manager (selected: {s}, declared_caps: 0x{x:0>16})\n",
-                .{ resolved_manager.name, resolved_manager.declared_caps },
-            );
-            std.debug.print(
-                "       falling back to non-incremental rebuilds for this manager.\n",
-                .{},
-            );
-            return null;
-        }
-
+        // Watch mode supports every first-party manager and any
+        // third-party manager that produces a valid `.zapmem` section:
+        // the resolved `declared_caps` flows into `compiler.getRuntimeSource`
+        // (so the embedded runtime collapses inline `ArcHeader` fields
+        // and `refcount_v1_active` branches under managers that omit
+        // `REFCOUNT_V1`), into `compileProjectFrontend` (so the
+        // arc_materialize pass elides retain/release IR for non-REFCOUNT_V1
+        // managers), and into `zir_compilation` (so ZIR codegen sees
+        // the same bitmask the front-end used). Phase 6 plumbed the
+        // bitmask through both code paths; this constructor just caches
+        // it so every subsequent `rebuild` reuses the same value.
         const declared_caps = resolved_manager.declared_caps;
         const memory_manager_object_owned: ?[]const u8 = if (resolved_manager.object_path) |op|
             (allocator.dupe(u8, op) catch return null)
