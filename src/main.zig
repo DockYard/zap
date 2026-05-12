@@ -63,7 +63,7 @@ fn printUsage() void {
         \\  -Dkey=value       Pass build option to the builder
         \\  --build-file <path>  Use a specific build file (default: build.zap)
         \\  --watch, -w       Watch source files and rebuild on changes
-        \\  --target <triple> Cross-compile for target (e.g., wasm32-wasi)
+        \\  --target <triple> Cross-compile for target (e.g., x86_64-linux-gnu)
         \\  --seed <integer>  Set the test seed for deterministic ordering
         \\  -- <args...>      Pass arguments to the program (run only)
         \\
@@ -1964,7 +1964,7 @@ fn parseTargetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Pars
             if (i < args.len) {
                 result.compile_target = args[i];
             } else {
-                std.debug.print("Error: --target requires a triple (e.g., wasm32-wasi)\n", .{});
+                std.debug.print("Error: --target requires a triple (e.g., x86_64-linux-gnu)\n", .{});
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, arg, "--seed")) {

@@ -814,6 +814,18 @@ fn assertExportsManagerSymbol(
     }
 }
 
+/// Public alias for `assertExportsManagerSymbol`. Exposes the symbol
+/// check to out-of-tree smoke tests (see `scripts/test_manager_compile.sh`)
+/// that need to invoke the same code path the build driver runs at link
+/// time without going through the full `resolve()` pipeline.
+pub fn assertExportsManagerSymbolForTest(
+    manager_name: []const u8,
+    object_bytes: []const u8,
+    diag: *DriverDiagnostic,
+) ResolveError!void {
+    return assertExportsManagerSymbol(manager_name, object_bytes, diag);
+}
+
 const SymbolCheckError = error{
     UnsupportedFormat,
     InvalidObject,
@@ -836,31 +848,34 @@ fn elfSymbolPresent(bytes: []const u8, want: []const u8) SymbolCheckError!bool {
     const header = std.elf.Header.read(&hdr_reader) catch return SymbolCheckError.InvalidObject;
     if (header.shnum == 0) return false;
 
-    // First pass: collect headers so we can look up the string table
-    // a symbol-table section references via `sh_link`.
-    var section_headers: [256]std.elf.Elf64_Shdr = undefined;
-    if (header.shnum > section_headers.len) return false;
-    var idx: u32 = 0;
+    // Walk the section header table once, looking for `SYMTAB`/`DYNSYM`
+    // entries. The previous implementation pre-buffered all headers into
+    // a fixed-size array which silently failed for objects with > 256
+    // sections (real Zig-compiled objects regularly exceed this via
+    // per-function `.text.*` and debug sections). The new implementation
+    // walks the table via direct byte arithmetic — `shoff + index *
+    // shentsize` — so it scales with `shnum`. Each symbol-table section
+    // dereferences its string table by index via the same arithmetic, so
+    // there is no upper bound beyond what the spec/header itself allows.
+    const shdr_size: u64 = if (header.is_64) @sizeOf(std.elf.Elf64_Shdr) else @sizeOf(std.elf.Elf32_Shdr);
+    const total_shdr_bytes = shdr_size * @as(u64, header.shnum);
+    if (total_shdr_bytes > bytes.len or header.shoff > bytes.len - total_shdr_bytes) {
+        return SymbolCheckError.InvalidObject;
+    }
+
     var it = header.iterateSectionHeadersBuffer(bytes);
-    while (true) {
+    var idx: u16 = 0;
+    while (true) : (idx += 1) {
         const maybe = it.next() catch return SymbolCheckError.InvalidObject;
         const sh = maybe orelse break;
-        if (idx >= section_headers.len) break;
-        section_headers[idx] = sh;
-        idx += 1;
-    }
-    const count = idx;
-
-    var s: u32 = 0;
-    while (s < count) : (s += 1) {
-        const sh = section_headers[s];
         if (sh.sh_type != @intFromEnum(std.elf.SHT.SYMTAB) and
             sh.sh_type != @intFromEnum(std.elf.SHT.DYNSYM))
         {
             continue;
         }
-        if (sh.sh_link >= count) return SymbolCheckError.InvalidObject;
-        const strtab_sh = section_headers[sh.sh_link];
+        if (sh.sh_link >= header.shnum) return SymbolCheckError.InvalidObject;
+        const strtab_sh = readSectionHeader(&header, bytes, @intCast(sh.sh_link)) catch
+            return SymbolCheckError.InvalidObject;
         if (strtab_sh.sh_size > bytes.len or
             strtab_sh.sh_offset > bytes.len - strtab_sh.sh_size)
         {
@@ -885,6 +900,24 @@ fn elfSymbolPresent(bytes: []const u8, want: []const u8) SymbolCheckError!bool {
         }
     }
     return false;
+}
+
+/// Read a single section header by index from the buffered object.
+/// Replaces the previous "pre-buffer all headers into a fixed array"
+/// pattern, which capped at 256 entries. Uses the same byte arithmetic
+/// as `std.elf.SectionHeaderBufferIterator` (offset = `shoff + index *
+/// shentsize`).
+fn readSectionHeader(
+    header: *const std.elf.Header,
+    bytes: []const u8,
+    index: u16,
+) !std.elf.Elf64_Shdr {
+    if (index >= header.shnum) return error.InvalidIndex;
+    const shdr_size: u64 = if (header.is_64) @sizeOf(std.elf.Elf64_Shdr) else @sizeOf(std.elf.Elf32_Shdr);
+    const offset: u64 = header.shoff + shdr_size * @as(u64, index);
+    if (offset > bytes.len or shdr_size > bytes.len - offset) return error.OutOfBounds;
+    var reader = std.Io.Reader.fixed(bytes[@intCast(offset)..]);
+    return std.elf.takeSectionHeader(&reader, header.is_64, header.endian);
 }
 
 fn elfSymbolName(strtab: []const u8, offset: u32) ?[]const u8 {
@@ -1954,4 +1987,347 @@ test "validateSection rejects reserved capability bit" {
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
     const result = validateSection("ReservedBit", &bytes, &diag);
     try std.testing.expectError(ResolveError.ReservedCapabilityDeclared, result);
+}
+
+/// Synthesize an ELF object whose total section count exceeds 256 to
+/// exercise the symbol-walker's scalability. Real Zig-compiled objects
+/// regularly exceed 256 sections (per-function `.text.*` sections,
+/// debug info, etc.); the previous fixed-buffer walker silently failed
+/// for such inputs because it capped at 256 entries.
+///
+/// Layout mirrors `synthesizeNoOpElf`'s 5 real sections (null, shstrtab,
+/// zapmem, symtab, strtab) and then appends `padding_count` zero-sized
+/// NOBITS sections to push the total over the historical cap. NOBITS
+/// sections do not occupy disk space so the buffer requirements stay
+/// modest.
+fn synthesizeNoOpElfWithExtraSections(buffer: []u8, padding_count: u16) usize {
+    const shstrtab = "\x00.shstrtab\x00.zapmem\x00.symtab\x00.strtab\x00.pad\x00";
+    const symstrtab = "\x00zap_memory_section\x00";
+    const pad_name_offset: u32 = 35; // offset of `.pad` in `shstrtab` above
+
+    const ehdr_size: u64 = @sizeOf(std.elf.Elf64_Ehdr);
+    const shdr_size: u64 = @sizeOf(std.elf.Elf64_Shdr);
+    const sym_size: u64 = @sizeOf(std.elf.Elf64_Sym);
+    const real_shdr_count: u16 = 5; // null, shstrtab, zapmem, symtab, strtab
+    const shdr_count: u16 = real_shdr_count + padding_count;
+
+    const shdr_table_offset = ehdr_size;
+    const shstrtab_offset = shdr_table_offset + shdr_size * @as(u64, shdr_count);
+    const zapmem_offset = shstrtab_offset + shstrtab.len;
+    const payload = synthesizeNoOpPayload();
+    const symtab_offset = zapmem_offset + payload.len;
+    const sym_count: u64 = 2;
+    const symstrtab_offset = symtab_offset + sym_size * sym_count;
+    const total = symstrtab_offset + symstrtab.len;
+
+    var ehdr: std.elf.Elf64_Ehdr = .{
+        .e_ident = [_]u8{0} ** 16,
+        .e_type = .REL,
+        .e_machine = .X86_64,
+        .e_version = 1,
+        .e_entry = 0,
+        .e_phoff = 0,
+        .e_shoff = shdr_table_offset,
+        .e_flags = 0,
+        .e_ehsize = @intCast(ehdr_size),
+        .e_phentsize = 0,
+        .e_phnum = 0,
+        .e_shentsize = @intCast(shdr_size),
+        .e_shnum = shdr_count,
+        .e_shstrndx = 1,
+    };
+    ehdr.e_ident[0] = 0x7F;
+    ehdr.e_ident[1] = 'E';
+    ehdr.e_ident[2] = 'L';
+    ehdr.e_ident[3] = 'F';
+    ehdr.e_ident[std.elf.EI.CLASS] = std.elf.ELFCLASS64;
+    ehdr.e_ident[std.elf.EI.DATA] = std.elf.ELFDATA2LSB;
+    ehdr.e_ident[std.elf.EI.VERSION] = 1;
+    @memcpy(buffer[0..@sizeOf(std.elf.Elf64_Ehdr)], std.mem.asBytes(&ehdr));
+
+    var sh_null: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
+    @memcpy(buffer[shdr_table_offset..][0..@sizeOf(std.elf.Elf64_Shdr)], std.mem.asBytes(&sh_null));
+
+    var sh_shstrtab: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
+    sh_shstrtab.sh_name = 1;
+    sh_shstrtab.sh_type = @intFromEnum(std.elf.SHT.STRTAB);
+    sh_shstrtab.sh_offset = shstrtab_offset;
+    sh_shstrtab.sh_size = shstrtab.len;
+    @memcpy(
+        buffer[shdr_table_offset + shdr_size ..][0..@sizeOf(std.elf.Elf64_Shdr)],
+        std.mem.asBytes(&sh_shstrtab),
+    );
+
+    var sh_zap: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
+    sh_zap.sh_name = 11;
+    sh_zap.sh_type = @intFromEnum(std.elf.SHT.PROGBITS);
+    sh_zap.sh_flags = std.elf.SHF_ALLOC;
+    sh_zap.sh_offset = zapmem_offset;
+    sh_zap.sh_size = payload.len;
+    @memcpy(
+        buffer[shdr_table_offset + shdr_size * 2 ..][0..@sizeOf(std.elf.Elf64_Shdr)],
+        std.mem.asBytes(&sh_zap),
+    );
+
+    var sh_symtab: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
+    sh_symtab.sh_name = 19;
+    sh_symtab.sh_type = @intFromEnum(std.elf.SHT.SYMTAB);
+    sh_symtab.sh_offset = symtab_offset;
+    sh_symtab.sh_size = sym_size * sym_count;
+    sh_symtab.sh_link = 4; // index of `.strtab` in section table — still valid even past 256
+    sh_symtab.sh_info = 1;
+    sh_symtab.sh_addralign = 8;
+    sh_symtab.sh_entsize = sym_size;
+    @memcpy(
+        buffer[shdr_table_offset + shdr_size * 3 ..][0..@sizeOf(std.elf.Elf64_Shdr)],
+        std.mem.asBytes(&sh_symtab),
+    );
+
+    var sh_strtab: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
+    sh_strtab.sh_name = 27;
+    sh_strtab.sh_type = @intFromEnum(std.elf.SHT.STRTAB);
+    sh_strtab.sh_offset = symstrtab_offset;
+    sh_strtab.sh_size = symstrtab.len;
+    @memcpy(
+        buffer[shdr_table_offset + shdr_size * 4 ..][0..@sizeOf(std.elf.Elf64_Shdr)],
+        std.mem.asBytes(&sh_strtab),
+    );
+
+    // Padding sections: zero-sized NOBITS entries pointing at `.pad` in
+    // the shstrtab. They contribute nothing on disk but bump `shnum`.
+    var pad_idx: u16 = 0;
+    while (pad_idx < padding_count) : (pad_idx += 1) {
+        var sh_pad: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
+        sh_pad.sh_name = pad_name_offset;
+        sh_pad.sh_type = @intFromEnum(std.elf.SHT.NOBITS);
+        sh_pad.sh_offset = 0;
+        sh_pad.sh_size = 0;
+        const offset = shdr_table_offset + shdr_size * @as(u64, real_shdr_count + pad_idx);
+        @memcpy(
+            buffer[@intCast(offset)..][0..@sizeOf(std.elf.Elf64_Shdr)],
+            std.mem.asBytes(&sh_pad),
+        );
+    }
+
+    @memcpy(buffer[shstrtab_offset..][0..shstrtab.len], shstrtab);
+    @memcpy(buffer[zapmem_offset..][0..payload.len], &payload);
+
+    var sym_null: std.elf.Elf64_Sym = std.mem.zeroes(std.elf.Elf64_Sym);
+    @memcpy(buffer[symtab_offset..][0..@sizeOf(std.elf.Elf64_Sym)], std.mem.asBytes(&sym_null));
+
+    var sym_zap: std.elf.Elf64_Sym = std.mem.zeroes(std.elf.Elf64_Sym);
+    sym_zap.st_name = 1;
+    sym_zap.st_info = (1 << 4) | 1;
+    sym_zap.st_other = 0;
+    sym_zap.st_shndx = 2;
+    sym_zap.st_value = 0;
+    sym_zap.st_size = payload.len;
+    @memcpy(
+        buffer[symtab_offset + sym_size ..][0..@sizeOf(std.elf.Elf64_Sym)],
+        std.mem.asBytes(&sym_zap),
+    );
+
+    @memcpy(buffer[symstrtab_offset..][0..symstrtab.len], symstrtab);
+
+    return @intCast(total);
+}
+
+test "assertExportsManagerSymbol handles ELF with > 256 sections" {
+    // Regression: the previous implementation pre-buffered all section
+    // headers into a fixed `[256]Elf64_Shdr` array, silently returning
+    // `false` for objects with `shnum > 256`. Real Zig-compiled objects
+    // routinely exceed this cap (per-function `.text.*` sections, debug
+    // info, etc.), causing valid managers to be rejected with a
+    // `ValidationFailed` error. Verify the walker now scales beyond 256.
+    const padding_count: u16 = 300; // 300 + 5 real = 305 sections
+    // 305 * sizeof(Elf64_Shdr=64) = 19,520 bytes for section headers
+    // plus ehdr + payload + symtab + strtab + shstrtab ≈ 19,720 bytes.
+    var buffer: [32 * 1024]u8 = undefined;
+    const written = synthesizeNoOpElfWithExtraSections(&buffer, padding_count);
+    var diag_buf: [512]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    try assertExportsManagerSymbol("LargeSectionCount", buffer[0..written], &diag);
+}
+
+/// Captured arguments from `mockForkCompileCaptureTarget`. Populated on
+/// each mock invocation so the test can assert what `resolve()` passed
+/// to the fork primitive.
+var captured_target_state: struct {
+    target: ZapForkTarget = std.mem.zeroes(ZapForkTarget),
+    invoked: bool = false,
+} = .{};
+
+/// Mock `ForkCompileFn` for the compile_target plumbing test. Records
+/// the `ZapForkTarget` it received into `captured_target_state` and
+/// writes a NoOp ELF object so the surrounding `resolve()` call
+/// completes successfully.
+fn mockForkCompileCaptureTarget(
+    source_path: [*:0]const u8,
+    target: *const ZapForkTarget,
+    optimize: ZapForkOptimize,
+    out_object_path: [*:0]const u8,
+    out_diagnostic_buffer: ?[*]u8,
+    out_diagnostic_capacity: usize,
+    zig_lib_dir_opt: ?[*:0]const u8,
+    local_cache_dir_opt: ?[*:0]const u8,
+    global_cache_dir_opt: ?[*:0]const u8,
+) callconv(.c) ZapForkResult {
+    _ = source_path;
+    _ = optimize;
+    _ = out_diagnostic_buffer;
+    _ = out_diagnostic_capacity;
+    _ = zig_lib_dir_opt;
+    _ = local_cache_dir_opt;
+    _ = global_cache_dir_opt;
+
+    captured_target_state.target = target.*;
+    captured_target_state.invoked = true;
+
+    var buffer: [4096]u8 = undefined;
+    const written = synthesizeNoOpElf(&buffer);
+    const path_slice = std.mem.span(out_object_path);
+    if (std.fs.path.dirname(path_slice)) |dir| {
+        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir) catch return .InternalError;
+    }
+    var file = std.Io.Dir.cwd().createFile(std.Options.debug_io, path_slice, .{}) catch return .InternalError;
+    defer file.close(std.Options.debug_io);
+    file.writeStreamingAll(std.Options.debug_io, buffer[0..written]) catch return .InternalError;
+    return .Ok;
+}
+
+test "resolve threads compile_target through to fork_compile_fn" {
+    // End-to-end check: when the build supplies a cross-compile target,
+    // `resolve()` must `parseTargetTriple` it and pass the resulting
+    // `ZapForkTarget` to the fork primitive. Without this plumbing the
+    // manager `.o` would be compiled for the host instead of the binary's
+    // final target, producing a link-time mismatch on cross-builds.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/zap/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/no_op") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+
+    const stdlib_decl =
+        \\@memory_manager_source = "src/memory/no_op/manager.zig"
+        \\
+        \\pub struct Zap.Memory.NoOp {
+        \\}
+        \\
+    ;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/zap/memory/no_op.zap", .data = stdlib_decl }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/no_op/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(stdlib_root);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
+    // Reset state in case prior tests touched it.
+    captured_target_state = .{};
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var resolved = try resolve(
+        allocator,
+        .{
+            .manager_name = "Zap.Memory.NoOp",
+            .source_roots = &.{
+                .{ .name = "zap_stdlib", .path = stdlib_root },
+            },
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = cache_root,
+            .target = "x86_64-linux-gnu",
+            .fork_compile_fn = mockForkCompileCaptureTarget,
+        },
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expect(captured_target_state.invoked);
+    const expected = parseTargetTriple("x86_64-linux-gnu") orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(expected.arch_tag, captured_target_state.target.arch_tag);
+    try std.testing.expectEqual(expected.os_tag, captured_target_state.target.os_tag);
+    try std.testing.expectEqual(expected.abi_tag, captured_target_state.target.abi_tag);
+    try std.testing.expectEqual(@as(u16, 0), captured_target_state.target._reserved);
+    // Sanity: the parsed values match the expected Zig enum values for
+    // x86_64 / linux / gnu.
+    try std.testing.expectEqual(
+        @as(u16, @intCast(@intFromEnum(std.Target.Cpu.Arch.x86_64))),
+        captured_target_state.target.arch_tag,
+    );
+    try std.testing.expectEqual(
+        @as(u16, @intCast(@intFromEnum(std.Target.Os.Tag.linux))),
+        captured_target_state.target.os_tag,
+    );
+    try std.testing.expectEqual(
+        @as(u16, @intCast(@intFromEnum(std.Target.Abi.gnu))),
+        captured_target_state.target.abi_tag,
+    );
+}
+
+test "resolve passes NATIVE sentinel when compile_target is null" {
+    // The complementary case: when no `target` is set, the driver passes
+    // `ZAP_FORK_ARCH_NATIVE` so the manager `.o` builds for the host.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/zap/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/no_op") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+
+    const stdlib_decl =
+        \\@memory_manager_source = "src/memory/no_op/manager.zig"
+        \\
+        \\pub struct Zap.Memory.NoOp {
+        \\}
+        \\
+    ;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/zap/memory/no_op.zap", .data = stdlib_decl }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/no_op/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(stdlib_root);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
+    captured_target_state = .{};
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var resolved = try resolve(
+        allocator,
+        .{
+            .manager_name = "Zap.Memory.NoOp",
+            .source_roots = &.{
+                .{ .name = "zap_stdlib", .path = stdlib_root },
+            },
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = cache_root,
+            // .target intentionally omitted — defaults to null.
+            .fork_compile_fn = mockForkCompileCaptureTarget,
+        },
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expect(captured_target_state.invoked);
+    try std.testing.expectEqual(ZAP_FORK_ARCH_NATIVE, captured_target_state.target.arch_tag);
+    try std.testing.expectEqual(@as(u16, 0), captured_target_state.target.os_tag);
+    try std.testing.expectEqual(@as(u16, 0), captured_target_state.target.abi_tag);
+    try std.testing.expectEqual(@as(u16, 0), captured_target_state.target._reserved);
 }

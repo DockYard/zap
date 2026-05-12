@@ -961,6 +961,20 @@ fn maybeBindExternalManager() void {
     if (section.meta.abi_major != 1) {
         @panic("zap runtime: external memory manager declares unsupported ABI major");
     }
+    // Lower and upper bound on `meta.size`. The build-time driver applies
+    // the same caps (`MAX_META_SIZE`). The runtime doesn't use `meta.size`
+    // for offset arithmetic (the section parser handed off the bytes
+    // already), so these checks are defensive depth — they catch a binary
+    // that bypassed the driver entirely (hand-edited section, post-link
+    // patch) and refuse to dispatch through a manager whose header looks
+    // structurally implausible.
+    const META_SIZE: usize = @sizeOf(@TypeOf(section.meta));
+    if (section.meta.size < META_SIZE) {
+        @panic("zap runtime: external memory manager metadata header is smaller than v1.0");
+    }
+    if (section.meta.size > 8 * META_SIZE) {
+        @panic("zap runtime: external memory manager metadata header exceeds v1.x upper bound");
+    }
     if (section.core.abi_major != 1) {
         @panic("zap runtime: external memory manager core declares unsupported ABI major");
     }
