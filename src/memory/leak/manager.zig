@@ -442,3 +442,43 @@ pub const retainSized = leakRetainSizedStub;
 pub const releaseSized = leakReleaseSizedStub;
 pub const refcountSized = leakRefcountSizedStub;
 pub const getCapabilityDesc = leakGetCapabilityDesc;
+
+// ---------------------------------------------------------------------------
+// Uniform-interface alias signature lock
+//
+// `Zap.Memory.Leak` does NOT declare REFCOUNT_V1, so the refcount
+// aliases above point at panic-stub bodies. The bodies are never
+// invoked (the runtime's comptime dispatch elides those call sites
+// under no-REFCOUNT_V1 builds), but the panic-stub signatures still
+// MUST match the canonical AbiV1 slot types because the runtime
+// source compiles uniformly across both first-party and third-party
+// builds — the type system has to validate the shape of every alias,
+// not just the ones that get reached at runtime. Pinning each alias
+// against its canonical slot type at module scope catches drift at
+// the manager build site rather than at user-binary link time.
+comptime {
+    const ZapDeepWalkFn = *const fn (object: *anyopaque) callconv(.c) void;
+    const InitFn = *const fn (options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque;
+    const DeinitFn = *const fn (ctx: *anyopaque) callconv(.c) void;
+    const AllocateFn = *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8;
+    const DeallocateFn = *const fn (ctx: *anyopaque, ptr: [*]u8, size: usize, alignment: u32) callconv(.c) void;
+    const GetCapDescFn = *const fn (ctx: *anyopaque, id: u32) callconv(.c) ?*const ZapCapabilityDescV1;
+    const RetainFn = *const fn (ctx: *anyopaque, object: *anyopaque) callconv(.c) void;
+    const ReleaseFn = *const fn (ctx: *anyopaque, object: *anyopaque, deep_walk: ?ZapDeepWalkFn) callconv(.c) void;
+    const RetainSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void;
+    const ReleaseSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32, deep_walk: ?ZapDeepWalkFn) callconv(.c) void;
+    const AllocateRefcountedFn = *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8;
+    const RefcountSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32;
+
+    _ = @as(InitFn, init);
+    _ = @as(DeinitFn, deinit);
+    _ = @as(AllocateFn, allocate);
+    _ = @as(DeallocateFn, deallocate);
+    _ = @as(GetCapDescFn, getCapabilityDesc);
+    _ = @as(RetainFn, retain);
+    _ = @as(ReleaseFn, release);
+    _ = @as(RetainSizedFn, retainSized);
+    _ = @as(ReleaseSizedFn, releaseSized);
+    _ = @as(AllocateRefcountedFn, allocateRefcounted);
+    _ = @as(RefcountSizedFn, refcountSized);
+}

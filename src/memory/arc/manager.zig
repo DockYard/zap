@@ -1263,3 +1263,42 @@ pub const retainSized = arcRetainSized;
 pub const releaseSized = arcReleaseSized;
 pub const refcountSized = arcRefcountSized;
 pub const getCapabilityDesc = arcGetCapabilityDesc;
+
+// ---------------------------------------------------------------------------
+// Uniform-interface alias signature lock
+//
+// The uniform-interface aliases declared above must match the canonical
+// AbiV1 slot types so the runtime's comptime dispatch (in `runtime.zig`'s
+// host stub OR a user-binary build that selects `Zap.Memory.ARC`) sees
+// the right calling shape. ARC declares REFCOUNT_V1, so all 11 aliases
+// MUST resolve to real implementations with matching ABI slot
+// signatures; a drift between the alias arrow and the underlying impl
+// (e.g. an extra parameter, a typo'd return type) would surface at
+// user-binary link time rather than here. Pinning each alias against
+// its canonical slot type at module scope catches that drift at the
+// host build site instead.
+comptime {
+    const InitFn = *const fn (options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque;
+    const DeinitFn = *const fn (ctx: *anyopaque) callconv(.c) void;
+    const AllocateFn = *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8;
+    const DeallocateFn = *const fn (ctx: *anyopaque, ptr: [*]u8, size: usize, alignment: u32) callconv(.c) void;
+    const GetCapDescFn = *const fn (ctx: *anyopaque, id: u32) callconv(.c) ?*const ZapCapabilityDescV1;
+    const RetainFn = *const fn (ctx: *anyopaque, object: *anyopaque) callconv(.c) void;
+    const ReleaseFn = *const fn (ctx: *anyopaque, object: *anyopaque, deep_walk: ?ZapDeepWalkFn) callconv(.c) void;
+    const RetainSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void;
+    const ReleaseSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32, deep_walk: ?ZapDeepWalkFn) callconv(.c) void;
+    const AllocateRefcountedFn = *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8;
+    const RefcountSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32;
+
+    _ = @as(InitFn, init);
+    _ = @as(DeinitFn, deinit);
+    _ = @as(AllocateFn, allocate);
+    _ = @as(DeallocateFn, deallocate);
+    _ = @as(GetCapDescFn, getCapabilityDesc);
+    _ = @as(RetainFn, retain);
+    _ = @as(ReleaseFn, release);
+    _ = @as(RetainSizedFn, retainSized);
+    _ = @as(ReleaseSizedFn, releaseSized);
+    _ = @as(AllocateRefcountedFn, allocateRefcounted);
+    _ = @as(RefcountSizedFn, refcountSized);
+}

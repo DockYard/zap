@@ -686,6 +686,18 @@ export fn zap_runtime_atomic_add_u32_acq_rel(ptr: *u32, delta: u32) callconv(.c)
 // file that gates on `zap_active_refcount_capability == null` is
 // audited to honor this contract; grep for `REFCOUNT_V1` to verify.
 //
+// **Refcount-read exemption.** `refCountAny` and similar refcount-READ
+// dispatchers may return `0` instead of panicking when REFCOUNT_V1 is
+// missing. They are not retain/release dispatchers and the `0` return
+// models the absence of refcounting cleanly for Perceus reuse /
+// `resetAny` callers (a `refCountAny == 1` check naturally returns
+// false under a non-refcounting manager, so callers fall back to the
+// non-reuse path without crashing). The panic contract applies only
+// to retain/release/alloc/free hot paths — anywhere the runtime is
+// MUTATING refcount state or DEPENDING on a slab return for
+// correctness. Reads that report "no refcount info available" are
+// soundness-preserving and intentionally graceful.
+//
 // (These panic paths cannot be exercised in standard `zig build
 // test` because `@panic` aborts the test process. Coverage of the
 // panic message text is by inspection — see the `headerRetain`
@@ -13426,6 +13438,81 @@ test "Phase 4 dispatch: ACTIVE_MANAGER_TAG defaults to .third_party in host test
     // (say) `.arc` would silently exercise the first-party direct-call
     // arm in tests while the runtime ABI assumes the vtable path.
     try std.testing.expectEqual(ActiveManagerTag.third_party, ACTIVE_MANAGER_TAG);
+}
+
+test "Phase 4: active_manager uniform interface signatures match the manager-ABI vtable slot types" {
+    // Force semantic analysis of every uniform-interface symbol against
+    // its expected vtable signature. In host test builds
+    // `ACTIVE_MANAGER_TAG == .third_party`, which means every
+    // `active_manager.<fn>(...)` call site in the runtime's dispatchers
+    // is dead-code-eliminated at the comptime branch — a typo like
+    // `active_manager.retainSizedd(...)` would compile clean and only
+    // surface at Phase 5/6 user-binary compile time.
+    //
+    // Pinning each alias to its expected canonical slot signature here
+    // forces the compiler to type-check the first-party arm in the
+    // host build. If a first-party manager's alias (or the third-party
+    // stub's matching panic body) drifts from the ABI slot signature,
+    // this test fails at host-build time rather than at user-binary
+    // link time.
+    //
+    // Note: in host test builds `active_manager` resolves to
+    // `src/zap_active_manager_stub.zig`, which exports panic-typed
+    // bodies with the exact signatures below. Real first-party
+    // managers are pinned in their own per-manager `comptime` blocks.
+    //
+    // The signatures below are scoped to the slots actually invoked
+    // through the comptime first-party arm: `allocate`, `deallocate`,
+    // `allocateRefcounted`, `retain`, `release`, `retainSized`,
+    // `releaseSized`, `refcountSized`. The `init`, `deinit`, and
+    // `getCapabilityDesc` slots are consumed via the runtime's core
+    // vtable (a `*const ZapMemoryManagerCoreV1` populated at manager
+    // bind time), never through a direct `active_manager.<fn>` call,
+    // so their nominal extern-struct parameter types (which differ
+    // between `AbiV1` and the stub's self-contained redeclaration —
+    // extern structs are nominal in Zig even when layouts are
+    // identical) are not in scope for this test. Each first-party
+    // manager's own per-module `comptime` block pins those slots
+    // against its locally-declared ABI types.
+
+    // Slot signatures invoked from the runtime's comptime first-party
+    // arm. These use only primitive types and function pointers (which
+    // ARE structural in Zig), so they pin cleanly against the
+    // third-party stub's panic bodies as well.
+    const DeepWalkFn = *const fn (object: *anyopaque) callconv(.c) void;
+    const AllocateFn = *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8;
+    const DeallocateFn = *const fn (ctx: *anyopaque, ptr: [*]u8, size: usize, alignment: u32) callconv(.c) void;
+    const RetainFn = *const fn (ctx: *anyopaque, object: *anyopaque) callconv(.c) void;
+    const ReleaseFn = *const fn (ctx: *anyopaque, object: *anyopaque, deep_walk: ?DeepWalkFn) callconv(.c) void;
+    const RetainSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void;
+    const ReleaseSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32, deep_walk: ?DeepWalkFn) callconv(.c) void;
+    const AllocateRefcountedFn = *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8;
+    const RefcountSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32;
+
+    // Pin each uniform-interface alias to its expected signature. The
+    // `comptime _ = @as(T, value)` form forces semantic analysis at
+    // the test site without emitting runtime code; if any signature
+    // drifts, this file fails to compile under `zig build test`. The
+    // existence checks for `init`/`deinit`/`getCapabilityDesc` use
+    // `@TypeOf(...)` (which only requires the symbol be defined,
+    // without coercing the nominal extern-struct parameter types) so
+    // the test still catches a missing symbol while delegating
+    // shape-of-the-extern-struct validation to each manager's own
+    // module-scope comptime block.
+    comptime {
+        _ = @TypeOf(active_manager.init);
+        _ = @TypeOf(active_manager.deinit);
+        _ = @TypeOf(active_manager.getCapabilityDesc);
+
+        _ = @as(AllocateFn, active_manager.allocate);
+        _ = @as(DeallocateFn, active_manager.deallocate);
+        _ = @as(RetainFn, active_manager.retain);
+        _ = @as(ReleaseFn, active_manager.release);
+        _ = @as(RetainSizedFn, active_manager.retainSized);
+        _ = @as(ReleaseSizedFn, active_manager.releaseSized);
+        _ = @as(AllocateRefcountedFn, active_manager.allocateRefcounted);
+        _ = @as(RefcountSizedFn, active_manager.refcountSized);
+    }
 }
 
 test "releaseChildrenAny releases ?*const Map(K, V) field" {

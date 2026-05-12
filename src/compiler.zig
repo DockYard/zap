@@ -5811,3 +5811,58 @@ test "Phase 4: ARC manager's uniform interface aliases name the real implementat
         }
     }
 }
+
+test "Phase 4: managers without REFCOUNT_V1 alias panic stubs for the capability functions" {
+    // Symmetric to the ARC alias test above. Arena, NoOp, Leak, and
+    // Tracking declare `declared_caps = 0`, so their refcount-aliased
+    // names (`retain`, `release`, `retainSized`, `releaseSized`,
+    // `refcountSized`, `allocateRefcounted`) MUST resolve to
+    // panic-stub functions — never to a real refcount routine. The
+    // panic-stub convention Phase 4 established is the `Stub` name
+    // suffix (e.g. `arenaRetainStub`); pinning that substring at the
+    // alias-arrow site catches a regression that wired a real
+    // refcount impl into a non-REFCOUNT manager (which would
+    // silently misbehave at runtime under those builds).
+    const non_refcount_managers = [_]struct {
+        tag: zap.memory_driver.BuiltinManagerTag,
+        name: []const u8,
+    }{
+        .{ .tag = .arena, .name = "arena" },
+        .{ .tag = .no_op, .name = "no_op" },
+        .{ .tag = .leak, .name = "leak" },
+        .{ .tag = .tracking, .name = "tracking" },
+    };
+
+    const refcount_aliases = [_][]const u8{
+        "pub const retain = ",
+        "pub const release = ",
+        "pub const retainSized = ",
+        "pub const releaseSized = ",
+        "pub const refcountSized = ",
+        "pub const allocateRefcounted = ",
+    };
+
+    for (non_refcount_managers) |mgr| {
+        const source = getBuiltinManagerSource(mgr.tag).?;
+        for (refcount_aliases) |needle| {
+            const idx = std.mem.indexOf(u8, source, needle) orelse {
+                std.debug.print(
+                    "\n  {s} manager is missing the alias line beginning `{s}`\n",
+                    .{ mgr.name, needle },
+                );
+                try std.testing.expect(false);
+                return;
+            };
+            const semi = std.mem.indexOfScalarPos(u8, source, idx, ';') orelse source.len;
+            const alias_line = source[idx..semi];
+            if (std.mem.indexOf(u8, alias_line, "Stub") == null) {
+                std.debug.print(
+                    "\n  {s} manager alias `{s}` does NOT name a panic stub: `{s}`\n",
+                    .{ mgr.name, needle, alias_line },
+                );
+                try std.testing.expect(false);
+                return;
+            }
+        }
+    }
+}
