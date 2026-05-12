@@ -14,6 +14,112 @@ const ast = zap.ast;
 const runtime_source = @embedFile("runtime.zig");
 const lexer = @import("lexer.zig");
 
+// ---------------------------------------------------------------------------
+// Phase 2 — first-party memory manager source embedding.
+//
+// Each first-party manager's `.zig` source is embedded into the compiler
+// binary so later phases (3+) can emit it as a sibling Zig module named
+// `zap_active_manager` alongside the user binary's runtime. The runtime's
+// comptime-dispatched `retain`/`release` call sites then resolve through
+// the manager's hot paths in the same compilation unit, which is the
+// precondition for LLVM to inline across the boundary (the original
+// reason every Zap binary linked the manager as a separate object file
+// and lost the inline opportunity).
+//
+// Symmetry obligation — the set of `@embedFile` declarations below MUST
+// remain in 1:1 correspondence with the first-party cases of
+// `BuiltinManagerTag` in `src/memory/driver.zig`. Adding a sixth
+// first-party manager means landing the manager's `.zap` stdlib decl,
+// its `BuiltinManagerTag` case, its classifier arm, its `manager.zig`
+// Zig source, AND a new `@embedFile` here plus a new arm in
+// `getBuiltinManagerSource`'s switch. The comptime assertion below
+// fires if the enum's case count drifts away from the switch.
+const arc_manager_source = @embedFile("memory/arc/manager.zig");
+const arena_manager_source = @embedFile("memory/arena/manager.zig");
+const no_op_manager_source = @embedFile("memory/no_op/manager.zig");
+const leak_manager_source = @embedFile("memory/leak/manager.zig");
+const tracking_manager_source = @embedFile("memory/tracking/manager.zig");
+
+/// Return the embedded Zig source bytes for a first-party memory
+/// manager identified by its `BuiltinManagerTag`, or `null` for the
+/// `.third_party` sentinel.
+///
+/// The returned slice is a borrowed view into the compiler binary's
+/// read-only data section (every byte came from `@embedFile` at
+/// compile time), so the call is zero-cost and the slice is valid for
+/// the full process lifetime — callers do not need to free it.
+///
+/// Why this exists — Phase 1 introduced `BuiltinManagerTag` so the
+/// compiler can identify which first-party manager a build resolved
+/// to. Phase 2 (this accessor) gives the rest of the pipeline a
+/// byte-stable handle on the manager's Zig source keyed by that tag.
+/// Phase 3 will emit the returned bytes as a sibling module so the
+/// runtime's comptime dispatch sites can be inlined through to the
+/// manager's hot paths — eliminating the cross-object-file boundary
+/// that currently blocks LLVM inlining and motivated the
+/// perf-recovery effort.
+///
+/// `.third_party` is the explicit non-built-in sentinel:
+/// third-party managers ship their `.zig` source through the build
+/// manifest, not the compiler binary, so the embedded-source surface
+/// is intentionally first-party-only. The build pipeline must
+/// consult the manifest for `.third_party` instead of this accessor.
+pub fn getBuiltinManagerSource(tag: zap.memory_driver.BuiltinManagerTag) ?[]const u8 {
+    return switch (tag) {
+        .arc => arc_manager_source,
+        .arena => arena_manager_source,
+        .no_op => no_op_manager_source,
+        .leak => leak_manager_source,
+        .tracking => tracking_manager_source,
+        .third_party => null,
+    };
+}
+
+/// Return the canonical Zig-module import name under which the
+/// active first-party manager's embedded source is registered, or
+/// `null` for `.third_party`.
+///
+/// Why one shared name — only one first-party manager is active per
+/// build, so the runtime's `@import("zap_active_manager")` resolves
+/// to whichever first-party manager Phase 3 registered for this
+/// compile. Returning a per-tag name (e.g., `"zap_active_manager_arc"`)
+/// would force the runtime to encode a conditional import surface
+/// per tag, which defeats the goal of letting LLVM see a single
+/// call-graph through the active manager's hot paths. A uniform
+/// name keeps the runtime source identical across first-party
+/// builds and isolates the manager swap to module-registration
+/// time.
+///
+/// `.third_party` returns `null` because the manifest, not the
+/// compiler, names the third-party module — the runtime does not
+/// `@import("zap_active_manager")` under a third-party manager;
+/// it links the manager's object file the way it does today.
+pub fn manager_source_unit_name(tag: zap.memory_driver.BuiltinManagerTag) ?[]const u8 {
+    return switch (tag) {
+        .arc, .arena, .no_op, .leak, .tracking => "zap_active_manager",
+        .third_party => null,
+    };
+}
+
+// Compile-time guard for the symmetry obligation documented above:
+// `getBuiltinManagerSource`'s switch hard-codes one arm per
+// first-party tag plus the explicit `.third_party` arm, so any change
+// to `BuiltinManagerTag`'s shape (adding, removing, or renaming a
+// case) MUST be accompanied by a matching change here. Bumping the
+// expected count without updating the switch — or vice versa — will
+// fail the build at this site instead of silently degrading a new
+// first-party manager to a missing-arm runtime crash. This assertion
+// is intentionally separate from the one in `src/memory/driver.zig`:
+// that one protects the classifier; this one protects the embedded-
+// source switch. Both must stay green.
+comptime {
+    const fields = @typeInfo(zap.memory_driver.BuiltinManagerTag).@"enum".fields;
+    if (fields.len != 6) @compileError(
+        "getBuiltinManagerSource: switch must be updated when adding a BuiltinManagerTag case " ++
+            "(also add a sibling `@embedFile` for the new manager's `.zig` source).",
+    );
+}
+
 /// Per-stage timing diagnostic. Gated by `ZAP_PROFILE`: production builds
 /// stay quiet, but `ZAP_PROFILE=1 zap test` (or any compile-driving
 /// command) emits `[stage NAME] ms=N` lines so a regression hunt can
@@ -5126,4 +5232,97 @@ test "Phase 6: getRuntimeSource rewrite encodes arbitrary caps bitmasks" {
     const src = getRuntimeSource(multi_caps);
     const expected = "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0xdeadbeefcafebabe;";
     try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — first-party manager source embedding (see Phase 1's
+// `BuiltinManagerTag` in `src/memory/driver.zig`). These tests pin the
+// per-tag accessor contract so later phases can rely on byte-stable
+// access to the manager source by tag without re-reading from disk.
+// ---------------------------------------------------------------------------
+
+test "Phase 2: getBuiltinManagerSource returns non-empty bytes for each first-party tag" {
+    // Exhaustive coverage of the five first-party tags is intentional:
+    // a regression that drops a tag (e.g., a future enum reorder) would
+    // pass any non-exhaustive test, but the perf-recovery plan requires
+    // every first-party manager to be reachable by tag from the
+    // compiler. The `const std = @import("std");` substring pins both
+    // the embed-path correctness AND the self-contained manager
+    // convention each `manager.zig` documents in its file header.
+    const std_import_needle = "const std = @import(\"std\");";
+    const tags = [_]zap.memory_driver.BuiltinManagerTag{ .arc, .arena, .no_op, .leak, .tracking };
+    for (tags) |tag| {
+        const source = getBuiltinManagerSource(tag);
+        try std.testing.expect(source != null);
+        try std.testing.expect(source.?.len > 0);
+        try std.testing.expect(std.mem.indexOf(u8, source.?, std_import_needle) != null);
+    }
+}
+
+test "Phase 2: getBuiltinManagerSource returns null for .third_party" {
+    // Third-party managers ship their own `.zig` source through the
+    // build manifest, not through the compiler binary — Phase 2's
+    // embed-and-expose contract is explicitly first-party-only. A
+    // non-null return here would leak a default first-party manager
+    // into third-party builds, breaking the manifest as the sole
+    // source of truth for non-built-in managers.
+    try std.testing.expect(getBuiltinManagerSource(.third_party) == null);
+}
+
+test "Phase 2: manager_source_unit_name returns 'zap_active_manager' for every first-party tag" {
+    // The accessor returns a single canonical import name across all
+    // first-party tags so the runtime's `@import("zap_active_manager")`
+    // works uniformly without a conditional import surface per tag —
+    // only one first-party manager is active per build, and the
+    // import name is intentionally tag-agnostic.
+    const expected = "zap_active_manager";
+    const tags = [_]zap.memory_driver.BuiltinManagerTag{ .arc, .arena, .no_op, .leak, .tracking };
+    for (tags) |tag| {
+        const name = manager_source_unit_name(tag);
+        try std.testing.expect(name != null);
+        try std.testing.expectEqualStrings(expected, name.?);
+    }
+}
+
+test "Phase 2: manager_source_unit_name returns null for .third_party" {
+    // Symmetric with `getBuiltinManagerSource(.third_party) == null`:
+    // third-party managers do not participate in the embedded-source
+    // import-name surface — the manifest names the module instead.
+    try std.testing.expect(manager_source_unit_name(.third_party) == null);
+}
+
+test "Phase 2: embedded ARC source matches the on-disk file" {
+    // `@embedFile` is path-relative to the caller's file. A typo in
+    // the embed path would silently grab the wrong bytes — every
+    // `manager.zig` opens with the same `//! ` doc-comment shape, so
+    // substring asserts alone cannot detect a swap. Byte-equality
+    // against the on-disk source pins the path verbatim. ARC is the
+    // canary because it's the default manager and the perf-critical
+    // first-party path.
+    const on_disk = try std.Io.Dir.cwd().readFileAlloc(
+        std.Options.debug_io,
+        "src/memory/arc/manager.zig",
+        std.testing.allocator,
+        .limited(16 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(on_disk);
+    const embedded = getBuiltinManagerSource(.arc).?;
+    try std.testing.expectEqualSlices(u8, on_disk, embedded);
+}
+
+test "Phase 2: every first-party manager source declares pub const ABI_MAJOR or imports std" {
+    // Pins the file-shape contract documented in every first-party
+    // `manager.zig` header: the file is self-contained (imports std)
+    // and is a Zig source file (opens with a doc-comment). Both
+    // signatures must be present in every embedded source — a future
+    // refactor that, say, splits the file or strips the header would
+    // be caught here before reaching Phase 3's emission step.
+    const doc_comment_needle = "//! ";
+    const std_import_needle = "const std = @import(\"std\");";
+    const tags = [_]zap.memory_driver.BuiltinManagerTag{ .arc, .arena, .no_op, .leak, .tracking };
+    for (tags) |tag| {
+        const source = getBuiltinManagerSource(tag).?;
+        try std.testing.expect(std.mem.startsWith(u8, source, doc_comment_needle));
+        try std.testing.expect(std.mem.indexOf(u8, source, std_import_needle) != null);
+    }
 }
