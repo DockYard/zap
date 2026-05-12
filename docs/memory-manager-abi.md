@@ -169,6 +169,44 @@ pub export const zap_memory_section linksection(SECTION_NAME) = ZapMemorySection
 
 The composite struct's `@offsetOf(ZapMemorySection, "core")` provides the value for `meta.core_vtable_offset`, and `@offsetOf(...)` on any embedded descriptor field provides its section offset. Because Zig lays out an `extern struct` in declaration order and emits it as a single contiguous initializer, the resulting `.zapmem` section is guaranteed to match the layout in the table above.
 
+**Composite struct with an embedded descriptor.** When the manager declares one or more capabilities and chooses to embed their descriptors rather than rely on runtime-only discovery (section 5.4), each embedded descriptor becomes an additional field in the same composite `extern struct`. For a refcounting-only manager that embeds a single `REFC` descriptor:
+
+```zig
+const ZapMemorySection = extern struct {
+    meta: ZapMemoryManagerMetaV1,    // 32 bytes, offset 0
+    core: ZapMemoryManagerCoreV1,    // 56 bytes, offset 32
+    desc_0: ZapCapabilityDescV1,     // 24 bytes, offset 88
+};
+
+pub export const zap_memory_section linksection(SECTION_NAME) = ZapMemorySection{
+    .meta = .{
+        // ...meta fields, including
+        // .core_vtable_offset = @offsetOf(ZapMemorySection, "core"),  // 32
+        // .desc_count         = 1,
+        // .declared_caps      = CAP_REFCOUNT_V1_BIT,
+    },
+    .core = .{
+        // ...core fields, including
+        // .declared_caps      = CAP_REFCOUNT_V1_BIT,
+    },
+    .desc_0 = .{
+        .id      = REFC_TAG,
+        .version = 1,
+        .size    = @sizeOf(ZapRefcountCapabilityV1),
+        .flags   = 0,
+        .vtable  = &refcount_vtable,
+    },
+};
+```
+
+The resulting `.zapmem` byte layout is:
+
+```
+meta@0 (32 bytes) | core@32 (56 bytes) | desc_0@88 (24 bytes) | total 112 bytes
+```
+
+`@offsetOf(ZapMemorySection, "desc_0")` is 88 in the canonical v1.0 layout — exactly `meta.core_vtable_offset + core.size` (32 + 56). Multiple embedded descriptors append in declaration order: `desc_0` at offset 88, `desc_1` at offset 112, `desc_2` at offset 136, and so on. The compiler reads them starting at `meta.core_vtable_offset + core.size` and walks `meta.desc_count` entries.
+
 The composite-struct symbol must have external linkage (the `export` keyword in Zig) so that the linker does not dead-strip it. The recommended symbol name is `zap_memory_section`, but the compiler does NOT rely on this name — it discovers all data purely by walking the section's contents starting at offset 0. Managers may also use multiple-declaration emission (one `export const` per artifact, each with the same `linksection`) provided they verify the produced section layout for every supported target; the resulting layout is implementation-defined and not portable across linkers.
 
 A manager package emits exactly one `ZapMemoryManagerMetaV1` and exactly one `ZapMemoryManagerCoreV1` into the `.zapmem` section. Emitting zero or more than one of either is a manager defect; the compiler rejects such managers with a build-time error.
@@ -207,7 +245,9 @@ The Zap compiler rejects the manager with a clear build-time error if any of the
 - `meta.desc_count > 0` and the section is smaller than `meta.core_vtable_offset + core.size + meta.desc_count * sizeof(ZapCapabilityDescV1)`.
 - A bit set in `meta.declared_caps` corresponds to a reserved-but-unimplemented capability (e.g., `GCOL` in v1.0). Reserved bits are reserved precisely because no v1 manager may declare them.
 - `meta.desc_count > 0` and any embedded descriptor's `id` does not correspond to a bit set in `meta.declared_caps`. Embedding a descriptor for an undeclared capability is rejected: `zap: manager embeds descriptor for capability <TAG> but does not declare it in declared_caps`.
+- `meta.desc_count > 0` and any embedded descriptor's `id == 0`: rejected with `zap: manager embeds descriptor with id == 0; descriptor ID 0 is reserved`. ID 0 is reserved (see section 5.5: `get_capability_desc` must return null for `id == 0`); embedding a descriptor under that ID is a manager defect.
 - `meta.reserved` is non-zero.
+- `meta._reserved2` is non-zero: rejected with `zap: manager metadata has non-zero reserved field _reserved2; the manager was built against a future ABI version`. The two reserved fields (`reserved`, `_reserved2`) are validated symmetrically — any non-zero value indicates a future-ABI bit the current compiler does not understand.
 
 A v1.x compiler may encounter bits set in `meta.declared_caps` that are unknown to it (added in a later v1.y minor). Such unknown bits are silently ignored — they have no effect on HIR or codegen. The manager must still implement the corresponding capability for the bits to be useful; bits the compiler does not recognize simply produce no compiler-side hooks. This is forward-compatible only for additive capabilities. A capability requiring new compiler-side codegen (write barriers, region setup) cannot be exercised by an older compiler; managers must omit the bit when targeting compilers that do not support the capability.
 
@@ -334,10 +374,22 @@ pub const ZapMemoryManagerCoreV1 = extern struct {
     /// an empty static struct. The runtime treats any non-null value
     /// as success and any null value as init failure.
     ///
-    /// The manager MAY call its own `allocate` from within `init` to
-    /// build internal data structures. Allocations made during init
-    /// will be matched by `deallocate` calls made during deinit (or
-    /// freed wholesale by the manager during deinit, at its discretion).
+    /// The manager MAY call its own `allocate` directly with its own
+    /// context pointer during `init` to build internal data structures
+    /// (free lists, slab pools, bookkeeping tables, etc.). Allocations
+    /// made during init will be matched by `deallocate` calls made
+    /// during deinit (or freed wholesale by the manager during deinit,
+    /// at its discretion).
+    ///
+    /// The manager MUST NOT trigger compiler-emitted allocation paths
+    /// during `init` — that is, the manager MUST NOT call into Zap
+    /// user code or Zap stdlib that allocates (Map, List, String
+    /// constructors, refcounted cell allocators, anything that lowers
+    /// through the compiler-emitted allocation site), because the
+    /// global `zap_memory_manager_context` (section 10.2) is not yet
+    /// populated when `init` is running. Compiler-emitted alloc sites
+    /// reached before startup completes will panic via the
+    /// deterministic unwrap trap described in section 10.2.
     ///
     /// Thread-safety: called on the thread that invokes the Zap
     /// runtime startup. The runtime guarantees that during init, no
@@ -557,12 +609,18 @@ pub const ZapCapabilityDescV1 = extern struct {
     /// bytes and ignores any tail.
     size: u16,
 
-    /// Capability-specific flags. In v1.0, all flag bits are reserved
-    /// for future use; managers MUST set `flags = 0` on every descriptor.
-    /// v1.x compilers ignore unknown flag bits. Bits 0..3 are reserved
-    /// for ABI-wide use across all capabilities; bits 4..31 are
-    /// reserved for per-capability use, to be defined per-capability
-    /// in future minor versions.
+    /// Capability-specific flags. In v1.0, all flag bits are reserved.
+    /// Managers SHOULD set `flags = 0` on every descriptor for forward
+    /// compatibility; v1.x compilers ignore unknown flag bits regardless,
+    /// so non-zero values do not cause rejection but are silently dropped.
+    /// Future ABI minors may define specific bits per capability; managers
+    /// built against a newer minor and run by an older compiler will see
+    /// their bits silently dropped (the capability degrades to the
+    /// older minor's behavior).
+    ///
+    /// Bits 0..3 are reserved for ABI-wide use across all capabilities;
+    /// bits 4..31 are reserved for per-capability use, to be defined
+    /// per-capability in future minor versions.
     flags: u32,
 
     /// Pointer to the capability vtable. Typed implicitly by
@@ -625,7 +683,7 @@ The `flags` field of `ZapCapabilityDescV1` is partitioned into ABI-wide bits (0.
 | 2    | `0x0000_0004` | Reserved. Must be 0 in v1.0.                                     |
 | 3    | `0x0000_0008` | Reserved. Must be 0 in v1.0.                                     |
 
-In v1.0, all flag bits are reserved for future use; managers MUST set `flags = 0` on every descriptor. v1.x compilers ignore unknown flag bits. Bits 0..3 are reserved for ABI-wide use across all capabilities; bits 4..31 are reserved for per-capability use, to be defined per-capability in future minor versions.
+In v1.0, all flag bits are reserved. Managers SHOULD set `flags = 0` on every descriptor for forward compatibility; v1.x compilers ignore unknown flag bits regardless. Future ABI minors may define specific bits per capability; managers built against a newer minor and run by an older compiler will see their bits silently dropped. Bits 0..3 are reserved for ABI-wide use across all capabilities; bits 4..31 are reserved for per-capability use, to be defined per-capability in future minor versions.
 
 ---
 
@@ -652,6 +710,8 @@ This table is normative. Implementations must use exactly these bit positions; f
 | 10..63 | (unused)         | —      | —                  | —                      | UNUSED         | Reserved for future minor versions      |
 
 The "Tag value (LE u32)" column shows the FourCC interpreted as a little-endian `u32` (i.e., the byte sequence `REFC` is `0x52, 0x45, 0x46, 0x43`, which read as little-endian is `0x4346_4552`). On big-endian targets the same bytes read as `0x5245_4643`.
+
+**Always use the named tag constants in Appendix A.1 (`REFC_TAG`, `GCOL_TAG`, etc.) rather than hand-computed hex literals.** The named constants resolve at comptime via `std.mem.readInt(u32, "REFC", target_endianness)` and are correct on every target; hand-computed hex values silently fail on big-endian targets because they bake in the little-endian interpretation. The hex columns in the canonical table exist only for documentation and ABI-validator implementations that need to recognize the wire format directly; manager source code should never write the hex literal.
 
 ### 7.2 Reserved-vs-defined
 
@@ -968,13 +1028,25 @@ The primitive does not currently accept package dependencies (`build.zig.zon` de
 
 ### 10.2 Runtime manager context storage
 
-The Zap runtime exports a single global storage for the active manager's context:
+The Zap runtime exports a single global storage for the active manager's context. The symbol is split across two translation-unit roles: the Zap runtime is the sole *defining* TU and every compiler-emitted retain/release/allocate/deallocate site is a *consuming* TU. Zig 0.16 rejects an `extern var` with an initializer (`error: extern variables have no initializers`), so the two roles use distinct declarations against the same symbol name:
 
 ```zig
-pub extern var zap_memory_manager_context: ?*anyopaque = null;
+// In the Zap runtime (defining translation unit):
+// The runtime defines and zero-initializes this global. It is written
+// exactly once, immediately after `core.init` returns at program startup,
+// before any compiler-emitted user code runs.
+pub export var zap_memory_manager_context: ?*anyopaque = null;
+
+// In compiler-emitted user code (consuming translation units):
+// Compiler-emitted retain/release/allocate/deallocate sites declare and
+// unwrap the runtime's global. Reaching a call site before startup
+// completes traps deterministically.
+pub extern var zap_memory_manager_context: ?*anyopaque;
 ```
 
-The runtime initializes this global to `null` at load time (it lives in `.bss`/`.data` and has an explicit `null` initializer). The startup hook emitted in step 8 invokes the manager's `init`, validates that the returned context pointer is non-null (treating null as initialization failure per section 4.2), and writes the validated pointer into `zap_memory_manager_context` before transferring control to user-level main.
+The defining declaration places the symbol in the runtime's `.bss`/`.data` with an explicit `null` initializer; the consuming declarations carry no initializer (Zig forbids it on `extern`) and resolve at link time to the runtime's symbol. Both declarations name the same global, so every consumer observes the runtime's zero-initialized slot until startup writes through it.
+
+The startup hook emitted in step 8 invokes the manager's `init`, validates that the returned context pointer is non-null (treating null as initialization failure per section 4.2), and writes the validated pointer into `zap_memory_manager_context` before transferring control to user-level main.
 
 Every compiler-emitted retain/release/allocate/deallocate site unwraps the nullable using the canonical Zig idiom — for example, `const ctx = zap_memory_manager_context orelse @panic("zap: memory manager not initialized; allocation issued before startup completed")`. The unwrap compiles to a single not-null branch on every target; the cold panic path emits a deterministic abort with a clear diagnostic.
 
@@ -998,8 +1070,11 @@ The compiled `<manager>.o` is content-addressed by `(zig_fork_version, manager_s
 | Capability version too new               | Step 5  | "manager `<name>` declares `<TAG>` at version `<n>`; this compiler supports only versions up to `<m>`" |
 | Reserved capability bit declared         | Step 5  | "manager `<name>` declares reserved capability `<TAG>` (bit `<n>`), which has no committed v1.0 shape" |
 | Embedded descriptor for undeclared cap   | Step 5  | "manager `<name>` embeds descriptor for capability `<TAG>` but does not declare it in declared_caps" |
+| Embedded descriptor with `id == 0`       | Step 5  | "zap: manager embeds descriptor with id == 0; descriptor ID 0 is reserved"            |
 | Embedded descriptor exceeds section size | Step 5  | "manager `<name>` declares `<n>` embedded descriptors but section is only `<bytes>` bytes" |
 | `core.declared_caps != meta.declared_caps` | Step 5 | "manager `<name>` has mismatched declared_caps between meta header and core vtable"   |
+| `meta._reserved2` non-zero               | Step 5  | "zap: manager metadata has non-zero reserved field _reserved2; the manager was built against a future ABI version" |
+| `meta.reserved` non-zero                 | Step 5  | "manager `<name>` metadata reserved field is non-zero; the manager was built against a future ABI version" |
 | Init returns null at runtime             | Runtime | "zap: manager `<name>` failed to initialize"                                          |
 | `allocate` returns null at runtime       | Runtime | "zap: out of memory: requested `<size>` bytes (alignment `<alignment>`) from manager `<name>`; aborting" |
 
@@ -1402,6 +1477,13 @@ const Header = extern struct {
 const HEADER_SIZE: usize = @sizeOf(Header);    // 24 bytes
 const HEADER_ALIGN: u32 = @alignOf(Header);    // 8 bytes on 64-bit targets
 
+// `block_size` is declared `u64` rather than `usize` deliberately. The
+// 24-byte assertion below holds across the v1.0 supported targets (all
+// 64-bit, per Appendix C); a future port to a 32-bit target would
+// shrink `usize` to 4 bytes and quietly break the layout. Using a
+// fixed-width `u64` keeps the assertion as a compile-time tripwire —
+// the manager author is forced to update the layout deliberately
+// rather than absorbing the change silently.
 comptime {
     // Lock the header layout for this example. A production manager may
     // pick a different size — the only hard constraint is that
@@ -1835,7 +1917,8 @@ Entry offset relative to start of entry:
 0x00    4     id              FourCC tag as u32 (target-endianness)
 0x04    2     version         Per-capability version
 0x06    2     size            sizeof(vtable struct)
-0x08    4     flags           Capability-specific; must be 0 in v1.0
+0x08    4     flags           Capability-specific; SHOULD be 0 in v1.0
+                                (unknown bits are silently ignored)
 0x0C    4     (padding)       Zero-filled; required for 8-byte align
 0x10    8     vtable          Pointer to capability vtable
 0x18    -     -               (end of entry; total 24 bytes)
@@ -1843,13 +1926,15 @@ Entry offset relative to start of entry:
 
 ### B.4 Total `.zapmem` section size
 
+The canonical v1.0 layout has a fixed prefix (meta + core = 88 bytes) and a variable-length descriptor tail. The total section size is therefore parametrized by `meta.desc_count`:
+
 ```
 section_size = sizeof(meta) + sizeof(core) + 24 * meta.desc_count
              = 32 + 56 + 24 * meta.desc_count          # canonical v1.0
              = 88 + 24 * meta.desc_count
 ```
 
-If `meta.desc_count = 0`, the section is exactly 88 bytes. If `meta.desc_count = 1` (e.g., a refcounting-only manager that embeds its single descriptor), the section is 112 bytes.
+If `meta.desc_count = 0`, the section is exactly 88 bytes. If `meta.desc_count = 1` (e.g., a refcounting-only manager that embeds its single descriptor), the section is 112 bytes; each additional embedded descriptor adds 24 bytes. The total is not a single fixed value — it scales with the manager's chosen capability set.
 
 ### B.5 Alignment
 
