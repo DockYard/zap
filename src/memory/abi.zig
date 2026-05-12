@@ -44,10 +44,26 @@ comptime {
 }
 
 /// Options passed to the manager's `init` entry point. Spec section 4.1.
-pub const ZapInitOptionsV1 = extern struct {
+///
+/// Unlike `ZapMemoryManagerMetaV1`, `ZapCapabilityDescV1`, and
+/// `ZapMemoryManagerCoreV1` — which are versioned by structural layout
+/// and grow new `*V2` siblings on minor bumps — `ZapInitOptions` evolves
+/// in place via the leading `size` field. Callers pass `size = sizeof(<their
+/// known options>)`; managers compiled against newer versions read up to
+/// `size` bytes and ignore the trailer, and managers compiled against
+/// older versions read up to `sizeof(<known options>)` bytes and ignore
+/// the trailing fields the caller doesn't yet know about. The naming
+/// drops the `V1` suffix to make this single-concept evolution explicit.
+pub const ZapInitOptions = extern struct {
     size: u32,
     reserved: u32,
 };
+
+comptime {
+    if (@sizeOf(ZapInitOptions) != 8) @compileError(
+        "abi: ZapInitOptions v1.0 must be exactly 8 bytes",
+    );
+}
 
 /// Capability descriptor record embedded in the manager's `.zapmem`
 /// metadata block (after the meta header). Spec section 3.6.
@@ -58,6 +74,12 @@ pub const ZapCapabilityDescV1 = extern struct {
     flags: u32,
     vtable: *const anyopaque,
 };
+
+comptime {
+    if (@sizeOf(ZapCapabilityDescV1) != 24) @compileError(
+        "abi: ZapCapabilityDescV1 v1.0 must be exactly 24 bytes",
+    );
+}
 
 /// Core capability vtable. Spec section 4.2.
 pub const ZapMemoryManagerCoreV1 = extern struct {
@@ -72,8 +94,26 @@ pub const ZapMemoryManagerCoreV1 = extern struct {
     get_capability_desc_fn: *const anyopaque,
 };
 
+comptime {
+    if (@sizeOf(ZapMemoryManagerCoreV1) != 56) @compileError(
+        "abi: ZapMemoryManagerCoreV1 v1.0 must be exactly 56 bytes",
+    );
+}
+
 test "ZapMemoryManagerMetaV1 layout is exactly 32 bytes" {
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(ZapMemoryManagerMetaV1));
+}
+
+test "ZapInitOptions layout is exactly 8 bytes" {
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(ZapInitOptions));
+}
+
+test "ZapCapabilityDescV1 layout is exactly 24 bytes" {
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(ZapCapabilityDescV1));
+}
+
+test "ZapMemoryManagerCoreV1 layout is exactly 56 bytes" {
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(ZapMemoryManagerCoreV1));
 }
 
 test "ZMEM_MAGIC_LE is little-endian 'ZMEM'" {

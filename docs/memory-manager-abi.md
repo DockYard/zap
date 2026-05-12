@@ -1040,11 +1040,16 @@ On `CompilationFailed`, the diagnostic buffer is populated with the formatted co
 
 `local_cache_dir_opt`
     Optional path to a local Zig build cache directory. If null, the
-    primitive uses `/tmp/zap-fork-cache`. Callers driving many
-    compilations (e.g., Zap's build orchestrator) should pass an
-    explicit per-build cache directory through this argument so that
-    repeated invocations share a stable cache root and do not collide
-    with other tools' caches under `/tmp`.
+    primitive uses a platform-appropriate default:
+    `/tmp/zap-fork-cache` on Linux and macOS, and
+    `%TEMP%\zap-fork-cache` (or `%TMP%\zap-fork-cache` as a fallback)
+    on Windows. On hosts without a documented default, the primitive
+    returns `InternalError` with a diagnostic naming the OS; exotic-host
+    callers must thread an explicit path through this argument. Callers
+    driving many compilations (e.g., Zap's build orchestrator) should
+    pass an explicit per-build cache directory through this argument so
+    that repeated invocations share a stable cache root and do not
+    collide with other tools' caches under the system temp directory.
 
 `global_cache_dir_opt`
     Optional path to a global (cross-build) Zig cache directory. If
@@ -2013,7 +2018,12 @@ target. When set, `os_tag` and `abi_tag` are ignored; the primitive
 selects the running compiler's native target. Useful for the common
 case where the manager is compiled for the host (e.g., the Zap build
 orchestrator targeting the same machine the build is running on). The
-Zig fork exposes this sentinel as `ZAP_FORK_ARCH_NATIVE`.
+Zig fork exposes this sentinel as `ZAP_FORK_ARCH_NATIVE`. The
+primitive verifies the resolved native host is itself in the v1.0
+supported set above; if a developer is running on an experimental host
+that does not appear in the table, the call is rejected with
+`TargetUnsupported` and a diagnostic naming the host triple, rather
+than silently emitting an unsupported binary.
 
 The reserved field `ZapForkTarget._reserved` must be zero in v1.0. A
 non-zero value indicates either a caller bug or a struct built against
