@@ -134,7 +134,16 @@ pub const StringId = u32;
 
 pub const StringInterner = struct {
     allocator: std.mem.Allocator,
-    strings: std.ArrayList([]const u8),
+    /// Each entry is owned by the interner — `intern` duplicates the
+    /// caller's input via `allocator.dupe` so the stored slice has the
+    /// interner's lifetime rather than the caller's. This is mandatory:
+    /// many callers pass short-lived buffers (`ArrayList.items`, parser
+    /// scratch, format temporaries) and would otherwise leave the
+    /// interner holding dangling pointers as soon as those buffers go
+    /// out of scope. The same duplicated slice is used as both the
+    /// `strings.items[id]` entry and the `map` key so a single free in
+    /// `deinit` cleans up both.
+    strings: std.ArrayList([]u8),
     map: std.StringHashMap(StringId),
     mutex: std.atomic.Mutex = .unlocked,
 
@@ -147,6 +156,7 @@ pub const StringInterner = struct {
     }
 
     pub fn deinit(self: *StringInterner) void {
+        for (self.strings.items) |buf| self.allocator.free(buf);
         self.strings.deinit(self.allocator);
         self.map.deinit();
     }
@@ -154,12 +164,19 @@ pub const StringInterner = struct {
     pub fn intern(self: *StringInterner, str: []const u8) !StringId {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
+        // Lookup uses the caller's slice as a transient key; the
+        // hashmap hashes the bytes immediately and the duplicated
+        // entry below replaces the transient slice as the map's
+        // permanent key.
         if (self.map.get(str)) |id| {
             return id;
         }
         const id: StringId = @intCast(self.strings.items.len);
-        try self.strings.append(self.allocator, str);
-        try self.map.put(str, id);
+        const owned = try self.allocator.dupe(u8, str);
+        errdefer self.allocator.free(owned);
+        try self.strings.append(self.allocator, owned);
+        errdefer _ = self.strings.pop();
+        try self.map.put(owned, id);
         return id;
     }
 
