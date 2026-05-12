@@ -155,6 +155,15 @@ pub const CompileOptions = struct {
     /// capabilities" (e.g. `Zap.Memory.NoOp`); `1` (`REFCOUNT_V1_BIT`)
     /// means the manager supports the ARC retain/release contract.
     declared_caps: u64 = 0,
+    /// Identity classification of the resolved memory manager. Mirrors
+    /// `ResolvedManager.builtin_tag` from `src/memory/driver.zig`. The
+    /// default `.third_party` covers every code path that does not go
+    /// through the memory-manager driver (unit tests that bypass it,
+    /// future callers that have not yet been wired). Production
+    /// `buildTarget` and `IncrementalWatchState.init` set this from
+    /// the resolved manager so later phases can branch on it for
+    /// comptime-dispatched first-party fast paths.
+    builtin_tag: @import("memory/driver.zig").BuiltinManagerTag = .third_party,
 };
 
 /// Create a ZirContext compilation context from the given options.

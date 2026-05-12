@@ -1240,6 +1240,11 @@ fn buildTarget(
         // on the same bit. Phase 3's only obligation is to keep the
         // wire intact end-to-end.
         .declared_caps = resolved_manager.declared_caps,
+        // First-party manager classification. Phase 1 only threads
+        // the tag through; later phases of the perf-recovery work
+        // branch on it to inline through a comptime-dispatched fast
+        // path for first-party managers.
+        .builtin_tag = resolved_manager.builtin_tag,
         // Zig 0.16 error formatting options from manifest
         .error_style = config.error_style,
         .multiline_errors = config.multiline_errors,
@@ -1482,6 +1487,13 @@ const IncrementalWatchState = struct {
     /// link step pulls in the manager `.o`. Mirrors the
     /// `resolved_manager.object_path` lifetime in `buildTarget`.
     memory_manager_object: ?[]const u8 = null,
+    /// Resolved manager's first-party classification. Cached in `init`
+    /// from `resolved_manager.builtin_tag` and threaded into every
+    /// `injectAndUpdate` call so the watch-session's emitted binaries
+    /// see the same classification the initial backend context was
+    /// created with. Later phases of the perf-recovery work branch
+    /// on this tag to inline through a comptime-dispatched fast path.
+    builtin_tag: @import("memory/driver.zig").BuiltinManagerTag = .third_party,
 
     fn deinit(self: *IncrementalWatchState) void {
         zir_backend.destroyContext(self.zir_ctx);
@@ -1682,6 +1694,7 @@ const IncrementalWatchState = struct {
             .link_libc = true,
             .memory_manager_object = memory_manager_object_owned,
             .declared_caps = declared_caps,
+            .builtin_tag = resolved_manager.builtin_tag,
         }) catch {
             allocator.free(zig_lib_duped);
             allocator.free(output_path_duped);
@@ -1703,6 +1716,7 @@ const IncrementalWatchState = struct {
             .allocator = allocator,
             .declared_caps = declared_caps,
             .memory_manager_object = memory_manager_object_owned,
+            .builtin_tag = resolved_manager.builtin_tag,
         };
     }
 
@@ -1919,6 +1933,7 @@ const IncrementalWatchState = struct {
             .arc_ownership = if (result.arc_ownership) |*ownership| ownership else null,
             .memory_manager_object = self.memory_manager_object,
             .declared_caps = self.declared_caps,
+            .builtin_tag = self.builtin_tag,
         }) catch return error.BackendError;
 
         self.baseline_established = true;
