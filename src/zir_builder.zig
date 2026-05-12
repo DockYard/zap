@@ -489,6 +489,17 @@ pub const ZirDriver = struct {
     /// of `buildAndInject` (the compiler pipeline) — the driver only
     /// borrows it.
     arc_ownership: ?*const @import("arc_liveness.zig").ProgramArcOwnership = null,
+    /// Memory Manager ABI v1.0 capability bitmask declared by the
+    /// active manager (see `docs/memory-manager-abi.md` section 7).
+    /// Set from `CompileOptions.declared_caps` so downstream codegen
+    /// passes (Phase 6's retain/release elision, Phase 4's layout
+    /// branch) can decide whether to emit refcount-aware instructions.
+    /// Phase 3 wires the value through end-to-end without branching
+    /// on it — the bit is present so later phases are purely additive.
+    /// `0` means "no capabilities" (the default, e.g.
+    /// `Zap.Memory.NoOp`); `1` (`REFCOUNT_V1_BIT`) means the manager
+    /// supports the ARC retain/release contract.
+    declared_caps: u64 = 0,
     reuse_backed_struct_locals: std.AutoHashMapUnmanaged(ir.LocalId, []const u8) = .empty,
     reuse_backed_union_locals: std.AutoHashMapUnmanaged(ir.LocalId, ir.UnionInit) = .empty,
     reuse_backed_tuple_locals: std.AutoHashMapUnmanaged(ir.LocalId, usize) = .empty,
@@ -8251,6 +8262,7 @@ pub fn buildAndInject(
     builder_entry: ?[]const u8,
     analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext,
     arc_ownership: ?*const @import("arc_liveness.zig").ProgramArcOwnership,
+    declared_caps: u64,
 ) BuildError!void {
     // Register the runtime struct if a path was provided.
     if (runtime_path) |rpath| {
@@ -8264,6 +8276,7 @@ pub fn buildAndInject(
     driver.builder_entry = builder_entry;
     driver.analysis_context = analysis_context;
     driver.arc_ownership = arc_ownership;
+    driver.declared_caps = declared_caps;
     driver.compilation_ctx = compilation_ctx;
 
     driver.buildProgram(program) catch |err| {

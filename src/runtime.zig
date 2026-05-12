@@ -967,6 +967,14 @@ fn maybeBindExternalManager() void {
     if (section.core.size < @sizeOf(AbiV1.ZapMemoryManagerCoreV1)) {
         @panic("zap runtime: external memory manager core vtable is smaller than v1.0");
     }
+    // Upper bound on `core.size`. The build-time driver applies the
+    // same cap (`MAX_CORE_SIZE`); this runtime check guards against
+    // a binary that bypassed the driver (e.g., a hand-edited section
+    // patched in post-link) and prevents arbitrary-offset reads when
+    // future code dispatches through the vtable.
+    if (section.core.size > 8 * @sizeOf(AbiV1.ZapMemoryManagerCoreV1)) {
+        @panic("zap runtime: external memory manager core vtable exceeds v1.x upper bound");
+    }
 
     // Re-point the active core vtable. The runtime's previous
     // initialiser pointed it at `&builtin_arc_core`; from here on every

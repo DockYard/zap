@@ -268,6 +268,15 @@ pub const ResolveOptions = struct {
     zig_lib_dir: ?[]const u8 = null,
     /// Optimize mode forwarded to the fork primitive.
     optimize: ZapForkOptimize = .ReleaseSafe,
+    /// Cross-compile target triple (e.g. `"aarch64-linux-gnu"`). Null
+    /// means "native": the manager `.o` is compiled for the host. When
+    /// the build's `compile_target` is set, the driver must pass the
+    /// matching `ZapForkTarget` to the fork primitive so the manager
+    /// `.o` matches the final binary's target. Phase 1's
+    /// `isSupportedTriple` whitelist gates which triples are accepted;
+    /// unsupported triples surface as `ResolveError.ManagerCompileFailed`
+    /// with the primitive's diagnostic text in `diag`.
+    target: ?[]const u8 = null,
     /// Optional override for the fork compile function. When null the
     /// driver invokes the real `libzap_compiler.a` extern. Tests pass a
     /// mock that synthesises an object file without needing the LLVM
@@ -399,6 +408,17 @@ pub fn resolve(
 
     // Static validation per spec section 3.5.
     const validated = try validateSection(manager_name, section_bytes, diag);
+
+    // Build-time check: the runtime bootstrap discovers the manager
+    // via `@extern(..., .{ .name = "zap_memory_section", .linkage =
+    // .weak })`. The contract in `docs/memory-manager-abi.md` section
+    // 3.2 / 10.5 requires every manager to export the section payload
+    // under that symbol name. A manager that emitted the section bytes
+    // under a different symbol (or as an unnamed payload) would pass
+    // the section-content validation above but silently resolve the
+    // weak extern to null at runtime, falling back to the built-in ARC
+    // vtable. The check below catches that mis-emission at build time.
+    try assertExportsManagerSymbol(manager_name, object_bytes, diag);
 
     return .{
         .name = try allocator.dupe(u8, manager_name),
@@ -599,12 +619,27 @@ fn compileManagerSource(
     } else null;
     defer if (zig_lib_z) |p| allocator.free(std.mem.span(p));
 
-    const target: ZapForkTarget = .{
-        .arch_tag = ZAP_FORK_ARCH_NATIVE,
-        .os_tag = 0,
-        .abi_tag = 0,
-        ._reserved = 0,
-    };
+    // When the build is cross-compiling (`compile_target` is set on
+    // the manifest), pass the matching `ZapForkTarget` to the fork
+    // primitive so the manager `.o` matches the binary's target.
+    // Otherwise pass the NATIVE sentinel — the fork's
+    // `isSupportedTriple` whitelist gates which native hosts are
+    // accepted.
+    const target: ZapForkTarget = if (options.target) |triple|
+        parseTargetTriple(triple) orelse {
+            diag.write(
+                "memory manager '{s}' could not build for cross-compile target '{s}': unrecognised triple (expected arch-os-abi)",
+                .{ manager_name, triple },
+            );
+            return ResolveError.ManagerCompileFailed;
+        }
+    else
+        .{
+            .arch_tag = ZAP_FORK_ARCH_NATIVE,
+            .os_tag = 0,
+            .abi_tag = 0,
+            ._reserved = 0,
+        };
 
     // Diagnostic buffer threaded into the fork primitive. We size it
     // generously so multi-error bundles fit; the primitive truncates and
@@ -675,6 +710,265 @@ fn makeSafeFileName(allocator: std.mem.Allocator, manager_name: []const u8) ![]c
     return out;
 }
 
+/// Parse a Zap cross-compile target triple of the form
+/// `arch-os-abi` (e.g. `"aarch64-linux-gnu"`) into a `ZapForkTarget`.
+/// Returns null when the string is not well-formed or any of the three
+/// segments fails to resolve to a known `std.Target.*` enum value.
+/// Tag-validity is enforced here; whether the resulting triple is in
+/// the v1.0 supported whitelist is decided downstream by the fork
+/// primitive's `isSupportedTriple`.
+fn parseTargetTriple(triple: []const u8) ?ZapForkTarget {
+    var iter = std.mem.tokenizeAny(u8, triple, "-");
+    const arch_str = iter.next() orelse return null;
+    const os_str = iter.next() orelse return null;
+    const abi_str = iter.next() orelse return null;
+    if (iter.next() != null) return null; // exactly 3 segments
+
+    const arch_tag = enumTag(std.Target.Cpu.Arch, arch_str) orelse return null;
+    const os_tag = enumTag(std.Target.Os.Tag, os_str) orelse return null;
+    const abi_tag = enumTag(std.Target.Abi, abi_str) orelse return null;
+
+    return .{
+        .arch_tag = @intCast(arch_tag),
+        .os_tag = @intCast(os_tag),
+        .abi_tag = @intCast(abi_tag),
+        ._reserved = 0,
+    };
+}
+
+/// Look up an enum's integer tag value by case-insensitive name match.
+/// Returns null when no field's `@tagName` matches the input.
+fn enumTag(comptime E: type, name: []const u8) ?usize {
+    inline for (@typeInfo(E).@"enum".fields) |field| {
+        if (std.ascii.eqlIgnoreCase(field.name, name)) {
+            return @intCast(field.value);
+        }
+    }
+    return null;
+}
+
+test "parseTargetTriple accepts a well-formed triple" {
+    const t = parseTargetTriple("aarch64-linux-gnu") orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(@as(u16, @intCast(@intFromEnum(std.Target.Cpu.Arch.aarch64))), t.arch_tag);
+    try std.testing.expectEqual(@as(u16, @intCast(@intFromEnum(std.Target.Os.Tag.linux))), t.os_tag);
+    try std.testing.expectEqual(@as(u16, @intCast(@intFromEnum(std.Target.Abi.gnu))), t.abi_tag);
+    try std.testing.expectEqual(@as(u16, 0), t._reserved);
+}
+
+test "parseTargetTriple rejects malformed input" {
+    try std.testing.expectEqual(@as(?ZapForkTarget, null), parseTargetTriple("aarch64-linux"));
+    try std.testing.expectEqual(@as(?ZapForkTarget, null), parseTargetTriple("aarch64-linux-gnu-extra"));
+    try std.testing.expectEqual(@as(?ZapForkTarget, null), parseTargetTriple("not-a-real-arch"));
+}
+
+// ---------------------------------------------------------------------------
+// Manager-symbol check (spec section 3.2 / 10.5)
+// ---------------------------------------------------------------------------
+
+/// Spec-mandated symbol name for the section payload. See the
+/// `zap_memory_section` exports in `src/memory/no_op/manager.zig`,
+/// `src/memory/arena/manager.zig`, and the runtime's weak-extern
+/// resolution in `src/runtime.zig#externalMemorySection`.
+const MANAGER_SYMBOL_NAME = "zap_memory_section";
+
+/// Verify the object's symbol table contains a `zap_memory_section`
+/// entry. The section validator above only inspects the section
+/// contents; without this complementary check, a manager that emitted
+/// the section bytes under a different symbol name would link cleanly
+/// but resolve the runtime weak-extern to null at startup, silently
+/// falling back to the built-in ARC vtable.
+fn assertExportsManagerSymbol(
+    manager_name: []const u8,
+    object_bytes: []const u8,
+    diag: *DriverDiagnostic,
+) ResolveError!void {
+    const found = managerSymbolPresent(object_bytes) catch |err| {
+        switch (err) {
+            error.UnsupportedFormat => {
+                // ELF and Mach-O 64-bit are the production targets;
+                // any other object format here was already rejected by
+                // `section_parser.extractSection`. Reaching this branch
+                // means the parser accepted bytes the symbol-check
+                // refuses; treat as malformed.
+                diag.write(
+                    "manager '{s}' object file uses an unsupported format for symbol-table inspection",
+                    .{manager_name},
+                );
+                return ResolveError.SectionInvalid;
+            },
+            error.InvalidObject => {
+                diag.write(
+                    "manager '{s}' has a malformed object header (symbol-table check)",
+                    .{manager_name},
+                );
+                return ResolveError.SectionInvalid;
+            },
+        }
+    };
+    if (!found) {
+        diag.write(
+            "manager '{s}' does not export the required symbol '{s}'; every manager MUST export its section payload under this name (see docs/memory-manager-abi.md section 3.2)",
+            .{ manager_name, MANAGER_SYMBOL_NAME },
+        );
+        return ResolveError.ValidationFailed;
+    }
+}
+
+const SymbolCheckError = error{
+    UnsupportedFormat,
+    InvalidObject,
+};
+
+/// Walk the object's symbol table and return `true` iff
+/// `zap_memory_section` is present. Supports ELF64 and Mach-O 64-bit
+/// — the same formats `section_parser.extractSection` handles.
+fn managerSymbolPresent(bytes: []const u8) SymbolCheckError!bool {
+    return switch (section_parser.detectFormat(bytes)) {
+        .elf => elfSymbolPresent(bytes, MANAGER_SYMBOL_NAME),
+        .macho => machoSymbolPresent(bytes, MANAGER_SYMBOL_NAME),
+        .coff => SymbolCheckError.UnsupportedFormat,
+        .unknown => SymbolCheckError.InvalidObject,
+    };
+}
+
+fn elfSymbolPresent(bytes: []const u8, want: []const u8) SymbolCheckError!bool {
+    var hdr_reader = std.Io.Reader.fixed(bytes);
+    const header = std.elf.Header.read(&hdr_reader) catch return SymbolCheckError.InvalidObject;
+    if (header.shnum == 0) return false;
+
+    // First pass: collect headers so we can look up the string table
+    // a symbol-table section references via `sh_link`.
+    var section_headers: [256]std.elf.Elf64_Shdr = undefined;
+    if (header.shnum > section_headers.len) return false;
+    var idx: u32 = 0;
+    var it = header.iterateSectionHeadersBuffer(bytes);
+    while (true) {
+        const maybe = it.next() catch return SymbolCheckError.InvalidObject;
+        const sh = maybe orelse break;
+        if (idx >= section_headers.len) break;
+        section_headers[idx] = sh;
+        idx += 1;
+    }
+    const count = idx;
+
+    var s: u32 = 0;
+    while (s < count) : (s += 1) {
+        const sh = section_headers[s];
+        if (sh.sh_type != @intFromEnum(std.elf.SHT.SYMTAB) and
+            sh.sh_type != @intFromEnum(std.elf.SHT.DYNSYM))
+        {
+            continue;
+        }
+        if (sh.sh_link >= count) return SymbolCheckError.InvalidObject;
+        const strtab_sh = section_headers[sh.sh_link];
+        if (strtab_sh.sh_size > bytes.len or
+            strtab_sh.sh_offset > bytes.len - strtab_sh.sh_size)
+        {
+            return SymbolCheckError.InvalidObject;
+        }
+        const strtab = bytes[@intCast(strtab_sh.sh_offset)..][0..@intCast(strtab_sh.sh_size)];
+
+        if (sh.sh_entsize == 0) return SymbolCheckError.InvalidObject;
+        if (sh.sh_size > bytes.len or sh.sh_offset > bytes.len - sh.sh_size) {
+            return SymbolCheckError.InvalidObject;
+        }
+        const sym_bytes = bytes[@intCast(sh.sh_offset)..][0..@intCast(sh.sh_size)];
+        const ent_size: usize = @intCast(sh.sh_entsize);
+        if (ent_size < @sizeOf(std.elf.Elf64_Sym)) return SymbolCheckError.InvalidObject;
+        const n = sym_bytes.len / ent_size;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var sym: std.elf.Elf64_Sym = undefined;
+            @memcpy(std.mem.asBytes(&sym), sym_bytes[i * ent_size ..][0..@sizeOf(std.elf.Elf64_Sym)]);
+            const name = elfSymbolName(strtab, sym.st_name) orelse continue;
+            if (std.mem.eql(u8, name, want)) return true;
+        }
+    }
+    return false;
+}
+
+fn elfSymbolName(strtab: []const u8, offset: u32) ?[]const u8 {
+    if (offset >= strtab.len) return null;
+    const start: usize = offset;
+    var end: usize = start;
+    while (end < strtab.len and strtab[end] != 0) : (end += 1) {}
+    return strtab[start..end];
+}
+
+fn machoSymbolPresent(bytes: []const u8, want: []const u8) SymbolCheckError!bool {
+    if (bytes.len < @sizeOf(std.macho.mach_header_64)) return SymbolCheckError.InvalidObject;
+    var header: std.macho.mach_header_64 = undefined;
+    @memcpy(std.mem.asBytes(&header), bytes[0..@sizeOf(std.macho.mach_header_64)]);
+    if (header.magic != std.macho.MH_MAGIC_64 and header.magic != std.macho.MH_CIGAM_64) {
+        return SymbolCheckError.UnsupportedFormat;
+    }
+    const swap = header.magic == std.macho.MH_CIGAM_64;
+    var ncmds: u32 = if (swap) @byteSwap(header.ncmds) else header.ncmds;
+
+    var cursor: usize = @sizeOf(std.macho.mach_header_64);
+    while (ncmds > 0) : (ncmds -= 1) {
+        if (@sizeOf(std.macho.load_command) > bytes.len or
+            cursor > bytes.len - @sizeOf(std.macho.load_command))
+        {
+            return SymbolCheckError.InvalidObject;
+        }
+        var lc: std.macho.load_command = undefined;
+        @memcpy(std.mem.asBytes(&lc), bytes[cursor..][0..@sizeOf(std.macho.load_command)]);
+        const lc_cmd_raw: u32 = if (swap) @byteSwap(@intFromEnum(lc.cmd)) else @intFromEnum(lc.cmd);
+        const lc_size: u32 = if (swap) @byteSwap(lc.cmdsize) else lc.cmdsize;
+        if (lc_size < @sizeOf(std.macho.load_command)) return SymbolCheckError.InvalidObject;
+        if (lc_size > bytes.len or cursor > bytes.len - lc_size) return SymbolCheckError.InvalidObject;
+
+        if (lc_cmd_raw == @intFromEnum(std.macho.LC.SYMTAB)) {
+            if (lc_size < @sizeOf(std.macho.symtab_command)) return SymbolCheckError.InvalidObject;
+            var symtab: std.macho.symtab_command = undefined;
+            @memcpy(std.mem.asBytes(&symtab), bytes[cursor..][0..@sizeOf(std.macho.symtab_command)]);
+            const symoff: u32 = if (swap) @byteSwap(symtab.symoff) else symtab.symoff;
+            const nsyms: u32 = if (swap) @byteSwap(symtab.nsyms) else symtab.nsyms;
+            const stroff: u32 = if (swap) @byteSwap(symtab.stroff) else symtab.stroff;
+            const strsize: u32 = if (swap) @byteSwap(symtab.strsize) else symtab.strsize;
+
+            if (@as(usize, stroff) > bytes.len or @as(usize, strsize) > bytes.len - stroff) {
+                return SymbolCheckError.InvalidObject;
+            }
+            const strtab = bytes[stroff..][0..strsize];
+
+            const sym_total: usize = @as(usize, nsyms) * @sizeOf(std.macho.nlist_64);
+            if (@as(usize, symoff) > bytes.len or sym_total > bytes.len - symoff) {
+                return SymbolCheckError.InvalidObject;
+            }
+            const sym_bytes = bytes[symoff..][0..sym_total];
+
+            var i: usize = 0;
+            while (i < nsyms) : (i += 1) {
+                var nl: std.macho.nlist_64 = undefined;
+                @memcpy(std.mem.asBytes(&nl), sym_bytes[i * @sizeOf(std.macho.nlist_64) ..][0..@sizeOf(std.macho.nlist_64)]);
+                const n_strx_raw = nl.n_strx;
+                const n_strx: u32 = if (swap) @byteSwap(n_strx_raw) else n_strx_raw;
+                const name = machoSymbolName(strtab, n_strx) orelse continue;
+                // Mach-O exported C symbols are prefixed with `_`. Match
+                // both the bare name and the underscored form.
+                if (std.mem.eql(u8, name, want)) return true;
+                if (name.len > 0 and name[0] == '_' and std.mem.eql(u8, name[1..], want)) return true;
+            }
+            // We found the symtab; whether or not the wanted symbol
+            // was inside it, no other LC_SYMTAB will appear.
+            return false;
+        }
+
+        cursor += lc_size;
+    }
+    return false;
+}
+
+fn machoSymbolName(strtab: []const u8, offset: u32) ?[]const u8 {
+    if (offset >= strtab.len) return null;
+    const start: usize = offset;
+    var end: usize = start;
+    while (end < strtab.len and strtab[end] != 0) : (end += 1) {}
+    return strtab[start..end];
+}
+
 // ---------------------------------------------------------------------------
 // Section validation (spec section 3.5)
 // ---------------------------------------------------------------------------
@@ -720,6 +1014,20 @@ fn validateSection(
         diag.write(
             "manager '{s}' metadata size {d} is smaller than the v1.0 base size ({d})",
             .{ manager_name, meta.size, @sizeOf(abi.ZapMemoryManagerMetaV1) },
+        );
+        return ResolveError.ValidationFailed;
+    }
+
+    // Upper bound: the meta header may grow in future ABI minors with
+    // additional fields, but a v1.0-aware driver bounds the growth so a
+    // malformed or maliciously-crafted manager cannot direct the parser
+    // to read arbitrary offsets within the object. Future minors that
+    // legitimately need more headroom will bump the cap.
+    const MAX_META_SIZE: usize = 8 * @sizeOf(abi.ZapMemoryManagerMetaV1);
+    if (@as(usize, meta.size) > MAX_META_SIZE) {
+        diag.write(
+            "manager '{s}' metadata size {d} exceeds the v1.x upper bound ({d}); the manager was built against a future ABI version",
+            .{ manager_name, meta.size, MAX_META_SIZE },
         );
         return ResolveError.ValidationFailed;
     }
@@ -794,6 +1102,19 @@ fn validateSection(
         diag.write(
             "manager '{s}' core size {d} is smaller than the v1.0 base size ({d})",
             .{ manager_name, core.size, @sizeOf(abi.ZapMemoryManagerCoreV1) },
+        );
+        return ResolveError.ValidationFailed;
+    }
+
+    // Upper bound on `core.size` for the same reason `meta.size` has one
+    // (see above). The core vtable may grow with additional function
+    // pointers in future ABI minors; the cap simply bounds how far the
+    // driver is willing to walk before deciding the input is corrupt.
+    const MAX_CORE_SIZE: usize = 8 * @sizeOf(abi.ZapMemoryManagerCoreV1);
+    if (@as(usize, core.size) > MAX_CORE_SIZE) {
+        diag.write(
+            "manager '{s}' core size {d} exceeds the v1.x upper bound ({d}); the manager was built against a future ABI version",
+            .{ manager_name, core.size, MAX_CORE_SIZE },
         );
         return ResolveError.ValidationFailed;
     }
@@ -1070,21 +1391,11 @@ test "validateSection rejects bad magic" {
 // production wiring.
 // ---------------------------------------------------------------------------
 
-/// Build a complete ELF object file in `buffer` whose `.zapmem` section
-/// carries a NoOp-style metadata payload. Returns the number of bytes
-/// written. Mirrors `synthesizeElf` from `section_parser.zig`'s test
-/// helpers but inlined here to keep the integration test self-
-/// contained.
-fn synthesizeNoOpElf(buffer: []u8) usize {
-    const strtab = "\x00.shstrtab\x00.zapmem\x00";
-    const ehdr_size: u64 = @sizeOf(std.elf.Elf64_Ehdr);
-    const shdr_size: u64 = @sizeOf(std.elf.Elf64_Shdr);
-    const shdr_count: u16 = 3; // null, shstrtab, zapmem
-    const shdr_table_offset = ehdr_size;
-    const strtab_offset = shdr_table_offset + shdr_size * @as(u64, shdr_count);
-    const zapmem_offset = strtab_offset + strtab.len;
-
-    // Payload: 32-byte meta + 56-byte core (declared_caps = 0, no descriptors)
+/// Build the 88-byte NoOp metadata payload shared by the ELF and
+/// Mach-O synthesisers — meta header + core vtable with stub function
+/// pointers. The validator only inspects layout/version fields and
+/// never invokes the pointers, so storing address-of-stub is safe.
+fn synthesizeNoOpPayload() [88]u8 {
     var payload: [88]u8 = undefined;
     const meta: abi.ZapMemoryManagerMetaV1 = .{
         .magic = abi.ZMEM_MAGIC_LE,
@@ -1097,9 +1408,6 @@ fn synthesizeNoOpElf(buffer: []u8) usize {
         .core_vtable_offset = @sizeOf(abi.ZapMemoryManagerMetaV1),
         .reserved = 0,
     };
-    // Compose with stub function pointers — the validator only checks
-    // layout/version fields and never invokes the pointers, so storing
-    // address-of-stub is safe across architectures.
     const stubs = struct {
         fn cInit(opts: ?*const abi.ZapInitOptions) callconv(.c) ?*anyopaque {
             _ = opts;
@@ -1142,6 +1450,35 @@ fn synthesizeNoOpElf(buffer: []u8) usize {
         payload[@sizeOf(abi.ZapMemoryManagerMetaV1)..][0..@sizeOf(abi.ZapMemoryManagerCoreV1)],
         std.mem.asBytes(&core),
     );
+    return payload;
+}
+
+/// Build a complete ELF object file in `buffer` whose `.zapmem` section
+/// carries a NoOp-style metadata payload AND whose symbol table exports
+/// `zap_memory_section` for the section's offset. Returns the number
+/// of bytes written. The symbol-table emission is what lets the
+/// driver's `assertExportsManagerSymbol` pass in the integration test.
+fn synthesizeNoOpElf(buffer: []u8) usize {
+    // shstrtab layout: index 0 = '\0', then ".shstrtab\0", then
+    // ".zapmem\0", then ".symtab\0", then ".strtab\0".
+    const shstrtab = "\x00.shstrtab\x00.zapmem\x00.symtab\x00.strtab\x00";
+    // Symbol-string table: index 0 = '\0', then the manager-symbol name.
+    const symstrtab = "\x00zap_memory_section\x00";
+
+    const ehdr_size: u64 = @sizeOf(std.elf.Elf64_Ehdr);
+    const shdr_size: u64 = @sizeOf(std.elf.Elf64_Shdr);
+    const sym_size: u64 = @sizeOf(std.elf.Elf64_Sym);
+    const shdr_count: u16 = 5; // null, shstrtab, zapmem, symtab, strtab
+
+    const shdr_table_offset = ehdr_size;
+    const shstrtab_offset = shdr_table_offset + shdr_size * @as(u64, shdr_count);
+    const zapmem_offset = shstrtab_offset + shstrtab.len;
+    const payload = synthesizeNoOpPayload();
+    const symtab_offset = zapmem_offset + payload.len;
+    // Two symbols: STN_UNDEF (zero) and `zap_memory_section`.
+    const sym_count: u64 = 2;
+    const symstrtab_offset = symtab_offset + sym_size * sym_count;
+    const total = symstrtab_offset + symstrtab.len;
 
     var ehdr: std.elf.Elf64_Ehdr = .{
         .e_ident = [_]u8{0} ** 16,
@@ -1171,18 +1508,18 @@ fn synthesizeNoOpElf(buffer: []u8) usize {
     var sh_null: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
     @memcpy(buffer[shdr_table_offset..][0..@sizeOf(std.elf.Elf64_Shdr)], std.mem.asBytes(&sh_null));
 
-    var sh_strtab: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
-    sh_strtab.sh_name = 1;
-    sh_strtab.sh_type = @intFromEnum(std.elf.SHT.STRTAB);
-    sh_strtab.sh_offset = strtab_offset;
-    sh_strtab.sh_size = strtab.len;
+    var sh_shstrtab: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
+    sh_shstrtab.sh_name = 1; // offset of `.shstrtab`
+    sh_shstrtab.sh_type = @intFromEnum(std.elf.SHT.STRTAB);
+    sh_shstrtab.sh_offset = shstrtab_offset;
+    sh_shstrtab.sh_size = shstrtab.len;
     @memcpy(
         buffer[shdr_table_offset + shdr_size ..][0..@sizeOf(std.elf.Elf64_Shdr)],
-        std.mem.asBytes(&sh_strtab),
+        std.mem.asBytes(&sh_shstrtab),
     );
 
     var sh_zap: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
-    sh_zap.sh_name = 11; // offset of `.zapmem` in strtab
+    sh_zap.sh_name = 11; // offset of `.zapmem` in shstrtab
     sh_zap.sh_type = @intFromEnum(std.elf.SHT.PROGBITS);
     sh_zap.sh_flags = std.elf.SHF_ALLOC;
     sh_zap.sh_offset = zapmem_offset;
@@ -1192,14 +1529,179 @@ fn synthesizeNoOpElf(buffer: []u8) usize {
         std.mem.asBytes(&sh_zap),
     );
 
-    @memcpy(buffer[strtab_offset..][0..strtab.len], strtab);
+    var sh_symtab: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
+    sh_symtab.sh_name = 19; // offset of `.symtab`
+    sh_symtab.sh_type = @intFromEnum(std.elf.SHT.SYMTAB);
+    sh_symtab.sh_offset = symtab_offset;
+    sh_symtab.sh_size = sym_size * sym_count;
+    sh_symtab.sh_link = 4; // index of `.strtab` in section table
+    sh_symtab.sh_info = 1; // first non-local symbol index
+    sh_symtab.sh_addralign = 8;
+    sh_symtab.sh_entsize = sym_size;
+    @memcpy(
+        buffer[shdr_table_offset + shdr_size * 3 ..][0..@sizeOf(std.elf.Elf64_Shdr)],
+        std.mem.asBytes(&sh_symtab),
+    );
+
+    var sh_strtab: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
+    sh_strtab.sh_name = 27; // offset of `.strtab`
+    sh_strtab.sh_type = @intFromEnum(std.elf.SHT.STRTAB);
+    sh_strtab.sh_offset = symstrtab_offset;
+    sh_strtab.sh_size = symstrtab.len;
+    @memcpy(
+        buffer[shdr_table_offset + shdr_size * 4 ..][0..@sizeOf(std.elf.Elf64_Shdr)],
+        std.mem.asBytes(&sh_strtab),
+    );
+
+    @memcpy(buffer[shstrtab_offset..][0..shstrtab.len], shstrtab);
     @memcpy(buffer[zapmem_offset..][0..payload.len], &payload);
 
-    return @intCast(zapmem_offset + payload.len);
+    // Symbol table: index 0 is STN_UNDEF; index 1 is `zap_memory_section`
+    // bound to the .zapmem section.
+    var sym_null: std.elf.Elf64_Sym = std.mem.zeroes(std.elf.Elf64_Sym);
+    @memcpy(buffer[symtab_offset..][0..@sizeOf(std.elf.Elf64_Sym)], std.mem.asBytes(&sym_null));
+
+    var sym_zap: std.elf.Elf64_Sym = std.mem.zeroes(std.elf.Elf64_Sym);
+    sym_zap.st_name = 1; // offset of `zap_memory_section` in strtab
+    // STT_OBJECT(1) | STB_GLOBAL(1) << 4 = 0x11
+    sym_zap.st_info = (1 << 4) | 1;
+    sym_zap.st_other = 0;
+    sym_zap.st_shndx = 2; // section index of `.zapmem`
+    sym_zap.st_value = 0;
+    sym_zap.st_size = payload.len;
+    @memcpy(
+        buffer[symtab_offset + sym_size ..][0..@sizeOf(std.elf.Elf64_Sym)],
+        std.mem.asBytes(&sym_zap),
+    );
+
+    @memcpy(buffer[symstrtab_offset..][0..symstrtab.len], symstrtab);
+
+    return @intCast(total);
 }
 
-/// Mock `ForkCompileFn` used by the integration test. Writes a NoOp-
-/// style ELF object to the requested output path and returns `.Ok`.
+/// Build a complete Mach-O 64-bit object file whose `__DATA,__zapmem`
+/// section carries a NoOp-style metadata payload AND whose symbol table
+/// exports `_zap_memory_section` (Mach-O prefixes external C symbols
+/// with a leading underscore). Returns the number of bytes written.
+/// Used by the Mach-O sibling integration test.
+fn synthesizeNoOpMacho(buffer: []u8) usize {
+    const header_size: usize = @sizeOf(std.macho.mach_header_64);
+    const seg_size: usize = @sizeOf(std.macho.segment_command_64);
+    const sect_size: usize = @sizeOf(std.macho.section_64);
+    const symtab_cmd_size: usize = @sizeOf(std.macho.symtab_command);
+    const nlist_size: usize = @sizeOf(std.macho.nlist_64);
+
+    // Mach-O symbol-string table for one external symbol. Mach-O strtab
+    // typically begins with `\x20\x00` (a space and a NUL — Apple's
+    // historical convention). Use `\x00` for both bytes so the first
+    // real entry sits at offset 1 and dereferences cleanly.
+    const sym_name = "_zap_memory_section";
+    // strtab layout: leading `\x00`, then sym_name + trailing `\x00`.
+    var strtab_buf: [1 + sym_name.len + 1]u8 = undefined;
+    strtab_buf[0] = 0;
+    @memcpy(strtab_buf[1..][0..sym_name.len], sym_name);
+    strtab_buf[1 + sym_name.len] = 0;
+
+    const payload = synthesizeNoOpPayload();
+
+    // Layout: header → LC_SEGMENT_64(__DATA + 1 section) → LC_SYMTAB →
+    // payload bytes → symbol table → string table.
+    const segment_cmd_offset = header_size;
+    const symtab_cmd_offset = segment_cmd_offset + seg_size + sect_size;
+    const payload_offset = symtab_cmd_offset + symtab_cmd_size;
+    const symtab_offset = payload_offset + payload.len;
+    const strtab_offset = symtab_offset + nlist_size;
+    const total = strtab_offset + strtab_buf.len;
+
+    // mach_header_64
+    var header: std.macho.mach_header_64 = std.mem.zeroes(std.macho.mach_header_64);
+    header.magic = std.macho.MH_MAGIC_64;
+    header.cputype = std.macho.CPU_TYPE_X86_64;
+    header.cpusubtype = std.macho.CPU_SUBTYPE_X86_64_ALL;
+    header.filetype = std.macho.MH_OBJECT;
+    header.ncmds = 2; // LC_SEGMENT_64 + LC_SYMTAB
+    header.sizeofcmds = @intCast(seg_size + sect_size + symtab_cmd_size);
+    header.flags = 0;
+    header.reserved = 0;
+    @memcpy(buffer[0..header_size], std.mem.asBytes(&header));
+
+    // segment_command_64
+    var seg: std.macho.segment_command_64 = std.mem.zeroes(std.macho.segment_command_64);
+    seg.cmd = .SEGMENT_64;
+    seg.cmdsize = @intCast(seg_size + sect_size);
+    @memcpy(seg.segname[0.."__DATA".len], "__DATA");
+    seg.vmaddr = 0;
+    seg.vmsize = payload.len;
+    seg.fileoff = payload_offset;
+    seg.filesize = payload.len;
+    seg.maxprot = .{ .READ = true, .WRITE = true };
+    seg.initprot = .{ .READ = true, .WRITE = true };
+    seg.nsects = 1;
+    seg.flags = 0;
+    @memcpy(buffer[segment_cmd_offset..][0..seg_size], std.mem.asBytes(&seg));
+
+    // section_64
+    var sect: std.macho.section_64 = std.mem.zeroes(std.macho.section_64);
+    @memcpy(sect.sectname[0.."__zapmem".len], "__zapmem");
+    @memcpy(sect.segname[0.."__DATA".len], "__DATA");
+    sect.addr = 0;
+    sect.size = payload.len;
+    sect.offset = @intCast(payload_offset);
+    sect.@"align" = 3;
+    sect.reloff = 0;
+    sect.nreloc = 0;
+    sect.flags = std.macho.S_REGULAR;
+    sect.reserved1 = 0;
+    sect.reserved2 = 0;
+    sect.reserved3 = 0;
+    @memcpy(buffer[segment_cmd_offset + seg_size ..][0..sect_size], std.mem.asBytes(&sect));
+
+    // symtab_command
+    var symtab_cmd: std.macho.symtab_command = std.mem.zeroes(std.macho.symtab_command);
+    symtab_cmd.cmd = .SYMTAB;
+    symtab_cmd.cmdsize = @intCast(symtab_cmd_size);
+    symtab_cmd.symoff = @intCast(symtab_offset);
+    symtab_cmd.nsyms = 1;
+    symtab_cmd.stroff = @intCast(strtab_offset);
+    symtab_cmd.strsize = @intCast(strtab_buf.len);
+    @memcpy(buffer[symtab_cmd_offset..][0..symtab_cmd_size], std.mem.asBytes(&symtab_cmd));
+
+    // payload
+    @memcpy(buffer[payload_offset..][0..payload.len], &payload);
+
+    // nlist_64 (single entry).
+    // External N_SECT symbol referencing the only section (index 1).
+    // The n_desc bits are all zero for a plain visible data symbol.
+    const nl: std.macho.nlist_64 = .{
+        .n_strx = 1, // offset of `_zap_memory_section` in strtab
+        .n_type = .{ .bits = .{
+            .ext = true,
+            .type = .sect,
+            .pext = false,
+            .is_stab = 0,
+        } },
+        .n_sect = 1,
+        .n_desc = .{
+            .arm_thumb_def = false,
+            .referenced_dynamically = false,
+            .discarded_or_no_dead_strip = false,
+            .weak_ref = false,
+            .weak_def_or_ref_to_weak = false,
+            .symbol_resolver = false,
+            .alt_entry = false,
+        },
+        .n_value = 0,
+    };
+    @memcpy(buffer[symtab_offset..][0..nlist_size], std.mem.asBytes(&nl));
+
+    // strtab
+    @memcpy(buffer[strtab_offset..][0..strtab_buf.len], &strtab_buf);
+
+    return total;
+}
+
+/// Mock `ForkCompileFn` used by the ELF integration test. Writes a
+/// NoOp-style ELF object to the requested output path and returns `.Ok`.
 fn mockForkCompileNoOp(
     source_path: [*:0]const u8,
     target: *const ZapForkTarget,
@@ -1222,6 +1724,44 @@ fn mockForkCompileNoOp(
 
     var buffer: [4096]u8 = undefined;
     const written = synthesizeNoOpElf(&buffer);
+    const path_slice = std.mem.span(out_object_path);
+    if (std.fs.path.dirname(path_slice)) |dir| {
+        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir) catch return .InternalError;
+    }
+    var file = std.Io.Dir.cwd().createFile(std.Options.debug_io, path_slice, .{}) catch return .InternalError;
+    defer file.close(std.Options.debug_io);
+    file.writeStreamingAll(std.Options.debug_io, buffer[0..written]) catch return .InternalError;
+    return .Ok;
+}
+
+/// Mock `ForkCompileFn` used by the Mach-O integration test. Writes a
+/// NoOp-style Mach-O 64-bit object whose symbol table exports
+/// `_zap_memory_section` and returns `.Ok`. This is the platform
+/// sibling to `mockForkCompileNoOp`; both flow through the same driver
+/// pipeline so the Mach-O code path that runs on macOS dev hosts is
+/// exercised in unit tests just like the ELF path.
+fn mockForkCompileNoOpMacho(
+    source_path: [*:0]const u8,
+    target: *const ZapForkTarget,
+    optimize: ZapForkOptimize,
+    out_object_path: [*:0]const u8,
+    out_diagnostic_buffer: ?[*]u8,
+    out_diagnostic_capacity: usize,
+    zig_lib_dir_opt: ?[*:0]const u8,
+    local_cache_dir_opt: ?[*:0]const u8,
+    global_cache_dir_opt: ?[*:0]const u8,
+) callconv(.c) ZapForkResult {
+    _ = source_path;
+    _ = target;
+    _ = optimize;
+    _ = out_diagnostic_buffer;
+    _ = out_diagnostic_capacity;
+    _ = zig_lib_dir_opt;
+    _ = local_cache_dir_opt;
+    _ = global_cache_dir_opt;
+
+    var buffer: [4096]u8 = undefined;
+    const written = synthesizeNoOpMacho(&buffer);
     const path_slice = std.mem.span(out_object_path);
     if (std.fs.path.dirname(path_slice)) |dir| {
         std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir) catch return .InternalError;
@@ -1293,6 +1833,106 @@ test "Phase 3 integration: NoOp manager resolves end-to-end through driver" {
 
     // The object the mock wrote must still be on disk under the cache.
     std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
+}
+
+test "Phase 3 integration: NoOp manager resolves end-to-end through driver (Mach-O)" {
+    // Sibling of the ELF integration test above. Exercises the
+    // Mach-O code path inside `section_parser.extractSection` and
+    // `assertExportsManagerSymbol` — both of which the macOS dev
+    // host's production builds rely on but had no test coverage
+    // before this phase.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/zap/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/no_op") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+
+    const stdlib_decl =
+        \\@memory_manager_source = "src/memory/no_op/manager.zig"
+        \\
+        \\pub struct Zap.Memory.NoOp {
+        \\}
+        \\
+    ;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/zap/memory/no_op.zap", .data = stdlib_decl }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/no_op/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(stdlib_root);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var resolved = try resolve(
+        allocator,
+        .{
+            .manager_name = "Zap.Memory.NoOp",
+            .source_roots = &.{
+                .{ .name = "zap_stdlib", .path = stdlib_root },
+            },
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = cache_root,
+            .fork_compile_fn = mockForkCompileNoOpMacho,
+        },
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expect(!resolved.is_builtin_default);
+    try std.testing.expectEqualStrings("Zap.Memory.NoOp", resolved.name);
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
+    try std.testing.expect(resolved.object_path != null);
+    std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
+}
+
+test "assertExportsManagerSymbol passes for synthesized NoOp ELF" {
+    // The ELF synthesiser emits a symbol table with `zap_memory_section`;
+    // the symbol-presence check must accept it.
+    var buffer: [4096]u8 = undefined;
+    const written = synthesizeNoOpElf(&buffer);
+    var diag_buf: [512]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    try assertExportsManagerSymbol("NoOp(ELF)", buffer[0..written], &diag);
+}
+
+test "assertExportsManagerSymbol passes for synthesized NoOp Mach-O" {
+    var buffer: [4096]u8 = undefined;
+    const written = synthesizeNoOpMacho(&buffer);
+    var diag_buf: [512]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    try assertExportsManagerSymbol("NoOp(Mach-O)", buffer[0..written], &diag);
+}
+
+test "assertExportsManagerSymbol rejects ELF object lacking the symbol" {
+    // Strip the symbol-table sections from the synthesised ELF by
+    // rewriting the manager symbol's strtab entry so the lookup fails.
+    var buffer: [4096]u8 = undefined;
+    const written = synthesizeNoOpElf(&buffer);
+    // Find and corrupt the strtab so the manager symbol becomes
+    // a different name. The strtab content begins with a NUL followed by
+    // `zap_memory_section\0`. Overwrite the first letter so the name no
+    // longer matches the spec.
+    var i: usize = 0;
+    while (i + "zap_memory_section".len <= written) : (i += 1) {
+        if (std.mem.eql(u8, buffer[i..][0.."zap_memory_section".len], "zap_memory_section")) {
+            buffer[i] = 'X';
+            break;
+        }
+    }
+    var diag_buf: [512]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const result = assertExportsManagerSymbol("BadName", buffer[0..written], &diag);
+    try std.testing.expectError(ResolveError.ValidationFailed, result);
+    try std.testing.expect(diag.text().len > 0);
 }
 
 test "validateSection rejects reserved capability bit" {

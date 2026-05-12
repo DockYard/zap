@@ -217,7 +217,6 @@ fn cmdDoc(allocator: std.mem.Allocator, args: []const []const u8) !void {
     std.process.exit(exit_code);
 }
 
-
 // ---------------------------------------------------------------------------
 // Command: init
 // ---------------------------------------------------------------------------
@@ -1191,6 +1190,12 @@ fn buildTarget(
             .cache_dir = memory_cache_dir,
             .zig_lib_dir = zig_lib_dir,
             .optimize = driver_optimize,
+            // Thread the build's cross-compile target through so the
+            // manager `.o` is built for the same target as the final
+            // binary. Null means "native"; a non-null triple flows
+            // through `parseTargetTriple` into the fork primitive's
+            // `ZapForkTarget`.
+            .target = compile_target,
         },
         &driver_diag,
     ) catch |err| {
@@ -1221,6 +1226,13 @@ fn buildTarget(
         .analysis_context = if (result.analysis_context) |*ctx| ctx else null,
         .arc_ownership = if (result.arc_ownership) |*ownership| ownership else null,
         .memory_manager_object = if (resolved_manager.is_builtin_default) null else resolved_manager.object_path,
+        // Capability bitmask from the resolved manager's `.zapmem`
+        // core vtable. Threaded into ZIR codegen so Phase 6 can elide
+        // retain/release calls when the active manager omits
+        // `REFCOUNT_V1`, and Phase 4 can branch the per-cell layout
+        // on the same bit. Phase 3's only obligation is to keep the
+        // wire intact end-to-end.
+        .declared_caps = resolved_manager.declared_caps,
         // Zig 0.16 error formatting options from manifest
         .error_style = config.error_style,
         .multiline_errors = config.multiline_errors,

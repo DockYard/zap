@@ -81,6 +81,15 @@ pub const CompileError = error{
     CompilationCreateFailed,
     ZirInjectionFailed,
     CompilationFailed,
+    /// The Zig fork's `zir_compilation_add_link_object_file` could not
+    /// open the object file (or its parent directory) the Memory
+    /// Manager ABI v1.0 driver produced. Distinguished from
+    /// `CompilationFailed` so the caller surfaces a specific
+    /// "object not readable" diagnostic instead of a generic compile
+    /// failure. See `zir_compilation_add_link_object_file` in
+    /// `~/projects/zig/src/zir_api.zig` for the `-2` return code that
+    /// maps to this error.
+    LinkObjectFileNotReadable,
     OutOfMemory,
 };
 
@@ -132,6 +141,17 @@ pub const CompileOptions = struct {
     /// section survives static linking. Null for the built-in default
     /// (`Zap.Memory.ARC`), which uses the runtime's static stub.
     memory_manager_object: ?[]const u8 = null,
+    /// Memory Manager ABI v1.0 capability bitmask declared by the
+    /// active manager (`docs/memory-manager-abi.md` section 7). Read
+    /// by the driver from the manager's `.zapmem` core vtable, threaded
+    /// here so downstream codegen passes can branch on capability bits
+    /// when deciding what runtime calls to emit (Phase 6 elision) and
+    /// what per-cell layout to use (Phase 4 conditional headers).
+    /// Phase 3 wires the bit through end-to-end without branching on
+    /// it; later phases are purely additive on top. `0` means "no
+    /// capabilities" (e.g. `Zap.Memory.NoOp`); `1` (`REFCOUNT_V1_BIT`)
+    /// means the manager supports the ARC retain/release contract.
+    declared_caps: u64 = 0,
 };
 
 /// Create a ZirContext compilation context from the given options.
@@ -202,7 +222,7 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
 pub fn injectAndUpdate(allocator: std.mem.Allocator, program: ir.Program, ctx: *ZirContext, options: CompileOptions) CompileError!void {
     // Build ZIR via C-ABI calls and inject into compilation.
     const lib_mode = options.output_mode == 1;
-    try zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode, options.builder_entry, options.analysis_context, options.arc_ownership);
+    try zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode, options.builder_entry, options.analysis_context, options.arc_ownership, options.declared_caps);
 
     // Run Sema + codegen + link.
     if (zir_compilation_update(ctx) != 0) {
@@ -244,11 +264,20 @@ pub fn addLinkLib(ctx: *ZirContext, name: []const u8, allocator: std.mem.Allocat
 /// compiled by `src/memory/driver.zig` into the binary alongside Zap-
 /// generated code. Must be called after createContext and before
 /// injectAndUpdate.
+///
+/// Translates the fork primitive's two negative return codes:
+///   * `-1` → `error.CompilationFailed` (general failure, allocation,
+///     internal error).
+///   * `-2` → `error.LinkObjectFileNotReadable` (filesystem failure
+///     opening the object or its parent dir).
 pub fn addLinkObjectFile(ctx: *ZirContext, path: []const u8, allocator: std.mem.Allocator) CompileError!void {
     const path_z = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
     defer allocator.free(path_z);
-    if (zir_compilation_add_link_object_file(ctx, path_z) != 0) {
-        return error.CompilationFailed;
+    const rc = zir_compilation_add_link_object_file(ctx, path_z);
+    switch (rc) {
+        0 => return,
+        -2 => return error.LinkObjectFileNotReadable,
+        else => return error.CompilationFailed,
     }
 }
 

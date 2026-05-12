@@ -180,12 +180,22 @@ const ZapMemorySection = extern struct {
     core: ZapMemoryManagerCoreV1,
 };
 
-/// The section payload. Exported so the linker does not dead-strip it. The
-/// recommended symbol name is `zap_memory_section`, but the compiler does
-/// not rely on this name — it discovers the section purely by walking its
-/// contents starting at offset 0 (spec section 3.2).
-pub export const zap_memory_section: ZapMemorySection
-    linksection(SECTION_NAME) = .{
+/// The section payload. Exported so the linker does not dead-strip it.
+///
+/// **`zap_memory_section` is a MANDATORY exported symbol name for every
+/// memory manager** — first-party and third-party alike. The runtime's
+/// bootstrap (`src/runtime.zig`'s `externalMemorySection`) discovers the
+/// payload via `@extern(?*const ExternalMemorySectionPrefix, .{ .name =
+/// "zap_memory_section", .linkage = .weak })`. A manager that emits the
+/// `.zapmem` section under any other symbol name (or as an unnamed
+/// section payload) will produce a binary whose weak-extern resolves to
+/// null at runtime, silently falling back to the built-in ARC vtable.
+///
+/// The driver enforces this contract at build time: see
+/// `src/memory/driver.zig`'s post-link symbol check (`assertExportsManagerSymbol`).
+/// Spec section 3.2 + section 10.5 codify the requirement; this comment
+/// pins the implementation-side invariant in source.
+pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) = .{
     .meta = .{
         .magic = ZMEM_MAGIC,
         .abi_major = 1,

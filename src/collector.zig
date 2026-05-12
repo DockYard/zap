@@ -268,14 +268,19 @@ pub const Collector = struct {
             if (!found) continue;
 
             // Compose the dotted-name StringId, matching what
-            // `collectStruct`'s registerType call used.
+            // `collectStruct`'s registerType call used. The scratch
+            // buffer is freed unconditionally — `intern` copies its
+            // input — and any OOM during composition propagates as
+            // a hard error so a truncated name never reaches the
+            // type-name registry.
             const type_name_id = if (entry.name.parts.len == 1)
                 entry.name.parts[0]
             else blk: {
                 var name_buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer name_buf.deinit(self.allocator);
                 for (entry.name.parts, 0..) |part, i| {
-                    if (i > 0) name_buf.appendSlice(self.allocator, ".") catch {};
-                    name_buf.appendSlice(self.allocator, self.interner.get(part)) catch {};
+                    if (i > 0) try name_buf.appendSlice(self.allocator, ".");
+                    try name_buf.appendSlice(self.allocator, self.interner.get(part));
                 }
                 const interner_mut = @constCast(self.interner);
                 break :blk try interner_mut.intern(name_buf.items);
@@ -377,14 +382,19 @@ pub const Collector = struct {
         // by `registerMemoryManagerStructTypes`, after attribute rows
         // attach to the StructEntry.
         if (mod.fields.len > 0 and mod.name.parts.len > 0) {
-            // Build the full qualified name (e.g., "Zap.Env") for type registration
+            // Build the full qualified name (e.g., "Zap.Env") for type
+            // registration. The scratch buffer is freed unconditionally —
+            // `intern` copies its input — and any OOM during composition
+            // propagates as a hard error so a truncated name never reaches
+            // the type-name registry.
             const type_name_id = if (mod.name.parts.len == 1)
                 mod.name.parts[0]
             else blk: {
                 var name_buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer name_buf.deinit(self.allocator);
                 for (mod.name.parts, 0..) |part, i| {
-                    if (i > 0) name_buf.appendSlice(self.allocator, ".") catch {};
-                    name_buf.appendSlice(self.allocator, self.interner.get(part)) catch {};
+                    if (i > 0) try name_buf.appendSlice(self.allocator, ".");
+                    try name_buf.appendSlice(self.allocator, self.interner.get(part));
                 }
                 const interner_mut = @constCast(self.interner);
                 break :blk try interner_mut.intern(name_buf.items);

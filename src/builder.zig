@@ -575,6 +575,15 @@ fn loadBuildOpts(
 ///
 /// Returns null when the value is `nil` or any unsupported shape — the
 /// caller treats this as "field absent" and falls back to defaults.
+///
+/// For `struct_val`, `sv.type_name` is always the canonical dotted form
+/// produced by `ctfe.structNameToString` (which calls
+/// `ast.StructName.toDottedString`) — see `src/ctfe.zig` near the
+/// `struct_expr` evaluation in `evaluateConstExpr`. We return it
+/// verbatim; we MUST NOT do underscore-to-dot translation because a
+/// struct's actual name can legitimately contain underscores (e.g.,
+/// `Foo_Bar.Manager`), and any heuristic that rewrites `_` → `.` would
+/// silently mangle such names.
 fn parseStructRefField(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !?[]const u8 {
     return switch (val) {
         .nil => null,
@@ -585,6 +594,11 @@ fn parseStructRefField(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !?[]c
             if (elems[0] != .atom or !std.mem.eql(u8, elems[0].atom, "__aliases__")) break :blk null;
             if (elems[2] != .list) break :blk null;
             var buf: std.ArrayListUnmanaged(u8) = .empty;
+            // `toOwnedSlice` clears `buf`'s pointer on success, so the
+            // defer is a no-op on the happy path; on any OOM from
+            // `buf.append`/`buf.appendSlice` the defer reclaims the
+            // partial allocation.
+            defer buf.deinit(alloc);
             for (elems[2].list, 0..) |part, idx| {
                 const text = switch (part) {
                     .atom => |s| s,
@@ -596,17 +610,10 @@ fn parseStructRefField(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !?[]c
             }
             break :blk try buf.toOwnedSlice(alloc);
         },
-        .struct_val => |sv| if (sv.type_name.len > 0) blk: {
-            // The CTFE pipeline may surface a `Zap.Memory.NoOp` reference as
-            // a struct value carrying the type name in dotted-underscore form
-            // (e.g., `Zap_Memory_NoOp`). Normalise underscores back to dots
-            // so the downstream driver sees the canonical dotted name.
-            var out = try alloc.alloc(u8, sv.type_name.len);
-            for (sv.type_name, 0..) |c, i| {
-                out[i] = if (c == '_') '.' else c;
-            }
-            break :blk out;
-        } else null,
+        .struct_val => |sv| if (sv.type_name.len > 0)
+            try alloc.dupe(u8, sv.type_name)
+        else
+            null,
         else => null,
     };
 }
@@ -709,18 +716,22 @@ test "constValueToBuildConfig parses memory: struct reference (aliases form)" {
     try testing.expectEqualStrings("Zap.Memory.NoOp", config.memory_manager.?);
 }
 
-test "constValueToBuildConfig parses memory: as a struct value with dotted-underscore type_name" {
+test "constValueToBuildConfig parses memory: as a struct value with canonical dotted type_name" {
+    // Production CTFE always populates `struct_val.type_name` with the
+    // dotted form via `ctfe.structNameToString`. This test pins that
+    // contract so `parseStructRefField` can return the name verbatim
+    // without any heuristic translation.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     const val = zap.ctfe.ConstValue{ .struct_val = .{
-        .type_name = "Zap_Manifest",
+        .type_name = "Zap.Manifest",
         .fields = &.{
             .{ .name = "name", .value = .{ .string = "app" } },
             .{ .name = "version", .value = .{ .string = "0.1.0" } },
             .{ .name = "kind", .value = .{ .atom = "bin" } },
             .{ .name = "memory", .value = .{ .struct_val = .{
-                .type_name = "Zap_Memory_ARC",
+                .type_name = "Zap.Memory.ARC",
                 .fields = &.{},
             } } },
         },
@@ -729,6 +740,23 @@ test "constValueToBuildConfig parses memory: as a struct value with dotted-under
     const config = try constValueToBuildConfig(alloc, val);
     try testing.expect(config.memory_manager != null);
     try testing.expectEqualStrings("Zap.Memory.ARC", config.memory_manager.?);
+}
+
+test "parseStructRefField preserves underscores in struct names" {
+    // Regression: struct names like `Foo_Bar.Manager` legitimately
+    // contain underscores. An earlier heuristic that rewrote `_` → `.`
+    // silently mangled such names; the fix is to return `type_name`
+    // verbatim from production CTFE (which emits the canonical dotted
+    // form via `structNameToString`).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Foo_Bar.Manager",
+        .fields = &.{},
+    } };
+    const got = (try parseStructRefField(alloc, val)) orelse return error.UnexpectedNull;
+    try testing.expectEqualStrings("Foo_Bar.Manager", got);
 }
 
 test "constValueToBuildConfig leaves memory: null when omitted" {
@@ -747,4 +775,3 @@ test "constValueToBuildConfig leaves memory: null when omitted" {
     const config = try constValueToBuildConfig(alloc, val);
     try testing.expectEqual(@as(?[]const u8, null), config.memory_manager);
 }
-
