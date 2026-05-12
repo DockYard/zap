@@ -861,6 +861,105 @@ comptime {
     );
 }
 
+/// Phase 7b comptime classifier — does the first-party manager
+/// identified by `tag` declare REFCOUNT_V1 with the v1.1 side-table
+/// extension surface (`retain_sized` / `release_sized` /
+/// `allocate_refcounted` / `refcount_sized`)?
+///
+/// Used by the Phase 4 hot-path dispatchers to comptime-fold the
+/// `active_manager_state.refcount_has_sized_extension` runtime load
+/// out of the first-party direct-call branch. The third-party path
+/// still consults the runtime flag — under a `.third_party` build
+/// the descriptor's size is only known after `bindRefcountCapability`
+/// runs at startup, so this predicate has no comptime answer.
+///
+/// Case map:
+///   * `.arc` — true. ARC's `.zapmem` exports `abi_minor = 1` and the
+///     REFCOUNT_V1 descriptor advertises `desc.size ==
+///     REFCOUNT_V1_SIZE_V1_1`. Cross-referenced by
+///     `src/memory/arc/manager.zig:1209` (`abi_minor = 1`) and
+///     `src/memory/arc/manager.zig:1184`
+///     (`.size = @sizeOf(ZapRefcountCapabilityV1)`).
+///   * `.arena`, `.no_op`, `.leak`, `.tracking` — false. These
+///     managers do NOT declare REFCOUNT_V1, so the question is
+///     semantically undefined; returning `false` keeps the dispatcher
+///     panic-arm safe under the (codegen-elided) hot path.
+///   * `.third_party` — false. Resolved at runtime by reading
+///     `active_manager_state.refcount_has_sized_extension`; the
+///     dispatcher uses that runtime flag instead of this predicate
+///     when `ACTIVE_MANAGER_TAG == .third_party`.
+pub fn managerHasSizedExtension(comptime tag: ActiveManagerTag) bool {
+    return switch (tag) {
+        .arc => true,
+        .arena, .no_op, .leak, .tracking => false,
+        // Third-party builds consult the runtime flag instead.
+        .third_party => false,
+    };
+}
+
+comptime {
+    // Same case-count tripwire shape as `managerHasRefcountV1`: every
+    // dispatcher hot path that consults the side-table extension flag
+    // routes through this classifier under first-party builds, so a
+    // missing arm would silently miscompile the dispatch. Pin the
+    // count so adding a new manager forces a deliberate decision
+    // about its `abi_minor` declaration.
+    if (@typeInfo(ActiveManagerTag).@"enum".fields.len != 6) @compileError(
+        "runtime.managerHasSizedExtension: case count drifted from ActiveManagerTag — " ++
+            "update both the switch and the cardinality assert in lock-step.",
+    );
+}
+
+/// Phase 7b comptime classifier — is the active manager's core vtable
+/// statically known to be present at every dispatcher entry?
+///
+/// First-party builds (`.arc`, `.arena`, `.no_op`, `.leak`,
+/// `.tracking`) link the manager `.o` directly so the section's
+/// `core` field is a comptime-known address in the read-only data
+/// segment; the runtime null-check `active_manager_state.core ==
+/// null` is dead code that LLVM cannot easily elide because
+/// `active_manager_state` is a module-private mutable global. Folding
+/// the check to a comptime `true` lets the optimizer drop the load +
+/// branch entirely on every dispatcher call.
+///
+/// Third-party builds keep the runtime check — the manager `.o`
+/// linkage is not validated until `maybeBindExternalManager` runs at
+/// startup, and the runtime's `.third_party` paths must surface a
+/// useful panic if the section is missing.
+pub fn activeManagerCorePresent(comptime tag: ActiveManagerTag) bool {
+    return switch (tag) {
+        .arc, .arena, .no_op, .leak, .tracking => true,
+        .third_party => false,
+    };
+}
+
+/// Phase 7b comptime classifier — is the active manager's REFCOUNT_V1
+/// capability vtable statically known to be present at every
+/// dispatcher entry?
+///
+/// Routes to `managerHasRefcountV1` for first-party builds — the
+/// presence of the capability is encoded in the manager source and
+/// the build-system contract guarantees the capability is bound
+/// before the first dispatch (spec §10.2). For `.third_party`
+/// returns `false` so the runtime null-check fires; the actual
+/// presence is a function of which `.o` the manifest links and the
+/// descriptor table emitted by that manager.
+pub fn activeManagerRefcountCapabilityPresent(comptime tag: ActiveManagerTag) bool {
+    return switch (tag) {
+        .arc => true,
+        .arena, .no_op, .leak, .tracking => false,
+        .third_party => false,
+    };
+}
+
+comptime {
+    // Cardinality tripwire mirroring the other Phase 7b classifiers.
+    if (@typeInfo(ActiveManagerTag).@"enum".fields.len != 6) @compileError(
+        "runtime.activeManagerCorePresent / activeManagerRefcountCapabilityPresent: " ++
+            "case count drifted from ActiveManagerTag — update each switch in lock-step.",
+    );
+}
+
 pub const AbiV1 = struct {
     /// `REFC` capability tag (spec section 7.1) read at the target's
     /// native endianness. Derived via `std.mem.readInt(u32, "REFC", endian)`
@@ -3519,8 +3618,18 @@ pub const ArcRuntime = struct {
                 @panic("zap runtime: memory dispatch after shutdown");
             }
             ensureMemoryStartup();
-            if (active_manager_state.core == null) {
-                @panic("zap runtime: allocAny dispatched with no active memory manager");
+            // Phase 7b: comptime-elide the `core == null` load under
+            // first-party builds. The manager `.o` is statically linked
+            // so the `.zapmem` section is bound to a comptime-known
+            // address; the runtime null-check below would dead-load
+            // `active_manager_state.core` on every dispatcher entry
+            // through a recursive Tree.make/release call boundary that
+            // LLVM cannot prove stable. The comptime classifier folds
+            // the branch out at codegen for first-party builds.
+            if (comptime !activeManagerCorePresent(ACTIVE_MANAGER_TAG)) {
+                if (active_manager_state.core == null) {
+                    @panic("zap runtime: allocAny dispatched with no active memory manager");
+                }
             }
             const ctx = active_manager_state.context orelse
                 @panic("zap runtime: allocAny dispatched with null manager context");
@@ -3545,17 +3654,24 @@ pub const ArcRuntime = struct {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (active_manager_state.core == null) {
-            @panic("zap runtime: allocAny dispatched with no active memory manager");
+        // Phase 7b: see comment block at the symmetric non-REFCOUNT_V1
+        // alloc entry above. The `core` and `refcount_capability` nulls
+        // are comptime-elided under first-party builds.
+        if (comptime !activeManagerCorePresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.core == null) {
+                @panic("zap runtime: allocAny dispatched with no active memory manager");
+            }
         }
-        if (active_manager_state.refcount_capability == null) {
-            // `Arc(T)` cells are inherently refcounted; allocating one under a
-            // manager that does not declare REFCOUNT_V1 would silently succeed
-            // here and only blow up on the eventual `release` path, leaving a
-            // misleading stack trace far from the original allocation site.
-            // Panic loudly at the alloc-time call site instead — the same
-            // soundness argument as `releaseAny` / `retainAny`.
-            @panic("zap runtime: allocAny dispatched but active manager does not declare REFCOUNT_V1");
+        if (comptime !activeManagerRefcountCapabilityPresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.refcount_capability == null) {
+                // `Arc(T)` cells are inherently refcounted; allocating one under a
+                // manager that does not declare REFCOUNT_V1 would silently succeed
+                // here and only blow up on the eventual `release` path, leaving a
+                // misleading stack trace far from the original allocation site.
+                // Panic loudly at the alloc-time call site instead — the same
+                // soundness argument as `releaseAny` / `retainAny`.
+                @panic("zap runtime: allocAny dispatched but active manager does not declare REFCOUNT_V1");
+            }
         }
         return dispatcherAllocImpl(T, allocator, value);
     }
@@ -3570,7 +3686,17 @@ pub const ArcRuntime = struct {
     /// per-cell refcount has somewhere to live.
     fn dispatcherAllocImpl(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
         _ = allocator;
-        if (active_manager_state.refcount_has_sized_extension) {
+        // Phase 7b: under first-party builds the side-table extension
+        // flag is statically known by the comptime classifier — the
+        // manager source pins `desc.size` at module scope, so the
+        // runtime flag would be a dead reload. Under `.third_party`
+        // the bound descriptor's size is only resolved at startup;
+        // the runtime flag is consulted exactly as before.
+        const has_sized_extension = if (comptime ACTIVE_MANAGER_TAG == .third_party)
+            active_manager_state.refcount_has_sized_extension
+        else
+            comptime managerHasSizedExtension(ACTIVE_MANAGER_TAG);
+        if (has_sized_extension) {
             const ctx = active_manager_state.context orelse
                 @panic("zap runtime: allocAny dispatched with null manager context");
             const size = @sizeOf(T);
@@ -3601,8 +3727,11 @@ pub const ArcRuntime = struct {
     /// every byte of the side-table optimisation is forfeit — but
     /// keeps generic `Arc(T)` working under third-party v1.0 managers.
     fn dispatcherAllocLegacyV1_0(comptime T: type, value: T) *T {
-        if (active_manager_state.core == null) {
-            @panic("zap runtime: allocAny dispatched with no active memory manager");
+        // Phase 7b: comptime-elide `core == null` for first-party builds.
+        if (comptime !activeManagerCorePresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.core == null) {
+                @panic("zap runtime: allocAny dispatched with no active memory manager");
+            }
         }
         const ctx = active_manager_state.context orelse
             @panic("zap runtime: allocAny dispatched with null manager context");
@@ -3716,8 +3845,11 @@ pub const ArcRuntime = struct {
             @panic("zap runtime: allocInlineHeaderCell dispatched after shutdown");
         }
         ensureMemoryStartup();
-        if (active_manager_state.core == null) {
-            @panic("zap runtime: allocInlineHeaderCell dispatched with no active memory manager");
+        // Phase 7b: comptime-elide `core == null` for first-party builds.
+        if (comptime !activeManagerCorePresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.core == null) {
+                @panic("zap runtime: allocInlineHeaderCell dispatched with no active memory manager");
+            }
         }
         const ctx = active_manager_state.context orelse
             @panic("zap runtime: allocInlineHeaderCell dispatched with null manager context");
@@ -3752,8 +3884,11 @@ pub const ArcRuntime = struct {
             @panic("zap runtime: freeInlineHeaderCell dispatched after shutdown");
         }
         ensureMemoryStartup();
-        if (active_manager_state.core == null) {
-            @panic("zap runtime: freeInlineHeaderCell dispatched with no active memory manager");
+        // Phase 7b: comptime-elide `core == null` for first-party builds.
+        if (comptime !activeManagerCorePresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.core == null) {
+                @panic("zap runtime: freeInlineHeaderCell dispatched with no active memory manager");
+            }
         }
         const ctx = active_manager_state.context orelse
             @panic("zap runtime: freeInlineHeaderCell dispatched with null manager context");
@@ -3883,11 +4018,19 @@ pub const ArcRuntime = struct {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (active_manager_state.core == null) {
-            @panic("zap runtime: freeAny dispatched with no active memory manager");
+        // Phase 7b: comptime-elide `core == null` / `refcount_capability == null`
+        // for first-party builds — the manager `.o` is statically
+        // linked and the descriptors are bound through `.zapmem` in
+        // `zapMemoryStartup` before any dispatcher fires.
+        if (comptime !activeManagerCorePresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.core == null) {
+                @panic("zap runtime: freeAny dispatched with no active memory manager");
+            }
         }
-        if (active_manager_state.refcount_capability == null) {
-            @panic("zap runtime: freeAny dispatched but active manager does not declare REFCOUNT_V1");
+        if (comptime !activeManagerRefcountCapabilityPresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.refcount_capability == null) {
+                @panic("zap runtime: freeAny dispatched but active manager does not declare REFCOUNT_V1");
+            }
         }
         dispatcherFreeImpl(allocator, ptr);
     }
@@ -3944,8 +4087,11 @@ pub const ArcRuntime = struct {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (active_manager_state.core == null) {
-            @panic("zap runtime: freeAny dispatched with no active memory manager");
+        // Phase 7b: comptime-elide `core == null` for first-party builds.
+        if (comptime !activeManagerCorePresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.core == null) {
+                @panic("zap runtime: freeAny dispatched with no active memory manager");
+            }
         }
         const ctx = active_manager_state.context orelse
             @panic("zap runtime: freeAny dispatched with null manager context");
@@ -3995,7 +4141,13 @@ pub const ArcRuntime = struct {
         // transition returns the slot to the slab pool. Public entry
         // already validated globals.
         const ctx = active_manager_state.context orelse unreachable;
-        if (!active_manager_state.refcount_has_sized_extension) {
+        // Phase 7b: comptime-fold the sized-extension branch for
+        // first-party builds; runtime-load for `.third_party`.
+        const has_sized_extension = if (comptime ACTIVE_MANAGER_TAG == .third_party)
+            active_manager_state.refcount_has_sized_extension
+        else
+            comptime managerHasSizedExtension(ACTIVE_MANAGER_TAG);
+        if (!has_sized_extension) {
             // v1.0 fallback: dispatch through `release` on the inline
             // ArcHeader at the cell base. The shallow-free closure
             // deallocates the cell without walking children (matching
@@ -4038,8 +4190,11 @@ pub const ArcRuntime = struct {
                 // for `LegacyArcInnerLayout(T).size` bytes starting at
                 // that address; deallocate the whole range.
                 const layout = LegacyArcInnerLayout(T);
-                if (active_manager_state.core == null) {
-                    @panic("zap runtime: v1.0 legacy freeAny: no active manager core");
+                // Phase 7b: comptime-elide `core == null` for first-party builds.
+                if (comptime !activeManagerCorePresent(ACTIVE_MANAGER_TAG)) {
+                    if (active_manager_state.core == null) {
+                        @panic("zap runtime: v1.0 legacy freeAny: no active manager core");
+                    }
                 }
                 const ctx = active_manager_state.context orelse @panic(
                     "zap runtime: v1.0 legacy freeAny: null manager context",
@@ -4089,17 +4244,24 @@ pub const ArcRuntime = struct {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (active_manager_state.core == null) {
-            @panic("zap runtime: releaseAny dispatched with no active memory manager");
+        // Phase 7b: comptime-elide `core == null` / `refcount_capability == null`
+        // for first-party builds — the manager `.o` is statically linked
+        // and the descriptors are bound at startup.
+        if (comptime !activeManagerCorePresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.core == null) {
+                @panic("zap runtime: releaseAny dispatched with no active memory manager");
+            }
         }
-        if (active_manager_state.refcount_capability == null) {
-            // Spec: when the active manager does not declare REFCOUNT_V1,
-            // the compiler statically elides retain/release at HIR
-            // elaboration time (section 8.5). Reaching this dispatcher
-            // with no active refcount capability means the compiler
-            // failed to elide, or a non-refcount manager is active and
-            // an old call site survived — a soundness bug either way.
-            @panic("zap runtime: releaseAny dispatched but active manager does not declare REFCOUNT_V1");
+        if (comptime !activeManagerRefcountCapabilityPresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.refcount_capability == null) {
+                // Spec: when the active manager does not declare REFCOUNT_V1,
+                // the compiler statically elides retain/release at HIR
+                // elaboration time (section 8.5). Reaching this dispatcher
+                // with no active refcount capability means the compiler
+                // failed to elide, or a non-refcount manager is active and
+                // an old call site survived — a soundness bug either way.
+                @panic("zap runtime: releaseAny dispatched but active manager does not declare REFCOUNT_V1");
+            }
         }
         dispatcherReleaseImpl(allocator, ptr);
     }
@@ -4172,7 +4334,13 @@ pub const ArcRuntime = struct {
         // `releaseAny` already validated globals before reaching this
         // type-specific dispatcher.
         const ctx = active_manager_state.context orelse unreachable;
-        if (!active_manager_state.refcount_has_sized_extension) {
+        // Phase 7b: comptime-fold the sized-extension branch for
+        // first-party builds; runtime-load for `.third_party`.
+        const has_sized_extension = if (comptime ACTIVE_MANAGER_TAG == .third_party)
+            active_manager_state.refcount_has_sized_extension
+        else
+            comptime managerHasSizedExtension(ACTIVE_MANAGER_TAG);
+        if (!has_sized_extension) {
             // v1.0 fallback: the cell was allocated via
             // `dispatcherAllocLegacyV1_0` with an inline ArcHeader at
             // offset 0 of the cell, followed by the user payload at
@@ -4233,8 +4401,11 @@ pub const ArcRuntime = struct {
                     const value_ptr: *T = @ptrCast(@alignCast(base_byte_ptr + layout.value_offset));
                     releaseChildrenAny(T, std.heap.page_allocator, value_ptr.*);
                 }
-                if (active_manager_state.core == null) {
-                    @panic("zap runtime: v1.0 legacy release: no active manager core");
+                // Phase 7b: comptime-elide `core == null` for first-party builds.
+                if (comptime !activeManagerCorePresent(ACTIVE_MANAGER_TAG)) {
+                    if (active_manager_state.core == null) {
+                        @panic("zap runtime: v1.0 legacy release: no active manager core");
+                    }
                 }
                 const ctx = active_manager_state.context orelse @panic(
                     "zap runtime: v1.0 legacy release: null manager context",
@@ -4354,13 +4525,22 @@ pub const ArcRuntime = struct {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (active_manager_state.core == null) {
-            @panic("zap runtime: retainAny dispatched with no active memory manager");
+        // Phase 7b: comptime-elide `core == null` / `refcount_capability == null`
+        // for first-party builds. binarytrees-style workloads hammer
+        // `retainAny` on every Tree.make/release boundary; folding
+        // these two loads out of the inlined preflight gives LLVM a
+        // tighter window to CSE the remaining `context` load.
+        if (comptime !activeManagerCorePresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.core == null) {
+                @panic("zap runtime: retainAny dispatched with no active memory manager");
+            }
         }
-        if (active_manager_state.refcount_capability == null) {
-            // See note in `releaseAny` on REFCOUNT_V1 absence; the same
-            // soundness argument applies symmetrically here.
-            @panic("zap runtime: retainAny dispatched but active manager does not declare REFCOUNT_V1");
+        if (comptime !activeManagerRefcountCapabilityPresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.refcount_capability == null) {
+                // See note in `releaseAny` on REFCOUNT_V1 absence; the same
+                // soundness argument applies symmetrically here.
+                @panic("zap runtime: retainAny dispatched but active manager does not declare REFCOUNT_V1");
+            }
         }
         dispatcherRetainImpl(ptr);
     }
@@ -4390,7 +4570,13 @@ pub const ArcRuntime = struct {
         // both globals; the orelse unreachable lets release builds
         // elide the second null check.
         const ctx = active_manager_state.context orelse unreachable;
-        if (!active_manager_state.refcount_has_sized_extension) {
+        // Phase 7b: comptime-fold the sized-extension branch for
+        // first-party builds; runtime-load for `.third_party`.
+        const has_sized_extension = if (comptime ACTIVE_MANAGER_TAG == .third_party)
+            active_manager_state.refcount_has_sized_extension
+        else
+            comptime managerHasSizedExtension(ACTIVE_MANAGER_TAG);
+        if (!has_sized_extension) {
             // v1.0 fallback: dispatch through `retain` on the inline
             // header at the cell base.
             const header_ptr = legacyArcInnerHeaderFromValuePtr(T, @constCast(ptr));
@@ -4443,11 +4629,16 @@ pub const ArcRuntime = struct {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (active_manager_state.core == null) {
-            @panic("zap runtime: retainAnyPersistent dispatched with no active memory manager");
+        // Phase 7b: same elision logic as `retainAny`.
+        if (comptime !activeManagerCorePresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.core == null) {
+                @panic("zap runtime: retainAnyPersistent dispatched with no active memory manager");
+            }
         }
-        if (active_manager_state.refcount_capability == null) {
-            @panic("zap runtime: retainAnyPersistent dispatched but active manager does not declare REFCOUNT_V1");
+        if (comptime !activeManagerRefcountCapabilityPresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.refcount_capability == null) {
+                @panic("zap runtime: retainAnyPersistent dispatched but active manager does not declare REFCOUNT_V1");
+            }
         }
         dispatcherRetainAnyPersistentImpl(ptr);
     }
@@ -4476,7 +4667,13 @@ pub const ArcRuntime = struct {
         }
         // Arc(T) side-table path. Public entry already validated globals.
         const ctx = active_manager_state.context orelse unreachable;
-        if (!active_manager_state.refcount_has_sized_extension) {
+        // Phase 7b: comptime-fold the sized-extension branch for
+        // first-party builds; runtime-load for `.third_party`.
+        const has_sized_extension = if (comptime ACTIVE_MANAGER_TAG == .third_party)
+            active_manager_state.refcount_has_sized_extension
+        else
+            comptime managerHasSizedExtension(ACTIVE_MANAGER_TAG);
+        if (!has_sized_extension) {
             // v1.0 fallback — same dispatch as the transient retain
             // path but with the persistent counter convention.
             const header_ptr = legacyArcInnerHeaderFromValuePtr(T, @constCast(ptr));
@@ -4575,8 +4772,14 @@ pub const ArcRuntime = struct {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (active_manager_state.core == null) {
-            @panic("zap runtime: headerRetain dispatched with no active memory manager");
+        // Phase 7b: comptime-elide `core == null` for first-party builds.
+        // This is the hot path for inline-header retain (Tree's List of
+        // children, Map's entries, MapIter, ...). Folding the load out
+        // closes the residual dispatcher gap from Phase 7a.
+        if (comptime !activeManagerCorePresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.core == null) {
+                @panic("zap runtime: headerRetain dispatched with no active memory manager");
+            }
         }
         const ctx = active_manager_state.context orelse {
             @panic("zap runtime: headerRetain dispatched with null manager context");
@@ -4640,8 +4843,13 @@ pub const ArcRuntime = struct {
             @panic("zap runtime: memory dispatch after shutdown");
         }
         ensureMemoryStartup();
-        if (active_manager_state.core == null) {
-            @panic("zap runtime: headerRelease dispatched with no active memory manager");
+        // Phase 7b: comptime-elide `core == null` for first-party builds.
+        // Symmetric with `headerRetain` — recursive Tree release fires
+        // this on every node, so the load elision compounds.
+        if (comptime !activeManagerCorePresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.core == null) {
+                @panic("zap runtime: headerRelease dispatched with no active memory manager");
+            }
         }
         const ctx = active_manager_state.context orelse {
             @panic("zap runtime: headerRelease dispatched with null manager context");
@@ -4686,9 +4894,17 @@ pub const ArcRuntime = struct {
         // REFCOUNT_V1 vtable yet. First-party builds always have the
         // capability wired (or it's a static `false` under managerHasRefcountV1
         // which short-circuits earlier).
-        if (active_manager_state.refcount_capability == null) return 0;
+        if (comptime !activeManagerRefcountCapabilityPresent(ACTIVE_MANAGER_TAG)) {
+            if (active_manager_state.refcount_capability == null) return 0;
+        }
         const ctx = active_manager_state.context orelse return 0;
-        if (!active_manager_state.refcount_has_sized_extension) {
+        // Phase 7b: comptime-fold the sized-extension branch for
+        // first-party builds; runtime-load for `.third_party`.
+        const has_sized_extension = if (comptime ACTIVE_MANAGER_TAG == .third_party)
+            active_manager_state.refcount_has_sized_extension
+        else
+            comptime managerHasSizedExtension(ACTIVE_MANAGER_TAG);
+        if (!has_sized_extension) {
             // v1.0 fallback: the inline ArcHeader at the cell base
             // carries the refcount. Read it directly — v1.0 has no
             // `refcount_sized` slot.
@@ -13466,6 +13682,70 @@ test "Phase 6: active_manager_state startup invariants" {
     // declares only the v1.0 surface this assertion would flip; the
     // assertion serves as a witness that startup correctly distinguishes
     // the two surfaces.
+    try std.testing.expect(active_manager_state.refcount_has_sized_extension);
+}
+
+test "Phase 7b: comptime manager classifiers are exhaustive and consistent" {
+    // The Phase 7b dispatcher rewrite hinges on three comptime
+    // classifiers — `activeManagerCorePresent`,
+    // `activeManagerRefcountCapabilityPresent`, and
+    // `managerHasSizedExtension`. Each classifier MUST agree with the
+    // pre-existing `managerHasRefcountV1` for every first-party tag so
+    // a refactor that adds a new manager (or changes its abi_minor
+    // declaration) cannot silently misroute the dispatch.
+    //
+    // Pin every (tag, classifier) tuple at the host build site so
+    // drift surfaces as a test failure rather than as a wrong-branch
+    // dispatch at runtime.
+    const all_tags = [_]ActiveManagerTag{ .arc, .arena, .no_op, .leak, .tracking, .third_party };
+    inline for (all_tags) |tag| {
+        const has_refcount = managerHasRefcountV1(tag);
+        const cap_present = activeManagerRefcountCapabilityPresent(tag);
+        const sized = managerHasSizedExtension(tag);
+        switch (tag) {
+            .arc => {
+                try std.testing.expect(has_refcount);
+                try std.testing.expect(cap_present);
+                try std.testing.expect(sized);
+                try std.testing.expect(activeManagerCorePresent(tag));
+            },
+            .arena, .no_op, .leak, .tracking => {
+                try std.testing.expect(!has_refcount);
+                try std.testing.expect(!cap_present);
+                try std.testing.expect(!sized);
+                try std.testing.expect(activeManagerCorePresent(tag));
+            },
+            .third_party => {
+                // Third-party builds resolve at runtime; the comptime
+                // classifiers MUST return `false` so the dispatcher
+                // routes through the runtime null-check arm.
+                try std.testing.expect(!has_refcount);
+                try std.testing.expect(!cap_present);
+                try std.testing.expect(!sized);
+                try std.testing.expect(!activeManagerCorePresent(tag));
+            },
+        }
+    }
+}
+
+test "Phase 7b: third_party host runtime still observes runtime-loaded manager state" {
+    // The host test suite runs under `ACTIVE_MANAGER_TAG == .third_party`,
+    // so every dispatcher in this build routes through the runtime
+    // null-check arm (the test-only ARC vtable provides the bound
+    // value). Pin the fallback semantics: a refactor that flipped the
+    // host build to a first-party tag would change which path is
+    // exercised by the rest of the suite, so detecting that drift
+    // here makes any such change deliberate.
+    try std.testing.expectEqual(ActiveManagerTag.third_party, ACTIVE_MANAGER_TAG);
+    try std.testing.expect(!activeManagerCorePresent(ACTIVE_MANAGER_TAG));
+    try std.testing.expect(!activeManagerRefcountCapabilityPresent(ACTIVE_MANAGER_TAG));
+    try std.testing.expect(!managerHasSizedExtension(ACTIVE_MANAGER_TAG));
+    // After startup the runtime-loaded fields are populated by the
+    // test-only fallback vtable; every dispatcher reads through these
+    // because the comptime classifiers above return `false`.
+    ensureMemoryStartup();
+    try std.testing.expect(active_manager_state.core != null);
+    try std.testing.expect(active_manager_state.refcount_capability != null);
     try std.testing.expect(active_manager_state.refcount_has_sized_extension);
 }
 
