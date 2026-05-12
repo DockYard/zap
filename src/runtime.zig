@@ -632,14 +632,23 @@ export fn zap_runtime_atomic_add_u32_acq_rel(ptr: *u32, delta: u32) callconv(.c)
 // The `allocAny` / `retainAny` / `releaseAny` dispatchers in
 // `ArcRuntime` validate the active vtable on every call. The
 // inline-header retain/release path (`Map(K,V)`, `List(T)`,
-// `MapIter`) routes fully through the manager's REFCOUNT_V1 vtable.
-// The typed slab-pool side-table path (`Arc(T)` for plain `T`) still
-// calls into `ArcPool(T)` directly because the byte-level
-// `core.allocate(size, alignment)` cannot drive a comptime-typed
-// slab pool without a runtime size-class dispatch — a structural
-// rework deferred to a Phase 4.x byte-level slab redesign.
-// `prepareReleaseAny` / `destroyPreparedAny` (split-phase borrow-
-// elision API) follow the same Phase 4.x deferral.
+// `MapIter`) routes through the manager's REFCOUNT_V1 vtable's
+// original `retain` / `release` slots (atomic-on-offset-0 of the
+// cell). The generic `Arc(T)` side-table path routes through the
+// Phase 4.x extended `allocate_refcounted` / `retain_sized` /
+// `release_sized` / `refcount_sized` slots, which the manager
+// services from a byte-keyed multi-class slab pool. Both paths now
+// flow end-to-end through the active manager — the Phase 4 vtable-
+// bypass deferral that previously left `Arc(T)` cells in a runtime-
+// owned typed slab pool is closed.
+//
+// The split-phase release API (`prepareReleaseAny` /
+// `destroyPreparedAny`) was removed in Phase 4.x because the
+// unified `release_sized` slot folds the refcount decrement, the
+// per-type `deep_walk` callback, and the slot-return into a single
+// vtable call. Callers that previously used the split-phase pair
+// (only `releaseArcAny` inside the runtime) now use `release_sized`
+// with a per-type deep-walk closure.
 //
 // ## Capability-missing panic contract
 //
@@ -711,12 +720,24 @@ pub const AbiV1 = struct {
         get_capability_desc: *const fn (ctx: *anyopaque, id: u32) callconv(.c) ?*const ZapCapabilityDescV1,
     };
 
-    /// `REFCOUNT_V1` capability vtable (spec section 8). `retain`
-    /// increments. `release` decrements and invokes `deep_walk` on the
-    /// zero-transition (if non-null), then frees the cell.
+    /// `REFCOUNT_V1` capability vtable (spec section 8). The first two
+    /// slots are the original v1.0 inline-header path (operate on a
+    /// 4-byte refcount at offset 0 of the cell). The trailing four
+    /// slots are the Phase 4.x side-table path used by generic
+    /// `Arc(T)` cells — `retain_sized` / `release_sized` recover the
+    /// cell's slab from a 64-KiB-aligned mask and look up the side-
+    /// table refcount; `allocate_refcounted` allocates a side-table
+    /// cell with rc=1; `refcount_sized` reads the side-table refcount
+    /// (used by `resetAny` / Perceus reuse). The descriptor's `size`
+    /// field advertises the actual vtable length so a v1.0 runtime
+    /// that only reads the first two slots continues to interoperate.
     pub const ZapRefcountCapabilityV1 = extern struct {
         retain: *const fn (ctx: *anyopaque, object: *anyopaque) callconv(.c) void,
         release: *const fn (ctx: *anyopaque, object: *anyopaque, deep_walk: ?ZapDeepWalkFn) callconv(.c) void,
+        retain_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void,
+        release_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32, deep_walk: ?ZapDeepWalkFn) callconv(.c) void,
+        allocate_refcounted: *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8,
+        refcount_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32,
     };
 
     // Tripwire asserts mirroring `src/memory/abi.zig`. Any drift in
@@ -785,14 +806,26 @@ pub const AbiV1 = struct {
             "runtime.AbiV1: ZapMemoryManagerCoreV1.get_capability_desc must be at offset 48",
         );
 
-        if (@sizeOf(ZapRefcountCapabilityV1) != 16) @compileError(
-            "runtime.AbiV1: ZapRefcountCapabilityV1 v1.0 must be exactly 16 bytes",
+        if (@sizeOf(ZapRefcountCapabilityV1) != 48) @compileError(
+            "runtime.AbiV1: ZapRefcountCapabilityV1 (Phase 4.x extended) must be exactly 48 bytes",
         );
         if (@offsetOf(ZapRefcountCapabilityV1, "retain") != 0) @compileError(
             "runtime.AbiV1: ZapRefcountCapabilityV1.retain must be at offset 0",
         );
         if (@offsetOf(ZapRefcountCapabilityV1, "release") != 8) @compileError(
             "runtime.AbiV1: ZapRefcountCapabilityV1.release must be at offset 8",
+        );
+        if (@offsetOf(ZapRefcountCapabilityV1, "retain_sized") != 16) @compileError(
+            "runtime.AbiV1: ZapRefcountCapabilityV1.retain_sized must be at offset 16",
+        );
+        if (@offsetOf(ZapRefcountCapabilityV1, "release_sized") != 24) @compileError(
+            "runtime.AbiV1: ZapRefcountCapabilityV1.release_sized must be at offset 24",
+        );
+        if (@offsetOf(ZapRefcountCapabilityV1, "allocate_refcounted") != 32) @compileError(
+            "runtime.AbiV1: ZapRefcountCapabilityV1.allocate_refcounted must be at offset 32",
+        );
+        if (@offsetOf(ZapRefcountCapabilityV1, "refcount_sized") != 40) @compileError(
+            "runtime.AbiV1: ZapRefcountCapabilityV1.refcount_sized must be at offset 40",
         );
     }
 };
@@ -923,15 +956,387 @@ var zap_memory_shutdown_complete: bool = false;
 // failure.
 // ----------------------------------------------------------------
 
-/// Static context for the test-only ARC manager. Mirrors the
-/// production manager's `Context` struct (allocation counter for
-/// `ctx` exercise). Only present in test builds; `if (builtin.is_test)`
-/// is a comptime constant so the variable is comptime-removed from
-/// production binaries.
+/// Test-only byte-keyed slab pool. Mirrors the production manager's
+/// `SlabPool` in `src/memory/arc/manager.zig` so the test path through
+/// `allocAny` / `retainAny` / `releaseAny` exercises the same vtable
+/// surface as a production binary, including the Phase 4.x extended
+/// `retain_sized` / `release_sized` / `allocate_refcounted` slots.
+/// Production binaries route through the externally-linked manager
+/// `.o`; the test runtime can't load that object (it would require a
+/// child-process model — see the Phase 4 commentary above), so we
+/// duplicate the slab-pool body here under `if (builtin.is_test)`.
+///
+/// The two implementations share the spec contract (atomic decrement
+/// with deep_walk on zero-transition, size-class lookup keyed on
+/// `(size, alignment)`, 64-KiB-aligned slab + side-table refcount
+/// layout) so observable behaviour is byte-faithful. Any drift between
+/// them produces an immediate test failure because every Arc(T) test
+/// path runs against this fallback.
+const TestOnlyArcSlabPool = if (builtin.is_test) struct {
+    pub const SLAB_SIZE: usize = 64 * 1024;
+    pub const SLAB_ALIGN: usize = SLAB_SIZE;
+    pub const SLAB_MASK: usize = SLAB_SIZE - 1;
+    pub const SLAB_BASE_MASK: usize = ~SLAB_MASK;
+    pub const NULL_SLOT: u32 = 0xFFFFFFFF;
+    pub const SLAB_MAGIC: u32 = 0x5A4D5342;
+    pub const LARGE_MAGIC: u32 = 0x5A4D4C47;
+
+    /// Size class table — same values as `src/memory/arc/manager.zig`'s
+    /// `SLAB_CLASS_SIZES`. Drift in either side produces test failure
+    /// because the slab layout and capacity computations depend on
+    /// these values being identical.
+    pub const SLAB_CLASS_SIZES = [_]u32{ 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096 };
+    pub const SLAB_CLASS_COUNT = SLAB_CLASS_SIZES.len;
+    pub const MAX_SLAB_CLASS_SIZE: u32 = SLAB_CLASS_SIZES[SLAB_CLASS_COUNT - 1];
+
+    pub const SLAB_CLASS_ALIGNS: [SLAB_CLASS_COUNT]u32 = blk: {
+        var aligns: [SLAB_CLASS_COUNT]u32 = undefined;
+        var class_index: u32 = 0;
+        while (class_index < SLAB_CLASS_COUNT) : (class_index += 1) {
+            const size = SLAB_CLASS_SIZES[class_index];
+            var align_val: u32 = 1;
+            var bit: u32 = 0;
+            while (bit < 32) : (bit += 1) {
+                const probe: u32 = @as(u32, 1) << bit;
+                if (probe > size) break;
+                if (size % probe == 0) align_val = probe;
+            }
+            aligns[class_index] = align_val;
+        }
+        break :blk aligns;
+    };
+
+    pub inline fn slotAlignForClass(class_index: u32) u32 {
+        return SLAB_CLASS_ALIGNS[class_index];
+    }
+
+    pub const SLAB_CLASS_LOOKUP_GRANULARITY: usize = 8;
+    pub const SLAB_CLASS_LOOKUP_TABLE_LEN: usize = (MAX_SLAB_CLASS_SIZE + SLAB_CLASS_LOOKUP_GRANULARITY - 1) / SLAB_CLASS_LOOKUP_GRANULARITY;
+    pub const SLAB_CLASS_LOOKUP_TABLE: [SLAB_CLASS_LOOKUP_TABLE_LEN]u32 = blk: {
+        @setEvalBranchQuota(20000);
+        var table: [SLAB_CLASS_LOOKUP_TABLE_LEN]u32 = undefined;
+        var bucket: usize = 0;
+        while (bucket < SLAB_CLASS_LOOKUP_TABLE_LEN) : (bucket += 1) {
+            const upper_bound: u32 = @intCast((bucket + 1) * SLAB_CLASS_LOOKUP_GRANULARITY);
+            var class_index: u32 = 0;
+            while (class_index < SLAB_CLASS_COUNT) : (class_index += 1) {
+                if (SLAB_CLASS_SIZES[class_index] >= upper_bound) break;
+            }
+            table[bucket] = class_index;
+        }
+        break :blk table;
+    };
+
+    pub inline fn lookupClass(size: usize, alignment: u32) ?u32 {
+        if (size == 0 or size > MAX_SLAB_CLASS_SIZE) return null;
+        const bucket: usize = (size - 1) / SLAB_CLASS_LOOKUP_GRANULARITY;
+        var class_index: u32 = SLAB_CLASS_LOOKUP_TABLE[bucket];
+        while (class_index < SLAB_CLASS_COUNT) : (class_index += 1) {
+            if (SLAB_CLASS_ALIGNS[class_index] >= alignment) return class_index;
+        }
+        return null;
+    }
+
+    pub const SlabHeader = extern struct {
+        magic: u32,
+        class_index: u32,
+        live_count: u32,
+        free_list_head: u32,
+        bump_index: u32,
+        capacity: u32,
+        prev: ?*SlabHeader,
+        next: ?*SlabHeader,
+        allocation_base: [*]align(std.heap.page_size_min) u8,
+        owner: *anyopaque,
+    };
+
+    pub const SizeClass = extern struct {
+        current: ?*SlabHeader,
+        partials: ?*SlabHeader,
+        cached_empty: ?*SlabHeader,
+    };
+
+    pub inline fn slotsOffsetForClass(class_index: u32, capacity: u32) usize {
+        const refcount_bytes: usize = @as(usize, capacity) * @sizeOf(u32);
+        const header_end: usize = @sizeOf(SlabHeader) + refcount_bytes;
+        const align_v: usize = slotAlignForClass(class_index);
+        return std.mem.alignForward(usize, header_end, align_v);
+    }
+
+    pub inline fn capacityForClass(class_index: u32) u32 {
+        const slot_size: usize = SLAB_CLASS_SIZES[class_index];
+        const slot_align: usize = slotAlignForClass(class_index);
+        if (SLAB_SIZE <= @sizeOf(SlabHeader) + slot_align) return 0;
+        const usable: usize = SLAB_SIZE - @sizeOf(SlabHeader) - slot_align;
+        const per_slot: usize = slot_size + @sizeOf(u32);
+        return @intCast(usable / per_slot);
+    }
+
+    pub const SlabPool = struct {
+        classes: [SLAB_CLASS_COUNT]SizeClass,
+    };
+
+    pub inline fn slabPoolInit() SlabPool {
+        var pool: SlabPool = undefined;
+        var class_index: u32 = 0;
+        while (class_index < SLAB_CLASS_COUNT) : (class_index += 1) {
+            pool.classes[class_index] = .{
+                .current = null,
+                .partials = null,
+                .cached_empty = null,
+            };
+        }
+        return pool;
+    }
+
+    pub fn mmapAlignedSlab() ?[*]align(std.heap.page_size_min) u8 {
+        const page_size = std.heap.page_size_min;
+        std.debug.assert(SLAB_SIZE % page_size == 0);
+        const overalloc_len: usize = SLAB_SIZE + SLAB_ALIGN - page_size;
+        const raw = std.posix.mmap(
+            null,
+            overalloc_len,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            -1,
+            0,
+        ) catch return null;
+        const raw_addr = @intFromPtr(raw.ptr);
+        const aligned_addr = std.mem.alignForward(usize, raw_addr, SLAB_ALIGN);
+        const head_bytes = aligned_addr - raw_addr;
+        const tail_bytes = overalloc_len - head_bytes - SLAB_SIZE;
+        if (head_bytes != 0) {
+            std.posix.munmap(@alignCast(raw[0..head_bytes]));
+        }
+        if (tail_bytes != 0) {
+            const tail_start = head_bytes + SLAB_SIZE;
+            std.posix.munmap(@alignCast(raw[tail_start..(tail_start + tail_bytes)]));
+        }
+        const aligned_ptr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(aligned_addr);
+        return aligned_ptr;
+    }
+
+    pub fn unmapSlab(base: [*]align(std.heap.page_size_min) u8) void {
+        const slab_slice = base[0..SLAB_SIZE];
+        std.posix.munmap(@alignCast(slab_slice));
+    }
+
+    pub fn slabInit(slab: *SlabHeader, class_index: u32, owner: *anyopaque, base: [*]align(std.heap.page_size_min) u8) void {
+        const capacity = capacityForClass(class_index);
+        slab.* = .{
+            .magic = SLAB_MAGIC,
+            .class_index = class_index,
+            .live_count = 0,
+            .free_list_head = NULL_SLOT,
+            .bump_index = 0,
+            .capacity = capacity,
+            .prev = null,
+            .next = null,
+            .allocation_base = base,
+            .owner = owner,
+        };
+        const refcount_ptr_byte: [*]u8 = @ptrCast(slab);
+        const refcount_bytes_ptr = refcount_ptr_byte + @sizeOf(SlabHeader);
+        const refcount_bytes_count: usize = @as(usize, capacity) * @sizeOf(u32);
+        @memset(refcount_bytes_ptr[0..refcount_bytes_count], 0);
+    }
+
+    pub inline fn slabRefcountPtr(slab: *SlabHeader, index: u32) *u32 {
+        const base: [*]u8 = @ptrCast(slab);
+        const table: [*]u32 = @ptrCast(@alignCast(base + @sizeOf(SlabHeader)));
+        return &table[index];
+    }
+
+    pub inline fn slabSlotPtr(slab: *SlabHeader, index: u32) [*]u8 {
+        const base: [*]u8 = @ptrCast(slab);
+        const offset = slotsOffsetForClass(slab.class_index, slab.capacity);
+        const slot_size: usize = SLAB_CLASS_SIZES[slab.class_index];
+        return base + offset + slot_size * @as(usize, index);
+    }
+
+    pub inline fn slabFromSlotPtr(ptr: *anyopaque) *SlabHeader {
+        const ptr_addr = @intFromPtr(ptr);
+        const slab_addr = ptr_addr & SLAB_BASE_MASK;
+        const slab: *SlabHeader = @ptrFromInt(slab_addr);
+        return slab;
+    }
+
+    pub inline fn slotIndexInSlab(slab: *SlabHeader, ptr: *anyopaque) u32 {
+        const base_addr = @intFromPtr(slab);
+        const ptr_addr = @intFromPtr(ptr);
+        const offset = ptr_addr - base_addr - slotsOffsetForClass(slab.class_index, slab.capacity);
+        const slot_size: usize = SLAB_CLASS_SIZES[slab.class_index];
+        return @intCast(offset / slot_size);
+    }
+
+    pub fn pushPartial(class: *SizeClass, slab: *SlabHeader) void {
+        slab.prev = null;
+        slab.next = class.partials;
+        if (class.partials) |head| {
+            head.prev = slab;
+        }
+        class.partials = slab;
+    }
+
+    pub fn unlinkPartial(class: *SizeClass, slab: *SlabHeader) void {
+        if (slab.prev) |prev_slab| {
+            prev_slab.next = slab.next;
+        } else if (class.partials == slab) {
+            class.partials = slab.next;
+        }
+        if (slab.next) |next_slab| {
+            next_slab.prev = slab.prev;
+        }
+        slab.prev = null;
+        slab.next = null;
+    }
+
+    pub inline fn slabOnPartialList(class: *SizeClass, slab: *SlabHeader) bool {
+        return slab.prev != null or class.partials == slab;
+    }
+
+    pub fn acquireSlab(pool: *SlabPool, class_index: u32) ?*SlabHeader {
+        const class = &pool.classes[class_index];
+        if (class.cached_empty) |cached| {
+            class.cached_empty = null;
+            cached.live_count = 0;
+            cached.free_list_head = NULL_SLOT;
+            cached.bump_index = 0;
+            cached.prev = null;
+            cached.next = null;
+            const ref_ptr_byte: [*]u8 = @ptrCast(cached);
+            const refcount_bytes_ptr = ref_ptr_byte + @sizeOf(SlabHeader);
+            const refcount_bytes_count: usize = @as(usize, cached.capacity) * @sizeOf(u32);
+            @memset(refcount_bytes_ptr[0..refcount_bytes_count], 0);
+            return cached;
+        }
+        if (class.partials) |partial| {
+            unlinkPartial(class, partial);
+            return partial;
+        }
+        const aligned_base = mmapAlignedSlab() orelse return null;
+        const slab: *SlabHeader = @ptrCast(@alignCast(aligned_base));
+        slabInit(slab, class_index, @ptrCast(class), aligned_base);
+        return slab;
+    }
+
+    pub fn slabAllocSlot(pool: *SlabPool, class_index: u32, init_refcount: u32) ?[*]u8 {
+        const class = &pool.classes[class_index];
+        var slab: *SlabHeader = class.current orelse blk: {
+            const acquired = acquireSlab(pool, class_index) orelse return null;
+            class.current = acquired;
+            break :blk acquired;
+        };
+        while (true) {
+            if (slab.free_list_head != NULL_SLOT) {
+                const slot_index = slab.free_list_head;
+                const slot_bytes = slabSlotPtr(slab, slot_index);
+                const free_node: *u32 = @ptrCast(@alignCast(slot_bytes));
+                slab.free_list_head = free_node.*;
+                slab.live_count += 1;
+                slabRefcountPtr(slab, slot_index).* = init_refcount;
+                return slot_bytes;
+            }
+            if (slab.bump_index < slab.capacity) {
+                const slot_index = slab.bump_index;
+                slab.bump_index += 1;
+                slab.live_count += 1;
+                const slot_bytes = slabSlotPtr(slab, slot_index);
+                slabRefcountPtr(slab, slot_index).* = init_refcount;
+                return slot_bytes;
+            }
+            class.current = null;
+            const fresh = acquireSlab(pool, class_index) orelse return null;
+            class.current = fresh;
+            slab = fresh;
+        }
+    }
+
+    pub fn slabFreeSlot(pool: *SlabPool, slab: *SlabHeader, slot_index: u32) void {
+        const class: *SizeClass = @ptrCast(@alignCast(slab.owner));
+        _ = pool;
+        const was_full = slab.free_list_head == NULL_SLOT and slab.bump_index >= slab.capacity;
+        const slot_bytes = slabSlotPtr(slab, slot_index);
+        const free_node: *u32 = @ptrCast(@alignCast(slot_bytes));
+        free_node.* = slab.free_list_head;
+        slab.free_list_head = slot_index;
+        std.debug.assert(slab.live_count > 0);
+        slab.live_count -= 1;
+        slabRefcountPtr(slab, slot_index).* = 0;
+        if (slab == class.current) return;
+        if (slab.live_count == 0) {
+            if (slabOnPartialList(class, slab)) {
+                unlinkPartial(class, slab);
+            }
+            if (class.cached_empty == null) {
+                class.cached_empty = slab;
+            } else {
+                unmapSlab(slab.allocation_base);
+            }
+            return;
+        }
+        if (was_full) {
+            pushPartial(class, slab);
+        }
+    }
+
+    pub const LargeHeader = extern struct {
+        magic: u32,
+        _pad0: u32,
+        size: usize,
+        alignment: u32,
+        refcount: u32,
+    };
+
+    pub inline fn largeLeadingFor(alignment: u32) usize {
+        const min_lead: usize = @sizeOf(LargeHeader);
+        const aligned_lead: usize = std.mem.alignForward(usize, min_lead, alignment);
+        return aligned_lead;
+    }
+
+    pub fn largeAlloc(size: usize, alignment: u32, init_refcount: u32) ?[*]u8 {
+        const leading = largeLeadingFor(alignment);
+        const total = std.math.add(usize, leading, size) catch return null;
+        const inner_alignment: std.mem.Alignment = .fromByteUnits(@max(alignment, @as(u32, @intCast(std.heap.page_size_min))));
+        const base = std.heap.page_allocator.rawAlloc(total, inner_alignment, @returnAddress()) orelse return null;
+        const header_ptr: *LargeHeader = @ptrCast(@alignCast(base + leading - @sizeOf(LargeHeader)));
+        header_ptr.* = .{
+            .magic = LARGE_MAGIC,
+            ._pad0 = 0,
+            .size = size,
+            .alignment = alignment,
+            .refcount = init_refcount,
+        };
+        return base + leading;
+    }
+
+    pub fn largeFree(ptr: [*]u8) void {
+        const header_ptr: *LargeHeader = @ptrCast(@alignCast(ptr - @sizeOf(LargeHeader)));
+        std.debug.assert(header_ptr.magic == LARGE_MAGIC);
+        const alignment = header_ptr.alignment;
+        const leading = largeLeadingFor(alignment);
+        const total = leading + header_ptr.size;
+        const base: [*]u8 = ptr - leading;
+        const inner_alignment: std.mem.Alignment = .fromByteUnits(@max(alignment, @as(u32, @intCast(std.heap.page_size_min))));
+        std.heap.page_allocator.rawFree(base[0..total], inner_alignment, @returnAddress());
+    }
+
+    pub inline fn largeHeader(ptr: *anyopaque) *LargeHeader {
+        const byte_ptr: [*]u8 = @ptrCast(ptr);
+        return @ptrCast(@alignCast(byte_ptr - @sizeOf(LargeHeader)));
+    }
+} else struct {};
+
+/// Static context for the test-only ARC manager. Allocated as a fixed
+/// global storage so it lives for the test process's lifetime; the
+/// embedded `SlabPool` carries the actual byte-keyed allocation state.
+/// Only present in test builds; `if (builtin.is_test)` is a comptime
+/// constant so the variable is comptime-removed from production
+/// binaries.
 var test_only_arc_context_storage: if (builtin.is_test) struct {
-    allocation_counter: std.atomic.Value(u64),
+    slab_pool: TestOnlyArcSlabPool.SlabPool,
 } else void = if (builtin.is_test)
-    .{ .allocation_counter = std.atomic.Value(u64).init(0) }
+    .{ .slab_pool = TestOnlyArcSlabPool.slabPoolInit() }
 else {};
 
 fn testOnlyArcInit(options: ?*const AbiV1.ZapInitOptions) callconv(.c) ?*anyopaque {
@@ -941,37 +1346,56 @@ fn testOnlyArcInit(options: ?*const AbiV1.ZapInitOptions) callconv(.c) ?*anyopaq
 
 fn testOnlyArcDeinit(ctx: *anyopaque) callconv(.c) void {
     _ = ctx;
+    // Tests deliberately do not free the slab pool — the test process
+    // exits and the OS reclaims every mmap'd page. Mirrors how the
+    // production manager's `arcDeinit` is best-effort.
 }
 
-/// Raw allocation slot mirroring `src/memory/arc/manager.zig`'s
-/// `arcAllocate`: always returns `null` (the spec's documented OOM
-/// signal). The runtime never dispatches user-visible allocations
-/// through this slot in v1.0 — inline-header types own their
-/// allocator selection and the typed slab pool uses `mmap` directly —
-/// so any caller that does reach it triggers the spec §4.3.1
-/// OOM-abort diagnostic. Returning `null` here keeps the test-only
-/// manager byte-faithful with the production manager and avoids any
-/// libc / page-allocator dependency for the test build.
+/// Raw allocation slot. Routes through the test-only slab pool the
+/// same way the production manager's `arcAllocate` does. Returns
+/// `null` for zero-size allocations (spec §4.2 contract).
 fn testOnlyArcAllocateRaw(ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8 {
-    _ = ctx;
-    _ = size;
-    _ = alignment;
-    return null;
+    if (size == 0) return null;
+    std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
+    if (!builtin.is_test) return null;
+    const tctx: *@TypeOf(test_only_arc_context_storage) = @ptrCast(@alignCast(ctx));
+    if (TestOnlyArcSlabPool.lookupClass(size, alignment)) |class_index| {
+        return TestOnlyArcSlabPool.slabAllocSlot(&tctx.slab_pool, class_index, 0);
+    }
+    return TestOnlyArcSlabPool.largeAlloc(size, alignment, 0);
 }
 
-/// Raw deallocation slot mirroring `src/memory/arc/manager.zig`'s
-/// `arcDeallocate`: no-op because `testOnlyArcAllocateRaw` never
-/// returns a non-null pointer.
+/// Raw deallocation slot. Returns slab slots to the free list; unmaps
+/// large allocations.
 fn testOnlyArcDeallocateRaw(
     ctx: *anyopaque,
     ptr: [*]u8,
     size: usize,
     alignment: u32,
 ) callconv(.c) void {
-    _ = ctx;
-    _ = ptr;
-    _ = size;
-    _ = alignment;
+    if (size == 0) return;
+    if (!builtin.is_test) return;
+    std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
+    const tctx: *@TypeOf(test_only_arc_context_storage) = @ptrCast(@alignCast(ctx));
+    if (TestOnlyArcSlabPool.lookupClass(size, alignment)) |_| {
+        const slab = TestOnlyArcSlabPool.slabFromSlotPtr(ptr);
+        std.debug.assert(slab.magic == TestOnlyArcSlabPool.SLAB_MAGIC);
+        const slot_index = TestOnlyArcSlabPool.slotIndexInSlab(slab, ptr);
+        TestOnlyArcSlabPool.slabFreeSlot(&tctx.slab_pool, slab, slot_index);
+        return;
+    }
+    TestOnlyArcSlabPool.largeFree(ptr);
+}
+
+fn testOnlyArcAllocateRefcounted(ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8 {
+    if (size == 0) return null;
+    if (!builtin.is_test) return null;
+    std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
+    const tctx: *@TypeOf(test_only_arc_context_storage) = @ptrCast(@alignCast(ctx));
+    if (TestOnlyArcSlabPool.lookupClass(size, alignment)) |class_index| {
+        return TestOnlyArcSlabPool.slabAllocSlot(&tctx.slab_pool, class_index, 1);
+    }
+    return TestOnlyArcSlabPool.largeAlloc(size, alignment, 1);
 }
 
 fn testOnlyArcGetCapabilityDesc(
@@ -986,19 +1410,6 @@ fn testOnlyArcGetCapabilityDesc(
 /// REFCOUNT_V1 `retain` for cells with the refcount at offset 0.
 /// Atomic increment on the 4-byte refcount with `monotonic` ordering
 /// (the release fence lives in `testOnlyArcRelease`).
-///
-/// Ordering note: the production manager in `src/memory/arc/manager.zig`
-/// emits `acq_rel` on retain too, by calling the externalised
-/// `zap_runtime_atomic_add_u32_acq_rel` helper. This test-only path
-/// uses `monotonic` because `acq_rel` ⊇ `monotonic` (every observation
-/// the strict ordering would establish is also established by the
-/// release path's `acq_rel` fence) — the two paths are observationally
-/// equivalent for the spec's refcount contract. Calling the production
-/// helper from this function would re-enter the same compilation unit,
-/// inflating test build time and offering no observable benefit. A
-/// future Phase 4.x convergence is to unify both paths on a shared
-/// `acq_rel` helper once the test-only manager can dlopen the same
-/// object the production build links against.
 fn testOnlyArcRetain(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
     _ = ctx;
     const refcount_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(object));
@@ -1007,10 +1418,7 @@ fn testOnlyArcRetain(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
 
 /// REFCOUNT_V1 `release` for cells with the refcount at offset 0.
 /// Atomic decrement; on the zero-transition invoke `deep_walk(object)`
-/// if non-null (the deep_walk callback performs both the
-/// children-walk and the cell's storage free — see the
-/// `src/memory/arc/manager.zig` docstring for the architecture
-/// rationale).
+/// if non-null.
 fn testOnlyArcRelease(
     ctx: *anyopaque,
     object: *anyopaque,
@@ -1024,9 +1432,91 @@ fn testOnlyArcRelease(
     }
 }
 
+fn testOnlyArcRetainSized(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) void {
+    _ = ctx;
+    if (!builtin.is_test) return;
+    if (TestOnlyArcSlabPool.lookupClass(size, alignment)) |_| {
+        const slab = TestOnlyArcSlabPool.slabFromSlotPtr(object);
+        std.debug.assert(slab.magic == TestOnlyArcSlabPool.SLAB_MAGIC);
+        const slot_index = TestOnlyArcSlabPool.slotIndexInSlab(slab, object);
+        const refcount_ptr = TestOnlyArcSlabPool.slabRefcountPtr(slab, slot_index);
+        const atomic_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(refcount_ptr));
+        _ = atomic_ptr.fetchAdd(1, .monotonic);
+        return;
+    }
+    const header = TestOnlyArcSlabPool.largeHeader(object);
+    std.debug.assert(header.magic == TestOnlyArcSlabPool.LARGE_MAGIC);
+    const atomic_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(&header.refcount));
+    _ = atomic_ptr.fetchAdd(1, .monotonic);
+}
+
+fn testOnlyArcReleaseSized(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+    deep_walk: ?AbiV1.ZapDeepWalkFn,
+) callconv(.c) void {
+    if (!builtin.is_test) return;
+    const tctx: *@TypeOf(test_only_arc_context_storage) = @ptrCast(@alignCast(ctx));
+    if (TestOnlyArcSlabPool.lookupClass(size, alignment)) |_| {
+        const slab = TestOnlyArcSlabPool.slabFromSlotPtr(object);
+        std.debug.assert(slab.magic == TestOnlyArcSlabPool.SLAB_MAGIC);
+        const slot_index = TestOnlyArcSlabPool.slotIndexInSlab(slab, object);
+        const refcount_ptr = TestOnlyArcSlabPool.slabRefcountPtr(slab, slot_index);
+        const atomic_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(refcount_ptr));
+        const prev = atomic_ptr.fetchSub(1, .acq_rel);
+        if (prev == 1) {
+            if (deep_walk) |walk| walk(object);
+            TestOnlyArcSlabPool.slabFreeSlot(&tctx.slab_pool, slab, slot_index);
+        }
+        return;
+    }
+    const header = TestOnlyArcSlabPool.largeHeader(object);
+    std.debug.assert(header.magic == TestOnlyArcSlabPool.LARGE_MAGIC);
+    const atomic_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(&header.refcount));
+    const prev = atomic_ptr.fetchSub(1, .acq_rel);
+    if (prev == 1) {
+        if (deep_walk) |walk| walk(object);
+        const byte_ptr: [*]u8 = @ptrCast(object);
+        TestOnlyArcSlabPool.largeFree(byte_ptr);
+    }
+}
+
+fn testOnlyArcRefcountSized(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) u32 {
+    _ = ctx;
+    if (!builtin.is_test) return 0;
+    if (TestOnlyArcSlabPool.lookupClass(size, alignment)) |_| {
+        const slab = TestOnlyArcSlabPool.slabFromSlotPtr(object);
+        std.debug.assert(slab.magic == TestOnlyArcSlabPool.SLAB_MAGIC);
+        const slot_index = TestOnlyArcSlabPool.slotIndexInSlab(slab, object);
+        const refcount_ptr = TestOnlyArcSlabPool.slabRefcountPtr(slab, slot_index);
+        const atomic_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(refcount_ptr));
+        return atomic_ptr.load(.acquire);
+    }
+    const header = TestOnlyArcSlabPool.largeHeader(object);
+    std.debug.assert(header.magic == TestOnlyArcSlabPool.LARGE_MAGIC);
+    const atomic_ptr: *std.atomic.Value(u32) = @ptrCast(@alignCast(&header.refcount));
+    return atomic_ptr.load(.acquire);
+}
+
 const test_only_arc_refcount_vtable: AbiV1.ZapRefcountCapabilityV1 = .{
     .retain = testOnlyArcRetain,
     .release = testOnlyArcRelease,
+    .retain_sized = testOnlyArcRetainSized,
+    .release_sized = testOnlyArcReleaseSized,
+    .allocate_refcounted = testOnlyArcAllocateRefcounted,
+    .refcount_sized = testOnlyArcRefcountSized,
 };
 
 const test_only_arc_refcount_descriptor: AbiV1.ZapCapabilityDescV1 = .{
@@ -3188,15 +3678,15 @@ pub const ArcRuntime = struct {
     /// at ~600 M nodes per N=21 run).
     ///
     /// Dispatch validates that the active manager is bound and its
-    /// core vtable is healthy before invoking the typed slab-pool
-    /// path. The byte-level `core.allocate(size, alignment)` vtable
-    /// slot is NOT invoked here: the slab pool requires comptime `T`
-    /// to compute slot sizes for the per-type side-table refcount
-    /// layout. Routing through `core.allocate` requires a runtime
-    /// size-class dispatch and is deferred to a future Phase 4.x
-    /// byte-level slab redesign; see the file-top "Memory Manager
-    /// ABI v1.0" comment block for the broader Phase 4.x deferral
-    /// rationale.
+    /// core vtable is healthy before invoking the manager's
+    /// `allocate_refcounted` slot. The slot returns a side-table-
+    /// backed cell whose refcount has already been initialised to 1;
+    /// the runtime writes `value` into the slot and returns its
+    /// pointer (the slot's first byte — there is no per-cell ArcHeader
+    /// under the side-table layout, so the slot is 100% user payload).
+    /// Phase 4.x closed the previous typed-slab-pool bypass: every
+    /// `Arc(T)` allocation now flows through the manager's vtable so
+    /// tracking managers can observe the cell's lifecycle end-to-end.
     pub fn allocAny(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
         // Phase 6: under no-REFCOUNT_V1 the slab pool's side-table
         // refcount layout has no semantic meaning, but the value
@@ -3257,15 +3747,67 @@ pub const ArcRuntime = struct {
         return dispatcherAllocImpl(T, allocator, value);
     }
 
-    /// Runtime-side dispatcher implementation of `allocAny`. Lives in
-    /// the runtime (not the external manager) because the typed slab
-    /// pool needs comptime `T` to compute slot sizes — see the
-    /// Phase 4.x deferral note on `allocAny`.
+    /// Runtime-side dispatcher implementation of `allocAny`. Routes
+    /// through the active manager's REFCOUNT_V1 `allocate_refcounted`
+    /// slot, which acquires a slot from the manager's byte-keyed
+    /// size-class slab pool, initialises the side-table refcount to 1,
+    /// and returns the slot pointer. The runtime then writes `value`
+    /// into the slot.
     fn dispatcherAllocImpl(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
         _ = allocator;
-        const ptr = ArcPool(T).create();
-        ptr.* = value;
-        return ptr;
+        const cap = zap_active_refcount_capability orelse
+            @panic("zap runtime: allocAny dispatched but active manager does not declare REFCOUNT_V1");
+        const ctx = zap_memory_manager_context orelse
+            @panic("zap runtime: allocAny dispatched with null manager context");
+        const size = @sizeOf(T);
+        const alignment_bytes = @alignOf(T);
+        const raw = cap.allocate_refcounted(ctx, size, @intCast(alignment_bytes)) orelse
+            @panic("zap runtime: out of memory: manager.allocate_refcounted returned null");
+        const slot: *T = @ptrCast(@alignCast(raw));
+        slot.* = value;
+        return slot;
+    }
+
+    /// Generate a per-type deep-walk callback that the active manager's
+    /// `release_sized` slot invokes on the zero-transition. The
+    /// callback recursively releases every indirect-storage Arc'd
+    /// child encountered by walking `T`'s fields at comptime. For
+    /// types with no refcounted children the callback compiles to a
+    /// no-op; the dispatcher passes `null` in that case to skip the
+    /// indirect call entirely.
+    fn DeepWalkFnFor(comptime T: type) AbiV1.ZapDeepWalkFn {
+        const DeepWalkClosure = struct {
+            fn walk(object: *anyopaque) callconv(.c) void {
+                const typed: *T = @ptrCast(@alignCast(object));
+                releaseChildrenAny(T, std.heap.page_allocator, typed.*);
+            }
+        };
+        return DeepWalkClosure.walk;
+    }
+
+    /// Comptime predicate: does the type carry any indirect-storage
+    /// Arc'd children whose release walker would do non-trivial work?
+    /// Used to elide the `deep_walk` callback for flat types (no
+    /// recursive pointer fields) — the dispatcher passes `null` and
+    /// the manager skips the indirect call.
+    fn typeHasArcChildren(comptime T: type) bool {
+        return switch (@typeInfo(T)) {
+            .@"struct" => |s| blk: {
+                inline for (s.fields) |field| {
+                    if (fieldTypeHasArcChild(field.type)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    fn fieldTypeHasArcChild(comptime FieldType: type) bool {
+        return switch (@typeInfo(FieldType)) {
+            .optional => |opt| fieldTypeHasArcChild(opt.child),
+            .pointer => |p| p.size == .one,
+            else => false,
+        };
     }
 
     /// Element type of an Arc value pointer. The ZIR backend calls every
@@ -3411,17 +3953,18 @@ pub const ArcRuntime = struct {
         core.deallocate(ctx, raw, size, @intCast(alignment_bytes));
     }
 
-    /// Runtime-side dispatcher implementation of `freeAny`. Lives in
-    /// the runtime (not the external manager) because the typed slab
-    /// pool needs comptime `T` to compute slot sizes — see the
-    /// Phase 4.x deferral note on `allocAny`.
+    /// Runtime-side dispatcher implementation of `freeAny`. Phase 4.x:
+    /// routes through the active manager's `release_sized` slot with
+    /// `deep_walk=null` so the manager performs the refcount decrement
+    /// and (on the zero-transition) the slot return without recursing
+    /// into children. Inline-header types continue through their
+    /// dedicated `release` / `arcReleaseDeep` method.
     fn dispatcherFreeImpl(allocator: std.mem.Allocator, ptr: anytype) void {
         if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
             const unwrapped = ptr orelse return;
             return dispatcherFreeImpl(allocator, unwrapped);
         }
         @setEvalBranchQuota(2000);
-        // `allocator` retained for ABI; pool-owned allocations don't use it.
         _ = &allocator;
         const T = arcPtrChild(@TypeOf(ptr));
         if (comptime hasInlineArcHeader(T)) {
@@ -3439,15 +3982,16 @@ pub const ArcRuntime = struct {
             }
             return;
         }
-        // Phase 4.x deferral: typed slab-pool path bypasses the
-        // REFCOUNT_V1 vtable (same rationale as `dispatcherRetainImpl`).
-        // The byte-level slab redesign will let this dispatch through
-        // `cap.release` once the slab pool can be driven by a
-        // runtime size-class.
+        // Arc(T) side-table path. Shallow free — no children walk; the
+        // manager observes the refcount decrement and on the zero-
+        // transition returns the slot to the slab pool. Public entry
+        // already validated globals.
+        const cap = zap_active_refcount_capability orelse unreachable;
+        const ctx = zap_memory_manager_context orelse unreachable;
+        const size = @sizeOf(T);
+        const alignment_bytes = @alignOf(T);
         const slot_ptr: *T = @constCast(ptr);
-        if (ArcPool(T).release(slot_ptr)) {
-            ArcPool(T).destroy(slot_ptr);
-        }
+        cap.release_sized(ctx, slot_ptr, size, @intCast(alignment_bytes), null);
     }
 
     /// Release (decrement refcount) an Arc-managed value given a pointer to the
@@ -3498,9 +4042,10 @@ pub const ArcRuntime = struct {
     }
 
     /// Runtime-side dispatcher implementation of `releaseAny`. Lives
-    /// in the runtime (not the external manager) because the typed
-    /// slab pool needs comptime `T` to compute slot sizes — see the
-    /// Phase 4.x deferral note on `allocAny`.
+    /// in the runtime so the comptime `T` can drive the per-type
+    /// deep-walk callback that the manager's `release_sized` slot
+    /// invokes on the zero-transition (inline-header types T route
+    /// through `T.release` / `T.arcReleaseDeep` for the same reason).
     fn dispatcherReleaseImpl(allocator: std.mem.Allocator, ptr: anytype) void {
         if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
             const unwrapped = ptr orelse return;
@@ -3526,78 +4071,6 @@ pub const ArcRuntime = struct {
         }
     }
 
-    /// Phase 1 of split-phase release: atomically decrement the refcount and
-    /// report whether the caller is now the last owner.
-    ///
-    /// Returns the mutable parent value pointer on the zero-transition (the
-    /// caller is the final owner and must finish destruction) and `null`
-    /// otherwise. Does NOT destroy the inner allocation — `destroyPreparedAny`
-    /// does that. The split exists so a compiler-generated deep-release helper
-    /// can read indirect-storage child pointers from the parent struct *before*
-    /// the parent's backing allocation is destroyed.
-    ///
-    /// The split is critical for side-table soundness: the caller reads
-    /// child pointers OUT of the slot (which still holds the user's `T`
-    /// value) BEFORE this function returns the slot to the free list.
-    /// On the zero transition the slot's content is still intact, so
-    /// callers can dereference `owned.*` to walk children before
-    /// invoking `destroyPreparedAny`.
-    pub fn prepareReleaseAny(comptime T: type, ptr: *const T) ?*T {
-        comptime {
-            if (hasInlineArcHeader(T))
-                @compileError("prepareReleaseAny: inline-header types must release via T.release, not the generic Arc pool");
-        }
-        // Phase 6: codegen elides every prepareReleaseAny call under
-        // no-REFCOUNT_V1. Without refcount tracking there is no
-        // "last owner" notion; the caller's deep-release walk path
-        // never fires.
-        if (comptime !refcount_v1_active) return null;
-        // Dispatcher consistency: every other public Arc(T) entry point
-        // panics on memory dispatch after shutdown; the split-phase pair
-        // honours the same contract. (The Phase 4.x vtable-bypass note
-        // below is a separate concern about the typed-slab path.)
-        if (zap_memory_shutdown_complete) {
-            @panic("zap runtime: memory dispatch after shutdown");
-        }
-        // Phase 4.x deferral: this split-phase entry point bypasses
-        // the REFCOUNT_V1 vtable. The split-phase borrow-elision API
-        // is not part of the spec's vtable surface yet — a future
-        // Phase 4.x byte-level slab redesign will reconcile it with
-        // the manager's release contract so the refcount decrement
-        // flows through `cap.release` while the caller retains
-        // access to the slot's contents.
-        const slot_ptr: *T = @constCast(ptr);
-        if (ArcPool(T).release(slot_ptr)) return slot_ptr;
-        return null;
-    }
-
-    /// Phase 2 of split-phase release: destroy an Arc-wrapped allocation
-    /// whose refcount has already been brought to zero by
-    /// `prepareReleaseAny`. The deep-release helper uses this between
-    /// the children walk and returning to the caller. The `allocator`
-    /// argument is vestigial — see `allocAny` and `ArcPool`.
-    pub fn destroyPreparedAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) void {
-        _ = allocator;
-        // Phase 6: codegen elides every destroyPreparedAny call under
-        // no-REFCOUNT_V1 (it pairs with `prepareReleaseAny` which
-        // always returns null in that mode, so this branch is
-        // unreachable from emitted code).
-        if (comptime !refcount_v1_active) return;
-        // Dispatcher consistency: every other public Arc(T) entry point
-        // panics on memory dispatch after shutdown; the split-phase pair
-        // honours the same contract. (The Phase 4.x vtable-bypass note
-        // below is a separate concern about the typed-slab path.)
-        if (zap_memory_shutdown_complete) {
-            @panic("zap runtime: memory dispatch after shutdown");
-        }
-        // Phase 4.x deferral: pairs with `prepareReleaseAny` — the
-        // storage-free half of the split-phase API also bypasses the
-        // core vtable. The future Phase 4.x rework routes this
-        // destruction through the manager so the storage path
-        // matches spec §8.2.
-        ArcPool(T).destroy(ptr);
-    }
-
     /// Deep-release an Arc-managed value. Walks the value's struct fields
     /// at comptime: every indirect-storage Arc'd field — encoded by the
     /// Zap codegen as a single-item const pointer (`?*const ChildT`) — is
@@ -3610,6 +4083,14 @@ pub const ArcRuntime = struct {
     /// terminates because Zig memoizes generic instantiations by their
     /// comptime parameter values; the recursive reference reuses the same
     /// in-progress instance rather than expanding indefinitely.
+    ///
+    /// Phase 4.x: For Arc(T) types this is implemented as
+    /// `cap.release_sized(ptr, size, alignment, deep_walk)` where
+    /// `deep_walk` is a per-T callback that invokes
+    /// `releaseChildrenAny(T, ...)` on the cell BEFORE the manager
+    /// returns the slot to the slab pool. Inline-header types continue
+    /// to go through their dedicated `release` / `arcReleaseDeep`
+    /// method (which itself routes through `headerRelease`).
     pub fn releaseArcAny(comptime T: type, allocator: std.mem.Allocator, ptr: *const T) void {
         if (comptime hasInlineArcHeader(T)) {
             if (@hasDecl(T, "release")) {
@@ -3621,10 +4102,22 @@ pub const ArcRuntime = struct {
             }
             return;
         }
-        if (prepareReleaseAny(T, ptr)) |owned| {
-            releaseChildrenAny(T, allocator, owned.*);
-            destroyPreparedAny(T, allocator, owned);
-        }
+        // Arc(T) side-table path. Dispatch through the active manager's
+        // `release_sized` slot; on the zero-transition the manager
+        // invokes the per-T `deep_walk` callback (which recursively
+        // releases children) and then frees the slot. The outer
+        // `releaseAny` already validated globals before reaching this
+        // type-specific dispatcher.
+        const cap = zap_active_refcount_capability orelse unreachable;
+        const ctx = zap_memory_manager_context orelse unreachable;
+        const size = @sizeOf(T);
+        const alignment_bytes = @alignOf(T);
+        const slot_ptr: *T = @constCast(ptr);
+        const deep_walk: ?AbiV1.ZapDeepWalkFn = if (comptime typeHasArcChildren(T))
+            DeepWalkFnFor(T)
+        else
+            null;
+        cap.release_sized(ctx, slot_ptr, size, @intCast(alignment_bytes), deep_walk);
     }
 
     /// Walk every field of an aggregate value at comptime and deep-release
@@ -3704,17 +4197,19 @@ pub const ArcRuntime = struct {
     /// assignment.
     ///
     /// Phase 2 indirection layer: the dispatcher validates the active
-    /// manager + refcount capability before dispatching. See the
-    /// header comment on `allocAny` for why the typed slab-pool path
-    /// still uses the typed impl directly.
+    /// manager + refcount capability before dispatching to either the
+    /// inline-header `cap.retain` slot (for Map/List/MapIter cells)
+    /// or the side-table `cap.retain_sized` slot (for `Arc(T)` cells).
     ///
     /// Naming convention: `retainAny` / `releaseAny` are the typed-
     /// pointer entry points used by codegen for `Arc(T)` cells, while
     /// `headerRetain` / `headerRelease` are the inline-header entry
-    /// points used by `Map.retain`, `List.retain`, etc. A future
-    /// Phase 4.x byte-level slab redesign will unify the two naming
-    /// families once the typed slab-pool path can be driven by the
-    /// vtable's runtime-sized `core.allocate(size, alignment)` slot.
+    /// points used by `Map.retain`, `List.retain`, etc. Both families
+    /// route through the same REFCOUNT_V1 capability; the inline-
+    /// header family uses `retain` / `release` (atomic-on-offset-0 of
+    /// the cell), and the Arc(T) family uses `retain_sized` /
+    /// `release_sized` (slab-lookup via 64-KiB-aligned pointer mask
+    /// + size class).
     pub fn retainAny(ptr: anytype) void {
         // Phase 6: codegen elides every retainAny call under no-REFCOUNT_V1.
         if (comptime !refcount_v1_active) return;
@@ -3733,17 +4228,16 @@ pub const ArcRuntime = struct {
         dispatcherRetainImpl(ptr);
     }
 
-    /// Runtime-side dispatcher implementation of `retainAny`. Lives
-    /// in the runtime (not the external manager) because the typed
-    /// slab pool needs comptime `T` to compute slot sizes for the
-    /// side-table refcount layout.
-    ///
-    /// Inline-header branch routes through `headerRetain` so the
-    /// retain actually flows through the active manager's vtable.
-    /// Side-table branch calls the typed `ArcPool(T).retain` directly
-    /// because the slab pool's per-slot side-table refcount requires
-    /// comptime `T` — a Phase 4.x byte-level slab redesign will
-    /// reconcile this with the vtable dispatch path.
+    /// Runtime-side dispatcher implementation of `retainAny`. Phase 4.x:
+    /// inline-header types route through `headerRetain` (atomic on the
+    /// offset-0 ArcHeader); Arc(T) side-table types route through the
+    /// active manager's `retain_sized` slot, which locates the cell's
+    /// slab via pointer masking and atomic-increments the side-table
+    /// refcount. The public entry (`retainAny`) has already validated
+    /// `zap_active_refcount_capability != null` and
+    /// `zap_memory_manager_context != null`; the dispatcher therefore
+    /// reads both via unchecked unwrap with `.?`, letting the compiler
+    /// fold the redundant null guard.
     fn dispatcherRetainImpl(ptr: anytype) void {
         if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
             const unwrapped = ptr orelse return;
@@ -3755,9 +4249,15 @@ pub const ArcRuntime = struct {
             headerRetain(&mut.header);
             return;
         }
-        // Phase 4.x deferral: typed slab-pool retain bypasses the
-        // REFCOUNT_V1 vtable. See file-top comment block.
-        ArcPool(T).retain(@constCast(ptr));
+        // Arc(T) side-table path. The public entry has already validated
+        // both globals; the orelse unreachable lets release builds
+        // elide the second null check.
+        const cap = zap_active_refcount_capability orelse unreachable;
+        const ctx = zap_memory_manager_context orelse unreachable;
+        const size = @sizeOf(T);
+        const alignment_bytes = @alignOf(T);
+        const slot_ptr: *T = @constCast(ptr);
+        cap.retain_sized(ctx, slot_ptr, size, @intCast(alignment_bytes));
         arc_retains_total += 1;
     }
 
@@ -3788,14 +4288,12 @@ pub const ArcRuntime = struct {
     }
 
     /// Runtime-side dispatcher implementation of `retainAnyPersistent`.
-    /// Lives in the runtime (not the external manager) for the same
-    /// comptime-`T` reasons as `dispatcherRetainImpl`.
-    ///
-    /// Inline-header branch: prefers the type's public `retain` method
-    /// (which itself routes through `headerRetain` plus any
-    /// type-specific bookkeeping like Map's share-event hook); falls
-    /// back to `headerRetain` directly when the type does not expose
-    /// a public `retain`.
+    /// Phase 4.x: inline-header types prefer the public `retain` method
+    /// (which routes through `headerRetain` plus any type-specific
+    /// bookkeeping like Map's share-event hook); falls back to
+    /// `headerRetain` directly when the type does not expose a public
+    /// `retain`. Arc(T) side-table types route through the active
+    /// manager's `retain_sized` slot.
     fn dispatcherRetainAnyPersistentImpl(ptr: anytype) void {
         if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
             const unwrapped = ptr orelse return;
@@ -3811,11 +4309,13 @@ pub const ArcRuntime = struct {
             headerRetain(&mut.header);
             return;
         }
-        // Phase 4.x deferral: same bypass rationale as
-        // `dispatcherRetainImpl` — typed slab pool requires comptime
-        // `T` for the side-table refcount, so the persistent-retain
-        // path also routes around the REFCOUNT_V1 vtable.
-        ArcPool(T).retain(@constCast(ptr));
+        // Arc(T) side-table path. Public entry already validated globals.
+        const cap = zap_active_refcount_capability orelse unreachable;
+        const ctx = zap_memory_manager_context orelse unreachable;
+        const size = @sizeOf(T);
+        const alignment_bytes = @alignOf(T);
+        const slot_ptr: *T = @constCast(ptr);
+        cap.retain_sized(ctx, slot_ptr, size, @intCast(alignment_bytes));
         arc_retains_total += 1;
     }
 
@@ -3947,7 +4447,11 @@ pub const ArcRuntime = struct {
         arc_releases_total += 1;
     }
 
-    /// Get the refcount of an Arc-managed value.
+    /// Get the refcount of an Arc-managed value. Phase 4.x: inline-
+    /// header types read directly from their offset-0 header; Arc(T)
+    /// side-table types route through the active manager's
+    /// `refcount_sized` slot, which looks up the slab and reads the
+    /// side-table entry.
     pub fn refCountAny(ptr: anytype) u32 {
         if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
             const unwrapped = ptr orelse return 0;
@@ -3957,7 +4461,13 @@ pub const ArcRuntime = struct {
         if (comptime hasInlineArcHeader(T)) {
             return ptr.header.count();
         }
-        return ArcPool(T).refCount(ptr);
+        if (comptime !refcount_v1_active) return 0;
+        const cap = zap_active_refcount_capability orelse return 0;
+        const ctx = zap_memory_manager_context orelse return 0;
+        const size = @sizeOf(T);
+        const alignment_bytes = @alignOf(T);
+        const slot_ptr: *const T = ptr;
+        return cap.refcount_sized(ctx, @ptrCast(@constCast(slot_ptr)), size, @intCast(alignment_bytes));
     }
 
     /// Reset a value for Perceus-style reuse. If the reference count is 1,
@@ -12595,24 +13105,28 @@ test "ArcRuntime.retainAny and refCountAny" {
     ArcRuntime.freeAny(std.testing.allocator, val);
 }
 
-test "ArcRuntime.prepareReleaseAny returns ptr only on the zero-transition" {
+test "ArcRuntime.releaseAny invokes per-type deep-walk on the zero-transition" {
+    // Phase 4.x: the split-phase `prepareReleaseAny` / `destroyPreparedAny`
+    // API was removed in favour of a unified `cap.release_sized` slot
+    // on the REFCOUNT_V1 vtable. The vtable's `release_sized` walks
+    // children via the per-type deep-walk callback BEFORE returning
+    // the slot to the slab pool, so the recursive teardown semantics
+    // are preserved. This test asserts the manager-driven path
+    // through `releaseAny`: alloc -> retain -> release (no-op) ->
+    // release (zero-transition + free).
     const alloc = std.testing.allocator;
     const val = ArcRuntime.allocAny(i64, alloc, 7);
     // Second owner — refcount now 2.
     ArcRuntime.retainAny(val);
+    try std.testing.expectEqual(@as(u32, 2), ArcRuntime.refCountAny(val));
 
-    // First prepare: count goes 2 → 1. We're not the final owner.
-    try std.testing.expect(ArcRuntime.prepareReleaseAny(i64, val) == null);
+    // First release decrements 2 -> 1. Cell stays alive.
+    ArcRuntime.releaseAny(alloc, val);
     try std.testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(val));
 
-    // Second prepare: count goes 1 → 0. We ARE the final owner.
-    const owned = ArcRuntime.prepareReleaseAny(i64, val) orelse {
-        try std.testing.expect(false);
-        return;
-    };
-    try std.testing.expectEqual(@as(i64, 7), owned.*);
-    // Children would be walked here in a deep-release helper. Then:
-    ArcRuntime.destroyPreparedAny(i64, alloc, owned);
+    // Second release decrements 1 -> 0; the manager invokes deep_walk
+    // (no children for i64) and returns the slot to the slab pool.
+    ArcRuntime.releaseAny(alloc, val);
 }
 
 test "Phase 4 ABI: ARC manager is bound by default in test builds" {

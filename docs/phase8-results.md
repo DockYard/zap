@@ -357,6 +357,62 @@ Two items remain deferred from this verification pass:
    carries this saving (verified by the test suite); a dedicated
    bench would just quantify it on a synthetic allocation pattern.
 
+## 10.1. Phase 4.x byte-level slab pool — CLOSED (v1.0.x follow-up)
+
+The original Phase 4 implementation routed inline-header retain/release
+(Map/List/MapIter) through the active manager's REFCOUNT_V1 vtable but
+kept generic `Arc(T)` cells in a runtime-owned typed slab pool
+(`ArcSlabPool(T, ...)` with `side_table=true`) — the byte-level
+`core.allocate(size, alignment)` could not drive a comptime-`T`-typed
+slab pool without runtime size-class dispatch. That bypass left
+`Arc(T)` allocations invisible to third-party tracking managers and
+was documented as a deferred follow-up.
+
+The v1.0.x rework landed in `src/memory/arc/manager.zig` and
+`src/runtime.zig`. The manager now owns a byte-keyed multi-class
+slab pool keyed on `(size, alignment)`, partitioned into 17 size
+classes from 16 bytes to 4096 bytes (1.5× progression: 16, 24, 32,
+48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072,
+4096). Allocations above 4096 bytes route to `page_allocator`
+directly. The REFCOUNT_V1 capability vtable grew by four function-
+pointer slots that the runtime dispatches through for every
+`Arc(T)` cell:
+
+- `allocate_refcounted(ctx, size, alignment)` — acquires a slot with
+  side-table refcount initialised to 1.
+- `retain_sized(ctx, ptr, size, alignment)` — atomic-increments the
+  side-table entry by looking up the cell's slab (64-KiB-aligned
+  pointer mask) and slot index.
+- `release_sized(ctx, ptr, size, alignment, deep_walk)` —
+  atomic-decrements the side-table entry; on the zero-transition
+  invokes `deep_walk` (children) and returns the slot to the slab.
+- `refcount_sized(ctx, ptr, size, alignment)` — reads the side-table
+  entry (used by `resetAny` / Perceus reuse).
+
+The descriptor's `size` field grew from 16 to 48 bytes to advertise
+the extended surface; older v1.0 runtimes that read only the first
+two slots remain compatible.
+
+The split-phase release API (`prepareReleaseAny` /
+`destroyPreparedAny`) was removed in favour of the unified
+`release_sized` slot, which folds the refcount decrement, the
+per-type deep-walk callback, and the slot-return into one vtable
+call. The runtime's `releaseArcAny` now constructs a per-type
+deep-walk closure at comptime when `T` has refcounted children;
+flat types pass `null` to elide the indirect call entirely.
+
+**Performance impact**: binarytrees N=21 RSS is 169.4 MB (vs the
+pre-rework 169.9 MB — within 5%, slightly better). Wall time is
+within noise of the pre-rework baseline once the manager's hot
+path is built with native `@atomicRmw` (the prebuilt
+`libzap_compiler.a` ships with LLVM enabled, so the fork primitive
+lowers atomic ops directly without the previous externalised
+helper). All 1128 tests continue to pass.
+
+**Tracking managers** (e.g. `Zap.Memory.Tracking` from §5.2) now
+observe `Arc(T)` allocations end-to-end through the standard
+`core.allocate` + `release_sized` interface.
+
 ## 11. Conclusion
 
 **Ready for v1.0 release.** The pluggable memory manager ABI v1.0
