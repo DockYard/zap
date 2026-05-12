@@ -1122,3 +1122,203 @@ fn insertionLessThan(_: void, a: PendingInsertion, b: PendingInsertion) bool {
     if (a.instr_index != b.instr_index) return a.instr_index < b.instr_index;
     return a.position == .before and b.position == .after;
 }
+
+// ============================================================
+// Phase 6 elision tests
+// ============================================================
+
+/// Count `.retain` / `.release` / `.reset` instructions across every block
+/// of `function`. Used by the Phase 6 elision tests below to assert
+/// that `materializeAnalysisArcOps` materialises every refcount op when
+/// the active manager declares REFCOUNT_V1 (`declared_caps =
+/// REFCOUNT_V1_BIT`) and elides every refcount op when the manager
+/// omits it (`declared_caps = 0`).
+fn countRefcountInstrs(function: *const ir.Function) struct { retains: u32, releases: u32, resets: u32 } {
+    var retains: u32 = 0;
+    var releases: u32 = 0;
+    var resets: u32 = 0;
+    for (function.body) |block| {
+        for (block.instructions) |instr| switch (instr) {
+            .retain => retains += 1,
+            .release => releases += 1,
+            .reset => resets += 1,
+            else => {},
+        };
+    }
+    return .{ .retains = retains, .releases = releases, .resets = resets };
+}
+
+test "materializeAnalysisArcOps strips refcount ops under declared_caps=0" {
+    // Build a fixture with two `param_get` instructions and a return.
+    // Stage three arc_ops at the top-level block targeting consecutive
+    // instruction indices: a retain on local 0, a release on local 1,
+    // and a release on the return slot. Under REFCOUNT_V1, materialize
+    // inserts a `.retain` and two `.release` instructions; under
+    // declared_caps=0, none of them appear in the IR.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const params = try arena.alloc(ir.Param, 2);
+    params[0] = .{ .name = "a", .type_expr = .string };
+    params[1] = .{ .name = "b", .type_expr = .string };
+
+    const stream = try arena.alloc(ir.Instruction, 3);
+    stream[0] = .{ .param_get = .{ .dest = 0, .index = 0 } };
+    stream[1] = .{ .param_get = .{ .dest = 1, .index = 1 } };
+    stream[2] = .{ .ret = .{ .value = 0 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 2);
+    local_ownership[0] = .owned;
+    local_ownership[1] = .owned;
+
+    var function = ir.Function{
+        .id = 0,
+        .name = "materialize_elision_fixture",
+        .scope_id = 0,
+        .arity = 2,
+        .params = params,
+        .return_type = .string,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 2,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var actx = escape_lattice.AnalysisContext.init(std.testing.allocator);
+    defer actx.deinit();
+
+    // Stage three arc_ops: retain on local 0 before instr 0, release on
+    // local 1 after instr 1, release on local 0 before the ret. Three
+    // distinct refcount op kinds is enough to lock in the elision
+    // contract for every kind without exercising the rest of the
+    // materialiser's nested-stream descent.
+    try actx.arc_ops.append(std.testing.allocator, .{
+        .kind = .retain,
+        .value = 0,
+        .insertion_point = .{
+            .function = 0,
+            .block = 0,
+            .instr_index = 0,
+            .position = .before,
+        },
+        .reason = .shared_binding,
+    });
+    try actx.arc_ops.append(std.testing.allocator, .{
+        .kind = .release,
+        .value = 1,
+        .insertion_point = .{
+            .function = 0,
+            .block = 0,
+            .instr_index = 1,
+            .position = .after,
+        },
+        .reason = .scope_exit,
+    });
+    try actx.arc_ops.append(std.testing.allocator, .{
+        .kind = .release,
+        .value = 0,
+        .insertion_point = .{
+            .function = 0,
+            .block = 0,
+            .instr_index = 2,
+            .position = .before,
+        },
+        .reason = .scope_exit,
+    });
+
+    try materializeAnalysisArcOps(arena, &function, &actx, 0);
+
+    const counts = countRefcountInstrs(&function);
+    try std.testing.expectEqual(@as(u32, 0), counts.retains);
+    try std.testing.expectEqual(@as(u32, 0), counts.releases);
+    try std.testing.expectEqual(@as(u32, 0), counts.resets);
+
+    // The analysis-context records are preserved verbatim under
+    // elision so downstream passes (Phase 7 tracking managers, the
+    // V10 audit) can still inspect them. Three records in, three
+    // records back out.
+    try std.testing.expectEqual(@as(usize, 3), actx.arc_ops.items.len);
+}
+
+test "materializeAnalysisArcOps emits refcount ops under REFCOUNT_V1" {
+    // Mirror image of the elision test: same fixture, declared_caps =
+    // REFCOUNT_V1_BIT, asserts the expected `.retain` / `.release`
+    // IR materializes. Locks the regression direction: tomorrow's
+    // refactor that accidentally always-elides must fail both
+    // tests, not just one.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const params = try arena.alloc(ir.Param, 2);
+    params[0] = .{ .name = "a", .type_expr = .string };
+    params[1] = .{ .name = "b", .type_expr = .string };
+
+    const stream = try arena.alloc(ir.Instruction, 3);
+    stream[0] = .{ .param_get = .{ .dest = 0, .index = 0 } };
+    stream[1] = .{ .param_get = .{ .dest = 1, .index = 1 } };
+    stream[2] = .{ .ret = .{ .value = 0 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 2);
+    local_ownership[0] = .owned;
+    local_ownership[1] = .owned;
+
+    var function = ir.Function{
+        .id = 0,
+        .name = "materialize_emit_fixture",
+        .scope_id = 0,
+        .arity = 2,
+        .params = params,
+        .return_type = .string,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 2,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var actx = escape_lattice.AnalysisContext.init(std.testing.allocator);
+    defer actx.deinit();
+
+    try actx.arc_ops.append(std.testing.allocator, .{
+        .kind = .retain,
+        .value = 0,
+        .insertion_point = .{
+            .function = 0,
+            .block = 0,
+            .instr_index = 0,
+            .position = .before,
+        },
+        .reason = .shared_binding,
+    });
+    try actx.arc_ops.append(std.testing.allocator, .{
+        .kind = .release,
+        .value = 1,
+        .insertion_point = .{
+            .function = 0,
+            .block = 0,
+            .instr_index = 1,
+            .position = .after,
+        },
+        .reason = .scope_exit,
+    });
+
+    const abi = @import("memory/abi.zig");
+    try materializeAnalysisArcOps(arena, &function, &actx, abi.REFCOUNT_V1_BIT);
+
+    const counts = countRefcountInstrs(&function);
+    try std.testing.expect(counts.retains >= 1);
+    try std.testing.expect(counts.releases >= 1);
+}

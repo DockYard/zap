@@ -1443,6 +1443,16 @@ fn runBinaryIgnoreError(allocator: std.mem.Allocator, output_path: []const u8, r
 /// incremental Sema can diff prev_zir vs new_zir and only re-analyze changed
 /// code. The frontend (parse→IR) is re-run fully on each change, but the
 /// expensive backend (Sema→codegen→link) is incremental.
+///
+/// Watch-mode pins the active memory manager for the lifetime of the
+/// watch session: `init` resolves the manager once, caches its
+/// `declared_caps` bitmask in `declared_caps`, and threads that value
+/// into every subsequent `rebuild`. The cache mirrors the spec's
+/// single-manager-per-binary invariant — a watch session does NOT
+/// re-resolve between rebuilds, even if the user edits `build.zap`'s
+/// `memory:` field. Editing `memory:` requires bouncing the watcher,
+/// which `watchAndRebuild` already does by tearing down the
+/// IncrementalWatchState on `build.zap` change.
 const IncrementalWatchState = struct {
     zir_ctx: *zir_builder.ZirContext,
     /// Duped backend compile options that outlive buildTarget's arena.
@@ -1457,15 +1467,43 @@ const IncrementalWatchState = struct {
     allocator: std.mem.Allocator,
     /// Whether the context has had at least one successful inject+update.
     baseline_established: bool = false,
+    /// Resolved memory manager's capability bitmask. Cached in `init`
+    /// from `zap.memory_driver.resolve` and threaded into every
+    /// `compileProjectFrontend` / `injectAndUpdate` call so Phase 6
+    /// codegen elision uses the same bitmask the initial backend
+    /// context was created with. Phase 6 watch mode currently
+    /// requires REFCOUNT_V1 (see `init` for the diagnostic) — the
+    /// cache exists so a future relaxation can carry per-session caps
+    /// without rebuilding it on every rebuild.
+    declared_caps: u64,
+    /// Resolved manager object path. Owned by `allocator`; freed in
+    /// `deinit`. Threaded into every `injectAndUpdate` call so the
+    /// link step pulls in the manager `.o`. Mirrors the
+    /// `resolved_manager.object_path` lifetime in `buildTarget`.
+    memory_manager_object: ?[]const u8 = null,
 
     fn deinit(self: *IncrementalWatchState) void {
         zir_backend.destroyContext(self.zir_ctx);
         self.allocator.free(self.zig_lib_dir);
         self.allocator.free(self.output_path);
         self.allocator.free(self.output_name);
+        if (self.memory_manager_object) |p| self.allocator.free(p);
     }
 
     /// Create incremental state by deriving the same config buildTarget uses.
+    ///
+    /// Watch mode pins one memory manager for the lifetime of the
+    /// session. `init` re-runs the same `zap.memory_driver.resolve`
+    /// flow `buildTarget` uses, caches the resolved `declared_caps`,
+    /// and persists the object path so every rebuild's link step
+    /// picks up the same manager `.o`. Phase 6 ships watch mode as
+    /// REFCOUNT_V1-only: a manager whose `declared_caps` omits
+    /// `REFCOUNT_V1_BIT` causes `init` to print a diagnostic and
+    /// return null, falling back to non-incremental rebuilds (the
+    /// regular `buildTarget` path supports every manager). The
+    /// incremental backend's interaction with elided refcount IR
+    /// remains incomplete; refusing to start is the only safe
+    /// option until that work lands.
     fn init(
         allocator: std.mem.Allocator,
         project_root: []const u8,
@@ -1485,6 +1523,120 @@ const IncrementalWatchState = struct {
         const config = manifest_eval.config;
 
         const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse (extractEmbeddedZigLib(alloc) catch return null);
+
+        // Build the same set of source roots `buildTarget` constructs
+        // (project lib/test/tools, deps, zap_stdlib) so the memory
+        // driver's discovery walk can find the manager struct that
+        // `memory:` references. Watch mode does not currently support
+        // git deps that haven't been previously resolved by a
+        // `buildTarget` run; the initial full rebuild that precedes
+        // `IncrementalWatchState.init` ensures the lockfile is in place.
+        var watch_source_roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
+        {
+            const lib_dir = std.fs.path.join(alloc, &.{ project_root, "lib" }) catch return null;
+            if (std.Io.Dir.cwd().access(global_io, lib_dir, .{})) |_| {
+                watch_source_roots.append(alloc, .{ .name = "project", .path = lib_dir }) catch return null;
+            } else |_| {}
+            const test_dir = std.fs.path.join(alloc, &.{ project_root, "test" }) catch return null;
+            if (std.Io.Dir.cwd().access(global_io, test_dir, .{})) |_| {
+                watch_source_roots.append(alloc, .{ .name = "project", .path = test_dir }) catch return null;
+            } else |_| {}
+            watch_source_roots.append(alloc, .{ .name = "project", .path = project_root }) catch return null;
+        }
+        for (config.deps) |dep| {
+            const dep_name = std.fmt.allocPrint(alloc, "dep:{s}", .{dep.name}) catch return null;
+            switch (dep.source) {
+                .path => |dep_path| {
+                    const dep_dir = std.fs.path.join(alloc, &.{ project_root, dep_path }) catch return null;
+                    const dep_lib_dir = std.fs.path.join(alloc, &.{ dep_dir, "lib" }) catch return null;
+                    if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{})) |_| {
+                        watch_source_roots.append(alloc, .{ .name = dep_name, .path = dep_lib_dir }) catch return null;
+                    } else |_| {
+                        watch_source_roots.append(alloc, .{ .name = dep_name, .path = dep_dir }) catch return null;
+                    }
+                },
+                else => {},
+            }
+        }
+        if (zap_lib_dir) |zap_lib| {
+            watch_source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_lib }) catch return null;
+            const zap_subdir = std.fs.path.join(alloc, &.{ zap_lib, "zap" }) catch return null;
+            if (std.Io.Dir.cwd().access(global_io, zap_subdir, .{})) |_| {
+                watch_source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_subdir }) catch return null;
+            } else |_| {}
+        }
+
+        // Resolve the active memory manager — mirror `buildTarget`'s
+        // flow so the watch-session uses the same manager `.o` and
+        // capability bitmask that a non-watch build would. The
+        // driver_optimize/driver target arguments mirror
+        // `buildTarget` to keep the cached object identical across
+        // build modes.
+        const driver_optimize: zap.memory_driver.ZapForkOptimize = switch (config.optimize) {
+            .debug => .Debug,
+            .release_safe => .ReleaseSafe,
+            .release_fast => .ReleaseFast,
+            .release_small => .ReleaseSmall,
+        };
+        const zap_source_tree_root: []const u8 = if (zap_lib_dir) |lib_dir|
+            (std.fs.path.dirname(lib_dir) orelse project_root)
+        else
+            project_root;
+        var driver_diag_buf: [4096]u8 = undefined;
+        var driver_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &driver_diag_buf };
+        const memory_source_roots = sourceRootsForMemoryDriver(alloc, watch_source_roots.items) catch return null;
+        var resolved_manager = zap.memory_driver.resolve(
+            alloc,
+            .{
+                .manager_name = config.memory_manager orelse "",
+                .source_roots = memory_source_roots,
+                .project_root = project_root,
+                .zap_source_root = zap_source_tree_root,
+                .cache_dir = ".zap-cache/memory",
+                .zig_lib_dir = zig_lib_dir,
+                .optimize = driver_optimize,
+                .target = compile_target,
+            },
+            &driver_diag,
+        ) catch |err| {
+            std.debug.print(
+                "Error: watch-mode memory manager resolution failed: {s}\n",
+                .{@errorName(err)},
+            );
+            if (driver_diag.text().len > 0) {
+                std.debug.print("  {s}\n", .{driver_diag.text()});
+            }
+            return null;
+        };
+        defer zap.memory_driver.freeResolved(alloc, &resolved_manager);
+
+        // Spec section 8.5 / Phase 6 codegen elision: watch mode does
+        // not yet support managers whose `declared_caps` omits
+        // `REFCOUNT_V1_BIT`. The incremental backend's interaction
+        // with the lifecycle-pairing-only code path (no retain/release
+        // IR, only `core.deallocate` matching) is genuinely incomplete
+        // — refusing to start is the only sound behavior. The full
+        // `buildTarget` rebuild path remains the supported way to
+        // build under Arena / NoOp managers.
+        if ((resolved_manager.declared_caps & zap.memory_abi.REFCOUNT_V1_BIT) == 0) {
+            std.debug.print(
+                "Error: watch mode currently requires a REFCOUNT_V1 manager (selected: {s}, declared_caps: 0x{x:0>16})\n",
+                .{ resolved_manager.name, resolved_manager.declared_caps },
+            );
+            std.debug.print(
+                "       falling back to non-incremental rebuilds for this manager.\n",
+                .{},
+            );
+            return null;
+        }
+
+        const declared_caps = resolved_manager.declared_caps;
+        const memory_manager_object_owned: ?[]const u8 = if (resolved_manager.object_path) |op|
+            (allocator.dupe(u8, op) catch return null)
+        else
+            null;
+        errdefer if (memory_manager_object_owned) |p| allocator.free(p);
+
         const output_name_raw = if (config.asset_name) |an| (if (an.len > 0) an else config.name) else config.name;
         const out_dir: []const u8 = switch (config.kind) {
             .bin => "zap-out/bin",
@@ -1522,33 +1674,28 @@ const IncrementalWatchState = struct {
             return null;
         };
 
-        // Create persistent ZirContext.
-        //
-        // Watch mode does not currently re-resolve the memory manager
-        // between rebuilds (the active manager binding is fixed for a
-        // watch session, matching the spec's single-manager-per-binary
-        // contract). For Phase 6, pass `REFCOUNT_V1_BIT` here so the
-        // runtime source rewrite matches the in-tree ARC manager that
-        // production builds use by default. A watch-mode session that
-        // selects a non-ARC manager via `memory:` in the manifest is
-        // out of scope for v1.0; the regular `buildTarget` path
-        // exercises every supported manager.
-        const watch_caps: u64 = zap.memory_abi.REFCOUNT_V1_BIT;
+        // Create persistent ZirContext. The runtime source is rewritten
+        // against `declared_caps` so the generated runtime matches the
+        // resolved manager's capability surface — Phase 6 inline-header
+        // layout and codegen elision both consult this value.
         const ctx = zir_backend.createContext(allocator, .{
             .zig_lib_dir = zig_lib_duped,
             .cache_dir = ".zap-cache",
             .global_cache_dir = ".zap-cache",
             .output_path = output_path_duped,
             .name = output_name_duped,
-            .runtime_source = compiler.getRuntimeSource(watch_caps),
+            .runtime_source = compiler.getRuntimeSource(declared_caps),
             .output_mode = output_mode_val,
             .optimize_mode = optimize_mode_val,
             .target = compile_target,
             .link_libc = true,
+            .memory_manager_object = memory_manager_object_owned,
+            .declared_caps = declared_caps,
         }) catch {
             allocator.free(zig_lib_duped);
             allocator.free(output_path_duped);
             allocator.free(output_name_duped);
+            if (memory_manager_object_owned) |p| allocator.free(p);
             return null;
         };
 
@@ -1563,6 +1710,8 @@ const IncrementalWatchState = struct {
             .lib_mode = config.kind == .lib,
             .link_libc = true,
             .allocator = allocator,
+            .declared_caps = declared_caps,
+            .memory_manager_object = memory_manager_object_owned,
         };
     }
 
@@ -1708,6 +1857,14 @@ const IncrementalWatchState = struct {
             .ctfe_target = target_name,
             .ctfe_optimize = @tagName(config.optimize),
             .io = global_io,
+            // Threading the cached `declared_caps` here is the key
+            // Phase 6 plumbing: `compileProjectFrontend` forwards it
+            // to `arc_materialize.materializeAnalysisArcOps`, which
+            // decides whether to emit retain/release/reset IR for
+            // each function. Defaulting to 0 (as the previous watch
+            // code did) would strip every refcount op even under a
+            // REFCOUNT_V1 manager and silently leak every Arc cell.
+            .declared_caps = self.declared_caps,
         }) catch return error.FrontendError;
 
         // Resolve entry point
@@ -1752,24 +1909,25 @@ const IncrementalWatchState = struct {
             }
         }
 
-        // Inject new ZIR and run Sema+codegen+link
-        // Watch mode caps: see `IncrementalWatchState.init` for the
-        // rationale. The watch session is pinned to the same caps the
-        // initial context was created with.
-        const watch_caps: u64 = zap.memory_abi.REFCOUNT_V1_BIT;
+        // Inject new ZIR and run Sema+codegen+link. The cached caps
+        // and manager object are reused from `IncrementalWatchState.init`
+        // (a watch session pins one manager for its lifetime — see the
+        // struct doc), so every rebuild emits codegen against the same
+        // capability surface that `init` resolved.
         zir_backend.injectAndUpdate(alloc, result.ir_program, self.zir_ctx, .{
             .zig_lib_dir = self.zig_lib_dir,
             .cache_dir = ".zap-cache",
             .global_cache_dir = ".zap-cache",
             .output_path = self.output_path,
             .name = self.output_name,
-            .runtime_source = compiler.getRuntimeSource(watch_caps),
+            .runtime_source = compiler.getRuntimeSource(self.declared_caps),
             .output_mode = self.output_mode,
             .optimize_mode = self.optimize_mode,
             .link_libc = self.link_libc,
             .analysis_context = if (result.analysis_context) |*ctx| ctx else null,
             .arc_ownership = if (result.arc_ownership) |*ownership| ownership else null,
-            .declared_caps = watch_caps,
+            .memory_manager_object = self.memory_manager_object,
+            .declared_caps = self.declared_caps,
         }) catch return error.BackendError;
 
         self.baseline_established = true;

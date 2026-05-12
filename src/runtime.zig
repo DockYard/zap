@@ -3211,6 +3211,21 @@ pub const ArcRuntime = struct {
             // routed path. We don't `_ = allocator;` because the
             // REFCOUNT_V1 branch below uses it, and Zig errors on a
             // discard-of-used-param. Leave it untouched.
+            //
+            // Symmetric guards with the REFCOUNT_V1 branch: the
+            // shutdown-complete check refuses any dispatch after
+            // `core.deinit` has run (spec section 4.4 / 4.6); the
+            // `ensureMemoryStartup` call binds the active manager
+            // lazily on first dispatch. Without these guards, the
+            // first `allocAny` call in an Arena/NoOp build would
+            // observe `zap_active_manager_core == null` (because
+            // startup binding only happens inside `ensureMemoryStartup`)
+            // and crash before the null-check below could produce a
+            // useful panic message.
+            if (zap_memory_shutdown_complete) {
+                @panic("zap runtime: memory dispatch after shutdown");
+            }
+            ensureMemoryStartup();
             const core = zap_active_manager_core orelse
                 @panic("zap runtime: allocAny dispatched with no active memory manager");
             const ctx = zap_memory_manager_context orelse
@@ -3303,8 +3318,24 @@ pub const ArcRuntime = struct {
     /// Validation mirrors `releaseAny` — the dispatcher refuses to
     /// dispatch against a manager that does not declare REFCOUNT_V1.
     pub fn freeAny(allocator: std.mem.Allocator, ptr: anytype) void {
-        // Phase 6: codegen elides every freeAny call under no-REFCOUNT_V1.
-        if (comptime !refcount_v1_active) return;
+        if (comptime !refcount_v1_active) {
+            // Phase 6 lifecycle pairing: under no-REFCOUNT_V1, every
+            // `allocAny` call routed through `core.allocate` (see the
+            // non-REFCOUNT_V1 branch of `allocAny` above). Spec §4.5
+            // mandates the matching call is `core.deallocate(ctx, ptr,
+            // size, alignment)` — there are no refcounted cells in
+            // this mode, so all allocations are "raw" and the alloc/
+            // free pair flows entirely through the core vtable. The
+            // refcount instrumentation (retain/release counters, deep-
+            // walk callbacks, side-table refcount layout) is elided,
+            // but the allocation lifecycle pairing is preserved so
+            // tracking managers can observe matched alloc/free pairs.
+            //
+            // `_ = allocator;` would conflict with the REFCOUNT_V1
+            // branch below (Zig errors on discard-of-used-param), so
+            // leave the parameter untouched.
+            return freeAnyNonRefcountedImpl(allocator, ptr);
+        }
         if (zap_memory_shutdown_complete) {
             @panic("zap runtime: memory dispatch after shutdown");
         }
@@ -3316,6 +3347,68 @@ pub const ArcRuntime = struct {
             @panic("zap runtime: freeAny dispatched but active manager does not declare REFCOUNT_V1");
         }
         dispatcherFreeImpl(allocator, ptr);
+    }
+
+    /// Phase 6 lifecycle-pairing dispatcher for `freeAny` under a manager
+    /// that does NOT declare REFCOUNT_V1. The matching call to the
+    /// non-REFCOUNT_V1 branch of `allocAny` (which routes through
+    /// `core.allocate`); spec §4.5 requires this side to route through
+    /// `core.deallocate(ctx, ptr, size, alignment)` so tracking managers
+    /// see matched alloc/free pairs.
+    ///
+    /// Inline-header types (`Map(K,V)`, `List(T)`, …) own their own
+    /// allocation pool and free path through their bespoke `release`
+    /// method — the generic core-vtable round trip would double-free
+    /// the cell's payload buffer. The compiler routes those types
+    /// through `T.release(...)` independently; we still call it from
+    /// here so the elided-IR path stays consistent with the REFCOUNT_V1
+    /// `dispatcherFreeImpl` shape.
+    fn freeAnyNonRefcountedImpl(allocator: std.mem.Allocator, ptr: anytype) void {
+        if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
+            const unwrapped = ptr orelse return;
+            return freeAnyNonRefcountedImpl(allocator, unwrapped);
+        }
+        @setEvalBranchQuota(2000);
+        _ = &allocator;
+        const T = arcPtrChild(@TypeOf(ptr));
+        if (comptime hasInlineArcHeader(T)) {
+            // Self-managed: T owns its own pool, allocated via the
+            // type's bespoke `bufferAlloc`-style call that already
+            // dispatches through `core.allocate`. T.release dispatches
+            // through `core.deallocate` for the cell payload. Match
+            // that semantic here so the generic-wrapper call site is
+            // a single source of truth.
+            if (@hasDecl(T, "release")) {
+                T.release(@as(?*const T, ptr));
+            } else if (@hasDecl(T, "arcReleaseDeep")) {
+                T.arcReleaseDeep(std.heap.page_allocator, ptr);
+            } else {
+                @compileError("inline-header Arc type missing release/arcReleaseDeep: " ++ @typeName(T));
+            }
+            return;
+        }
+        // Generic Arc(T) raw allocation: the matching `allocAny` call
+        // routed through `core.allocate(size, alignment)`; mirror that
+        // through `core.deallocate(ptr, size, alignment)` so tracking
+        // managers see balanced alloc/free pairs. For Arena (no-op
+        // deallocate) and NoOp (no-op deallocate) this is free; for
+        // future tracking managers it's the observable hook.
+        if (zap_memory_shutdown_complete) {
+            // Memory dispatch after shutdown is a soundness violation
+            // (spec §4.6). Panic loudly even under the lifecycle-only
+            // path so the diagnostic surfaces at the call site rather
+            // than as a silent leak.
+            @panic("zap runtime: memory dispatch after shutdown");
+        }
+        ensureMemoryStartup();
+        const core = zap_active_manager_core orelse
+            @panic("zap runtime: freeAny dispatched with no active memory manager");
+        const ctx = zap_memory_manager_context orelse
+            @panic("zap runtime: freeAny dispatched with null manager context");
+        const size = @sizeOf(T);
+        const alignment_bytes = @alignOf(T);
+        const raw: [*]u8 = @ptrCast(@constCast(ptr));
+        core.deallocate(ctx, raw, size, @intCast(alignment_bytes));
     }
 
     /// Runtime-side dispatcher implementation of `freeAny`. Lives in
@@ -3373,8 +3466,18 @@ pub const ArcRuntime = struct {
     /// for why the typed slab-pool path still uses the typed impl
     /// directly rather than the byte-level vtable.
     pub fn releaseAny(allocator: std.mem.Allocator, ptr: anytype) void {
-        // Phase 6: codegen elides every releaseAny call under no-REFCOUNT_V1.
-        if (comptime !refcount_v1_active) return;
+        if (comptime !refcount_v1_active) {
+            // Phase 6 lifecycle pairing: under no-REFCOUNT_V1, the
+            // matching `allocAny` call routed through `core.allocate`
+            // (spec §4.5 — all allocations are "raw" in this mode).
+            // The refcount instrumentation (`releaseArcAny` deep walk,
+            // `arc_releases_total` counter, side-table refcount
+            // decrement) is elided, but the allocation lifecycle
+            // pairing flows through `core.deallocate` so tracking
+            // managers see balanced alloc/free pairs. Phase 7
+            // diagnostic managers depend on this.
+            return freeAnyNonRefcountedImpl(allocator, ptr);
+        }
         if (zap_memory_shutdown_complete) {
             @panic("zap runtime: memory dispatch after shutdown");
         }

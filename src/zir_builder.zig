@@ -8500,3 +8500,109 @@ test "ZirDriver.isReleaseSuppressed: causes are independent" {
     try std.testing.expect(driver.arc_returned_locals.contains(51));
     try std.testing.expect(!driver.arc_share_skipped.contains(51));
 }
+
+test "ZirDriver.shouldSkipArc returns true unconditionally under declared_caps=0" {
+    // Phase 6 elision contract: when the active manager omits
+    // REFCOUNT_V1, every retain/release call site is skipped before
+    // any escape-state classification or arc-managed bookkeeping is
+    // consulted. The local's properties (arc_managed, escape state,
+    // function membership) do not matter. The runtime helpers
+    // (`retainAny`, `releaseAny`, …) panic when dispatched under a
+    // non-REFCOUNT_V1 manager (`src/runtime.zig`'s capability checks),
+    // so the codegen-time skip is what keeps the program from ever
+    // hitting those panics.
+    const escape_lattice = @import("escape_lattice.zig");
+
+    var actx = escape_lattice.AnalysisContext.init(std.testing.allocator);
+    defer actx.deinit();
+
+    // Pre-populate every shape that would normally OVERRIDE the skip
+    // under REFCOUNT_V1: an `arc_managed_local` (heap-pool cell), a
+    // `.no_escape` lattice classification (would skip under REFCOUNT_V1
+    // too, but the elision must run BEFORE that check fires), and a
+    // `.global_escape` classification (would NOT skip under
+    // REFCOUNT_V1). Under declared_caps=0 all three must skip.
+    const vkey_managed = escape_lattice.ValueKey{ .function = 0, .local = 100 };
+    try actx.escape_states.put(vkey_managed, .no_escape);
+
+    const vkey_global = escape_lattice.ValueKey{ .function = 0, .local = 200 };
+    try actx.escape_states.put(vkey_global, .global_escape);
+
+    var driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = std.testing.allocator,
+        .program = null,
+        .declared_caps = 0,
+        .analysis_context = &actx,
+        .current_function_id = 0,
+    };
+    defer {
+        driver.arc_share_skipped.deinit(driver.allocator);
+        driver.arc_returned_locals.deinit(driver.allocator);
+        driver.arc_managed_locals.deinit(driver.allocator);
+    }
+
+    try driver.arc_managed_locals.put(driver.allocator, 100, {});
+
+    // arc-managed local: under REFCOUNT_V1 this would return false
+    // (managed cells always retain/release); under declared_caps=0 the
+    // elision overrides and the skip fires anyway.
+    try std.testing.expect(driver.shouldSkipArc(100));
+
+    // global_escape local: under REFCOUNT_V1 this would return false
+    // (escaping locals must retain/release); under declared_caps=0 the
+    // skip still fires.
+    try std.testing.expect(driver.shouldSkipArc(200));
+
+    // Local with no classification at all: the default-skip path also
+    // fires under declared_caps=0.
+    try std.testing.expect(driver.shouldSkipArc(300));
+}
+
+test "ZirDriver.shouldSkipArc respects local state under REFCOUNT_V1" {
+    // Mirror image of the elision test. Same fixture, REFCOUNT_V1
+    // declared: arc-managed locals must NOT skip (their cells live on
+    // the heap pool and require explicit retain/release), and
+    // global-escape locals must NOT skip (the lattice forbids stack
+    // eligibility). The pair locks the regression direction so a
+    // future refactor that accidentally always-skips fails both
+    // tests, not just one.
+    const memory_abi = @import("memory/abi.zig");
+    const escape_lattice = @import("escape_lattice.zig");
+
+    var actx = escape_lattice.AnalysisContext.init(std.testing.allocator);
+    defer actx.deinit();
+
+    const vkey_managed = escape_lattice.ValueKey{ .function = 0, .local = 100 };
+    try actx.escape_states.put(vkey_managed, .no_escape);
+
+    const vkey_global = escape_lattice.ValueKey{ .function = 0, .local = 200 };
+    try actx.escape_states.put(vkey_global, .global_escape);
+
+    var driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = std.testing.allocator,
+        .program = null,
+        .declared_caps = memory_abi.REFCOUNT_V1_BIT,
+        .analysis_context = &actx,
+        .current_function_id = 0,
+    };
+    defer {
+        driver.arc_share_skipped.deinit(driver.allocator);
+        driver.arc_returned_locals.deinit(driver.allocator);
+        driver.arc_managed_locals.deinit(driver.allocator);
+    }
+
+    try driver.arc_managed_locals.put(driver.allocator, 100, {});
+
+    // arc-managed local — never skipped under REFCOUNT_V1.
+    try std.testing.expect(!driver.shouldSkipArc(100));
+
+    // global-escape local — not stack-eligible per the escape lattice,
+    // so retain/release must fire.
+    try std.testing.expect(!driver.shouldSkipArc(200));
+}
