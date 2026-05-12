@@ -62,6 +62,8 @@ pub const monomorphize = @import("monomorphize.zig");
 pub const env = @import("env.zig");
 pub const signature = @import("signature.zig");
 pub const wyhash = @import("wyhash.zig");
+pub const memory_section_parser = @import("memory/section_parser.zig");
+pub const memory_abi = @import("memory/abi.zig");
 
 test {
     _ = @import("token.zig");
@@ -112,4 +114,6 @@ test {
     _ = @import("monomorphize.zig");
     _ = @import("env.zig");
     _ = @import("wyhash.zig");
+    _ = @import("memory/section_parser.zig");
+    _ = @import("memory/abi.zig");
 }

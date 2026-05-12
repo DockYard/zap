@@ -42,6 +42,8 @@ extern "c" fn zap_fork_compile_zig_to_object(
     out_diagnostic_buffer: ?[*]u8,
     out_diagnostic_capacity: usize,
     zig_lib_dir_opt: ?[*:0]const u8,
+    local_cache_dir_opt: ?[*:0]const u8,
+    global_cache_dir_opt: ?[*:0]const u8,
 ) ZapForkResult;
 
 pub fn main() !void {
@@ -78,6 +80,8 @@ pub fn main() !void {
         &diag,
         diag.len,
         zig_lib_dir_z.ptr,
+        null, // local_cache_dir_opt: use primitive default
+        null, // global_cache_dir_opt: use primitive default
     );
     if (result != .Ok) {
         const msg = std.mem.sliceTo(@as([*:0]u8, @ptrCast(&diag)), 0);

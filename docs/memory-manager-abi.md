@@ -1019,10 +1019,44 @@ pub extern fn zap_fork_compile_zig_to_object(
     out_object_path: [*:0]const u8,
     out_diagnostic_buffer: ?[*]u8,
     out_diagnostic_capacity: usize,
+    zig_lib_dir_opt: ?[*:0]const u8,
+    local_cache_dir_opt: ?[*:0]const u8,
+    global_cache_dir_opt: ?[*:0]const u8,
 ) callconv(.c) ZapForkResult;
 ```
 
 The diagnostic buffer receives a UTF-8 error message on non-`Ok` returns; pass `null` to discard. The function writes at most `out_diagnostic_capacity` bytes (including a trailing NUL if space permits) and truncates the message otherwise. On `Ok`, the buffer is left untouched.
+
+On `CompilationFailed`, the diagnostic buffer is populated with the formatted contents of the Zig compiler's structured `ErrorBundle` — each error appears on its own line with source-location prefix where available (`[i] path:line:column: error: text`). If the buffer fills up before all errors fit, the remaining errors are summarized with a trailing `... [truncated, N more errors]` marker. On other non-`Ok` returns the buffer carries a human-readable explanation of the failure.
+
+#### 10.1.1.1 Optional parameters
+
+`zig_lib_dir_opt`
+    Optional path to a Zig stdlib directory. If null, the primitive uses
+    its compiled-in default (typically inferred from the executable
+    location). Pass a non-null pointer when calling from a binary that
+    unpacks its stdlib at runtime (e.g., Zap's build orchestrator) so
+    the primitive can locate built-in modules like `@import("std")`.
+
+`local_cache_dir_opt`
+    Optional path to a local Zig build cache directory. If null, the
+    primitive uses `/tmp/zap-fork-cache`. Callers driving many
+    compilations (e.g., Zap's build orchestrator) should pass an
+    explicit per-build cache directory through this argument so that
+    repeated invocations share a stable cache root and do not collide
+    with other tools' caches under `/tmp`.
+
+`global_cache_dir_opt`
+    Optional path to a global (cross-build) Zig cache directory. If
+    null, the primitive uses the same default as `local_cache_dir_opt`.
+    Pass an explicit path when the orchestrator wants global cache
+    artifacts (e.g., libcxx, compiler_rt) to live alongside the rest
+    of its tooling cache.
+
+All three pointers are `?[*:0]const u8` and follow C-string conventions:
+NUL-terminated UTF-8 paths or `null` to request the default. The
+primitive never takes ownership of the buffers; the caller may free
+them as soon as the call returns.
 
 The primitive does not currently accept package dependencies (`build.zig.zon` deps arrays); see section 11.1.1 for the implication.
 
@@ -1973,6 +2007,21 @@ The set of supported targets is the intersection of (a) targets the Zap-pinned Z
 | `x86_64-windows-msvc`   | 54 (`x86_64`)    | 24 (`windows`) | 22 (`msvc`)      |
 
 A v1.0 caller that passes an unsupported `(arch_tag, os_tag, abi_tag)` triple receives `ZapForkResult.TargetUnsupported`. The diagnostic buffer carries a human-readable explanation including the rejected triple.
+
+Special value: `arch_tag == 0xFFFF` (decimal 65535) requests the host
+target. When set, `os_tag` and `abi_tag` are ignored; the primitive
+selects the running compiler's native target. Useful for the common
+case where the manager is compiled for the host (e.g., the Zap build
+orchestrator targeting the same machine the build is running on). The
+Zig fork exposes this sentinel as `ZAP_FORK_ARCH_NATIVE`.
+
+The reserved field `ZapForkTarget._reserved` must be zero in v1.0. A
+non-zero value indicates either a caller bug or a struct built against
+a future ABI version that the v1.0 primitive cannot interpret safely;
+the primitive rejects such inputs with `TargetUnsupported`. Future ABI
+revisions may repurpose `_reserved` as a flags or option field;
+existing callers that respect the v1.0 contract (`_reserved = 0`) will
+continue to work under those revisions.
 
 ### C.2 `std.Target.Cpu.Arch` value table
 
