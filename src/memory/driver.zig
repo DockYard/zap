@@ -2126,6 +2126,142 @@ test "Phase 3 integration: NoOp manager resolves end-to-end through driver (Mach
     std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
 }
 
+test "Phase 5 integration: Arena manager resolves end-to-end through driver (ELF)" {
+    // Phase 5 ships the real `src/memory/arena/manager.zig`
+    // implementation. Like the Phase 3 NoOp test above, this asserts:
+    //   1. The driver discovers `Zap.Memory.Arena` from a stdlib-shaped
+    //      `lib/zap/memory/arena.zap`.
+    //   2. The mock fork synthesises an Arena-style object whose
+    //      `.zapmem` section declares zero capabilities (Arena's
+    //      section layout is byte-compatible with NoOp's at the
+    //      metadata level — both pass `declared_caps = 0` — so we
+    //      reuse `mockForkCompileNoOp` rather than introducing a
+    //      synthesiser that would be a verbatim duplicate).
+    //   3. `resolve` produces a `ResolvedManager` with a real
+    //      `object_path` and `declared_caps == 0`.
+    //
+    // The integration target is the section/symbol pipeline, not the
+    // runtime allocator behaviour — the latter is exercised by the
+    // `test_arena_manager_compile.sh` smoke test, which compiles the
+    // real source with system zig and inspects the produced bytes.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/zap/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/arena") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+
+    const stdlib_decl =
+        \\@memory_manager_source = "src/memory/arena/manager.zig"
+        \\
+        \\pub struct Zap.Memory.Arena {
+        \\}
+        \\
+    ;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/zap/memory/arena.zap", .data = stdlib_decl }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/arena/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(stdlib_root);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var resolved = try resolve(
+        allocator,
+        .{
+            .manager_name = "Zap.Memory.Arena",
+            .source_roots = &.{
+                .{ .name = "zap_stdlib", .path = stdlib_root },
+            },
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = cache_root,
+            .fork_compile_fn = mockForkCompileNoOp,
+        },
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expectEqualStrings("Zap.Memory.Arena", resolved.name);
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
+    try std.testing.expect(resolved.object_path != null);
+    // Arena declares no REFCOUNT_V1 capability — explicit check guards
+    // against a future regression that mistakenly turns the bit on at
+    // the section level.
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps & abi.REFCOUNT_V1_BIT);
+
+    // The object the mock wrote must still be on disk under the cache.
+    std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
+}
+
+test "Phase 5 integration: Arena manager resolves end-to-end through driver (Mach-O)" {
+    // Mach-O sibling of the Phase 5 ELF integration test. Exercises
+    // the same source-discovery + compile + parse + validate pipeline
+    // but with a Mach-O 64-bit object whose `__DATA,__zapmem` section
+    // declares zero capabilities. This catches Mach-O-specific drift
+    // in the section parser and symbol-table inspector — neither of
+    // which the Linux-only ELF path can exercise.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/zap/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/arena") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+
+    const stdlib_decl =
+        \\@memory_manager_source = "src/memory/arena/manager.zig"
+        \\
+        \\pub struct Zap.Memory.Arena {
+        \\}
+        \\
+    ;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/zap/memory/arena.zap", .data = stdlib_decl }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/arena/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(stdlib_root);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var resolved = try resolve(
+        allocator,
+        .{
+            .manager_name = "Zap.Memory.Arena",
+            .source_roots = &.{
+                .{ .name = "zap_stdlib", .path = stdlib_root },
+            },
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = cache_root,
+            .fork_compile_fn = mockForkCompileNoOpMacho,
+        },
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expectEqualStrings("Zap.Memory.Arena", resolved.name);
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
+    try std.testing.expect(resolved.object_path != null);
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps & abi.REFCOUNT_V1_BIT);
+    std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
+}
+
 test "assertExportsManagerSymbol passes for synthesized NoOp ELF" {
     // The ELF synthesiser emits a symbol table with `zap_memory_section`;
     // the symbol-presence check must accept it.
