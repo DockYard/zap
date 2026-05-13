@@ -388,7 +388,6 @@ pub fn analyzeFunctionWithFixpoint(
     );
 }
 
-
 fn calleeFunctionOwnedReceiverSlot(function: *const ir.Function) ?usize {
     if (function.result_convention != .owned) return null;
     for (function.param_conventions, 0..) |conv, idx| {

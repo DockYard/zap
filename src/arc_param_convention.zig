@@ -244,7 +244,6 @@ pub fn inferConventions(
             if (after > before) changed = true;
         }
     }
-
 }
 
 /// Set of `(FunctionId, slot)` pairs that have passed the chain-

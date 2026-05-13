@@ -300,6 +300,45 @@ fn noOpRefcountSizedStub(
     @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
+pub inline fn refcountSlabClassIndex(comptime size: usize, comptime alignment: u32) ?u32 {
+    _ = size;
+    _ = alignment;
+    return null;
+}
+
+pub inline fn allocateRefcountedClass(ctx: *anyopaque, comptime class_index: u32) ?[*]u8 {
+    _ = ctx;
+    _ = class_index;
+    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+pub inline fn retainSizedClass(ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) void {
+    _ = ctx;
+    _ = object;
+    _ = class_index;
+    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+pub inline fn releaseSizedClass(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    comptime class_index: u32,
+    deep_walk: ?*const fn (object: *anyopaque) callconv(.c) void,
+) void {
+    _ = ctx;
+    _ = object;
+    _ = class_index;
+    _ = deep_walk;
+    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
+pub inline fn refcountSizedClass(ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) u32 {
+    _ = ctx;
+    _ = object;
+    _ = class_index;
+    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+}
+
 // ---------------------------------------------------------------------------
 // Uniform first-party manager interface (Phase 4)
 //
@@ -345,6 +384,11 @@ comptime {
     const ReleaseSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32, deep_walk: ?ZapDeepWalkFn) callconv(.c) void;
     const AllocateRefcountedFn = *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8;
     const RefcountSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32;
+    const ClassIndexFn = fn (comptime size: usize, comptime alignment: u32) callconv(.@"inline") ?u32;
+    const AllocateRefcountedClassFn = fn (ctx: *anyopaque, comptime class_index: u32) callconv(.@"inline") ?[*]u8;
+    const RetainSizedClassFn = fn (ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) callconv(.@"inline") void;
+    const ReleaseSizedClassFn = fn (ctx: *anyopaque, object: *anyopaque, comptime class_index: u32, deep_walk: ?ZapDeepWalkFn) callconv(.@"inline") void;
+    const RefcountSizedClassFn = fn (ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) callconv(.@"inline") u32;
 
     _ = @as(InitFn, init);
     _ = @as(DeinitFn, deinit);
@@ -357,4 +401,9 @@ comptime {
     _ = @as(ReleaseSizedFn, releaseSized);
     _ = @as(AllocateRefcountedFn, allocateRefcounted);
     _ = @as(RefcountSizedFn, refcountSized);
+    _ = @as(*const ClassIndexFn, refcountSlabClassIndex);
+    _ = @as(*const AllocateRefcountedClassFn, allocateRefcountedClass);
+    _ = @as(*const RetainSizedClassFn, retainSizedClass);
+    _ = @as(*const ReleaseSizedClassFn, releaseSizedClass);
+    _ = @as(*const RefcountSizedClassFn, refcountSizedClass);
 }

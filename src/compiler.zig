@@ -3291,7 +3291,7 @@ pub fn validateOneStructPerFile(
 
 /// Get the embedded runtime source, applying the toolchain's
 /// compile-time rewrites that should affect every Zap user binary it
-/// produces. Three independent rewrites layer here, in order:
+/// produces. Five independent rewrites layer here, in order:
 ///
 ///   1. The Phase A Map workload instrumentation flag
 ///      (`INSTRUMENT_MAP_DEFAULT`). Flipped on when the host compiler
@@ -3309,14 +3309,31 @@ pub fn validateOneStructPerFile(
 ///      a first-party manager build then resolves through
 ///      `@import("zap_active_manager")` directly (LLVM-inlineable),
 ///      while a `.third_party` build routes through the vtable.
+///   4. The ARC stats collection flag (`COLLECT_ARC_STATS_DEFAULT`).
+///      Rewritten to `true` only for builds that explicitly request
+///      counter collection. `ZAP_ARC_STATS=1` remains a runtime output
+///      trigger; it does not enable counter increments after this
+///      compile-time flag has elided them.
+///   5. The Phase 7e entry-startup guarantee
+///      (`RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT`). Rewritten to
+///      `true` only for executable binary outputs because the final
+///      artifact has a generated entry boundary where the ZIR backend
+///      emits an explicit call to `zap_runtime.memoryStartupForEntry()`
+///      before user entry code runs. Dispatchers use the marker to
+///      compile away the lazy startup fallback only in that guaranteed
+///      executable shape; library and object outputs retain the
+///      fallback.
 ///
-/// The host test suite uses separate `@import("root")` overrides
-/// inside `runtime.zig` for both flags (see `src/root.zig`), so
-/// neither rewrite affects the host's own build.
+/// Host tests import `runtime.zig` directly and therefore observe the
+/// source-level defaults: instrumentation follows the host build
+/// option, declared caps default to ARC, the active-manager tag
+/// defaults to `.third_party`, the startup-prologue marker stays
+/// false so lazy startup remains available, and ARC stats default to
+/// `builtin.is_test`.
 ///
 /// The returned slice is either a borrowed view of the embedded source
 /// (no rewrites required) or a freshly-allocated owned buffer (one or
-/// both rewrites applied). Callers that hold onto the slice past the
+/// more rewrites applied). Callers that hold onto the slice past the
 /// allocator's lifetime must duplicate.
 ///
 /// `declared_caps` is the active manager's capability bitmask.
@@ -3334,11 +3351,53 @@ pub fn getRuntimeSource(
     declared_caps: u64,
     builtin_tag: zap.memory_driver.BuiltinManagerTag,
 ) []const u8 {
+    return getRuntimeSourceForRuntimeControls(declared_caps, builtin_tag, .{
+        .memory_startup_prologue_emitted = true,
+        .collect_arc_stats = false,
+    });
+}
+
+pub const RuntimeSourceControls = struct {
+    /// True only when the generated artifact has an executable entry
+    /// boundary that runs `zap_runtime.memoryStartupForEntry()` before
+    /// runtime-managed memory can be touched.
+    memory_startup_prologue_emitted: bool,
+    /// True only for builds that deliberately collect ARC counters.
+    /// Runtime `ZAP_ARC_STATS=1` still controls whether collected
+    /// counters are printed.
+    collect_arc_stats: bool = false,
+};
+
+/// Variant of `getRuntimeSource` for callers whose output mode does
+/// not guarantee a generated entry prologue. `memory_startup_prologue_emitted`
+/// must be true only for executable output shapes where
+/// `zir_builder.zig` will emit `zap_runtime.memoryStartupForEntry()`
+/// at a guaranteed artifact entry boundary before runtime-managed
+/// memory can be touched. Library and object outputs pass false so
+/// dispatchers retain the lazy startup fallback.
+pub fn getRuntimeSourceForEntryShape(
+    declared_caps: u64,
+    builtin_tag: zap.memory_driver.BuiltinManagerTag,
+    memory_startup_prologue_emitted: bool,
+) []const u8 {
+    return getRuntimeSourceForRuntimeControls(declared_caps, builtin_tag, .{
+        .memory_startup_prologue_emitted = memory_startup_prologue_emitted,
+        .collect_arc_stats = false,
+    });
+}
+
+pub fn getRuntimeSourceForRuntimeControls(
+    declared_caps: u64,
+    builtin_tag: zap.memory_driver.BuiltinManagerTag,
+    controls: RuntimeSourceControls,
+) []const u8 {
     const instrumented = @import("build_options").instrument_map;
     return rewriteRuntimeSource(.{
         .instrumented = instrumented,
         .declared_caps = declared_caps,
         .builtin_tag = builtin_tag,
+        .memory_startup_prologue_emitted = controls.memory_startup_prologue_emitted,
+        .collect_arc_stats = controls.collect_arc_stats,
     });
 }
 
@@ -3346,6 +3405,8 @@ const RuntimeRewrite = struct {
     instrumented: bool,
     declared_caps: u64,
     builtin_tag: zap.memory_driver.BuiltinManagerTag,
+    memory_startup_prologue_emitted: bool,
+    collect_arc_stats: bool,
 };
 
 /// Lazily-built rewritten runtime source. Keyed by the rewrite
@@ -3359,18 +3420,23 @@ var rewritten_runtime_cache: std.AutoHashMapUnmanaged(u128, []const u8) = .empty
 ///
 ///   * bits  0..63 — `declared_caps` (the full u64 bitmask).
 ///   * bit   64    — `instrumented` (Map workload instrumentation flag).
-///   * bits 65..71 — reserved for future single-bit rewrite flags.
+///   * bit   65    — `memory_startup_prologue_emitted`.
+///   * bit   66    — `collect_arc_stats`.
+///   * bits 67..71 — reserved for future single-bit rewrite flags.
 ///   * bits 72..79 — `builtin_tag` ordinal (u8; the enum is declared
 ///                  `enum(u8)` in `runtime.zig`'s `ActiveManagerTag`
 ///                  and mirrored unannotated here via `@intFromEnum`).
 ///
-/// The (instrumented, declared_caps, builtin_tag) triple must produce
-/// a unique key — two builds that differ in any one of the three MUST
-/// alias to two distinct cache entries, otherwise the second build's
-/// rewrite would silently inject the first build's source.
+/// The (instrumented, declared_caps, builtin_tag, startup-prologue,
+/// ARC-stats) tuple must produce a unique key — two builds that
+/// differ in any one field MUST alias to two distinct cache entries,
+/// otherwise the second build's rewrite would silently inject the
+/// first build's source.
 fn rewriteCacheKey(req: RuntimeRewrite) u128 {
     var key: u128 = req.declared_caps;
     if (req.instrumented) key |= (@as(u128, 1) << 64);
+    if (req.memory_startup_prologue_emitted) key |= (@as(u128, 1) << 65);
+    if (req.collect_arc_stats) key |= (@as(u128, 1) << 66);
     const tag_ordinal: u128 = @intFromEnum(req.builtin_tag);
     key |= (tag_ordinal << 72);
     return key;
@@ -3461,9 +3527,53 @@ fn rewriteRuntimeSource(req: RuntimeRewrite) []const u8 {
     // leak per (instrumented, caps, tag) shape triple.
     std.heap.page_allocator.free(caps_buf);
 
-    rewritten_runtime_cache.put(std.heap.page_allocator, key, tag_buf) catch
+    // Stage 4: ARC stats collection marker rewrite. Runtime
+    // `ZAP_ARC_STATS=1` controls the stderr dump only; this
+    // compile-time marker controls whether the counter stores exist
+    // in the generated binary at all.
+    var final_buf: []u8 = tag_buf;
+    if (req.collect_arc_stats) {
+        const stats_needle = "const COLLECT_ARC_STATS_DEFAULT: bool = builtin.is_test;";
+        const stats_replacement = "const COLLECT_ARC_STATS_DEFAULT: bool = true;";
+        const stats_idx = std.mem.indexOf(u8, final_buf, stats_needle) orelse {
+            @panic("runtime.zig is missing the COLLECT_ARC_STATS_DEFAULT marker; ARC stats rewrite cannot proceed");
+        };
+        const stats_total_len = final_buf.len - stats_needle.len + stats_replacement.len;
+        var stats_buf = std.heap.page_allocator.alloc(u8, stats_total_len) catch
+            @panic("out of memory rewriting runtime source for ARC stats collection");
+        @memcpy(stats_buf[0..stats_idx], final_buf[0..stats_idx]);
+        @memcpy(stats_buf[stats_idx .. stats_idx + stats_replacement.len], stats_replacement);
+        @memcpy(stats_buf[stats_idx + stats_replacement.len ..], final_buf[stats_idx + stats_needle.len ..]);
+        std.heap.page_allocator.free(final_buf);
+        final_buf = stats_buf;
+    }
+
+    // Stage 5: entry-startup prologue marker rewrite. Only generated
+    // executable binary outputs set this true: the final artifact has
+    // an entry boundary where the ZIR backend emits an explicit call
+    // to `memoryStartupForEntry()`. Host tests, libraries, objects,
+    // and any runtime source imported without that executable-entry
+    // guarantee must retain the source-level false marker so
+    // dispatcher startup remains lazy and safe.
+    if (req.memory_startup_prologue_emitted) {
+        const prologue_needle = "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = false;";
+        const prologue_replacement = "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = true;";
+        const prologue_idx = std.mem.indexOf(u8, final_buf, prologue_needle) orelse {
+            @panic("runtime.zig is missing the RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT marker; Phase 7e startup-prologue rewrite cannot proceed");
+        };
+        const prologue_total_len = final_buf.len - prologue_needle.len + prologue_replacement.len;
+        var prologue_buf = std.heap.page_allocator.alloc(u8, prologue_total_len) catch
+            @panic("out of memory rewriting runtime source for memory startup prologue");
+        @memcpy(prologue_buf[0..prologue_idx], final_buf[0..prologue_idx]);
+        @memcpy(prologue_buf[prologue_idx .. prologue_idx + prologue_replacement.len], prologue_replacement);
+        @memcpy(prologue_buf[prologue_idx + prologue_replacement.len ..], final_buf[prologue_idx + prologue_needle.len ..]);
+        std.heap.page_allocator.free(final_buf);
+        final_buf = prologue_buf;
+    }
+
+    rewritten_runtime_cache.put(std.heap.page_allocator, key, final_buf) catch
         @panic("out of memory caching rewritten runtime source");
-    return tag_buf;
+    return final_buf;
 }
 
 /// Map a `BuiltinManagerTag` to its lowercase identifier as it appears
@@ -5413,6 +5523,109 @@ test "Phase 6: getRuntimeSource rewrite encodes arbitrary caps bitmasks" {
     const src = getRuntimeSource(multi_caps, .third_party);
     const expected = "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0xdeadbeefcafebabe;";
     try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
+}
+
+test "Phase 7e: getRuntimeSource rewrites memory startup prologue marker for executable binaries" {
+    // The convenience accessor is the executable-binary shape: a
+    // generated artifact entry point owns the explicit startup
+    // prologue, so its injected runtime source must make that
+    // guarantee comptime-visible to dispatchers. Leaving the
+    // source-level `false` marker in place would keep the
+    // per-dispatch `ensureMemoryStartup()` guard on the hot path.
+    const src = getRuntimeSource(0x1, .arc);
+    const expected = "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = true;";
+    try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
+
+    const original = "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = false;";
+    try std.testing.expect(std.mem.indexOf(u8, src, original) == null);
+}
+
+test "Phase 7e: runtime rewrite cache separates startup prologue shape" {
+    // The rewrite cache must key the startup-prologue guarantee. A
+    // caller that asks for the host-safe lazy-startup source and a
+    // caller that asks for the executable-binary prologue source with
+    // the same caps/tag/instrumentation triple must not alias the same
+    // cached buffer.
+    const lazy_src = rewriteRuntimeSource(.{
+        .instrumented = false,
+        .declared_caps = 0x1,
+        .builtin_tag = .arc,
+        .memory_startup_prologue_emitted = false,
+        .collect_arc_stats = false,
+    });
+    const prologue_src = rewriteRuntimeSource(.{
+        .instrumented = false,
+        .declared_caps = 0x1,
+        .builtin_tag = .arc,
+        .memory_startup_prologue_emitted = true,
+        .collect_arc_stats = false,
+    });
+
+    try std.testing.expect(lazy_src.ptr != prologue_src.ptr);
+    try std.testing.expect(std.mem.indexOf(u8, lazy_src, "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prologue_src, "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = true;") != null);
+}
+
+test "Phase 7e: library-shaped runtime source keeps lazy startup marker" {
+    // Library mode skips generated `main`, so there is no guaranteed
+    // entry prologue. The public shape-aware accessor must preserve
+    // the false marker for that mode even while applying the caps/tag
+    // rewrites.
+    const src = getRuntimeSourceForEntryShape(0x1, .arc, false);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .arc;") != null);
+}
+
+test "Phase 7e: object-shaped runtime source keeps lazy startup marker" {
+    // Object output has no executable artifact entry boundary. Even
+    // when the object contains a generated `main` function, a future
+    // linker can touch runtime-managed dispatchers before that symbol
+    // is called, so the embedded runtime must keep the lazy startup
+    // fallback compiled in.
+    const src = getRuntimeSourceForEntryShape(0x1, .arc, false);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = true;") == null);
+}
+
+test "Phase 2 ARC stats: runtime source keeps collection elided by default" {
+    const src = getRuntimeSourceForRuntimeControls(0x1, .arc, .{
+        .memory_startup_prologue_emitted = true,
+        .collect_arc_stats = false,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, src, "const COLLECT_ARC_STATS_DEFAULT: bool = builtin.is_test;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const COLLECT_ARC_STATS_DEFAULT: bool = true;") == null);
+}
+
+test "Phase 2 ARC stats: runtime source rewrites collection marker on explicit opt-in" {
+    const src = getRuntimeSourceForRuntimeControls(0x1, .arc, .{
+        .memory_startup_prologue_emitted = true,
+        .collect_arc_stats = true,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, src, "const COLLECT_ARC_STATS_DEFAULT: bool = true;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const COLLECT_ARC_STATS_DEFAULT: bool = builtin.is_test;") == null);
+}
+
+test "Phase 2 ARC stats: runtime rewrite cache separates collection shape" {
+    const elided_src = rewriteRuntimeSource(.{
+        .instrumented = false,
+        .declared_caps = 0x1,
+        .builtin_tag = .arc,
+        .memory_startup_prologue_emitted = true,
+        .collect_arc_stats = false,
+    });
+    const collecting_src = rewriteRuntimeSource(.{
+        .instrumented = false,
+        .declared_caps = 0x1,
+        .builtin_tag = .arc,
+        .memory_startup_prologue_emitted = true,
+        .collect_arc_stats = true,
+    });
+
+    try std.testing.expect(elided_src.ptr != collecting_src.ptr);
+    try std.testing.expect(std.mem.indexOf(u8, elided_src, "const COLLECT_ARC_STATS_DEFAULT: bool = builtin.is_test;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collecting_src, "const COLLECT_ARC_STATS_DEFAULT: bool = true;") != null);
 }
 
 // ---------------------------------------------------------------------------

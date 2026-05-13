@@ -20,7 +20,8 @@
 //! Phase 4 introduced a uniform `pub` interface on every first-party
 //! manager — `init`, `deinit`, `allocate`, `deallocate`, `retain`,
 //! `release`, `retainSized`, `releaseSized`, `allocateRefcounted`,
-//! `refcountSized`, `getCapabilityDesc` — so the runtime's comptime
+//! `refcountSized`, `getCapabilityDesc`, and the first-party class
+//! specialization helpers — so the runtime's comptime
 //! dispatch can call into the active manager's hot paths directly
 //! through `@import("zap_active_manager")` and let LLVM inline across
 //! the module boundary (the whole motivation behind Phases 3-5 of the
@@ -98,6 +99,18 @@ pub fn allocateRefcounted(ctx: *anyopaque, size: usize, alignment: u32) callconv
     @panic("third-party stub: allocateRefcounted unreachable — vtable path always selected under .third_party builds");
 }
 
+pub inline fn refcountSlabClassIndex(comptime size: usize, comptime alignment: u32) ?u32 {
+    _ = size;
+    _ = alignment;
+    return null;
+}
+
+pub inline fn allocateRefcountedClass(ctx: *anyopaque, comptime class_index: u32) ?[*]u8 {
+    _ = ctx;
+    _ = class_index;
+    @panic("third-party stub: allocateRefcountedClass unreachable — vtable path always selected under .third_party builds");
+}
+
 pub fn retain(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
     _ = ctx;
     _ = object;
@@ -119,6 +132,13 @@ pub fn retainSized(ctx: *anyopaque, object: *anyopaque, size: usize, alignment: 
     @panic("third-party stub: retainSized unreachable — vtable path always selected under .third_party builds");
 }
 
+pub inline fn retainSizedClass(ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) void {
+    _ = ctx;
+    _ = object;
+    _ = class_index;
+    @panic("third-party stub: retainSizedClass unreachable — vtable path always selected under .third_party builds");
+}
+
 pub fn releaseSized(
     ctx: *anyopaque,
     object: *anyopaque,
@@ -134,12 +154,32 @@ pub fn releaseSized(
     @panic("third-party stub: releaseSized unreachable — vtable path always selected under .third_party builds");
 }
 
+pub inline fn releaseSizedClass(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    comptime class_index: u32,
+    deep_walk: ?ZapDeepWalkFn,
+) void {
+    _ = ctx;
+    _ = object;
+    _ = class_index;
+    _ = deep_walk;
+    @panic("third-party stub: releaseSizedClass unreachable — vtable path always selected under .third_party builds");
+}
+
 pub fn refcountSized(ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32 {
     _ = ctx;
     _ = object;
     _ = size;
     _ = alignment;
     @panic("third-party stub: refcountSized unreachable — vtable path always selected under .third_party builds");
+}
+
+pub inline fn refcountSizedClass(ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) u32 {
+    _ = ctx;
+    _ = object;
+    _ = class_index;
+    @panic("third-party stub: refcountSizedClass unreachable — vtable path always selected under .third_party builds");
 }
 
 pub fn getCapabilityDesc(ctx: *anyopaque, id: u32) callconv(.c) ?*const ZapCapabilityDescV1 {

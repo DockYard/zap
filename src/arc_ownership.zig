@@ -3862,11 +3862,10 @@ fn withRenamedCall(instr: ir.Instruction, new_name: []const u8) ir.Instruction {
 // Running the elision here lets us treat every surviving share as a
 // candidate without re-checking the callee convention from scratch
 // for `call_named` / `call_direct` / `try_call_named`. For
-// `call_builtin` we still check `arc_liveness.builtinArgCanMoveAtLastUse`
-// to skip slots that the consume rewriter intentionally left alone
-// (e.g., `List.push` element values whose last-use signal didn't
-// fire — those shares are kept by `rewriteOwnedConsumeBuiltinSites`
-// because the list takes ownership of the temporary retain).
+// `call_builtin` we still check the builtin ABI consume predicates to
+// skip slots that the consume rewriter intentionally left alone (e.g.,
+// `List.push` element values whose last-use signal didn't fire, and
+// `List.cons` arguments that are always consumed by the runtime).
 //
 // Why this pass runs BEFORE `arc_drop_insertion`
 // ----------------------------------------------
@@ -3991,7 +3990,7 @@ const BorrowedPassThroughRewriter = struct {
                     const builtin_name = effective.call_builtin.name;
                     // The consume-rewriter handles the consume slots;
                     // any surviving share here is on a borrow slot.
-                    if (arc_liveness.builtinArgCanMoveAtLastUse(builtin_name, slot)) continue;
+                    if (!builtinArgIsBorrowOnly(builtin_name, slot)) continue;
                 } else if (callee_conv) |conv| {
                     if (slot < conv.len) {
                         // Only elide on .borrowed slots. .owned slots
@@ -4020,9 +4019,13 @@ const BorrowedPassThroughRewriter = struct {
                 // scope or as an owned local with scope-exit release).
                 if (!sourceCellIsLifetimeExtended(self.function, share.source)) continue;
 
-                // Locate the optional `retain{value=arg_local, kind=normal}`
-                // emitted immediately after the share.
-                const retain_idx = findShareRetain(stream, rebuilt_children.items, share_idx + 1, arg_local);
+                // Locate the `retain{value=arg_local, kind=normal}`
+                // emitted immediately after the share. The Phase 8
+                // slice only certifies the complete
+                // share/retain/call/release shape; if the retain is
+                // already absent, leave the stream alone rather than
+                // widening the proof obligation.
+                const retain_idx = findShareRetain(stream, rebuilt_children.items, share_idx + 1, arg_local) orelse continue;
 
                 // Locate the matching post-call release. Bound the
                 // forward scan to the contiguous run of releases
@@ -4030,22 +4033,30 @@ const BorrowedPassThroughRewriter = struct {
                 // releases together).
                 const release_idx = findPostCallRelease(stream, rebuilt_children.items, i + 1, arg_local) orelse continue;
 
+                if (arg_local >= self.function.local_ownership.len) continue;
+                if (self.function.local_ownership[arg_local] != .owned) continue;
+                if (countLocalDefsInFunction(self.function, arg_local) != 1) continue;
+                if (countLocalUsesInFunction(self.function, arg_local) != 3) continue;
+                if (!shareDestHasOnlyBorrowedCallPath(
+                    stream,
+                    rebuilt_children.items,
+                    share_idx,
+                    retain_idx,
+                    i,
+                    release_idx,
+                    arg_local,
+                )) continue;
+
                 // All four pieces matched: schedule the rewrite.
                 try rewrite_share_to_borrow.put(self.allocator, share_idx, {});
-                if (retain_idx) |ri| {
-                    try drop_index.put(self.allocator, ri, {});
-                }
+                try drop_index.put(self.allocator, retain_idx, {});
                 try drop_index.put(self.allocator, release_idx, {});
                 any_change = true;
 
                 // Refine `local_ownership[arg_local]` to `.borrowed`
                 // so drop insertion skips the now-borrowed alias and
                 // the verifier accepts the chain.
-                if (arg_local < self.function.local_ownership.len and
-                    self.function.local_ownership[arg_local] == .owned)
-                {
-                    self.function.local_ownership[arg_local] = .borrowed;
-                }
+                self.function.local_ownership[arg_local] = .borrowed;
             }
         }
 
@@ -4248,6 +4259,11 @@ const BorrowedPassThroughRewriter = struct {
     }
 };
 
+fn builtinArgIsBorrowOnly(name: []const u8, slot: usize) bool {
+    return !arc_liveness.builtinArgCanMoveAtLastUse(name, slot) and
+        !arc_liveness.alwaysConsumingBuiltinArg(name, slot);
+}
+
 /// Walk backward from `before_index` to find the most recent
 /// `share_value{dest = arg_local}` in `stream`. Returns the stream
 /// index or null when no matching share is present in the prelude.
@@ -4330,6 +4346,235 @@ fn findPostCallRelease(
     return null;
 }
 
+/// Prove the share destination is used only by the certified borrowed
+/// pass-through path:
+///
+///   share_value dest <- source
+///   retain dest
+///   borrowed call(..., dest, ...)
+///   release dest
+///
+/// A second use of `dest` would extend the local's semantic role
+/// beyond "one borrowed call argument". Rewriting such a value to
+/// `borrow_value` and changing its `local_ownership` to `.borrowed`
+/// could hide a real ownership edge from drop insertion or verifier
+/// checks, so the pass refuses those streams.
+fn shareDestHasOnlyBorrowedCallPath(
+    stream: []const ir.Instruction,
+    rebuilt_children: []const ?ir.Instruction,
+    share_idx: usize,
+    retain_idx: usize,
+    call_idx: usize,
+    release_idx: usize,
+    arg_local: ir.LocalId,
+) bool {
+    var total_uses: usize = 0;
+    for (stream, 0..) |original, idx| {
+        const effective = rebuilt_children[idx] orelse original;
+        const use_count = countLocalUsesRecursive(effective, arg_local);
+        if (use_count == 0) continue;
+        total_uses += use_count;
+
+        if (idx == share_idx) {
+            return false;
+        } else if (idx == retain_idx) {
+            if (use_count != 1) return false;
+            if (effective != .retain) return false;
+            const retain = effective.retain;
+            if (retain.value != arg_local or retain.kind != .normal) return false;
+        } else if (idx == call_idx) {
+            if (use_count != 1) return false;
+            if (!callUsesArgExactlyOnce(effective, arg_local)) return false;
+        } else if (idx == release_idx) {
+            if (use_count != 1) return false;
+            if (effective != .release) return false;
+            if (effective.release.value != arg_local) return false;
+        } else {
+            return false;
+        }
+    }
+
+    return total_uses == 3;
+}
+
+fn callUsesArgExactlyOnce(instr: ir.Instruction, arg_local: ir.LocalId) bool {
+    const args = callArgs(instr) orelse switch (instr) {
+        .call_builtin => |call_builtin| call_builtin.args,
+        else => return false,
+    };
+    var count: usize = 0;
+    for (args) |arg| {
+        if (arg == arg_local) count += 1;
+    }
+    return count == 1;
+}
+
+fn countLocalUsesRecursive(instr: ir.Instruction, local: ir.LocalId) usize {
+    var count = countImmediateLocalUses(instr, local);
+    switch (instr) {
+        .if_expr => |if_expr| {
+            count += countLocalUsesInStream(if_expr.then_instrs, local);
+            count += countLocalUsesInStream(if_expr.else_instrs, local);
+        },
+        .case_block => |case_block| {
+            count += countLocalUsesInStream(case_block.pre_instrs, local);
+            for (case_block.arms) |arm| {
+                count += countLocalUsesInStream(arm.cond_instrs, local);
+                count += countLocalUsesInStream(arm.body_instrs, local);
+            }
+            count += countLocalUsesInStream(case_block.default_instrs, local);
+        },
+        .switch_literal => |switch_literal| {
+            for (switch_literal.cases) |case| {
+                count += countLocalUsesInStream(case.body_instrs, local);
+            }
+            count += countLocalUsesInStream(switch_literal.default_instrs, local);
+        },
+        .switch_return => |switch_return| {
+            for (switch_return.cases) |case| {
+                count += countLocalUsesInStream(case.body_instrs, local);
+            }
+            count += countLocalUsesInStream(switch_return.default_instrs, local);
+        },
+        .union_switch => |union_switch| {
+            for (union_switch.cases) |case| {
+                count += countLocalUsesInStream(case.body_instrs, local);
+            }
+        },
+        .union_switch_return => |union_switch_return| {
+            for (union_switch_return.cases) |case| {
+                count += countLocalUsesInStream(case.body_instrs, local);
+            }
+        },
+        .try_call_named => |try_call_named| {
+            count += countLocalUsesInStream(try_call_named.handler_instrs, local);
+            count += countLocalUsesInStream(try_call_named.success_instrs, local);
+        },
+        .guard_block => |guard_block| {
+            count += countLocalUsesInStream(guard_block.body, local);
+        },
+        .optional_dispatch => |optional_dispatch| {
+            count += countLocalUsesInStream(optional_dispatch.nil_instrs, local);
+            count += countLocalUsesInStream(optional_dispatch.struct_instrs, local);
+        },
+        else => {},
+    }
+    return count;
+}
+
+fn countLocalUsesInStream(stream: []const ir.Instruction, local: ir.LocalId) usize {
+    var count: usize = 0;
+    for (stream) |instr| {
+        count += countLocalUsesRecursive(instr, local);
+    }
+    return count;
+}
+
+fn countLocalUsesInFunction(function: *const ir.Function, local: ir.LocalId) usize {
+    var count: usize = 0;
+    for (function.body) |block| {
+        count += countLocalUsesInStream(block.instructions, local);
+    }
+    return count;
+}
+
+fn countImmediateLocalUses(instr: ir.Instruction, local: ir.LocalId) usize {
+    var uses: arc_liveness.UseList = .{};
+    defer uses.deinit(std.heap.page_allocator);
+    arc_liveness.collectUses(instr, &uses);
+
+    var count: usize = 0;
+    for (uses.slice()) |used_local| {
+        if (used_local == local) count += 1;
+    }
+    switch (instr) {
+        .try_call_named => |try_call_named| {
+            if (try_call_named.handler_result == local) count += 1;
+            if (try_call_named.success_result == local) count += 1;
+        },
+        else => {},
+    }
+    return count;
+}
+
+fn countLocalDefsRecursive(instr: ir.Instruction, local: ir.LocalId) usize {
+    var count = countImmediateLocalDefs(instr, local);
+    switch (instr) {
+        .if_expr => |if_expr| {
+            count += countLocalDefsInStream(if_expr.then_instrs, local);
+            count += countLocalDefsInStream(if_expr.else_instrs, local);
+        },
+        .case_block => |case_block| {
+            count += countLocalDefsInStream(case_block.pre_instrs, local);
+            for (case_block.arms) |arm| {
+                count += countLocalDefsInStream(arm.cond_instrs, local);
+                count += countLocalDefsInStream(arm.body_instrs, local);
+            }
+            count += countLocalDefsInStream(case_block.default_instrs, local);
+        },
+        .switch_literal => |switch_literal| {
+            for (switch_literal.cases) |case| {
+                count += countLocalDefsInStream(case.body_instrs, local);
+            }
+            count += countLocalDefsInStream(switch_literal.default_instrs, local);
+        },
+        .switch_return => |switch_return| {
+            for (switch_return.cases) |case| {
+                count += countLocalDefsInStream(case.body_instrs, local);
+            }
+            count += countLocalDefsInStream(switch_return.default_instrs, local);
+        },
+        .union_switch => |union_switch| {
+            for (union_switch.cases) |case| {
+                count += countLocalDefsInStream(case.body_instrs, local);
+            }
+        },
+        .union_switch_return => |union_switch_return| {
+            for (union_switch_return.cases) |case| {
+                count += countLocalDefsInStream(case.body_instrs, local);
+            }
+        },
+        .try_call_named => |try_call_named| {
+            count += countLocalDefsInStream(try_call_named.handler_instrs, local);
+            count += countLocalDefsInStream(try_call_named.success_instrs, local);
+        },
+        .guard_block => |guard_block| {
+            count += countLocalDefsInStream(guard_block.body, local);
+        },
+        .optional_dispatch => |optional_dispatch| {
+            count += countLocalDefsInStream(optional_dispatch.nil_instrs, local);
+            count += countLocalDefsInStream(optional_dispatch.struct_instrs, local);
+        },
+        else => {},
+    }
+    return count;
+}
+
+fn countLocalDefsInStream(stream: []const ir.Instruction, local: ir.LocalId) usize {
+    var count: usize = 0;
+    for (stream) |instr| {
+        count += countLocalDefsRecursive(instr, local);
+    }
+    return count;
+}
+
+fn countLocalDefsInFunction(function: *const ir.Function, local: ir.LocalId) usize {
+    var count: usize = 0;
+    for (function.body) |block| {
+        count += countLocalDefsInStream(block.instructions, local);
+    }
+    return count;
+}
+
+fn countImmediateLocalDefs(instr: ir.Instruction, local: ir.LocalId) usize {
+    const defs = arc_liveness.collectDefs(instr);
+    var count: usize = 0;
+    for (defs.slice()) |defined_local| {
+        if (defined_local == local) count += 1;
+    }
+    return count;
+}
+
 /// Soundness predicate for the borrowed pass-through elision: does the
 /// caller hold a `+1` on `source`'s cell that is independent of any
 /// per-call share's retain and that spans every call within the
@@ -4379,6 +4624,7 @@ const Parser = @import("parser.zig").Parser;
 const Collector = @import("collector.zig").Collector;
 const hir_mod = @import("hir.zig");
 const HirBuilder = hir_mod.HirBuilder;
+const arc_drop_insertion = @import("arc_drop_insertion.zig");
 
 /// End-to-end fixture for the Phase C classifier tests. Mirrors the
 /// `DropTestSuite` shape used by `arc_drop_insertion.zig`: parses
@@ -8351,4 +8597,627 @@ test "arc_ownership: elideBorrowedPassThroughShares handles nested streams (if_e
     try std.testing.expect(!saw_share);
     try std.testing.expect(!saw_release_5);
     try std.testing.expect(saw_borrow_dest_5);
+}
+
+test "arc_ownership: elideBorrowedPassThroughShares refuses when share dest has a second use" {
+    // The safe Phase 8 slice is a single borrowed pass-through:
+    // share/retain feeding exactly one borrowed call, then the paired
+    // post-call release. If the share dest is used again, even by a
+    // borrowed call, the pass must leave the original ownership shape
+    // intact so later phases see the exact producer/use chain.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const target_param_conv = try arena.alloc(ir.ParamConvention, 1);
+    target_param_conv[0] = .borrowed;
+    const target_params = try arena.alloc(ir.Param, 1);
+    target_params[0] = .{ .name = "x", .type_expr = .void, .type_id = null };
+    const target_blocks = try arena.alloc(ir.Block, 1);
+    target_blocks[0] = .{
+        .label = 0,
+        .instructions = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+            .{ .ret = .{ .value = null } },
+        }),
+    };
+    const target_local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{.borrowed});
+    const target_func = ir.Function{
+        .id = 100,
+        .name = "Mod__target__1",
+        .scope_id = 0,
+        .arity = 1,
+        .params = target_params,
+        .return_type = .void,
+        .body = target_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+        .param_conventions = target_param_conv,
+        .local_ownership = target_local_ownership,
+        .result_convention = .trivial,
+    };
+
+    const first_call_args = try arena.alloc(ir.LocalId, 1);
+    first_call_args[0] = 1;
+    const first_call_arg_modes = try arena.alloc(ir.ValueMode, 1);
+    first_call_arg_modes[0] = .share;
+    const second_call_args = try arena.alloc(ir.LocalId, 1);
+    second_call_args[0] = 1;
+    const second_call_arg_modes = try arena.alloc(ir.ValueMode, 1);
+    second_call_arg_modes[0] = .borrow;
+    const caller_instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .retain = .{ .value = 1, .kind = .normal } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "Mod__target__1",
+            .args = first_call_args,
+            .arg_modes = first_call_arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .call_named = .{
+            .dest = 3,
+            .name = "Mod__target__1",
+            .args = second_call_args,
+            .arg_modes = second_call_arg_modes,
+        } },
+        .{ .ret = .{ .value = null } },
+    });
+    const caller_blocks = try arena.alloc(ir.Block, 1);
+    caller_blocks[0] = .{ .label = 0, .instructions = caller_instrs };
+    const caller_param_conv = try arena.alloc(ir.ParamConvention, 1);
+    caller_param_conv[0] = .borrowed;
+    const caller_params = try arena.alloc(ir.Param, 1);
+    caller_params[0] = .{ .name = "src", .type_expr = .void, .type_id = null };
+    const caller_local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .borrowed, .owned, .trivial, .trivial,
+    });
+    const caller_func = ir.Function{
+        .id = 200,
+        .name = "Mod__caller__1",
+        .scope_id = 0,
+        .arity = 1,
+        .params = caller_params,
+        .return_type = .void,
+        .body = caller_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = caller_param_conv,
+        .local_ownership = caller_local_ownership,
+        .result_convention = .trivial,
+    };
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = target_func;
+    functions[1] = caller_func;
+    const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    try elideBorrowedPassThroughShares(arena, &functions[1], &program);
+
+    const rewritten = functions[1].body[0].instructions;
+    var saw_share = false;
+    var saw_retain_1 = false;
+    var saw_release_1 = false;
+    var saw_borrow_dest_1 = false;
+    for (rewritten) |instr| {
+        switch (instr) {
+            .share_value => saw_share = true,
+            .retain => |retain| if (retain.value == 1) {
+                saw_retain_1 = true;
+            },
+            .release => |release| if (release.value == 1) {
+                saw_release_1 = true;
+            },
+            .borrow_value => |borrow_value| if (borrow_value.dest == 1) {
+                saw_borrow_dest_1 = true;
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(saw_share);
+    try std.testing.expect(saw_retain_1);
+    try std.testing.expect(saw_release_1);
+    try std.testing.expect(!saw_borrow_dest_1);
+    try std.testing.expectEqual(ir.OwnershipClass.owned, functions[1].local_ownership[1]);
+}
+
+test "arc_ownership: elided borrowed pass-through does not receive stale scope-exit release" {
+    // Prove the downstream contract: after elision rewrites the share
+    // dest to borrow_value and local_ownership[dest] to .borrowed,
+    // drop insertion must not synthesize a scope-exit release for that
+    // dest even if stale liveness input still lists it before ret.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const target_param_conv = try arena.alloc(ir.ParamConvention, 1);
+    target_param_conv[0] = .borrowed;
+    const target_params = try arena.alloc(ir.Param, 1);
+    target_params[0] = .{ .name = "x", .type_expr = .void, .type_id = null };
+    const target_blocks = try arena.alloc(ir.Block, 1);
+    target_blocks[0] = .{
+        .label = 0,
+        .instructions = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+            .{ .ret = .{ .value = null } },
+        }),
+    };
+    const target_local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{.borrowed});
+    const target_func = ir.Function{
+        .id = 100,
+        .name = "Mod__target__1",
+        .scope_id = 0,
+        .arity = 1,
+        .params = target_params,
+        .return_type = .void,
+        .body = target_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+        .param_conventions = target_param_conv,
+        .local_ownership = target_local_ownership,
+        .result_convention = .trivial,
+    };
+
+    const caller_args = try arena.alloc(ir.LocalId, 1);
+    caller_args[0] = 1;
+    const caller_arg_modes = try arena.alloc(ir.ValueMode, 1);
+    caller_arg_modes[0] = .share;
+    const caller_instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .retain = .{ .value = 1, .kind = .normal } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "Mod__target__1",
+            .args = caller_args,
+            .arg_modes = caller_arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .ret = .{ .value = null } },
+    });
+    const caller_blocks = try arena.alloc(ir.Block, 1);
+    caller_blocks[0] = .{ .label = 0, .instructions = caller_instrs };
+    const caller_param_conv = try arena.alloc(ir.ParamConvention, 1);
+    caller_param_conv[0] = .borrowed;
+    const caller_params = try arena.alloc(ir.Param, 1);
+    caller_params[0] = .{ .name = "src", .type_expr = .void, .type_id = null };
+    const caller_local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .borrowed, .owned, .trivial,
+    });
+    const caller_func = ir.Function{
+        .id = 200,
+        .name = "Mod__caller__1",
+        .scope_id = 0,
+        .arity = 1,
+        .params = caller_params,
+        .return_type = .void,
+        .body = caller_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+        .param_conventions = caller_param_conv,
+        .local_ownership = caller_local_ownership,
+        .result_convention = .trivial,
+    };
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = target_func;
+    functions[1] = caller_func;
+    const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    try elideBorrowedPassThroughShares(arena, &functions[1], &program);
+    try std.testing.expectEqual(ir.OwnershipClass.borrowed, functions[1].local_ownership[1]);
+
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(std.testing.allocator);
+    var live_set: arc_liveness.ArcLocalSet = .empty;
+    errdefer live_set.deinit(std.testing.allocator);
+    try live_set.put(std.testing.allocator, 1, {});
+    // Post-elision stream ids: param_get=0, borrow_value=1,
+    // call_named=2, ret=3.
+    try ownership.live_before_ret.putNoClobber(std.testing.allocator, 3, live_set);
+
+    try arc_drop_insertion.insertScopeExitDrops(arena, &functions[1], &ownership);
+
+    var releases_of_borrow_dest: usize = 0;
+    for (functions[1].body[0].instructions) |instr| {
+        if (instr == .release and instr.release.value == 1) {
+            releases_of_borrow_dest += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), releases_of_borrow_dest);
+}
+
+const BorrowedPassThroughTestFixture = struct {
+    functions: []ir.Function,
+    program: ir.Program,
+};
+
+fn buildBorrowedPassThroughTestFixture(
+    arena: std.mem.Allocator,
+    caller_instrs: []const ir.Instruction,
+    caller_local_ownership: []const ir.OwnershipClass,
+) !BorrowedPassThroughTestFixture {
+    const target_param_conventions = try arena.dupe(ir.ParamConvention, &[_]ir.ParamConvention{.borrowed});
+    const target_params = try arena.dupe(ir.Param, &[_]ir.Param{
+        .{ .name = "x", .type_expr = .void, .type_id = null },
+    });
+    const target_blocks = try arena.alloc(ir.Block, 1);
+    target_blocks[0] = .{
+        .label = 0,
+        .instructions = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+            .{ .ret = .{ .value = null } },
+        }),
+    };
+    const target_local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{.borrowed});
+    const target_function = ir.Function{
+        .id = 100,
+        .name = "Mod__target__1",
+        .scope_id = 0,
+        .arity = 1,
+        .params = target_params,
+        .return_type = .void,
+        .body = target_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+        .param_conventions = target_param_conventions,
+        .local_ownership = target_local_ownership,
+        .result_convention = .trivial,
+    };
+
+    const caller_blocks = try arena.alloc(ir.Block, 1);
+    caller_blocks[0] = .{ .label = 0, .instructions = caller_instrs };
+    const caller_param_conventions = try arena.dupe(ir.ParamConvention, &[_]ir.ParamConvention{.borrowed});
+    const caller_params = try arena.dupe(ir.Param, &[_]ir.Param{
+        .{ .name = "src", .type_expr = .void, .type_id = null },
+    });
+    const caller_function = ir.Function{
+        .id = 200,
+        .name = "Mod__caller__1",
+        .scope_id = 0,
+        .arity = 1,
+        .params = caller_params,
+        .return_type = .void,
+        .body = caller_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = @intCast(caller_local_ownership.len),
+        .param_conventions = caller_param_conventions,
+        .local_ownership = try arena.dupe(ir.OwnershipClass, caller_local_ownership),
+        .result_convention = .trivial,
+    };
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = target_function;
+    functions[1] = caller_function;
+    return .{
+        .functions = functions,
+        .program = .{ .functions = functions, .type_defs = &.{}, .entry = null },
+    };
+}
+
+fn expectBorrowedPassThroughUnchanged(function: *const ir.Function, arg_local: ir.LocalId) !void {
+    var saw_share = false;
+    var saw_retain = false;
+    var saw_release = false;
+    var saw_borrow = false;
+    for (function.body[0].instructions) |instr| {
+        switch (instr) {
+            .share_value => |share| if (share.dest == arg_local) {
+                saw_share = true;
+            },
+            .retain => |retain| if (retain.value == arg_local) {
+                saw_retain = true;
+            },
+            .release => |release| if (release.value == arg_local) {
+                saw_release = true;
+            },
+            .borrow_value => |borrow_value| if (borrow_value.dest == arg_local) {
+                saw_borrow = true;
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(saw_share);
+    try std.testing.expect(saw_retain);
+    try std.testing.expect(saw_release);
+    try std.testing.expect(!saw_borrow);
+}
+
+test "arc_ownership: elideBorrowedPassThroughShares refuses always-consuming call_builtin slots" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{ 1, 3 });
+    const arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{ .share, .borrow });
+    const caller_instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .retain = .{ .value = 1, .kind = .normal } },
+        .{ .call_builtin = .{
+            .dest = 2,
+            .name = "List.cons",
+            .args = args,
+            .arg_modes = arg_modes,
+            .result_type = .any,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .ret = .{ .value = null } },
+    });
+    const caller_blocks = try arena.alloc(ir.Block, 1);
+    caller_blocks[0] = .{ .label = 0, .instructions = caller_instrs };
+    const caller_local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .owned, .owned,
+    });
+    const caller_function = ir.Function{
+        .id = 200,
+        .name = "Mod__caller__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = caller_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = &.{},
+        .local_ownership = caller_local_ownership,
+        .result_convention = .trivial,
+    };
+
+    const functions = try arena.dupe(ir.Function, &[_]ir.Function{caller_function});
+    const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    try elideBorrowedPassThroughShares(arena, &functions[0], &program);
+
+    try expectBorrowedPassThroughUnchanged(&functions[0], 1);
+    try std.testing.expectEqual(ir.OwnershipClass.owned, functions[0].local_ownership[1]);
+}
+
+test "arc_ownership: elideBorrowedPassThroughShares refuses share dest with intervening definition" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const call_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{1});
+    const call_arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{.share});
+    const caller_instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .retain = .{ .value = 1, .kind = .normal } },
+        .{ .const_nil = 1 },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "Mod__target__1",
+            .args = call_args,
+            .arg_modes = call_arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .ret = .{ .value = null } },
+    });
+    var fixture = try buildBorrowedPassThroughTestFixture(
+        arena,
+        caller_instrs,
+        &[_]ir.OwnershipClass{ .borrowed, .owned, .trivial },
+    );
+
+    try elideBorrowedPassThroughShares(arena, &fixture.functions[1], &fixture.program);
+
+    try expectBorrowedPassThroughUnchanged(&fixture.functions[1], 1);
+    try std.testing.expectEqual(ir.OwnershipClass.owned, fixture.functions[1].local_ownership[1]);
+}
+
+test "arc_ownership: elideBorrowedPassThroughShares refuses try_call_named success_result use of share dest" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const call_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{1});
+    const call_arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{.share});
+    const try_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{});
+    const try_arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{});
+    const caller_instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .retain = .{ .value = 1, .kind = .normal } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "Mod__target__1",
+            .args = call_args,
+            .arg_modes = call_arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .try_call_named = .{
+            .dest = 4,
+            .name = "Mod__maybe__0",
+            .args = try_args,
+            .arg_modes = try_arg_modes,
+            .input_local = 5,
+            .handler_instrs = &.{},
+            .handler_result = null,
+            .success_instrs = &.{},
+            .success_result = 1,
+            .payload_local = null,
+        } },
+        .{ .ret = .{ .value = null } },
+    });
+    var fixture = try buildBorrowedPassThroughTestFixture(
+        arena,
+        caller_instrs,
+        &[_]ir.OwnershipClass{ .borrowed, .owned, .trivial, .trivial, .trivial, .trivial },
+    );
+
+    try elideBorrowedPassThroughShares(arena, &fixture.functions[1], &fixture.program);
+
+    try expectBorrowedPassThroughUnchanged(&fixture.functions[1], 1);
+    try std.testing.expectEqual(ir.OwnershipClass.owned, fixture.functions[1].local_ownership[1]);
+}
+
+test "arc_ownership: elideBorrowedPassThroughShares refuses try_call_named handler_result use of share dest" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const call_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{1});
+    const call_arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{.share});
+    const try_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{});
+    const try_arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{});
+    const caller_instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .retain = .{ .value = 1, .kind = .normal } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "Mod__target__1",
+            .args = call_args,
+            .arg_modes = call_arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .try_call_named = .{
+            .dest = 4,
+            .name = "Mod__maybe__0",
+            .args = try_args,
+            .arg_modes = try_arg_modes,
+            .input_local = 5,
+            .handler_instrs = &.{},
+            .handler_result = 1,
+            .success_instrs = &.{},
+            .success_result = null,
+            .payload_local = null,
+        } },
+        .{ .ret = .{ .value = null } },
+    });
+    var fixture = try buildBorrowedPassThroughTestFixture(
+        arena,
+        caller_instrs,
+        &[_]ir.OwnershipClass{ .borrowed, .owned, .trivial, .trivial, .trivial, .trivial },
+    );
+
+    try elideBorrowedPassThroughShares(arena, &fixture.functions[1], &fixture.program);
+
+    try expectBorrowedPassThroughUnchanged(&fixture.functions[1], 1);
+    try std.testing.expectEqual(ir.OwnershipClass.owned, fixture.functions[1].local_ownership[1]);
+}
+
+test "arc_ownership: elideBorrowedPassThroughShares refuses try_call_named payload_local reuse of share dest" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const call_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{1});
+    const call_arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{.share});
+    const try_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{});
+    const try_arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{});
+    const caller_instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .retain = .{ .value = 1, .kind = .normal } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "Mod__target__1",
+            .args = call_args,
+            .arg_modes = call_arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .try_call_named = .{
+            .dest = 4,
+            .name = "Mod__maybe__0",
+            .args = try_args,
+            .arg_modes = try_arg_modes,
+            .input_local = 5,
+            .handler_instrs = &.{},
+            .handler_result = null,
+            .success_instrs = &.{},
+            .success_result = null,
+            .payload_local = 1,
+        } },
+        .{ .ret = .{ .value = null } },
+    });
+    var fixture = try buildBorrowedPassThroughTestFixture(
+        arena,
+        caller_instrs,
+        &[_]ir.OwnershipClass{ .borrowed, .owned, .trivial, .trivial, .trivial, .trivial },
+    );
+
+    try elideBorrowedPassThroughShares(arena, &fixture.functions[1], &fixture.program);
+
+    try expectBorrowedPassThroughUnchanged(&fixture.functions[1], 1);
+    try std.testing.expectEqual(ir.OwnershipClass.owned, fixture.functions[1].local_ownership[1]);
+}
+
+test "arc_ownership: elideBorrowedPassThroughShares refuses optional_dispatch payload_local reuse of share dest" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const call_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{1});
+    const call_arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{.share});
+    const caller_instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .retain = .{ .value = 1, .kind = .normal } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "Mod__target__1",
+            .args = call_args,
+            .arg_modes = call_arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .optional_dispatch = .{
+            .scrutinee_param = 0,
+            .payload_local = 1,
+            .nil_instrs = &.{},
+            .nil_result = null,
+            .struct_instrs = &.{},
+            .struct_result = null,
+        } },
+        .{ .ret = .{ .value = null } },
+    });
+    var fixture = try buildBorrowedPassThroughTestFixture(
+        arena,
+        caller_instrs,
+        &[_]ir.OwnershipClass{ .borrowed, .owned, .trivial },
+    );
+
+    try elideBorrowedPassThroughShares(arena, &fixture.functions[1], &fixture.program);
+
+    try expectBorrowedPassThroughUnchanged(&fixture.functions[1], 1);
+    try std.testing.expectEqual(ir.OwnershipClass.owned, fixture.functions[1].local_ownership[1]);
+}
+
+test "arc_ownership: elideBorrowedPassThroughShares refuses non-owned share dest local" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const call_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{1});
+    const call_arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{.share});
+    const caller_instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .retain = .{ .value = 1, .kind = .normal } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "Mod__target__1",
+            .args = call_args,
+            .arg_modes = call_arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .ret = .{ .value = null } },
+    });
+    var fixture = try buildBorrowedPassThroughTestFixture(
+        arena,
+        caller_instrs,
+        &[_]ir.OwnershipClass{ .borrowed, .trivial, .trivial },
+    );
+
+    try elideBorrowedPassThroughShares(arena, &fixture.functions[1], &fixture.program);
+
+    try expectBorrowedPassThroughUnchanged(&fixture.functions[1], 1);
+    try std.testing.expectEqual(ir.OwnershipClass.trivial, fixture.functions[1].local_ownership[1]);
 }

@@ -3848,7 +3848,8 @@ pub const DefList = struct {
     }
 };
 
-/// Locals defined (written) by this instruction. Sub-stream defs are
+/// Locals defined (written) by this instruction, including binder
+/// locals introduced by control-flow instructions. Sub-stream defs are
 /// not collected here — the recursive walk visits them.
 pub fn collectDefs(instr: ir.Instruction) DefList {
     var out: DefList = .{};
@@ -3888,7 +3889,10 @@ pub fn collectDefs(instr: ir.Instruction) DefList {
         .call_closure => |x| out.append(x.dest),
         .call_dispatch => |x| out.append(x.dest),
         .call_builtin => |x| out.append(x.dest),
-        .try_call_named => |x| out.append(x.dest),
+        .try_call_named => |x| {
+            out.append(x.dest);
+            if (x.payload_local) |payload_local| out.append(payload_local);
+        },
         .error_catch => |x| out.append(x.dest),
         .if_expr => |x| out.append(x.dest),
         .case_block => |x| out.append(x.dest),
@@ -3916,6 +3920,7 @@ pub fn collectDefs(instr: ir.Instruction) DefList {
         .int_widen, .float_widen => |x| out.append(x.dest),
         .phi => |x| out.append(x.dest),
         .jump => |x| if (x.bind_dest) |d| out.append(d),
+        .optional_dispatch => |x| out.append(x.payload_local),
         else => {},
     }
     return out;

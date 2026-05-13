@@ -931,8 +931,13 @@ pub const PerceusAnalyzer = struct {
                 });
                 for (gb.body, 0..) |nested, idx| {
                     try self.scanInstructionForConstructions(
-                        nested, decon, function_id, block_label,
-                        path_builder, @intCast(idx), results,
+                        nested,
+                        decon,
+                        function_id,
+                        block_label,
+                        path_builder,
+                        @intCast(idx),
+                        results,
                     );
                 }
                 _ = path_builder.pop();
@@ -944,8 +949,13 @@ pub const PerceusAnalyzer = struct {
                 });
                 for (ie.then_instrs, 0..) |nested, idx| {
                     try self.scanInstructionForConstructions(
-                        nested, decon, function_id, block_label,
-                        path_builder, @intCast(idx), results,
+                        nested,
+                        decon,
+                        function_id,
+                        block_label,
+                        path_builder,
+                        @intCast(idx),
+                        results,
                     );
                 }
                 _ = path_builder.pop();
@@ -956,8 +966,13 @@ pub const PerceusAnalyzer = struct {
                 });
                 for (ie.else_instrs, 0..) |nested, idx| {
                     try self.scanInstructionForConstructions(
-                        nested, decon, function_id, block_label,
-                        path_builder, @intCast(idx), results,
+                        nested,
+                        decon,
+                        function_id,
+                        block_label,
+                        path_builder,
+                        @intCast(idx),
+                        results,
                     );
                 }
                 _ = path_builder.pop();
@@ -969,8 +984,13 @@ pub const PerceusAnalyzer = struct {
                 });
                 for (cb.pre_instrs, 0..) |nested, idx| {
                     try self.scanInstructionForConstructions(
-                        nested, decon, function_id, block_label,
-                        path_builder, @intCast(idx), results,
+                        nested,
+                        decon,
+                        function_id,
+                        block_label,
+                        path_builder,
+                        @intCast(idx),
+                        results,
                     );
                 }
                 _ = path_builder.pop();
@@ -982,8 +1002,13 @@ pub const PerceusAnalyzer = struct {
                     });
                     for (arm.cond_instrs, 0..) |nested, idx| {
                         try self.scanInstructionForConstructions(
-                            nested, decon, function_id, block_label,
-                            path_builder, @intCast(idx), results,
+                            nested,
+                            decon,
+                            function_id,
+                            block_label,
+                            path_builder,
+                            @intCast(idx),
+                            results,
                         );
                     }
                     _ = path_builder.pop();
@@ -994,8 +1019,13 @@ pub const PerceusAnalyzer = struct {
                     });
                     for (arm.body_instrs, 0..) |nested, idx| {
                         try self.scanInstructionForConstructions(
-                            nested, decon, function_id, block_label,
-                            path_builder, @intCast(idx), results,
+                            nested,
+                            decon,
+                            function_id,
+                            block_label,
+                            path_builder,
+                            @intCast(idx),
+                            results,
                         );
                     }
                     _ = path_builder.pop();
@@ -1007,8 +1037,13 @@ pub const PerceusAnalyzer = struct {
                 });
                 for (cb.default_instrs, 0..) |nested, idx| {
                     try self.scanInstructionForConstructions(
-                        nested, decon, function_id, block_label,
-                        path_builder, @intCast(idx), results,
+                        nested,
+                        decon,
+                        function_id,
+                        block_label,
+                        path_builder,
+                        @intCast(idx),
+                        results,
                     );
                 }
                 _ = path_builder.pop();
@@ -1021,8 +1056,13 @@ pub const PerceusAnalyzer = struct {
                     });
                     for (case.body_instrs, 0..) |nested, idx| {
                         try self.scanInstructionForConstructions(
-                            nested, decon, function_id, block_label,
-                            path_builder, @intCast(idx), results,
+                            nested,
+                            decon,
+                            function_id,
+                            block_label,
+                            path_builder,
+                            @intCast(idx),
+                            results,
                         );
                     }
                     _ = path_builder.pop();
@@ -1033,8 +1073,13 @@ pub const PerceusAnalyzer = struct {
                 });
                 for (sl.default_instrs, 0..) |nested, idx| {
                     try self.scanInstructionForConstructions(
-                        nested, decon, function_id, block_label,
-                        path_builder, @intCast(idx), results,
+                        nested,
+                        decon,
+                        function_id,
+                        block_label,
+                        path_builder,
+                        @intCast(idx),
+                        results,
                     );
                 }
                 _ = path_builder.pop();
@@ -1047,8 +1092,13 @@ pub const PerceusAnalyzer = struct {
                     });
                     for (case.body_instrs, 0..) |nested, idx| {
                         try self.scanInstructionForConstructions(
-                            nested, decon, function_id, block_label,
-                            path_builder, @intCast(idx), results,
+                            nested,
+                            decon,
+                            function_id,
+                            block_label,
+                            path_builder,
+                            @intCast(idx),
+                            results,
                         );
                     }
                     _ = path_builder.pop();
@@ -1059,8 +1109,13 @@ pub const PerceusAnalyzer = struct {
                 });
                 for (sr.default_instrs, 0..) |nested, idx| {
                     try self.scanInstructionForConstructions(
-                        nested, decon, function_id, block_label,
-                        path_builder, @intCast(idx), results,
+                        nested,
+                        decon,
+                        function_id,
+                        block_label,
+                        path_builder,
+                        @intCast(idx),
+                        results,
                     );
                 }
                 _ = path_builder.pop();
@@ -1073,8 +1128,13 @@ pub const PerceusAnalyzer = struct {
                     });
                     for (case.body_instrs, 0..) |nested, idx| {
                         try self.scanInstructionForConstructions(
-                            nested, decon, function_id, block_label,
-                            path_builder, @intCast(idx), results,
+                            nested,
+                            decon,
+                            function_id,
+                            block_label,
+                            path_builder,
+                            @intCast(idx),
+                            results,
                         );
                     }
                     _ = path_builder.pop();
@@ -1088,8 +1148,13 @@ pub const PerceusAnalyzer = struct {
                     });
                     for (case.body_instrs, 0..) |nested, idx| {
                         try self.scanInstructionForConstructions(
-                            nested, decon, function_id, block_label,
-                            path_builder, @intCast(idx), results,
+                            nested,
+                            decon,
+                            function_id,
+                            block_label,
+                            path_builder,
+                            @intCast(idx),
+                            results,
                         );
                     }
                     _ = path_builder.pop();
@@ -1102,8 +1167,13 @@ pub const PerceusAnalyzer = struct {
                 });
                 for (tc.success_instrs, 0..) |nested, idx| {
                     try self.scanInstructionForConstructions(
-                        nested, decon, function_id, block_label,
-                        path_builder, @intCast(idx), results,
+                        nested,
+                        decon,
+                        function_id,
+                        block_label,
+                        path_builder,
+                        @intCast(idx),
+                        results,
                     );
                 }
                 _ = path_builder.pop();
@@ -1114,8 +1184,13 @@ pub const PerceusAnalyzer = struct {
                 });
                 for (tc.handler_instrs, 0..) |nested, idx| {
                     try self.scanInstructionForConstructions(
-                        nested, decon, function_id, block_label,
-                        path_builder, @intCast(idx), results,
+                        nested,
+                        decon,
+                        function_id,
+                        block_label,
+                        path_builder,
+                        @intCast(idx),
+                        results,
                     );
                 }
                 _ = path_builder.pop();
@@ -1127,8 +1202,13 @@ pub const PerceusAnalyzer = struct {
                 });
                 for (od.nil_instrs, 0..) |nested, idx| {
                     try self.scanInstructionForConstructions(
-                        nested, decon, function_id, block_label,
-                        path_builder, @intCast(idx), results,
+                        nested,
+                        decon,
+                        function_id,
+                        block_label,
+                        path_builder,
+                        @intCast(idx),
+                        results,
                     );
                 }
                 _ = path_builder.pop();
@@ -1139,8 +1219,13 @@ pub const PerceusAnalyzer = struct {
                 });
                 for (od.struct_instrs, 0..) |nested, idx| {
                     try self.scanInstructionForConstructions(
-                        nested, decon, function_id, block_label,
-                        path_builder, @intCast(idx), results,
+                        nested,
+                        decon,
+                        function_id,
+                        block_label,
+                        path_builder,
+                        @intCast(idx),
+                        results,
                     );
                 }
                 _ = path_builder.pop();

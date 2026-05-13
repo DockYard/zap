@@ -859,6 +859,20 @@ pub const ZirDriver = struct {
         return ref;
     }
 
+    fn emitMemoryStartupForEntryFromRuntime(self: *ZirDriver, rt_import: u32) BuildError!void {
+        const startup_fn = zir_builder_emit_field_val(self.handle, rt_import, "memoryStartupForEntry", 21);
+        if (startup_fn == error_ref) return error.EmitFailed;
+        const empty_args: [0]u32 = .{};
+        const startup_call = zir_builder_emit_call_ref(self.handle, startup_fn, &empty_args, 0);
+        if (startup_call == error_ref) return error.EmitFailed;
+    }
+
+    fn emitMemoryStartupForEntry(self: *ZirDriver) BuildError!void {
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+        try self.emitMemoryStartupForEntryFromRuntime(rt_import);
+    }
+
     fn emitAllocatorRef(self: *ZirDriver) BuildError!u32 {
         // `std.heap.c_allocator` is malloc-backed: ~32 byte per-allocation
         // overhead, vs. `std.heap.page_allocator`'s full OS-page rounding
@@ -2154,6 +2168,12 @@ pub const ZirDriver = struct {
             const rt = zir_builder_emit_import(self.handle, "zap_runtime", 11);
             if (rt == error_ref) return error.EmitFailed;
 
+            // Generated builder binaries use the rewritten runtime
+            // source whose dispatchers compile away lazy startup.
+            // Emit the explicit prologue before any BuilderRuntime
+            // helper can touch runtime-managed memory.
+            try self.emitMemoryStartupForEntryFromRuntime(rt);
+
             // Call BuilderRuntime.buildEnvFromArgv() → returns env struct
             const builder_rt = emitRuntimeNamespaceField(self.handle, rt, runtime_ns.builder_runtime);
             if (builder_rt == error_ref) return error.EmitFailed;
@@ -3371,6 +3391,17 @@ pub const ZirDriver = struct {
             return error.BeginFuncFailed;
         }
 
+        if (is_main) {
+            // Executable binary builds pair this emitted entry call
+            // with a runtime-source rewrite that sets
+            // `MEMORY_STARTUP_PROLOGUE_EMITTED == true`, allowing
+            // dispatchers to compile away lazy startup. Object outputs
+            // may still contain this generated function, but they have
+            // no guaranteed executable artifact entry boundary, so
+            // their runtime source keeps the marker false.
+            try self.emitMemoryStartupForEntry();
+        }
+
         // __try variants return optionals: ?ReturnType.
         // On no-match, they return null. The caller checks and runs the handler.
         const is_try_variant = std.mem.endsWith(u8, func.name, "__try");
@@ -4189,22 +4220,13 @@ pub const ZirDriver = struct {
                             // assign has already happened above (via
                             // `local_refs.put`); skip the retain.
                             //
-                            // CRITICAL: consume mode does NOT suppress the
-                            // post-call `.release{value=sv.dest}`. The
-                            // callee BORROWS its argument — it does not
-                            // decrement the cell on its own. Suppressing
-                            // the post-call release would leak the cell on
-                            // every consume-mode share (this was the
-                            // root-cause bug discovered in the first
-                            // Phase 6.3 attempt: borrowing callees + the
-                            // old "skip retain AND release" semantics =
-                            // unbounded leak). The release-suppression
-                            // path is now reserved for retain-elision
-                            // causes that are symmetric: escape analysis
-                            // (no retain emitted here either) and return-
-                            // source elision (the retain-on-ret pass
-                            // skips the bump because ownership flows to
-                            // the caller's slot).
+                            // CRITICAL: this share mode skips only the
+                            // retain emitted by share lowering. It is not
+                            // a release-suppression reason; the matching
+                            // post-call `.release{value=sv.dest}` remains
+                            // unless a separate symmetric retain-elision
+                            // path records the share in `arc_share_skipped`
+                            // (escape analysis or return-source elision).
                             //
                             // Net effect of consume mode in the steady
                             // state: -1 retain. Net refcount delta of
@@ -8359,6 +8381,37 @@ test "closure lowering helper distinguishes immediate and stack tiers" {
     try std.testing.expect(escaping.needs_closure_object);
     try std.testing.expect(!escaping.stack_env);
     try std.testing.expectEqual(ZirDriver.ClosureLowering.StorageScope.heap, escaping.storage_scope);
+}
+
+test "Phase 7e: ZIR entry paths call memory startup prologue" {
+    // The regular `zig build test` target does not link the Zig fork's
+    // ZIR builder C-ABI symbols, and `zig build zir-test` is not used
+    // here. Pin the source-level emission contract instead: both
+    // generated entry surfaces must call the shared startup-prologue
+    // helper, and the builder entry must do so before
+    // BuilderRuntime.buildEnvFromArgv().
+    const source = @embedFile("zir_builder.zig");
+
+    var builder_call_buf: [128]u8 = undefined;
+    const builder_call = try std.fmt.bufPrint(
+        &builder_call_buf,
+        "try self.{s}(rt);",
+        .{"emitMemoryStartupForEntryFromRuntime"},
+    );
+    const builder_call_index = std.mem.indexOf(u8, source, builder_call) orelse return error.TestUnexpectedResult;
+    const build_env_index = std.mem.indexOf(u8, source, "buildEnvFromArgv") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(builder_call_index < build_env_index);
+
+    var main_call_buf: [128]u8 = undefined;
+    const main_call = try std.fmt.bufPrint(
+        &main_call_buf,
+        "try self.{s}();",
+        .{"emitMemoryStartupForEntry"},
+    );
+    const main_gate_index = std.mem.indexOf(u8, source, "if (is_main) {") orelse return error.TestUnexpectedResult;
+    const main_call_index = std.mem.indexOfPos(u8, source, main_gate_index, main_call) orelse return error.TestUnexpectedResult;
+    const try_variant_index = std.mem.indexOfPos(u8, source, main_gate_index, "__try variants return optionals") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(main_call_index < try_variant_index);
 }
 
 test "findClosureTargetInInstrs follows local aliases" {

@@ -406,6 +406,20 @@ inline fn lookupClass(size: usize, alignment: u32) ?u32 {
     return null;
 }
 
+/// First-party direct-call helper for runtime comptime specialization.
+/// Returns the ARC slab class that serves `(size, alignment)`, or null
+/// when the request must use the generic large-allocation path.
+pub inline fn refcountSlabClassIndex(comptime size: usize, comptime alignment: u32) ?u32 {
+    if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return null;
+    return lookupClass(size, alignment);
+}
+
+inline fn validateSlabClassIndex(comptime class_index: u32) void {
+    if (class_index >= SLAB_CLASS_COUNT) {
+        @compileError("arc: slab class index out of range");
+    }
+}
+
 /// Slab header. Lives at the start of every slab; the side-table
 /// refcount array begins immediately after the header (4-byte aligned;
 /// the header is already a multiple of 4 bytes), and the slot array
@@ -1004,6 +1018,14 @@ fn arcAllocateRefcounted(ctx: *anyopaque, size: usize, alignment: u32) callconv(
     return largeAlloc(size, alignment, 1);
 }
 
+/// First-party direct-call allocation helper for generic `Arc(T)` cells
+/// whose `(size, alignment)` pair maps to a slab class at comptime.
+pub inline fn allocateRefcountedClass(ctx: *anyopaque, comptime class_index: u32) ?[*]u8 {
+    validateSlabClassIndex(class_index);
+    const arc_ctx: *ArcContext = @ptrCast(@alignCast(ctx));
+    return slabAllocSlot(&arc_ctx.slab_pool, class_index, 1);
+}
+
 /// Capability descriptor lookup. Returns the REFCOUNT_V1 descriptor
 /// for the `REFC` tag; returns null for every other ID (spec §5.5,
 /// §7.2).
@@ -1065,23 +1087,35 @@ fn arcRetainSized(
     std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
     if (size == 0) return;
     if (lookupClass(size, alignment)) |class_index| {
-        const slab = slabFromSlotPtr(object);
-        std.debug.assert(slab.magic == SLAB_MAGIC);
-        // Cross-check that the (size, alignment) the caller passed
-        // matches the slab the pointer actually lives in. A mismatch
-        // means the caller computed `size` from the wrong type — a
-        // soundness violation. Catch it in debug builds where the
-        // bug is cheapest to diagnose; release builds elide the
-        // assert and trust the caller's `(size, alignment)` pair.
-        std.debug.assert(slab.class_index == class_index);
-        const slot_index = slotIndexInSlab(slab, object);
-        const refcount_ptr = slabRefcountPtr(slab, slot_index);
-        _ = atomicAddU32(refcount_ptr, 1, .monotonic);
+        retainSlabClass(object, class_index);
         return;
     }
     const header = largeHeader(object);
     if (header.magic != LARGE_MAGIC) @panic("zap.arc: retain_sized large path: corrupt LargeHeader magic");
     _ = atomicAddU32(&header.refcount, 1, .monotonic);
+}
+
+inline fn retainSlabClass(object: *anyopaque, class_index: u32) void {
+    const slab = slabFromSlotPtr(object);
+    std.debug.assert(slab.magic == SLAB_MAGIC);
+    // Cross-check that the (size, alignment) the caller passed
+    // matches the slab the pointer actually lives in. A mismatch
+    // means the caller computed `size` from the wrong type — a
+    // soundness violation. Catch it in debug builds where the
+    // bug is cheapest to diagnose; release builds elide the
+    // assert and trust the caller's `(size, alignment)` pair.
+    std.debug.assert(slab.class_index == class_index);
+    const slot_index = slotIndexInSlab(slab, object);
+    const refcount_ptr = slabRefcountPtr(slab, slot_index);
+    _ = atomicAddU32(refcount_ptr, 1, .monotonic);
+}
+
+/// First-party direct-call retain helper for generic `Arc(T)` cells
+/// whose `(size, alignment)` pair maps to a slab class at comptime.
+pub inline fn retainSizedClass(ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) void {
+    _ = ctx;
+    validateSlabClassIndex(class_index);
+    retainSlabClass(object, class_index);
 }
 
 /// REFCOUNT_V1 `release_sized` (Phase 4.x extension). Locates the
@@ -1101,24 +1135,7 @@ fn arcReleaseSized(
     std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
     if (size == 0) return;
     if (lookupClass(size, alignment)) |class_index| {
-        const slab = slabFromSlotPtr(object);
-        std.debug.assert(slab.magic == SLAB_MAGIC);
-        std.debug.assert(slab.class_index == class_index);
-        const slot_index = slotIndexInSlab(slab, object);
-        const refcount_ptr = slabRefcountPtr(slab, slot_index);
-        const prev = atomicAddU32(refcount_ptr, @bitCast(@as(i32, -1)), .acq_rel);
-        // Spec §8.2: a release that drops to zero is the sole owner.
-        // A prev == 0 result means the caller released a cell with
-        // rc=0 already — a double-release. Catch in debug.
-        std.debug.assert(prev > 0);
-        if (prev == 1) {
-            // Children walk runs BEFORE the slot returns to the free
-            // list — `deep_walk` may dereference fields of the cell to
-            // recursively release children, and the side-table layout
-            // guarantees the slot's bytes are still valid at this point.
-            if (deep_walk) |walk| walk(object);
-            slabFreeSlot(&arc_ctx.slab_pool, slab, slot_index);
-        }
+        releaseSlabClass(&arc_ctx.slab_pool, object, class_index, deep_walk);
         return;
     }
     const header = largeHeader(object);
@@ -1134,6 +1151,45 @@ fn arcReleaseSized(
         const byte_ptr: [*]u8 = @ptrCast(object);
         largeFree(byte_ptr);
     }
+}
+
+inline fn releaseSlabClass(
+    slab_pool: *SlabPool,
+    object: *anyopaque,
+    class_index: u32,
+    deep_walk: ?ZapDeepWalkFn,
+) void {
+    const slab = slabFromSlotPtr(object);
+    std.debug.assert(slab.magic == SLAB_MAGIC);
+    std.debug.assert(slab.class_index == class_index);
+    const slot_index = slotIndexInSlab(slab, object);
+    const refcount_ptr = slabRefcountPtr(slab, slot_index);
+    const prev = atomicAddU32(refcount_ptr, @bitCast(@as(i32, -1)), .acq_rel);
+    // Spec §8.2: a release that drops to zero is the sole owner.
+    // A prev == 0 result means the caller released a cell with
+    // rc=0 already — a double-release. Catch in debug.
+    std.debug.assert(prev > 0);
+    if (prev == 1) {
+        // Children walk runs BEFORE the slot returns to the free
+        // list — `deep_walk` may dereference fields of the cell to
+        // recursively release children, and the side-table layout
+        // guarantees the slot's bytes are still valid at this point.
+        if (deep_walk) |walk| walk(object);
+        slabFreeSlot(slab_pool, slab, slot_index);
+    }
+}
+
+/// First-party direct-call release helper for generic `Arc(T)` cells
+/// whose `(size, alignment)` pair maps to a slab class at comptime.
+pub inline fn releaseSizedClass(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    comptime class_index: u32,
+    deep_walk: ?ZapDeepWalkFn,
+) void {
+    validateSlabClassIndex(class_index);
+    const arc_ctx: *ArcContext = @ptrCast(@alignCast(ctx));
+    releaseSlabClass(&arc_ctx.slab_pool, object, class_index, deep_walk);
 }
 
 /// REFCOUNT_V1 `refcount_sized` (Phase 4.x extension). Reads the
@@ -1153,16 +1209,28 @@ fn arcRefcountSized(
     std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
     if (size == 0) return 0;
     if (lookupClass(size, alignment)) |class_index| {
-        const slab = slabFromSlotPtr(object);
-        std.debug.assert(slab.magic == SLAB_MAGIC);
-        std.debug.assert(slab.class_index == class_index);
-        const slot_index = slotIndexInSlab(slab, object);
-        const refcount_ptr = slabRefcountPtr(slab, slot_index);
-        return @atomicLoad(u32, refcount_ptr, .acquire);
+        return refcountSlabClass(object, class_index);
     }
     const header = largeHeader(object);
     if (header.magic != LARGE_MAGIC) @panic("zap.arc: refcount_sized large path: corrupt LargeHeader magic");
     return @atomicLoad(u32, &header.refcount, .acquire);
+}
+
+inline fn refcountSlabClass(object: *anyopaque, class_index: u32) u32 {
+    const slab = slabFromSlotPtr(object);
+    std.debug.assert(slab.magic == SLAB_MAGIC);
+    std.debug.assert(slab.class_index == class_index);
+    const slot_index = slotIndexInSlab(slab, object);
+    const refcount_ptr = slabRefcountPtr(slab, slot_index);
+    return @atomicLoad(u32, refcount_ptr, .acquire);
+}
+
+/// First-party direct-call refcount helper for generic `Arc(T)` cells
+/// whose `(size, alignment)` pair maps to a slab class at comptime.
+pub inline fn refcountSizedClass(ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) u32 {
+    _ = ctx;
+    validateSlabClassIndex(class_index);
+    return refcountSlabClass(object, class_index);
 }
 
 // ---------------------------------------------------------------------------
@@ -1270,13 +1338,13 @@ pub const getCapabilityDesc = arcGetCapabilityDesc;
 // The uniform-interface aliases declared above must match the canonical
 // AbiV1 slot types so the runtime's comptime dispatch (in `runtime.zig`'s
 // host stub OR a user-binary build that selects `Zap.Memory.ARC`) sees
-// the right calling shape. ARC declares REFCOUNT_V1, so all 11 aliases
-// MUST resolve to real implementations with matching ABI slot
-// signatures; a drift between the alias arrow and the underlying impl
-// (e.g. an extra parameter, a typo'd return type) would surface at
-// user-binary link time rather than here. Pinning each alias against
-// its canonical slot type at module scope catches that drift at the
-// host build site instead.
+// the right calling shape. ARC declares REFCOUNT_V1, so every ABI slot
+// alias plus every first-party class-specialized helper MUST resolve to
+// real implementations with matching signatures; a drift between the
+// alias arrow and the underlying impl (e.g. an extra parameter, a typo'd
+// return type) would surface at user-binary link time rather than here.
+// Pinning each alias against its canonical slot type at module scope
+// catches that drift at the host build site instead.
 comptime {
     const InitFn = *const fn (options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque;
     const DeinitFn = *const fn (ctx: *anyopaque) callconv(.c) void;
@@ -1289,6 +1357,11 @@ comptime {
     const ReleaseSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32, deep_walk: ?ZapDeepWalkFn) callconv(.c) void;
     const AllocateRefcountedFn = *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8;
     const RefcountSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32;
+    const ClassIndexFn = fn (comptime size: usize, comptime alignment: u32) callconv(.@"inline") ?u32;
+    const AllocateRefcountedClassFn = fn (ctx: *anyopaque, comptime class_index: u32) callconv(.@"inline") ?[*]u8;
+    const RetainSizedClassFn = fn (ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) callconv(.@"inline") void;
+    const ReleaseSizedClassFn = fn (ctx: *anyopaque, object: *anyopaque, comptime class_index: u32, deep_walk: ?ZapDeepWalkFn) callconv(.@"inline") void;
+    const RefcountSizedClassFn = fn (ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) callconv(.@"inline") u32;
 
     _ = @as(InitFn, init);
     _ = @as(DeinitFn, deinit);
@@ -1301,4 +1374,43 @@ comptime {
     _ = @as(ReleaseSizedFn, releaseSized);
     _ = @as(AllocateRefcountedFn, allocateRefcounted);
     _ = @as(RefcountSizedFn, refcountSized);
+    _ = @as(*const ClassIndexFn, refcountSlabClassIndex);
+    _ = @as(*const AllocateRefcountedClassFn, allocateRefcountedClass);
+    _ = @as(*const RetainSizedClassFn, retainSizedClass);
+    _ = @as(*const ReleaseSizedClassFn, releaseSizedClass);
+    _ = @as(*const RefcountSizedClassFn, refcountSizedClass);
+}
+
+test "ARC refcount slab class helper maps small Tree-like payloads" {
+    try std.testing.expectEqual(@as(?u32, 0), refcountSlabClassIndex(16, 8));
+}
+
+test "ARC refcount slab class helper rejects generic-path requests" {
+    try std.testing.expectEqual(@as(?u32, null), refcountSlabClassIndex(0, 8));
+    try std.testing.expectEqual(@as(?u32, null), refcountSlabClassIndex(4097, 8));
+    try std.testing.expectEqual(@as(?u32, null), refcountSlabClassIndex(16, 8192));
+}
+
+test "ARC class-specialized helpers interoperate with generic sized refcount slots" {
+    const ctx = init(null) orelse return error.OutOfMemory;
+    defer deinit(ctx);
+
+    const Payload = extern struct {
+        left: ?*const anyopaque,
+        right: ?*const anyopaque,
+    };
+    const class_index = comptime refcountSlabClassIndex(@sizeOf(Payload), @alignOf(Payload)).?;
+    const slot_bytes = allocateRefcountedClass(ctx, class_index) orelse return error.OutOfMemory;
+    const slot_ptr: *Payload = @ptrCast(@alignCast(slot_bytes));
+    slot_ptr.* = .{ .left = null, .right = null };
+
+    try std.testing.expectEqual(@as(u32, 1), refcountSized(ctx, slot_ptr, @sizeOf(Payload), @alignOf(Payload)));
+
+    retainSizedClass(ctx, slot_ptr, class_index);
+    try std.testing.expectEqual(@as(u32, 2), refcountSized(ctx, slot_ptr, @sizeOf(Payload), @alignOf(Payload)));
+
+    releaseSizedClass(ctx, slot_ptr, class_index, null);
+    try std.testing.expectEqual(@as(u32, 1), refcountSizedClass(ctx, slot_ptr, class_index));
+
+    releaseSized(ctx, slot_ptr, @sizeOf(Payload), @alignOf(Payload), null);
 }

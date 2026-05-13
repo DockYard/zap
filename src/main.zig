@@ -64,6 +64,7 @@ fn printUsage() void {
         \\  --build-file <path>  Use a specific build file (default: build.zap)
         \\  --watch, -w       Watch source files and rebuild on changes
         \\  --target <triple> Cross-compile for target (e.g., x86_64-linux-gnu)
+        \\  --collect-arc-stats Compile ARC counter increments into the generated runtime
         \\  --seed <integer>  Set the test seed for deterministic ordering
         \\  -- <args...>      Pass arguments to the program (run only)
         \\
@@ -94,7 +95,7 @@ fn cmdBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
-    const artifact = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target);
+    const artifact = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target, parsed.collect_arc_stats);
     allocator.free(artifact.path);
 
     if (parsed.watch) {
@@ -107,7 +108,7 @@ fn cmdBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
             allocator.free(source_paths);
         }
         std.debug.print("\n[watching for changes...]\n", .{});
-        watchAndRebuild(allocator, source_paths, project_root, target, parsed.build_opts, false, &.{});
+        watchAndRebuild(allocator, source_paths, project_root, target, parsed.build_opts, false, &.{}, parsed.collect_arc_stats);
     }
 }
 
@@ -123,7 +124,7 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
-    const artifact = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target);
+    const artifact = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target, parsed.collect_arc_stats);
     defer allocator.free(artifact.path);
 
     if (artifact.kind != .bin) {
@@ -144,7 +145,7 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
             allocator.free(source_paths);
         }
         std.debug.print("\n[watching for changes...]\n", .{});
-        watchAndRebuild(allocator, source_paths, project_root, target, parsed.build_opts, true, parsed.run_args);
+        watchAndRebuild(allocator, source_paths, project_root, target, parsed.build_opts, true, parsed.run_args, parsed.collect_arc_stats);
     } else {
         // Normal run: build, run, exit with the binary's exit code
         const exit_code = compiler.runBinary(allocator, global_io, artifact.path, parsed.run_args) catch |err| {
@@ -165,7 +166,7 @@ fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
-    const artifact = try buildTarget(allocator, project_root, "test", parsed.build_opts, parsed.compile_target);
+    const artifact = try buildTarget(allocator, project_root, "test", parsed.build_opts, parsed.compile_target, parsed.collect_arc_stats);
     defer allocator.free(artifact.path);
 
     // Build run_args: forward --seed to the test binary if provided
@@ -207,7 +208,7 @@ fn cmdDoc(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // `Zap.Doc.Builder`'s `write_docs_to/1` to render and write
     // pages. The Zig CLI is just a thin shell around build+run, so
     // the same machinery that powers `zap test` powers `zap doc`.
-    const artifact = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target);
+    const artifact = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target, parsed.collect_arc_stats);
     defer allocator.free(artifact.path);
 
     const exit_code = compiler.runBinary(allocator, global_io, artifact.path, parsed.run_args) catch |err| {
@@ -492,6 +493,16 @@ const BuildArtifact = struct {
     kind: zap.builder.BuildConfig.Kind,
 };
 
+/// Runtime-source startup-prologue rewrite shape. Only executable
+/// binary outputs have a generated entry point that the final artifact
+/// is guaranteed to run before runtime-managed memory can be touched.
+/// Object outputs may contain a generated `main` function, but the
+/// object artifact has no executable entry boundary, so dispatchers
+/// must keep their lazy startup fallback compiled in.
+fn hasGeneratedExecutableStartupPrologue(kind: zap.builder.BuildConfig.Kind) bool {
+    return kind == .bin;
+}
+
 /// Build a target. Returns the output artifact path and target kind.
 fn buildTarget(
     allocator: std.mem.Allocator,
@@ -499,6 +510,7 @@ fn buildTarget(
     target_name: []const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
     compile_target: ?[]const u8,
+    collect_arc_stats: bool,
 ) !BuildArtifact {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -1041,7 +1053,11 @@ fn buildTarget(
     const output_path = try std.fs.path.join(alloc, &.{ out_dir, output_filename });
 
     // Compilation caching: hash build.zap + all sources + target name
-    const cache_key = computeBuildCacheKey(build_source, source_units.items, target_name, manifest_eval.result_hash);
+    // plus build controls that change the emitted artifact.
+    const cache_key = computeBuildCacheKey(build_source, source_units.items, target_name, .{
+        .manifest_result_hash = manifest_eval.result_hash,
+        .collect_arc_stats = collect_arc_stats,
+    });
     const cache_key_hex = try std.fmt.allocPrint(alloc, "{x:0>16}", .{cache_key});
     const hash_file = try std.fmt.allocPrint(alloc, ".zap-cache/{s}.hash", .{target_name});
 
@@ -1220,15 +1236,20 @@ fn buildTarget(
         .lib => 1,
         .obj => 2,
     };
+    const has_generated_executable_startup_prologue = hasGeneratedExecutableStartupPrologue(config.kind);
     zir_backend.compile(alloc, result.ir_program, .{
         .zig_lib_dir = zig_lib_dir,
         .cache_dir = ".zap-cache",
         .global_cache_dir = ".zap-cache",
         .output_path = output_path,
         .name = output_name,
-        .runtime_source = compiler.getRuntimeSource(
+        .runtime_source = compiler.getRuntimeSourceForRuntimeControls(
             resolved_manager.declared_caps,
             resolved_manager.builtin_tag,
+            .{
+                .memory_startup_prologue_emitted = has_generated_executable_startup_prologue,
+                .collect_arc_stats = collect_arc_stats,
+            },
         ),
         .output_mode = output_mode_val,
         .optimize_mode = optimize_mode,
@@ -1329,11 +1350,46 @@ fn sourceRootsForMemoryDriver(
 /// Compute a build cache key using SHA-256 (Zig 0.16 std.crypto) for
 /// cryptographic integrity. Returns a truncated u64 for backward-compatible
 /// hex formatting, but the full hash provides collision resistance.
+const BuildCacheOptions = struct {
+    manifest_result_hash: u64,
+    collect_arc_stats: bool = false,
+
+    const Section = extern struct {
+        magic: u32,
+        version: u16,
+        runtime_flags: u16,
+    };
+
+    const MAGIC: u32 = 0x5a_43_4b_31; // "ZCK1"
+    const VERSION: u16 = 1;
+    const ARC_STATS_FLAG: u16 = 0x0001;
+
+    fn runtimeFlags(self: BuildCacheOptions) u16 {
+        var flags: u16 = 0;
+        if (self.collect_arc_stats) flags |= ARC_STATS_FLAG;
+        return flags;
+    }
+
+    fn updateHasher(self: BuildCacheOptions, hasher: *std.crypto.hash.sha2.Sha256) void {
+        hasher.update(std.mem.asBytes(&self.manifest_result_hash));
+
+        const runtime_flags = self.runtimeFlags();
+        if (runtime_flags == 0) return;
+
+        const section = Section{
+            .magic = MAGIC,
+            .version = VERSION,
+            .runtime_flags = runtime_flags,
+        };
+        hasher.update(std.mem.asBytes(&section));
+    }
+};
+
 fn computeBuildCacheKey(
     build_source: []const u8,
     source_units: []const compiler.SourceUnit,
     target_name: []const u8,
-    manifest_result_hash: u64,
+    options: BuildCacheOptions,
 ) u64 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(build_source);
@@ -1343,7 +1399,7 @@ fn computeBuildCacheKey(
         hasher.update(unit.source);
     }
     hasher.update(target_name);
-    hasher.update(std.mem.asBytes(&manifest_result_hash));
+    options.updateHasher(&hasher);
     const digest = hasher.finalResult();
     // Truncate to u64 for backward-compatible cache key format
     return std.mem.readInt(u64, digest[0..8], .little);
@@ -1479,6 +1535,8 @@ const IncrementalWatchState = struct {
     optimize_mode: u8,
     kind: zap.builder.BuildConfig.Kind,
     lib_mode: bool,
+    has_generated_executable_startup_prologue: bool,
+    collect_arc_stats: bool,
     link_libc: bool,
     allocator: std.mem.Allocator,
     /// Whether the context has had at least one successful inject+update.
@@ -1539,6 +1597,7 @@ const IncrementalWatchState = struct {
         target_name: []const u8,
         build_opts: std.StringHashMapUnmanaged([]const u8),
         compile_target: ?[]const u8,
+        collect_arc_stats: bool,
     ) ?IncrementalWatchState {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -1675,6 +1734,7 @@ const IncrementalWatchState = struct {
             .lib => 1,
             .obj => 2,
         };
+        const has_generated_executable_startup_prologue = hasGeneratedExecutableStartupPrologue(config.kind);
         const optimize_mode_val: u8 = switch (config.optimize) {
             .debug => 0,
             .release_safe => 1,
@@ -1704,7 +1764,14 @@ const IncrementalWatchState = struct {
             .global_cache_dir = ".zap-cache",
             .output_path = output_path_duped,
             .name = output_name_duped,
-            .runtime_source = compiler.getRuntimeSource(declared_caps, resolved_manager.builtin_tag),
+            .runtime_source = compiler.getRuntimeSourceForRuntimeControls(
+                declared_caps,
+                resolved_manager.builtin_tag,
+                .{
+                    .memory_startup_prologue_emitted = has_generated_executable_startup_prologue,
+                    .collect_arc_stats = collect_arc_stats,
+                },
+            ),
             .output_mode = output_mode_val,
             .optimize_mode = optimize_mode_val,
             .target = compile_target,
@@ -1736,6 +1803,8 @@ const IncrementalWatchState = struct {
             .optimize_mode = optimize_mode_val,
             .kind = config.kind,
             .lib_mode = config.kind == .lib,
+            .has_generated_executable_startup_prologue = has_generated_executable_startup_prologue,
+            .collect_arc_stats = collect_arc_stats,
             .link_libc = true,
             .allocator = allocator,
             .declared_caps = declared_caps,
@@ -1949,7 +2018,14 @@ const IncrementalWatchState = struct {
             .global_cache_dir = ".zap-cache",
             .output_path = self.output_path,
             .name = self.output_name,
-            .runtime_source = compiler.getRuntimeSource(self.declared_caps, self.builtin_tag),
+            .runtime_source = compiler.getRuntimeSourceForRuntimeControls(
+                self.declared_caps,
+                self.builtin_tag,
+                .{
+                    .memory_startup_prologue_emitted = self.has_generated_executable_startup_prologue,
+                    .collect_arc_stats = self.collect_arc_stats,
+                },
+            ),
             .output_mode = self.output_mode,
             .optimize_mode = self.optimize_mode,
             .link_libc = self.link_libc,
@@ -2002,6 +2078,7 @@ fn watchAndRebuild(
     build_opts: std.StringHashMapUnmanaged([]const u8),
     run_after_build: bool,
     run_args: []const []const u8,
+    collect_arc_stats: bool,
 ) void {
     // Initialize last-known mtimes using Io.Timestamp (Zig 0.16)
     var last_mtimes = allocator.alloc(std.Io.Timestamp, source_paths.len) catch return;
@@ -2074,7 +2151,7 @@ fn watchAndRebuild(
 
             // Fall back to full rebuild
             if (!build_succeeded) {
-                const artifact = buildTarget(allocator, project_root, target_name, build_opts, null) catch |err| {
+                const artifact = buildTarget(allocator, project_root, target_name, build_opts, null, collect_arc_stats) catch |err| {
                     std.debug.print("Build error: {}\n", .{err});
                     std.debug.print("\n[watching for changes...]\n", .{});
                     changed_paths = .empty;
@@ -2085,7 +2162,7 @@ fn watchAndRebuild(
                 build_succeeded = true;
 
                 // Set up incremental state for subsequent builds
-                incr_state = IncrementalWatchState.init(allocator, project_root, target_name, build_opts, null);
+                incr_state = IncrementalWatchState.init(allocator, project_root, target_name, build_opts, null, collect_arc_stats);
             }
 
             if (build_succeeded) {
@@ -2122,8 +2199,9 @@ fn watchBuildTask(
     project_root: []const u8,
     target_name: []const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
+    collect_arc_stats: bool,
 ) WatchBuildResult {
-    const artifact = buildTarget(allocator, project_root, target_name, build_opts, null) catch |err| {
+    const artifact = buildTarget(allocator, project_root, target_name, build_opts, null, collect_arc_stats) catch |err| {
         std.debug.print("Build error: {}\n", .{err});
         return .{ .failed = true };
     };
@@ -2142,6 +2220,7 @@ const ParsedArgs = struct {
     seed: ?[]const u8 = null,
     watch: bool = false,
     compile_target: ?[]const u8 = null,
+    collect_arc_stats: bool = false,
     no_deps: bool = false,
 
     fn deinit(self: *ParsedArgs, allocator: std.mem.Allocator) void {
@@ -2178,6 +2257,8 @@ fn parseTargetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Pars
             }
         } else if (std.mem.eql(u8, arg, "--watch") or std.mem.eql(u8, arg, "-w")) {
             result.watch = true;
+        } else if (std.mem.eql(u8, arg, "--collect-arc-stats")) {
+            result.collect_arc_stats = true;
         } else if (std.mem.eql(u8, arg, "--no-deps")) {
             result.no_deps = true;
         } else if (std.mem.eql(u8, arg, "--target")) {
@@ -2225,10 +2306,71 @@ test "computeBuildCacheKey includes manifest result hash" {
     };
     const target_name = "default";
 
-    const first = computeBuildCacheKey(build_source, &units, target_name, 111);
-    const second = computeBuildCacheKey(build_source, &units, target_name, 222);
+    const first = computeBuildCacheKey(build_source, &units, target_name, .{ .manifest_result_hash = 111 });
+    const second = computeBuildCacheKey(build_source, &units, target_name, .{ .manifest_result_hash = 222 });
 
     try testing.expect(first != second);
+}
+
+test "Phase 2 ARC stats: build cache key separates runtime collection shape" {
+    const build_source = "pub struct App.Builder {}";
+    const units = [_]compiler.SourceUnit{
+        .{ .file_path = "lib/app.zap", .source = "pub struct App {}" },
+    };
+    const target_name = "default";
+    const manifest_hash: u64 = 111;
+
+    const default_key = computeBuildCacheKey(build_source, &units, target_name, .{
+        .manifest_result_hash = manifest_hash,
+        .collect_arc_stats = false,
+    });
+    const stats_key = computeBuildCacheKey(build_source, &units, target_name, .{
+        .manifest_result_hash = manifest_hash,
+        .collect_arc_stats = true,
+    });
+
+    try testing.expect(default_key != stats_key);
+}
+
+test "Phase 2 ARC stats: default build cache key preserves legacy shape" {
+    const build_source = "pub struct App.Builder {}";
+    const units = [_]compiler.SourceUnit{
+        .{ .file_path = "lib/app.zap", .source = "pub struct App {}" },
+    };
+    const target_name = "default";
+    const manifest_hash: u64 = 111;
+
+    var legacy_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    legacy_hasher.update(build_source);
+    for (&units) |unit| {
+        legacy_hasher.update(unit.file_path);
+        legacy_hasher.update(unit.source);
+    }
+    legacy_hasher.update(target_name);
+    legacy_hasher.update(std.mem.asBytes(&manifest_hash));
+    const legacy_digest = legacy_hasher.finalResult();
+    const legacy_key = std.mem.readInt(u64, legacy_digest[0..8], .little);
+
+    const default_key = computeBuildCacheKey(build_source, &units, target_name, .{
+        .manifest_result_hash = manifest_hash,
+        .collect_arc_stats = false,
+    });
+
+    try testing.expectEqual(legacy_key, default_key);
+}
+
+test "Phase 7e: object manifest kind does not guarantee executable startup prologue" {
+    try testing.expect(hasGeneratedExecutableStartupPrologue(.bin));
+    try testing.expect(!hasGeneratedExecutableStartupPrologue(.lib));
+    try testing.expect(!hasGeneratedExecutableStartupPrologue(.obj));
+}
+
+test "Phase 2 ARC stats: parse build flag for runtime counter collection" {
+    var parsed = try parseTargetArgs(testing.allocator, &.{ "app", "--collect-arc-stats" });
+    defer parsed.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("app", parsed.target.?);
+    try testing.expect(parsed.collect_arc_stats);
 }
 
 // ---------------------------------------------------------------------------

@@ -36,6 +36,13 @@ const TestError = error{
     CurrentWorkingDirectoryUnlinked,
 } || std.posix.ReadError || std.posix.PollError || std.process.SpawnError;
 
+const COMPILE_OUTPUT_LIMIT = 4 * 1024 * 1024;
+
+const CompileFailureDiagnostics = enum {
+    silent,
+    report,
+};
+
 const TestResult = struct {
     stdout: []const u8,
     stderr: []const u8,
@@ -58,7 +65,56 @@ const TestResult = struct {
     }
 };
 
-fn compileOnly(source: []const u8) TestError!void {
+fn printUnexpectedCompileFailure(exit_code: u8, stdout: []const u8, stderr: []const u8) void {
+    std.debug.print("\n=== COMPILATION FAILED (exit {d}) ===\n", .{exit_code});
+    if (stdout.len != 0) {
+        std.debug.print("=== stdout ===\n{s}\n", .{stdout});
+    }
+    if (stderr.len != 0) {
+        std.debug.print("=== stderr ===\n{s}\n", .{stderr});
+    }
+}
+
+fn runZapBuild(
+    allocator: std.mem.Allocator,
+    zap_binary: []const u8,
+    tmp_dir_path: []const u8,
+    collect_arc_stats: bool,
+    diagnostics: CompileFailureDiagnostics,
+) TestError!void {
+    const compile_argv: []const []const u8 = if (collect_arc_stats)
+        &.{ zap_binary, "build", "test_prog", "--collect-arc-stats" }
+    else
+        &.{ zap_binary, "build", "test_prog" };
+
+    const compile_result = std.process.run(allocator, getTestIo(), .{
+        .argv = compile_argv,
+        .cwd = .{ .path = tmp_dir_path },
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.CompilationFailed;
+    defer allocator.free(compile_result.stdout);
+    defer allocator.free(compile_result.stderr);
+
+    const compile_exit = switch (compile_result.term) {
+        .exited => |code| code,
+        else => {
+            if (diagnostics == .report) {
+                printUnexpectedCompileFailure(255, compile_result.stdout, compile_result.stderr);
+            }
+            return error.CompilationFailed;
+        },
+    };
+
+    if (compile_exit != 0) {
+        if (diagnostics == .report) {
+            printUnexpectedCompileFailure(compile_exit, compile_result.stdout, compile_result.stderr);
+        }
+        return error.CompilationFailed;
+    }
+}
+
+fn compileOnlyWithDiagnostics(source: []const u8, diagnostics: CompileFailureDiagnostics) TestError!void {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -99,21 +155,15 @@ fn compileOnly(source: []const u8) TestError!void {
         std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
     defer allocator.free(zap_binary);
 
-    const compile_argv: []const []const u8 = &.{ zap_binary, "build", "test_prog" };
-    var compile_child = std.process.spawn(getTestIo(), .{
-        .argv = compile_argv,
-        .cwd = .{ .path = tmp_dir_path },
-        .stderr = .inherit,
-        .stdout = .inherit,
-    }) catch return error.CompilationFailed;
-    const compile_term = compile_child.wait(getTestIo()) catch return error.CompilationFailed;
+    try runZapBuild(allocator, zap_binary, tmp_dir_path, false, diagnostics);
+}
 
-    const compile_exit = switch (compile_term) {
-        .exited => |code| code,
-        else => return error.CompilationFailed,
-    };
+fn compileOnly(source: []const u8) TestError!void {
+    return compileOnlyWithDiagnostics(source, .report);
+}
 
-    if (compile_exit != 0) return error.CompilationFailed;
+fn expectCompileFails(source: []const u8) !void {
+    try std.testing.expectError(error.CompilationFailed, compileOnlyWithDiagnostics(source, .silent));
 }
 
 /// Compile a Zap source string and run the resulting binary, returning stdout.
@@ -168,24 +218,7 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
     // The child process runs with `cwd` set to the temp project so it
     // discovers the test's synthesized build.zap (with `:test_prog` target)
     // instead of the parent's project-root build.zap.
-    const compile_argv: []const []const u8 = &.{ zap_binary, "build", "test_prog" };
-    var compile_child = std.process.spawn(getTestIo(), .{
-        .argv = compile_argv,
-        .cwd = .{ .path = tmp_dir_path },
-        .stderr = .inherit,
-        .stdout = .inherit,
-    }) catch return error.CompilationFailed;
-    const compile_term = compile_child.wait(getTestIo()) catch return error.CompilationFailed;
-
-    const compile_exit = switch (compile_term) {
-        .exited => |code| code,
-        else => return error.CompilationFailed,
-    };
-
-    if (compile_exit != 0) {
-        std.debug.print("\n=== COMPILATION FAILED (exit {d}) ===\n", .{compile_exit});
-        return error.CompilationFailed;
-    }
+    try runZapBuild(allocator, zap_binary, tmp_dir_path, false, .report);
 
     // The zap binary outputs to zap-out/bin/test_prog (relative to cwd)
     const compiled_binary = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out/bin/test_prog", allocator) catch {
@@ -227,11 +260,19 @@ const EnvEntry = struct {
     value: []const u8,
 };
 
+const CompileRunEnvOptions = struct {
+    collect_arc_stats: bool = false,
+};
+
 /// Compile a Zap source string and run the resulting binary with extra
 /// environment variables layered on top of the parent's environment.
 /// Used by Phase 4 ARC ownership tests that observe `ZAP_ARC_STATS=1`
 /// counter dumps emitted on stderr by the runtime atexit hook.
-fn compileAndRunWithEnv(source: []const u8, extra_env: []const EnvEntry) TestError!TestResult {
+fn compileAndRunWithEnvOptions(
+    source: []const u8,
+    extra_env: []const EnvEntry,
+    options: CompileRunEnvOptions,
+) TestError!TestResult {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -275,24 +316,7 @@ fn compileAndRunWithEnv(source: []const u8, extra_env: []const EnvEntry) TestErr
         std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
     defer allocator.free(zap_binary);
 
-    const compile_argv: []const []const u8 = &.{ zap_binary, "build", "test_prog" };
-    var compile_child = std.process.spawn(getTestIo(), .{
-        .argv = compile_argv,
-        .cwd = .{ .path = tmp_dir_path },
-        .stderr = .inherit,
-        .stdout = .inherit,
-    }) catch return error.CompilationFailed;
-    const compile_term = compile_child.wait(getTestIo()) catch return error.CompilationFailed;
-
-    const compile_exit = switch (compile_term) {
-        .exited => |code| code,
-        else => return error.CompilationFailed,
-    };
-
-    if (compile_exit != 0) {
-        std.debug.print("\n=== COMPILATION FAILED (exit {d}) ===\n", .{compile_exit});
-        return error.CompilationFailed;
-    }
+    try runZapBuild(allocator, zap_binary, tmp_dir_path, options.collect_arc_stats, .report);
 
     const compiled_binary = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out/bin/test_prog", allocator) catch {
         std.debug.print("\n=== COMPILED BINARY NOT FOUND ===\n", .{});
@@ -338,6 +362,25 @@ fn compileAndRunWithEnv(source: []const u8, extra_env: []const EnvEntry) TestErr
         .allocator = allocator,
         .output_dir = output_dir,
     };
+}
+
+fn compileAndRunWithArcStatsEnv(source: []const u8, extra_env: []const EnvEntry) TestError!TestResult {
+    return compileAndRunWithEnvOptions(source, extra_env, .{ .collect_arc_stats = true });
+}
+
+test "ZIR helper: ARC stats env helper opts into compile-time collection" {
+    const source = @embedFile("zir_integration_tests.zig");
+    try std.testing.expect(std.mem.indexOf(u8, source, "--collect-arc-stats") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "compileAndRunWithArcStatsEnv") != null);
+}
+
+test "ZIR helper: compiler subprocess output is captured by the harness" {
+    const source = @embedFile("zir_integration_tests.zig");
+    const stderr_inherit = ".stderr" ++ " = .inherit";
+    const stdout_inherit = ".stdout" ++ " = .inherit";
+    try std.testing.expect(std.mem.indexOf(u8, source, stderr_inherit) == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, stdout_inherit) == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "expectCompileFails") != null);
 }
 
 /// Parse a single `[zap-arc-stats] ... key=value ...` line emitted by
@@ -420,24 +463,7 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
         std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
     defer allocator.free(zap_binary);
 
-    const compile_argv: []const []const u8 = &.{ zap_binary, "build", "test_prog" };
-    var compile_child = std.process.spawn(getTestIo(), .{
-        .argv = compile_argv,
-        .cwd = .{ .path = tmp_dir_path },
-        .stderr = .inherit,
-        .stdout = .inherit,
-    }) catch return error.CompilationFailed;
-    const compile_term = compile_child.wait(getTestIo()) catch return error.CompilationFailed;
-
-    const compile_exit = switch (compile_term) {
-        .exited => |code| code,
-        else => return error.CompilationFailed,
-    };
-
-    if (compile_exit != 0) {
-        std.debug.print("\n=== COMPILATION FAILED (exit {d}) ===\n", .{compile_exit});
-        return error.CompilationFailed;
-    }
+    try runZapBuild(allocator, zap_binary, tmp_dir_path, false, .report);
 
     const compiled_binary = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out/bin/test_prog", allocator) catch {
         return error.CompilationFailed;
@@ -2105,7 +2131,7 @@ test "ZIR: numeric widening is fallback after exact overload search" {
 }
 
 test "ZIR: unsigned integer does not widen to signed integer" {
-    try std.testing.expectError(error.CompilationFailed, compileOnly(
+    try expectCompileFails(
         \\pub struct TestProg {
         \\  pub fn classify(value :: i64) -> String {
         \\    "i64"
@@ -2115,7 +2141,7 @@ test "ZIR: unsigned integer does not widen to signed integer" {
         \\    classify(1 :: u32)
         \\  }
         \\}
-    ));
+    );
 }
 
 test "ZIR: Integer overloads preserve exact integer width" {
@@ -2391,7 +2417,7 @@ test "ZIR: for comprehension with filter" {
 }
 
 test "ZIR: protocol dispatch rejects unconstrained lowercase receiver type" {
-    try std.testing.expectError(error.CompilationFailed, compileOnly(
+    try expectCompileFails(
         \\pub struct TestProg {
         \\  pub fn bad(collection :: enumerable) -> i64 {
         \\    case Enumerable.next(collection) {
@@ -2404,11 +2430,11 @@ test "ZIR: protocol dispatch rejects unconstrained lowercase receiver type" {
         \\    "done"
         \\  }
         \\}
-    ));
+    );
 }
 
 test "ZIR: protocol parameter rejects unconstrained lowercase argument type" {
-    try std.testing.expectError(error.CompilationFailed, compileOnly(
+    try expectCompileFails(
         \\pub struct TestProg {
         \\  pub fn bad(collection :: enumerable) -> [i64] {
         \\    Enum.to_list(collection)
@@ -2418,7 +2444,7 @@ test "ZIR: protocol parameter rejects unconstrained lowercase argument type" {
         \\    "done"
         \\  }
         \\}
-    ));
+    );
 }
 
 test "ZIR: Enum map dispatches through exact Enumerable constraint" {
@@ -3016,16 +3042,12 @@ test "ZIR: Phase 4 Map microbench regression baseline" {
 }
 
 // Phase 4 byte-exact regression: a Map-based tail-recursive workload
-// must produce the same output after the ownership pass upgrades
-// `share_value` instructions to `.consume`. The pass is currently a
-// no-op for `.map` (Phase 6 flips that flag), but the regression
-// guards against the pass mistakenly mutating Map locals or otherwise
-// breaking any code path the existing benchmarks exercise. Pairs the
+// must produce the same output after ownership rewriting. Pairs the
 // counter dump with `ZAP_ARC_STATS=1` so a future regression that
-// silently inflates retain/release traffic is observable through the
-// stderr dump.
-test "ZIR: Phase 4 Map workload byte-exact with retain/release balance check" {
-    var result = try compileAndRunWithEnv(
+// silently inflates retain/release traffic or loses dense-Map
+// uniqueness coverage is observable through stderr.
+test "ZIR: Phase 4 Map workload byte-exact with dense-map ownership stats" {
+    var result = try compileAndRunWithArcStatsEnv(
         \\pub struct TestProg {
         \\  pub fn loop(m :: %{i64 => i64}, i :: i64, n :: i64) -> %{i64 => i64} {
         \\    if i >= n {
@@ -3065,26 +3087,34 @@ test "ZIR: Phase 4 Map workload byte-exact with retain/release balance check" {
     const retains = parseArcStatCounter(result.stderr, "retains_total") orelse return error.RunFailed;
     const releases = parseArcStatCounter(result.stderr, "releases_total") orelse return error.RunFailed;
     try std.testing.expect(releases >= retains);
-    // Return-source elision fires for the base-case `if i >= n { m }`
-    // returning the parameter directly. This is the load-bearing
-    // signal that Phase F's discipline is engaged on this workload.
+    // Current arc_liveness invariant, pinned by
+    // "arc_liveness: Phase 5 — k-nucleotide-shaped tail loop populates
+    // both categories": after Phase E.7 pushes the base-arm `ret m`
+    // into the arm and Phase E.5 Gap 4 rejects borrowed-param-returned
+    // locals, this shape does NOT populate `return_source_locals`.
+    // Ownership is observed through dense Map's unchecked mutation
+    // counters instead.
     const return_elisions_total = parseArcStatCounter(result.stderr, "return_elisions_total") orelse return error.RunFailed;
-    try std.testing.expect(return_elisions_total > 0);
+    try std.testing.expectEqual(@as(u64, 0), return_elisions_total);
+
+    const dense_map_mut_calls_total = parseArcStatCounter(result.stderr, "dense_map_mut_calls_total") orelse return error.RunFailed;
+    const dense_map_unchecked_total = parseArcStatCounter(result.stderr, "dense_map_unchecked_total") orelse return error.RunFailed;
+    try std.testing.expect(dense_map_mut_calls_total > 0);
+    try std.testing.expectEqual(dense_map_mut_calls_total, dense_map_unchecked_total);
 }
 
 // ----------------------------------------------------------------
 // Phase 5: return-source drop elision counter regression baseline.
 // ----------------------------------------------------------------
 
-// Phase 5 wires `arc_returned_locals` into the release filter and
-// emits a `noteReturnElision` ZIR call at every elision point. The
-// runtime counter `arc_return_elisions_total` must remain at zero
-// for any program whose ARC-managed locals should not participate
-// in return-source elision. An unexpected non-zero reading here
-// would mean Phase 5's emission accidentally fired outside the
-// analyzer's intended filter.
-test "ZIR: Phase 5 return-elision counter fires for Map workload (post-Phase-F)" {
-    var result = try compileAndRunWithEnv(
+// Phase E.7/E.5 current invariant for the k-nucleotide-shaped Map
+// tail loop: tail-call rewriting pushes the base-arm `ret m` into the
+// arm, and borrowed-param returns do not enter `return_source_locals`.
+// The return-elision counter therefore stays zero. The load-bearing
+// ownership signal for this workload is now dense Map's unchecked
+// mutation counters.
+test "ZIR: Phase 5 Map tail loop keeps return-elision counter zero and uses unchecked Map mutations" {
+    var result = try compileAndRunWithArcStatsEnv(
         \\pub struct TestProg {
         \\  pub fn loop(m :: %{i64 => i64}, i :: i64, n :: i64) -> %{i64 => i64} {
         \\    if i >= n {
@@ -3109,22 +3139,28 @@ test "ZIR: Phase 5 return-elision counter fires for Map workload (post-Phase-F)"
     defer result.deinit();
     try std.testing.expectEqualStrings("50\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    // Post-Phase-F: `.map` is ARC-managed. The base case's `m`
-    // sources the ret directly; that local is in
-    // `return_source_locals` (Phase E.5 Gap 4's borrow gate is
-    // bypassed because Phase E.9 inferred the param as `.owned`).
-    // The matching scope-exit release is suppressed and
-    // `arc_return_elisions_total` bumps. consumes_total stays 0
-    // because Phase E.9 emits `.move_value` (not the counter-
-    // bumping `share_value(.consume)`); the Phase 6.9 consume gate
-    // is still in effect — E.9 replaces consume_share_sites with
-    // move_value emission rather than re-enabling them.
+    // Mirrors arc_liveness' k-nucleotide-shaped tail-loop invariant:
+    // the base-arm borrowed-param return does not populate
+    // `return_source_locals`, so there are no runtime return-elision
+    // bumps for this shape.
     const return_elisions_total = parseArcStatCounter(result.stderr, "return_elisions_total") orelse
         return error.RunFailed;
-    try std.testing.expect(return_elisions_total > 0);
+    try std.testing.expectEqual(@as(u64, 0), return_elisions_total);
     const consumes_total = parseArcStatCounter(result.stderr, "consumes_total") orelse
         return error.RunFailed;
     try std.testing.expectEqual(@as(u64, 0), consumes_total);
+    const retains = parseArcStatCounter(result.stderr, "retains_total") orelse
+        return error.RunFailed;
+    const releases = parseArcStatCounter(result.stderr, "releases_total") orelse
+        return error.RunFailed;
+    try std.testing.expect(releases >= retains);
+
+    const dense_map_mut_calls_total = parseArcStatCounter(result.stderr, "dense_map_mut_calls_total") orelse
+        return error.RunFailed;
+    const dense_map_unchecked_total = parseArcStatCounter(result.stderr, "dense_map_unchecked_total") orelse
+        return error.RunFailed;
+    try std.testing.expect(dense_map_mut_calls_total > 0);
+    try std.testing.expectEqual(dense_map_mut_calls_total, dense_map_unchecked_total);
 }
 
 // Phase 5 byte-exact regression: a non-ARC integer-arithmetic
@@ -3143,7 +3179,7 @@ test "ZIR: Phase 5 return-elision counter fires for Map workload (post-Phase-F)"
 // explicit `return_elisions_total=0` reading; both are equivalent
 // observations of the load-bearing invariant.
 test "ZIR: Phase 5 return-elision counter stays zero for non-ARC workload" {
-    var result = try compileAndRunWithEnv(
+    var result = try compileAndRunWithArcStatsEnv(
         \\pub struct TestProg {
         \\  pub fn add(a :: i64, b :: i64) -> i64 {
         \\    a + b
