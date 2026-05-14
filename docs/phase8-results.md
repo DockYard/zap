@@ -107,7 +107,7 @@ The fix adds a `Zcu.PerThread.Id.deinit()` that resets the pool to
   `arena_state.deinit()`.
 
 With both fixes in place, the manager `.o` compiles cleanly under
-default `Zap.Memory.ARC` and the emitted object carries the expected
+default `Memory.ARC` and the emitted object carries the expected
 `__zapmem` Mach-O section with the correct REFCOUNT_V1 capability bit
 (verified via `otool -l` and `nm`).
 
@@ -123,11 +123,11 @@ manager source as a standalone object and validates the result through
 
 | Manager | Smoke test | `zap_memory_section` symbol | `__zapmem` section | declared_caps |
 |---|---|---|---|---|
-| `Zap.Memory.ARC` | PASS | present | present | `REFCOUNT_V1` (bit 0 set) |
-| `Zap.Memory.NoOp` | PASS | present | present | 0 (no capabilities) |
-| `Zap.Memory.Arena` | PASS | present | present | 0 |
-| `Zap.Memory.Leak` | PASS | present | present | 0 |
-| `Zap.Memory.Tracking` | PASS | present | present | 0 |
+| `Memory.ARC` | PASS | present | present | `REFCOUNT_V1` (bit 0 set) |
+| `Memory.NoOp` | PASS | present | present | 0 (no capabilities) |
+| `Memory.Arena` | PASS | present | present | 0 |
+| `Memory.Leak` | PASS | present | present | 0 |
+| `Memory.Tracking` | PASS | present | present | 0 |
 
 These five smoke-test scripts mirror the production code path —
 `section_parser.extractSection` (used by the build driver),
@@ -211,12 +211,12 @@ After both fixes (Zap commit `2160821`, Zig fork commit
 manager:
 
 ```sh
-# Default (Zap.Memory.ARC)
+# Default (Memory.ARC)
 $ cd ~/projects/zap/examples/hello && zap build hello
 $ ./zap-out/bin/hello
 Hello World!
 
-# Arena (memory: Zap.Memory.Arena in build.zap)
+# Arena (memory: Memory.Arena in build.zap)
 $ cd ~/projects/zap/examples/factorial && zap build factorial
 $ ./zap-out/bin/factorial
 3628800
@@ -229,33 +229,33 @@ applied.
 
 | Manager | Manager `.o` compile | End-to-end binary build |
 |---|---|---|
-| `Zap.Memory.ARC` | OK (verified) | OK (`examples/hello`, `examples/factorial`, all lang-benches) |
-| `Zap.Memory.NoOp` | OK (verified) | OK (manager-compile path identical to ARC) |
-| `Zap.Memory.Arena` | OK (verified) | OK (`examples/factorial` + lang-benches under §6) |
-| `Zap.Memory.Leak` | OK (verified) | OK (manager-compile path identical to ARC) |
-| `Zap.Memory.Tracking` | OK (verified) | OK (manager-compile path identical to ARC) |
+| `Memory.ARC` | OK (verified) | OK (`examples/hello`, `examples/factorial`, all lang-benches) |
+| `Memory.NoOp` | OK (verified) | OK (manager-compile path identical to ARC) |
+| `Memory.Arena` | OK (verified) | OK (`examples/factorial` + lang-benches under §6) |
+| `Memory.Leak` | OK (verified) | OK (manager-compile path identical to ARC) |
+| `Memory.Tracking` | OK (verified) | OK (manager-compile path identical to ARC) |
 
 ## 6. Lang-benches under ARC and Arena
 
 All six lang-benches at `~/projects/lang-benches/` rebuild and run
-cleanly under both `Zap.Memory.ARC` (default) and `Zap.Memory.Arena`.
+cleanly under both `Memory.ARC` (default) and `Memory.Arena`.
 Wall-clock and peak RSS were captured via `/usr/bin/time -l`
 (single timed run after a warm-up pass; macOS, M1):
 
 | Benchmark | Manager | Wall time | Peak RSS |
 |---|---|---|---|
-| nbody (N=5_000_000) | Zap.Memory.ARC | 0.10 s | 1.34 MB |
-| nbody (N=5_000_000) | Zap.Memory.Arena | 0.10 s | 1.34 MB |
-| mandelbrot (N=8_000) | Zap.Memory.ARC | 2.08 s | 1.39 MB |
-| mandelbrot (N=8_000) | Zap.Memory.Arena | 2.08 s | 1.39 MB |
-| binarytrees (N=21) | Zap.Memory.ARC | 8.62 s | 169.9 MB |
-| binarytrees (N=21) | Zap.Memory.Arena | 8.84 s | 169.9 MB |
-| fannkuch-redux (N=11) | Zap.Memory.ARC | 2.33 s | 1.44 MB |
-| fannkuch-redux (N=11) | Zap.Memory.Arena | 2.26 s | 1.44 MB |
-| spectral-norm (N=2500) | Zap.Memory.ARC | 0.16 s | 1.49 MB |
-| spectral-norm (N=2500) | Zap.Memory.Arena | 0.16 s | 1.49 MB |
-| k-nucleotide (FASTA 250k) | Zap.Memory.ARC | 0.29 s | 21.48 MB |
-| k-nucleotide (FASTA 250k) | Zap.Memory.Arena | 0.29 s | 21.46 MB |
+| nbody (N=5_000_000) | Memory.ARC | 0.10 s | 1.34 MB |
+| nbody (N=5_000_000) | Memory.Arena | 0.10 s | 1.34 MB |
+| mandelbrot (N=8_000) | Memory.ARC | 2.08 s | 1.39 MB |
+| mandelbrot (N=8_000) | Memory.Arena | 2.08 s | 1.39 MB |
+| binarytrees (N=21) | Memory.ARC | 8.62 s | 169.9 MB |
+| binarytrees (N=21) | Memory.Arena | 8.84 s | 169.9 MB |
+| fannkuch-redux (N=11) | Memory.ARC | 2.33 s | 1.44 MB |
+| fannkuch-redux (N=11) | Memory.Arena | 2.26 s | 1.44 MB |
+| spectral-norm (N=2500) | Memory.ARC | 0.16 s | 1.49 MB |
+| spectral-norm (N=2500) | Memory.Arena | 0.16 s | 1.49 MB |
+| k-nucleotide (FASTA 250k) | Memory.ARC | 0.29 s | 21.48 MB |
+| k-nucleotide (FASTA 250k) | Memory.Arena | 0.29 s | 21.46 MB |
 
 Reproduce: `~/projects/lang-benches/scripts/bench-zap-managers.sh`.
 The wall numbers agree across managers within hyperfine-style
@@ -280,12 +280,12 @@ returns, so peak RSS reflects the per-cell overhead end-to-end.
 ```sh
 $ ~/projects/lang-benches/string-heavy/bench-string-heavy.sh 10000000
 === string-heavy benchmark, N=10000000 ===
-  Zap.Memory.ARC-run1       wall=0.12  rss=241713152 bytes
-  Zap.Memory.ARC-run2       wall=0.12  rss=241713152 bytes
-  Zap.Memory.ARC-run3       wall=0.11  rss=241713152 bytes
-  Zap.Memory.Arena-run1     wall=0.11  rss=241713152 bytes
-  Zap.Memory.Arena-run2     wall=0.11  rss=241713152 bytes
-  Zap.Memory.Arena-run3     wall=0.11  rss=241713152 bytes
+  Memory.ARC-run1       wall=0.12  rss=241713152 bytes
+  Memory.ARC-run2       wall=0.12  rss=241713152 bytes
+  Memory.ARC-run3       wall=0.11  rss=241713152 bytes
+  Memory.Arena-run1     wall=0.11  rss=241713152 bytes
+  Memory.Arena-run2     wall=0.11  rss=241713152 bytes
+  Memory.Arena-run3     wall=0.11  rss=241713152 bytes
 ```
 
 Wall time matches within noise. RSS is identical because Zap's
@@ -341,7 +341,7 @@ optional `--memory <Manager>` argument. When set, the harness:
    naming,
 6. Restores each `build.zap` to its original contents.
 
-Example: `bash scripts/run-all.sh --memory Zap.Memory.Arena`.
+Example: `bash scripts/run-all.sh --memory Memory.Arena`.
 
 Companion: `scripts/bench-zap-managers.sh` does the same rebuild
 + time + RSS pass for Zap only (no cross-language hyperfine) which
@@ -409,7 +409,7 @@ path is built with native `@atomicRmw` (the prebuilt
 lowers atomic ops directly without the previous externalised
 helper). All 1128 tests continue to pass.
 
-**Tracking managers** (e.g. `Zap.Memory.Tracking` from §5.2) now
+**Tracking managers** (e.g. `Memory.Tracking` from §5.2) now
 observe `Arc(T)` allocations end-to-end through the standard
 `core.allocate` + `release_sized` interface.
 

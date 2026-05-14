@@ -56,7 +56,7 @@ pub impl Memory.Manager for Memory.Arena {
     """
 
   pub fn primitive_source_path(_manager :: Memory.Arena) -> String {
-    "src/memory/arena/manager.zig"
+    "zap:src/memory/arena/manager.zig"
   }
 
   @doc = """

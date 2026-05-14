@@ -53,7 +53,7 @@ pub impl Memory.Manager for Memory.ARC {
     """
 
   pub fn primitive_source_path(_manager :: Memory.ARC) -> String {
-    "src/memory/arc/manager.zig"
+    "zap:src/memory/arc/manager.zig"
   }
 
   @doc = """

@@ -1105,10 +1105,14 @@ fn buildTarget(
     var driver_diag_buf: [4096]u8 = undefined;
     var driver_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &driver_diag_buf };
 
-    // The Phase 1 memory driver still accepts a Zap source-tree root
-    // for legacy third-party `@memory_manager_source` path resolution.
+    const manifest_memory_manager = config.memory_manager orelse {
+        std.debug.print("Error: build.zap manifest did not evaluate a Memory.Manager adapter\n", .{});
+        std.process.exit(1);
+    };
+
     // `detectZapLibDir` returns the stdlib `lib/` subdirectory; the
-    // source tree root is the parent of that directory.
+    // source tree root is the parent of that directory, used for
+    // `zap:<path>` primitive source references.
     const zap_source_tree_root: []const u8 = if (zap_lib_dir) |lib_dir|
         (std.fs.path.dirname(lib_dir) orelse project_root)
     else
@@ -1117,7 +1121,12 @@ fn buildTarget(
     var resolved_manager = zap.memory_driver.resolve(
         alloc,
         .{
-            .manager_name = config.memory_manager orelse "",
+            .adapter = .{
+                .name = manifest_memory_manager.name,
+                .primitive_source_path = manifest_memory_manager.primitive_source_path,
+                .capability_mask = manifest_memory_manager.capability_mask,
+                .refcount_v1 = manifest_memory_manager.refcount_v1,
+            },
             .source_roots = sourceRootsForMemoryDriver(alloc, source_roots.items) catch return error.OutOfMemory,
             .project_root = project_root,
             .zap_source_root = zap_source_tree_root,
@@ -1241,7 +1250,7 @@ fn buildTarget(
         .name = output_name,
         .runtime_source = compiler.getRuntimeSourceForRuntimeControls(
             resolved_manager.declared_caps,
-            resolved_manager.builtin_tag,
+            resolved_manager.refcount_sized_extension,
             .{
                 .memory_startup_prologue_emitted = has_generated_executable_startup_prologue,
                 .collect_arc_stats = collect_arc_stats,
@@ -1252,7 +1261,6 @@ fn buildTarget(
         .target = compile_target,
         .analysis_context = if (result.analysis_context) |*ctx| ctx else null,
         .arc_ownership = if (result.arc_ownership) |*ownership| ownership else null,
-        .memory_manager_object = resolved_manager.object_path,
         // Capability bitmask from the resolved manager's `.zapmem`
         // core vtable. Threaded into ZIR codegen so Phase 6 can elide
         // retain/release calls when the active manager omits
@@ -1260,19 +1268,7 @@ fn buildTarget(
         // on the same bit. Phase 3's only obligation is to keep the
         // wire intact end-to-end.
         .declared_caps = resolved_manager.declared_caps,
-        // First-party manager classification. Phase 1 only threads
-        // the tag through; later phases of the perf-recovery work
-        // branch on it to inline through a comptime-dispatched fast
-        // path for first-party managers.
-        .builtin_tag = resolved_manager.builtin_tag,
-        // Phase 3: register the active manager's Zig source as the
-        // `zap_active_manager` sibling module so the runtime's
-        // top-level `@import("zap_active_manager")` resolves at every
-        // user-binary compile. First-party tags hand the manager's
-        // embedded `manager.zig` source through; `.third_party` hands
-        // the minimal stub through. See
-        // `compiler.getActiveManagerSourceBytes`.
-        .active_manager_source = compiler.getActiveManagerSourceBytes(resolved_manager.builtin_tag),
+        .active_manager_source_path = resolved_manager.active_manager_source_path,
         // Zig 0.16 error formatting options from manifest
         .error_style = config.error_style,
         .multiline_errors = config.multiline_errors,
@@ -1547,46 +1543,30 @@ const IncrementalWatchState = struct {
     /// field is pinned for the lifetime of the watcher (see
     /// `watchAndRebuild` for the teardown-on-build.zap-change flow).
     declared_caps: u64,
-    /// Resolved manager object path. Owned by `allocator`; freed in
-    /// `deinit`. Threaded into every `injectAndUpdate` call so the
-    /// link step pulls in the manager `.o`. Mirrors the
-    /// `resolved_manager.object_path` lifetime in `buildTarget`.
-    memory_manager_object: ?[]const u8 = null,
-    /// Resolved manager's first-party classification. Cached in `init`
-    /// from `resolved_manager.builtin_tag` and threaded into every
-    /// `injectAndUpdate` call so the watch-session's emitted binaries
-    /// see the same classification the initial backend context was
-    /// created with. Later phases of the perf-recovery work branch
-    /// on this tag to inline through a comptime-dispatched fast path.
-    ///
-    /// The type is reached through the `zap` module's re-export rather
-    /// than a direct `@import("memory/driver.zig")` so the same file
-    /// is not pulled into two modules (`root` and `zap`) at once —
-    /// Zig 0.16 forbids that and the resulting "file exists in modules
-    /// 'root' and 'zap'" error blocks the whole `zig build` step.
-    builtin_tag: zap.memory_driver.BuiltinManagerTag = .third_party,
+    /// Validated REFCOUNT_V1 v1.1 sized-extension availability.
+    refcount_sized_extension: bool,
+    /// Resolved active manager source path. Owned by `allocator`;
+    /// freed in `deinit`.
+    active_manager_source_path: []const u8,
 
     fn deinit(self: *IncrementalWatchState) void {
         zir_backend.destroyContext(self.zir_ctx);
         self.allocator.free(self.zig_lib_dir);
         self.allocator.free(self.output_path);
         self.allocator.free(self.output_name);
-        if (self.memory_manager_object) |p| self.allocator.free(p);
+        self.allocator.free(self.active_manager_source_path);
     }
 
     /// Create incremental state by deriving the same config buildTarget uses.
     ///
     /// Watch mode pins one memory manager for the lifetime of the
     /// session. `init` re-runs the same `zap.memory_driver.resolve`
-    /// flow `buildTarget` uses, caches the resolved `declared_caps`,
-    /// and persists the object path so every rebuild's link step
-    /// picks up the same manager `.o`. All first-party managers
-    /// (`Memory.ARC`, `Memory.Arena`, `Memory.NoOp`,
-    /// `Memory.Leak`, `Memory.Tracking`) and third-party
-    /// managers flow through the same path — the cached caps drive
-    /// codegen elision and the runtime-source rewrite so every
-    /// rebuild produces a binary against the manager the manifest
-    /// resolved at `init` time.
+    /// flow `buildTarget` uses, then caches the resolved
+    /// `declared_caps`, `refcount_sized_extension`, and active source
+    /// path. Stdlib and project/dependency managers flow through the
+    /// same path; the cached metadata drives codegen elision and the
+    /// runtime-source rewrite so every rebuild produces a binary against
+    /// the manager the manifest resolved at `init` time.
     fn init(
         allocator: std.mem.Allocator,
         project_root: []const u8,
@@ -1610,8 +1590,8 @@ const IncrementalWatchState = struct {
 
         // Build the same set of source roots `buildTarget` constructs
         // (project lib/test/tools, deps, zap_stdlib) so the memory
-        // driver's discovery walk can find the manager struct that
-        // `memory:` references. Watch mode does not currently support
+        // driver can resolve `dep:<name>:<path>` primitive source
+        // references. Watch mode does not currently support
         // git deps that haven't been previously resolved by a
         // `buildTarget` run; the initial full rebuild that precedes
         // `IncrementalWatchState.init` ensures the lockfile is in place.
@@ -1651,11 +1631,10 @@ const IncrementalWatchState = struct {
         }
 
         // Resolve the active memory manager — mirror `buildTarget`'s
-        // flow so the watch-session uses the same manager `.o` and
-        // capability bitmask that a non-watch build would. The
-        // driver_optimize/driver target arguments mirror
-        // `buildTarget` to keep the cached object identical across
-        // build modes.
+        // flow so the watch-session uses the same active manager source,
+        // validation object, and capability bitmask that a non-watch
+        // build would. The driver_optimize/driver target arguments mirror
+        // `buildTarget` to keep validation identical across build modes.
         const driver_optimize: zap.memory_driver.ZapForkOptimize = switch (config.optimize) {
             .debug => .Debug,
             .release_safe => .ReleaseSafe,
@@ -1669,10 +1648,16 @@ const IncrementalWatchState = struct {
         var driver_diag_buf: [4096]u8 = undefined;
         var driver_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &driver_diag_buf };
         const memory_source_roots = sourceRootsForMemoryDriver(alloc, watch_source_roots.items) catch return null;
+        const manifest_memory_manager = config.memory_manager orelse return null;
         var resolved_manager = zap.memory_driver.resolve(
             alloc,
             .{
-                .manager_name = config.memory_manager orelse "",
+                .adapter = .{
+                    .name = manifest_memory_manager.name,
+                    .primitive_source_path = manifest_memory_manager.primitive_source_path,
+                    .capability_mask = manifest_memory_manager.capability_mask,
+                    .refcount_v1 = manifest_memory_manager.refcount_v1,
+                },
                 .source_roots = memory_source_roots,
                 .project_root = project_root,
                 .zap_source_root = zap_source_tree_root,
@@ -1694,8 +1679,8 @@ const IncrementalWatchState = struct {
         };
         defer zap.memory_driver.freeResolved(alloc, &resolved_manager);
 
-        // Watch mode supports every first-party manager and any
-        // third-party manager that produces a valid `.zapmem` section:
+        // Watch mode supports every manager that produces a valid
+        // `.zapmem` section:
         // the resolved `declared_caps` flows into `compiler.getRuntimeSource`
         // (so the embedded runtime collapses inline `ArcHeader` fields
         // and `refcount_v1_active` branches under managers that omit
@@ -1706,11 +1691,9 @@ const IncrementalWatchState = struct {
         // bitmask through both code paths; this constructor just caches
         // it so every subsequent `rebuild` reuses the same value.
         const declared_caps = resolved_manager.declared_caps;
-        const memory_manager_object_owned: ?[]const u8 = if (resolved_manager.object_path) |op|
-            (allocator.dupe(u8, op) catch return null)
-        else
-            null;
-        errdefer if (memory_manager_object_owned) |p| allocator.free(p);
+        const refcount_sized_extension = resolved_manager.refcount_sized_extension;
+        const active_manager_source_path_owned = allocator.dupe(u8, resolved_manager.active_manager_source_path) catch return null;
+        errdefer allocator.free(active_manager_source_path_owned);
 
         const output_name_raw = if (config.asset_name) |an| (if (an.len > 0) an else config.name) else config.name;
         const out_dir: []const u8 = switch (config.kind) {
@@ -1762,7 +1745,7 @@ const IncrementalWatchState = struct {
             .name = output_name_duped,
             .runtime_source = compiler.getRuntimeSourceForRuntimeControls(
                 declared_caps,
-                resolved_manager.builtin_tag,
+                refcount_sized_extension,
                 .{
                     .memory_startup_prologue_emitted = has_generated_executable_startup_prologue,
                     .collect_arc_stats = collect_arc_stats,
@@ -1772,21 +1755,13 @@ const IncrementalWatchState = struct {
             .optimize_mode = optimize_mode_val,
             .target = compile_target,
             .link_libc = true,
-            .memory_manager_object = memory_manager_object_owned,
             .declared_caps = declared_caps,
-            .builtin_tag = resolved_manager.builtin_tag,
-            // Phase 3: register the active manager's Zig source as the
-            // `zap_active_manager` sibling module for the watch session's
-            // persistent context. The tag is pinned for the lifetime of
-            // the watcher (the manifest's `memory:` field cannot change
-            // without tearing the session down — see `watchAndRebuild`),
-            // so a single registration at `init` time is sound.
-            .active_manager_source = compiler.getActiveManagerSourceBytes(resolved_manager.builtin_tag),
+            .active_manager_source_path = active_manager_source_path_owned,
         }) catch {
             allocator.free(zig_lib_duped);
             allocator.free(output_path_duped);
             allocator.free(output_name_duped);
-            if (memory_manager_object_owned) |p| allocator.free(p);
+            allocator.free(active_manager_source_path_owned);
             return null;
         };
 
@@ -1804,8 +1779,8 @@ const IncrementalWatchState = struct {
             .link_libc = true,
             .allocator = allocator,
             .declared_caps = declared_caps,
-            .memory_manager_object = memory_manager_object_owned,
-            .builtin_tag = resolved_manager.builtin_tag,
+            .refcount_sized_extension = refcount_sized_extension,
+            .active_manager_source_path = active_manager_source_path_owned,
         };
     }
 
@@ -2003,11 +1978,10 @@ const IncrementalWatchState = struct {
             }
         }
 
-        // Inject new ZIR and run Sema+codegen+link. The cached caps
-        // and manager object are reused from `IncrementalWatchState.init`
-        // (a watch session pins one manager for its lifetime — see the
-        // struct doc), so every rebuild emits codegen against the same
-        // capability surface that `init` resolved.
+        // Inject new ZIR and run Sema+codegen+link. The cached adapter
+        // resolution from `IncrementalWatchState.init` is reused for the
+        // lifetime of the watch session, so every rebuild emits codegen
+        // against the same capability surface and active-manager source.
         zir_backend.injectAndUpdate(alloc, result.ir_program, self.zir_ctx, .{
             .zig_lib_dir = self.zig_lib_dir,
             .cache_dir = ".zap-cache",
@@ -2016,7 +1990,7 @@ const IncrementalWatchState = struct {
             .name = self.output_name,
             .runtime_source = compiler.getRuntimeSourceForRuntimeControls(
                 self.declared_caps,
-                self.builtin_tag,
+                self.refcount_sized_extension,
                 .{
                     .memory_startup_prologue_emitted = self.has_generated_executable_startup_prologue,
                     .collect_arc_stats = self.collect_arc_stats,
@@ -2027,19 +2001,8 @@ const IncrementalWatchState = struct {
             .link_libc = self.link_libc,
             .analysis_context = if (result.analysis_context) |*ctx| ctx else null,
             .arc_ownership = if (result.arc_ownership) |*ownership| ownership else null,
-            .memory_manager_object = self.memory_manager_object,
             .declared_caps = self.declared_caps,
-            .builtin_tag = self.builtin_tag,
-            // The persistent context already registered
-            // `zap_active_manager` at `createContext` time
-            // (`IncrementalWatchState.init`); `injectAndUpdate` only
-            // reads the file-registration slots it owns
-            // (`active_manager_source` is for fresh registration
-            // only, not re-registration). Pass it through so the
-            // `CompileOptions` shape stays consistent across the two
-            // entry points; the persistent context's existing
-            // registration wins.
-            .active_manager_source = compiler.getActiveManagerSourceBytes(self.builtin_tag),
+            .active_manager_source_path = self.active_manager_source_path,
         }) catch return error.BackendError;
 
         self.baseline_established = true;

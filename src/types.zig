@@ -2801,6 +2801,7 @@ pub const TypeChecker = struct {
                                     try fields.append(self.allocator, .{
                                         .name = field.name,
                                         .type_id = field_type,
+                                        .default_expr = field.default,
                                     });
                                 }
                             }

@@ -85,6 +85,17 @@ echo ">>> Copying binary to $DIST_DIR/bin/zap"
 cp "$ZAP_BIN" "$DIST_DIR/bin/zap"
 
 # ---------------------------------------------------------------------------
+# Bundle Zap stdlib and first-party memory manager sources
+# ---------------------------------------------------------------------------
+
+echo ">>> Bundling Zap stdlib ..."
+cp -R "$PROJECT_ROOT/lib" "$DIST_DIR/lib"
+
+echo ">>> Bundling first-party memory manager sources ..."
+mkdir -p "$DIST_DIR/src"
+cp -R "$PROJECT_ROOT/src/memory" "$DIST_DIR/src/memory"
+
+# ---------------------------------------------------------------------------
 # Bundle Zig lib
 # ---------------------------------------------------------------------------
 

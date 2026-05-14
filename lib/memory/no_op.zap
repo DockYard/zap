@@ -42,7 +42,7 @@ pub impl Memory.Manager for Memory.NoOp {
     """
 
   pub fn primitive_source_path(_manager :: Memory.NoOp) -> String {
-    "src/memory/no_op/manager.zig"
+    "zap:src/memory/no_op/manager.zig"
   }
 
   @doc = """

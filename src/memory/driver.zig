@@ -1,33 +1,25 @@
 //! Memory manager build-time driver.
 //!
-//! Phase 3 of the pluggable memory manager rollout — see
+//! Adapter-driven pluggable memory manager resolver — see
 //! `docs/memory-manager-abi.md` section 10 for the normative build pipeline.
 //!
-//! Phase 1 of the adapter refactor keeps the existing first-party
-//! short-circuit for runtime compatibility:
-//! `Memory.{ARC,Arena,NoOp,Leak,Tracking}` classify to
-//! `BuiltinManagerTag` and use embedded primitive sources.
-//! Third-party managers still flow through the legacy discovery path
-//! that compiles a manager `.zig` source and validates its `.zapmem`
-//! section. Phase 2 removes the first-party hardcoding.
-//!
 //! The driver:
-//!   1. Receives the manifest's `memory:` selection (a struct reference
-//!      resolved to a dotted name like `"Memory.NoOp"`). When the
-//!      manifest does not set `memory:`, the driver applies
-//!      `DEFAULT_MANAGER` (`Memory.ARC`).
-//!   2. Classifies first-party `Memory.*` adapters without I/O.
-//!   3. For third-party managers, locates the matching `.zap` struct
-//!      and reads its `@memory_manager_source` attribute to find the
-//!      manager's Zig source.
-//!   4. Invokes the Zig-fork primitive `zap_fork_compile_zig_to_object`
-//!      for third-party sources, then reads the object file, extracts
-//!      the `.zapmem` section, and validates the meta header + core
-//!      vtable + embedded descriptors per spec section 3.5.
+//!   1. Receives the manifest's `Memory.Manager` adapter metadata as
+//!      evaluated by build.zap CTFE.
+//!   2. Resolves the adapter's primitive source reference to a concrete
+//!      Zig source path.
+//!   3. Invokes the Zig-fork primitive `zap_fork_compile_zig_to_object`
+//!      for every manager source, stdlib and project/dependency alike, then
+//!      reads the object file, extracts the `.zapmem` section, and
+//!      validates the meta header + core vtable + embedded descriptors
+//!      per spec section 3.5.
+//!   4. Compares the validated `.zapmem` capability mask with the
+//!      adapter-reported capability mask, so the Zap-level adapter and
+//!      Zig primitive implementation cannot drift silently.
 //!   5. Exposes the resulting `ResolvedManager` to the compiler driver:
-//!      the object path goes onto the link line; `declared_caps` flows
-//!      through to HIR / codegen (Phase 6 will branch on it); the manager
-//!      name appears in diagnostics.
+//!      `declared_caps` flows through HIR / codegen; the selected Zig
+//!      source path is registered as `zap_active_manager` for the final
+//!      binary; the manager name appears in diagnostics.
 //!
 //! The driver is build-time-only — it produces a `ResolvedManager` value
 //! that the rest of the build pipeline (`src/main.zig`'s `buildTarget`)
@@ -153,143 +145,34 @@ fn resolveDefaultForkFn() ?ForkCompileFn {
 // Driver types
 // ---------------------------------------------------------------------------
 
-/// Identity of the resolved memory manager from the compiler driver's
-/// perspective. The five named cases correspond exactly to the
-/// canonical first-party managers declared in `lib/memory/*.zap`
-/// (one tag case per stdlib `.zap` file). Anything else — including
-/// third-party managers shipped by user projects — collapses to
-/// `.third_party`.
-///
-/// The tag exists so later phases of the memory-manager perf-recovery
-/// work can comptime-dispatch direct calls into first-party manager
-/// source while keeping the v1.0 vtable for third-party managers.
-/// Phase 1 only classifies and threads the tag through the build
-/// pipeline; later phases branch on it in the runtime and codegen
-/// layers. The classifier is intentionally pure and runs before any
-/// I/O so downstream code can rely on the tag without first having to
-/// succeed in resolution.
-///
-/// Symmetry obligation — the case set of this enum MUST remain in 1:1
-/// correspondence with the `pub struct Memory.{...}` declarations
-/// in `lib/memory/*.zap`. Adding a sixth first-party manager
-/// requires landing in one commit:
-///   (a) the new `lib/memory/<name>.zap` stdlib declaration,
-///   (b) the new `BuiltinManagerTag` case here,
-///   (c) the new arm in `classifyBuiltinManager`,
-///   (d) the new `src/memory/<name>/manager.zig` Zig source.
-/// Skipping any one of those four pieces breaks the contract that the
-/// tag set mirrors the stdlib declaration set exactly, and the
-/// comptime exhaustiveness assertion below will fire if the enum and
-/// classifier drift apart.
-pub const BuiltinManagerTag = enum {
-    arc,
-    arena,
-    no_op,
-    leak,
-    tracking,
-    third_party,
+/// Metadata returned by the selected `Memory.Manager` protocol adapter.
+/// The build driver consumes this value instead of inspecting Zap source
+/// attributes or classifying manager names.
+pub const AdapterMetadata = struct {
+    /// User-facing manager name returned by `Memory.Manager.name/1`.
+    name: []const u8,
+    /// Primitive source reference returned by
+    /// `Memory.Manager.primitive_source_path/1`.
+    primitive_source_path: []const u8,
+    /// Adapter-declared capability mask returned by
+    /// `Memory.Manager.capability_mask/1`.
+    capability_mask: u64,
+    /// Adapter-declared boolean projection of bit 0.
+    refcount_v1: bool,
 };
-
-// Compile-time guard for the symmetry obligation documented above:
-// the classifier hard-codes one arm per first-party tag plus the
-// implicit `.third_party` fallthrough, so any change to the enum's
-// shape (adding, removing, or renaming a case) MUST be accompanied by
-// a matching change in `classifyBuiltinManager`. Bumping this expected
-// count without updating the classifier — or vice versa — will fail
-// the build at this site instead of silently degrading a first-party
-// manager to `.third_party` and losing the perf-recovery fast path.
-comptime {
-    const fields = @typeInfo(BuiltinManagerTag).@"enum".fields;
-    if (fields.len != 6) @compileError(
-        "BuiltinManagerTag: case count changed — update `classifyBuiltinManager` " ++
-            "and this assertion together (see the symmetry obligation comment above).",
-    );
-}
-
-/// Pure classifier: map a dotted manager name to its `BuiltinManagerTag`.
-/// The five recognised names correspond to `lib/memory/arc.zap`,
-/// `arena.zap`, `no_op.zap`, `leak.zap`, and `tracking.zap`. The match
-/// is case-sensitive because Zap struct identifiers are themselves
-/// case-sensitive — a manager named `zap.memory.arc` would be a
-/// different struct than `Memory.ARC`. Anything not in the list
-/// (including the empty string, though `resolve()` substitutes
-/// `DEFAULT_MANAGER` before reaching this function) returns
-/// `.third_party`.
-pub fn classifyBuiltinManager(name: []const u8) BuiltinManagerTag {
-    if (std.mem.eql(u8, name, "Memory.ARC")) return .arc;
-    if (std.mem.eql(u8, name, "Memory.Arena")) return .arena;
-    if (std.mem.eql(u8, name, "Memory.NoOp")) return .no_op;
-    if (std.mem.eql(u8, name, "Memory.Leak")) return .leak;
-    if (std.mem.eql(u8, name, "Memory.Tracking")) return .tracking;
-    return .third_party;
-}
-
-/// Capability bitmask declared by each first-party manager. Hard-coded
-/// because first-party manager sources are shipped with the compiler and
-/// their caps are invariants of the source — the host test suite enforces
-/// the declarations via the per-manager `comptime` ABI tripwires in
-/// `src/memory/{arc,arena,no_op,leak,tracking}/manager.zig`. Returns
-/// `null` for `.third_party` because that path discovers caps by parsing
-/// the externally-compiled `.zapmem` section.
-///
-/// Source of truth note: must match the `declared_caps` field of each
-/// manager's `zap_memory_section` declaration. The `0x1` literal for
-/// `.arc` is the spec-pinned `REFCOUNT_V1` capability bit
-/// (`src/memory/abi.zig:REFCOUNT_V1_BIT`); the ARC manager source
-/// expresses the same bit through its file-local
-/// `CAP_REFCOUNT_V1_BIT = 0x0000_0000_0000_0001` constant in
-/// `src/memory/arc/manager.zig`. Drift between this table and the
-/// manager source would not be caught by the existing tripwires; see
-/// `Phase 5 test "builtin manager caps table matches each manager source's declared_caps"`.
-pub fn builtinManagerDeclaredCaps(tag: BuiltinManagerTag) ?u64 {
-    return switch (tag) {
-        .arc => abi.REFCOUNT_V1_BIT, // 0x1 — ARC's `zap_memory_section.core.declared_caps`
-        .arena => 0,
-        .no_op => 0,
-        .leak => 0,
-        .tracking => 0,
-        .third_party => null,
-    };
-}
-
-/// ABI minor advertised by each first-party manager. Fixed at the current
-/// canonical value (`1`) for every first-party manager — the v1.0 and v1.1
-/// vtable sizes are both runtime-detectable, but first-party managers all
-/// advertise the v1.1 size as of Phase 4.x. Updated alongside the ABI.
-/// Returns `null` for `.third_party` because that path discovers the
-/// `abi_minor` by parsing the externally-compiled `.zapmem` section's
-/// `meta.abi_minor` field. The first-party constant aligns with each
-/// manager's `zap_memory_section.meta.abi_minor = 1` literal (see
-/// `src/memory/{arc,arena,no_op,leak,tracking}/manager.zig`).
-pub fn builtinManagerAbiMinor(tag: BuiltinManagerTag) ?u16 {
-    return switch (tag) {
-        .arc, .arena, .no_op, .leak, .tracking => 1,
-        .third_party => null,
-    };
-}
 
 /// Resolved state of the active manager, threaded from the build driver
 /// through to the link step and runtime bootstrap.
 pub const ResolvedManager = struct {
-    /// Dotted manager name as it appears in the manifest (e.g.
-    /// `"Memory.ARC"`, `"Memory.NoOp"`). Always non-empty.
+    /// Public manager name returned by the selected adapter.
     name: []const u8,
 
-    /// Classification of `name`. Populated by `resolve()` after the
-    /// empty-string-to-DEFAULT substitution; downstream phases branch
-    /// on this to decide between the comptime-dispatched first-party
-    /// fast path and the v1.0 vtable path. Phase 1 only threads the
-    /// field through; later phases consume it.
-    builtin_tag: BuiltinManagerTag,
+    /// Absolute path to the selected manager's Zig primitive source.
+    /// The backend registers this file as `zap_active_manager`.
+    active_manager_source_path: []const u8,
 
-    /// Absolute or relative path to the compiled third-party manager
-    /// object file. Null for first-party managers because their
-    /// primitive source is embedded and registered as `zap_active_manager`.
-    object_path: ?[]const u8,
-
-    /// Capability bitmask resolved for the active manager. First-party
-    /// managers use the built-in table; third-party managers read it
-    /// from the validated `.zapmem` core vtable.
+    /// Capability bitmask resolved from the validated `.zapmem` core
+    /// vtable and cross-checked against the adapter.
     /// Phase 6 (codegen elision) reads this to decide whether to emit
     /// retain/release calls; Phase 4 (Map/List/String layout branch)
     /// reads it to decide whether the inline ArcHeader is present.
@@ -299,19 +182,21 @@ pub const ResolvedManager = struct {
     /// for diagnostic context; runtime validation rejects majors that
     /// don't match the compiler's (currently 1).
     abi_minor: u16,
+
+    /// True when the validated REFCOUNT_V1 descriptor is at least the
+    /// v1.1 size that exposes the side-table extension slots.
+    refcount_sized_extension: bool,
 };
 
 /// Driver-level errors. Each variant maps to a build-time diagnostic in
 /// the normative table from spec section 10.4.
 pub const ResolveError = error{
-    /// The `memory:` field was set to a third-party struct that does
-    /// not declare a `@memory_manager_source` attribute.
-    MissingMemoryManagerSource,
-    /// The struct named by `memory:` could not be found in any of the
-    /// source roots.
-    ManagerStructNotFound,
-    /// The Zig source file referenced by a third-party
-    /// `@memory_manager_source` could not be opened.
+    /// The manifest did not provide evaluated `Memory.Manager` metadata.
+    MissingMemoryManagerAdapter,
+    /// The adapter's primitive source reference is malformed or uses an
+    /// unknown scheme.
+    InvalidPrimitiveSourceReference,
+    /// The Zig source file referenced by the adapter could not be opened.
     ManagerSourceNotFound,
     /// Compilation of the manager source failed; the build driver
     /// surfaces the diagnostic text.
@@ -373,16 +258,18 @@ pub const SourceRoot = struct {
 
 /// Inputs passed to `resolve`.
 pub const ResolveOptions = struct {
-    /// Dotted manager name from the manifest (e.g. `"Memory.NoOp"`).
-    /// Empty string -> driver applies the default `Memory.ARC`.
-    manager_name: []const u8,
-    /// Source roots to search for third-party manager `.zap` structs.
+    /// Metadata produced by evaluating the selected `Memory.Manager`
+    /// adapter through CTFE.
+    adapter: ?AdapterMetadata,
+    /// Source roots available to project and dependency source
+    /// reference schemes.
     source_roots: []const SourceRoot,
-    /// Project root — used to resolve third-party
-    /// `@memory_manager_source` attributes, which may be relative.
+    /// Project root — used to resolve `project:<path>` primitive
+    /// source references.
     project_root: []const u8,
     /// Path to the Zap source tree's root (e.g.
-    /// `/Users/.../zap`) — used to resolve first-party stdlib paths.
+    /// `/Users/.../zap`) — used to resolve `zap:<path>` primitive
+    /// source references.
     /// May be the same as `project_root` when building Zap itself.
     zap_source_root: []const u8,
     /// Directory the driver writes the compiled manager `.o` into.
@@ -410,123 +297,45 @@ pub const ResolveOptions = struct {
     fork_compile_fn: ?ForkCompileFn = null,
 };
 
-/// Default manager when the manifest does not set `memory:`.
-pub const DEFAULT_MANAGER: []const u8 = "Memory.ARC";
-
 /// Resolve the active memory manager for the build. Returns a
 /// `ResolvedManager` whose lifetime is bound to the caller's allocator.
-///
-/// Phase 5 added a short-circuit for first-party manager tags. The
-/// runtime emits the manager's symbols (including `zap_memory_section`)
-/// directly because the runtime translation unit `@import`s the active
-/// manager source as the `zap_active_manager` sibling module (registered
-/// per-user-binary in Phase 3). Compiling and linking a separate
-/// manager `.o` would produce a duplicate-symbol link error AND defeat
-/// the Phase 4 comptime-dispatch perf recovery. For `.third_party` the
-/// driver still walks the full pipeline: source discovery → external
-/// compile → section parse → validation.
 pub fn resolve(
     allocator: std.mem.Allocator,
     options: ResolveOptions,
     diag: *DriverDiagnostic,
 ) ResolveError!ResolvedManager {
-    const manager_name = if (options.manager_name.len == 0)
-        DEFAULT_MANAGER
-    else
-        options.manager_name;
-
-    // Classify the manager identity before any I/O. The tag is a pure
-    // function of the (post-default-substitution) name, so future
-    // code paths can branch on it without needing a successful
-    // resolution. Carried into the returned `ResolvedManager`.
-    const builtin_tag = classifyBuiltinManager(manager_name);
-
-    // Phase 5 first-party short-circuit. Skip source discovery,
-    // external compile, and `.zapmem` parse. The manager's source is
-    // shipped with the compiler (`compiler.getBuiltinManagerSource(tag)`)
-    // and registered as the `zap_active_manager` module per user
-    // binary; the runtime translation unit's `@import("zap_active_manager")`
-    // already pulls in every exported symbol the manager declares,
-    // including `zap_memory_section`. Linking a separate manager `.o`
-    // would produce a duplicate-symbol error AND defeat the Phase 4
-    // comptime-dispatch perf recovery. The caps and abi_minor values
-    // come from `builtinManagerDeclaredCaps` / `builtinManagerAbiMinor`
-    // — invariants pinned at compile time against each manager source
-    // (see the Phase 5 caps-pin test).
-    if (builtin_tag != .third_party) {
-        // The non-null unwrap is sound: `builtinManagerDeclaredCaps` and
-        // `builtinManagerAbiMinor` both return non-null for every
-        // non-`.third_party` tag, and the only path here requires
-        // `builtin_tag != .third_party`. A future first-party tag added
-        // without populating both tables fires the comptime
-        // exhaustiveness assertion above (BuiltinManagerTag enum guard)
-        // long before reaching this site.
-        return ResolvedManager{
-            .name = try allocator.dupe(u8, manager_name),
-            .builtin_tag = builtin_tag,
-            .object_path = null,
-            .declared_caps = builtinManagerDeclaredCaps(builtin_tag).?,
-            .abi_minor = builtinManagerAbiMinor(builtin_tag).?,
-        };
+    const adapter = options.adapter orelse {
+        diag.write("build manifest did not evaluate a `Memory.Manager` adapter", .{});
+        return ResolveError.MissingMemoryManagerAdapter;
+    };
+    if (adapter.name.len == 0 or adapter.primitive_source_path.len == 0) {
+        diag.write("selected `Memory.Manager` adapter returned empty metadata", .{});
+        return ResolveError.InvalidPrimitiveSourceReference;
+    }
+    if (adapter.refcount_v1 != ((adapter.capability_mask & abi.REFCOUNT_V1_BIT) != 0)) {
+        diag.write(
+            "memory manager adapter '{s}' reports refcount_v1?={any} but capability_mask=0x{x}",
+            .{ adapter.name, adapter.refcount_v1, adapter.capability_mask },
+        );
+        return ResolveError.ValidationFailed;
     }
 
-    // Third-party flow (unchanged from Phase 4): source discovery →
-    // external compile → section parse → validation. The manager's
-    // `.zapmem` section is the sole source of truth for caps and
-    // abi_minor on this path because we cannot assume any properties
-    // of an externally-shipped manager source.
-
-    // Find the .zap source that declares the manager struct so we can
-    // read its `@memory_manager_source` attribute.
-    const manager_source_rel = (try discoverManagerSource(allocator, manager_name, options.source_roots)) orelse {
-        diag.write(
-            "memory manager struct '{s}' was not found in any source root; check the manifest's `memory:` value",
-            .{manager_name},
-        );
-        return ResolveError.ManagerStructNotFound;
-    };
-    defer allocator.free(manager_source_rel);
-
-    // Resolve `@memory_manager_source` to an absolute filesystem path.
-    // First-party managers express the path relative to the Zap source
-    // tree; third-party managers express it relative to the dep's root
-    // (Phase 3 always treats the path as relative to either the project
-    // root or the Zap source root; richer dep-aware resolution lands in
-    // Phase 7).
-    const candidates = [_][]const u8{ options.zap_source_root, options.project_root };
-    var manager_zig_path: ?[]const u8 = null;
-    for (candidates) |root| {
-        const joined = std.fs.path.join(allocator, &.{ root, manager_source_rel }) catch return ResolveError.OutOfMemory;
-        std.Io.Dir.cwd().access(std.Options.debug_io, joined, .{}) catch {
-            allocator.free(joined);
-            continue;
-        };
-        manager_zig_path = joined;
-        break;
-    }
-    const manager_zig_path_owned = manager_zig_path orelse {
-        diag.write(
-            "memory manager source not found at '{s}' (from `@memory_manager_source` on `{s}`)",
-            .{ manager_source_rel, manager_name },
-        );
-        return ResolveError.ManagerSourceNotFound;
-    };
+    const manager_zig_path_owned = try resolvePrimitiveSourcePath(allocator, adapter.primitive_source_path, options, diag);
     defer allocator.free(manager_zig_path_owned);
 
-    // Compile the manager's Zig source into an object file in
-    // `<cache_dir>/<safe_name>.o`. Spec section 10.3: the .o is content-
-    // addressed; Phase 3 always recompiles (cheap) and Phase 7 may add
-    // a content hash.
+    // Compile every selected manager source into an object file for the
+    // same `.zapmem` validation pipeline. The object is build-time
+    // evidence only; the final binary registers the source path as
+    // `zap_active_manager` and does not link this validation object.
     std.Io.Dir.cwd().createDirPath(std.Options.debug_io, options.cache_dir) catch {};
-    const safe_name = try makeSafeFileName(allocator, manager_name);
+    const safe_name = try makeSafeFileName(allocator, adapter.name);
     defer allocator.free(safe_name);
     const object_basename = try std.fmt.allocPrint(allocator, "{s}.o", .{safe_name});
     defer allocator.free(object_basename);
     const object_path = std.fs.path.join(allocator, &.{ options.cache_dir, object_basename }) catch return ResolveError.OutOfMemory;
-    // Caller owns `object_path` via the returned struct; we must NOT free it here.
-    errdefer allocator.free(object_path);
+    defer allocator.free(object_path);
 
-    try compileManagerSource(allocator, manager_name, manager_zig_path_owned, object_path, options, diag);
+    try compileManagerSource(allocator, adapter.name, manager_zig_path_owned, object_path, options, diag);
 
     // Read the resulting object file and locate the `.zapmem` section.
     const object_bytes = std.Io.Dir.cwd().readFileAlloc(
@@ -544,214 +353,132 @@ pub fn resolve(
         switch (err) {
             error.SectionNotFound => diag.write(
                 "manager '{s}' did not emit a `.zapmem` metadata section; see docs/memory-manager-abi.md section 3",
-                .{manager_name},
+                .{adapter.name},
             ),
             error.SectionTooSmall => diag.write(
                 "manager '{s}' emitted a `.zapmem` section smaller than the v1.0 metadata header (32 bytes)",
-                .{manager_name},
+                .{adapter.name},
             ),
             error.InvalidObject => diag.write(
                 "manager '{s}' produced a malformed object file at '{s}'",
-                .{ manager_name, object_path },
+                .{ adapter.name, object_path },
             ),
             error.UnsupportedFormat => diag.write(
                 "manager '{s}' object file uses an unsupported format (Phase 3 supports ELF and Mach-O 64-bit)",
-                .{manager_name},
+                .{adapter.name},
             ),
         }
         return ResolveError.SectionInvalid;
     };
 
     // Static validation per spec section 3.5.
-    const validated = try validateSection(manager_name, section_bytes, diag);
+    const validated = try validateSection(adapter.name, section_bytes, diag);
+    if (validated.declared_caps != adapter.capability_mask) {
+        diag.write(
+            "memory manager adapter '{s}' capability_mask=0x{x} but `.zapmem` declares 0x{x}",
+            .{ adapter.name, adapter.capability_mask, validated.declared_caps },
+        );
+        return ResolveError.ValidationFailed;
+    }
 
-    // Build-time check: the runtime bootstrap discovers the manager
-    // via `@extern(..., .{ .name = "zap_memory_section", .linkage =
-    // .weak })`. The contract in `docs/memory-manager-abi.md` section
-    // 3.2 / 10.5 requires every manager to export the section payload
-    // under that symbol name. A manager that emitted the section bytes
-    // under a different symbol (or as an unnamed payload) would pass
-    // the section-content validation above but silently resolve the
-    // weak extern to null at runtime, causing the runtime to panic at
-    // startup ("no active memory manager bound at startup"). The check
-    // below catches that mis-emission at build time.
-    try assertExportsManagerSymbol(manager_name, object_bytes, diag);
+    // Build-time check: source registration later binds
+    // `zap_active_manager.zap_memory_section`; the validation object
+    // must export the same section payload symbol.
+    try assertExportsManagerSymbol(adapter.name, object_bytes, diag);
 
     return .{
-        .name = try allocator.dupe(u8, manager_name),
-        .builtin_tag = builtin_tag,
-        .object_path = object_path,
+        .name = try allocator.dupe(u8, adapter.name),
+        .active_manager_source_path = try allocator.dupe(u8, manager_zig_path_owned),
         .declared_caps = validated.declared_caps,
         .abi_minor = validated.abi_minor,
+        .refcount_sized_extension = validated.refcount_sized_extension,
     };
 }
 
 /// Free the owned memory inside a `ResolvedManager`. Safe to call once.
 pub fn freeResolved(allocator: std.mem.Allocator, resolved: *ResolvedManager) void {
     allocator.free(resolved.name);
-    if (resolved.object_path) |p| allocator.free(p);
+    allocator.free(resolved.active_manager_source_path);
     resolved.name = "";
-    resolved.object_path = null;
+    resolved.active_manager_source_path = "";
 }
 
 // ---------------------------------------------------------------------------
-// Source discovery
+// Primitive source reference resolution
 // ---------------------------------------------------------------------------
 
-/// Walk every `.zap` file under `source_roots` looking for the one that
-/// declares `manager_name`. When the declaration is found, return the
-/// owned string value of the file's `@memory_manager_source` attribute.
-/// Returns null when no file declares the struct. Returns
-/// `MissingMemoryManagerSource` when the struct is declared without the
-/// attribute.
-fn discoverManagerSource(
+fn resolvePrimitiveSourcePath(
     allocator: std.mem.Allocator,
-    manager_name: []const u8,
-    source_roots: []const SourceRoot,
-) ResolveError!?[]const u8 {
-    for (source_roots) |root| {
-        if (try scanDirForManagerSource(allocator, manager_name, root.path)) |found| {
-            return found;
-        }
+    primitive_source_path: []const u8,
+    options: ResolveOptions,
+    diag: *DriverDiagnostic,
+) ResolveError![]const u8 {
+    if (std.mem.startsWith(u8, primitive_source_path, "zap:")) {
+        return resolveSourceUnderRoot(allocator, options.zap_source_root, primitive_source_path["zap:".len..], primitive_source_path, diag);
     }
-    return null;
+    if (std.mem.startsWith(u8, primitive_source_path, "project:")) {
+        return resolveSourceUnderRoot(allocator, options.project_root, primitive_source_path["project:".len..], primitive_source_path, diag);
+    }
+    if (std.mem.startsWith(u8, primitive_source_path, "dep:")) {
+        const rest = primitive_source_path["dep:".len..];
+        const colon = std.mem.indexOfScalar(u8, rest, ':') orelse {
+            diag.write("invalid memory manager source reference '{s}': expected dep:<name>:<path>", .{primitive_source_path});
+            return ResolveError.InvalidPrimitiveSourceReference;
+        };
+        const dep_name = rest[0..colon];
+        const relative_path = rest[colon + 1 ..];
+        if (dep_name.len == 0) {
+            diag.write("invalid memory manager source reference '{s}': empty dependency name", .{primitive_source_path});
+            return ResolveError.InvalidPrimitiveSourceReference;
+        }
+        var dep_root_name_buffer: [256]u8 = undefined;
+        const dep_root_name = std.fmt.bufPrint(&dep_root_name_buffer, "dep:{s}", .{dep_name}) catch {
+            diag.write("invalid memory manager source reference '{s}': dependency name is too long", .{primitive_source_path});
+            return ResolveError.InvalidPrimitiveSourceReference;
+        };
+        for (options.source_roots) |source_root| {
+            if (std.mem.eql(u8, source_root.name, dep_root_name)) {
+                return resolveSourceUnderRoot(allocator, source_root.path, relative_path, primitive_source_path, diag);
+            }
+        }
+        diag.write("invalid memory manager source reference '{s}': dependency '{s}' is not a source root", .{ primitive_source_path, dep_name });
+        return ResolveError.InvalidPrimitiveSourceReference;
+    }
+    diag.write(
+        "invalid memory manager source reference '{s}': expected zap:<path>, project:<path>, or dep:<name>:<path>",
+        .{primitive_source_path},
+    );
+    return ResolveError.InvalidPrimitiveSourceReference;
 }
 
-fn scanDirForManagerSource(
+fn resolveSourceUnderRoot(
     allocator: std.mem.Allocator,
-    manager_name: []const u8,
-    dir_path: []const u8,
-) ResolveError!?[]const u8 {
-    var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, dir_path, .{ .iterate = true }) catch return null;
-    defer dir.close(std.Options.debug_io);
-
-    var iter = dir.iterate();
-    while (iter.next(std.Options.debug_io) catch null) |entry| {
-        if (entry.kind == .directory) {
-            const sub_path = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch return ResolveError.OutOfMemory;
-            defer allocator.free(sub_path);
-            if (try scanDirForManagerSource(allocator, manager_name, sub_path)) |found| return found;
-            continue;
-        }
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
-        const file_path = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch return ResolveError.OutOfMemory;
-        defer allocator.free(file_path);
-
-        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, allocator, .limited(10 * 1024 * 1024)) catch continue;
-        defer allocator.free(source);
-
-        if (try matchManagerSourceInZap(allocator, manager_name, source)) |attr_value| return attr_value;
+    root: []const u8,
+    relative_path: []const u8,
+    original_reference: []const u8,
+    diag: *DriverDiagnostic,
+) ResolveError![]const u8 {
+    if (!isSafeRelativePath(relative_path)) {
+        diag.write("invalid memory manager source reference '{s}': path must be relative and may not contain '..'", .{original_reference});
+        return ResolveError.InvalidPrimitiveSourceReference;
     }
-    return null;
+    const joined = std.fs.path.join(allocator, &.{ root, relative_path }) catch return ResolveError.OutOfMemory;
+    std.Io.Dir.cwd().access(std.Options.debug_io, joined, .{}) catch {
+        diag.write("memory manager source not found at '{s}' (from adapter source reference '{s}')", .{ joined, original_reference });
+        allocator.free(joined);
+        return ResolveError.ManagerSourceNotFound;
+    };
+    return joined;
 }
 
-/// Best-effort scan of a Zap source's text looking for a top-level
-/// `@memory_manager_source = "..."` attribute paired with a `pub struct
-/// <manager_name>` declaration. The driver runs before the full collector
-/// pipeline, so we tokenize the file directly (mirroring how the
-/// `@native_type` discovery pass works in `discovery.zig`).
-fn matchManagerSourceInZap(
-    allocator: std.mem.Allocator,
-    manager_name: []const u8,
-    source: []const u8,
-) ResolveError!?[]const u8 {
-    var pending_attr: ?[]const u8 = null;
-
-    var cursor: usize = 0;
-    while (cursor < source.len) {
-        // Skip whitespace.
-        while (cursor < source.len and isWhitespace(source[cursor])) : (cursor += 1) {}
-        if (cursor >= source.len) break;
-
-        // Line comments — `#`. The Zap lexer treats `#` as a comment marker
-        // outside of string interpolation; we approximate by skipping to
-        // newline whenever we see a `#` that isn't preceded by `\` or
-        // inside a heredoc. The driver only needs to ignore comment lines
-        // that contain literal `@memory_manager_source`, which is rare.
-        if (source[cursor] == '#') {
-            while (cursor < source.len and source[cursor] != '\n') : (cursor += 1) {}
-            continue;
-        }
-
-        // Heredoc `"""` — skip everything up to the closing `"""`.
-        if (cursor + 2 < source.len and source[cursor] == '"' and source[cursor + 1] == '"' and source[cursor + 2] == '"') {
-            cursor += 3;
-            while (cursor + 2 < source.len) : (cursor += 1) {
-                if (source[cursor] == '"' and source[cursor + 1] == '"' and source[cursor + 2] == '"') {
-                    cursor += 3;
-                    break;
-                }
-            }
-            continue;
-        }
-
-        // Top-level attribute: `@memory_manager_source = "..."`.
-        if (source[cursor] == '@') {
-            cursor += 1;
-            const name_start = cursor;
-            while (cursor < source.len and isIdentChar(source[cursor])) : (cursor += 1) {}
-            const attr_name = source[name_start..cursor];
-            if (std.mem.eql(u8, attr_name, "memory_manager_source")) {
-                // Skip whitespace, `=`, whitespace.
-                while (cursor < source.len and isWhitespace(source[cursor])) : (cursor += 1) {}
-                if (cursor >= source.len or source[cursor] != '=') continue;
-                cursor += 1;
-                while (cursor < source.len and isWhitespace(source[cursor])) : (cursor += 1) {}
-                if (cursor >= source.len or source[cursor] != '"') continue;
-                cursor += 1;
-                const value_start = cursor;
-                while (cursor < source.len and source[cursor] != '"') : (cursor += 1) {}
-                if (cursor >= source.len) break;
-                const value_end = cursor;
-                cursor += 1;
-                if (pending_attr) |old| allocator.free(old);
-                pending_attr = try allocator.dupe(u8, source[value_start..value_end]);
-            }
-            continue;
-        }
-
-        // `pub struct <manager_name>` — match the manager name literally.
-        if (matchAtCursor(source, cursor, "pub struct")) {
-            cursor += "pub struct".len;
-            while (cursor < source.len and isWhitespace(source[cursor])) : (cursor += 1) {}
-            const name_start = cursor;
-            while (cursor < source.len and (isIdentChar(source[cursor]) or source[cursor] == '.')) : (cursor += 1) {}
-            const decl_name = source[name_start..cursor];
-            if (std.mem.eql(u8, decl_name, manager_name)) {
-                if (pending_attr) |attr| return attr;
-                return ResolveError.MissingMemoryManagerSource;
-            }
-            // Different struct in the same file — reset attribute and
-            // continue scanning.
-            if (pending_attr) |old| {
-                allocator.free(old);
-                pending_attr = null;
-            }
-            continue;
-        }
-
-        cursor += 1;
+fn isSafeRelativePath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (std.fs.path.isAbsolute(path)) return false;
+    var parts = std.mem.tokenizeAny(u8, path, "/\\");
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, "..")) return false;
     }
-
-    if (pending_attr) |old| allocator.free(old);
-    return null;
-}
-
-fn matchAtCursor(source: []const u8, cursor: usize, prefix: []const u8) bool {
-    if (cursor + prefix.len > source.len) return false;
-    return std.mem.eql(u8, source[cursor .. cursor + prefix.len], prefix);
-}
-
-fn isWhitespace(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
-}
-
-fn isIdentChar(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or
-        (c >= 'A' and c <= 'Z') or
-        (c >= '0' and c <= '9') or
-        c == '_';
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -827,7 +554,7 @@ fn compileManagerSource(
         .Ok => return,
         .SourceNotFound => {
             diag.write(
-                "memory manager source not found at '{s}' (from `@memory_manager_source` on `{s}`)",
+                "memory manager source not found at '{s}' for adapter '{s}'",
                 .{ source_path, manager_name },
             );
             return ResolveError.ManagerSourceNotFound;
@@ -904,144 +631,85 @@ fn enumTag(comptime E: type, name: []const u8) ?usize {
     return null;
 }
 
-test "classifyBuiltinManager maps the five canonical first-party names" {
-    // Exhaustive: every canonical first-party manager name listed in
-    // `lib/memory/*.zap` maps to its dedicated tag case. A new
-    // first-party manager added under `lib/memory/` MUST add a
-    // matching case here AND a tag enum case below.
-    try std.testing.expectEqual(BuiltinManagerTag.arc, classifyBuiltinManager("Memory.ARC"));
-    try std.testing.expectEqual(BuiltinManagerTag.arena, classifyBuiltinManager("Memory.Arena"));
-    try std.testing.expectEqual(BuiltinManagerTag.no_op, classifyBuiltinManager("Memory.NoOp"));
-    try std.testing.expectEqual(BuiltinManagerTag.leak, classifyBuiltinManager("Memory.Leak"));
-    try std.testing.expectEqual(BuiltinManagerTag.tracking, classifyBuiltinManager("Memory.Tracking"));
-}
+test "primitive source references resolve zap, project, and dep schemes" {
+    const allocator = std.testing.allocator;
 
-test "classifyBuiltinManager returns .third_party for unknown names" {
-    try std.testing.expectEqual(BuiltinManagerTag.third_party, classifyBuiltinManager("Foo.Bar"));
-    try std.testing.expectEqual(BuiltinManagerTag.third_party, classifyBuiltinManager("Memory.OtherBogus"));
-    // Empty string is included for defensive completeness; the resolver
-    // substitutes `DEFAULT_MANAGER` before classification, so reaching
-    // `classifyBuiltinManager` with an empty string is a bug in the
-    // caller, not a runtime condition.
-    try std.testing.expectEqual(BuiltinManagerTag.third_party, classifyBuiltinManager(""));
-}
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
 
-test "classifyBuiltinManager is case-sensitive" {
-    // The canonical manager names are case-sensitive struct identifiers
-    // declared in `lib/memory/*.zap` files. A lowercase variant is
-    // not a valid first-party manager and must classify as third-party
-    // so the runtime falls back to the vtable dispatch path rather than
-    // wrongly assuming first-party semantics.
-    try std.testing.expectEqual(BuiltinManagerTag.third_party, classifyBuiltinManager("memory.arc"));
-    try std.testing.expectEqual(BuiltinManagerTag.third_party, classifyBuiltinManager("MEMORY.ARC"));
-    try std.testing.expectEqual(BuiltinManagerTag.third_party, classifyBuiltinManager("Memory.arc"));
-}
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "zap/src/memory/no_op") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "project/src/memory/custom") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "deps/pkg/src/memory/custom") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zap/src/memory/no_op/manager.zig", .data = "// stdlib" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "project/src/memory/custom/manager.zig", .data = "// project" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "deps/pkg/src/memory/custom/manager.zig", .data = "// dep" }) catch return error.Unexpected;
 
-test "resolve populates builtin_tag for the default ARC manager before discovery" {
-    // The empty-string fallback to `DEFAULT_MANAGER` runs before any
-    // I/O. The tag is therefore classifiable even when the resolver
-    // ultimately fails (no source root contains the manager struct).
-    // Phase 1 exposes the tag on the error path by classifying first
-    // and threading the classification through to diagnostics. This
-    // test pins that ordering: the tag classification MUST happen
-    // before the discovery walk so future callers can branch on the
-    // tag without first having to succeed in resolution.
-    try std.testing.expectEqual(BuiltinManagerTag.arc, classifyBuiltinManager(DEFAULT_MANAGER));
-}
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+    const zap_root = try std.fs.path.join(allocator, &.{ tmp_path, "zap" });
+    defer allocator.free(zap_root);
+    const project_root = try std.fs.path.join(allocator, &.{ tmp_path, "project" });
+    defer allocator.free(project_root);
+    const dep_root = try std.fs.path.join(allocator, &.{ tmp_path, "deps/pkg" });
+    defer allocator.free(dep_root);
 
-test "resolve populates builtin_tag for third-party managers as .third_party" {
-    // A third-party manager (one whose dotted name is not in the
-    // canonical first-party list) must classify as `.third_party`.
-    // The discovery walk fails for unknown names (no source roots
-    // declare the struct), but the tag is classified before discovery
-    // runs, so we observe it via a separate code path. This test pins
-    // the negative-classification contract via the pure classifier
-    // function — the resolver call would fail with
-    // `ManagerStructNotFound` and never produce a populated
-    // `ResolvedManager` for an unknown name.
-    try std.testing.expectEqual(
-        BuiltinManagerTag.third_party,
-        classifyBuiltinManager("Third.Party.Manager"),
-    );
-}
-
-test "Phase 5: builtin manager caps table matches each manager source's declared_caps literal" {
-    // Pin the caps table at `builtinManagerDeclaredCaps` against the
-    // actual `declared_caps = N` literal in each first-party manager's
-    // `zap_memory_section` declaration. Drift between the comptime
-    // table and the manager source would otherwise go undetected (no
-    // other tripwire crosses both sides). The literal substring varies
-    // per manager: ARC declares the capability via its file-local
-    // `CAP_REFCOUNT_V1_BIT` constant (= 0x1), while the zero-cap
-    // managers (Arena, NoOp, Leak, Tracking) declare the literal `0`.
-    const cases = [_]struct {
-        tag: BuiltinManagerTag,
-        path: []const u8,
-        expected_caps: u64,
-        // Substring that MUST appear in the manager source, pinning
-        // the source-of-truth side of the contract. The literal
-        // matches the `declared_caps` field assignment inside the
-        // manager's `zap_memory_section.core` block.
-        expected_substring: []const u8,
-    }{
-        .{ .tag = .arc, .path = "src/memory/arc/manager.zig", .expected_caps = abi.REFCOUNT_V1_BIT, .expected_substring = ".declared_caps = CAP_REFCOUNT_V1_BIT" },
-        .{ .tag = .arena, .path = "src/memory/arena/manager.zig", .expected_caps = 0, .expected_substring = ".declared_caps = 0" },
-        .{ .tag = .no_op, .path = "src/memory/no_op/manager.zig", .expected_caps = 0, .expected_substring = ".declared_caps = 0" },
-        .{ .tag = .leak, .path = "src/memory/leak/manager.zig", .expected_caps = 0, .expected_substring = ".declared_caps = 0" },
-        .{ .tag = .tracking, .path = "src/memory/tracking/manager.zig", .expected_caps = 0, .expected_substring = ".declared_caps = 0" },
+    const options: ResolveOptions = .{
+        .adapter = null,
+        .source_roots = &.{.{ .name = "dep:pkg", .path = dep_root }},
+        .project_root = project_root,
+        .zap_source_root = zap_root,
+        .cache_dir = tmp_path,
     };
+    var diag_buf: [512]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
 
-    for (cases) |c| {
-        // Comptime table side: caps the static table records for the
-        // tag must equal the expected value. A regression here means
-        // `builtinManagerDeclaredCaps` was edited without a matching
-        // change in the manager source.
-        try std.testing.expectEqual(
-            @as(?u64, c.expected_caps),
-            builtinManagerDeclaredCaps(c.tag),
-        );
+    const zap_path = try resolvePrimitiveSourcePath(allocator, "zap:src/memory/no_op/manager.zig", options, &diag);
+    defer allocator.free(zap_path);
+    try std.testing.expect(std.mem.endsWith(u8, zap_path, "zap/src/memory/no_op/manager.zig"));
 
-        // Source-of-truth side: the manager source's
-        // `.declared_caps = <expected>` literal MUST be present so a
-        // drift in the manager source bumps this test red. We read
-        // the on-disk source the same way the Phase 2
-        // `getBuiltinManagerSource` on-disk pin test does.
-        const src = try std.Io.Dir.cwd().readFileAlloc(
-            std.Options.debug_io,
-            c.path,
-            std.testing.allocator,
-            .limited(16 * 1024 * 1024),
-        );
-        defer std.testing.allocator.free(src);
+    const project_path = try resolvePrimitiveSourcePath(allocator, "project:src/memory/custom/manager.zig", options, &diag);
+    defer allocator.free(project_path);
+    try std.testing.expect(std.mem.endsWith(u8, project_path, "project/src/memory/custom/manager.zig"));
 
-        try std.testing.expect(std.mem.indexOf(u8, src, c.expected_substring) != null);
-    }
+    const dep_path = try resolvePrimitiveSourcePath(allocator, "dep:pkg:src/memory/custom/manager.zig", options, &diag);
+    defer allocator.free(dep_path);
+    try std.testing.expect(std.mem.endsWith(u8, dep_path, "deps/pkg/src/memory/custom/manager.zig"));
 }
 
-test "Phase 5: builtinManagerDeclaredCaps returns null for .third_party" {
-    // Third-party managers discover their caps by parsing the
-    // externally-compiled `.zapmem` section, so the static table
-    // has nothing to say about them. `null` is the canonical
-    // signal — `resolve()` reads it to decide whether to take the
-    // first-party short-circuit (`Phase 5`) or the external-compile
-    // path.
-    try std.testing.expectEqual(@as(?u64, null), builtinManagerDeclaredCaps(.third_party));
-}
+test "primitive source references reject unsafe or unknown paths" {
+    const allocator = std.testing.allocator;
 
-test "Phase 5: builtinManagerAbiMinor returns 1 for every first-party tag and null for .third_party" {
-    // Every first-party manager advertises v1.1 (`abi_minor = 1`) as
-    // of Phase 4.x. Third-party managers discover the value by
-    // parsing the externally-compiled section; the static table
-    // returns null for them. Pin both contracts together so a future
-    // bump (e.g. an ABI v1.2 first-party manager that needs a
-    // different minor) fails this test instead of silently shipping
-    // an inconsistent runtime.
-    try std.testing.expectEqual(@as(?u16, 1), builtinManagerAbiMinor(.arc));
-    try std.testing.expectEqual(@as(?u16, 1), builtinManagerAbiMinor(.arena));
-    try std.testing.expectEqual(@as(?u16, 1), builtinManagerAbiMinor(.no_op));
-    try std.testing.expectEqual(@as(?u16, 1), builtinManagerAbiMinor(.leak));
-    try std.testing.expectEqual(@as(?u16, 1), builtinManagerAbiMinor(.tracking));
-    try std.testing.expectEqual(@as(?u16, null), builtinManagerAbiMinor(.third_party));
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const options: ResolveOptions = .{
+        .adapter = null,
+        .source_roots = &.{},
+        .project_root = tmp_path,
+        .zap_source_root = tmp_path,
+        .cache_dir = tmp_path,
+    };
+    var diag_buf: [512]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    try std.testing.expectError(
+        ResolveError.InvalidPrimitiveSourceReference,
+        resolvePrimitiveSourcePath(allocator, "src/memory/no_op/manager.zig", options, &diag),
+    );
+    try std.testing.expectError(
+        ResolveError.InvalidPrimitiveSourceReference,
+        resolvePrimitiveSourcePath(allocator, "project:../manager.zig", options, &diag),
+    );
+    try std.testing.expectError(
+        ResolveError.InvalidPrimitiveSourceReference,
+        resolvePrimitiveSourcePath(allocator, "dep:missing:manager.zig", options, &diag),
+    );
+    try std.testing.expectError(
+        ResolveError.ManagerSourceNotFound,
+        resolvePrimitiveSourcePath(allocator, "project:missing.zig", options, &diag),
+    );
 }
 
 test "parseTargetTriple accepts a well-formed triple" {
@@ -1311,6 +979,7 @@ fn machoSymbolName(strtab: []const u8, offset: u32) ?[]const u8 {
 const ValidatedSection = struct {
     declared_caps: u64,
     abi_minor: u16,
+    refcount_sized_extension: bool,
 };
 
 fn validateSection(
@@ -1456,6 +1125,7 @@ fn validateSection(
 
     // Validate embedded descriptors: each id must map to a declared bit;
     // id == 0 is reserved; size must fit.
+    var refcount_sized_extension = false;
     if (meta.desc_count > 0) {
         const desc_table_offset = @as(usize, meta.core_vtable_offset) + @as(usize, core.size);
         const desc_total = @as(usize, meta.desc_count) * @sizeOf(abi.ZapCapabilityDescV1);
@@ -1520,12 +1190,16 @@ fn validateSection(
                 );
                 return ResolveError.ValidationFailed;
             }
+            if (desc.id == abi.REFC_TAG and desc.size >= abi.REFCOUNT_V1_SIZE_V1_1) {
+                refcount_sized_extension = true;
+            }
         }
     }
 
     return .{
         .declared_caps = meta.declared_caps,
         .abi_minor = meta.abi_minor,
+        .refcount_sized_extension = refcount_sized_extension,
     };
 }
 
@@ -1564,99 +1238,51 @@ fn bitForTag(tag: u32) ?u6 {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "empty manager name falls back to DEFAULT_MANAGER (Memory.ARC) via the Phase 5 short-circuit" {
-    // Phase 5 short-circuit: the empty-name fallback path resolves
-    // `DEFAULT_MANAGER` (= `Memory.ARC`) without touching the
-    // source roots or fork primitive. This test pins the contract:
-    //   - The empty `manager_name` is substituted to `Memory.ARC`.
-    //   - Classification yields `.arc`.
-    //   - The short-circuit fires and returns a populated
-    //     `ResolvedManager` (caps from the comptime table, no
-    //     `object_path`).
-    //
-    // Pre-Phase-5 this same test asserted `ManagerStructNotFound`
-    // because empty source roots failed the discovery walk; the
-    // short-circuit makes that walk unreachable for first-party tags.
+test "resolve requires evaluated adapter metadata" {
     var diag_buf: [512]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
 
-    var resolved = try resolve(
-        std.testing.allocator,
-        .{
-            .manager_name = "",
-            .source_roots = &.{},
-            .project_root = ".",
-            .zap_source_root = ".",
-            .cache_dir = "/tmp/zap-driver-test-default",
-        },
-        &diag,
-    );
-    defer freeResolved(std.testing.allocator, &resolved);
-
-    try std.testing.expectEqualStrings(DEFAULT_MANAGER, resolved.name);
-    try std.testing.expectEqual(BuiltinManagerTag.arc, resolved.builtin_tag);
-    try std.testing.expectEqual(abi.REFCOUNT_V1_BIT, resolved.declared_caps);
-    try std.testing.expectEqual(@as(?[]const u8, null), resolved.object_path);
-}
-
-test "unknown manager name returns ManagerStructNotFound" {
-    var diag_buf: [512]u8 = undefined;
-    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-
-    const result = resolve(
-        std.testing.allocator,
-        .{
-            .manager_name = "Third.Party.Bogus",
-            .source_roots = &.{},
-            .project_root = ".",
-            .zap_source_root = ".",
-            .cache_dir = "/tmp/zap-driver-test-bogus",
-        },
-        &diag,
-    );
-    try std.testing.expectError(ResolveError.ManagerStructNotFound, result);
-    try std.testing.expect(diag.text().len > 0);
-}
-
-test "matchManagerSourceInZap extracts @memory_manager_source attribute" {
-    const source =
-        \\@memory_manager_source = "src/memory/no_op/manager.zig"
-        \\
-        \\pub struct Memory.NoOp {
-        \\}
-        \\
-    ;
-    const allocator = std.testing.allocator;
-    const found = try matchManagerSourceInZap(allocator, "Memory.NoOp", source);
-    defer if (found) |f| allocator.free(f);
-    try std.testing.expect(found != null);
-    try std.testing.expectEqualStrings("src/memory/no_op/manager.zig", found.?);
-}
-
-test "matchManagerSourceInZap returns MissingMemoryManagerSource when attribute absent" {
-    const source =
-        \\pub struct Some.Manager {
-        \\}
-        \\
-    ;
-    const allocator = std.testing.allocator;
     try std.testing.expectError(
-        ResolveError.MissingMemoryManagerSource,
-        matchManagerSourceInZap(allocator, "Some.Manager", source),
+        ResolveError.MissingMemoryManagerAdapter,
+        resolve(
+            std.testing.allocator,
+            .{
+                .adapter = null,
+                .source_roots = &.{},
+                .project_root = ".",
+                .zap_source_root = ".",
+                .cache_dir = "/tmp/zap-driver-test-missing-adapter",
+            },
+            &diag,
+        ),
     );
+    try std.testing.expect(std.mem.indexOf(u8, diag.text(), "Memory.Manager") != null);
 }
 
-test "matchManagerSourceInZap returns null when struct not present" {
-    const source =
-        \\@memory_manager_source = "x.zig"
-        \\
-        \\pub struct Different.Name {
-        \\}
-        \\
-    ;
-    const allocator = std.testing.allocator;
-    const found = try matchManagerSourceInZap(allocator, "Missing.Name", source);
-    try std.testing.expect(found == null);
+test "resolve rejects inconsistent adapter capability metadata before compiling" {
+    var diag_buf: [512]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    try std.testing.expectError(
+        ResolveError.ValidationFailed,
+        resolve(
+            std.testing.allocator,
+            .{
+                .adapter = .{
+                    .name = "Test.Bad.Manager",
+                    .primitive_source_path = "project:src/memory/bad/manager.zig",
+                    .capability_mask = 0,
+                    .refcount_v1 = true,
+                },
+                .source_roots = &.{},
+                .project_root = ".",
+                .zap_source_root = ".",
+                .cache_dir = "/tmp/zap-driver-test-bad-adapter",
+            },
+            &diag,
+        ),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, diag.text(), "capability_mask") != null);
 }
 
 test "validateSection accepts a minimal NoOp-style section" {
@@ -2173,278 +1799,15 @@ fn mockForkCompileNoOpMacho(
     return .Ok;
 }
 
-test "Phase 5 integration: ARC manager resolves via the first-party short-circuit (no .o emitted)" {
-    // Phase 5 short-circuit: first-party managers skip the external
-    // compile + `.zapmem` parse path entirely. The runtime's embedded
-    // `@import("zap_active_manager")` (registered per user binary in
-    // Phase 3) becomes the sole source of the manager's symbols
-    // including `zap_memory_section`. This test pins the contract:
-    // a first-party build does NOT produce a manager `.o` (the
-    // duplicate-symbol link error from a paired runtime-embed +
-    // sibling-link would otherwise reappear), and the resolved caps
-    // come from the comptime caps table rather than the section
-    // parse.
-    //
-    // The fork_compile_fn is intentionally omitted — a regression
-    // that lost the short-circuit would call the default fork (null
-    // in test builds) and fail with `InternalError`. The absence of
-    // a mock here doubles as a stress test for the short-circuit:
-    // any pre-section-parse code path that touches the fork would
-    // surface immediately.
-    const allocator = std.testing.allocator;
-
-    var diag_buf: [1024]u8 = undefined;
-    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-
-    var resolved = try resolve(
-        allocator,
-        .{
-            .manager_name = "Memory.ARC",
-            // Source roots are irrelevant under the short-circuit —
-            // pass empty to prove the discovery walk never runs for
-            // first-party tags.
-            .source_roots = &.{},
-            .project_root = ".",
-            .zap_source_root = ".",
-            .cache_dir = "/tmp/zap-phase5-arc",
-        },
-        &diag,
-    );
-    defer freeResolved(allocator, &resolved);
-
-    try std.testing.expectEqualStrings("Memory.ARC", resolved.name);
-    // Pin the Phase 1 `builtin_tag` classification on the canonical
-    // success path. Later phases (Phase 4 comptime dispatch) branch
-    // on this — a regression that silently misclassified ARC as
-    // `.third_party` would route every ARC build through the v1.0
-    // vtable and lose the perf-recovery win.
-    try std.testing.expectEqual(BuiltinManagerTag.arc, resolved.builtin_tag);
-    // Caps come from the comptime table, not the section parse.
-    try std.testing.expectEqual(abi.REFCOUNT_V1_BIT, resolved.declared_caps);
-    // No external `.o` was compiled — the manager's symbols are
-    // emitted by the runtime translation unit's
-    // `@import("zap_active_manager")` instead.
-    try std.testing.expectEqual(@as(?[]const u8, null), resolved.object_path);
-    // The abi_minor field comes from the comptime table; pin it.
-    try std.testing.expectEqual(@as(u16, 1), resolved.abi_minor);
-}
-
-// Phase 5 note: the previous `mockForkCompileArc` and
-// `mockForkCompileArcMacho` mocks (which synthesised ELF/Mach-O ARC
-// objects with a REFCOUNT_V1-declaring `.zapmem` section) lived here.
-// Phase 5's first-party short-circuit makes the fork never run for
-// `Memory.ARC`, so the mocks have no callers and were removed.
-// Mach-O parity for the section parser + symbol-table inspector is
-// preserved on the THIRD-PARTY path — the `Phase 5 integration:
-// third-party manager exercises the external compile + section parse
-// path (Mach-O)` test below drives the Mach-O code path with the
-// `mockForkCompileNoOpMacho` synthesiser, so removing the ARC-specific
-// Mach-O mock does not reduce Mach-O coverage.
-
-test "Phase 5 integration: NoOp manager resolves via the first-party short-circuit (no .o emitted)" {
-    // NoOp sibling of the ARC short-circuit test. Pins the contract
-    // for the zero-capability first-party manager: caps come from
-    // `builtinManagerDeclaredCaps(.no_op) = 0`, no `.o` is produced,
-    // and the source roots are never walked. NoOp is the simplest
-    // first-party manager — its allocate slot returns null — so any
-    // codegen-elision regression that needed `declared_caps == 0` to
-    // suppress retain/release would fail this test first.
-    const allocator = std.testing.allocator;
-
-    var diag_buf: [1024]u8 = undefined;
-    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-
-    var resolved = try resolve(
-        allocator,
-        .{
-            .manager_name = "Memory.NoOp",
-            .source_roots = &.{},
-            .project_root = ".",
-            .zap_source_root = ".",
-            .cache_dir = "/tmp/zap-phase5-no-op",
-        },
-        &diag,
-    );
-    defer freeResolved(allocator, &resolved);
-
-    try std.testing.expectEqualStrings("Memory.NoOp", resolved.name);
-    // Pin the Phase 1 `builtin_tag` classification: NoOp is a canonical
-    // first-party manager and must classify as `.no_op` so future
-    // phases can dispatch to its specialised fast path.
-    try std.testing.expectEqual(BuiltinManagerTag.no_op, resolved.builtin_tag);
-    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
-    try std.testing.expectEqual(@as(?[]const u8, null), resolved.object_path);
-    try std.testing.expectEqual(@as(u16, 1), resolved.abi_minor);
-}
-
-test "Phase 5 integration: Arena manager resolves via the first-party short-circuit (no .o emitted)" {
-    // Arena sibling of the ARC and NoOp short-circuit tests. Arena
-    // is the bump-pointer first-party allocator — it declares zero
-    // capabilities, and Phase 4's comptime dispatch routes through
-    // its specialised allocate slot. Pinning the short-circuit for
-    // Arena guards against a regression that re-engaged the external
-    // compile + section parse path (which would reintroduce the
-    // duplicate-symbol link error AND cost the ~7s perf recovery).
-    //
-    // The runtime allocator behaviour is exercised by the
-    // `test_arena_manager_compile.sh` smoke test and the
-    // `real Arena manager source compiles...` system-zig test
-    // further down in this file.
-    const allocator = std.testing.allocator;
-
-    var diag_buf: [1024]u8 = undefined;
-    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-
-    var resolved = try resolve(
-        allocator,
-        .{
-            .manager_name = "Memory.Arena",
-            .source_roots = &.{},
-            .project_root = ".",
-            .zap_source_root = ".",
-            .cache_dir = "/tmp/zap-phase5-arena",
-        },
-        &diag,
-    );
-    defer freeResolved(allocator, &resolved);
-
-    try std.testing.expectEqualStrings("Memory.Arena", resolved.name);
-    // Pin the Phase 1 `builtin_tag` classification: Arena is a
-    // canonical first-party manager and must classify as `.arena` so
-    // future phases can dispatch to its bump-pointer fast path.
-    try std.testing.expectEqual(BuiltinManagerTag.arena, resolved.builtin_tag);
-    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
-    try std.testing.expectEqual(@as(?[]const u8, null), resolved.object_path);
-    try std.testing.expectEqual(@as(u16, 1), resolved.abi_minor);
-    // Arena declares no REFCOUNT_V1 capability — explicit check
-    // guards against a future regression that mistakenly turns the
-    // bit on in `builtinManagerDeclaredCaps`.
-    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps & abi.REFCOUNT_V1_BIT);
-}
-
-test "Phase 5 integration: Leak manager resolves via the first-party short-circuit (no .o emitted)" {
-    // Leak sibling of the ARC/NoOp/Arena short-circuit tests. Leak
-    // is the diagnostic leak-everything first-party manager — it
-    // declares zero capabilities and is selected for codegen-elision
-    // verification builds (a binary built under Leak should contain
-    // zero retain/release call sites; see `lib/memory/leak.zap`'s
-    // `@doc` metadata). Pinning the short-circuit for Leak guards against a
-    // regression that re-engaged the external compile path and lost
-    // both the dup-symbol fix and the perf-recovery win.
-    //
-    // The real-source contract for Leak is exercised by the
-    // `real Leak manager source compiles...` system-zig test further
-    // down in this file, which compiles `src/memory/leak/manager.zig`
-    // with `zig build-obj` and validates the produced `.zapmem`
-    // section. That test still covers any drift between the on-disk
-    // Leak source and the driver's section parser.
-    const allocator = std.testing.allocator;
-
-    var diag_buf: [1024]u8 = undefined;
-    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-
-    var resolved = try resolve(
-        allocator,
-        .{
-            .manager_name = "Memory.Leak",
-            .source_roots = &.{},
-            .project_root = ".",
-            .zap_source_root = ".",
-            .cache_dir = "/tmp/zap-phase5-leak",
-        },
-        &diag,
-    );
-    defer freeResolved(allocator, &resolved);
-
-    try std.testing.expectEqualStrings("Memory.Leak", resolved.name);
-    try std.testing.expectEqual(BuiltinManagerTag.leak, resolved.builtin_tag);
-    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
-    try std.testing.expectEqual(@as(?[]const u8, null), resolved.object_path);
-    try std.testing.expectEqual(@as(u16, 1), resolved.abi_minor);
-    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps & abi.REFCOUNT_V1_BIT);
-}
-
-test "Phase 5 integration: Tracking manager resolves via the first-party short-circuit (no .o emitted)" {
-    // Tracking sibling of the other first-party short-circuit tests.
-    // Tracking is the diagnostic canary/leak-detecting first-party
-    // manager — its bookkeeping (canary fill/check, hashmap insert/
-    // remove, leak reporting on deinit) is internal, not declared
-    // via `REFCOUNT_V1`. Pinning the short-circuit for Tracking
-    // closes the last first-party manager.
-    //
-    // The real-source contract for Tracking is exercised by the
-    // `real Tracking manager source compiles...` system-zig test
-    // further down in this file.
-    const allocator = std.testing.allocator;
-
-    var diag_buf: [1024]u8 = undefined;
-    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-
-    var resolved = try resolve(
-        allocator,
-        .{
-            .manager_name = "Memory.Tracking",
-            .source_roots = &.{},
-            .project_root = ".",
-            .zap_source_root = ".",
-            .cache_dir = "/tmp/zap-phase5-tracking",
-        },
-        &diag,
-    );
-    defer freeResolved(allocator, &resolved);
-
-    try std.testing.expectEqualStrings("Memory.Tracking", resolved.name);
-    try std.testing.expectEqual(BuiltinManagerTag.tracking, resolved.builtin_tag);
-    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
-    try std.testing.expectEqual(@as(?[]const u8, null), resolved.object_path);
-    try std.testing.expectEqual(@as(u16, 1), resolved.abi_minor);
-    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps & abi.REFCOUNT_V1_BIT);
-}
-
-test "Phase 5 integration: third-party manager exercises the external compile + section parse path (ELF)" {
-    // Third-party fixture for the section/symbol pipeline. Phase 5
-    // ripped the external compile path off the first-party tags
-    // (they now go through `builtinManagerDeclaredCaps` instead), so
-    // the only callers of `compileManagerSource` →
-    // `section_parser.extractSection` → `validateSection` →
-    // `assertExportsManagerSymbol` in production are third-party
-    // managers (e.g. a user's `My.Slab.Manager`). This test pins the
-    // contract by using a non-canonical manager name
-    // (`Test.Third.Party.Manager`) — `classifyBuiltinManager` returns
-    // `.third_party`, the short-circuit in `resolve()` is skipped, and
-    // the full discovery + compile + validate pipeline runs against
-    // a stdlib-shaped temp tree.
-    //
-    // Replaces the previous Phase 5 Arena ELF / Phase 7 Leak ELF /
-    // Phase 7 Tracking ELF integration tests, which all repeatedly
-    // exercised the same parser code under a first-party name —
-    // value the short-circuit now makes unreachable. The single
-    // third-party fixture is the load-bearing test for the parser
-    // path that production third-party builds actually exercise.
+test "Phase 2 adapters: stdlib manager resolves through generic compile validation" {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/memory") catch return error.Unexpected;
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/third_party") catch return error.Unexpected;
     tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
-
-    const stdlib_decl =
-        \\@memory_manager_source = "src/memory/third_party/manager.zig"
-        \\
-        \\pub struct Test.Third.Party.Manager {
-        \\}
-        \\
-    ;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/memory/third_party.zap", .data = stdlib_decl }) catch return error.Unexpected;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/third_party/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
 
     const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_path);
-
-    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
-    defer allocator.free(stdlib_root);
     const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
     defer allocator.free(cache_root);
 
@@ -2454,10 +1817,61 @@ test "Phase 5 integration: third-party manager exercises the external compile + 
     var resolved = try resolve(
         allocator,
         .{
-            .manager_name = "Test.Third.Party.Manager",
-            .source_roots = &.{
-                .{ .name = "zap_stdlib", .path = stdlib_root },
+            .adapter = .{
+                .name = "Memory.NoOp",
+                .primitive_source_path = "zap:src/memory/no_op/manager.zig",
+                .capability_mask = 0,
+                .refcount_v1 = false,
             },
+            .source_roots = &.{},
+            .project_root = ".",
+            .zap_source_root = ".",
+            .cache_dir = cache_root,
+            .fork_compile_fn = mockForkCompileNoOp,
+        },
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expectEqualStrings("Memory.NoOp", resolved.name);
+    try std.testing.expect(std.mem.endsWith(u8, resolved.active_manager_source_path, "src/memory/no_op/manager.zig"));
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
+    try std.testing.expectEqual(@as(u16, 0), resolved.abi_minor);
+    try std.testing.expect(!resolved.refcount_sized_extension);
+
+    const validation_object = std.fs.path.join(allocator, &.{ cache_root, "Memory_NoOp.o" }) catch return error.Unexpected;
+    defer allocator.free(validation_object);
+    std.Io.Dir.cwd().access(std.Options.debug_io, validation_object, .{}) catch return error.Unexpected;
+}
+
+test "Phase 2 adapters: project manager resolves through same ELF validation path" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/project_manager") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var resolved = try resolve(
+        allocator,
+        .{
+            .adapter = .{
+                .name = "Example.Project.Manager",
+                .primitive_source_path = "project:src/memory/project_manager/manager.zig",
+                .capability_mask = 0,
+                .refcount_v1 = false,
+            },
+            .source_roots = &.{},
             .project_root = tmp_path,
             .zap_source_root = tmp_path,
             .cache_dir = cache_root,
@@ -2467,55 +1881,23 @@ test "Phase 5 integration: third-party manager exercises the external compile + 
     );
     defer freeResolved(allocator, &resolved);
 
-    try std.testing.expectEqualStrings("Test.Third.Party.Manager", resolved.name);
-    // Third-party tag classification: the unknown manager name MUST
-    // route through the external compile path. A regression that
-    // classified an unknown name as first-party would silently skip
-    // the section parse — caught here.
-    try std.testing.expectEqual(BuiltinManagerTag.third_party, resolved.builtin_tag);
-    // Caps for third-party managers come from the section parse, not
-    // the comptime table; `mockForkCompileNoOp` synthesises a section
-    // declaring zero capabilities.
+    try std.testing.expectEqualStrings("Example.Project.Manager", resolved.name);
+    try std.testing.expect(std.mem.endsWith(u8, resolved.active_manager_source_path, "src/memory/project_manager/manager.zig"));
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
-    // Third-party path produces a real `.o` on disk — the linker
-    // splices it into the binary.
-    try std.testing.expect(resolved.object_path != null);
-    std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
 }
 
-test "Phase 5 integration: third-party manager exercises the external compile + section parse path (Mach-O)" {
-    // Mach-O sibling of the third-party ELF integration test above.
-    // The macOS dev host's production builds rely on the Mach-O
-    // section parser and symbol-table inspector; this is the only
-    // remaining test that exercises that code path end-to-end
-    // (the first-party tests now short-circuit before the parser
-    // runs). A regression that broke Mach-O `.zapmem` extraction or
-    // `_zap_memory_section` symbol-name detection would fail this
-    // test first.
+test "Phase 2 adapters: project manager resolves through same Mach-O validation path" {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/memory") catch return error.Unexpected;
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/third_party") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/project_manager") catch return error.Unexpected;
     tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
-
-    const stdlib_decl =
-        \\@memory_manager_source = "src/memory/third_party/manager.zig"
-        \\
-        \\pub struct Test.Third.Party.Manager {
-        \\}
-        \\
-    ;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/memory/third_party.zap", .data = stdlib_decl }) catch return error.Unexpected;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/third_party/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
 
     const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_path);
-
-    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
-    defer allocator.free(stdlib_root);
     const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
     defer allocator.free(cache_root);
 
@@ -2525,10 +1907,13 @@ test "Phase 5 integration: third-party manager exercises the external compile + 
     var resolved = try resolve(
         allocator,
         .{
-            .manager_name = "Test.Third.Party.Manager",
-            .source_roots = &.{
-                .{ .name = "zap_stdlib", .path = stdlib_root },
+            .adapter = .{
+                .name = "Example.Project.Manager",
+                .primitive_source_path = "project:src/memory/project_manager/manager.zig",
+                .capability_mask = 0,
+                .refcount_v1 = false,
             },
+            .source_roots = &.{},
             .project_root = tmp_path,
             .zap_source_root = tmp_path,
             .cache_dir = cache_root,
@@ -2538,11 +1923,49 @@ test "Phase 5 integration: third-party manager exercises the external compile + 
     );
     defer freeResolved(allocator, &resolved);
 
-    try std.testing.expectEqualStrings("Test.Third.Party.Manager", resolved.name);
-    try std.testing.expectEqual(BuiltinManagerTag.third_party, resolved.builtin_tag);
+    try std.testing.expectEqualStrings("Example.Project.Manager", resolved.name);
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
-    try std.testing.expect(resolved.object_path != null);
-    std.Io.Dir.cwd().access(std.Options.debug_io, resolved.object_path.?, .{}) catch return error.Unexpected;
+}
+
+test "Phase 2 adapters: adapter capability mask must match validated section" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/project_manager") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    try std.testing.expectError(
+        ResolveError.ValidationFailed,
+        resolve(
+            allocator,
+            .{
+                .adapter = .{
+                    .name = "Example.Project.Manager",
+                    .primitive_source_path = "project:src/memory/project_manager/manager.zig",
+                    .capability_mask = abi.REFCOUNT_V1_BIT,
+                    .refcount_v1 = true,
+                },
+                .source_roots = &.{},
+                .project_root = tmp_path,
+                .zap_source_root = tmp_path,
+                .cache_dir = cache_root,
+                .fork_compile_fn = mockForkCompileNoOp,
+            },
+            &diag,
+        ),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, diag.text(), "capability_mask") != null);
 }
 
 test "assertExportsManagerSymbol passes for synthesized NoOp ELF" {
@@ -2934,43 +2357,28 @@ fn mockForkCompileCaptureTarget(
     return .Ok;
 }
 
-test "resolve threads compile_target through to fork_compile_fn (third-party)" {
+test "resolve threads compile_target through to fork_compile_fn" {
     // End-to-end check: when the build supplies a cross-compile target,
     // `resolve()` must `parseTargetTriple` it and pass the resulting
     // `ZapForkTarget` to the fork primitive. Without this plumbing the
     // manager `.o` would be compiled for the host instead of the binary's
     // final target, producing a link-time mismatch on cross-builds.
     //
-    // Uses a third-party manager name so the Phase 5 short-circuit
-    // does NOT fire — the fork primitive is only ever called on the
-    // third-party path (first-party tags get their caps from the
-    // comptime table and emit symbols via the runtime translation
-    // unit's `@import("zap_active_manager")`). The target-plumbing
-    // contract therefore only needs to hold on the third-party path.
+    // The selected adapter's primitive source is compiled for validation
+    // regardless of whether it came from the stdlib, project, or a
+    // dependency, so target plumbing must be uniform across all managers.
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/memory") catch return error.Unexpected;
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/third_party") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/project_manager") catch return error.Unexpected;
     tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
-
-    const stdlib_decl =
-        \\@memory_manager_source = "src/memory/third_party/manager.zig"
-        \\
-        \\pub struct Test.Third.Party.Manager {
-        \\}
-        \\
-    ;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/memory/third_party.zap", .data = stdlib_decl }) catch return error.Unexpected;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/third_party/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
 
     const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_path);
 
-    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
-    defer allocator.free(stdlib_root);
     const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
     defer allocator.free(cache_root);
 
@@ -2983,10 +2391,13 @@ test "resolve threads compile_target through to fork_compile_fn (third-party)" {
     var resolved = try resolve(
         allocator,
         .{
-            .manager_name = "Test.Third.Party.Manager",
-            .source_roots = &.{
-                .{ .name = "zap_stdlib", .path = stdlib_root },
+            .adapter = .{
+                .name = "Example.Project.Manager",
+                .primitive_source_path = "project:src/memory/project_manager/manager.zig",
+                .capability_mask = 0,
+                .refcount_v1 = false,
             },
+            .source_roots = &.{},
             .project_root = tmp_path,
             .zap_source_root = tmp_path,
             .cache_dir = cache_root,
@@ -3019,37 +2430,23 @@ test "resolve threads compile_target through to fork_compile_fn (third-party)" {
     );
 }
 
-test "resolve passes NATIVE sentinel when compile_target is null (third-party)" {
+test "resolve passes NATIVE sentinel when compile_target is null" {
     // The complementary case: when no `target` is set, the driver passes
     // `ZAP_FORK_ARCH_NATIVE` so the manager `.o` builds for the host.
-    // Uses a third-party manager so the fork primitive actually runs
-    // (the Phase 5 short-circuit skips the fork entirely for
-    // first-party tags — see the sibling third-party plumbing test
-    // above).
+    // Uses the same adapter path as the cross-target sibling, but leaves
+    // `target` unset so the driver must pass the native sentinel.
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/memory") catch return error.Unexpected;
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/third_party") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/project_manager") catch return error.Unexpected;
     tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
-
-    const stdlib_decl =
-        \\@memory_manager_source = "src/memory/third_party/manager.zig"
-        \\
-        \\pub struct Test.Third.Party.Manager {
-        \\}
-        \\
-    ;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/memory/third_party.zap", .data = stdlib_decl }) catch return error.Unexpected;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/third_party/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
 
     const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_path);
 
-    const stdlib_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
-    defer allocator.free(stdlib_root);
     const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
     defer allocator.free(cache_root);
 
@@ -3061,10 +2458,13 @@ test "resolve passes NATIVE sentinel when compile_target is null (third-party)" 
     var resolved = try resolve(
         allocator,
         .{
-            .manager_name = "Test.Third.Party.Manager",
-            .source_roots = &.{
-                .{ .name = "zap_stdlib", .path = stdlib_root },
+            .adapter = .{
+                .name = "Example.Project.Manager",
+                .primitive_source_path = "project:src/memory/project_manager/manager.zig",
+                .capability_mask = 0,
+                .refcount_v1 = false,
             },
+            .source_roots = &.{},
             .project_root = tmp_path,
             .zap_source_root = tmp_path,
             .cache_dir = cache_root,
@@ -3102,32 +2502,37 @@ test "resolve passes NATIVE sentinel when compile_target is null (third-party)" 
 // the parser, validator, and the manager source itself, without any
 // shell-script choreography.
 //
-// **Skip semantics.** When the host has no `zig` on PATH (CI without
-// system zig, sandboxed environments, etc.) the spawn returns
-// `error.FileNotFound`. The tests catch that and `return
-// error.SkipZigTest` so the suite still passes on those hosts. Any
-// other failure is a real test failure.
+// **Skip semantics.** When the host has no usable system `zig` (no
+// binary on PATH, spawn forbidden by a sandbox, or a present binary
+// whose own stdlib cannot be read), the harness maps that host/toolchain
+// bootstrap failure to `error.SkipZigTest`. Once `zig build-obj` can
+// actually load its toolchain, every manager-source compile error,
+// malformed `.zapmem` section, or missing symbol remains a real test
+// failure.
 //
 // **Cost.** Each test compiles a single `std`-only Zig source file at
 // `-O ReleaseSafe`. Local measurement: ~0.3-0.6 seconds per test,
 // well under the budget for `zig build test`.
 // ---------------------------------------------------------------------------
 
-/// Skip-marker returned when the host has no working `zig` on PATH.
+/// Skip-marker returned when the host has no usable system `zig`.
 /// Reused by every system-zig probe in this file so the catch-and-skip
 /// pattern stays in one place.
 const SystemZigSkipError = error{
-    /// The system `zig` binary could not be spawned. Most commonly
-    /// `error.FileNotFound` (no `zig` on PATH) on bare CI runners.
+    /// The system `zig` binary could not be spawned or cannot read its
+    /// own stdlib. Most commonly `error.FileNotFound` on bare CI runners
+    /// or an inaccessible Zig installation inside sandboxed tests.
     SystemZigUnavailable,
 };
 
 /// Run `zig build-obj <source_abs> -O ReleaseSafe -femit-bin=<obj_abs>`
 /// and return on success. Maps the spawn-side errors that indicate
 /// "no working `zig` on this host" to `SystemZigUnavailable` so the
-/// caller can `return error.SkipZigTest`; every other failure mode
-/// (compilation error, non-zero exit, etc.) is surfaced as the
-/// underlying error and fails the test loudly.
+/// caller can `return error.SkipZigTest`. A present `zig` that exits
+/// before compiling the manager because its own stdlib cannot be read
+/// is treated the same way. Every other failure mode (manager compile
+/// error, malformed source, non-zero exit after toolchain bootstrap,
+/// etc.) is surfaced as the underlying error and fails the test loudly.
 ///
 /// Uses `std.testing.io` for the spawn — that is the threaded-IO
 /// instance the test runner sets up with a real allocator backing
@@ -3169,6 +2574,9 @@ fn invokeSystemZigBuildObj(
 
     switch (result.term) {
         .exited => |code| if (code != 0) {
+            if (isSystemZigStdlibUnavailable(result.stderr)) {
+                return SystemZigSkipError.SystemZigUnavailable;
+            }
             std.debug.print(
                 "system `zig build-obj` exited with code {d}\nstderr:\n{s}\n",
                 .{ code, result.stderr },
@@ -3183,6 +2591,34 @@ fn invokeSystemZigBuildObj(
             return error.SystemZigCompileFailed;
         },
     }
+}
+
+fn isSystemZigStdlibUnavailable(stderr: []const u8) bool {
+    const mentions_std_root =
+        std.mem.indexOf(u8, stderr, "std/std.zig") != null or
+        std.mem.indexOf(u8, stderr, "std\\std.zig") != null;
+    const unable_to_load_std = std.mem.indexOf(u8, stderr, "unable to load 'std.zig':") != null;
+    if (!mentions_std_root or !unable_to_load_std) return false;
+
+    return std.mem.indexOf(u8, stderr, "PermissionDenied") != null or
+        std.mem.indexOf(u8, stderr, "FileNotFound") != null or
+        std.mem.indexOf(u8, stderr, "NotDir") != null or
+        std.mem.indexOf(u8, stderr, "AccessDenied") != null or
+        std.mem.indexOf(u8, stderr, "InputOutput") != null;
+}
+
+test "system zig stdlib unavailable classifier recognizes inaccessible std root" {
+    const stderr =
+        "/Users/test/.asdf/installs/zig/0.16.0/lib/std/std.zig:1:1: error: unable to load 'std.zig': PermissionDenied\n";
+
+    try std.testing.expect(isSystemZigStdlibUnavailable(stderr));
+}
+
+test "system zig stdlib unavailable classifier rejects manager compile errors" {
+    const stderr =
+        "/work/src/memory/no_op/manager.zig:12:5: error: expected type 'u64', found '[]const u8'\n";
+
+    try std.testing.expect(!isSystemZigStdlibUnavailable(stderr));
 }
 
 /// Shared body for the two real-toolchain probes below. Compiles
@@ -3305,8 +2741,8 @@ test "real Arena manager source compiles and exports a valid section (system zig
 
 test "real ARC manager source compiles and exports a valid section (system zig)" {
     // Sibling of the Arena test above for the production ARC manager
-    // at `src/memory/arc/manager.zig`. ARC is the default
-    // (`DEFAULT_MANAGER`) so any drift here would break every Zap
+    // at `src/memory/arc/manager.zig`. `Zap.Manifest.memory` selects
+    // `Memory.ARC` by default, so any drift here would break every Zap
     // binary built without an explicit `memory:` selection.
     //
     // ARC declares the `REFCOUNT_V1` capability bit (0x1) in its
@@ -3352,165 +2788,83 @@ test "real Tracking manager source compiles and exports a valid section (system 
 }
 
 // ---------------------------------------------------------------------------
-// Watch-mode rebuild-path simulation tests
+// Watch-mode rebuild-path simulation tests.
 //
-// `src/main.zig`'s `IncrementalWatchState.init` (the constructor that
-// powers `zap build --watch`) re-runs `resolve()` once at watch-session
-// startup, caches the resulting `declared_caps` + `object_path`, and
-// then threads those values into every subsequent
-// `compileProjectFrontend` + `injectAndUpdate` call without
-// re-resolving. v1.0 of the Memory Manager ABI gated this constructor
-// on `REFCOUNT_V1`: any manager whose `.zapmem` section omitted the
-// bit caused `init` to print a diagnostic and return null, refusing
-// to start an incremental session. Once Phase 4.x (byte-level slab
-// pool) and Phase 6.x (codegen elision) shipped the runtime support
-// for non-REFCOUNT_V1 managers end-to-end, the refusal became overly
-// cautious and was removed (see `IncrementalWatchState.init` for the
-// post-removal docstring).
-//
-// These tests pin the post-removal contract: for every first-party
-// manager that declares zero capabilities, the `resolve()` call
-// `IncrementalWatchState.init` makes must succeed and yield the
-// values the constructor caches. A regression that re-introduces the
-// gate (or breaks the underlying resolution for non-REFCOUNT_V1
-// managers) fails the closest test below — well before a contributor
-// runs `zap build --watch` against an Arena/NoOp/Leak/Tracking
-// project and hits the cliff. Each test mirrors the constructor's
-// call sequence verbatim, including the second simulated rebuild
-// that re-uses the cached values (the pinning invariant that makes
-// the watch session safe across many `state.rebuild()` calls).
+// `src/main.zig`'s `IncrementalWatchState.init` resolves the selected
+// adapter once at watch-session startup, caches the resulting
+// `declared_caps`, `refcount_sized_extension`, and
+// `active_manager_source_path`, then threads those values into every
+// subsequent `compileProjectFrontend` + `injectAndUpdate` call without
+// re-resolving. These tests pin that cache shape for zero-capability
+// managers, which historically exercised the REFCOUNT_V1 refusal path.
 // ---------------------------------------------------------------------------
 
-/// Shared implementation for the four watch-mode rebuild-path
-/// simulation tests below. Mirrors the manager-resolution call
-/// sequence in `src/main.zig`'s `IncrementalWatchState.init` so any
-/// regression in that path (notably re-introducing the v1.0
-/// `REFCOUNT_V1`-only refusal) fails here first. The shared body
-/// keeps the per-manager tests focused on the per-manager invariants
-/// (`manager_name`, `manager_zig_relative_path`, the expected
-/// stdlib `.zap` filename) without duplicating the watch-mode
-/// scaffolding four times.
 fn simulateWatchInitForManager(
     manager_name: []const u8,
+    primitive_source_path: []const u8,
 ) !void {
     const allocator = std.testing.allocator;
 
-    // Phase 5 short-circuit: first-party managers skip the source
-    // discovery + external compile + section parse path entirely.
-    // The watch-mode helper accordingly does NOT lay out a stdlib
-    // tree or pass a `fork_compile_fn` — the short-circuit never
-    // reads either. A regression that re-engaged the external
-    // pipeline would fail when the default fork-compile resolves to
-    // null in test builds (see `resolveDefaultForkFn`).
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
 
-    // --- IncrementalWatchState.init: first `resolve()` call ---
-    //
-    // The constructor calls `resolve()` exactly once during init and
-    // caches the resolved `declared_caps` + `object_path`. v1.0 gated
-    // this call on a post-resolve REFCOUNT_V1 check. Phase 4.x + Phase
-    // 6 closed the runtime gap so non-REFCOUNT_V1 managers (Arena,
-    // NoOp, Leak, Tracking) no longer hit a watch-mode refusal.
-    // Phase 5 added the first-party short-circuit, so the resolved
-    // `object_path` is now `null` for every first-party manager — the
-    // runtime translation unit emits the manager's symbols directly
-    // and a sibling `.o` would produce a duplicate-symbol link error.
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+
     var diag_buf: [1024]u8 = undefined;
     var init_diag: DriverDiagnostic = .{ .buffer = &diag_buf };
 
     var init_resolved = try resolve(
         allocator,
         .{
-            .manager_name = manager_name,
+            .adapter = .{
+                .name = manager_name,
+                .primitive_source_path = primitive_source_path,
+                .capability_mask = 0,
+                .refcount_v1 = false,
+            },
             .source_roots = &.{},
             .project_root = ".",
             .zap_source_root = ".",
-            .cache_dir = "/tmp/zap-phase5-watch-mode",
+            .cache_dir = cache_root,
+            .fork_compile_fn = mockForkCompileNoOp,
         },
         &init_diag,
     );
     defer freeResolved(allocator, &init_resolved);
 
-    // Pin the watch-mode contract under Phase 5: every first-party
-    // non-REFCOUNT_V1 manager must resolve with `declared_caps == 0`
-    // and `object_path == null`. Phase 6 codegen elision and Phase
-    // 4.x inline-header layout both read this caps value at every
-    // `state.rebuild()` — a regression that changes either field
-    // silently breaks every watch session.
     try std.testing.expectEqualStrings(manager_name, init_resolved.name);
     try std.testing.expectEqual(@as(u64, 0), init_resolved.declared_caps);
     try std.testing.expectEqual(@as(u64, 0), init_resolved.declared_caps & abi.REFCOUNT_V1_BIT);
-    try std.testing.expectEqual(@as(?[]const u8, null), init_resolved.object_path);
+    try std.testing.expect(!init_resolved.refcount_sized_extension);
+    try std.testing.expect(init_resolved.active_manager_source_path.len > 0);
 
-    // Save the values the constructor would cache. `IncrementalWatchState`
-    // caches a `?[]const u8` for `object_path`; under the Phase 5
-    // short-circuit this is always `null` for first-party managers
-    // and the cached value is simply the absence of an external `.o`.
     const cached_caps: u64 = init_resolved.declared_caps;
-    const cached_object_path: ?[]const u8 = if (init_resolved.object_path) |op|
-        try allocator.dupe(u8, op)
-    else
-        null;
-    defer if (cached_object_path) |p| allocator.free(p);
+    const cached_refcount_sized_extension = init_resolved.refcount_sized_extension;
+    const cached_source_path = try allocator.dupe(u8, init_resolved.active_manager_source_path);
+    defer allocator.free(cached_source_path);
 
-    // --- IncrementalWatchState.rebuild: simulated second pass ---
-    //
-    // `state.rebuild()` does NOT call `resolve()` again. The cached
-    // caps + object path are reused verbatim across every rebuild —
-    // the manifest's `memory:` field is pinned for the lifetime of
-    // the watch session (the `build_zap_changed` branch in
-    // `watchAndRebuild` tears down the entire state when the manifest
-    // changes). Resolving a second time here would not reflect what
-    // the code does in production; instead, assert that the cached
-    // values are stable (still satisfy the post-removal invariants)
-    // and that the object-path side of the cache is correctly absent
-    // for first-party managers. A regression that introduced a
-    // spurious `.o` between rebuilds, or that allowed the cached caps
-    // to drift, would break every second rebuild in a watch session.
     try std.testing.expectEqual(@as(u64, 0), cached_caps);
     try std.testing.expectEqual(@as(u64, 0), cached_caps & abi.REFCOUNT_V1_BIT);
-    try std.testing.expectEqual(@as(?[]const u8, null), cached_object_path);
+    try std.testing.expect(!cached_refcount_sized_extension);
+    try std.testing.expectEqualStrings(init_resolved.active_manager_source_path, cached_source_path);
 }
 
 test "watch-mode rebuild path: Memory.Arena resolves without REFCOUNT_V1 refusal" {
-    // v1.0 of the Memory Manager ABI rejected this manager at the
-    // watch-mode entry point with the diagnostic "watch mode currently
-    // requires a REFCOUNT_V1 manager". Phase 4.x + Phase 6 closed the
-    // runtime gap; this test pins that closure so a future refactor
-    // can't quietly re-introduce the refusal for Arena projects.
-    // Phase 5 additionally pins `object_path == null` for the
-    // first-party short-circuit.
-    try simulateWatchInitForManager("Memory.Arena");
+    try simulateWatchInitForManager("Memory.Arena", "zap:src/memory/arena/manager.zig");
 }
 
 test "watch-mode rebuild path: Memory.NoOp resolves without REFCOUNT_V1 refusal" {
-    // NoOp is the simplest non-REFCOUNT_V1 manager: it declares zero
-    // capabilities and its allocate slot returns null. A program built
-    // under NoOp panics on first allocation, but the BUILD itself —
-    // and therefore the watch-mode rebuild path — must succeed
-    // unconditionally for Phase 6 codegen-elision verification builds
-    // to run.
-    try simulateWatchInitForManager("Memory.NoOp");
+    try simulateWatchInitForManager("Memory.NoOp", "zap:src/memory/no_op/manager.zig");
 }
 
 test "watch-mode rebuild path: Memory.Leak resolves without REFCOUNT_V1 refusal" {
-    // Leak is the diagnostic leak-everything manager used for codegen
-    // elision verification builds (a binary built under Leak should
-    // contain zero refcount call sites — see
-    // `lib/memory/leak.zap`'s `@doc`). Watch-mode support is
-    // required for the iteration loop where a contributor edits a
-    // `.zap` file, rebuilds under Leak, and re-inspects the elision
-    // status. The v1.0 refusal made that loop impossible without
-    // bouncing the watcher between every edit.
-    try simulateWatchInitForManager("Memory.Leak");
+    try simulateWatchInitForManager("Memory.Leak", "zap:src/memory/leak/manager.zig");
 }
 
 test "watch-mode rebuild path: Memory.Tracking resolves without REFCOUNT_V1 refusal" {
-    // Tracking is the diagnostic canary/leak-detecting manager used
-    // to validate the runtime's allocation lifecycle (see
-    // `lib/memory/tracking.zap`'s `@doc`). Like Leak it
-    // declares zero capabilities at the section level — its
-    // hash-map bookkeeping is internal, not declared via
-    // `REFCOUNT_V1` — so the watch-mode resolution path is the same
-    // shape as Leak's.
-    try simulateWatchInitForManager("Memory.Tracking");
+    try simulateWatchInitForManager("Memory.Tracking", "zap:src/memory/tracking/manager.zig");
 }

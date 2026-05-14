@@ -3,7 +3,7 @@
 
   A memory manager adapter is a Zap-level value that identifies the
   low-level primitive manager implementation selected for a binary.
-  First-party managers and third-party managers use the same protocol:
+  Stdlib managers and third-party managers use the same protocol:
   the public adapter name is user-facing, the primitive source path is
   the implementation identity consumed by the compiler/runtime bridge,
   and the capability mask declares which optional ABI extensions the
@@ -11,7 +11,7 @@
 
   The adapter is intentionally independent of `Process`: future APIs
   such as per-process manager selection can accept values that implement
-  this protocol without changing the first-party manager model.
+  this protocol without changing the adapter model.
   """
 
 pub protocol Memory.Manager {
@@ -23,11 +23,14 @@ pub protocol Memory.Manager {
   fn name(manager) -> String
 
   @doc = """
-    Returns the relative Zig primitive source path for this manager.
+    Returns the Zig primitive source reference for this manager.
 
-    The path identifies the implementation unit that exports the
-    `.zapmem` metadata section and runtime vtables. The compiler/runtime
-    bridge resolves it; ordinary Zap code should treat it as opaque
+    The reference identifies the implementation unit that exports the
+    `.zapmem` metadata section and runtime vtables. `zap:<path>` is
+    resolved relative to the Zap source tree, `project:<path>` is
+    resolved relative to the current project root, and
+    `dep:<name>:<path>` is resolved relative to the named dependency
+    source root. Ordinary Zap code should treat the value as opaque
     manager metadata.
     """
 

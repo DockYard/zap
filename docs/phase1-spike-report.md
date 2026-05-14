@@ -539,10 +539,10 @@ What Phase 2 should do, refined based on spike findings:
 
 3. **Compiler-side manager parser** — wire `src/memory/section_parser.zig`
    (kept from the spike) into the compile pipeline at the build step.
-   The natural attach point is `src/compiler.zig` or `src/builder.zig`
-   — wherever the build orchestrator sees the manifest's `memory:`
-   field today (TBD; the spec section 10 step 2 says it's the
-   `@memory_manager_source` attribute on the named struct).
+   The active implementation now resolves the manifest's `memory:`
+   adapter through the `Memory.Manager` protocol and validates the
+   adapter's primitive source reference; the earlier attribute-based
+   lookup described by the spike was not adopted.
 
 4. **Validation + diagnostic surface** — implement spec section 3.5
    validations as Phase 2 work. The diagnostics in section 10.4 form
@@ -575,7 +575,7 @@ above.
 
 * `/Users/bcardarella/projects/zap/spike/manager_v1/src/manager.zig` —
   reference no-op manager; copy this into Phase 4 as the basis for the
-  first-party `Zap.Memory.NoOp` reference and the `Zap.Memory.Arena`
+  first-party `Memory.NoOp` reference and the `Memory.Arena`
   starting point.
 * `/Users/bcardarella/projects/zap/src/memory/section_parser.zig` —
   kept after the spike. Phase 2 integrates this into the build pipeline.

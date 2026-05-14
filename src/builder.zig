@@ -20,12 +20,11 @@ pub const BuildConfig = struct {
     paths: []const []const u8 = &.{},
     deps: []const Dep = &.{},
     build_opts: std.StringHashMapUnmanaged([]const u8) = .empty,
-    /// Dotted memory-manager name parsed from the manifest's `memory:`
-    /// field. Empty when omitted; the Zap-side memory driver
-    /// (`src/memory/driver.zig`) then applies the default
-    /// `Memory.ARC`. A non-empty value names a Zap struct that
-    /// implements the `Memory.Manager` adapter contract.
-    memory_manager: ?[]const u8 = null,
+    /// Memory manager adapter metadata evaluated through the
+    /// `Memory.Manager` protocol during manifest CTFE. The compiler
+    /// driver treats this as the sole resolver input; stdlib and
+    /// project/dependency managers use the same adapter path.
+    memory_manager: ?MemoryManager = null,
     /// Test timeout in milliseconds (0 = no timeout). Zig 0.16 supports
     /// native unit test timeouts in the build system.
     test_timeout: i64 = 0,
@@ -48,6 +47,18 @@ pub const BuildConfig = struct {
 
     pub const Kind = enum { bin, lib, obj };
     pub const Optimize = enum { debug, release_safe, release_fast, release_small };
+
+    pub const MemoryManager = struct {
+        /// Public adapter name returned by `Memory.Manager.name/1`.
+        name: []const u8,
+        /// Primitive source reference returned by
+        /// `Memory.Manager.primitive_source_path/1`.
+        primitive_source_path: []const u8,
+        /// Capability mask returned by `Memory.Manager.capability_mask/1`.
+        capability_mask: u64,
+        /// Boolean projection returned by `Memory.Manager.refcount_v1?/1`.
+        refcount_v1: bool,
+    };
 
     pub const Dep = struct {
         name: []const u8,
@@ -169,10 +180,20 @@ pub fn ctfeManifestDetailed(
         return error.CtfeFailed;
     };
 
+    var config = try constValueToBuildConfig(alloc, manifest_result.value);
+    const memory_eval = try evaluateMemoryManagerAdapter(
+        alloc,
+        &interp,
+        &ctx.collector.graph,
+        &ctx.interner,
+        manifest_result.value,
+    );
+    config.memory_manager = memory_eval.manager;
+
     return .{
-        .config = try constValueToBuildConfig(alloc, manifest_result.value),
+        .config = config,
         .dependencies = manifest_result.dependencies,
-        .result_hash = manifest_result.result_hash,
+        .result_hash = hashManifestWithMemoryAdapter(manifest_result.result_hash, memory_eval.result_hash),
     };
 }
 
@@ -353,8 +374,6 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                         },
                         else => {},
                     }
-                } else if (std.mem.eql(u8, field.name, "memory")) {
-                    config.memory_manager = try parseStructRefField(alloc, field.value);
                 } else if (std.mem.eql(u8, field.name, "build_opts")) {
                     try loadBuildOpts(alloc, &config.build_opts, field.value);
                 } else if (std.mem.eql(u8, field.name, "source_url")) {
@@ -389,6 +408,148 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
         },
         else => return error.ManifestNotFound,
     }
+}
+
+const MemoryAdapterEval = struct {
+    manager: ?BuildConfig.MemoryManager,
+    result_hash: u64 = 0,
+};
+
+fn evaluateMemoryManagerAdapter(
+    alloc: std.mem.Allocator,
+    interp: *zap.ctfe.Interpreter,
+    scope_graph: *const zap.scope.ScopeGraph,
+    interner: *const zap.ast.StringInterner,
+    manifest_value: zap.ctfe.ConstValue,
+) !MemoryAdapterEval {
+    const adapter_value = findManifestField(manifest_value, "memory") orelse return .{ .manager = null };
+    const adapter_type_name = (try parseStructRefField(alloc, adapter_value)) orelse return .{ .manager = null };
+
+    try requireMemoryManagerImpl(scope_graph, interner, adapter_type_name);
+
+    const public_name_eval = try evalAdapterFunction(alloc, interp, adapter_type_name, "name", adapter_value);
+    const primitive_source_eval = try evalAdapterFunction(alloc, interp, adapter_type_name, "primitive_source_path", adapter_value);
+    const capability_mask_eval = try evalAdapterFunction(alloc, interp, adapter_type_name, "capability_mask", adapter_value);
+    const refcount_v1_eval = try evalAdapterFunction(alloc, interp, adapter_type_name, "refcount_v1?", adapter_value);
+
+    const public_name = switch (public_name_eval.value) {
+        .string => |value| try alloc.dupe(u8, value),
+        else => return error.InvalidMemoryManagerAdapter,
+    };
+    const primitive_source_path = switch (primitive_source_eval.value) {
+        .string => |value| try alloc.dupe(u8, value),
+        else => return error.InvalidMemoryManagerAdapter,
+    };
+    const capability_mask_signed = switch (capability_mask_eval.value) {
+        .int => |value| value,
+        else => return error.InvalidMemoryManagerAdapter,
+    };
+    if (capability_mask_signed < 0) return error.InvalidMemoryManagerAdapter;
+    const capability_mask: u64 = @intCast(capability_mask_signed);
+    const refcount_v1 = switch (refcount_v1_eval.value) {
+        .bool_val => |value| value,
+        else => return error.InvalidMemoryManagerAdapter,
+    };
+    if (refcount_v1 != ((capability_mask & zap.memory_abi.REFCOUNT_V1_BIT) != 0)) {
+        return error.InvalidMemoryManagerAdapter;
+    }
+
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(std.mem.asBytes(&public_name_eval.result_hash));
+    hasher.update(std.mem.asBytes(&primitive_source_eval.result_hash));
+    hasher.update(std.mem.asBytes(&capability_mask_eval.result_hash));
+    hasher.update(std.mem.asBytes(&refcount_v1_eval.result_hash));
+
+    return .{
+        .manager = .{
+            .name = public_name,
+            .primitive_source_path = primitive_source_path,
+            .capability_mask = capability_mask,
+            .refcount_v1 = refcount_v1,
+        },
+        .result_hash = hasher.final(),
+    };
+}
+
+fn requireMemoryManagerImpl(
+    scope_graph: *const zap.scope.ScopeGraph,
+    interner: *const zap.ast.StringInterner,
+    adapter_type_name: []const u8,
+) !void {
+    for (scope_graph.impls.items) |impl_entry| {
+        if (!structNameMatchesDotted(interner, impl_entry.protocol_name, "Memory.Manager")) continue;
+        if (!structNameMatchesDotted(interner, impl_entry.target_type, adapter_type_name)) continue;
+        return;
+    }
+
+    return error.InvalidMemoryManagerAdapter;
+}
+
+fn structNameMatchesDotted(
+    interner: *const zap.ast.StringInterner,
+    struct_name: zap.ast.StructName,
+    dotted_name: []const u8,
+) bool {
+    var offset: usize = 0;
+    for (struct_name.parts, 0..) |part_id, part_index| {
+        if (part_index > 0) {
+            if (offset >= dotted_name.len or dotted_name[offset] != '.') return false;
+            offset += 1;
+        }
+
+        const part = interner.get(part_id);
+        if (offset + part.len > dotted_name.len) return false;
+        if (!std.mem.eql(u8, dotted_name[offset .. offset + part.len], part)) return false;
+        offset += part.len;
+    }
+
+    return offset == dotted_name.len;
+}
+
+fn findManifestField(manifest_value: zap.ctfe.ConstValue, field_name: []const u8) ?zap.ctfe.ConstValue {
+    switch (manifest_value) {
+        .struct_val => |struct_value| {
+            for (struct_value.fields) |field| {
+                if (std.mem.eql(u8, field.name, field_name)) return field.value;
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+fn evalAdapterFunction(
+    alloc: std.mem.Allocator,
+    interp: *zap.ctfe.Interpreter,
+    adapter_type_name: []const u8,
+    method_name: []const u8,
+    adapter_value: zap.ctfe.ConstValue,
+) !zap.ctfe.CtEvalResult {
+    const function_name = try adapterFunctionName(alloc, adapter_type_name, method_name);
+    const function_id = interp.function_by_name.get(function_name) orelse return error.InvalidMemoryManagerAdapter;
+    return interp.evalAndExport(function_id, &.{adapter_value}, zap.ctfe.CapabilitySet.build) catch return error.InvalidMemoryManagerAdapter;
+}
+
+fn adapterFunctionName(
+    alloc: std.mem.Allocator,
+    adapter_type_name: []const u8,
+    method_name: []const u8,
+) ![]const u8 {
+    var prefix = std.ArrayListUnmanaged(u8).empty;
+    defer prefix.deinit(alloc);
+    for (adapter_type_name) |char| {
+        try prefix.append(alloc, if (char == '.') '_' else char);
+    }
+    const mangled_method_name = try zap.ir.mangleSymbolForZig(alloc, method_name);
+    return std.fmt.allocPrint(alloc, "{s}__{s}__1", .{ prefix.items, mangled_method_name });
+}
+
+fn hashManifestWithMemoryAdapter(manifest_hash: u64, memory_adapter_hash: u64) u64 {
+    if (memory_adapter_hash == 0) return manifest_hash;
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(std.mem.asBytes(&manifest_hash));
+    hasher.update(std.mem.asBytes(&memory_adapter_hash));
+    return hasher.final();
 }
 
 fn constValueToDocGroup(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !?BuildConfig.DocGroup {
@@ -688,33 +849,24 @@ test "constValueToBuildConfig parses deps and build opts" {
     try testing.expectEqualStrings("true", config.build_opts.get("feature_x").?);
 }
 
-test "constValueToBuildConfig parses memory: struct reference (aliases form)" {
+test "parseStructRefField parses memory: struct reference (aliases form)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const val = zap.ctfe.ConstValue{ .struct_val = .{
-        .type_name = "Zap_Manifest",
-        .fields = &.{
-            .{ .name = "name", .value = .{ .string = "app" } },
-            .{ .name = "version", .value = .{ .string = "0.1.0" } },
-            .{ .name = "kind", .value = .{ .atom = "bin" } },
-            .{ .name = "memory", .value = .{ .tuple = &.{
-                .{ .atom = "__aliases__" },
-                .{ .list = &.{} },
-                .{ .list = &.{
-                    .{ .atom = "Memory" },
-                    .{ .atom = "NoOp" },
-                } },
-            } } },
-        },
+    const val = zap.ctfe.ConstValue{ .tuple = &.{
+        .{ .atom = "__aliases__" },
+        .{ .list = &.{} },
+        .{ .list = &.{
+            .{ .atom = "Memory" },
+            .{ .atom = "NoOp" },
+        } },
     } };
 
-    const config = try constValueToBuildConfig(alloc, val);
-    try testing.expect(config.memory_manager != null);
-    try testing.expectEqualStrings("Memory.NoOp", config.memory_manager.?);
+    const parsed = (try parseStructRefField(alloc, val)) orelse return error.UnexpectedNull;
+    try testing.expectEqualStrings("Memory.NoOp", parsed);
 }
 
-test "constValueToBuildConfig parses memory: as a struct value with canonical dotted type_name" {
+test "parseStructRefField parses memory: as a struct value with canonical dotted type_name" {
     // Production CTFE always populates `struct_val.type_name` with the
     // dotted form via `ctfe.structNameToString`. This test pins that
     // contract so `parseStructRefField` can return the name verbatim
@@ -723,24 +875,15 @@ test "constValueToBuildConfig parses memory: as a struct value with canonical do
     defer arena.deinit();
     const alloc = arena.allocator();
     const val = zap.ctfe.ConstValue{ .struct_val = .{
-        .type_name = "Zap.Manifest",
-        .fields = &.{
-            .{ .name = "name", .value = .{ .string = "app" } },
-            .{ .name = "version", .value = .{ .string = "0.1.0" } },
-            .{ .name = "kind", .value = .{ .atom = "bin" } },
-            .{ .name = "memory", .value = .{ .struct_val = .{
-                .type_name = "Memory.ARC",
-                .fields = &.{},
-            } } },
-        },
+        .type_name = "Memory.ARC",
+        .fields = &.{},
     } };
 
-    const config = try constValueToBuildConfig(alloc, val);
-    try testing.expect(config.memory_manager != null);
-    try testing.expectEqualStrings("Memory.ARC", config.memory_manager.?);
+    const parsed = (try parseStructRefField(alloc, val)) orelse return error.UnexpectedNull;
+    try testing.expectEqualStrings("Memory.ARC", parsed);
 }
 
-test "ctfe manifest accepts Memory.Manager adapter values and dotted protocol dispatch" {
+test "ctfe manifest evaluates Memory.Manager adapter metadata through protocol impls" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -748,6 +891,9 @@ test "ctfe manifest accepts Memory.Manager adapter values and dotted protocol di
     const source =
         \\pub protocol Memory.Manager {
         \\  fn name(manager) -> String
+        \\  fn primitive_source_path(manager) -> String
+        \\  fn capability_mask(manager) -> i64
+        \\  fn refcount_v1?(manager) -> Bool
         \\}
         \\
         \\pub struct Memory.ARC {
@@ -757,6 +903,15 @@ test "ctfe manifest accepts Memory.Manager adapter values and dotted protocol di
         \\  pub fn name(_manager :: Memory.ARC) -> String {
         \\    "Memory.ARC"
         \\  }
+        \\  pub fn primitive_source_path(_manager :: Memory.ARC) -> String {
+        \\    "zap:src/memory/arc/manager.zig"
+        \\  }
+        \\  pub fn capability_mask(_manager :: Memory.ARC) -> i64 {
+        \\    1
+        \\  }
+        \\  pub fn refcount_v1?(_manager :: Memory.ARC) -> Bool {
+        \\    true
+        \\  }
         \\}
         \\
         \\pub struct Memory.NoOp {
@@ -765,6 +920,15 @@ test "ctfe manifest accepts Memory.Manager adapter values and dotted protocol di
         \\pub impl Memory.Manager for Memory.NoOp {
         \\  pub fn name(_manager :: Memory.NoOp) -> String {
         \\    "Memory.NoOp"
+        \\  }
+        \\  pub fn primitive_source_path(_manager :: Memory.NoOp) -> String {
+        \\    "project:src/memory/no_op/manager.zig"
+        \\  }
+        \\  pub fn capability_mask(_manager :: Memory.NoOp) -> i64 {
+        \\    0
+        \\  }
+        \\  pub fn refcount_v1?(_manager :: Memory.NoOp) -> Bool {
+        \\    false
         \\  }
         \\}
         \\
@@ -808,12 +972,171 @@ test "ctfe manifest accepts Memory.Manager adapter values and dotted protocol di
     } };
 
     const manifest_result = try interp.evalAndExport(manifest_id, &.{env_const}, zap.ctfe.CapabilitySet.build);
-    const config = try constValueToBuildConfig(alloc, manifest_result.value);
+    var config = try constValueToBuildConfig(alloc, manifest_result.value);
+    const memory_eval = try evaluateMemoryManagerAdapter(
+        alloc,
+        &interp,
+        &ctx.collector.graph,
+        &ctx.interner,
+        manifest_result.value,
+    );
+    config.memory_manager = memory_eval.manager;
 
     try testing.expectEqualStrings("Memory.NoOp", config.name);
     try testing.expectEqualStrings("Memory.NoOp", config.version);
     try testing.expect(config.memory_manager != null);
-    try testing.expectEqualStrings("Memory.NoOp", config.memory_manager.?);
+    try testing.expectEqualStrings("Memory.NoOp", config.memory_manager.?.name);
+    try testing.expectEqualStrings("project:src/memory/no_op/manager.zig", config.memory_manager.?.primitive_source_path);
+    try testing.expectEqual(@as(u64, 0), config.memory_manager.?.capability_mask);
+    try testing.expect(!config.memory_manager.?.refcount_v1);
+}
+
+test "ctfe manifest rejects memory adapter methods without Memory.Manager impl" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub protocol Memory.Manager {
+        \\  fn name(manager) -> String
+        \\  fn primitive_source_path(manager) -> String
+        \\  fn capability_mask(manager) -> i64
+        \\  fn refcount_v1?(manager) -> Bool
+        \\}
+        \\
+        \\pub struct FakeManager {
+        \\  pub fn name(_manager :: FakeManager) -> String {
+        \\    "FakeManager"
+        \\  }
+        \\  pub fn primitive_source_path(_manager :: FakeManager) -> String {
+        \\    "project:src/memory/fake/manager.zig"
+        \\  }
+        \\  pub fn capability_mask(_manager :: FakeManager) -> i64 {
+        \\    0
+        \\  }
+        \\  pub fn refcount_v1?(_manager :: FakeManager) -> Bool {
+        \\    false
+        \\  }
+        \\}
+    ;
+
+    var source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "build.zap", .source = source },
+    };
+
+    var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+    const result = try compiler.compileForCtfe(alloc, &ctx, .{ .show_progress = false });
+
+    var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    defer interp.deinit();
+    interp.capabilities = zap.ctfe.CapabilitySet.build;
+
+    const manifest_value = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Manifest",
+        .fields = &.{
+            .{ .name = "memory", .value = .{ .struct_val = .{
+                .type_name = "FakeManager",
+                .fields = &.{},
+            } } },
+        },
+    } };
+    try testing.expectError(
+        error.InvalidMemoryManagerAdapter,
+        evaluateMemoryManagerAdapter(
+            alloc,
+            &interp,
+            &ctx.collector.graph,
+            &ctx.interner,
+            manifest_value,
+        ),
+    );
+}
+
+test "ctfe manifest evaluates default Memory.Manager adapter metadata when memory omitted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub protocol Memory.Manager {
+        \\  fn name(manager) -> String
+        \\  fn primitive_source_path(manager) -> String
+        \\  fn capability_mask(manager) -> i64
+        \\  fn refcount_v1?(manager) -> Bool
+        \\}
+        \\
+        \\pub struct Memory.ARC {
+        \\}
+        \\
+        \\pub impl Memory.Manager for Memory.ARC {
+        \\  pub fn name(_manager :: Memory.ARC) -> String {
+        \\    "Memory.ARC"
+        \\  }
+        \\  pub fn primitive_source_path(_manager :: Memory.ARC) -> String {
+        \\    "zap:src/memory/arc/manager.zig"
+        \\  }
+        \\  pub fn capability_mask(_manager :: Memory.ARC) -> i64 {
+        \\    1
+        \\  }
+        \\  pub fn refcount_v1?(_manager :: Memory.ARC) -> Bool {
+        \\    true
+        \\  }
+        \\}
+        \\
+        \\pub struct Zap.Env {
+        \\}
+        \\
+        \\pub struct Zap.Manifest {
+        \\  name :: String
+        \\  version :: String
+        \\  kind :: Atom
+        \\  memory :: Memory.Manager = Memory.ARC
+        \\}
+        \\
+        \\pub struct App.Builder {
+        \\  pub fn manifest(_env :: Zap.Env) -> Zap.Manifest {
+        \\    %Zap.Manifest{
+        \\      name: "app",
+        \\      version: "0.1.0",
+        \\      kind: :bin
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "build.zap", .source = source },
+    };
+
+    var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+    const result = try compiler.compileForCtfe(alloc, &ctx, .{ .show_progress = false });
+
+    var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    defer interp.deinit();
+    interp.capabilities = zap.ctfe.CapabilitySet.build;
+
+    const manifest_id = findManifestFunction(&result.ir_program) orelse return error.ManifestNotFound;
+    const env_const = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Env",
+        .fields = &.{},
+    } };
+
+    const manifest_result = try interp.evalAndExport(manifest_id, &.{env_const}, zap.ctfe.CapabilitySet.build);
+    var config = try constValueToBuildConfig(alloc, manifest_result.value);
+    const memory_eval = try evaluateMemoryManagerAdapter(
+        alloc,
+        &interp,
+        &ctx.collector.graph,
+        &ctx.interner,
+        manifest_result.value,
+    );
+    config.memory_manager = memory_eval.manager;
+
+    try testing.expect(config.memory_manager != null);
+    try testing.expectEqualStrings("Memory.ARC", config.memory_manager.?.name);
+    try testing.expectEqualStrings("zap:src/memory/arc/manager.zig", config.memory_manager.?.primitive_source_path);
+    try testing.expectEqual(@as(u64, 1), config.memory_manager.?.capability_mask);
+    try testing.expect(config.memory_manager.?.refcount_v1);
 }
 
 test "parseStructRefField preserves underscores in struct names" {
@@ -847,5 +1170,5 @@ test "constValueToBuildConfig leaves memory: null when omitted" {
     } };
 
     const config = try constValueToBuildConfig(alloc, val);
-    try testing.expectEqual(@as(?[]const u8, null), config.memory_manager);
+    try testing.expectEqual(@as(?BuildConfig.MemoryManager, null), config.memory_manager);
 }

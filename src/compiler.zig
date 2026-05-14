@@ -14,154 +14,6 @@ const ast = zap.ast;
 const runtime_source = @embedFile("runtime.zig");
 const lexer = @import("lexer.zig");
 
-// ---------------------------------------------------------------------------
-// Phase 2 — first-party memory manager source embedding.
-//
-// Each first-party manager's `.zig` source is embedded into the compiler
-// binary so later phases (3+) can emit it as a sibling Zig module named
-// `zap_active_manager` alongside the user binary's runtime. The runtime's
-// comptime-dispatched `retain`/`release` call sites then resolve through
-// the manager's hot paths in the same compilation unit, which is the
-// precondition for LLVM to inline across the boundary (the original
-// reason every Zap binary linked the manager as a separate object file
-// and lost the inline opportunity).
-//
-// Symmetry obligation — the set of `@embedFile` declarations below MUST
-// remain in 1:1 correspondence with the first-party cases of
-// `BuiltinManagerTag` in `src/memory/driver.zig`. Adding a sixth
-// first-party manager means landing the manager's `.zap` stdlib decl,
-// its `BuiltinManagerTag` case, its classifier arm, its `manager.zig`
-// Zig source, AND a new `@embedFile` here plus a new arm in
-// `getBuiltinManagerSource`'s switch. The comptime assertion below
-// fires if the enum's case count drifts away from the switch.
-const arc_manager_source = @embedFile("memory/arc/manager.zig");
-const arena_manager_source = @embedFile("memory/arena/manager.zig");
-const no_op_manager_source = @embedFile("memory/no_op/manager.zig");
-const leak_manager_source = @embedFile("memory/leak/manager.zig");
-const tracking_manager_source = @embedFile("memory/tracking/manager.zig");
-
-/// Return the embedded Zig source bytes for a first-party memory
-/// manager identified by its `BuiltinManagerTag`, or `null` for the
-/// `.third_party` sentinel.
-///
-/// The returned slice is a borrowed view into the compiler binary's
-/// read-only data section (every byte came from `@embedFile` at
-/// compile time), so the call is zero-cost and the slice is valid for
-/// the full process lifetime — callers do not need to free it.
-///
-/// Why this exists — Phase 1 introduced `BuiltinManagerTag` so the
-/// compiler can identify which first-party manager a build resolved
-/// to. Phase 2 (this accessor) gives the rest of the pipeline a
-/// byte-stable handle on the manager's Zig source keyed by that tag.
-/// Phase 3 will emit the returned bytes as a sibling module so the
-/// runtime's comptime dispatch sites can be inlined through to the
-/// manager's hot paths — eliminating the cross-object-file boundary
-/// that currently blocks LLVM inlining and motivated the
-/// perf-recovery effort.
-///
-/// `.third_party` is the explicit non-built-in sentinel:
-/// third-party managers ship their `.zig` source through the build
-/// manifest, not the compiler binary, so the embedded-source surface
-/// is intentionally first-party-only. The build pipeline must
-/// consult the manifest for `.third_party` instead of this accessor.
-pub fn getBuiltinManagerSource(tag: zap.memory_driver.BuiltinManagerTag) ?[]const u8 {
-    return switch (tag) {
-        .arc => arc_manager_source,
-        .arena => arena_manager_source,
-        .no_op => no_op_manager_source,
-        .leak => leak_manager_source,
-        .tracking => tracking_manager_source,
-        .third_party => null,
-    };
-}
-
-/// Return the canonical Zig-module import name under which the
-/// active first-party manager's embedded source is registered, or
-/// `null` for `.third_party`.
-///
-/// Why one shared name — only one first-party manager is active per
-/// build, so the runtime's `@import("zap_active_manager")` resolves
-/// to whichever first-party manager Phase 3 registered for this
-/// compile. Returning a per-tag name (e.g., `"zap_active_manager_arc"`)
-/// would force the runtime to encode a conditional import surface
-/// per tag, which defeats the goal of letting LLVM see a single
-/// call-graph through the active manager's hot paths. A uniform
-/// name keeps the runtime source identical across first-party
-/// builds and isolates the manager swap to module-registration
-/// time.
-///
-/// `.third_party` returns `null` because the manifest, not the
-/// compiler, names the third-party module — the runtime does not
-/// `@import("zap_active_manager")` under a third-party manager;
-/// it links the manager's object file the way it does today.
-pub fn managerSourceUnitName(tag: zap.memory_driver.BuiltinManagerTag) ?[]const u8 {
-    return switch (tag) {
-        .arc, .arena, .no_op, .leak, .tracking => "zap_active_manager",
-        .third_party => null,
-    };
-}
-
-// Compile-time guard for the symmetry obligation documented above:
-// `getBuiltinManagerSource`'s switch hard-codes one arm per
-// first-party tag plus the explicit `.third_party` arm, so any change
-// to `BuiltinManagerTag`'s shape (adding, removing, or renaming a
-// case) MUST be accompanied by a matching change here. Bumping the
-// expected count without updating the switch — or vice versa — will
-// fail the build at this site instead of silently degrading a new
-// first-party manager to a missing-arm runtime crash. This assertion
-// is intentionally separate from the one in `src/memory/driver.zig`:
-// that one protects the classifier; this one protects the embedded-
-// source switch. Both must stay green.
-comptime {
-    const fields = @typeInfo(zap.memory_driver.BuiltinManagerTag).@"enum".fields;
-    if (fields.len != 6) @compileError(
-        "getBuiltinManagerSource and managerSourceUnitName: switches must be updated when adding a BuiltinManagerTag case; also add a matching @embedFile constant",
-    );
-}
-
-/// Stub registered as `zap_active_manager` when the build selects a
-/// third-party memory manager. The runtime's `.third_party` comptime
-/// branch never references symbols from this module; it routes through
-/// the manager `.o`'s `.zapmem`-registered vtable instead. This stub
-/// exists solely so the runtime's top-level
-/// `@import("zap_active_manager")` resolves cleanly under every
-/// user-binary build, regardless of which manager the manifest
-/// selected.
-///
-/// The bytes MUST parse as valid Zig — they are handed straight to
-/// `zir_compilation_add_struct_source`, which feeds them to the Zig
-/// compiler's parser. A regression that emits non-Zig text (or empty
-/// bytes) would surface as a Sema parse error during every
-/// third-party user-binary build.
-const THIRD_PARTY_ACTIVE_MANAGER_STUB = @embedFile("zap_active_manager_stub.zig");
-
-/// Return the Zig source bytes to register as the user binary's
-/// `zap_active_manager` module. For first-party tags this is the
-/// active manager's embedded `manager.zig` source (Phase 4's comptime
-/// branches in `runtime.zig` call into it directly so LLVM can inline
-/// across the boundary, which is the whole motivation behind Phases
-/// 3-5 of the perf-recovery plan). For `.third_party` it is the
-/// minimal `THIRD_PARTY_ACTIVE_MANAGER_STUB`; the runtime's
-/// `.third_party` branch never references the stub's symbols, so the
-/// stub only needs to be valid Zig for parsing/registration purposes.
-///
-/// Non-nullable return: every user-binary build MUST register
-/// `zap_active_manager` (the runtime's top-level
-/// `@import("zap_active_manager")` would otherwise fail to resolve,
-/// failing every Zap user binary's compile). Returning a sentinel
-/// instead of a nullable value forces the caller to wire the bytes
-/// through end-to-end. The returned slice is a borrowed view into the
-/// compiler binary's read-only data (either an `@embedFile` blob or
-/// the constant stub literal above), so the call is zero-cost and the
-/// slice is valid for the full process lifetime — callers do not need
-/// to free it.
-pub fn getActiveManagerSourceBytes(tag: zap.memory_driver.BuiltinManagerTag) []const u8 {
-    return switch (tag) {
-        .arc, .arena, .no_op, .leak, .tracking => getBuiltinManagerSource(tag).?,
-        .third_party => THIRD_PARTY_ACTIVE_MANAGER_STUB,
-    };
-}
-
 /// Per-stage timing diagnostic. Gated by `ZAP_PROFILE`: production builds
 /// stay quiet, but `ZAP_PROFILE=1 zap test` (or any compile-driving
 /// command) emits `[stage NAME] ms=N` lines so a regression hunt can
@@ -3291,7 +3143,7 @@ pub fn validateOneStructPerFile(
 
 /// Get the embedded runtime source, applying the toolchain's
 /// compile-time rewrites that should affect every Zap user binary it
-/// produces. Five independent rewrites layer here, in order:
+/// produces. Six independent rewrites layer here, in order:
 ///
 ///   1. The Phase A Map workload instrumentation flag
 ///      (`INSTRUMENT_MAP_DEFAULT`). Flipped on when the host compiler
@@ -3302,19 +3154,20 @@ pub fn validateOneStructPerFile(
 ///      `runtime.refcount_v1_active` resolve correctly without
 ///      pulling in `@import("root")` (the user binary's root has no
 ///      such override).
-///   3. The Phase 3 active-manager identity tag
-///      (`RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT`). Rewritten with the
-///      resolved manager's `builtin_tag` so Phase 4's comptime
-///      branches in `runtime.zig` see the right case at compile time;
-///      a first-party manager build then resolves through
-///      `@import("zap_active_manager")` directly (LLVM-inlineable),
-///      while a `.third_party` build routes through the vtable.
-///   4. The ARC stats collection flag (`COLLECT_ARC_STATS_DEFAULT`).
+///   3. The active-manager source binding marker
+///      (`RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT`). Rewritten to true
+///      for user binaries after the driver resolves the selected
+///      `Memory.Manager` adapter and registers its primitive Zig source
+///      as `zap_active_manager`.
+///   4. The REFCOUNT_V1 v1.1 sized-extension marker
+///      (`RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT`). Rewritten from
+///      the selected manager's validated `.zapmem` descriptor surface.
+///   5. The ARC stats collection flag (`COLLECT_ARC_STATS_DEFAULT`).
 ///      Rewritten to `true` only for builds that explicitly request
 ///      counter collection. `ZAP_ARC_STATS=1` remains a runtime output
 ///      trigger; it does not enable counter increments after this
 ///      compile-time flag has elided them.
-///   5. The Phase 7e entry-startup guarantee
+///   6. The Phase 7e entry-startup guarantee
 ///      (`RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT`). Rewritten to
 ///      `true` only for executable binary outputs because the final
 ///      artifact has a generated entry boundary where the ZIR backend
@@ -3326,9 +3179,9 @@ pub fn validateOneStructPerFile(
 ///
 /// Host tests import `runtime.zig` directly and therefore observe the
 /// source-level defaults: instrumentation follows the host build
-/// option, declared caps default to ARC, the active-manager tag
-/// defaults to `.third_party`, the startup-prologue marker stays
-/// false so lazy startup remains available, and ARC stats default to
+/// option, declared caps default to ARC, active-manager source binding
+/// defaults to unavailable, the startup-prologue marker stays false so
+/// lazy startup remains available, and ARC stats default to
 /// `builtin.is_test`.
 ///
 /// The returned slice is either a borrowed view of the embedded source
@@ -3341,17 +3194,14 @@ pub fn validateOneStructPerFile(
 /// marker; rather than relying on that, the rewrite always runs so
 /// the user-binary's runtime reflects the exact resolved value.
 ///
-/// `builtin_tag` is the resolved manager's identity classification
-/// (`.arc` / `.arena` / `.no_op` / `.leak` / `.tracking` for the
-/// first-party managers, `.third_party` for everything else). The
-/// rewrite always runs so the third-party path is self-validating
-/// (a no-op rewrite for `.third_party` would silently leave a future
-/// bug in the rewrite path uncaught on third-party builds).
+/// `refcount_sized_extension` is derived from the selected manager's
+/// validated REFCOUNT_V1 capability descriptor, not from any manager
+/// name table.
 pub fn getRuntimeSource(
     declared_caps: u64,
-    builtin_tag: zap.memory_driver.BuiltinManagerTag,
+    refcount_sized_extension: bool,
 ) []const u8 {
-    return getRuntimeSourceForRuntimeControls(declared_caps, builtin_tag, .{
+    return getRuntimeSourceForRuntimeControls(declared_caps, refcount_sized_extension, .{
         .memory_startup_prologue_emitted = true,
         .collect_arc_stats = false,
     });
@@ -3377,10 +3227,10 @@ pub const RuntimeSourceControls = struct {
 /// dispatchers retain the lazy startup fallback.
 pub fn getRuntimeSourceForEntryShape(
     declared_caps: u64,
-    builtin_tag: zap.memory_driver.BuiltinManagerTag,
+    refcount_sized_extension: bool,
     memory_startup_prologue_emitted: bool,
 ) []const u8 {
-    return getRuntimeSourceForRuntimeControls(declared_caps, builtin_tag, .{
+    return getRuntimeSourceForRuntimeControls(declared_caps, refcount_sized_extension, .{
         .memory_startup_prologue_emitted = memory_startup_prologue_emitted,
         .collect_arc_stats = false,
     });
@@ -3388,14 +3238,14 @@ pub fn getRuntimeSourceForEntryShape(
 
 pub fn getRuntimeSourceForRuntimeControls(
     declared_caps: u64,
-    builtin_tag: zap.memory_driver.BuiltinManagerTag,
+    refcount_sized_extension: bool,
     controls: RuntimeSourceControls,
 ) []const u8 {
     const instrumented = @import("build_options").instrument_map;
     return rewriteRuntimeSource(.{
         .instrumented = instrumented,
         .declared_caps = declared_caps,
-        .builtin_tag = builtin_tag,
+        .refcount_sized_extension = refcount_sized_extension,
         .memory_startup_prologue_emitted = controls.memory_startup_prologue_emitted,
         .collect_arc_stats = controls.collect_arc_stats,
     });
@@ -3404,7 +3254,7 @@ pub fn getRuntimeSourceForRuntimeControls(
 const RuntimeRewrite = struct {
     instrumented: bool,
     declared_caps: u64,
-    builtin_tag: zap.memory_driver.BuiltinManagerTag,
+    refcount_sized_extension: bool,
     memory_startup_prologue_emitted: bool,
     collect_arc_stats: bool,
 };
@@ -3422,13 +3272,11 @@ var rewritten_runtime_cache: std.AutoHashMapUnmanaged(u128, []const u8) = .empty
 ///   * bit   64    — `instrumented` (Map workload instrumentation flag).
 ///   * bit   65    — `memory_startup_prologue_emitted`.
 ///   * bit   66    — `collect_arc_stats`.
-///   * bits 67..71 — reserved for future single-bit rewrite flags.
-///   * bits 72..79 — `builtin_tag` ordinal (u8; the enum is declared
-///                  `enum(u8)` in `runtime.zig`'s `ActiveManagerTag`
-///                  and mirrored unannotated here via `@intFromEnum`).
+///   * bit   67    — `refcount_sized_extension`.
+///   * bits 68..127 — reserved for future rewrite flags.
 ///
-/// The (instrumented, declared_caps, builtin_tag, startup-prologue,
-/// ARC-stats) tuple must produce a unique key — two builds that
+/// The (instrumented, declared_caps, refcount_sized_extension,
+/// startup-prologue, ARC-stats) tuple must produce a unique key — two builds that
 /// differ in any one field MUST alias to two distinct cache entries,
 /// otherwise the second build's rewrite would silently inject the
 /// first build's source.
@@ -3437,8 +3285,7 @@ fn rewriteCacheKey(req: RuntimeRewrite) u128 {
     if (req.instrumented) key |= (@as(u128, 1) << 64);
     if (req.memory_startup_prologue_emitted) key |= (@as(u128, 1) << 65);
     if (req.collect_arc_stats) key |= (@as(u128, 1) << 66);
-    const tag_ordinal: u128 = @intFromEnum(req.builtin_tag);
-    key |= (tag_ordinal << 72);
+    if (req.refcount_sized_extension) key |= (@as(u128, 1) << 67);
     return key;
 }
 
@@ -3497,41 +3344,50 @@ fn rewriteRuntimeSource(req: RuntimeRewrite) []const u8 {
         std.heap.page_allocator.free(@constCast(staged));
     }
 
-    // Stage 3: active-manager identity marker rewrite. The source-level
-    // default is `.third_party` so the host test suite (which loads
-    // `runtime.zig` as a Zig module without going through this
-    // rewrite) naturally exercises the vtable path — the same path a
-    // third-party-manager build follows. For every Zap user binary we
-    // always rewrite (even on `.third_party` builds, which re-encode
-    // the same value) so the rewrite path is self-validating end-to-end.
-    const tag_needle = "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .third_party;";
-    const tag_name = activeManagerTagName(req.builtin_tag);
-    var tag_replacement_buf: [128]u8 = undefined;
-    const tag_replacement = std.fmt.bufPrint(
-        &tag_replacement_buf,
-        "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .{s};",
-        .{tag_name},
-    ) catch @panic("runtime active-manager-tag rewrite: formatted replacement overflows fixed buffer");
-    const tag_idx = std.mem.indexOf(u8, caps_buf, tag_needle) orelse {
-        @panic("runtime.zig is missing the RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT marker; Phase 3 tag rewrite cannot proceed");
+    // Stage 3: source-manager binding marker rewrite. User binaries
+    // always register the selected manager source as `zap_active_manager`;
+    // host tests keep the source-level false marker and bind the
+    // test-only ARC fallback through the vtable path.
+    const source_needle = "const RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT: bool = false;";
+    const source_replacement = "const RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT: bool = true;";
+    const source_idx = std.mem.indexOf(u8, caps_buf, source_needle) orelse {
+        @panic("runtime.zig is missing the RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT marker; source-binding rewrite cannot proceed");
     };
-    const tag_total_len = caps_buf.len - tag_needle.len + tag_replacement.len;
-    var tag_buf = std.heap.page_allocator.alloc(u8, tag_total_len) catch
-        @panic("out of memory rewriting runtime source for active-manager tag");
-    @memcpy(tag_buf[0..tag_idx], caps_buf[0..tag_idx]);
-    @memcpy(tag_buf[tag_idx .. tag_idx + tag_replacement.len], tag_replacement);
-    @memcpy(tag_buf[tag_idx + tag_replacement.len ..], caps_buf[tag_idx + tag_needle.len ..]);
+    const source_total_len = caps_buf.len - source_needle.len + source_replacement.len;
+    var source_buf = std.heap.page_allocator.alloc(u8, source_total_len) catch
+        @panic("out of memory rewriting runtime source for source-manager binding");
+    @memcpy(source_buf[0..source_idx], caps_buf[0..source_idx]);
+    @memcpy(source_buf[source_idx .. source_idx + source_replacement.len], source_replacement);
+    @memcpy(source_buf[source_idx + source_replacement.len ..], caps_buf[source_idx + source_needle.len ..]);
 
-    // Stage-2's buffer is no longer needed once stage-3 produces its
-    // own owned copy. Free it back to the page allocator so we don't
-    // leak per (instrumented, caps, tag) shape triple.
     std.heap.page_allocator.free(caps_buf);
 
-    // Stage 4: ARC stats collection marker rewrite. Runtime
+    // Stage 4: REFCOUNT_V1 v1.1 sized-extension marker rewrite. The
+    // build driver derives this from the validated `.zapmem`
+    // descriptor size for every manager through the same object
+    // validation path.
+    const sized_needle = "const RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT: bool = true;";
+    const sized_replacement = if (req.refcount_sized_extension)
+        "const RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT: bool = true;"
+    else
+        "const RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT: bool = false;";
+    const sized_idx = std.mem.indexOf(u8, source_buf, sized_needle) orelse {
+        @panic("runtime.zig is missing the RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT marker; sized-extension rewrite cannot proceed");
+    };
+    const sized_total_len = source_buf.len - sized_needle.len + sized_replacement.len;
+    var sized_buf = std.heap.page_allocator.alloc(u8, sized_total_len) catch
+        @panic("out of memory rewriting runtime source for REFCOUNT_V1 sized extension");
+    @memcpy(sized_buf[0..sized_idx], source_buf[0..sized_idx]);
+    @memcpy(sized_buf[sized_idx .. sized_idx + sized_replacement.len], sized_replacement);
+    @memcpy(sized_buf[sized_idx + sized_replacement.len ..], source_buf[sized_idx + sized_needle.len ..]);
+
+    std.heap.page_allocator.free(source_buf);
+
+    // Stage 5: ARC stats collection marker rewrite. Runtime
     // `ZAP_ARC_STATS=1` controls the stderr dump only; this
     // compile-time marker controls whether the counter stores exist
     // in the generated binary at all.
-    var final_buf: []u8 = tag_buf;
+    var final_buf: []u8 = sized_buf;
     if (req.collect_arc_stats) {
         const stats_needle = "const COLLECT_ARC_STATS_DEFAULT: bool = builtin.is_test;";
         const stats_replacement = "const COLLECT_ARC_STATS_DEFAULT: bool = true;";
@@ -3548,7 +3404,7 @@ fn rewriteRuntimeSource(req: RuntimeRewrite) []const u8 {
         final_buf = stats_buf;
     }
 
-    // Stage 5: entry-startup prologue marker rewrite. Only generated
+    // Stage 6: entry-startup prologue marker rewrite. Only generated
     // executable binary outputs set this true: the final artifact has
     // an entry boundary where the ZIR backend emits an explicit call
     // to `memoryStartupForEntry()`. Host tests, libraries, objects,
@@ -3574,77 +3430,6 @@ fn rewriteRuntimeSource(req: RuntimeRewrite) []const u8 {
     rewritten_runtime_cache.put(std.heap.page_allocator, key, final_buf) catch
         @panic("out of memory caching rewritten runtime source");
     return final_buf;
-}
-
-/// Map a `BuiltinManagerTag` to its lowercase identifier as it appears
-/// in the runtime's `ActiveManagerTag` enum source. The names MUST
-/// match `runtime.zig`'s enum-field identifiers verbatim because the
-/// Phase 3 marker rewrite splices the result directly into Zig source
-/// at the `.<name>` literal — a mismatch would compile but bind the
-/// runtime to the wrong arm at every user-binary build. Kept in
-/// lock-step with `runtime.zig:ActiveManagerTag` via the comptime
-/// exhaustiveness assert directly below.
-fn activeManagerTagName(tag: zap.memory_driver.BuiltinManagerTag) []const u8 {
-    return switch (tag) {
-        .arc => "arc",
-        .arena => "arena",
-        .no_op => "no_op",
-        .leak => "leak",
-        .tracking => "tracking",
-        .third_party => "third_party",
-    };
-}
-
-// Compile-time guard for the symmetry obligation between
-// `activeManagerTagName`'s switch and `BuiltinManagerTag`'s shape.
-// The Phase 3 tag-marker rewrite treats the tag as a closed set; a
-// silent shape drift would surface as a Sema parse error at every
-// user-binary build (the rewritten `.<missing_name>` literal would
-// not be a valid `ActiveManagerTag` field), so we fail the build at
-// this site instead.
-comptime {
-    const fields = @typeInfo(zap.memory_driver.BuiltinManagerTag).@"enum".fields;
-    if (fields.len != 6) @compileError(
-        "activeManagerTagName: switch must be updated when adding a BuiltinManagerTag case",
-    );
-}
-
-// Phase 3 — ordinal-pair tripwire pinning `runtime.zig`'s
-// `ActiveManagerTag(enum(u8))` ordinals to `driver.zig`'s
-// `BuiltinManagerTag` ordinals.
-//
-// The runtime enum cannot be referenced from this site because
-// `runtime.zig` is `@embedFile`'d into the compiler (it is a source
-// blob, not a Zig module in scope here). The runtime side is the
-// canonical wire encoding — the embedded source is what every Zap
-// user binary sees, with `ActiveManagerTag` declared as
-// `enum(u8) { arc = 0, arena = 1, no_op = 2, leak = 3, tracking = 4, third_party = 5 }`.
-// `BuiltinManagerTag` must agree on every (name, ordinal) pair so
-// that the `@intFromEnum` value packed into `rewriteCacheKey`'s
-// `bits 72..79` slot resolves to the same comptime arm at every
-// user-binary build.
-//
-// Adding a case to either enum without matching the other (in name,
-// position, AND ordinal) breaks the wire encoding. This block fails
-// the build before that drift can ship.
-comptime {
-    const DriverTag = zap.memory_driver.BuiltinManagerTag;
-    const expected = [_]struct { name: []const u8, ord: u8 }{
-        .{ .name = "arc", .ord = 0 },
-        .{ .name = "arena", .ord = 1 },
-        .{ .name = "no_op", .ord = 2 },
-        .{ .name = "leak", .ord = 3 },
-        .{ .name = "tracking", .ord = 4 },
-        .{ .name = "third_party", .ord = 5 },
-    };
-    for (expected) |e| {
-        const driver_field = @field(DriverTag, e.name);
-        if (@intFromEnum(driver_field) != e.ord) @compileError(
-            "Phase 3: BuiltinManagerTag ordinals drifted from runtime.zig's ActiveManagerTag — " ++
-                "both enums must agree on (name, ordinal) because the runtime's enum(u8) " ++
-                "wire encoding is consumed by `rewriteCacheKey` via @intFromEnum.",
-        );
-    }
 }
 
 // ============================================================
@@ -5484,79 +5269,54 @@ test "staged macro provider rejects direct underscore-prefixed call before compi
     );
 }
 
-test "Phase 6: getRuntimeSource rewrites RUNTIME_DECLARED_CAPS_DEFAULT for REFCOUNT_V1" {
-    // User binaries built against a REFCOUNT_V1 manager (Memory.ARC)
-    // see the same `runtime.refcount_v1_active = true` shape the host
-    // tests see — the rewrite path is exercised even when the source-
-    // level default already encodes the right value, so a drift in
-    // the default value cannot mask a rewrite-path bug.
-    const arc_caps: u64 = 0x0000_0000_0000_0001;
-    const src = getRuntimeSource(arc_caps, .arc);
-    // The rewritten source must contain the resolved caps literal.
-    const expected = "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x1;";
-    try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
-    // And must NOT still carry the source-level default (the original
-    // literal would short-circuit the runtime's comptime caps query
-    // and the rewrite would be silently no-op).
-    const original = "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x0000_0000_0000_0001;";
-    try std.testing.expect(std.mem.indexOf(u8, src, original) == null);
+test "Phase 2 memory adapters: getRuntimeSource rewrites REFCOUNT_V1 caps" {
+    const src = getRuntimeSource(0x1, true);
+
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x0000_0000_0000_0001;") == null);
 }
 
-test "Phase 6: getRuntimeSource rewrites RUNTIME_DECLARED_CAPS_DEFAULT to 0 under Arena/NoOp" {
-    // Arena and NoOp managers declare zero capabilities. The rewrite
-    // must produce a runtime source whose embedded
-    // `RUNTIME_DECLARED_CAPS_DEFAULT == 0`, so the user-binary
-    // runtime's comptime `refcount_v1_active` resolves to `false` and
-    // the inline `ArcHeader` field collapses to `@sizeOf == 0`.
-    const arena_caps: u64 = 0;
-    const src = getRuntimeSource(arena_caps, .arena);
-    const expected = "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x0;";
-    try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
+test "Phase 2 memory adapters: getRuntimeSource rewrites zero caps" {
+    const src = getRuntimeSource(0, false);
+
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT: bool = false;") != null);
 }
 
-test "Phase 6: getRuntimeSource rewrite encodes arbitrary caps bitmasks" {
-    // A hypothetical multi-capability manager would declare a
-    // bitmask with more than one bit set. The rewrite path is
-    // pure string substitution — it must reproduce whatever
-    // `declared_caps` the caller passes, verbatim as a hex literal.
+test "Phase 2 memory adapters: getRuntimeSource encodes arbitrary caps bitmasks" {
     const multi_caps: u64 = 0xDEADBEEFCAFEBABE;
-    const src = getRuntimeSource(multi_caps, .third_party);
-    const expected = "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0xdeadbeefcafebabe;";
-    try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
+    const src = getRuntimeSource(multi_caps, false);
+
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0xdeadbeefcafebabe;") != null);
+}
+
+test "Phase 2 memory adapters: getRuntimeSource enables active manager source binding" {
+    const src = getRuntimeSource(0x1, true);
+
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT: bool = true;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT: bool = false;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT: bool = true;") != null);
 }
 
 test "Phase 7e: getRuntimeSource rewrites memory startup prologue marker for executable binaries" {
-    // The convenience accessor is the executable-binary shape: a
-    // generated artifact entry point owns the explicit startup
-    // prologue, so its injected runtime source must make that
-    // guarantee comptime-visible to dispatchers. Leaving the
-    // source-level `false` marker in place would keep the
-    // per-dispatch `ensureMemoryStartup()` guard on the hot path.
-    const src = getRuntimeSource(0x1, .arc);
-    const expected = "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = true;";
-    try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
+    const src = getRuntimeSource(0x1, true);
 
-    const original = "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = false;";
-    try std.testing.expect(std.mem.indexOf(u8, src, original) == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = true;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = false;") == null);
 }
 
 test "Phase 7e: runtime rewrite cache separates startup prologue shape" {
-    // The rewrite cache must key the startup-prologue guarantee. A
-    // caller that asks for the host-safe lazy-startup source and a
-    // caller that asks for the executable-binary prologue source with
-    // the same caps/tag/instrumentation triple must not alias the same
-    // cached buffer.
     const lazy_src = rewriteRuntimeSource(.{
         .instrumented = false,
         .declared_caps = 0x1,
-        .builtin_tag = .arc,
+        .refcount_sized_extension = true,
         .memory_startup_prologue_emitted = false,
         .collect_arc_stats = false,
     });
     const prologue_src = rewriteRuntimeSource(.{
         .instrumented = false,
         .declared_caps = 0x1,
-        .builtin_tag = .arc,
+        .refcount_sized_extension = true,
         .memory_startup_prologue_emitted = true,
         .collect_arc_stats = false,
     });
@@ -5567,28 +5327,21 @@ test "Phase 7e: runtime rewrite cache separates startup prologue shape" {
 }
 
 test "Phase 7e: library-shaped runtime source keeps lazy startup marker" {
-    // Library mode skips generated `main`, so there is no guaranteed
-    // entry prologue. The public shape-aware accessor must preserve
-    // the false marker for that mode even while applying the caps/tag
-    // rewrites.
-    const src = getRuntimeSourceForEntryShape(0x1, .arc, false);
+    const src = getRuntimeSourceForEntryShape(0x1, true, false);
+
     try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = false;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .arc;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT: bool = true;") != null);
 }
 
 test "Phase 7e: object-shaped runtime source keeps lazy startup marker" {
-    // Object output has no executable artifact entry boundary. Even
-    // when the object contains a generated `main` function, a future
-    // linker can touch runtime-managed dispatchers before that symbol
-    // is called, so the embedded runtime must keep the lazy startup
-    // fallback compiled in.
-    const src = getRuntimeSourceForEntryShape(0x1, .arc, false);
+    const src = getRuntimeSourceForEntryShape(0x1, true, false);
+
     try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = false;") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_MEMORY_STARTUP_PROLOGUE_DEFAULT: bool = true;") == null);
 }
 
 test "Phase 2 ARC stats: runtime source keeps collection elided by default" {
-    const src = getRuntimeSourceForRuntimeControls(0x1, .arc, .{
+    const src = getRuntimeSourceForRuntimeControls(0x1, true, .{
         .memory_startup_prologue_emitted = true,
         .collect_arc_stats = false,
     });
@@ -5598,7 +5351,7 @@ test "Phase 2 ARC stats: runtime source keeps collection elided by default" {
 }
 
 test "Phase 2 ARC stats: runtime source rewrites collection marker on explicit opt-in" {
-    const src = getRuntimeSourceForRuntimeControls(0x1, .arc, .{
+    const src = getRuntimeSourceForRuntimeControls(0x1, true, .{
         .memory_startup_prologue_emitted = true,
         .collect_arc_stats = true,
     });
@@ -5611,14 +5364,14 @@ test "Phase 2 ARC stats: runtime rewrite cache separates collection shape" {
     const elided_src = rewriteRuntimeSource(.{
         .instrumented = false,
         .declared_caps = 0x1,
-        .builtin_tag = .arc,
+        .refcount_sized_extension = true,
         .memory_startup_prologue_emitted = true,
         .collect_arc_stats = false,
     });
     const collecting_src = rewriteRuntimeSource(.{
         .instrumented = false,
         .declared_caps = 0x1,
-        .builtin_tag = .arc,
+        .refcount_sized_extension = true,
         .memory_startup_prologue_emitted = true,
         .collect_arc_stats = true,
     });
@@ -5628,454 +5381,23 @@ test "Phase 2 ARC stats: runtime rewrite cache separates collection shape" {
     try std.testing.expect(std.mem.indexOf(u8, collecting_src, "const COLLECT_ARC_STATS_DEFAULT: bool = true;") != null);
 }
 
-// ---------------------------------------------------------------------------
-// Phase 2 — first-party manager source embedding (see Phase 1's
-// `BuiltinManagerTag` in `src/memory/driver.zig`). These tests pin the
-// per-tag accessor contract so later phases can rely on byte-stable
-// access to the manager source by tag without re-reading from disk.
-// ---------------------------------------------------------------------------
+test "Phase 2 memory adapters: runtime rewrite cache separates refcount sized extension shape" {
+    const sized_src = rewriteRuntimeSource(.{
+        .instrumented = false,
+        .declared_caps = 0x1,
+        .refcount_sized_extension = true,
+        .memory_startup_prologue_emitted = true,
+        .collect_arc_stats = false,
+    });
+    const unsized_src = rewriteRuntimeSource(.{
+        .instrumented = false,
+        .declared_caps = 0x1,
+        .refcount_sized_extension = false,
+        .memory_startup_prologue_emitted = true,
+        .collect_arc_stats = false,
+    });
 
-test "Phase 2: getBuiltinManagerSource returns non-empty bytes for each first-party tag" {
-    // Exhaustive coverage of the five first-party tags is intentional:
-    // a regression that drops a tag (e.g., a future enum reorder) would
-    // pass any non-exhaustive test, but the perf-recovery plan requires
-    // every first-party manager to be reachable by tag from the
-    // compiler. The `const std = @import("std");` substring pins both
-    // the embed-path correctness AND the self-contained manager
-    // convention each `manager.zig` documents in its file header.
-    const std_import_needle = "const std = @import(\"std\");";
-    const tags = [_]zap.memory_driver.BuiltinManagerTag{ .arc, .arena, .no_op, .leak, .tracking };
-    for (tags) |tag| {
-        const source = getBuiltinManagerSource(tag);
-        try std.testing.expect(source != null);
-        try std.testing.expect(source.?.len > 0);
-        try std.testing.expect(std.mem.indexOf(u8, source.?, std_import_needle) != null);
-    }
-}
-
-test "Phase 2: getBuiltinManagerSource returns null for .third_party" {
-    // Third-party managers ship their own `.zig` source through the
-    // build manifest, not through the compiler binary — Phase 2's
-    // embed-and-expose contract is explicitly first-party-only. A
-    // non-null return here would leak a default first-party manager
-    // into third-party builds, breaking the manifest as the sole
-    // source of truth for non-built-in managers.
-    try std.testing.expect(getBuiltinManagerSource(.third_party) == null);
-}
-
-test "Phase 2: managerSourceUnitName returns 'zap_active_manager' for every first-party tag" {
-    // The accessor returns a single canonical import name across all
-    // first-party tags so the runtime's `@import("zap_active_manager")`
-    // works uniformly without a conditional import surface per tag —
-    // only one first-party manager is active per build, and the
-    // import name is intentionally tag-agnostic.
-    const expected = "zap_active_manager";
-    const tags = [_]zap.memory_driver.BuiltinManagerTag{ .arc, .arena, .no_op, .leak, .tracking };
-    for (tags) |tag| {
-        const name = managerSourceUnitName(tag);
-        try std.testing.expect(name != null);
-        try std.testing.expectEqualStrings(expected, name.?);
-    }
-}
-
-test "Phase 2: managerSourceUnitName returns null for .third_party" {
-    // Symmetric with `getBuiltinManagerSource(.third_party) == null`:
-    // third-party managers do not participate in the embedded-source
-    // import-name surface — the manifest names the module instead.
-    try std.testing.expect(managerSourceUnitName(.third_party) == null);
-}
-
-test "Phase 2: each embedded first-party manager source matches the on-disk file" {
-    // `@embedFile` is path-relative to the caller's file. A typo in
-    // the embed path would silently grab the wrong bytes — every
-    // `manager.zig` opens with the same `//! ` doc-comment shape, so
-    // substring asserts alone cannot detect a swap. Byte-equality
-    // against the on-disk source pins each embed path verbatim across
-    // all five first-party managers — not just ARC — so any
-    // single-path drift surfaces here before reaching Phase 3's
-    // emission step.
-    const cases = [_]struct {
-        tag: zap.memory_driver.BuiltinManagerTag,
-        path: []const u8,
-    }{
-        .{ .tag = .arc, .path = "src/memory/arc/manager.zig" },
-        .{ .tag = .arena, .path = "src/memory/arena/manager.zig" },
-        .{ .tag = .no_op, .path = "src/memory/no_op/manager.zig" },
-        .{ .tag = .leak, .path = "src/memory/leak/manager.zig" },
-        .{ .tag = .tracking, .path = "src/memory/tracking/manager.zig" },
-    };
-    for (cases) |c| {
-        const on_disk = try std.Io.Dir.cwd().readFileAlloc(
-            std.Options.debug_io,
-            c.path,
-            std.testing.allocator,
-            .limited(16 * 1024 * 1024),
-        );
-        defer std.testing.allocator.free(on_disk);
-        const embedded = getBuiltinManagerSource(c.tag).?;
-        try std.testing.expectEqualSlices(u8, on_disk, embedded);
-    }
-}
-
-test "Phase 2: every first-party manager source opens with a doc-comment header and imports std" {
-    // Pins the file-shape contract documented in every first-party
-    // `manager.zig` header: the file is self-contained (imports std)
-    // and is a Zig source file (opens with a doc-comment). Both
-    // signatures must be present in every embedded source — a future
-    // refactor that, say, splits the file or strips the header would
-    // be caught here before reaching Phase 3's emission step.
-    const doc_comment_needle = "//! ";
-    const std_import_needle = "const std = @import(\"std\");";
-    const tags = [_]zap.memory_driver.BuiltinManagerTag{ .arc, .arena, .no_op, .leak, .tracking };
-    for (tags) |tag| {
-        const source = getBuiltinManagerSource(tag).?;
-        try std.testing.expect(std.mem.startsWith(u8, source, doc_comment_needle));
-        try std.testing.expect(std.mem.indexOf(u8, source, std_import_needle) != null);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Phase 3 — per-user-binary active-manager source registration. Each Zap
-// user binary registers exactly one Zig module named `zap_active_manager`
-// alongside the runtime: for a first-party manager the module IS the
-// manager's `manager.zig` source (Phase 4's comptime branches call into
-// it directly so LLVM can inline through the boundary); for third-party
-// managers it is a minimal stub (Phase 4's comptime branches route
-// through the manager-`.o`'s vtable instead and never touch the stub's
-// symbols). These tests pin the registration contract end-to-end:
-//   * `getActiveManagerSourceBytes` returns the right bytes for every tag.
-//   * `getRuntimeSource` rewrites the runtime's `ACTIVE_MANAGER_TAG`
-//     marker per resolved manager and treats the tag as part of the
-//     cache key so two builds with different tags never alias the same
-//     rewritten source slice.
-// ---------------------------------------------------------------------------
-
-test "Phase 3: getActiveManagerSourceBytes returns embedded source for first-party tags" {
-    // Phase 3's first-party path simply forwards to
-    // `getBuiltinManagerSource`'s embedded bytes — the active-manager
-    // registration MUST hand the Zig compiler the same backing storage
-    // the embed-time switch produced so the test suite, the build
-    // pipeline, and the watch-mode incremental path all see the same
-    // bytes. Pointer equality (not just slice equality) pins that there
-    // is no hidden copy or allocator buffer on the first-party path —
-    // any divergence would mean a future caller could pass a stale
-    // pointer through to `zir_compilation_add_struct_source`.
-    const tags = [_]zap.memory_driver.BuiltinManagerTag{ .arc, .arena, .no_op, .leak, .tracking };
-    for (tags) |tag| {
-        const embedded = getBuiltinManagerSource(tag).?;
-        const active = getActiveManagerSourceBytes(tag);
-        try std.testing.expectEqual(embedded.ptr, active.ptr);
-        try std.testing.expectEqual(embedded.len, active.len);
-    }
-}
-
-test "Phase 3: getActiveManagerSourceBytes returns a valid Zig stub for third_party" {
-    // Third-party managers route every retain/release through the
-    // manager `.o`'s `.zapmem`-registered vtable, but the runtime's
-    // top-level `@import("zap_active_manager")` still needs to resolve
-    // — so Phase 3 registers a minimal Zig stub under that name. The
-    // stub must be (a) non-empty and (b) a valid Zig source unit (it
-    // gets fed to the Zig compiler via `zir_compilation_add_struct_source`).
-    // We pin both invariants here: a regression that emits empty bytes
-    // would break the `addStructSource` call, and a regression that
-    // emits non-Zig text would surface as a Sema parse error during
-    // every third-party user-binary build.
-    const stub = getActiveManagerSourceBytes(.third_party);
-    try std.testing.expect(stub.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, stub, "const std = @import(\"std\")") != null);
-}
-
-test "Phase 3: getRuntimeSource rewrites RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT to the requested tag" {
-    // The runtime ships with `.third_party` as the source-level default
-    // so the host test suite — which loads `runtime.zig` as a Zig
-    // module without going through `getRuntimeSource` — naturally
-    // exercises the vtable path. For every Zap user binary the rewrite
-    // replaces the marker with the resolved tag so Phase 4's comptime
-    // branches in `runtime.zig` see the right case at compile time.
-    // The rewrite must produce the exact `.<tag>` literal AND drop the
-    // original `.third_party` literal — a no-op rewrite would silently
-    // leave every first-party build dispatching through the vtable
-    // path, defeating the whole inlining motivation behind Phases 3-4.
-    const cases = [_]struct {
-        tag: zap.memory_driver.BuiltinManagerTag,
-        name: []const u8,
-    }{
-        .{ .tag = .arc, .name = "arc" },
-        .{ .tag = .arena, .name = "arena" },
-        .{ .tag = .no_op, .name = "no_op" },
-        .{ .tag = .leak, .name = "leak" },
-        .{ .tag = .tracking, .name = "tracking" },
-    };
-    for (cases) |c| {
-        const src = getRuntimeSource(0, c.tag);
-        var expected_buf: [256]u8 = undefined;
-        const expected = std.fmt.bufPrint(
-            &expected_buf,
-            "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .{s};",
-            .{c.name},
-        ) catch unreachable;
-        try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
-        const original = "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .third_party;";
-        try std.testing.expect(std.mem.indexOf(u8, src, original) == null);
-    }
-}
-
-test "Phase 3: getRuntimeSource preserves the .third_party marker for third-party builds" {
-    // The third-party path is a deliberate identity rewrite: the
-    // resolved tag IS `.third_party`, so the rewritten source must
-    // still contain the original marker verbatim. We test this
-    // explicitly (rather than skipping the rewrite for `.third_party`)
-    // because the rewrite path is self-validating only when it always
-    // runs — a future bug that silently no-ops the rewrite on
-    // `.third_party` would not be caught by the first-party assertions
-    // alone.
-    const src = getRuntimeSource(0, .third_party);
-    const expected = "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .third_party;";
-    try std.testing.expect(std.mem.indexOf(u8, src, expected) != null);
-}
-
-test "Phase 3: getRuntimeSource cache key separates by builtin_tag" {
-    // The rewrite cache keys on (instrumented, declared_caps, builtin_tag).
-    // Two builds with identical declared_caps but different tags MUST
-    // produce distinct cached buffers — otherwise the builder and full-
-    // build phases would alias the wrong rewrite for the second build
-    // in a multi-target run (a `zap build foo` followed by
-    // `zap build bar` from the same compiler process), silently
-    // injecting the wrong manager source into one of them. Pointer
-    // inequality is the strongest invariant the cache layer can
-    // expose to a black-box test.
-    const arc_src = getRuntimeSource(0, .arc);
-    const arena_src = getRuntimeSource(0, .arena);
-    try std.testing.expect(arc_src.ptr != arena_src.ptr);
-}
-
-test "Phase 3: getRuntimeSource applies both caps and tag rewrites in one pass" {
-    // The Phase 6 caps rewrite (stage 2) and the Phase 3 tag rewrite
-    // (stage 3) chain through the same allocator-owned buffer in a
-    // single `rewriteRuntimeSource` call. A regression that drops
-    // either stage — or runs them against the wrong intermediate
-    // buffer — would let the other stage's marker survive untouched
-    // in the returned slice. Pin the end-to-end invariant by asserting
-    // BOTH rewritten literals appear together for an ARC build with
-    // `REFCOUNT_V1` set: the caps literal `0x1` from stage 2 AND the
-    // matching `.arc` tag literal from stage 3 must both be present.
-    const src = getRuntimeSource(0x1, .arc);
-    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_DECLARED_CAPS_DEFAULT: u64 = 0x1;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_ACTIVE_MANAGER_TAG_DEFAULT: ActiveManagerTag = .arc;") != null);
-}
-
-// ---------------------------------------------------------------------------
-// Phase 4 — uniform first-party manager interface. Each first-party
-// `manager.zig` exposes the same set of public symbols (`init`, `deinit`,
-// `allocate`, `deallocate`, `allocateRefcounted`, `retain`, `release`,
-// `retainSized`, `releaseSized`, `refcountSized`, `getCapabilityDesc`)
-// so the runtime's comptime dispatch in `src/runtime.zig` can call into
-// the active manager's hot paths through `@import("zap_active_manager")`
-// uniformly. The runtime arm that selects the direct-call path
-// (`if (comptime ACTIVE_MANAGER_TAG != .third_party)`) compiles only
-// when these symbols all resolve; the third-party stub
-// (`src/zap_active_manager_stub.zig`) must mirror the same interface.
-// These tests pin the symbol set across every embedded source so a
-// future refactor that drops one of the aliases is caught at the
-// compile-test boundary rather than at the user-binary compile.
-// ---------------------------------------------------------------------------
-
-test "Phase 4: every first-party manager source exposes the uniform interface aliases" {
-    // The Phase 4 runtime dispatch arm calls `active_manager.<fn>(...)`
-    // for each of these names. A missing alias in any first-party
-    // `manager.zig` would break the user-binary compile for that
-    // manager but would NOT be caught by the host test suite (which
-    // loads `runtime.zig` against the third-party stub instead). This
-    // test pins the symbol set across all five first-party sources
-    // so a missing alias surfaces immediately.
-    //
-    // The substring shape (`pub const <name> =`) is the canonical
-    // declaration pattern documented in `src/memory/arc/manager.zig`.
-    // The first-party managers route their `init`/`deinit`/...
-    // aliases at the **bottom of the file** where the implementing
-    // functions are already in scope; a regression that moves the
-    // aliases above the function definitions (an order-of-declaration
-    // mistake) would surface during the user-binary compile, but the
-    // substring check here catches the simpler "alias missing
-    // entirely" regression.
-    const uniform_aliases = [_][]const u8{
-        "pub const init = ",
-        "pub const deinit = ",
-        "pub const allocate = ",
-        "pub const deallocate = ",
-        "pub const allocateRefcounted = ",
-        "pub const retain = ",
-        "pub const release = ",
-        "pub const retainSized = ",
-        "pub const releaseSized = ",
-        "pub const refcountSized = ",
-        "pub const getCapabilityDesc = ",
-    };
-    const tags = [_]zap.memory_driver.BuiltinManagerTag{ .arc, .arena, .no_op, .leak, .tracking };
-    for (tags) |tag| {
-        const source = getBuiltinManagerSource(tag).?;
-        for (uniform_aliases) |needle| {
-            if (std.mem.indexOf(u8, source, needle) == null) {
-                std.debug.print(
-                    "\n  manager tag={s} is missing uniform alias `{s}`\n",
-                    .{ @tagName(tag), needle },
-                );
-                try std.testing.expect(false);
-            }
-        }
-    }
-}
-
-test "Phase 4: third-party stub exposes the uniform interface as pub fn declarations" {
-    // The third-party stub's panic functions are declared with
-    // `pub fn <name>(...)` (rather than `pub const <name> = ...`)
-    // because each function has a body. Either declaration form
-    // would satisfy the runtime's `active_manager.<fn>(...)` call
-    // site, but the stub uses `pub fn` so the source reads as
-    // intentionally unreachable defensive code rather than an alias
-    // table. Pin both contracts here: the stub must declare every
-    // name on the uniform interface, AND every panic body must
-    // mention `unreachable` so a reader knows the call site is by
-    // design dead.
-    const stub_source = getActiveManagerSourceBytes(.third_party);
-    const uniform_pub_fn_aliases = [_][]const u8{
-        "pub fn init(",
-        "pub fn deinit(",
-        "pub fn allocate(",
-        "pub fn deallocate(",
-        "pub fn allocateRefcounted(",
-        "pub fn retain(",
-        "pub fn release(",
-        "pub fn retainSized(",
-        "pub fn releaseSized(",
-        "pub fn refcountSized(",
-        "pub fn getCapabilityDesc(",
-    };
-    for (uniform_pub_fn_aliases) |needle| {
-        if (std.mem.indexOf(u8, stub_source, needle) == null) {
-            std.debug.print(
-                "\n  third-party stub is missing uniform alias `{s}`\n",
-                .{needle},
-            );
-            try std.testing.expect(false);
-        }
-    }
-    // Every stub body @panics with an "unreachable" diagnostic; pin
-    // the substring so a regression that swaps a panic for a real
-    // implementation (which would silently mis-route under a
-    // `.third_party` build) is caught at the source level.
-    try std.testing.expect(std.mem.indexOf(u8, stub_source, "unreachable") != null);
-}
-
-test "Phase 4: managers without REFCOUNT_V1 declare panic stubs that name the missing capability" {
-    // The four first-party managers that do NOT declare REFCOUNT_V1
-    // (Arena, NoOp, Leak, Tracking) expose the uniform interface with
-    // panic stubs in place of the refcount slot aliases. The stub
-    // bodies must mention `REFCOUNT_V1` so a regression that bypasses
-    // codegen elision and reaches one of these stubs surfaces with a
-    // clear diagnostic naming the missing capability — not an
-    // anonymous "panic" with no actionable signal.
-    const tags = [_]zap.memory_driver.BuiltinManagerTag{ .arena, .no_op, .leak, .tracking };
-    for (tags) |tag| {
-        const source = getBuiltinManagerSource(tag).?;
-        try std.testing.expect(std.mem.indexOf(u8, source, "REFCOUNT_V1") != null);
-        // The diagnostic phrase is shared across every panic stub —
-        // see `src/memory/arena/manager.zig` for the canonical
-        // wording. Match a substring of that wording so an
-        // accidental message change in one stub surfaces here.
-        try std.testing.expect(std.mem.indexOf(u8, source, "codegen should have elided this call") != null);
-    }
-}
-
-test "Phase 4: ARC manager's uniform interface aliases name the real implementation functions" {
-    // ARC is the only first-party manager that declares REFCOUNT_V1;
-    // its uniform-interface aliases must point at the real
-    // implementation functions (`arcInit`, `arcRetainSized`, ...)
-    // rather than at panic stubs. A regression that aliased a panic
-    // stub instead would silently regress every ARC build's
-    // retain/release into an immediate process crash.
-    const source = getBuiltinManagerSource(.arc).?;
-    const real_alias_pairs = [_]struct { alias: []const u8, target: []const u8 }{
-        .{ .alias = "pub const init = ", .target = "arcInit" },
-        .{ .alias = "pub const deinit = ", .target = "arcDeinit" },
-        .{ .alias = "pub const allocate = ", .target = "arcAllocate" },
-        .{ .alias = "pub const deallocate = ", .target = "arcDeallocate" },
-        .{ .alias = "pub const allocateRefcounted = ", .target = "arcAllocateRefcounted" },
-        .{ .alias = "pub const retain = ", .target = "arcRetain" },
-        .{ .alias = "pub const release = ", .target = "arcRelease" },
-        .{ .alias = "pub const retainSized = ", .target = "arcRetainSized" },
-        .{ .alias = "pub const releaseSized = ", .target = "arcReleaseSized" },
-        .{ .alias = "pub const refcountSized = ", .target = "arcRefcountSized" },
-        .{ .alias = "pub const getCapabilityDesc = ", .target = "arcGetCapabilityDesc" },
-    };
-    for (real_alias_pairs) |pair| {
-        // Build the expected line literal and assert it appears
-        // verbatim — pointer equality of the alias name and the
-        // implementation function name pins both ends of the alias
-        // table.
-        var buf: [128]u8 = undefined;
-        const expected = std.fmt.bufPrint(&buf, "{s}{s};", .{ pair.alias, pair.target }) catch unreachable;
-        if (std.mem.indexOf(u8, source, expected) == null) {
-            std.debug.print(
-                "\n  ARC manager is missing the alias line `{s}`\n",
-                .{expected},
-            );
-            try std.testing.expect(false);
-        }
-    }
-}
-
-test "Phase 4: managers without REFCOUNT_V1 alias panic stubs for the capability functions" {
-    // Symmetric to the ARC alias test above. Arena, NoOp, Leak, and
-    // Tracking declare `declared_caps = 0`, so their refcount-aliased
-    // names (`retain`, `release`, `retainSized`, `releaseSized`,
-    // `refcountSized`, `allocateRefcounted`) MUST resolve to
-    // panic-stub functions — never to a real refcount routine. The
-    // panic-stub convention Phase 4 established is the `Stub` name
-    // suffix (e.g. `arenaRetainStub`); pinning that substring at the
-    // alias-arrow site catches a regression that wired a real
-    // refcount impl into a non-REFCOUNT manager (which would
-    // silently misbehave at runtime under those builds).
-    const non_refcount_managers = [_]struct {
-        tag: zap.memory_driver.BuiltinManagerTag,
-        name: []const u8,
-    }{
-        .{ .tag = .arena, .name = "arena" },
-        .{ .tag = .no_op, .name = "no_op" },
-        .{ .tag = .leak, .name = "leak" },
-        .{ .tag = .tracking, .name = "tracking" },
-    };
-
-    const refcount_aliases = [_][]const u8{
-        "pub const retain = ",
-        "pub const release = ",
-        "pub const retainSized = ",
-        "pub const releaseSized = ",
-        "pub const refcountSized = ",
-        "pub const allocateRefcounted = ",
-    };
-
-    for (non_refcount_managers) |mgr| {
-        const source = getBuiltinManagerSource(mgr.tag).?;
-        for (refcount_aliases) |needle| {
-            const idx = std.mem.indexOf(u8, source, needle) orelse {
-                std.debug.print(
-                    "\n  {s} manager is missing the alias line beginning `{s}`\n",
-                    .{ mgr.name, needle },
-                );
-                try std.testing.expect(false);
-                return;
-            };
-            const semi = std.mem.indexOfScalarPos(u8, source, idx, ';') orelse source.len;
-            const alias_line = source[idx..semi];
-            if (std.mem.indexOf(u8, alias_line, "Stub") == null) {
-                std.debug.print(
-                    "\n  {s} manager alias `{s}` does NOT name a panic stub: `{s}`\n",
-                    .{ mgr.name, needle, alias_line },
-                );
-                try std.testing.expect(false);
-                return;
-            }
-        }
-    }
+    try std.testing.expect(sized_src.ptr != unsized_src.ptr);
+    try std.testing.expect(std.mem.indexOf(u8, sized_src, "const RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT: bool = true;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsized_src, "const RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT: bool = false;") != null);
 }

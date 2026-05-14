@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "instrument_map", instrument_map);
 
     // ----------------------------------------------------------------
-    // Phase 3 — `zap_active_manager` stub for the host build
+    // `zap_active_manager` stub for the host test build
     //
     // `runtime.zig` declares `const active_manager = @import("zap_active_manager");`
     // at top level so every Zap user binary resolves the active
@@ -42,19 +42,12 @@ pub fn build(b: *std.Build) void {
     // top-level `@import` decls during semantic analysis even when
     // the bound name is unused.
     //
-    // The stub file `src/zap_active_manager_stub.zig` is the single
-    // source of truth: `src/compiler.zig` `@embedFile`'s it as
-    // `THIRD_PARTY_ACTIVE_MANAGER_STUB` (for the per-user-binary
-    // third-party registration path), and the same file is registered
-    // here as the sibling module for the host test build. Under the
-    // host test build the runtime's source-level default
-    // (`ACTIVE_MANAGER_TAG == .third_party`) routes every hot path
-    // through the vtable (no symbols from `zap_active_manager` are
-    // referenced), so the minimal `const std = @import("std");` body
-    // is sufficient. Production user binaries register the real
-    // per-tag source through `compiler.getActiveManagerSourceBytes`
-    // and `zir_compilation_add_struct_source`; see
-    // `src/zir_backend.zig:createContext`.
+    // The host test build keeps the runtime's source-level
+    // `active_manager_source_available == false` marker, so runtime hot
+    // paths bind the test-only ARC fallback state and do not call into
+    // this import. Production user binaries instead register the selected
+    // adapter's primitive source path through `zir_compilation_add_struct`;
+    // see `src/zir_backend.zig:createContext`.
     // ----------------------------------------------------------------
 
     // Library import unit — no native deps needed
@@ -300,6 +293,16 @@ pub fn build(b: *std.Build) void {
     }
 
     b.installArtifact(exe);
+    b.installDirectory(.{
+        .source_dir = b.path("lib"),
+        .install_dir = .prefix,
+        .install_subdir = "lib",
+    });
+    b.installDirectory(.{
+        .source_dir = b.path("src/memory"),
+        .install_dir = .prefix,
+        .install_subdir = "src/memory",
+    });
 
     // -----------------------------------------------------------------------
     // Run step

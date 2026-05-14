@@ -4897,6 +4897,9 @@ pub const HirBuilder = struct {
                         .value = value,
                     });
                 }
+                if (se.update_source == null) {
+                    try self.appendStructDefaults(&hir_fields, struct_type_id);
+                }
                 return try self.create(Expr, .{
                     .kind = .{ .struct_init = .{
                         .type_id = struct_type_id,
@@ -5652,6 +5655,32 @@ pub const HirBuilder = struct {
         }
 
         return null;
+    }
+
+    fn appendStructDefaults(self: *HirBuilder, fields: *std.ArrayList(StructFieldInit), struct_type_id: types_mod.TypeId) !void {
+        if (struct_type_id == types_mod.TypeStore.UNKNOWN) return;
+        if (struct_type_id >= self.type_store.types.items.len) return;
+
+        const typ = self.type_store.getType(struct_type_id);
+        if (typ != .struct_type) return;
+
+        for (typ.struct_type.fields) |declared_field| {
+            var already_provided = false;
+            for (fields.items) |field| {
+                if (field.name == declared_field.name) {
+                    already_provided = true;
+                    break;
+                }
+            }
+            if (already_provided) continue;
+
+            const default_expr = declared_field.default_expr orelse continue;
+            const value = try self.buildExpr(default_expr);
+            try fields.append(self.allocator, .{
+                .name = declared_field.name,
+                .value = value,
+            });
+        }
     }
 
     fn isFieldlessStructType(self: *const HirBuilder, type_id: types_mod.TypeId) bool {

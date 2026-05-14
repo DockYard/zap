@@ -72,7 +72,7 @@ pub impl Memory.Manager for Memory.Leak {
     """
 
   pub fn primitive_source_path(_manager :: Memory.Leak) -> String {
-    "src/memory/leak/manager.zig"
+    "zap:src/memory/leak/manager.zig"
   }
 
   @doc = """

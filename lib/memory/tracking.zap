@@ -90,7 +90,7 @@ pub impl Memory.Manager for Memory.Tracking {
     """
 
   pub fn primitive_source_path(_manager :: Memory.Tracking) -> String {
-    "src/memory/tracking/manager.zig"
+    "zap:src/memory/tracking/manager.zig"
   }
 
   @doc = """

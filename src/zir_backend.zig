@@ -53,6 +53,12 @@ extern "c" fn zir_compilation_add_struct_source(
     source_len: u32,
 ) i32;
 
+extern "c" fn zir_compilation_add_struct(
+    ctx: *ZirContext,
+    name: [*:0]const u8,
+    source_path: [*:0]const u8,
+) i32;
+
 extern "c" fn zir_compilation_print_errors(ctx: *ZirContext) void;
 
 extern "c" fn zir_compilation_set_builder_entry(
@@ -134,16 +140,6 @@ pub const CompileOptions = struct {
     /// matching `share_value`/`ret` pair, suppressing the function's
     /// scope-exit release on the returned local.
     arc_ownership: ?*const @import("arc_liveness.zig").ProgramArcOwnership = null,
-    /// Path to an additional object file the Memory Manager ABI v1.0
-    /// build pipeline produces (see `docs/memory-manager-abi.md` section
-    /// 10). Spliced into the link line via
-    /// `zir_compilation_add_link_object_file` so the manager's `.zapmem`
-    /// section survives static linking. Phase 4 made this non-optional
-    /// in practice — every Zap binary links a manager `.o`, including
-    /// builds that select the first-party `Memory.ARC`. The field
-    /// stays nullable so unit tests that bypass the driver can leave
-    /// it unset; production builds always populate it.
-    memory_manager_object: ?[]const u8 = null,
     /// Memory Manager ABI v1.0 capability bitmask declared by the
     /// active manager (`docs/memory-manager-abi.md` section 7). Read
     /// by the driver from the manager's `.zapmem` core vtable, threaded
@@ -155,33 +151,11 @@ pub const CompileOptions = struct {
     /// capabilities" (e.g. `Memory.NoOp`); `1` (`REFCOUNT_V1_BIT`)
     /// means the manager supports the ARC retain/release contract.
     declared_caps: u64 = 0,
-    /// Identity classification of the resolved memory manager. Mirrors
-    /// `ResolvedManager.builtin_tag` from `src/memory/driver.zig`. The
-    /// default `.third_party` covers every code path that does not go
-    /// through the memory-manager driver (unit tests that bypass it,
-    /// future callers that have not yet been wired). Production
-    /// `buildTarget` and `IncrementalWatchState.init` set this from
-    /// the resolved manager so later phases can branch on it for
-    /// comptime-dispatched first-party fast paths.
-    builtin_tag: @import("memory/driver.zig").BuiltinManagerTag = .third_party,
-    /// Zig source bytes registered as the `zap_active_manager` sibling
-    /// module alongside the runtime in every user-binary build. For
-    /// first-party tags this is the active manager's embedded
-    /// `manager.zig` source (Phase 4's comptime branches in
-    /// `runtime.zig` will call into it directly so LLVM can inline
-    /// across the boundary); for `.third_party` it is the minimal
-    /// stub `compiler.THIRD_PARTY_ACTIVE_MANAGER_STUB`. Either way the
-    /// runtime's top-level `@import("zap_active_manager")` resolves
-    /// against this module, so omitting it would fail every Zap user
-    /// binary's compile with a "module not found" Sema error.
-    ///
-    /// Non-optional, no default: every production caller MUST set
-    /// this from `compiler.getActiveManagerSourceBytes(resolved_manager.builtin_tag)`.
-    /// The Phase 3 design treats this as a build-pipeline invariant
-    /// (the runtime's import is always present), so a missing default
-    /// here forces the call sites to wire the field at the type-check
-    /// level instead of failing at link time.
-    active_manager_source: []const u8,
+    /// Absolute path to the selected manager's Zig primitive source.
+    /// Registered as the `zap_active_manager` sibling module in every
+    /// user-binary build. The memory driver validates the same source
+    /// through the `.zapmem` object pipeline before it reaches here.
+    active_manager_source_path: []const u8,
 };
 
 /// Create a ZirContext compilation context from the given options.
@@ -230,44 +204,19 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
         }
     }
 
-    // Register the active manager's source as the `zap_active_manager`
-    // sibling module so the runtime's top-level
+    // Register the selected adapter's primitive source as the
+    // `zap_active_manager` sibling module so the runtime's top-level
     // `@import("zap_active_manager")` resolves under every user-binary
-    // build. For first-party tags the source IS the manager's
-    // `manager.zig` (Phase 4's comptime branches will call into its
-    // hot paths so LLVM can inline through the boundary); for
-    // `.third_party` it is the minimal stub the runtime's
-    // `.third_party` branch never references. See
-    // `compiler.getActiveManagerSourceBytes` for the per-tag dispatch
-    // and `runtime.zig`'s top-level `active_manager` declaration for
-    // the consumer side.
-    //
-    // Registration is unconditional: `active_manager_source` is a
-    // non-optional field on `CompileOptions` and every production
-    // call site wires it through `compiler.getActiveManagerSourceBytes`,
-    // which never returns empty bytes (first-party tags return the
-    // embedded `manager.zig`, `.third_party` returns the embedded
-    // stub). A silent skip on empty bytes would mask a regression as a
-    // far-removed "module not found" Sema error at every user-binary
-    // build.
-    if (zir_compilation_add_struct_source(
-        ctx,
-        "zap_active_manager",
-        options.active_manager_source.ptr,
-        @intCast(options.active_manager_source.len),
-    ) != 0) {
+    // build. The source path has already been resolved and validated by
+    // `src/memory/driver.zig` through the same pipeline for stdlib,
+    // project, and dependency managers. A silent skip on an empty path
+    // would mask a regression as a far-removed "module not found" Sema
+    // error at every user-binary build.
+    const active_manager_path_z = allocator.dupeZ(u8, options.active_manager_source_path) catch return error.OutOfMemory;
+    defer allocator.free(active_manager_path_z);
+    if (zir_compilation_add_struct(ctx, "zap_active_manager", active_manager_path_z) != 0) {
         zir_compilation_destroy(ctx);
         return error.CompilationFailed;
-    }
-
-    // Splice the memory-manager object file into the link inputs if the
-    // build pipeline produced one. See `docs/memory-manager-abi.md` and
-    // `src/memory/driver.zig` for the contract.
-    if (options.memory_manager_object) |obj_path| {
-        addLinkObjectFile(ctx, obj_path, allocator) catch |err| {
-            zir_compilation_destroy(ctx);
-            return err;
-        };
     }
 
     return ctx;

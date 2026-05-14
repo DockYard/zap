@@ -2,9 +2,9 @@
 
 **Status:** Normative. Final for v1.0. Any incompatible change requires an ABI major bump (v2.0).
 
-**Audience:** Third-party authors of Zap memory managers, contributors to the Zap compiler and runtime, and authors of the first-party `Memory.ARC` and `Memory.Arena` managers.
+**Audience:** Third-party authors of Zap memory managers, contributors to the Zap compiler and runtime, and authors of the stdlib `Memory.ARC` and `Memory.Arena` managers.
 
-**Scope:** This document specifies the binary interface, build-time discovery protocol, and semantic contract that every Zap memory manager — first-party or third-party — must implement. The specification is normative: ambiguity in this document is a defect of this document, not a license for implementer choice.
+**Scope:** This document specifies the binary interface, build-time discovery protocol, and semantic contract that every Zap memory manager — stdlib or third-party — must implement. The specification is normative: ambiguity in this document is a defect of this document, not a license for implementer choice.
 
 ---
 
@@ -26,13 +26,13 @@ project's `build.zap` manifest:
 }
 ```
 
-Phase 1 source model: first-party managers are top-level adapters
-(`Memory.ARC`, `Memory.Arena`, `Memory.NoOp`, `Memory.Leak`,
-`Memory.Tracking`) that implement `Memory.Manager`. The compiler still
-uses its existing first-party `BuiltinManagerTag` short-circuit and the
-legacy third-party `@memory_manager_source` discovery path until the
-Phase 2 resolver removes that hardcoding. The public Zap namespace is
-`Memory.*`.
+The source model is adapter-driven: stdlib and project managers are
+top-level structs that implement `Memory.Manager`. The selected adapter
+value in `Zap.Manifest.memory` is evaluated at build time, and the
+compiler obtains the public manager name, primitive Zig source
+reference, and declared capability mask by calling the protocol
+functions. No manager uses a special source attribute or a compiler name
+table.
 
 ### 1.1 The build pipeline at a glance
 
@@ -43,17 +43,17 @@ Zap.Manifest.memory: Memory.ARC
 Resolve adapter name
         |
         v
-First-party: classify BuiltinManagerTag and register embedded primitive source
-Third-party Phase 1 legacy path: read @memory_manager_source and compile <manager>.zig
+Evaluate Memory.Manager.name/1, primitive_source_path/1,
+capability_mask/1, and refcount_v1?/1 through CTFE
         |
         v
-Resolve manager metadata
-  First-party Phase 1 path: BuiltinManagerTag tables
-  Third-party Phase 1 legacy path: parse .zapmem from <manager>.o
+Resolve primitive_source_path/1 using zap:, project:, or dep:<name>:
+and compile the selected manager source to a validation object
         |
         v
 Validate ZapMemoryManagerMetaV1 + embedded ZapMemoryManagerCoreV1
-  (magic, abi_major, caps consistency, core vtable offset)
+  (magic, abi_major, caps consistency, core vtable offset);
+cross-check the validated .zapmem caps against adapter capability_mask/1
         |
         v
 Thread declared_caps into HIR type elaboration
@@ -64,10 +64,10 @@ Thread declared_caps into codegen
   (retain/release calls elided if REFCOUNT_V1 absent)
         |
         v
-Link or register the active primitive implementation in the final Zap binary
+Register the selected primitive source as zap_active_manager in the final Zap binary
 ```
 
-### 1.2 First-party manager locations
+### 1.2 Stdlib manager locations
 
 | Manager | Zap adapter | Zap source | Zig source |
 |---|---|---|---|
@@ -77,13 +77,13 @@ Link or register the active primitive implementation in the final Zap binary
 | `Memory.Leak` | `Memory.Leak` | `lib/memory/leak.zap` | `src/memory/leak/manager.zig` |
 | `Memory.Tracking` | `Memory.Tracking` | `lib/memory/tracking.zap` | `src/memory/tracking/manager.zig` |
 
-Third-party managers may live anywhere on the filesystem. In Phase 1,
-third-party managers still use the legacy `@memory_manager_source`
-discovery path; the target model is the same `Memory.Manager` adapter
-contract used by first-party managers. Architectural conventions for a
-production manager (slab pooling, size-class buckets, atomic per-cell
-headers) are out of scope for this specification; the goal here is the
-wire contract, not implementation guidance.
+Third-party managers follow the same `Memory.Manager` adapter contract.
+Their primitive source reference normally uses `project:<path>` for
+project-local code or `dep:<name>:<path>` for dependency-provided code.
+Architectural conventions for a production manager (slab pooling,
+size-class buckets, atomic per-cell headers) are out of scope for this
+specification; the goal here is the wire contract, not implementation
+guidance.
 
 ### 1.3 What this ABI does NOT cover
 
@@ -1056,27 +1056,28 @@ Step 1. Parse the project's build.zap and load the manifest.
         The manifest's `memory:` field names a Zap memory adapter
         (e.g., Memory.ARC or Memory.Arena).
 
-Step 2. Resolve the adapter.
-        First-party adapters are top-level Memory.* structs that
-        implement Memory.Manager and currently resolve through the
-        compiler's BuiltinManagerTag table. Third-party managers still
-        use the legacy @memory_manager_source path in Phase 1.
+Step 2. Resolve the adapter metadata.
+        The build CTFE interpreter evaluates the selected manifest
+        value through the Memory.Manager protocol:
+        name/1, primitive_source_path/1, capability_mask/1, and
+        refcount_v1?/1.
 
 Step 3. Compile the manager's Zig source to an object file.
-        On the third-party path, the compiler invokes the Zig-fork
-        primitive `zap_fork_compile_zig_to_object` (see section
-        10.1.1). First-party Phase 1 builds register the embedded
-        primitive source directly as `zap_active_manager`.
+        The compiler resolves primitive_source_path/1 and invokes the
+        Zig-fork primitive `zap_fork_compile_zig_to_object` (see section
+        10.1.2). This object is build-time validation evidence for every
+        manager; the final binary registers the selected source path as
+        `zap_active_manager`.
 
 Step 4. Resolve metadata.
-        First-party Phase 1 builds use the compiler's built-in
-        capability table. Third-party builds parse the .zapmem section
-        from the object file using std.elf, std.macho, or std.coff
-        (depending on detected object format).
+        The driver parses the .zapmem section from the object file using
+        std.elf or std.macho (depending on detected object format).
 
 Step 5. Validate the metadata per section 3.5.
         Any validation failure aborts the build with a diagnostic
-        identifying the manager package and the specific defect.
+        identifying the manager package and the specific defect. The
+        validated declared_caps must exactly match the adapter's
+        capability_mask/1 result.
 
 Step 6. Thread declared_caps into HIR type elaboration.
         The compiler's HIR pass, when elaborating Map, List, String,
@@ -1099,17 +1100,37 @@ Step 7. Thread declared_caps into codegen.
 
 Step 8. Emit the runtime startup hook.
         The compiler generates a small startup stub that calls the
-        manager's `init` and stores the returned context pointer in
-        the global `zap_memory_manager_context` (see section 10.2).
+        manager's `init` through the runtime bootstrap path and stores
+        the returned context pointer in active manager runtime state
+        (see section 10.2).
 
-Step 9. Link the manager object alongside the Zap-generated objects.
-        The final link step includes <manager>.o in its input set.
-        The runtime locates the core vtable by walking the linked
-        .zapmem section at startup; no per-symbol reference is
-        emitted.
+Step 9. Register the selected primitive source.
+        The final binary registers the adapter's resolved source path as
+        `zap_active_manager`. The runtime binds
+        `zap_active_manager.zap_memory_section` at startup. The
+        validation object from step 3 is not linked into the final
+        binary.
 ```
 
-#### 10.1.1 `zap_fork_compile_zig_to_object`
+#### 10.1.1 Primitive source reference resolution
+
+`Memory.Manager.primitive_source_path/1` returns an opaque source
+reference string, not a raw filesystem path. The build driver recognizes
+exactly these schemes:
+
+- `zap:<path>`: `<path>` is resolved relative to the Zap source tree
+  root. Stdlib adapters use this for the built-in primitive sources.
+- `project:<path>`: `<path>` is resolved relative to the project root.
+  Project-local adapters use this.
+- `dep:<name>:<path>`: `<path>` is resolved relative to the registered
+  source root named `dep:<name>`. Dependency adapters use this.
+
+The path part must be non-empty, relative, and may not contain `..`.
+The driver checks that the resolved file exists before invoking the Zig
+fork. These rules apply identically to stdlib, project, and dependency
+managers.
+
+#### 10.1.2 `zap_fork_compile_zig_to_object`
 
 The Zig-fork primitive used in step 3 is a public C-ABI surface available to anyone calling into the Zig fork (not memory-manager-specific). Its full signature:
 
@@ -1161,7 +1182,7 @@ The diagnostic buffer receives a UTF-8 error message on non-`Ok` returns; pass `
 
 On `CompilationFailed`, the diagnostic buffer is populated with the formatted contents of the Zig compiler's structured `ErrorBundle` — each error appears on its own line with source-location prefix where available (`[i] path:line:column: error: text`). If the buffer fills up before all errors fit, the remaining errors are summarized with a trailing `... [truncated, N more errors]` marker. On other non-`Ok` returns the buffer carries a human-readable explanation of the failure.
 
-#### 10.1.1.1 Optional parameters
+#### 10.1.2.1 Optional parameters
 
 `zig_lib_dir_opt`
     Optional path to a Zig stdlib directory. If null, the primitive uses
@@ -1233,7 +1254,9 @@ The compiled `<manager>.o` is content-addressed by `(zig_fork_version, manager_s
 
 | Failure                                  | Stage   | Diagnostic                                                                           |
 |------------------------------------------|---------|--------------------------------------------------------------------------------------|
-| Manager Zig source missing               | Step 2  | "memory manager source not found at `<path>` (from `@memory_manager_source` on `<struct>`)" |
+| Adapter metadata missing                 | Step 2  | "build manifest did not evaluate a `Memory.Manager` adapter"                                |
+| Primitive source reference invalid       | Step 2  | "invalid memory manager source reference `<ref>`: expected zap:<path>, project:<path>, or dep:<name>:<path>" |
+| Manager Zig source missing               | Step 2  | "memory manager source not found at `<path>` (from adapter source reference `<ref>`)"       |
 | Manager Zig source fails to compile      | Step 3  | Forwarded Zig compiler error, prefixed with the manager package name.                |
 | `.zapmem` section absent from object     | Step 4  | "manager `<name>` did not emit a `.zapmem` metadata section; see docs/memory-manager-abi.md section 3" |
 | Magic mismatch                           | Step 5  | "manager `<name>` has invalid magic (expected `'ZMEM'`, got `<bytes>`)"               |
@@ -1251,26 +1274,23 @@ The compiled `<manager>.o` is content-addressed by `(zig_fork_version, manager_s
 
 ---
 
-## 11. First-party / third-party extension model
+## 11. Extension model
 
 The Zap source model is shared: memory managers are adapter structs
-that implement `Memory.Manager`. Phase 1 keeps the existing compiler
-bridge for runtime compatibility: first-party managers still resolve
-through `BuiltinManagerTag`, while third-party managers still use the
-legacy `@memory_manager_source` discovery attribute. Phase 2 removes
-the first-party hardcoding and makes adapter-driven resolution the
-single path.
+that implement `Memory.Manager`. Stdlib and third-party adapters use
+the same compiler path: CTFE evaluates the protocol functions, the
+driver resolves the primitive source reference, the selected source is
+compiled for `.zapmem` validation, and the final binary registers the
+same source path as `zap_active_manager`.
 
 ### 11.1 What a third party ships
 
-A third-party manager is a Zig package containing:
+A third-party manager is a Zap package containing:
 
 1. A `<name>.zig` source file (path arbitrary, but typically `src/manager.zig`).
 2. A `build.zig.zon` so the package can be referenced by Zap's dependency system.
-3. In Phase 1, a Zap struct declaration in `lib/<name>.zap` (or
-   wherever the user wants) that points at the Zig source via
-   `@memory_manager_source`. The target model is for that struct to
-   implement `Memory.Manager`, matching first-party adapters.
+3. A Zap adapter struct in `lib/<name>.zap` (or wherever the package
+   exposes its public API) that implements `Memory.Manager`.
 
 The user then references the Zap struct from their project's `build.zap`:
 
@@ -1282,10 +1302,10 @@ The user then references the Zap struct from their project's `build.zap`:
 }
 ```
 
-The Phase 1 Zap compiler resolves `ThirdParty.MyManager`, reads its
-`@memory_manager_source`, compiles the named Zig file, validates the
-resulting `.zapmem` metadata, and threads `declared_caps` into HIR and
-codegen.
+The Zap compiler evaluates `ThirdParty.MyManager` through
+`Memory.Manager`, resolves its primitive source reference, compiles the
+named Zig file, validates the resulting `.zapmem` metadata, and threads
+`declared_caps` into HIR and codegen.
 
 #### 11.1.1 Third-party manager dependencies
 
@@ -1305,7 +1325,7 @@ For each memory manager, there is a field-free Zap adapter struct that
 names the manager and implements `Memory.Manager`. The adapter is the
 public source-level model. It exposes the manager's public name,
 primitive source path, and declared capabilities through documented Zap
-functions rather than through first-party compiler-only attributes.
+functions rather than through compiler-only attributes.
 
 ### 12.1 `Memory.Manager`
 
@@ -1316,12 +1336,11 @@ The top-level `Memory.Manager` protocol is the adapter contract:
 - `capability_mask(manager) -> i64`
 - `refcount_v1?(manager) -> Bool`
 
-First-party adapters implement this protocol today. Third-party
-managers still use the legacy `@memory_manager_source` discovery path in
-Phase 1, but the extension model converges on this same adapter
-contract.
+Stdlib and third-party adapters implement this protocol directly. The
+adapter's `capability_mask/1` return value must match the validated
+`.zapmem` metadata exactly.
 
-### 12.2 First-party `Memory.ARC`
+### 12.2 Stdlib `Memory.ARC`
 
 ```
 @doc = """
@@ -1349,7 +1368,7 @@ pub impl Memory.Manager for Memory.ARC {
     """
 
   pub fn primitive_source_path(_manager :: Memory.ARC) -> String {
-    "src/memory/arc/manager.zig"
+    "zap:src/memory/arc/manager.zig"
   }
 
   @doc = """
@@ -1370,7 +1389,7 @@ pub impl Memory.Manager for Memory.ARC {
 }
 ```
 
-### 12.3 First-party `Memory.Arena`
+### 12.3 Stdlib `Memory.Arena`
 
 ```
 @doc = """
@@ -1398,7 +1417,7 @@ pub impl Memory.Manager for Memory.Arena {
     """
 
   pub fn primitive_source_path(_manager :: Memory.Arena) -> String {
-    "src/memory/arena/manager.zig"
+    "zap:src/memory/arena/manager.zig"
   }
 
   @doc = """
@@ -1423,7 +1442,7 @@ pub impl Memory.Manager for Memory.Arena {
 
 Adapter structs are intentionally field-free. The behavior lives in the
 `Memory.Manager` impl so the same protocol dispatch path can support
-first-party and third-party managers. Future APIs may accept values that
+stdlib and third-party managers. Future APIs may accept values that
 implement `Memory.Manager` for per-process selection; this document does
 not define `Process` behavior.
 
@@ -1615,7 +1634,7 @@ pub impl Memory.Manager for Memory.NoOp {
     """
 
   pub fn primitive_source_path(_manager :: Memory.NoOp) -> String {
-    "src/memory/no_op/manager.zig"
+    "zap:src/memory/no_op/manager.zig"
   }
 
   @doc = """
@@ -2007,18 +2026,54 @@ pub export const zap_memory_section: ZapMemorySection
 ### 15.2 Zap source: `lib/tinyref.zap`
 
 ```
-@memory_manager_source = "src/manager.zig"
-
 @doc = """
-Minimal example refcounting manager. Backs allocations with the
-page allocator and stores a 32-bit atomic refcount along with the
-original allocation's offset, size, and alignment in an inline
-header. Supports arbitrary user-requested alignment values.
-Demonstrates the smallest manager that declares REFCOUNT_V1 while
-still freeing cells correctly when the refcount reaches zero.
-"""
+  Minimal example refcounting manager. Backs allocations with the
+  page allocator and stores a 32-bit atomic refcount along with the
+  original allocation's offset, size, and alignment in an inline
+  header. Supports arbitrary user-requested alignment values.
+  Demonstrates the smallest manager that declares REFCOUNT_V1 while
+  still freeing cells correctly when the refcount reaches zero.
+  """
 
 pub struct TinyRef {
+}
+
+@doc = """
+  `Memory.Manager` adapter implementation for `TinyRef`.
+  """
+
+pub impl Memory.Manager for TinyRef {
+  @doc = """
+    Returns the public adapter name for TinyRef.
+    """
+
+  pub fn name(_manager :: TinyRef) -> String {
+    "TinyRef"
+  }
+
+  @doc = """
+    Returns the primitive source reference for TinyRef.
+    """
+
+  pub fn primitive_source_path(_manager :: TinyRef) -> String {
+    "project:src/manager.zig"
+  }
+
+  @doc = """
+    Returns TinyRef's declared capability bitmask.
+    """
+
+  pub fn capability_mask(_manager :: TinyRef) -> i64 {
+    1
+  }
+
+  @doc = """
+    Returns true because TinyRef declares `REFCOUNT_V1`.
+    """
+
+  pub fn refcount_v1?(_manager :: TinyRef) -> Bool {
+    true
+  }
 }
 ```
 
@@ -2270,7 +2325,7 @@ The byte sequence `5A 4D 45 4D` is the same in both cases — the bytes spell `Z
 
 ## Appendix C. `ZapForkTarget` tag mapping (v1.0)
 
-The `arch_tag`, `os_tag`, and `abi_tag` fields of `ZapForkTarget` (section 10.1.1) carry the integer values of the Zap-pinned Zig fork's `std.Target.Cpu.Arch`, `std.Target.Os.Tag`, and `std.Target.Abi` enums, respectively. The Zig fork pins these enum definitions for the lifetime of ABI v1.x — adding new tags is permitted (appends to the end of the enum) but reordering or removing existing tags is prohibited. This guarantees that the integer values shown below are stable wire constants.
+The `arch_tag`, `os_tag`, and `abi_tag` fields of `ZapForkTarget` (section 10.1.2) carry the integer values of the Zap-pinned Zig fork's `std.Target.Cpu.Arch`, `std.Target.Os.Tag`, and `std.Target.Abi` enums, respectively. The Zig fork pins these enum definitions for the lifetime of ABI v1.x — adding new tags is permitted (appends to the end of the enum) but reordering or removing existing tags is prohibited. This guarantees that the integer values shown below are stable wire constants.
 
 The values in this appendix are read directly from `lib/std/Target.zig` in the pinned Zig fork (`~/projects/zig`). Each enum begins at integer 0 and increments by 1 per declaration; the tables below give the discriminant of every supported tag.
 
