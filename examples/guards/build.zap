@@ -6,7 +6,7 @@ pub struct Guards.Builder {
           name: "guards",
           version: "0.1.0",
           kind: :bin,
-          root: "Guards.main/1",
+          root: &Guards.main/1,
           paths: ["./*.zap"]
         }
       _ ->

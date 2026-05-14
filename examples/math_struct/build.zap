@@ -6,7 +6,7 @@ pub struct MathStruct.Builder {
           name: "math_struct",
           version: "0.1.0",
           kind: :bin,
-          root: "MathStruct.main/1",
+          root: &MathStruct.main/1,
           paths: ["./*.zap"]
         }
       _ ->

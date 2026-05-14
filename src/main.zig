@@ -394,7 +394,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\      name: "{s}",
         \\      version: "0.1.0",
         \\      kind: :bin,
-        \\      root: "{s}.main/1",
+        \\      root: &{s}.main/1,
         \\      paths: ["lib/**/*.zap"],
         \\      # :debug | :release_safe | :release_fast | :release_small
         \\      optimize: :release_safe
@@ -406,7 +406,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\      name: "{s}_test",
         \\      version: "0.1.0",
         \\      kind: :bin,
-        \\      root: "{s}Test.main/1",
+        \\      root: &{s}Test.main/1,
         \\      paths: ["lib/**/*.zap", "test/**/*.zap"],
         \\      optimize: :debug
         \\    }}
@@ -804,7 +804,7 @@ fn buildTarget(
         // Import-driven discovery from the entry point
         const root_spec = config.root.?;
 
-        // Extract struct name from root spec: "App.main/0" → "App"
+        // Extract struct name from the canonical root name lowered from &App.main/0.
         const slash_pos = std.mem.findScalar(u8, root_spec, '/');
         const name_part = if (slash_pos) |pos| root_spec[0..pos] else root_spec;
         const last_dot = std.mem.findScalarLast(u8, name_part, '.');
@@ -1195,12 +1195,12 @@ fn buildTarget(
         std.process.exit(1);
     };
 
-    // Resolve the manifest root (e.g. "Test.TestHelper.main/1") to an IR function ID
+    // Resolve the manifest root to an IR function ID.
     // so the ZIR backend knows which function is the entry point.
     // IR naming: struct parts joined by "_", then "__" before function name, then "__" arity.
-    // e.g. "Test.TestHelper.main/1" -> "Test_TestHelper__main__1"
+    // For example, &Test.TestHelper.main/1 maps to Test_TestHelper__main__1.
     if (config.root) |root| {
-        // Extract arity suffix: "Test.TestHelper.main/1" -> arity="1"
+        // Extract the arity suffix from the canonical root name.
         const arity_str = if (std.mem.findScalarLast(u8, root, '/')) |slash|
             root[slash + 1 ..]
         else

@@ -6,7 +6,7 @@ pub struct BinaryPatterns.Builder {
           name: "binary_patterns",
           version: "0.1.0",
           kind: :bin,
-          root: "BinaryPatterns.main/1",
+          root: &BinaryPatterns.main/1,
           paths: ["./*.zap"]
         }
       _ ->

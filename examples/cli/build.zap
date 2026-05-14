@@ -6,7 +6,7 @@ pub struct Cli.Builder {
           name: "cli",
           version: "0.1.0",
           kind: :bin,
-          root: "Cli.main/1",
+          root: &Cli.main/1,
           paths: ["./*.zap"]
         }
       _ ->

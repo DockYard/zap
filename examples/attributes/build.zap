@@ -6,7 +6,7 @@ pub struct Attributes.Builder {
           name: "attributes",
           version: "0.1.0",
           kind: :bin,
-          root: "Attributes.main/1",
+          root: &Attributes.main/1,
           paths: ["./*.zap"]
         }
       _ ->

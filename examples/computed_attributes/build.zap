@@ -6,7 +6,7 @@ pub struct ComputedAttributes.Builder {
           name: "computed_attributes",
           version: "0.1.0",
           kind: :bin,
-          root: "ComputedAttributes.main/1",
+          root: &ComputedAttributes.main/1,
           paths: ["./*.zap"]
         }
       _ ->

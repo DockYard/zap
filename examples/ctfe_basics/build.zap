@@ -6,7 +6,7 @@ pub struct CtfeBasics.Builder {
           name: "ctfe_basics",
           version: "0.1.0",
           kind: :bin,
-          root: "CtfeBasics.main/1",
+          root: &CtfeBasics.main/1,
           paths: ["./*.zap"]
         }
       _ ->

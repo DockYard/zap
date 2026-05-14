@@ -6,7 +6,7 @@ pub struct DoubleMacro.Builder {
           name: "double_macro",
           version: "0.1.0",
           kind: :bin,
-          root: "DoubleMacro.main/1",
+          root: &DoubleMacro.main/1,
           paths: ["./*.zap"]
         }
       _ ->

@@ -130,7 +130,7 @@ pub struct MyApp.Builder {
       name: "my_app",
       version: "0.1.0",
       kind: :bin,
-      root: "MyApp.main/1",
+      root: &MyApp.main/1,
       paths: ["lib/**/*.zap"],
       optimize: :release_safe
     }
@@ -141,7 +141,7 @@ pub struct MyApp.Builder {
       name: "my_app_test",
       version: "0.1.0",
       kind: :bin,
-      root: "TestRunner.main/1",
+      root: &TestRunner.main/1,
       paths: ["lib/**/*.zap", "test/**/*.zap"],
       optimize: :debug
     }
@@ -167,10 +167,10 @@ Manifest fields:
 | `name` | Output artifact name |
 | `version` | Project version string |
 | `kind` | `:bin`, `:lib`, `:obj`, or `:doc` |
-| `root` | Entry point, formatted as `"Struct.function/arity"` |
+| `root` | Entry point function reference, formatted as `&Struct.function/arity` |
 | `paths` | Source glob patterns, relative to the project root |
 | `deps` | Dependency declarations |
-| `memory` | Memory manager adapter, defaults to `Memory.ARC` |
+| `memory` | Memory manager type reference, defaults to `Memory.ARC` |
 | `optimize` | `:debug`, `:release_safe`, `:release_fast`, or `:release_small` |
 | `test_timeout` | Test timeout in milliseconds |
 | `source_url` | Base source URL for generated documentation |
@@ -190,7 +190,7 @@ Dependencies can point at local paths or Git repositories:
   name: "my_app",
   version: "0.1.0",
   kind: :bin,
-  root: "MyApp.main/1",
+  root: &MyApp.main/1,
   deps: [
     %Zap.Dep{name: "shared_utils", path: "../shared_utils"},
     %Zap.Dep{name: "parser", git_url: "https://github.com/example/parser.git", git_tag: "v1.0.0"}

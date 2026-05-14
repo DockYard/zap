@@ -15,12 +15,14 @@ pub struct Zap.Manifest {
   name :: String
   version :: String
   kind :: Atom
-  memory :: Memory.Manager = Memory.ARC
+  memory :: Type = Memory.ARC
 }
 ```
 
-The selected value is an implementation of the `Memory.Manager` protocol. The
-compiler evaluates one adapter method during manifest CTFE:
+The selected value is a first-class type reference. The compiler instantiates
+that type as an adapter value and validates that it implements the
+`Memory.Manager` protocol, then evaluates one adapter method during manifest
+CTFE:
 
 - `backend/1` delegates to `:zig.Memory.backend(manager)`.
 

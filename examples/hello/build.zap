@@ -6,7 +6,7 @@ pub struct Hello.Builder {
           name: "hello",
           version: "0.1.0",
           kind: :bin,
-          root: "Hello.main/1",
+          root: &Hello.main/1,
           paths: ["./*.zap"]
         }
       _ ->

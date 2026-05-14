@@ -748,7 +748,7 @@ pub struct TestProg.Builder {
     case env.target {
       :test_prog -> %Zap.Manifest{
         name: "test_prog", version: "0.1.0", kind: :bin,
-        root: "TestProg.main/0", paths: ["lib/**/*.zap"]
+        root: &TestProg.main/0, paths: ["lib/**/*.zap"]
       }
       _ -> panic("Unknown target")
     }

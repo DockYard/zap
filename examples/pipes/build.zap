@@ -6,7 +6,7 @@ pub struct Pipes.Builder {
           name: "pipes",
           version: "0.1.0",
           kind: :bin,
-          root: "Pipes.main/1",
+          root: &Pipes.main/1,
           paths: ["./*.zap"]
         }
       _ ->

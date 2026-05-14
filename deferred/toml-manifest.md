@@ -47,8 +47,13 @@ Example output:
 name = "foo_bar"
 version = "0.1.0"
 kind = "bin"
-root = "FooBar.main/1"
 paths = ["lib", "test"]
+
+[root]
+type = "function"
+struct = ["FooBar"]
+name = "main"
+arity = 1
 
 [build_opts]
 optimize = "release_safe"

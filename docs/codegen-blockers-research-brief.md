@@ -439,7 +439,7 @@ pub struct Divtest.Builder {
   pub fn manifest(_env :: Zap.Env) -> Zap.Manifest {
     %Zap.Manifest{
       name: "divtest", version: "0.0.1", kind: :bin,
-      root: "Divtest.main/1",
+      root: &Divtest.main/1,
       paths: ["./*.zap"],
       deps: [{:zap_stdlib, {:path, "/Users/bcardarella/projects/zap/lib"}}]
     }

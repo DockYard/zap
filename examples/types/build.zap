@@ -6,7 +6,7 @@ pub struct Types.Builder {
           name: "types",
           version: "0.1.0",
           kind: :bin,
-          root: "Types.main/1",
+          root: &Types.main/1,
           paths: ["./*.zap"]
         }
       _ ->

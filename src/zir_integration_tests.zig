@@ -155,7 +155,7 @@ fn compileOnlyWithDiagnostics(source: []const u8, diagnostics: CompileFailureDia
         \\          name: "test_prog",
         \\          version: "0.1.0",
         \\          kind: :bin,
-        \\          root: "TestProg.main/0",
+        \\          root: &TestProg.main/0,
         \\          paths: ["lib/**/*.zap"]
         \\        }
         \\      _ ->
@@ -204,7 +204,7 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
         \\          name: "test_prog",
         \\          version: "0.1.0",
         \\          kind: :bin,
-        \\          root: "TestProg.main/0",
+        \\          root: &TestProg.main/0,
         \\          paths: ["lib/**/*.zap"]
         \\        }
         \\      _ ->
@@ -303,7 +303,7 @@ fn compileAndRunWithEnvOptions(
         \\          name: "test_prog",
         \\          version: "0.1.0",
         \\          kind: :bin,
-        \\          root: "TestProg.main/0",
+        \\          root: &TestProg.main/0,
         \\          paths: ["lib/**/*.zap"]
         \\        }
         \\      _ ->
@@ -435,7 +435,7 @@ fn defaultTestProgBuildSource() []const u8 {
     \\          name: "test_prog",
     \\          version: "0.1.0",
     \\          kind: :bin,
-    \\          root: "TestProg.main/0",
+    \\          root: &TestProg.main/0,
     \\          paths: ["lib/**/*.zap"]
     \\        }
     \\      _ ->
@@ -522,7 +522,7 @@ test "ZIR memory manager: project-local third-party adapter builds and runs" {
         \\          name: "test_prog",
         \\          version: "0.1.0",
         \\          kind: :bin,
-        \\          root: "TestProg.main/0",
+        \\          root: &TestProg.main/0,
         \\          paths: ["lib/**/*.zap"],
         \\          memory: ThirdParty.ProjectArena
         \\        }
@@ -573,7 +573,7 @@ test "ZIR memory manager: dependency third-party adapter builds and runs" {
         \\          name: "test_prog",
         \\          version: "0.1.0",
         \\          kind: :bin,
-        \\          root: "TestProg.main/0",
+        \\          root: &TestProg.main/0,
         \\          paths: ["lib/**/*.zap"],
         \\          deps: [%Zap.Dep{name: "fake_mem", path: "deps/fake_mem"}],
         \\          memory: ThirdParty.DepArena
@@ -632,7 +632,7 @@ test "CLI: zap test runs Zest cases discovered by project-root relative pattern"
         \\          name: "zap_test",
         \\          version: "0.1.0",
         \\          kind: :bin,
-        \\          root: "TestRunner.main/1",
+        \\          root: &TestRunner.main/1,
         \\          paths: ["test/**/*_test.zap"]
         \\        }
         \\      _ ->
@@ -719,7 +719,7 @@ test "CLI: zap run doc-runner target generates documentation via Zap-side pipeli
         \\          name: "doc_example",
         \\          version: "0.1.0",
         \\          kind: :bin,
-        \\          root: "DocExample.Doc.Runner.main/1",
+        \\          root: &DocExample.Doc.Runner.main/1,
         \\          paths: ["lib/**/*.zap"],
         \\          deps: [%Zap.Dep{name: "zap_stdlib", path: "lib"}]
         \\        }

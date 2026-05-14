@@ -6,7 +6,7 @@ pub struct Arena.Builder {
           name: "arena",
           version: "0.1.0",
           kind: :bin,
-          root: "Arena.main/1",
+          root: &Arena.main/1,
           paths: ["./*.zap"],
           memory: Memory.Arena
         }

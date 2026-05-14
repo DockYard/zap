@@ -6,7 +6,7 @@ pub struct WhenMacro.Builder {
           name: "when_macro",
           version: "0.1.0",
           kind: :bin,
-          root: "WhenMacro.main/1",
+          root: &WhenMacro.main/1,
           paths: ["./*.zap"]
         }
       _ ->

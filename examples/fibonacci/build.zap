@@ -6,7 +6,7 @@ pub struct Fibonacci.Builder {
           name: "fibonacci",
           version: "0.1.0",
           kind: :bin,
-          root: "Fibonacci.main/1",
+          root: &Fibonacci.main/1,
           paths: ["./*.zap"]
         }
       _ ->

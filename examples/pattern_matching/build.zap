@@ -6,7 +6,7 @@ pub struct PatternMatching.Builder {
           name: "pattern_matching",
           version: "0.1.0",
           kind: :bin,
-          root: "PatternMatching.main/1",
+          root: &PatternMatching.main/1,
           paths: ["./*.zap"]
         }
       _ ->

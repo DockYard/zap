@@ -42,9 +42,10 @@ struct Zap do
     name :: String
     version :: String
     kind :: Atom
-    root :: String = ""
+    root :: Function | Nil = nil
     asset_name :: String = ""
     paths :: [String] = []
+    memory :: Type = Memory.ARC
     build_opts :: %{Atom => String | i64 | Bool | [String | i64 | Bool]} = %{}
   end
 end

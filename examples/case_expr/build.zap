@@ -6,7 +6,7 @@ pub struct CaseExpr.Builder {
           name: "case_expr",
           version: "0.1.0",
           kind: :bin,
-          root: "CaseExpr.main/1",
+          root: &CaseExpr.main/1,
           paths: ["./*.zap"]
         }
       _ ->

@@ -91,7 +91,7 @@ Every Zap project has a `build.zap` defining one or more build targets:
           name: "my_app",
           version: "0.1.0",
           kind: :bin,
-          root: "MyApp.main/1",
+          root: &MyApp.main/1,
           paths: ["./*.zap"],
           optimize: :release_fast,
           deps: [{:zap_stdlib, {:path, "../../lib"}}]

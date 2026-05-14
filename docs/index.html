@@ -197,7 +197,7 @@ zap deps update &lt;name&gt;         Re-resolve one dependency</code></pre>
       name: <span class="hl-string">"my_app"</span>,
       version: <span class="hl-string">"0.1.0"</span>,
       kind: <span class="hl-atom">:bin</span>,
-      root: <span class="hl-string">"MyApp.main/1"</span>,
+      root: &amp;MyApp.main/1,
       paths: [<span class="hl-string">"lib/**/*.zap"</span>],
       optimize: <span class="hl-atom">:release_safe</span>
     }
@@ -208,7 +208,7 @@ zap deps update &lt;name&gt;         Re-resolve one dependency</code></pre>
       name: <span class="hl-string">"my_app_test"</span>,
       version: <span class="hl-string">"0.1.0"</span>,
       kind: <span class="hl-atom">:bin</span>,
-      root: <span class="hl-string">"TestRunner.main/1"</span>,
+      root: &amp;TestRunner.main/1,
       paths: [<span class="hl-string">"lib/**/*.zap"</span>, <span class="hl-string">"test/**/*.zap"</span>],
       optimize: <span class="hl-atom">:debug</span>
     }
@@ -234,9 +234,10 @@ zap deps update &lt;name&gt;         Re-resolve one dependency</code></pre>
 <tr><td><code>name</code></td><td>Output artifact name</td></tr>
 <tr><td><code>version</code></td><td>Project version string</td></tr>
 <tr><td><code>kind</code></td><td><code>:bin</code>, <code>:lib</code>, <code>:obj</code>, or <code>:doc</code></td></tr>
-<tr><td><code>root</code></td><td>Entry point, formatted as <code>&quot;Struct.function/arity&quot;</code></td></tr>
+<tr><td><code>root</code></td><td>Entry point function reference, formatted as <code>&amp;Struct.function/arity</code></td></tr>
 <tr><td><code>paths</code></td><td>Source glob patterns, relative to the project root</td></tr>
 <tr><td><code>deps</code></td><td>Dependency declarations</td></tr>
+<tr><td><code>memory</code></td><td>Memory manager type reference, defaults to <code>Memory.ARC</code></td></tr>
 <tr><td><code>optimize</code></td><td><code>:debug</code>, <code>:release_safe</code>, <code>:release_fast</code>, or <code>:release_small</code></td></tr>
 <tr><td><code>test_timeout</code></td><td>Test timeout in milliseconds</td></tr>
 <tr><td><code>source_url</code></td><td>Base source URL for generated documentation</td></tr>
@@ -253,7 +254,7 @@ point and struct references.</p>
   name: <span class="hl-string">"my_app"</span>,
   version: <span class="hl-string">"0.1.0"</span>,
   kind: <span class="hl-atom">:bin</span>,
-  root: <span class="hl-string">"MyApp.main/1"</span>,
+  root: &amp;MyApp.main/1,
   deps: [
     {<span class="hl-atom">:shared_utils</span>, {<span class="hl-atom">:path</span>, <span class="hl-string">"../shared_utils"</span>}},
     {<span class="hl-atom">:parser</span>, {<span class="hl-atom">:git</span>, <span class="hl-string">"https://github.com/example/parser.git"</span>, tag: <span class="hl-string">"v1.0.0"</span>}}

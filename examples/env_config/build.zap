@@ -6,7 +6,7 @@ pub struct EnvConfig.Builder {
           name: "env_config",
           version: "0.1.0",
           kind: :bin,
-          root: "EnvConfig.main/1",
+          root: &EnvConfig.main/1,
           paths: ["./*.zap"]
         }
       _ ->

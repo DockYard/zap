@@ -6,7 +6,7 @@ pub struct WorkingDict.Builder {
           name: "working_dict",
           version: "0.1.0",
           kind: :bin,
-          root: "WorkingDict.main/1",
+          root: &WorkingDict.main/1,
           paths: ["./*.zap"],
           deps: [{:zap_stdlib, {:path, "/Users/bcardarella/projects/zap/lib"}}]
         }

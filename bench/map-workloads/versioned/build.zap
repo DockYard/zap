@@ -6,7 +6,7 @@ pub struct Versioned.Builder {
           name: "versioned",
           version: "0.1.0",
           kind: :bin,
-          root: "Versioned.main/1",
+          root: &Versioned.main/1,
           paths: ["./*.zap"],
           deps: [{:zap_stdlib, {:path, "/Users/bcardarella/projects/zap/lib"}}]
         }

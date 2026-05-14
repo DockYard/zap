@@ -6,7 +6,7 @@ pub struct UnlessMacro.Builder {
           name: "unless_macro",
           version: "0.1.0",
           kind: :bin,
-          root: "UnlessMacro.main/1",
+          root: &UnlessMacro.main/1,
           paths: ["./*.zap"]
         }
       _ ->

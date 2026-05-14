@@ -6,7 +6,7 @@ pub struct DefaultParams.Builder {
           name: "default_params",
           version: "0.1.0",
           kind: :bin,
-          root: "DefaultParams.main/1",
+          root: &DefaultParams.main/1,
           paths: ["./*.zap"]
         }
       _ ->

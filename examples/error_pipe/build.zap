@@ -6,7 +6,7 @@ pub struct ErrorPipe.Builder {
           name: "error_pipe",
           version: "0.1.0",
           kind: :bin,
-          root: "ErrorPipe.main/1",
+          root: &ErrorPipe.main/1,
           paths: ["./*.zap"]
         }
       _ ->

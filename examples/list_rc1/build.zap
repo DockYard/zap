@@ -6,7 +6,7 @@ pub struct ListRc1.Builder {
           name: "list_rc1",
           version: "0.1.0",
           kind: :bin,
-          root: "ListRc1.main/1",
+          root: &ListRc1.main/1,
           paths: ["./*.zap"]
         }
       _ ->

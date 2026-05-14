@@ -166,7 +166,7 @@ pub const ErrorInfo = struct {
 
 /// Discover all files reachable from the entry struct.
 ///
-/// `entry_struct` is e.g. "App" (extracted from build.zap root "App.main/0").
+/// `entry_struct` is e.g. "App" (extracted from a build.zap root such as &App.main/0).
 /// `source_roots` are directories to search for struct files, in priority order.
 /// The first root is typically the project's own lib dir.
 /// Name of the stdlib struct that's auto-imported into every Zap

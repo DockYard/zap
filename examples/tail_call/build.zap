@@ -6,7 +6,7 @@ pub struct TailCall.Builder {
           name: "tail_call",
           version: "0.1.0",
           kind: :bin,
-          root: "TailCall.main/1",
+          root: &TailCall.main/1,
           optimize: :release_safe,
           paths: ["./*.zap"]
         }

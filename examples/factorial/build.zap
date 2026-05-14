@@ -6,7 +6,7 @@ pub struct Factorial.Builder {
           name: "factorial",
           version: "0.1.0",
           kind: :bin,
-          root: "Factorial.main/1",
+          root: &Factorial.main/1,
           paths: ["./*.zap"]
         }
       _ ->

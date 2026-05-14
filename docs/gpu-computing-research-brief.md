@@ -590,7 +590,7 @@ pub struct MyApp.Builder {
           name: "my_app",
           version: "0.1.0",
           kind: :bin,
-          root: "MyApp.main/0",
+          root: &MyApp.main/0,
           deps: [
             {:math_webgpu, {:git, "https://github.com/zaplang/math_webgpu.zap", "v0.1.0"}}
           ]

@@ -6,7 +6,7 @@ pub struct Multifile.Builder {
           name: "multifile",
           version: "0.1.0",
           kind: :bin,
-          root: "App.main/1",
+          root: &App.main/1,
           paths: ["./*.zap"]
         }
       _ ->
