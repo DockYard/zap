@@ -527,11 +527,11 @@ pub const collect_arc_stats: bool = COLLECT_ARC_STATS_DEFAULT;
 //     pulls `runtime.zig` in as a Zig module without going through
 //     the user-binary `@embedFile` rewrite) sees the full inline-
 //     header layout and the existing retain/release semantics — a
-//     `Zap.Memory.ARC` build, byte-for-byte.
+//     `Memory.ARC` build, byte-for-byte.
 //   * For each Zap user binary, `compiler.getRuntimeSource(caps)`
 //     rewrites the literal to the resolved manager's `declared_caps`
 //     before injecting the source into the build. A binary that
-//     selects `Zap.Memory.Arena` or `Zap.Memory.NoOp` therefore sees
+//     selects `Memory.Arena` or `Memory.NoOp` therefore sees
 //     `RUNTIME_DECLARED_CAPS_DEFAULT == 0`, which collapses
 //     `refcount_v1_active` to `false` and drops the inline header
 //     plus every internal retain/release dispatch.
@@ -769,7 +769,7 @@ export fn zap_runtime_atomic_add_u32_acq_rel(ptr: *u32, delta: u32) callconv(.c)
 // the missing capability literally as `REFCOUNT_V1` so the user can
 // trace the failure back to the manifest's `memory:` selection. This
 // is a normative source-side invariant: tooling (e.g. the
-// `Zap.Memory.Arena` `@doc`, the Phase 6 codegen-elision plan,
+// `Memory.Arena` `@doc`, the Phase 6 codegen-elision plan,
 // any future diagnostics layer) relies on the `REFCOUNT_V1` token
 // appearing verbatim in the panic text. Every panic site in this
 // file that gates on `active_manager_state.refcount_capability == null` is
@@ -817,7 +817,7 @@ export fn zap_runtime_atomic_add_u32_acq_rel(ptr: *u32, delta: u32) callconv(.c)
 //   * For each Zap user binary, `compiler.getRuntimeSource(caps, tag)`
 //     rewrites the marker to the resolved manager's tag before
 //     injecting the source into the build. A binary built against
-//     `Zap.Memory.ARC` therefore sees `ACTIVE_MANAGER_TAG == .arc`,
+//     `Memory.ARC` therefore sees `ACTIVE_MANAGER_TAG == .arc`,
 //     which lets Phase 4's comptime branches call into the active
 //     manager's hot paths directly through `@import("zap_active_manager")`.
 // ============================================================
@@ -1227,7 +1227,7 @@ pub const AbiV1 = struct {
 // green the runtime defines a minimal in-source ARC manager under
 // `if (builtin.is_test)` below (`test_only_arc_core`) and binds it as
 // the active manager at startup. The test-only fallback mirrors the
-// production `Zap.Memory.ARC` manager byte-for-byte (same retain/release
+// production `Memory.ARC` manager byte-for-byte (same retain/release
 // semantics, same REFCOUNT_V1 declaration); the two implementations are
 // kept in lock-step via the spec contract and the shared `AbiV1` extern
 // types.
@@ -2465,7 +2465,7 @@ fn zapMemoryStartup() void {
     // will carry per-manager configuration into a stack-resident
     // `ZapInitOptions` whose `size` field reflects the caller's
     // knowledge of the option layout (spec §4.1). Phase 4 has no
-    // option-bearing manager — both `Zap.Memory.ARC` and the test
+    // option-bearing manager — both `Memory.ARC` and the test
     // fallback ignore the parameter — so we pass `null` and the
     // forward-extension contract is satisfied by the spec's "older
     // manager / newer compiler" branch (`options == null`).
@@ -4826,7 +4826,7 @@ pub const ArcRuntime = struct {
     /// active manager's REFCOUNT_V1 capability vtable. `header_ptr`
     /// must point at the `ArcHeader` at offset 0 of an inline-header
     /// cell (`Map(K,V)`, `List(T)`, `MapIter`, ...). The vtable's
-    /// `retain(ctx, ptr)` slot, for the first-party `Zap.Memory.ARC`
+    /// `retain(ctx, ptr)` slot, for the first-party `Memory.ARC`
     /// manager, performs an atomic `monotonic` increment on the 4-byte
     /// refcount at offset 0 of the cell. Future managers may use a
     /// completely different mechanism (e.g., generational refcounts).

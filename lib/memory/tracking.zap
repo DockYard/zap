@@ -1,5 +1,3 @@
-@memory_manager_source = "src/memory/tracking/manager.zig"
-
 @doc = """
   Diagnostic tracking memory manager. CI tool.
 
@@ -19,7 +17,7 @@
 
   ## Phase 7 status
 
-  As of Phase 7, the manager source at `@memory_manager_source` is
+  As of Phase 7, `Memory.Manager.primitive_source_path/1` identifies
   the production Tracking implementation: every `core.allocate`
   request becomes an inner `page_allocator` allocation of
   `leading_canary + size + trailing_canary` bytes, with the user
@@ -38,7 +36,7 @@
   Phase 6's codegen elision means programs built without
   `REFCOUNT_V1` route Map/List/String allocations through raw
   `core.allocate` (no refcount call sites). Building such a
-  program with `memory: Zap.Memory.Tracking` exercises the
+  program with `memory: Memory.Tracking` exercises the
   elision path under canary checks: any compiler-emitted alloc
   not matched by a corresponding `deallocate` becomes a leak
   report at exit, and any buffer overflow into the trailing
@@ -68,8 +66,46 @@
   if the program does not drive `core.deinit` on a clean exit
   path; in CI use this is acceptable because the OS reclaims
   everything at process exit. For production, use
-  `Zap.Memory.ARC` (default) or `Zap.Memory.Arena`.
+  `Memory.ARC` (default) or `Memory.Arena`.
   """
 
-pub struct Zap.Memory.Tracking {
+pub struct Memory.Tracking {
+}
+
+@doc = """
+  `Memory.Manager` adapter implementation for `Memory.Tracking`.
+  """
+
+pub impl Memory.Manager for Memory.Tracking {
+  @doc = """
+    Returns the public adapter name for the Tracking manager.
+    """
+
+  pub fn name(_manager :: Memory.Tracking) -> String {
+    "Memory.Tracking"
+  }
+
+  @doc = """
+    Returns the primitive source path for the Tracking manager.
+    """
+
+  pub fn primitive_source_path(_manager :: Memory.Tracking) -> String {
+    "src/memory/tracking/manager.zig"
+  }
+
+  @doc = """
+    Returns the Tracking manager's declared capability bitmask.
+    """
+
+  pub fn capability_mask(_manager :: Memory.Tracking) -> i64 {
+    0
+  }
+
+  @doc = """
+    Returns false because Tracking does not declare `REFCOUNT_V1`.
+    """
+
+  pub fn refcount_v1?(_manager :: Memory.Tracking) -> Bool {
+    false
+  }
 }

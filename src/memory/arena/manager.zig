@@ -1,4 +1,4 @@
-//! `Zap.Memory.Arena` — production whole-program arena memory manager.
+//! `Memory.Arena` — production whole-program arena memory manager.
 //!
 //! Phase 5 of the pluggable memory manager rollout — see
 //! `docs/memory-manager-abi.md` (especially sections 4, 10, and 14) for
@@ -7,7 +7,7 @@
 //! This file is the canonical first-party Arena implementation. It is
 //! compiled by the Zig-fork primitive `zap_fork_compile_zig_to_object`
 //! into a standalone object file that the Zap build pipeline links into
-//! every Zap binary whose manifest selects `Zap.Memory.Arena`. The
+//! every Zap binary whose manifest selects `Memory.Arena`. The
 //! manager declares zero capabilities (no REFCOUNT_V1) and exposes the
 //! mandatory v1.0 `ZapMemoryManagerCoreV1` vtable with a real allocator
 //! backing `core.allocate`.
@@ -22,7 +22,7 @@
 //!
 //! ## Architecture
 //!
-//! `Zap.Memory.Arena` wraps Zig 0.16's `std.heap.ArenaAllocator` backed
+//! `Memory.Arena` wraps Zig 0.16's `std.heap.ArenaAllocator` backed
 //! by `std.heap.page_allocator`. Every `core.allocate` request is
 //! served from the wrapped arena; every `core.deallocate` is a no-op
 //! because the arena reclaims its backing storage in a single bulk
@@ -40,7 +40,7 @@
 //! in the alloc hot path). The manager therefore needs no external
 //! mutex: `core.allocate` and `core.deallocate` are safe under any
 //! degree of multi-threaded contention. Spec section 4.7 carried a
-//! historical note that `Zap.Memory.Arena` would wrap `ArenaAllocator`
+//! historical note that `Memory.Arena` would wrap `ArenaAllocator`
 //! "with a mutex when called from the multi-threaded allocator path";
 //! that footnote pre-dates the 0.16 lock-free rewrite and is no longer
 //! applicable to this implementation.
@@ -57,7 +57,7 @@
 //! declares no `REFCOUNT_V1` can never service those calls, so the
 //! runtime must trap rather than silently miscompile.
 //!
-//! In practice this means Phase 5 makes `Zap.Memory.Arena` usable only
+//! In practice this means Phase 5 makes `Memory.Arena` usable only
 //! for programs whose allocations all flow through `core.allocate`
 //! (raw byte allocations from compiler-emitted code, non-refcounted
 //! data structures, transient scratch). Any program that constructs a
@@ -413,7 +413,7 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
 fn arenaRetainStub(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
     _ = ctx;
     _ = object;
-    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn arenaReleaseStub(
@@ -424,7 +424,7 @@ fn arenaReleaseStub(
     _ = ctx;
     _ = object;
     _ = deep_walk;
-    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn arenaRetainSizedStub(
@@ -437,7 +437,7 @@ fn arenaRetainSizedStub(
     _ = object;
     _ = size;
     _ = alignment;
-    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn arenaReleaseSizedStub(
@@ -452,7 +452,7 @@ fn arenaReleaseSizedStub(
     _ = size;
     _ = alignment;
     _ = deep_walk;
-    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn arenaAllocateRefcountedStub(
@@ -463,7 +463,7 @@ fn arenaAllocateRefcountedStub(
     _ = ctx;
     _ = size;
     _ = alignment;
-    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn arenaRefcountSizedStub(
@@ -476,7 +476,7 @@ fn arenaRefcountSizedStub(
     _ = object;
     _ = size;
     _ = alignment;
-    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn refcountSlabClassIndex(comptime size: usize, comptime alignment: u32) ?u32 {
@@ -488,14 +488,14 @@ pub inline fn refcountSlabClassIndex(comptime size: usize, comptime alignment: u
 pub inline fn allocateRefcountedClass(ctx: *anyopaque, comptime class_index: u32) ?[*]u8 {
     _ = ctx;
     _ = class_index;
-    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn retainSizedClass(ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) void {
     _ = ctx;
     _ = object;
     _ = class_index;
-    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn releaseSizedClass(
@@ -508,14 +508,14 @@ pub inline fn releaseSizedClass(
     _ = object;
     _ = class_index;
     _ = deep_walk;
-    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn refcountSizedClass(ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) u32 {
     _ = ctx;
     _ = object;
     _ = class_index;
-    @panic("Zap.Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Arena does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 // ---------------------------------------------------------------------------
@@ -542,7 +542,7 @@ pub const getCapabilityDesc = arenaGetCapabilityDesc;
 // ---------------------------------------------------------------------------
 // Uniform-interface alias signature lock
 //
-// `Zap.Memory.Arena` does NOT declare REFCOUNT_V1, so the refcount
+// `Memory.Arena` does NOT declare REFCOUNT_V1, so the refcount
 // aliases above point at panic-stub bodies. The bodies are never
 // invoked (the runtime's comptime dispatch elides those call sites
 // under no-REFCOUNT_V1 builds), but the panic-stub signatures still

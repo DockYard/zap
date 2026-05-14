@@ -2238,6 +2238,8 @@ pub const HirBuilder = struct {
         if (impl_d.target_type.parts.len == 0) return types_mod.TypeStore.UNKNOWN;
         const target_name = impl_d.target_type.parts[impl_d.target_type.parts.len - 1];
         const target_text = self.interner.get(target_name);
+        const full_target_name = try self.internDottedStructName(impl_d.target_type);
+        const full_target_text = self.interner.get(full_target_name);
 
         if (self.isNativeTypeName(.list, target_name) and impl_d.type_params.len == 1) {
             const element_name = self.interner.get(impl_d.type_params[0]);
@@ -2254,7 +2256,9 @@ pub const HirBuilder = struct {
         }
 
         if (impl_d.type_params.len > 0) {
-            const base = self.type_store.name_to_type.get(target_name) orelse
+            const base = self.type_store.name_to_type.get(full_target_name) orelse
+                self.type_store.name_to_type.get(target_name) orelse
+                self.type_store.resolveTypeName(full_target_text) orelse
                 self.type_store.resolveTypeName(target_text) orelse
                 types_mod.TypeStore.UNKNOWN;
             const args = try self.allocator.alloc(TypeId, impl_d.type_params.len);
@@ -2265,6 +2269,8 @@ pub const HirBuilder = struct {
             return try self.type_store.addType(.{ .applied = .{ .base = base, .args = args } });
         }
 
+        if (self.type_store.name_to_type.get(full_target_name)) |type_id| return type_id;
+        if (self.type_store.resolveTypeName(full_target_text)) |type_id| return type_id;
         if (self.type_store.resolveTypeName(target_text)) |type_id| return type_id;
         if (self.type_store.name_to_type.get(target_name)) |type_id| return type_id;
         return types_mod.TypeStore.UNKNOWN;
@@ -2492,8 +2498,7 @@ pub const HirBuilder = struct {
         const key = scope_mod.FamilyKey{ .name = func_name_id, .arity = arity };
         for (self.graph.structs.items) |struct_entry| {
             if (struct_entry.name.parts.len == 0) continue;
-            const last_part = self.interner.get(struct_entry.name.parts[struct_entry.name.parts.len - 1]);
-            if (!std.mem.eql(u8, last_part, struct_simple)) continue;
+            if (!self.structNameMatchesCallQualifier(struct_entry.name, struct_simple)) continue;
             const struct_scope = self.graph.getScope(struct_entry.scope_id);
             const fam_id = struct_scope.function_families.get(key) orelse continue;
             const family = self.graph.getFamily(fam_id);
@@ -2771,8 +2776,7 @@ pub const HirBuilder = struct {
     fn resolveCallInStruct(self: *HirBuilder, struct_name: []const u8, name: ast.StringId, arity: u32, args: []const CallArg) ?ResolvedFunctionCall {
         for (self.graph.structs.items) |struct_entry| {
             if (struct_entry.name.parts.len == 0) continue;
-            const last_part = self.interner.get(struct_entry.name.parts[struct_entry.name.parts.len - 1]);
-            if (!std.mem.eql(u8, last_part, struct_name)) continue;
+            if (!self.structNameMatchesCallQualifier(struct_entry.name, struct_name)) continue;
             return self.resolveCallInScope(struct_entry.scope_id, name, arity, args);
         }
         return null;
@@ -3191,7 +3195,7 @@ pub const HirBuilder = struct {
                 try arities.append(self.allocator, @intCast(sig.params.len));
             }
             try protocol_infos.append(self.allocator, .{
-                .name = proto.name.parts[proto.name.parts.len - 1],
+                .name = try self.internDottedStructName(proto.name),
                 .type_params = proto.decl.type_params,
                 .function_names = try names.toOwnedSlice(self.allocator),
                 .function_arities = try arities.toOwnedSlice(self.allocator),
@@ -3215,9 +3219,9 @@ pub const HirBuilder = struct {
             if (impl_entry.protocol_name.parts.len > 0 and impl_entry.target_type.parts.len > 0) {
                 const impl_type_data = try self.resolveImplProtocolTypeData(impl_entry.decl);
                 try impl_infos.append(self.allocator, .{
-                    .protocol_name = impl_entry.protocol_name.parts[impl_entry.protocol_name.parts.len - 1],
+                    .protocol_name = try self.internDottedStructName(impl_entry.protocol_name),
                     .protocol_type_args = impl_type_data.protocol_type_args,
-                    .target_struct = impl_entry.target_type.parts[impl_entry.target_type.parts.len - 1],
+                    .target_struct = try self.internDottedStructName(impl_entry.target_type),
                     .target_type_pattern = impl_type_data.target_type_pattern,
                     .impl_scope_id = impl_entry.scope_id,
                     .function_group_ids = try group_ids.toOwnedSlice(self.allocator),
@@ -4237,7 +4241,7 @@ pub const HirBuilder = struct {
                         rhs_expr.type_id;
                     if (operand_type != types_mod.TypeStore.UNKNOWN) {
                         if (self.type_store.typeToStructName(operand_type, self.interner)) |struct_name| {
-                            if (self.hasImpl(op_meta.protocol, struct_name)) {
+                            if (self.hasImplByText(op_meta.protocol, struct_name) != null) {
                                 var args: std.ArrayList(CallArg) = .empty;
                                 try args.append(self.allocator, .{ .expr = lhs_expr, .mode = .share });
                                 try args.append(self.allocator, .{ .expr = rhs_expr, .mode = .share });
@@ -4348,7 +4352,8 @@ pub const HirBuilder = struct {
                     const fa = call.callee.field_access;
                     if (fa.object.* == .struct_ref) {
                         const func_name = self.interner.get(fa.field);
-                        const initial_mod = self.structNameToString(fa.object.struct_ref.name);
+                        const written_struct_name = fa.object.struct_ref.name;
+                        const initial_mod = self.structNameToString(written_struct_name);
                         // Protocol-call dispatch: rewrite `Protocol.method(arg, ...)`
                         // to `Impl.method(arg, ...)` when the first arg's type has
                         // a matching impl. Mirrors the binary_op dispatch path so
@@ -4357,7 +4362,7 @@ pub const HirBuilder = struct {
                         // name when the call isn't protocol-qualified or the type
                         // is UNKNOWN.
                         const dispatched_mod = if (args.items.len > 0)
-                            self.protocolDispatchStruct(initial_mod, args.items[0].expr.type_id) orelse initial_mod
+                            self.protocolDispatchStruct(written_struct_name, args.items[0].expr.type_id) orelse initial_mod
                         else
                             initial_mod;
                         selected_call_info = self.resolveCallInStruct(dispatched_mod, fa.field, @intCast(call.args.len), args.items);
@@ -4873,7 +4878,12 @@ pub const HirBuilder = struct {
                 // Resolve struct type from struct name (e.g., %Point{x: 1, y: 2})
                 var struct_type_id = types_mod.TypeStore.UNKNOWN;
                 if (se.struct_name.parts.len > 0) {
-                    const type_name_id = se.struct_name.parts[se.struct_name.parts.len - 1];
+                    const full_type_name_id = try self.internDottedStructName(se.struct_name);
+                    const simple_type_name_id = se.struct_name.parts[se.struct_name.parts.len - 1];
+                    const type_name_id = if (self.type_store.name_to_type.get(full_type_name_id) != null)
+                        full_type_name_id
+                    else
+                        simple_type_name_id;
                     if (self.type_store.name_to_type.get(type_name_id)) |tid| {
                         struct_type_id = tid;
                     }
@@ -5095,6 +5105,18 @@ pub const HirBuilder = struct {
                                 .span = mr.meta.span,
                             });
                         }
+                    }
+                }
+                if (try self.resolveNominalStructRefType(mr.name)) |type_id| {
+                    if (self.isFieldlessStructType(type_id)) {
+                        return try self.create(Expr, .{
+                            .kind = .{ .struct_init = .{
+                                .type_id = type_id,
+                                .fields = &.{},
+                            } },
+                            .type_id = type_id,
+                            .span = mr.meta.span,
+                        });
                     }
                 }
                 return try self.create(Expr, .{
@@ -5336,7 +5358,7 @@ pub const HirBuilder = struct {
                 }
                 // Check if this is a protocol name — create a protocol_constraint type
                 for (self.graph.protocols.items) |proto| {
-                    if (proto.name.parts.len > 0 and proto.name.parts[proto.name.parts.len - 1] == n.name) {
+                    if (proto.name.parts.len > 0 and self.structNameMatchesText(proto.name, name_str)) {
                         // Resolve type parameters (e.g., Enumerable(member) → [type_var_for_member])
                         var type_params: std.ArrayList(types_mod.TypeId) = .empty;
                         for (n.args) |arg| {
@@ -5537,27 +5559,62 @@ pub const HirBuilder = struct {
         return name.joinedWith(self.allocator, self.interner, "_") catch self.interner.get(name.parts[0]);
     }
 
-    /// True iff `impl <protocol_simple> for <target_simple>` exists in the
-    /// scope graph. Both names are matched as single-part struct names —
-    /// adequate for the current built-in protocols (`Arithmetic`,
-    /// `Comparator`, etc.) that target single-segment types like
-    /// `Integer` or `Float`.
-    fn hasImpl(self: *const HirBuilder, protocol_simple: []const u8, target_simple: []const u8) bool {
-        for (self.graph.impls.items) |entry| {
-            if (entry.protocol_name.parts.len != 1 or entry.target_type.parts.len != 1) continue;
-            const p = self.interner.get(entry.protocol_name.parts[0]);
-            const t = self.interner.get(entry.target_type.parts[0]);
-            if (std.mem.eql(u8, p, protocol_simple) and std.mem.eql(u8, t, target_simple)) return true;
+    fn structNameMatchesText(self: *const HirBuilder, name: ast.StructName, text: []const u8) bool {
+        if (name.parts.len == 0) return false;
+        if (name.parts.len == 1) {
+            return std.mem.eql(u8, self.interner.get(name.parts[0]), text);
         }
-        return false;
+
+        const dotted = name.joinedWith(self.allocator, self.interner, ".") catch return false;
+        defer self.allocator.free(dotted);
+        return std.mem.eql(u8, dotted, text);
     }
 
-    /// True iff `name` matches a registered single-segment protocol
-    /// (e.g., `Enumerable`, `Arithmetic`).
-    fn isProtocolName(self: *const HirBuilder, name: []const u8) bool {
+    fn structNameMatchesCallQualifier(self: *const HirBuilder, name: ast.StructName, qualifier: []const u8) bool {
+        if (name.parts.len == 0) return false;
+
+        const last_part = self.interner.get(name.parts[name.parts.len - 1]);
+        if (std.mem.eql(u8, last_part, qualifier)) return true;
+
+        const prefix = self.structNameToString(name);
+        if (std.mem.eql(u8, prefix, qualifier)) return true;
+
+        return self.structNameMatchesText(name, qualifier);
+    }
+
+    fn internDottedStructName(self: *HirBuilder, name: ast.StructName) !ast.StringId {
+        if (name.parts.len == 0) return 0;
+        if (name.parts.len == 1) return name.parts[0];
+
+        var name_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer name_buf.deinit(self.allocator);
+        for (name.parts, 0..) |part, index| {
+            if (index > 0) try name_buf.append(self.allocator, '.');
+            try name_buf.appendSlice(self.allocator, self.interner.get(part));
+        }
+        const interner_mut = @constCast(self.interner);
+        return try interner_mut.intern(name_buf.items);
+    }
+
+    fn hasImpl(self: *const HirBuilder, protocol_name: ast.StructName, target_name: []const u8) ?ast.StructName {
+        for (self.graph.impls.items) |entry| {
+            if (!self.structNamesEqual(entry.protocol_name, protocol_name)) continue;
+            if (self.structNameMatchesText(entry.target_type, target_name)) return entry.target_type;
+        }
+        return null;
+    }
+
+    fn hasImplByText(self: *const HirBuilder, protocol_name: []const u8, target_name: []const u8) ?ast.StructName {
+        for (self.graph.impls.items) |entry| {
+            if (!self.structNameMatchesText(entry.protocol_name, protocol_name)) continue;
+            if (self.structNameMatchesText(entry.target_type, target_name)) return entry.target_type;
+        }
+        return null;
+    }
+
+    fn isProtocolName(self: *const HirBuilder, name: ast.StructName) bool {
         for (self.graph.protocols.items) |entry| {
-            if (entry.name.parts.len != 1) continue;
-            if (std.mem.eql(u8, self.interner.get(entry.name.parts[0]), name)) return true;
+            if (self.structNamesEqual(entry.name, name)) return true;
         }
         return false;
     }
@@ -5574,14 +5631,33 @@ pub const HirBuilder = struct {
     /// Callers fall through to the original struct name when null is returned.
     fn protocolDispatchStruct(
         self: *const HirBuilder,
-        mod_name: []const u8,
+        protocol_name: ast.StructName,
         first_arg_type: types_mod.TypeId,
     ) ?[]const u8 {
-        if (!self.isProtocolName(mod_name)) return null;
+        if (!self.isProtocolName(protocol_name)) return null;
         if (first_arg_type == types_mod.TypeStore.UNKNOWN) return null;
         const target_struct = self.type_store.typeToStructName(first_arg_type, self.interner) orelse return null;
-        if (!self.hasImpl(mod_name, target_struct)) return null;
-        return target_struct;
+        const impl_target = self.hasImpl(protocol_name, target_struct) orelse return null;
+        return self.structNameToString(impl_target);
+    }
+
+    fn resolveNominalStructRefType(self: *HirBuilder, struct_name: ast.StructName) !?types_mod.TypeId {
+        if (struct_name.parts.len == 0) return null;
+
+        const full_name = try self.internDottedStructName(struct_name);
+        if (self.type_store.name_to_type.get(full_name)) |type_id| return type_id;
+
+        if (struct_name.parts.len == 1) {
+            if (self.type_store.name_to_type.get(struct_name.parts[0])) |type_id| return type_id;
+        }
+
+        return null;
+    }
+
+    fn isFieldlessStructType(self: *const HirBuilder, type_id: types_mod.TypeId) bool {
+        if (type_id >= self.type_store.types.items.len) return false;
+        const typ = self.type_store.getType(type_id);
+        return typ == .struct_type and typ.struct_type.fields.len == 0;
     }
 
     /// Walk a block and stamp `expected_type` on any UNKNOWN-typed

@@ -1,4 +1,4 @@
-//! `Zap.Memory.NoOp` — production no-op memory manager.
+//! `Memory.NoOp` — production no-op memory manager.
 //!
 //! Declares zero capabilities, allocate returns null, deallocate is a no-op,
 //! `get_capability_desc` returns null for every ID. Conforms to the Memory
@@ -6,7 +6,7 @@
 //! sections 3, 4, and 14.
 //!
 //! This manager is the primary integration test target for the external-
-//! manager pipeline: a Zap program built with `memory: Zap.Memory.NoOp` in
+//! manager pipeline: a Zap program built with `memory: Memory.NoOp` in
 //! its build manifest compiles cleanly, the `.zapmem` section round-trips
 //! through the section parser, and the first allocation aborts with the
 //! documented OOM diagnostic.
@@ -234,7 +234,7 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
 fn noOpRetainStub(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
     _ = ctx;
     _ = object;
-    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn noOpReleaseStub(
@@ -245,7 +245,7 @@ fn noOpReleaseStub(
     _ = ctx;
     _ = object;
     _ = deep_walk;
-    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn noOpRetainSizedStub(
@@ -258,7 +258,7 @@ fn noOpRetainSizedStub(
     _ = object;
     _ = size;
     _ = alignment;
-    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn noOpReleaseSizedStub(
@@ -273,7 +273,7 @@ fn noOpReleaseSizedStub(
     _ = size;
     _ = alignment;
     _ = deep_walk;
-    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn noOpAllocateRefcountedStub(
@@ -284,7 +284,7 @@ fn noOpAllocateRefcountedStub(
     _ = ctx;
     _ = size;
     _ = alignment;
-    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn noOpRefcountSizedStub(
@@ -297,7 +297,7 @@ fn noOpRefcountSizedStub(
     _ = object;
     _ = size;
     _ = alignment;
-    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn refcountSlabClassIndex(comptime size: usize, comptime alignment: u32) ?u32 {
@@ -309,14 +309,14 @@ pub inline fn refcountSlabClassIndex(comptime size: usize, comptime alignment: u
 pub inline fn allocateRefcountedClass(ctx: *anyopaque, comptime class_index: u32) ?[*]u8 {
     _ = ctx;
     _ = class_index;
-    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn retainSizedClass(ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) void {
     _ = ctx;
     _ = object;
     _ = class_index;
-    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn releaseSizedClass(
@@ -329,14 +329,14 @@ pub inline fn releaseSizedClass(
     _ = object;
     _ = class_index;
     _ = deep_walk;
-    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn refcountSizedClass(ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) u32 {
     _ = ctx;
     _ = object;
     _ = class_index;
-    @panic("Zap.Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.NoOp does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +361,7 @@ pub const getCapabilityDesc = noOpGetCapabilityDesc;
 // ---------------------------------------------------------------------------
 // Uniform-interface alias signature lock
 //
-// `Zap.Memory.NoOp` does NOT declare REFCOUNT_V1, so the refcount
+// `Memory.NoOp` does NOT declare REFCOUNT_V1, so the refcount
 // aliases above point at panic-stub bodies. The bodies are never
 // invoked (the runtime's comptime dispatch elides those call sites
 // under no-REFCOUNT_V1 builds), but the panic-stub signatures still

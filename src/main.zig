@@ -1105,14 +1105,10 @@ fn buildTarget(
     var driver_diag_buf: [4096]u8 = undefined;
     var driver_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &driver_diag_buf };
 
-    // First-party `@memory_manager_source` paths are relative to the
-    // Zap source tree root (e.g., `src/memory/arc/manager.zig`).
-    // `detectZapLibDir` returns the path to the stdlib `lib/`
-    // subdirectory (which contains `kernel.zap`); the source tree root
-    // is the parent of that directory. When running from a checked-out
-    // Zap repository the parent contains `src/memory/arc/manager.zig`;
-    // when running from an installed `zig-out/`, the parent contains
-    // the bundled `src/memory/...` tree shipped alongside `lib/`.
+    // The Phase 1 memory driver still accepts a Zap source-tree root
+    // for legacy third-party `@memory_manager_source` path resolution.
+    // `detectZapLibDir` returns the stdlib `lib/` subdirectory; the
+    // source tree root is the parent of that directory.
     const zap_source_tree_root: []const u8 = if (zap_lib_dir) |lib_dir|
         (std.fs.path.dirname(lib_dir) orelse project_root)
     else
@@ -1585,8 +1581,8 @@ const IncrementalWatchState = struct {
     /// flow `buildTarget` uses, caches the resolved `declared_caps`,
     /// and persists the object path so every rebuild's link step
     /// picks up the same manager `.o`. All first-party managers
-    /// (`Zap.Memory.ARC`, `Zap.Memory.Arena`, `Zap.Memory.NoOp`,
-    /// `Zap.Memory.Leak`, `Zap.Memory.Tracking`) and third-party
+    /// (`Memory.ARC`, `Memory.Arena`, `Memory.NoOp`,
+    /// `Memory.Leak`, `Memory.Tracking`) and third-party
     /// managers flow through the same path — the cached caps drive
     /// codegen elision and the runtime-source rewrite so every
     /// rebuild produces a binary against the manager the manifest

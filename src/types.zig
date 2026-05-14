@@ -1523,29 +1523,70 @@ pub const TypeChecker = struct {
         if (protocol_name.parts.len == 0) return false;
         const typ = self.store.getType(type_id);
         if (typ != .protocol_constraint) return false;
-        return typ.protocol_constraint.protocol_name == protocol_name.parts[protocol_name.parts.len - 1];
+        return self.structNameMatchesTypeName(protocol_name, self.interner.get(typ.protocol_constraint.protocol_name));
     }
 
     fn implTargetForProtocolArgument(self: *const TypeChecker, protocol_name: ast.StructName, arg_type: TypeId) ?ast.StructName {
-        const target_simple = self.store.typeToStructName(arg_type, self.interner) orelse return null;
+        const target_type_name = self.store.typeToStructName(arg_type, self.interner) orelse return null;
         for (self.graph.impls.items) |entry| {
             if (!self.structNamesEqual(entry.protocol_name, protocol_name)) continue;
-            if (entry.target_type.parts.len != 1) continue;
-            const target_name = self.interner.get(entry.target_type.parts[0]);
-            if (std.mem.eql(u8, target_name, target_simple)) return entry.target_type;
+            if (self.structNameMatchesTypeName(entry.target_type, target_type_name)) return entry.target_type;
         }
         return null;
     }
 
     fn implTargetForProtocolId(self: *const TypeChecker, protocol_name: ast.StringId, arg_type: TypeId) ?ast.StructName {
-        const target_simple = self.store.typeToStructName(arg_type, self.interner) orelse return null;
+        const target_type_name = self.store.typeToStructName(arg_type, self.interner) orelse return null;
+        const protocol_type_name = self.interner.get(protocol_name);
         for (self.graph.impls.items) |entry| {
-            if (entry.protocol_name.parts.len != 1 or entry.protocol_name.parts[0] != protocol_name) continue;
-            if (entry.target_type.parts.len != 1) continue;
-            const target_name = self.interner.get(entry.target_type.parts[0]);
-            if (std.mem.eql(u8, target_name, target_simple)) return entry.target_type;
+            if (!self.structNameMatchesTypeName(entry.protocol_name, protocol_type_name)) continue;
+            if (self.structNameMatchesTypeName(entry.target_type, target_type_name)) return entry.target_type;
         }
         return null;
+    }
+
+    fn resolveNominalStructRefType(self: *TypeChecker, struct_name: ast.StructName) !?TypeId {
+        if (struct_name.parts.len == 0) return null;
+
+        const full_name = try self.internDottedStructName(struct_name);
+        if (self.store.name_to_type.get(full_name)) |type_id| return type_id;
+
+        if (struct_name.parts.len == 1) {
+            if (self.store.name_to_type.get(struct_name.parts[0])) |type_id| return type_id;
+        }
+
+        return null;
+    }
+
+    fn isFieldlessStructType(self: *const TypeChecker, type_id: TypeId) bool {
+        if (type_id >= self.store.types.items.len) return false;
+        const typ = self.store.getType(type_id);
+        return typ == .struct_type and typ.struct_type.fields.len == 0;
+    }
+
+    fn structNameMatchesTypeName(self: *const TypeChecker, struct_name: ast.StructName, type_name: []const u8) bool {
+        if (struct_name.parts.len == 0) return false;
+        if (struct_name.parts.len == 1) {
+            return std.mem.eql(u8, self.interner.get(struct_name.parts[0]), type_name);
+        }
+
+        const dotted_name = struct_name.joinedWith(self.allocator, self.interner, ".") catch return false;
+        defer self.allocator.free(dotted_name);
+        return std.mem.eql(u8, dotted_name, type_name);
+    }
+
+    fn internDottedStructName(self: *TypeChecker, struct_name: ast.StructName) !ast.StringId {
+        if (struct_name.parts.len == 0) return 0;
+        if (struct_name.parts.len == 1) return struct_name.parts[0];
+
+        var name_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer name_buf.deinit(self.allocator);
+        for (struct_name.parts, 0..) |part, index| {
+            if (index > 0) try name_buf.append(self.allocator, '.');
+            try name_buf.appendSlice(self.allocator, self.interner.get(part));
+        }
+        const interner_mut = @constCast(self.interner);
+        return try interner_mut.intern(name_buf.items);
     }
 
     fn structNamesEqual(_: *const TypeChecker, lhs: ast.StructName, rhs: ast.StructName) bool {
@@ -4297,7 +4338,12 @@ pub const TypeChecker = struct {
             .struct_expr => |se| {
                 // Resolve struct type from struct name annotation
                 if (se.struct_name.parts.len > 0) {
-                    const type_name_id = se.struct_name.parts[se.struct_name.parts.len - 1];
+                    const full_type_name_id = try self.internDottedStructName(se.struct_name);
+                    const simple_type_name_id = se.struct_name.parts[se.struct_name.parts.len - 1];
+                    const type_name_id = if (self.store.name_to_type.get(full_type_name_id) != null)
+                        full_type_name_id
+                    else
+                        simple_type_name_id;
                     if (self.store.name_to_type.get(type_name_id)) |tid| {
                         const typ = self.store.getType(tid);
                         if (typ == .struct_type) {
@@ -4334,31 +4380,28 @@ pub const TypeChecker = struct {
                                     for (self.graph.types.items) |te| {
                                         if (te.kind == .struct_type) {
                                             const sd = te.kind.struct_type;
-                                            if (sd.name.parts.len > 0) {
-                                                const n = sd.name.parts[0];
-                                                if (n == type_name_id) {
-                                                    for (sd.fields) |f| {
-                                                        if (f.name == req_field.name and f.default != null) {
-                                                            has_default = true;
-                                                            break;
-                                                        }
+                                            if (te.name == type_name_id) {
+                                                for (sd.fields) |f| {
+                                                    if (f.name == req_field.name and f.default != null) {
+                                                        has_default = true;
+                                                        break;
                                                     }
-                                                    // Also check parent fields for defaults
-                                                    if (!has_default and sd.parent != null) {
-                                                        // Parent fields don't have defaults accessible here,
-                                                        // so we check the parent's AST
-                                                        if (sd.parent) |parent_name| {
-                                                            for (self.graph.types.items) |pte| {
-                                                                if (pte.kind == .struct_type) {
-                                                                    const psd = pte.kind.struct_type;
-                                                                    if (psd.name.parts.len > 0) {
-                                                                        const pn = psd.name.parts[0];
-                                                                        if (pn == parent_name) {
-                                                                            for (psd.fields) |pf| {
-                                                                                if (pf.name == req_field.name and pf.default != null) {
-                                                                                    has_default = true;
-                                                                                    break;
-                                                                                }
+                                                }
+                                                // Also check parent fields for defaults
+                                                if (!has_default and sd.parent != null) {
+                                                    // Parent fields don't have defaults accessible here,
+                                                    // so we check the parent's AST
+                                                    if (sd.parent) |parent_name| {
+                                                        for (self.graph.types.items) |pte| {
+                                                            if (pte.kind == .struct_type) {
+                                                                const psd = pte.kind.struct_type;
+                                                                if (psd.name.parts.len > 0) {
+                                                                    const pn = psd.name.parts[0];
+                                                                    if (pn == parent_name) {
+                                                                        for (psd.fields) |pf| {
+                                                                            if (pf.name == req_field.name and pf.default != null) {
+                                                                                has_default = true;
+                                                                                break;
                                                                             }
                                                                         }
                                                                     }
@@ -4366,8 +4409,8 @@ pub const TypeChecker = struct {
                                                             }
                                                         }
                                                     }
-                                                    break;
                                                 }
+                                                break;
                                             }
                                         }
                                     }
@@ -4520,6 +4563,9 @@ pub const TypeChecker = struct {
                             return tid;
                         }
                     }
+                }
+                if (try self.resolveNominalStructRefType(mr.name)) |tid| {
+                    if (self.isFieldlessStructType(tid)) return tid;
                 }
                 return TypeStore.UNKNOWN;
             },
@@ -5140,7 +5186,7 @@ pub const TypeChecker = struct {
 
                 // Check if this is a protocol name
                 for (self.graph.protocols.items) |proto| {
-                    if (proto.name.parts.len > 0 and proto.name.parts[proto.name.parts.len - 1] == tn.name) {
+                    if (proto.name.parts.len > 0 and self.structNameMatchesTypeName(proto.name, name)) {
                         // Protocol constraint — resolve type params and create constraint type
                         var type_params: std.ArrayList(TypeId) = .empty;
                         for (tn.args) |arg| {

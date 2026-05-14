@@ -1,5 +1,3 @@
-@memory_manager_source = "src/memory/leak/manager.zig"
-
 @doc = """
   Diagnostic leak-everything memory manager. CI tool.
 
@@ -10,7 +8,7 @@
 
   ## Phase 7 status
 
-  As of Phase 7, the manager source at `@memory_manager_source` is
+  As of Phase 7, `Memory.Manager.primitive_source_path/1` identifies
   the production Leak implementation: `core.allocate` returns real
   memory backed by `page_allocator`, `core.deallocate` is a no-op,
   and `core.get_capability_desc` returns `null` for every ID. The
@@ -23,7 +21,7 @@
 
   ### 1. Codegen elision verification
 
-  A Zap binary built with `memory: Zap.Memory.Leak` declares zero
+  A Zap binary built with `memory: Memory.Leak` declares zero
   capabilities (no `REFCOUNT_V1`). Under Phase 6's conditional
   layout + codegen elision the compiler must emit zero retain/
   release call sites. The output binary's `.text` should contain no
@@ -48,10 +46,48 @@
   with Leak will exhaust the process's address space and abort with
   OOM the moment `mmap` (or the host-OS equivalent) refuses another
   page. For BEAM-style "leak until exit but bulk-free on shutdown"
-  semantics, use `Zap.Memory.Arena` instead — it has the same
+  semantics, use `Memory.Arena` instead — it has the same
   no-individual-deallocation surface but reclaims its backing
   storage in a single bulk free at `core.deinit`.
   """
 
-pub struct Zap.Memory.Leak {
+pub struct Memory.Leak {
+}
+
+@doc = """
+  `Memory.Manager` adapter implementation for `Memory.Leak`.
+  """
+
+pub impl Memory.Manager for Memory.Leak {
+  @doc = """
+    Returns the public adapter name for the Leak manager.
+    """
+
+  pub fn name(_manager :: Memory.Leak) -> String {
+    "Memory.Leak"
+  }
+
+  @doc = """
+    Returns the primitive source path for the Leak manager.
+    """
+
+  pub fn primitive_source_path(_manager :: Memory.Leak) -> String {
+    "src/memory/leak/manager.zig"
+  }
+
+  @doc = """
+    Returns the Leak manager's declared capability bitmask.
+    """
+
+  pub fn capability_mask(_manager :: Memory.Leak) -> i64 {
+    0
+  }
+
+  @doc = """
+    Returns false because Leak does not declare `REFCOUNT_V1`.
+    """
+
+  pub fn refcount_v1?(_manager :: Memory.Leak) -> Bool {
+    false
+  }
 }

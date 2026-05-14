@@ -1,4 +1,4 @@
-//! `Zap.Memory.Tracking` — diagnostic tracking memory manager.
+//! `Memory.Tracking` — diagnostic tracking memory manager.
 //!
 //! Phase 7 of the pluggable memory manager rollout — see
 //! `docs/memory-manager-abi.md` (especially sections 4, 10, and 14) for
@@ -43,7 +43,7 @@
 //!
 //! ## Architecture
 //!
-//! `Zap.Memory.Tracking` wraps `std.heap.page_allocator` as its inner
+//! `Memory.Tracking` wraps `std.heap.page_allocator` as its inner
 //! allocator. Every `core.allocate(size, alignment)` becomes an inner
 //! allocation of `leading_canary + size + trailing_canary` bytes, with
 //! the user pointer offset past the leading canary. The leading-canary
@@ -805,7 +805,7 @@ const ZapMemorySection = extern struct {
 fn trackingRetainStub(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
     _ = ctx;
     _ = object;
-    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn trackingReleaseStub(
@@ -816,7 +816,7 @@ fn trackingReleaseStub(
     _ = ctx;
     _ = object;
     _ = deep_walk;
-    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn trackingRetainSizedStub(
@@ -829,7 +829,7 @@ fn trackingRetainSizedStub(
     _ = object;
     _ = size;
     _ = alignment;
-    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn trackingReleaseSizedStub(
@@ -844,7 +844,7 @@ fn trackingReleaseSizedStub(
     _ = size;
     _ = alignment;
     _ = deep_walk;
-    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn trackingAllocateRefcountedStub(
@@ -855,7 +855,7 @@ fn trackingAllocateRefcountedStub(
     _ = ctx;
     _ = size;
     _ = alignment;
-    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn trackingRefcountSizedStub(
@@ -868,7 +868,7 @@ fn trackingRefcountSizedStub(
     _ = object;
     _ = size;
     _ = alignment;
-    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn refcountSlabClassIndex(comptime size: usize, comptime alignment: u32) ?u32 {
@@ -880,14 +880,14 @@ pub inline fn refcountSlabClassIndex(comptime size: usize, comptime alignment: u
 pub inline fn allocateRefcountedClass(ctx: *anyopaque, comptime class_index: u32) ?[*]u8 {
     _ = ctx;
     _ = class_index;
-    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn retainSizedClass(ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) void {
     _ = ctx;
     _ = object;
     _ = class_index;
-    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn releaseSizedClass(
@@ -900,14 +900,14 @@ pub inline fn releaseSizedClass(
     _ = object;
     _ = class_index;
     _ = deep_walk;
-    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn refcountSizedClass(ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) u32 {
     _ = ctx;
     _ = object;
     _ = class_index;
-    @panic("Zap.Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Tracking does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 // ---------------------------------------------------------------------------
@@ -932,7 +932,7 @@ pub const getCapabilityDesc = trackingGetCapabilityDesc;
 // ---------------------------------------------------------------------------
 // Uniform-interface alias signature lock
 //
-// `Zap.Memory.Tracking` does NOT declare REFCOUNT_V1, so the refcount
+// `Memory.Tracking` does NOT declare REFCOUNT_V1, so the refcount
 // aliases above point at panic-stub bodies. The bodies are never
 // invoked (the runtime's comptime dispatch elides those call sites
 // under no-REFCOUNT_V1 builds), but the panic-stub signatures still

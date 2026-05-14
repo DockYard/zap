@@ -109,12 +109,6 @@ pub const Collector = struct {
         // Range, String) reads this registry instead of comparing
         // struct names against hardcoded string literals.
         self.registerNativeTypes();
-
-        // Fifth pass: register field-free structs that carry a
-        // `@memory_manager_source` attribute as nominal user types so
-        // `Zap.Manifest`'s `memory :: Zap.Memory.ARC` annotation resolves.
-        // See `registerMemoryManagerStructTypes`.
-        try self.registerMemoryManagerStructTypes();
     }
 
     pub fn collectProgramSurface(self: *Collector, program: *const ast.Program) !void {
@@ -207,11 +201,6 @@ pub const Collector = struct {
 
         // Fourth pass: see `collectProgram` for rationale.
         self.registerNativeTypes();
-
-        // Fifth pass: register field-free memory-manager structs (see
-        // `collectProgram` for rationale and `registerMemoryManagerStructTypes`
-        // for the implementation).
-        try self.registerMemoryManagerStructTypes();
     }
 
     /// Scan all collected struct entries and register any that opt in
@@ -235,66 +224,6 @@ pub const Collector = struct {
                 if (entry.name.parts.len != 1) continue;
                 self.graph.registerNativeType(kind, entry.name.parts[0]);
             }
-        }
-    }
-
-    /// Register every field-free struct that carries a
-    /// `@memory_manager_source` attribute as a nominal user type so
-    /// `:: Zap.Memory.ARC` style annotations on `Zap.Manifest.memory`
-    /// resolve. Mirrors the role `registerNativeTypes` plays for
-    /// `@native_type` — runs after attribute attachment so the attribute
-    /// rows are visible. Structs with fields are already registered by
-    /// `collectStruct`; this pass only catches the empty-body case
-    /// (`Zap.Memory.ARC`, `Zap.Memory.Arena`, `Zap.Memory.NoOp`).
-    fn registerMemoryManagerStructTypes(self: *Collector) !void {
-        const attr_id = self.interner.lookupExisting("memory_manager_source") orelse return;
-        for (self.graph.structs.items) |entry| {
-            // Skip structs that already produced a type entry — either
-            // because they have fields, or because a sibling pass added
-            // one. `name_to_type` is keyed by the interned StringId of
-            // the dotted name; we re-derive it the same way
-            // `collectStruct` does.
-            if (entry.decl.fields.len > 0) continue;
-            if (entry.name.parts.len == 0) continue;
-
-            // Does this struct carry the attribute?
-            var found = false;
-            for (entry.attributes.items) |attr| {
-                if (attr.name == attr_id) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) continue;
-
-            // Compose the dotted-name StringId, matching what
-            // `collectStruct`'s registerType call used. The scratch
-            // buffer is freed unconditionally — `intern` copies its
-            // input — and any OOM during composition propagates as
-            // a hard error so a truncated name never reaches the
-            // type-name registry.
-            const type_name_id = if (entry.name.parts.len == 1)
-                entry.name.parts[0]
-            else blk: {
-                var name_buf: std.ArrayListUnmanaged(u8) = .empty;
-                defer name_buf.deinit(self.allocator);
-                for (entry.name.parts, 0..) |part, i| {
-                    if (i > 0) try name_buf.appendSlice(self.allocator, ".");
-                    try name_buf.appendSlice(self.allocator, self.interner.get(part));
-                }
-                const interner_mut = @constCast(self.interner);
-                break :blk try interner_mut.intern(name_buf.items);
-            };
-
-            // Skip if already registered (e.g., second pass on same struct).
-            if (self.graph.resolveTypeByName(type_name_id) != null) continue;
-
-            _ = try self.graph.registerType(
-                type_name_id,
-                entry.scope_id,
-                .{ .struct_type = entry.decl },
-                &.{},
-            );
         }
     }
 
@@ -376,12 +305,10 @@ pub const Collector = struct {
         try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(mod.meta.span), mod_scope);
         try self.graph.registerStruct(mod.name, mod_scope, mod);
 
-        // If the struct has fields, also register it as a type so the type checker can find it.
-        // Empty struct bodies (e.g., Memory Manager ABI v1.0 stdlib
-        // structs like `Zap.Memory.ARC`) are registered in a later pass
-        // by `registerMemoryManagerStructTypes`, after attribute rows
-        // attach to the StructEntry.
-        if (mod.fields.len > 0 and mod.name.parts.len > 0) {
+        // Data structs and truly empty marker structs are nominal types.
+        // Function-only structs remain module-like namespaces and are not
+        // registered as value types.
+        if ((mod.fields.len > 0 or mod.items.len == 0) and mod.name.parts.len > 0) {
             // Build the full qualified name (e.g., "Zap.Env") for type
             // registration. The scratch buffer is freed unconditionally —
             // `intern` copies its input — and any OOM during composition
@@ -1377,6 +1304,28 @@ test "collect struct declaration" {
     try collector.collectProgram(&program);
 
     // Should have 1 type registered (struct)
+    try std.testing.expectEqual(@as(usize, 1), collector.graph.types.items.len);
+    try std.testing.expect(collector.graph.types.items[0].kind == .struct_type);
+}
+
+test "collect empty struct declaration registers nominal type" {
+    const source =
+        \\pub struct Memory.ARC {
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
     try std.testing.expectEqual(@as(usize, 1), collector.graph.types.items.len);
     try std.testing.expect(collector.graph.types.items[0].kind == .struct_type);
 }

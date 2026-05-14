@@ -2,7 +2,7 @@
 
 **Status:** Normative. Final for v1.0. Any incompatible change requires an ABI major bump (v2.0).
 
-**Audience:** Third-party authors of Zap memory managers, contributors to the Zap compiler and runtime, and authors of the first-party `Zap.Memory.ARC` and `Zap.Memory.Arena` managers.
+**Audience:** Third-party authors of Zap memory managers, contributors to the Zap compiler and runtime, and authors of the first-party `Memory.ARC` and `Memory.Arena` managers.
 
 **Scope:** This document specifies the binary interface, build-time discovery protocol, and semantic contract that every Zap memory manager — first-party or third-party — must implement. The specification is normative: ambiguity in this document is a defect of this document, not a license for implementer choice.
 
@@ -10,31 +10,46 @@
 
 ## 1. Overview
 
-A Zap memory manager is a Zig package that supplies the runtime allocation, deallocation, and (optionally) reference-counting, finalization, weak-reference, and other memory-related primitives that a Zap binary needs. Exactly one manager is selected per binary at build time via the project's `build.zap` manifest:
+A Zap memory manager is a Zig package plus a Zap adapter struct. The
+Zig package supplies runtime allocation, deallocation, and optionally
+reference-counting, finalization, weak-reference, and other
+memory-related primitives. The Zap adapter implements `Memory.Manager`
+and gives the source-level program a stable, public manager name.
+Exactly one manager is selected per binary at build time via the
+project's `build.zap` manifest:
 
 ```
 %Zap.Manifest{
   name: "my_app",
-  memory: Zap.Memory.ARC,    # or Zap.Memory.Arena, or any third-party Zap struct
+  memory: Memory.ARC,    # or Memory.Arena
   ...
 }
 ```
 
-The compiler treats first-party (`Zap.Memory.ARC`, `Zap.Memory.Arena`) and third-party managers identically. There is no hardcoded knowledge of any specific manager in the Zig compiler sources. Manager resolution is fully data-driven via the `@memory_manager_source` attribute on the Zap struct.
+Phase 1 source model: first-party managers are top-level adapters
+(`Memory.ARC`, `Memory.Arena`, `Memory.NoOp`, `Memory.Leak`,
+`Memory.Tracking`) that implement `Memory.Manager`. The compiler still
+uses its existing first-party `BuiltinManagerTag` short-circuit and the
+legacy third-party `@memory_manager_source` discovery path until the
+Phase 2 resolver removes that hardcoding. The public Zap namespace is
+`Memory.*`.
 
 ### 1.1 The build pipeline at a glance
 
 ```
-Zap.Manifest.memory: Zap.Memory.ARC
+Zap.Manifest.memory: Memory.ARC
         |
         v
-Resolve struct -> @memory_manager_source attribute
+Resolve adapter name
         |
         v
-Generic Zig-fork primitive: compile <manager>.zig to <manager>.o
+First-party: classify BuiltinManagerTag and register embedded primitive source
+Third-party Phase 1 legacy path: read @memory_manager_source and compile <manager>.zig
         |
         v
-Parse .zapmem section from <manager>.o (ELF/Mach-O/COFF)
+Resolve manager metadata
+  First-party Phase 1 path: BuiltinManagerTag tables
+  Third-party Phase 1 legacy path: parse .zapmem from <manager>.o
         |
         v
 Validate ZapMemoryManagerMetaV1 + embedded ZapMemoryManagerCoreV1
@@ -49,21 +64,30 @@ Thread declared_caps into codegen
   (retain/release calls elided if REFCOUNT_V1 absent)
         |
         v
-Link <manager>.o into final Zap binary
+Link or register the active primitive implementation in the final Zap binary
 ```
 
 ### 1.2 First-party manager locations
 
-| Manager              | Zap struct           | Zap source                         | Zig source                                  |
-|----------------------|----------------------|------------------------------------|---------------------------------------------|
-| `Zap.Memory.ARC`     | `Zap.Memory.ARC`     | `lib/zap/memory/arc.zap`           | `src/runtime/memory/arc/manager.zig`        |
-| `Zap.Memory.Arena`   | `Zap.Memory.Arena`   | `lib/zap/memory/arena.zap`         | `src/runtime/memory/arena/manager.zig`      |
+| Manager | Zap adapter | Zap source | Zig source |
+|---|---|---|---|
+| `Memory.ARC` | `Memory.ARC` | `lib/memory/arc.zap` | `src/memory/arc/manager.zig` |
+| `Memory.Arena` | `Memory.Arena` | `lib/memory/arena.zap` | `src/memory/arena/manager.zig` |
+| `Memory.NoOp` | `Memory.NoOp` | `lib/memory/no_op.zap` | `src/memory/no_op/manager.zig` |
+| `Memory.Leak` | `Memory.Leak` | `lib/memory/leak.zap` | `src/memory/leak/manager.zig` |
+| `Memory.Tracking` | `Memory.Tracking` | `lib/memory/tracking.zap` | `src/memory/tracking/manager.zig` |
 
-Third-party managers may live anywhere on the filesystem; the `@memory_manager_source` attribute carries the path. Architectural conventions for a production manager (slab pooling, size-class buckets, atomic per-cell headers) are out of scope for this specification; the goal here is the wire contract, not implementation guidance.
+Third-party managers may live anywhere on the filesystem. In Phase 1,
+third-party managers still use the legacy `@memory_manager_source`
+discovery path; the target model is the same `Memory.Manager` adapter
+contract used by first-party managers. Architectural conventions for a
+production manager (slab pooling, size-class buckets, atomic per-cell
+headers) are out of scope for this specification; the goal here is the
+wire contract, not implementation guidance.
 
 ### 1.3 What this ABI does NOT cover
 
-- **Per-process manager selection.** v1 ships a single manager per binary. The future BEAM-style `Process.spawn(memory: Zap.Memory.Arena)` model is reserved for v2.
+- **Per-process manager selection.** v1 ships a single manager per binary. The future BEAM-style `Process.spawn(memory: Memory.Arena)` model is reserved for v2.
 - **Cross-manager object sharing.** Forbidden in v1 (see section 13).
 - **Tracing garbage collection.** Reserved (see section 9); no v1 manager may implement it.
 - **Region-based memory management.** Reserved; no v1 manager may implement it.
@@ -538,7 +562,7 @@ When a manager cannot satisfy an `allocate` request:
    ```
    zap: out of memory: requested <size> bytes (alignment <alignment>) from manager <manager_name>; aborting
    ```
-   The `<manager_name>` is read from the manager's stdlib struct path (e.g., `Zap.Memory.ARC`).
+   The `<manager_name>` is read from the manager's stdlib struct path (e.g., `Memory.ARC`).
 3. Managers must not call `std.process.abort`, `std.process.exit`, or perform IO during the allocation path. The runtime owns the OOM diagnostic.
 4. Behavior on allocation success but partial fill (e.g., backing-store partial failure) is undefined; managers must either fully succeed or return null.
 
@@ -583,7 +607,7 @@ All managers shipped with v1.0 must be thread-safe — that is, `allocate`, `dea
 
 `init` is called on the thread that invokes the Zap runtime startup. `deinit` is called on the same thread at shutdown. The runtime guarantees that during init and deinit, no other thread will call any function on this manager. Managers may assume single-threaded access to themselves during these phases.
 
-Zig 0.16's `std.heap.ArenaAllocator` is not lock-free, so `Zap.Memory.Arena` wraps it with a mutex when called from the multi-threaded allocator path; managers built on lock-free pools may avoid the extra synchronization.
+Zig 0.16's `std.heap.ArenaAllocator` is not lock-free, so `Memory.Arena` wraps it with a mutex when called from the multi-threaded allocator path; managers built on lock-free pools may avoid the extra synchronization.
 
 ---
 
@@ -913,7 +937,7 @@ Reserved upper bound: the compiler caps the accepted `desc.size` at `8 * sizeof(
 
 The compiler-emitted layout for refcounted cells (under a manager that declares `REFCOUNT_V1`) includes an inline header carrying the refcount and a type tag. The exact layout is private to the compiler/runtime and may change between Zap releases; managers must treat the pointer passed to `retain` / `release` as opaque and may not inspect the cell's contents.
 
-When a manager does NOT declare `REFCOUNT_V1`, the compiler omits the refcount header entirely from the cell layout. Object pointers in this configuration point directly at the first user field. This is the conditional-layout mechanism that makes `Zap.Memory.Arena` cell-overhead-free.
+When a manager does NOT declare `REFCOUNT_V1`, the compiler omits the refcount header entirely from the cell layout. Object pointers in this configuration point directly at the first user field. This is the conditional-layout mechanism that makes `Memory.Arena` cell-overhead-free.
 
 ### 8.2 Who frees the cell
 
@@ -1029,29 +1053,26 @@ This section describes the exact sequence of build-time operations the Zap compi
 
 ```
 Step 1. Parse the project's build.zap and load the manifest.
-        The manifest's `memory:` field names a Zap struct
-        (e.g., Zap.Memory.ARC, Zap.Memory.Arena, or any third-party struct).
+        The manifest's `memory:` field names a Zap memory adapter
+        (e.g., Memory.ARC or Memory.Arena).
 
-Step 2. Resolve the struct reference to its source file.
-        Read the struct's @memory_manager_source attribute, which
-        contains a path to a Zig source file relative to either the
-        Zap stdlib (for first-party managers) or the project root
-        (for third-party managers).
+Step 2. Resolve the adapter.
+        First-party adapters are top-level Memory.* structs that
+        implement Memory.Manager and currently resolve through the
+        compiler's BuiltinManagerTag table. Third-party managers still
+        use the legacy @memory_manager_source path in Phase 1.
 
 Step 3. Compile the manager's Zig source to an object file.
-        The compiler invokes the Zig-fork primitive
-        `zap_fork_compile_zig_to_object` (see section 10.1.1). The
-        primitive is general-purpose; it is not specific to memory
-        managers. The result is an object file in the target
-        platform's native format (ELF, Mach-O, or COFF).
+        On the third-party path, the compiler invokes the Zig-fork
+        primitive `zap_fork_compile_zig_to_object` (see section
+        10.1.1). First-party Phase 1 builds register the embedded
+        primitive source directly as `zap_active_manager`.
 
-Step 4. Parse the .zapmem section from the object file.
-        The compiler uses std.elf, std.macho, or std.coff (depending
-        on detected object format) to locate the .zapmem section.
-        It reads the meta header (at section offset 0), then the
-        core vtable (at offset meta.core_vtable_offset), then any
-        embedded ZapCapabilityDescV1 entries. All discovery is by
-        section content; no symbol-name lookup is performed.
+Step 4. Resolve metadata.
+        First-party Phase 1 builds use the compiler's built-in
+        capability table. Third-party builds parse the .zapmem section
+        from the object file using std.elf, std.macho, or std.coff
+        (depending on detected object format).
 
 Step 5. Validate the metadata per section 3.5.
         Any validation failure aborts the build with a diagnostic
@@ -1230,9 +1251,15 @@ The compiled `<manager>.o` is content-addressed by `(zig_fork_version, manager_s
 
 ---
 
-## 11. First-party / third-party symmetry
+## 11. First-party / third-party extension model
 
-The Zap compiler has zero hardcoded knowledge of `Zap.Memory.ARC` or `Zap.Memory.Arena`. Both are resolved through exactly the same `@memory_manager_source` attribute mechanism as any third-party manager. There is no special-case code path, no name-based dispatch, no whitelist.
+The Zap source model is shared: memory managers are adapter structs
+that implement `Memory.Manager`. Phase 1 keeps the existing compiler
+bridge for runtime compatibility: first-party managers still resolve
+through `BuiltinManagerTag`, while third-party managers still use the
+legacy `@memory_manager_source` discovery attribute. Phase 2 removes
+the first-party hardcoding and makes adapter-driven resolution the
+single path.
 
 ### 11.1 What a third party ships
 
@@ -1240,7 +1267,10 @@ A third-party manager is a Zig package containing:
 
 1. A `<name>.zig` source file (path arbitrary, but typically `src/manager.zig`).
 2. A `build.zig.zon` so the package can be referenced by Zap's dependency system.
-3. A Zap struct declaration in `lib/<name>.zap` (or wherever the user wants) that points at the Zig source via `@memory_manager_source`.
+3. In Phase 1, a Zap struct declaration in `lib/<name>.zap` (or
+   wherever the user wants) that points at the Zig source via
+   `@memory_manager_source`. The target model is for that struct to
+   implement `Memory.Manager`, matching first-party adapters.
 
 The user then references the Zap struct from their project's `build.zap`:
 
@@ -1252,7 +1282,10 @@ The user then references the Zap struct from their project's `build.zap`:
 }
 ```
 
-The Zap compiler resolves `ThirdParty.MyManager`, reads its `@memory_manager_source`, compiles the named Zig file, validates the resulting `.zapmem` metadata, and threads `declared_caps` into HIR and codegen — exactly as it does for `Zap.Memory.ARC`.
+The Phase 1 Zap compiler resolves `ThirdParty.MyManager`, reads its
+`@memory_manager_source`, compiles the named Zig file, validates the
+resulting `.zapmem` metadata, and threads `declared_caps` into HIR and
+codegen.
 
 #### 11.1.1 Third-party manager dependencies
 
@@ -1268,63 +1301,131 @@ The third party's package version is independent of Zap's ABI version. The third
 
 ## 12. The Zap-side stdlib struct
 
-For each memory manager, there is a Zap struct that names the manager and points at its Zig source. The struct itself is mostly metadata: it has no runtime fields. The compiler reads the `@memory_manager_source` attribute to find the Zig source file.
+For each memory manager, there is a field-free Zap adapter struct that
+names the manager and implements `Memory.Manager`. The adapter is the
+public source-level model. It exposes the manager's public name,
+primitive source path, and declared capabilities through documented Zap
+functions rather than through first-party compiler-only attributes.
 
-### 12.1 First-party `Zap.Memory.ARC`
+### 12.1 `Memory.Manager`
 
-The `@memory_manager_source` attribute is file-level metadata that points at the manager's Zig source; the convention matches `@native_type` in `lib/list.zap` — file-top, before `pub struct`. The descriptive heredoc is a canonical `@doc` placed immediately before the `pub struct` declaration.
+The top-level `Memory.Manager` protocol is the adapter contract:
+
+- `name(manager) -> String`
+- `primitive_source_path(manager) -> String`
+- `capability_mask(manager) -> i64`
+- `refcount_v1?(manager) -> Bool`
+
+First-party adapters implement this protocol today. Third-party
+managers still use the legacy `@memory_manager_source` discovery path in
+Phase 1, but the extension model converges on this same adapter
+contract.
+
+### 12.2 First-party `Memory.ARC`
 
 ```
-@memory_manager_source = "src/runtime/memory/arc/manager.zig"
+@doc = """
+  Atomic reference counting memory manager.
+  """
+
+pub struct Memory.ARC {
+}
 
 @doc = """
-Atomic reference counting memory manager.
+  `Memory.Manager` adapter implementation for `Memory.ARC`.
+  """
 
-Each refcounted cell carries an inline header storing the refcount
-and type tag. Retains and releases are atomic. When a release
-brings the count to zero, the manager's release function walks the
-cell's children, releases them, and frees the cell's storage.
+pub impl Memory.Manager for Memory.ARC {
+  @doc = """
+    Returns the public adapter name for the ARC manager.
+    """
 
-Declared capabilities: REFCOUNT_V1.
-"""
+  pub fn name(_manager :: Memory.ARC) -> String {
+    "Memory.ARC"
+  }
 
-pub struct Zap.Memory.ARC {
+  @doc = """
+    Returns the primitive source path for the ARC manager.
+    """
+
+  pub fn primitive_source_path(_manager :: Memory.ARC) -> String {
+    "src/memory/arc/manager.zig"
+  }
+
+  @doc = """
+    Returns the ARC manager's declared capability bitmask.
+    """
+
+  pub fn capability_mask(_manager :: Memory.ARC) -> i64 {
+    1
+  }
+
+  @doc = """
+    Returns true because ARC declares `REFCOUNT_V1`.
+    """
+
+  pub fn refcount_v1?(_manager :: Memory.ARC) -> Bool {
+    true
+  }
 }
 ```
 
-### 12.2 First-party `Zap.Memory.Arena`
+### 12.3 First-party `Memory.Arena`
 
 ```
-@memory_manager_source = "src/runtime/memory/arena/manager.zig"
+@doc = """
+  Whole-program arena memory manager.
+  """
+
+pub struct Memory.Arena {
+}
 
 @doc = """
-Whole-program arena memory manager.
+  `Memory.Manager` adapter implementation for `Memory.Arena`.
+  """
 
-All allocations come from a single arena. Individual deallocations
-are no-ops; the entire arena is reclaimed at program exit. Because
-no per-cell refcount is tracked, the compiler omits the refcount
-header from Map, List, and String layouts, reducing per-cell
-overhead.
+pub impl Memory.Manager for Memory.Arena {
+  @doc = """
+    Returns the public adapter name for the Arena manager.
+    """
 
-Declared capabilities: none.
-"""
+  pub fn name(_manager :: Memory.Arena) -> String {
+    "Memory.Arena"
+  }
 
-pub struct Zap.Memory.Arena {
+  @doc = """
+    Returns the primitive source path for the Arena manager.
+    """
+
+  pub fn primitive_source_path(_manager :: Memory.Arena) -> String {
+    "src/memory/arena/manager.zig"
+  }
+
+  @doc = """
+    Returns the Arena manager's declared capability bitmask.
+    """
+
+  pub fn capability_mask(_manager :: Memory.Arena) -> i64 {
+    0
+  }
+
+  @doc = """
+    Returns false because Arena does not declare `REFCOUNT_V1`.
+    """
+
+  pub fn refcount_v1?(_manager :: Memory.Arena) -> Bool {
+    false
+  }
 }
 ```
 
-### 12.3 The `@memory_manager_source` attribute
+### 12.4 Adapter struct shape
 
-The attribute is a compile-time string literal. Its value is a path:
-
-- **First-party managers**: path is relative to the Zap source tree root.
-- **Third-party managers**: path is relative to the third-party package root (the directory containing the third party's `build.zig.zon`).
-
-The compiler resolves the path against the package the struct is declared in; this gives first-party / third-party symmetry without ambiguity.
-
-### 12.4 Pseudo-emptiness of the struct
-
-The struct body is intentionally empty of fields and functions. The struct exists purely as a typed reference for use in `Zap.Manifest.memory:` and to carry the `@memory_manager_source` attribute plus an immediately preceding `@doc` heredoc. Future ABI versions may add type-level methods to memory-manager structs (e.g., for per-process selection in v2), but v1.0 keeps the bodies free of methods and fields.
+Adapter structs are intentionally field-free. The behavior lives in the
+`Memory.Manager` impl so the same protocol dispatch path can support
+first-party and third-party managers. Future APIs may accept values that
+implement `Memory.Manager` for per-process selection; this document does
+not define `Process` behavior.
 
 ---
 
@@ -1485,35 +1586,65 @@ pub export const zap_memory_section: ZapMemorySection
 };
 ```
 
-### 14.2 Zap source: `lib/zap/memory/noop.zap`
+### 14.2 Zap source: `lib/memory/no_op.zap`
 
 ```
-@memory_manager_source = "src/runtime/memory/noop/manager.zig"
+@doc = """
+  No-op memory manager. Declares zero capabilities, the manager's
+  `allocate` vtable slot returns null, and `deallocate` is a no-op.
+  """
+
+pub struct Memory.NoOp {
+}
 
 @doc = """
-No-op memory manager. Used only for compiler integration tests:
-allocation fails immediately, deallocation does nothing, no
-capabilities are declared.
+  `Memory.Manager` adapter implementation for `Memory.NoOp`.
+  """
 
-Programs built against this manager terminate as soon as they
-attempt to allocate. The purpose is to validate that the build
-pipeline accepts a minimal manager and that capability-elision
-removes all retain/release calls.
-"""
+pub impl Memory.Manager for Memory.NoOp {
+  @doc = """
+    Returns the public adapter name for the NoOp manager.
+    """
 
-pub struct Zap.Memory.NoOp {
+  pub fn name(_manager :: Memory.NoOp) -> String {
+    "Memory.NoOp"
+  }
+
+  @doc = """
+    Returns the primitive source path for the NoOp manager.
+    """
+
+  pub fn primitive_source_path(_manager :: Memory.NoOp) -> String {
+    "src/memory/no_op/manager.zig"
+  }
+
+  @doc = """
+    Returns the NoOp manager's declared capability bitmask.
+    """
+
+  pub fn capability_mask(_manager :: Memory.NoOp) -> i64 {
+    0
+  }
+
+  @doc = """
+    Returns false because NoOp does not declare `REFCOUNT_V1`.
+    """
+
+  pub fn refcount_v1?(_manager :: Memory.NoOp) -> Bool {
+    false
+  }
 }
 ```
 
 ### 14.3 Expected behavior
 
-A program built with `memory: Zap.Memory.NoOp`:
+A program built with `memory: Memory.NoOp`:
 
 1. Compiles cleanly. The `.zapmem` section is present, magic matches, `declared_caps = 0`.
 2. The compiler elides every retain/release in HIR (because `REFCOUNT_V1` is not declared).
 3. Map/List/String types are emitted without the refcount-header field.
 4. At runtime, `init` returns the placeholder pointer.
-5. The first allocation returns null, the runtime aborts with: `zap: out of memory: requested <size> bytes (alignment <alignment>) from manager Zap.Memory.NoOp; aborting`.
+5. The first allocation returns null, the runtime aborts with: `zap: out of memory: requested <size> bytes (alignment <alignment>) from manager Memory.NoOp; aborting`.
 
 ---
 
@@ -1908,10 +2039,10 @@ Two non-user-facing managers ship with the Zap source tree as part of the test i
 
 | Manager           | Source                                            | Purpose                                              |
 |-------------------|---------------------------------------------------|------------------------------------------------------|
-| `Zap.Memory.Leak`     | `src/runtime/memory/leak/manager.zig`         | Allocates from the page allocator, never frees. Declares no capabilities. Used to verify that retain/release elision is complete under a non-refcounting manager. |
-| `Zap.Memory.Tracking` | `src/runtime/memory/tracking/manager.zig`     | Wraps another manager and logs every allocate / deallocate / retain / release call. Used to detect missing or duplicated lifecycle events in compiler tests. |
+| `Memory.Leak`     | `src/memory/leak/manager.zig`         | Allocates from the page allocator, never frees. Declares no capabilities. Used to verify that retain/release elision is complete under a non-refcounting manager. |
+| `Memory.Tracking` | `src/memory/tracking/manager.zig`     | Wraps another manager and logs every allocate / deallocate / retain / release call. Used to detect missing or duplicated lifecycle events in compiler tests. |
 
-These managers are not part of the public ABI surface in the sense that users do not select them via `memory:` in production builds. They are used by the Zap test runner to validate ABI-conformance properties (e.g., "every retain has a matching release") on every CI run. Their implementation follows the same ABI as `Zap.Memory.ARC` and `Zap.Memory.Arena`; no special compiler accommodation is needed.
+These managers are not part of the public ABI surface in the sense that users do not select them via `memory:` in production builds. They are used by the Zap test runner to validate ABI-conformance properties (e.g., "every retain has a matching release") on every CI run. Their implementation follows the same ABI as `Memory.ARC` and `Memory.Arena`; no special compiler accommodation is needed.
 
 ---
 

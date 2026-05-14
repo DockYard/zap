@@ -23,9 +23,8 @@ pub const BuildConfig = struct {
     /// Dotted memory-manager name parsed from the manifest's `memory:`
     /// field. Empty when omitted; the Zap-side memory driver
     /// (`src/memory/driver.zig`) then applies the default
-    /// `Zap.Memory.ARC`. A non-empty value names a Zap struct that
-    /// declares a `@memory_manager_source` attribute pointing at the
-    /// manager's Zig source.
+    /// `Memory.ARC`. A non-empty value names a Zap struct that
+    /// implements the `Memory.Manager` adapter contract.
     memory_manager: ?[]const u8 = null,
     /// Test timeout in milliseconds (0 = no timeout). Zig 0.16 supports
     /// native unit test timeouts in the build system.
@@ -703,7 +702,6 @@ test "constValueToBuildConfig parses memory: struct reference (aliases form)" {
                 .{ .atom = "__aliases__" },
                 .{ .list = &.{} },
                 .{ .list = &.{
-                    .{ .atom = "Zap" },
                     .{ .atom = "Memory" },
                     .{ .atom = "NoOp" },
                 } },
@@ -713,7 +711,7 @@ test "constValueToBuildConfig parses memory: struct reference (aliases form)" {
 
     const config = try constValueToBuildConfig(alloc, val);
     try testing.expect(config.memory_manager != null);
-    try testing.expectEqualStrings("Zap.Memory.NoOp", config.memory_manager.?);
+    try testing.expectEqualStrings("Memory.NoOp", config.memory_manager.?);
 }
 
 test "constValueToBuildConfig parses memory: as a struct value with canonical dotted type_name" {
@@ -731,7 +729,7 @@ test "constValueToBuildConfig parses memory: as a struct value with canonical do
             .{ .name = "version", .value = .{ .string = "0.1.0" } },
             .{ .name = "kind", .value = .{ .atom = "bin" } },
             .{ .name = "memory", .value = .{ .struct_val = .{
-                .type_name = "Zap.Memory.ARC",
+                .type_name = "Memory.ARC",
                 .fields = &.{},
             } } },
         },
@@ -739,7 +737,83 @@ test "constValueToBuildConfig parses memory: as a struct value with canonical do
 
     const config = try constValueToBuildConfig(alloc, val);
     try testing.expect(config.memory_manager != null);
-    try testing.expectEqualStrings("Zap.Memory.ARC", config.memory_manager.?);
+    try testing.expectEqualStrings("Memory.ARC", config.memory_manager.?);
+}
+
+test "ctfe manifest accepts Memory.Manager adapter values and dotted protocol dispatch" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub protocol Memory.Manager {
+        \\  fn name(manager) -> String
+        \\}
+        \\
+        \\pub struct Memory.ARC {
+        \\}
+        \\
+        \\pub impl Memory.Manager for Memory.ARC {
+        \\  pub fn name(_manager :: Memory.ARC) -> String {
+        \\    "Memory.ARC"
+        \\  }
+        \\}
+        \\
+        \\pub struct Memory.NoOp {
+        \\}
+        \\
+        \\pub impl Memory.Manager for Memory.NoOp {
+        \\  pub fn name(_manager :: Memory.NoOp) -> String {
+        \\    "Memory.NoOp"
+        \\  }
+        \\}
+        \\
+        \\pub struct Zap.Env {
+        \\}
+        \\
+        \\pub struct Zap.Manifest {
+        \\  name :: String
+        \\  version :: String
+        \\  kind :: Atom
+        \\  memory :: Memory.Manager = Memory.ARC
+        \\}
+        \\
+        \\pub struct App.Builder {
+        \\  pub fn manifest(_env :: Zap.Env) -> Zap.Manifest {
+        \\    %Zap.Manifest{
+        \\      name: Memory.Manager.name(Memory.NoOp),
+        \\      version: Memory.Manager.name(%Memory.NoOp{}),
+        \\      kind: :bin,
+        \\      memory: Memory.NoOp
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "build.zap", .source = source },
+    };
+
+    var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+    const result = try compiler.compileForCtfe(alloc, &ctx, .{ .show_progress = false });
+
+    var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    defer interp.deinit();
+    interp.capabilities = zap.ctfe.CapabilitySet.build;
+
+    const manifest_id = findManifestFunction(&result.ir_program) orelse return error.ManifestNotFound;
+    const env_const = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Env",
+        .fields = &.{},
+    } };
+
+    const manifest_result = try interp.evalAndExport(manifest_id, &.{env_const}, zap.ctfe.CapabilitySet.build);
+    const config = try constValueToBuildConfig(alloc, manifest_result.value);
+
+    try testing.expectEqualStrings("Memory.NoOp", config.name);
+    try testing.expectEqualStrings("Memory.NoOp", config.version);
+    try testing.expect(config.memory_manager != null);
+    try testing.expectEqualStrings("Memory.NoOp", config.memory_manager.?);
 }
 
 test "parseStructRefField preserves underscores in struct names" {

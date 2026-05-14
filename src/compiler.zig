@@ -5485,7 +5485,7 @@ test "staged macro provider rejects direct underscore-prefixed call before compi
 }
 
 test "Phase 6: getRuntimeSource rewrites RUNTIME_DECLARED_CAPS_DEFAULT for REFCOUNT_V1" {
-    // User binaries built against a REFCOUNT_V1 manager (Zap.Memory.ARC)
+    // User binaries built against a REFCOUNT_V1 manager (Memory.ARC)
     // see the same `runtime.refcount_v1_active = true` shape the host
     // tests see — the rewrite path is exercised even when the source-
     // level default already encodes the right value, so a drift in

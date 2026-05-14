@@ -4692,6 +4692,21 @@ fn evaluateConstExpr(
             const alloc_id = interp.allocation_store.alloc(alloc, .struct_val, interp.currentFunctionId());
             break :blk .{ .struct_val = .{ .alloc_id = alloc_id, .type_name = type_name, .fields = fields } };
         },
+        .struct_ref => |s| blk: {
+            const graph = interp.scope_graph orelse return error.NotComputable;
+            for (graph.structs.items) |struct_entry| {
+                if (!structNamesEqual(struct_entry.name, s.name)) continue;
+                if (struct_entry.decl.fields.len != 0 or struct_entry.decl.items.len != 0) return error.NotComputable;
+                const type_name = try structNameToString(alloc, s.name, interner);
+                const alloc_id = interp.allocation_store.alloc(alloc, .struct_val, interp.currentFunctionId());
+                break :blk .{ .struct_val = .{
+                    .alloc_id = alloc_id,
+                    .type_name = type_name,
+                    .fields = &.{},
+                } };
+            }
+            return error.NotComputable;
+        },
         .attr_ref => |ar| blk: {
             const graph = interp.scope_graph orelse return error.NotComputable;
             const current_struct = mod_name orelse return error.NotComputable;
@@ -4933,6 +4948,14 @@ fn structNameToString(
     interner: *const ast.StringInterner,
 ) ![]const u8 {
     return name.toDottedString(alloc, interner);
+}
+
+fn structNamesEqual(left: ast.StructName, right: ast.StructName) bool {
+    if (left.parts.len != right.parts.len) return false;
+    for (left.parts, right.parts) |left_part, right_part| {
+        if (left_part != right_part) return false;
+    }
+    return true;
 }
 
 /// Find the enclosing struct name for a scope, walking up the scope tree.

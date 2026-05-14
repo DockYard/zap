@@ -1,4 +1,4 @@
-//! `Zap.Memory.ARC` — production atomic-refcount memory manager.
+//! `Memory.ARC` — production atomic-refcount memory manager.
 //!
 //! Phase 4 + Phase 4.x of the pluggable memory manager rollout — see
 //! `docs/memory-manager-abi.md` (sections 4, 5, 8, 10, 11.1 and 12) and
@@ -6,7 +6,7 @@
 //! the canonical first-party ARC implementation. It is compiled by the
 //! Zig-fork primitive `zap_fork_compile_zig_to_object` into a standalone
 //! object file that the Zap build pipeline links into every Zap binary
-//! whose manifest selects `Zap.Memory.ARC` (the default).
+//! whose manifest selects `Memory.ARC` (the default).
 //!
 //! The file is intentionally self-contained — it only imports `std` and
 //! `builtin` — so it can be compiled by the fork primitive (which does
@@ -18,7 +18,7 @@
 //!
 //! ## Architecture
 //!
-//! `Zap.Memory.ARC` declares the `REFCOUNT_V1` capability and exposes
+//! `Memory.ARC` declares the `REFCOUNT_V1` capability and exposes
 //! the `retain` / `release` vtable that the runtime's inline-header
 //! types (`Map(K,V)`, `List(T)`, `MapIter`) dispatch through, plus the
 //! extended `retain_sized` / `release_sized` slots that the runtime's
@@ -1337,7 +1337,7 @@ pub const getCapabilityDesc = arcGetCapabilityDesc;
 //
 // The uniform-interface aliases declared above must match the canonical
 // AbiV1 slot types so the runtime's comptime dispatch (in `runtime.zig`'s
-// host stub OR a user-binary build that selects `Zap.Memory.ARC`) sees
+// host stub OR a user-binary build that selects `Memory.ARC`) sees
 // the right calling shape. ARC declares REFCOUNT_V1, so every ABI slot
 // alias plus every first-party class-specialized helper MUST resolve to
 // real implementations with matching signatures; a drift between the

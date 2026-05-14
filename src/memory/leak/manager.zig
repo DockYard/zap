@@ -1,4 +1,4 @@
-//! `Zap.Memory.Leak` — diagnostic leak-everything memory manager.
+//! `Memory.Leak` — diagnostic leak-everything memory manager.
 //!
 //! Phase 7 of the pluggable memory manager rollout — see
 //! `docs/memory-manager-abi.md` (especially sections 4, 10, and 14) for
@@ -10,7 +10,7 @@
 //! freed for the lifetime of the process. Two CI use cases this enables:
 //!
 //!   1. **Codegen elision verification.** A binary built with
-//!      `memory: Zap.Memory.Leak` declares zero capabilities (no
+//!      `memory: Memory.Leak` declares zero capabilities (no
 //!      `REFCOUNT_V1`), so under Phase 6's conditional layout + codegen
 //!      elision the compiler must emit zero retain/release call sites.
 //!      The output binary's `.text` should contain no calls into the
@@ -35,7 +35,7 @@
 //!
 //! ## Architecture
 //!
-//! `Zap.Memory.Leak` wraps `std.heap.page_allocator` directly. There is
+//! `Memory.Leak` wraps `std.heap.page_allocator` directly. There is
 //! no slab pool, no free list, no per-allocation header — every request
 //! goes straight to a syscall (`mmap` on POSIX, `NtAllocateVirtualMemory`
 //! on Windows). This is the simplest possible backing allocator that
@@ -45,7 +45,7 @@
 //!
 //! Leak declares zero capabilities. `core.get_capability_desc` returns
 //! null for every ID. Under Phase 6's codegen elision, a Zap program
-//! built with `memory: Zap.Memory.Leak` must compile cleanly — the
+//! built with `memory: Memory.Leak` must compile cleanly — the
 //! compiler sees zero declared capabilities and elides all retain/
 //! release call sites. Map/List/String allocations route through raw
 //! `core.allocate` only.
@@ -58,7 +58,7 @@
 //! reclaims every `mmap`'d page; on abnormal exit (panic, abort,
 //! SIGKILL) the OS reclaims those pages too. From the program's point
 //! of view, leaked memory is indistinguishable from leaked-by-design
-//! arena memory (the `Zap.Memory.Arena` manager has the same surface
+//! arena memory (the `Memory.Arena` manager has the same surface
 //! behaviour, just with explicit bulk free in `core.deinit`).
 //!
 //! ### Why `page_allocator` and not `c_allocator`?
@@ -69,7 +69,7 @@
 //! `link_libc = false` for object-mode output). `c_allocator` requires
 //! libc; `page_allocator` makes a direct `mmap` syscall on POSIX and
 //! `NtAllocateVirtualMemory` on Windows, neither of which depends on
-//! libc startup. Both `Zap.Memory.Arena` and `Zap.Memory.ARC` follow
+//! libc startup. Both `Memory.Arena` and `Memory.ARC` follow
 //! the same convention.
 
 const std = @import("std");
@@ -217,9 +217,9 @@ fn leakInit(options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque {
 ///
 /// The intentional leak is the entire reason this manager exists; do
 /// not "fix" this by adding a tracking list and freeing pages on
-/// deinit. If you need that behaviour, you want `Zap.Memory.Tracking`
+/// deinit. If you need that behaviour, you want `Memory.Tracking`
 /// (which wraps another manager and detects leaks at deinit) or
-/// `Zap.Memory.Arena` (which bulk-frees at deinit).
+/// `Memory.Arena` (which bulk-frees at deinit).
 ///
 /// Spec §4.4 makes `deinit` best-effort — it runs only on the
 /// normal-main-return path — so the manager must not depend on this
@@ -358,7 +358,7 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
 fn leakRetainStub(ctx: *anyopaque, object: *anyopaque) callconv(.c) void {
     _ = ctx;
     _ = object;
-    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn leakReleaseStub(
@@ -369,7 +369,7 @@ fn leakReleaseStub(
     _ = ctx;
     _ = object;
     _ = deep_walk;
-    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn leakRetainSizedStub(
@@ -382,7 +382,7 @@ fn leakRetainSizedStub(
     _ = object;
     _ = size;
     _ = alignment;
-    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn leakReleaseSizedStub(
@@ -397,7 +397,7 @@ fn leakReleaseSizedStub(
     _ = size;
     _ = alignment;
     _ = deep_walk;
-    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn leakAllocateRefcountedStub(
@@ -408,7 +408,7 @@ fn leakAllocateRefcountedStub(
     _ = ctx;
     _ = size;
     _ = alignment;
-    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 fn leakRefcountSizedStub(
@@ -421,7 +421,7 @@ fn leakRefcountSizedStub(
     _ = object;
     _ = size;
     _ = alignment;
-    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn refcountSlabClassIndex(comptime size: usize, comptime alignment: u32) ?u32 {
@@ -433,14 +433,14 @@ pub inline fn refcountSlabClassIndex(comptime size: usize, comptime alignment: u
 pub inline fn allocateRefcountedClass(ctx: *anyopaque, comptime class_index: u32) ?[*]u8 {
     _ = ctx;
     _ = class_index;
-    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn retainSizedClass(ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) void {
     _ = ctx;
     _ = object;
     _ = class_index;
-    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn releaseSizedClass(
@@ -453,14 +453,14 @@ pub inline fn releaseSizedClass(
     _ = object;
     _ = class_index;
     _ = deep_walk;
-    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 pub inline fn refcountSizedClass(ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) u32 {
     _ = ctx;
     _ = object;
     _ = class_index;
-    @panic("Zap.Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
+    @panic("Memory.Leak does not implement REFCOUNT_V1 — codegen should have elided this call");
 }
 
 // ---------------------------------------------------------------------------
@@ -485,7 +485,7 @@ pub const getCapabilityDesc = leakGetCapabilityDesc;
 // ---------------------------------------------------------------------------
 // Uniform-interface alias signature lock
 //
-// `Zap.Memory.Leak` does NOT declare REFCOUNT_V1, so the refcount
+// `Memory.Leak` does NOT declare REFCOUNT_V1, so the refcount
 // aliases above point at panic-stub bodies. The bodies are never
 // invoked (the runtime's comptime dispatch elides those call sites
 // under no-REFCOUNT_V1 builds), but the panic-stub signatures still

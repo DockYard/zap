@@ -1,5 +1,3 @@
-@memory_manager_source = "src/memory/arc/manager.zig"
-
 @doc = """
   Atomic reference counting memory manager.
 
@@ -34,5 +32,43 @@
   Declared capabilities: REFCOUNT_V1.
   """
 
-pub struct Zap.Memory.ARC {
+pub struct Memory.ARC {
+}
+
+@doc = """
+  `Memory.Manager` adapter implementation for `Memory.ARC`.
+  """
+
+pub impl Memory.Manager for Memory.ARC {
+  @doc = """
+    Returns the public adapter name for the ARC manager.
+    """
+
+  pub fn name(_manager :: Memory.ARC) -> String {
+    "Memory.ARC"
+  }
+
+  @doc = """
+    Returns the primitive source path for the ARC manager.
+    """
+
+  pub fn primitive_source_path(_manager :: Memory.ARC) -> String {
+    "src/memory/arc/manager.zig"
+  }
+
+  @doc = """
+    Returns the ARC manager's declared capability bitmask.
+    """
+
+  pub fn capability_mask(_manager :: Memory.ARC) -> i64 {
+    1
+  }
+
+  @doc = """
+    Returns true because ARC declares `REFCOUNT_V1`.
+    """
+
+  pub fn refcount_v1?(_manager :: Memory.ARC) -> Bool {
+    true
+  }
 }

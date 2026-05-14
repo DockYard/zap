@@ -498,7 +498,7 @@ pub const ZirDriver = struct {
     /// Phase 3 wires the value through end-to-end without branching
     /// on it — the bit is present so later phases are purely additive.
     /// `0` means "no capabilities" (the default, e.g.
-    /// `Zap.Memory.NoOp`); `1` (`REFCOUNT_V1_BIT`) means the manager
+    /// `Memory.NoOp`); `1` (`REFCOUNT_V1_BIT`) means the manager
     /// supports the ARC retain/release contract.
     declared_caps: u64 = 0,
     reuse_backed_struct_locals: std.AutoHashMapUnmanaged(ir.LocalId, []const u8) = .empty,

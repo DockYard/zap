@@ -140,7 +140,7 @@ pub const CompileOptions = struct {
     /// `zir_compilation_add_link_object_file` so the manager's `.zapmem`
     /// section survives static linking. Phase 4 made this non-optional
     /// in practice — every Zap binary links a manager `.o`, including
-    /// builds that select the first-party `Zap.Memory.ARC`. The field
+    /// builds that select the first-party `Memory.ARC`. The field
     /// stays nullable so unit tests that bypass the driver can leave
     /// it unset; production builds always populate it.
     memory_manager_object: ?[]const u8 = null,
@@ -152,7 +152,7 @@ pub const CompileOptions = struct {
     /// what per-cell layout to use (Phase 4 conditional headers).
     /// Phase 3 wires the bit through end-to-end without branching on
     /// it; later phases are purely additive on top. `0` means "no
-    /// capabilities" (e.g. `Zap.Memory.NoOp`); `1` (`REFCOUNT_V1_BIT`)
+    /// capabilities" (e.g. `Memory.NoOp`); `1` (`REFCOUNT_V1_BIT`)
     /// means the manager supports the ARC retain/release contract.
     declared_caps: u64 = 0,
     /// Identity classification of the resolved memory manager. Mirrors
