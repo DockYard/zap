@@ -7,7 +7,7 @@ pub struct ErrorPipe.Builder {
           version: "0.1.0",
           kind: :bin,
           root: "ErrorPipe.main/1",
-          paths: ["./*.zap"], deps: [{:zap_stdlib, {:path, "../../lib"}}]
+          paths: ["./*.zap"]
         }
       _ ->
         panic("Unknown target: use 'error_pipe'")

@@ -170,6 +170,7 @@ Manifest fields:
 | `root` | Entry point, formatted as `"Struct.function/arity"` |
 | `paths` | Source glob patterns, relative to the project root |
 | `deps` | Dependency declarations |
+| `memory` | Memory manager adapter, defaults to `Memory.ARC` |
 | `optimize` | `:debug`, `:release_safe`, `:release_fast`, or `:release_small` |
 | `test_timeout` | Test timeout in milliseconds |
 | `source_url` | Base source URL for generated documentation |
@@ -191,8 +192,8 @@ Dependencies can point at local paths or Git repositories:
   kind: :bin,
   root: "MyApp.main/1",
   deps: [
-    {:shared_utils, {:path, "../shared_utils"}},
-    {:parser, {:git, "https://github.com/example/parser.git", tag: "v1.0.0"}}
+    %Zap.Dep{name: "shared_utils", path: "../shared_utils"},
+    %Zap.Dep{name: "parser", git_url: "https://github.com/example/parser.git", git_tag: "v1.0.0"}
   ]
 }
 ```

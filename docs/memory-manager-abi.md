@@ -1300,7 +1300,7 @@ The user then references the Zap struct from their project's `build.zap`:
 ```
 %Zap.Manifest{
   memory: ThirdParty.MyManager,
-  deps: [{:third_party_manager, {:path, "../third_party_manager"}}],
+  deps: [%Zap.Dep{name: "third_party_manager", path: "../third_party_manager"}],
   ...
 }
 ```

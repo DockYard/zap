@@ -7,7 +7,7 @@ pub struct CaseExpr.Builder {
           version: "0.1.0",
           kind: :bin,
           root: "CaseExpr.main/1",
-          paths: ["./*.zap"], deps: [{:zap_stdlib, {:path, "../../lib"}}]
+          paths: ["./*.zap"]
         }
       _ ->
         panic("Unknown target: use 'case_expr'")

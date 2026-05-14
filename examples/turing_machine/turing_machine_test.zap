@@ -3,131 +3,124 @@ pub struct TuringMachineTest {
 
   describe("tape construction") {
     test("empty tape has blank under head") {
-      tape = TuringMachine.tape_new([], "_")
-      assert(tape.current == "_")
-      assert(List.empty?(tape.left))
-      assert(List.empty?(tape.right))
+      {left, current, right, _blank} = TuringMachine.tape_new(([] :: [String]), "_")
+      assert(current == "_")
+      assert(List.empty?(left))
+      assert(List.empty?(right))
     }
 
     test("non-empty tape places head on first symbol") {
-      tape = TuringMachine.tape_new(["1", "0", "1"], "_")
-      assert(tape.current == "1")
-      assert(List.empty?(tape.left))
-      assert(List.length(tape.right) == 2)
+      {left, current, right, _blank} = TuringMachine.tape_new(["1", "0", "1"], "_")
+      assert(current == "1")
+      assert(List.empty?(left))
+      assert(List.length(right) == 2)
     }
   }
 
   describe("tape movement") {
-    test("move_right pushes current onto left, pops from right") {
-      start = TuringMachine.tape_new(["A", "B", "C"], "_")
-      moved = TuringMachine.move_right(start)
-      assert(moved.current == "B")
-      assert(List.length(moved.left) == 1)
-      assert(List.length(moved.right) == 1)
+    test("move_right pushes current onto left and pops from right") {
+      moved = TuringMachine.move_right(TuringMachine.tape_new(["A", "B", "C"], "_"))
+      {left, current, right, _blank} = moved
+      assert(current == "B")
+      assert(List.length(left) == 1)
+      assert(List.length(right) == 1)
     }
 
     test("move_right past the end yields a blank cell") {
-      start = TuringMachine.tape_new(["A"], "_")
-      moved = TuringMachine.move_right(start)
-      assert(moved.current == "_")
+      {_left, current, _right, _blank} = TuringMachine.move_right(TuringMachine.tape_new(["A"], "_"))
+      assert(current == "_")
     }
 
     test("move_left at the start yields a blank cell") {
-      start = TuringMachine.tape_new(["A"], "_")
-      moved = TuringMachine.move_left(start)
-      assert(moved.current == "_")
+      {_left, current, _right, _blank} = TuringMachine.move_left(TuringMachine.tape_new(["A"], "_"))
+      assert(current == "_")
     }
 
-    test("move_right then move_left returns to the original") {
-      start = TuringMachine.tape_new(["A", "B", "C"], "_")
-      round_trip = TuringMachine.move_left(TuringMachine.move_right(start))
-      assert(round_trip.current == "A")
-      assert(List.length(round_trip.left) == 0)
-      assert(List.length(round_trip.right) == 2)
+    test("move_right then move_left returns to the original head") {
+      round_trip = TuringMachine.move_left(TuringMachine.move_right(TuringMachine.tape_new(["A", "B", "C"], "_")))
+      {_left, current, right, _blank} = round_trip
+      assert(current == "A")
+      assert(List.length(right) == 2)
     }
 
     test("write_tape only changes the current cell") {
-      start = TuringMachine.tape_new(["A", "B"], "_")
-      written = TuringMachine.write_tape(start, "Z")
-      assert(written.current == "Z")
-      assert(List.length(written.right) == 1)
+      written = TuringMachine.write_tape(TuringMachine.tape_new(["A", "B"], "_"), "Z")
+      {_left, current, right, _blank} = written
+      assert(current == "Z")
+      assert(List.length(right) == 1)
     }
   }
 
   describe("move_tape dispatch") {
     test("L moves left") {
-      start = TuringMachine.tape_new(["A", "B"], "_")
-      right = TuringMachine.move_right(start)
-      left = TuringMachine.move_tape(right, "L")
-      assert(left.current == "A")
+      right = TuringMachine.move_right(TuringMachine.tape_new(["A", "B"], "_"))
+      {_left, current, _right, _blank} = TuringMachine.move_tape(right, "L")
+      assert(current == "A")
     }
 
     test("R moves right") {
-      start = TuringMachine.tape_new(["A", "B"], "_")
-      moved = TuringMachine.move_tape(start, "R")
-      assert(moved.current == "B")
+      {_left, current, _right, _blank} = TuringMachine.move_tape(TuringMachine.tape_new(["A", "B"], "_"), "R")
+      assert(current == "B")
     }
 
     test("S leaves the head in place") {
-      start = TuringMachine.tape_new(["A", "B"], "_")
-      stayed = TuringMachine.move_tape(start, "S")
-      assert(stayed.current == "A")
+      {_left, current, _right, _blank} = TuringMachine.move_tape(TuringMachine.tape_new(["A", "B"], "_"), "S")
+      assert(current == "A")
     }
   }
 
   describe("transition matching") {
-    test("apply_first_match with empty table halts the machine") {
+    test("empty table halts the machine") {
       tape = TuringMachine.tape_new(["1"], "_")
-      machine = TuringMachine.new_machine("q0", tape, [])
-      stepped = TuringMachine.step(machine)
-      assert(stepped.halted)
+      {state, _new_tape, halted} = TuringMachine.lookup_and_step("q0", tape, ([] :: [{String, String, String, String, String}]), ([] :: [{String, String, String, String, String}]))
+      assert(state == "q0")
+      assert(halted)
     }
 
-    test("apply_first_match with no matching row halts the machine") {
+    test("no matching row halts the machine") {
       tape = TuringMachine.tape_new(["1"], "_")
-      transitions = ([] :: [TuringMachine.Transition]) |> List.push(TuringMachine.transition("qX", "1", "qY", "0", "R"))
-      machine = TuringMachine.new_machine("q0", tape, transitions)
-      stepped = TuringMachine.step(machine)
-      assert(stepped.halted)
+      transitions = ([] :: [{String, String, String, String, String}])
+        |> List.push(TuringMachine.t("qX", "1", "qY", "0", "R"))
+      {state, _new_tape, halted} = TuringMachine.lookup_and_step("q0", tape, transitions, transitions)
+      assert(state == "q0")
+      assert(halted)
     }
 
-    test("apply_first_match applies the matching row") {
+    test("matching row writes, moves, and changes state") {
       tape = TuringMachine.tape_new(["0"], "_")
-      transitions = ([] :: [TuringMachine.Transition]) |> List.push(TuringMachine.transition("q0", "0", "q1", "1", "R"))
-      machine = TuringMachine.new_machine("q0", tape, transitions)
-      stepped = TuringMachine.step(machine)
-      assert(stepped.state == "q1")
-      assert(stepped.halted == false)
-      assert(stepped.steps == 1)
+      transitions = ([] :: [{String, String, String, String, String}])
+        |> List.push(TuringMachine.t("q0", "0", "q1", "1", "R"))
+      {state, moved_tape, halted} = TuringMachine.lookup_and_step("q0", tape, transitions, transitions)
+      {_left, current, _right, _blank} = moved_tape
+      assert(state == "q1")
+      assert(halted == false)
+      assert(current == "_")
     }
 
-    test("apply_first_match uses the first row that matches") {
+    test("first matching row wins") {
       tape = TuringMachine.tape_new(["1"], "_")
-      transitions = ([] :: [TuringMachine.Transition])
-        |> List.push(TuringMachine.transition("q0", "1", "first", "1", "R"))
-        |> List.push(TuringMachine.transition("q0", "1", "second", "1", "R"))
-      machine = TuringMachine.new_machine("q0", tape, transitions)
-      stepped = TuringMachine.step(machine)
-      assert(stepped.state == "first")
+      transitions = ([] :: [{String, String, String, String, String}])
+        |> List.push(TuringMachine.t("q0", "1", "first", "1", "R"))
+        |> List.push(TuringMachine.t("q0", "1", "second", "1", "R"))
+      {state, _new_tape, _halted} = TuringMachine.lookup_and_step("q0", tape, transitions, transitions)
+      assert(state == "first")
     }
   }
 
   describe("run") {
-    test("already-halted machine is returned unchanged") {
+    test("machine with no matching transition stops immediately") {
       tape = TuringMachine.tape_new(["1"], "_")
-      machine = TuringMachine.halt(TuringMachine.new_machine("q0", tape, []))
-      finished = TuringMachine.run(machine, 100)
-      assert(finished.halted)
-      assert(finished.steps == 0)
+      {state, _final_tape, steps} = TuringMachine.run("q0", tape, ([] :: [{String, String, String, String, String}]), 0, 100)
+      assert(state == "q0")
+      assert(steps == 0)
     }
 
-    test("max_steps caps the run when the machine cannot halt") {
+    test("max_steps caps a machine that cannot halt") {
       tape = TuringMachine.tape_new(["1"], "_")
-      transitions = ([] :: [TuringMachine.Transition]) |> List.push(TuringMachine.transition("q0", "1", "q0", "1", "R"))
-      machine = TuringMachine.new_machine("q0", tape, transitions)
-      finished = TuringMachine.run(machine, 5)
-      assert(finished.halted == false)
-      assert(finished.steps == 5)
+      transitions = ([] :: [{String, String, String, String, String}])
+        |> List.push(TuringMachine.t("q0", "1", "q0", "1", "R"))
+      {_state, _final_tape, steps} = TuringMachine.run("q0", tape, transitions, 0, 5)
+      assert(steps == 5)
     }
   }
 
@@ -189,7 +182,7 @@ pub struct TuringMachineTest {
   }
 
   describe("symbol helpers") {
-    test("string_to_symbols splits a string into single-char symbols") {
+    test("string_to_symbols splits a string into single-character symbols") {
       symbols = TuringMachine.string_to_symbols("101")
       assert(List.length(symbols) == 3)
       assert(List.at(symbols, 0) == "1")

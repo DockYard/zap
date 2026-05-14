@@ -327,6 +327,8 @@ pub fn build(b: *std.Build) void {
         var it = dir.iterate();
         while (it.next(b.graph.io) catch null) |entry| {
             if (entry.kind != .directory) continue;
+            const example_build_file = b.fmt("examples/{s}/build.zap", .{entry.name});
+            std.Io.Dir.cwd().access(b.graph.io, example_build_file, .{}) catch continue;
             // Each example dir has a build.zap with a target matching the dir name
             const example_run = b.addRunArtifact(exe);
             example_run.addArgs(&.{ "build", entry.name });

@@ -7,8 +7,7 @@ pub struct TuringMachine.Builder {
           version: "0.1.0",
           kind: :bin,
           root: "TestRunner.main/1",
-          paths: ["*_test.zap", "turing_machine.zap"],
-          deps: [{:zap_stdlib, {:path, "../../lib"}}]
+          paths: ["*_test.zap", "turing_machine.zap"]
         }
       _ ->
         %Zap.Manifest{
@@ -17,8 +16,7 @@ pub struct TuringMachine.Builder {
           kind: :bin,
           root: "TuringMachine.main/1",
           paths: ["./turing_machine.zap"],
-          optimize: :release_fast,
-          deps: [{:zap_stdlib, {:path, "../../lib"}}]
+          optimize: :release_fast
         }
     }
   }
