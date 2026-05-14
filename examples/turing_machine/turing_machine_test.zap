@@ -116,7 +116,7 @@ pub struct TuringMachineTest {
     test("already-halted machine is returned unchanged") {
       tape = TuringMachine.tape_new(["1"], "_")
       machine = TuringMachine.halt(TuringMachine.new_machine("q0", tape, []))
-      finished = TuringMachine.run(machine, 100 :: i64)
+      finished = TuringMachine.run(machine, 100)
       assert(finished.halted)
       assert(finished.steps == 0)
     }
@@ -125,7 +125,7 @@ pub struct TuringMachineTest {
       tape = TuringMachine.tape_new(["1"], "_")
       transitions = ([] :: [TuringMachine.Transition]) |> List.push(TuringMachine.transition("q0", "1", "q0", "1", "R"))
       machine = TuringMachine.new_machine("q0", tape, transitions)
-      finished = TuringMachine.run(machine, 5 :: i64)
+      finished = TuringMachine.run(machine, 5)
       assert(finished.halted == false)
       assert(finished.steps == 5)
     }
@@ -159,19 +159,19 @@ pub struct TuringMachineTest {
 
   describe("unary doubler") {
     test("1 -> 2") {
-      assert(TuringMachine.unary_double(1 :: i64) == "11")
+      assert(TuringMachine.unary_double(1) == "11")
     }
 
     test("2 -> 4") {
-      assert(TuringMachine.unary_double(2 :: i64) == "1111")
+      assert(TuringMachine.unary_double(2) == "1111")
     }
 
     test("3 -> 6") {
-      assert(TuringMachine.unary_double(3 :: i64) == "111111")
+      assert(TuringMachine.unary_double(3) == "111111")
     }
 
     test("5 -> 10") {
-      assert(TuringMachine.unary_double(5 :: i64) == "1111111111")
+      assert(TuringMachine.unary_double(5) == "1111111111")
     }
   }
 
@@ -192,9 +192,9 @@ pub struct TuringMachineTest {
     test("string_to_symbols splits a string into single-char symbols") {
       symbols = TuringMachine.string_to_symbols("101")
       assert(List.length(symbols) == 3)
-      assert(List.at(symbols, 0 :: i64) == "1")
-      assert(List.at(symbols, 1 :: i64) == "0")
-      assert(List.at(symbols, 2 :: i64) == "1")
+      assert(List.at(symbols, 0) == "1")
+      assert(List.at(symbols, 1) == "0")
+      assert(List.at(symbols, 2) == "1")
     }
 
     test("string_to_symbols of empty string is empty list") {

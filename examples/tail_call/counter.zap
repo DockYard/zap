@@ -1,5 +1,5 @@
 pub struct Counter {
-  pub fn countdown(0 :: i64) -> i64 {
+  pub fn countdown(0) -> i64 {
     0
   }
 

@@ -30,8 +30,8 @@ pub struct ListRc1 {
   }
 
   pub fn main(_args :: [String]) -> String {
-    limit = 100 :: i64
-    values = List.new_filled(limit, 0 :: i64)
+    limit = 100
+    values = List.new_filled(limit, 0)
     values = fill_in_place(values, 0, limit)
     total = sum_get(values, 0, limit, 0)
     "total=#{total}" |> IO.puts()

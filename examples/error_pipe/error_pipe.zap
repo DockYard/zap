@@ -1,15 +1,15 @@
 pub struct ErrorPipe {
   # Multi-clause function: only matches certain strings.
   # Unmatched inputs flow to the ~> catch basin.
-  pub fn parse_number("one" :: String) -> String {
+  pub fn parse_number("one") -> String {
     "1"
   }
 
-  pub fn parse_number("two" :: String) -> String {
+  pub fn parse_number("two") -> String {
     "2"
   }
 
-  pub fn parse_number("three" :: String) -> String {
+  pub fn parse_number("three") -> String {
     "3"
   }
 

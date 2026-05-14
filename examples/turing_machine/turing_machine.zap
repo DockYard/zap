@@ -153,7 +153,7 @@ pub struct TuringMachine {
       if halted {
         {next_state, next_tape, steps}
       } else {
-        one = 1 :: i64
+        one = 1
         TuringMachine.run(next_state, next_tape, transitions, steps + one, max_steps)
       }
     }
@@ -193,12 +193,12 @@ pub struct TuringMachine {
   }
 
   pub fn trim_leading_blanks(s :: String, blank :: String) -> String {
-    one = 1 :: i64
+    one = 1
     len = String.length(s)
     if len == 0 {
       s
     } else {
-      if String.slice(s, 0 :: i64, one) == blank {
+      if String.slice(s, 0, one) == blank {
         TuringMachine.trim_leading_blanks(String.slice(s, one, len), blank)
       } else {
         s
@@ -207,13 +207,13 @@ pub struct TuringMachine {
   }
 
   pub fn trim_trailing_blanks(s :: String, blank :: String) -> String {
-    one = 1 :: i64
+    one = 1
     len = String.length(s)
     if len == 0 {
       s
     } else {
       if String.slice(s, len - one, len) == blank {
-        TuringMachine.trim_trailing_blanks(String.slice(s, 0 :: i64, len - one), blank)
+        TuringMachine.trim_trailing_blanks(String.slice(s, 0, len - one), blank)
       } else {
         s
       }
@@ -225,7 +225,7 @@ pub struct TuringMachine {
     """
 
   pub fn string_to_symbols(s :: String) -> [String] {
-    TuringMachine.explode(s, 0 :: i64, String.length(s), ([] :: [String]))
+    TuringMachine.explode(s, 0, String.length(s), ([] :: [String]))
   }
 
   pub fn explode(_s :: String, index :: i64, length :: i64, acc :: [String]) -> [String] if index >= length {
@@ -233,7 +233,7 @@ pub struct TuringMachine {
   }
 
   pub fn explode(s :: String, index :: i64, length :: i64, acc :: [String]) -> [String] {
-    one = 1 :: i64
+    one = 1
     char = String.slice(s, index, index + one)
     TuringMachine.explode(s, index + one, length, [char | acc])
   }
@@ -263,7 +263,7 @@ pub struct TuringMachine {
   pub fn binary_increment(bits :: String) -> String {
     tape = TuringMachine.tape_new(TuringMachine.string_to_symbols(bits), "_")
     transitions = TuringMachine.binary_increment_transitions()
-    {_final_state, final_tape, _steps} = TuringMachine.run("scan", tape, transitions, 0 :: i64, 1000000 :: i64)
+    {_final_state, final_tape, _steps} = TuringMachine.run("scan", tape, transitions, 0, 1000000)
     TuringMachine.tape_to_string(final_tape)
   }
 
@@ -292,16 +292,16 @@ pub struct TuringMachine {
   pub fn unary_double(n :: i64) -> String {
     tape = TuringMachine.tape_new(TuringMachine.unary_ones(n, ([] :: [String])), "_")
     transitions = TuringMachine.unary_double_transitions()
-    {_final_state, final_tape, _steps} = TuringMachine.run("find", tape, transitions, 0 :: i64, 1000000 :: i64)
+    {_final_state, final_tape, _steps} = TuringMachine.run("find", tape, transitions, 0, 1000000)
     TuringMachine.tape_to_string(final_tape)
   }
 
-  pub fn unary_ones(0 :: i64, acc :: [String]) -> [String] {
+  pub fn unary_ones(0, acc :: [String]) -> [String] {
     acc
   }
 
   pub fn unary_ones(n :: i64, acc :: [String]) -> [String] {
-    one = 1 :: i64
+    one = 1
     TuringMachine.unary_ones(n - one, ["1" | acc])
   }
 
@@ -318,10 +318,10 @@ pub struct TuringMachine {
     _ = TuringMachine.demo_increment("100000")
     IO.puts("")
     IO.puts("unary doubler (n -> 2n, as runs of 1s):")
-    _ = TuringMachine.demo_double(1 :: i64)
-    _ = TuringMachine.demo_double(2 :: i64)
-    _ = TuringMachine.demo_double(3 :: i64)
-    _ = TuringMachine.demo_double(5 :: i64)
+    _ = TuringMachine.demo_double(1)
+    _ = TuringMachine.demo_double(2)
+    _ = TuringMachine.demo_double(3)
+    _ = TuringMachine.demo_double(5)
     ""
   }
 

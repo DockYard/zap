@@ -3,15 +3,15 @@ pub struct PatternMatch {
     "HEY YO!"
   }
 
-  pub fn describe(0 :: i64) -> String {
+  pub fn describe(0) -> String {
     "zero"
   }
 
-  pub fn describe(:ok :: Atom) -> String {
+  pub fn describe(:ok) -> String {
     "success"
   }
 
-  pub fn describe(:error :: Atom) -> String {
+  pub fn describe(:error) -> String {
     "failure"
   }
 

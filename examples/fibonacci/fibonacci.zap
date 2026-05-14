@@ -1,9 +1,9 @@
 pub struct Fibonacci {
-  pub fn fib(0 :: i64) -> i64 {
+  pub fn fib(0) -> i64 {
     0
   }
 
-  pub fn fib(1 :: i64) -> i64 {
+  pub fn fib(1) -> i64 {
     1
   }
 

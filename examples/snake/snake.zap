@@ -102,18 +102,18 @@ pub struct Snake {
     handle_status(status, body_xs, body_ys, next_x, next_y, food_x, food_y, score, direction)
   }
 
-  fn handle_status(:ok :: Atom, body_xs :: [i64], body_ys :: [i64], next_x :: i64, next_y :: i64, food_x :: i64, food_y :: i64, score :: i64, direction :: String) -> i64 {
+  fn handle_status(:ok, body_xs :: [i64], body_ys :: [i64], next_x :: i64, next_y :: i64, food_x :: i64, food_y :: i64, score :: i64, direction :: String) -> i64 {
     advance(body_xs, body_ys, next_x, next_y, food_x, food_y, score, direction)
   }
 
-  fn handle_status(:wall :: Atom, body_xs :: [i64], body_ys :: [i64], _next_x :: i64, _next_y :: i64, food_x :: i64, food_y :: i64, score :: i64, _direction :: String) -> i64 {
+  fn handle_status(:wall, body_xs :: [i64], body_ys :: [i64], _next_x :: i64, _next_y :: i64, food_x :: i64, food_y :: i64, score :: i64, _direction :: String) -> i64 {
     "\x1b[2J\x1b[H" |> IO.print_str()
     draw_death(body_xs, body_ys, food_x, food_y, score)
     IO.puts(red("  CRASH! You hit a wall!"))
     game_over(score)
   }
 
-  fn handle_status(:self_collision :: Atom, body_xs :: [i64], body_ys :: [i64], _next_x :: i64, _next_y :: i64, food_x :: i64, food_y :: i64, score :: i64, _direction :: String) -> i64 {
+  fn handle_status(:self_collision, body_xs :: [i64], body_ys :: [i64], _next_x :: i64, _next_y :: i64, food_x :: i64, food_y :: i64, score :: i64, _direction :: String) -> i64 {
     "\x1b[2J\x1b[H" |> IO.print_str()
     draw_death(body_xs, body_ys, food_x, food_y, score)
     IO.puts(red("  OUCH! You bit yourself!"))
