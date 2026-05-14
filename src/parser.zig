@@ -5167,8 +5167,8 @@ test "parse struct literal field named struct" {
 test "parse struct pattern field named struct" {
     const source =
         \\pub struct Test {
-        \\  pub fn main(%Function{struct: module, name: name, arity: arity}) {
-        \\    module
+        \\  pub fn main(%Function{struct: target_type, name: name, arity: arity}) {
+        \\    target_type
         \\  }
         \\}
     ;
