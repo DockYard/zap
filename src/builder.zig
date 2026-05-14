@@ -20,8 +20,8 @@ pub const BuildConfig = struct {
     paths: []const []const u8 = &.{},
     deps: []const Dep = &.{},
     build_opts: std.StringHashMapUnmanaged([]const u8) = .empty,
-    /// Memory manager selected by the manifest. Initial build.zap CTFE
-    /// records only the selected type so dependency resolution can
+    /// Memory manager type selected by the manifest. Initial build.zap
+    /// CTFE records only the selected `Type` so dependency resolution can
     /// complete first. The adapter source path is filled by evaluating
     /// `Memory.Manager.backend/1` after project and dependency sources
     /// are loaded.
@@ -369,10 +369,7 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                         else => .bin,
                     };
                 } else if (std.mem.eql(u8, field.name, "root")) {
-                    config.root = switch (field.value) {
-                        .string => |s| if (s.len > 0) try alloc.dupe(u8, s) else null,
-                        else => null,
-                    };
+                    config.root = try parseManifestRootFunction(alloc, field.value);
                 } else if (std.mem.eql(u8, field.name, "asset_name")) {
                     config.asset_name = switch (field.value) {
                         .string => |s| if (s.len > 0) try alloc.dupe(u8, s) else null,
@@ -504,10 +501,7 @@ pub fn evaluateMemoryManagerAdapterFromSources(
         selected_manager orelse return .{ .manager = null };
     if (selected.type_name.len == 0) return .{ .manager = null };
 
-    const adapter_value = zap.ctfe.ConstValue{ .struct_val = .{
-        .type_name = selected.type_name,
-        .fields = &.{},
-    } };
+    const adapter_value = emptyMemoryManagerValue(selected.type_name);
     return evaluateMemoryManagerAdapterValue(
         alloc,
         &interp,
@@ -522,8 +516,8 @@ fn memoryManagerSelectionFromManifest(
     alloc: std.mem.Allocator,
     manifest_value: zap.ctfe.ConstValue,
 ) !?BuildConfig.MemoryManager {
-    const adapter_value = findManifestField(manifest_value, "memory") orelse return null;
-    const adapter_type_name = (try parseStructRefField(alloc, adapter_value)) orelse return null;
+    const memory_type_value = findManifestField(manifest_value, "memory") orelse return null;
+    const adapter_type_name = try parseManifestMemoryType(alloc, memory_type_value);
     return .{ .type_name = adapter_type_name };
 }
 
@@ -534,9 +528,17 @@ fn evaluateMemoryManagerAdapter(
     interner: *const zap.ast.StringInterner,
     manifest_value: zap.ctfe.ConstValue,
 ) !MemoryAdapterEval {
-    const adapter_value = findManifestField(manifest_value, "memory") orelse return .{ .manager = null };
-    const adapter_type_name = (try parseStructRefField(alloc, adapter_value)) orelse return .{ .manager = null };
+    const memory_type_value = findManifestField(manifest_value, "memory") orelse return .{ .manager = null };
+    const adapter_type_name = try parseManifestMemoryType(alloc, memory_type_value);
+    const adapter_value = emptyMemoryManagerValue(adapter_type_name);
     return evaluateMemoryManagerAdapterValue(alloc, interp, scope_graph, interner, adapter_type_name, adapter_value);
+}
+
+fn emptyMemoryManagerValue(adapter_type_name: []const u8) zap.ctfe.ConstValue {
+    return zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = adapter_type_name,
+        .fields = &.{},
+    } };
 }
 
 fn evaluateMemoryManagerAdapterValue(
@@ -624,14 +626,19 @@ fn structNameMatchesDotted(
 
 fn findManifestField(manifest_value: zap.ctfe.ConstValue, field_name: []const u8) ?zap.ctfe.ConstValue {
     switch (manifest_value) {
-        .struct_val => |struct_value| {
-            for (struct_value.fields) |field| {
-                if (std.mem.eql(u8, field.name, field_name)) return field.value;
-            }
-            return null;
-        },
+        .struct_val => |struct_value| return findConstStructField(struct_value, field_name),
         else => return null,
     }
+}
+
+fn findConstStructField(
+    struct_value: zap.ctfe.ConstValue.ConstStructValue,
+    field_name: []const u8,
+) ?zap.ctfe.ConstValue {
+    for (struct_value.fields) |field| {
+        if (std.mem.eql(u8, field.name, field_name)) return field.value;
+    }
+    return null;
 }
 
 fn evalAdapterFunction(
@@ -841,56 +848,51 @@ fn loadBuildOpts(
     }
 }
 
-/// Extract a dotted struct name from a manifest field whose value may be
-/// any of:
-///   * a 3-tuple `{:__aliases__, [], [:Foo, :Bar, :Baz]}` (the canonical
-///     CTFE representation of a struct reference);
-///   * an atom or string carrying the dotted name directly;
-///   * a struct value (the CTFE form a `pub struct` evaluates to once
-///     captured into a variable).
-///
-/// Returns null when the value is `nil` or any unsupported shape — the
-/// caller treats this as "field absent" and falls back to defaults.
-///
-/// For `struct_val`, `sv.type_name` is always the canonical dotted form
-/// produced by `ctfe.structNameToString` (which calls
-/// `ast.StructName.toDottedString`) — see `src/ctfe.zig` near the
-/// `struct_expr` evaluation in `evaluateConstExpr`. We return it
-/// verbatim; we MUST NOT do underscore-to-dot translation because a
-/// struct's actual name can legitimately contain underscores (e.g.,
-/// `Foo_Bar.Manager`), and any heuristic that rewrites `_` → `.` would
-/// silently mangle such names.
-fn parseStructRefField(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !?[]const u8 {
-    return switch (val) {
-        .nil => null,
-        .string => |s| if (s.len > 0) try alloc.dupe(u8, s) else null,
-        .atom => |s| if (s.len > 0) try alloc.dupe(u8, s) else null,
-        .tuple => |elems| blk: {
-            if (elems.len != 3) break :blk null;
-            if (elems[0] != .atom or !std.mem.eql(u8, elems[0].atom, "__aliases__")) break :blk null;
-            if (elems[2] != .list) break :blk null;
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
-            // `toOwnedSlice` clears `buf`'s pointer on success, so the
-            // defer is a no-op on the happy path; on any OOM from
-            // `buf.append`/`buf.appendSlice` the defer reclaims the
-            // partial allocation.
-            defer buf.deinit(alloc);
-            for (elems[2].list, 0..) |part, idx| {
-                const text = switch (part) {
-                    .atom => |s| s,
-                    .string => |s| s,
-                    else => break :blk null,
-                };
-                if (idx > 0) try buf.append(alloc, '.');
-                try buf.appendSlice(alloc, text);
-            }
-            break :blk try buf.toOwnedSlice(alloc);
-        },
-        .struct_val => |sv| if (sv.type_name.len > 0)
-            try alloc.dupe(u8, sv.type_name)
+fn parseManifestRootFunction(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !?[]const u8 {
+    if (val == .nil) return null;
+    if (val != .struct_val) return error.InvalidManifestRoot;
+
+    const function_value = val.struct_val;
+    if (!std.mem.eql(u8, function_value.type_name, "Function")) return error.InvalidManifestRoot;
+
+    const root_struct_value = findConstStructField(function_value, "struct") orelse return error.InvalidManifestRoot;
+    const root_struct_name = try parseTypeReferenceName(root_struct_value, error.InvalidManifestRoot);
+    const function_name_value = findConstStructField(function_value, "name") orelse return error.InvalidManifestRoot;
+    const arity_value = findConstStructField(function_value, "arity") orelse return error.InvalidManifestRoot;
+
+    const function_name = switch (function_name_value) {
+        .atom => |name| if (name.len > 0) name else return error.InvalidManifestRoot,
+        else => return error.InvalidManifestRoot,
+    };
+    const arity = switch (arity_value) {
+        .int => |value| if (value >= 0)
+            @as(u8, @truncate(@as(u64, @intCast(value))))
         else
-            null,
-        else => null,
+            return error.InvalidManifestRoot,
+        else => return error.InvalidManifestRoot,
+    };
+
+    return try std.fmt.allocPrint(alloc, "{s}.{s}/{d}", .{ root_struct_name, function_name, arity });
+}
+
+fn parseManifestMemoryType(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) ![]const u8 {
+    const type_name = try parseTypeReferenceName(val, error.InvalidManifestMemory);
+    return try alloc.dupe(u8, type_name);
+}
+
+fn parseTypeReferenceName(
+    val: zap.ctfe.ConstValue,
+    comptime invalid_error: anyerror,
+) ![]const u8 {
+    if (val != .struct_val) return invalid_error;
+
+    const type_value = val.struct_val;
+    if (!std.mem.eql(u8, type_value.type_name, "Type")) return invalid_error;
+
+    const name_value = findConstStructField(type_value, "name") orelse return invalid_error;
+    return switch (name_value) {
+        .atom => |name| if (name.len > 0) name else invalid_error,
+        else => invalid_error,
     };
 }
 
@@ -965,46 +967,199 @@ test "constValueToBuildConfig parses deps and build opts" {
     try testing.expectEqualStrings("true", config.build_opts.get("feature_x").?);
 }
 
-test "parseStructRefField parses memory: struct reference (aliases form)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const val = zap.ctfe.ConstValue{ .tuple = &.{
-        .{ .atom = "__aliases__" },
-        .{ .list = &.{} },
-        .{ .list = &.{
-            .{ .atom = "Memory" },
-            .{ .atom = "NoOp" },
-        } },
-    } };
-
-    const parsed = (try parseStructRefField(alloc, val)) orelse return error.UnexpectedNull;
-    try testing.expectEqualStrings("Memory.NoOp", parsed);
-}
-
-test "parseStructRefField parses memory: as a struct value with canonical dotted type_name" {
-    // Production CTFE always populates `struct_val.type_name` with the
-    // dotted form via `ctfe.structNameToString`. This test pins that
-    // contract so `parseStructRefField` can return the name verbatim
-    // without any heuristic translation.
+test "constValueToBuildConfig parses root Function value" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     const val = zap.ctfe.ConstValue{ .struct_val = .{
-        .type_name = "Memory.ARC",
-        .fields = &.{},
+        .type_name = "Zap.Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "app" } },
+            .{ .name = "version", .value = .{ .string = "0.1.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+            .{ .name = "root", .value = .{ .struct_val = .{
+                .type_name = "Function",
+                .fields = &.{
+                    .{ .name = "struct", .value = .{ .struct_val = .{
+                        .type_name = "Type",
+                        .fields = &.{
+                            .{ .name = "name", .value = .{ .atom = "Arena" } },
+                        },
+                    } } },
+                    .{ .name = "name", .value = .{ .atom = "main" } },
+                    .{ .name = "arity", .value = .{ .int = 1 } },
+                },
+            } } },
+        },
     } };
 
-    const parsed = (try parseStructRefField(alloc, val)) orelse return error.UnexpectedNull;
-    try testing.expectEqualStrings("Memory.ARC", parsed);
+    const config = try constValueToBuildConfig(alloc, val);
+    try testing.expect(config.root != null);
+    try testing.expectEqualStrings("Arena.main/1", config.root.?);
 }
 
-test "ctfe manifest evaluates Memory.Manager backend through one protocol method" {
+test "constValueToBuildConfig narrows root Function arity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "app" } },
+            .{ .name = "version", .value = .{ .string = "0.1.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+            .{ .name = "root", .value = .{ .struct_val = .{
+                .type_name = "Function",
+                .fields = &.{
+                    .{ .name = "struct", .value = .{ .struct_val = .{
+                        .type_name = "Type",
+                        .fields = &.{
+                            .{ .name = "name", .value = .{ .atom = "Arena" } },
+                        },
+                    } } },
+                    .{ .name = "name", .value = .{ .atom = "main" } },
+                    .{ .name = "arity", .value = .{ .int = 300 } },
+                },
+            } } },
+        },
+    } };
+
+    const config = try constValueToBuildConfig(alloc, val);
+    try testing.expect(config.root != null);
+    try testing.expectEqualStrings("Arena.main/44", config.root.?);
+}
+
+test "constValueToBuildConfig rejects legacy string root" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "app" } },
+            .{ .name = "version", .value = .{ .string = "0.1.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+            .{ .name = "root", .value = .{ .string = "Arena.main/1" } },
+        },
+    } };
+
+    try testing.expectError(error.InvalidManifestRoot, constValueToBuildConfig(alloc, val));
+}
+
+test "ctfe manifest extracts root Function reference" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Function {
+        \\  struct :: Type
+        \\  name :: Atom
+        \\  arity :: u8
+        \\}
+        \\
+        \\pub struct Zap.Env {
+        \\}
+        \\
+        \\pub struct Zap.Manifest {
+        \\  name :: String
+        \\  version :: String
+        \\  kind :: Atom
+        \\  root :: Function | Nil = nil
+        \\}
+        \\
+        \\pub struct App {
+        \\  pub fn main(_args :: Nil) -> Nil {
+        \\    nil
+        \\  }
+        \\}
+        \\
+        \\pub struct App.Builder {
+        \\  pub fn manifest(_env :: Zap.Env) -> Zap.Manifest {
+        \\    %Zap.Manifest{
+        \\      name: "app",
+        \\      version: "0.1.0",
+        \\      kind: :bin,
+        \\      root: &App.main/1
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "build.zap", .source = source },
+    };
+
+    var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+    const result = try compiler.compileForCtfe(alloc, &ctx, .{ .show_progress = false });
+
+    var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    defer interp.deinit();
+    interp.scope_graph = &ctx.collector.graph;
+    interp.interner = &ctx.interner;
+    interp.capabilities = zap.ctfe.CapabilitySet.build;
+
+    const manifest_id = findManifestFunction(&result.ir_program) orelse return error.ManifestNotFound;
+    const env_const = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Env",
+        .fields = &.{},
+    } };
+
+    const manifest_result = try interp.evalAndExport(manifest_id, &.{env_const}, zap.ctfe.CapabilitySet.build);
+    const config = try constValueToBuildConfig(alloc, manifest_result.value);
+
+    try testing.expect(config.root != null);
+    try testing.expectEqualStrings("App.main/1", config.root.?);
+}
+
+test "memoryManagerSelectionFromManifest parses memory Type value" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Manifest",
+        .fields = &.{
+            .{ .name = "memory", .value = .{ .struct_val = .{
+                .type_name = "Type",
+                .fields = &.{
+                    .{ .name = "name", .value = .{ .atom = "ThirdParty.ProjectArena" } },
+                },
+            } } },
+        },
+    } };
+
+    const selected = (try memoryManagerSelectionFromManifest(alloc, val)) orelse return error.UnexpectedNull;
+    try testing.expectEqualStrings("ThirdParty.ProjectArena", selected.type_name);
+}
+
+test "memoryManagerSelectionFromManifest rejects legacy memory string" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Manifest",
+        .fields = &.{
+            .{ .name = "memory", .value = .{ .string = "Memory.ARC" } },
+        },
+    } };
+
+    try testing.expectError(error.InvalidManifestMemory, memoryManagerSelectionFromManifest(alloc, val));
+}
+
+test "ctfe manifest evaluates third-party Memory.Manager backend through protocol metadata" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
         \\pub protocol Memory.Manager {
         \\  fn backend(manager) -> Bool
         \\}
@@ -1018,11 +1173,11 @@ test "ctfe manifest evaluates Memory.Manager backend through one protocol method
         \\  }
         \\}
         \\
-        \\pub struct Memory.NoOp {
+        \\pub struct ThirdParty.ProjectArena {
         \\}
         \\
-        \\pub impl Memory.Manager for Memory.NoOp {
-        \\  pub fn backend(manager :: Memory.NoOp) -> Bool {
+        \\pub impl Memory.Manager for ThirdParty.ProjectArena {
+        \\  pub fn backend(manager :: ThirdParty.ProjectArena) -> Bool {
         \\    :zig.Memory.backend(manager)
         \\  }
         \\}
@@ -1034,7 +1189,7 @@ test "ctfe manifest evaluates Memory.Manager backend through one protocol method
         \\  name :: String
         \\  version :: String
         \\  kind :: Atom
-        \\  memory :: Memory.Manager = Memory.ARC
+        \\  memory :: Type = Memory.ARC
         \\}
         \\
         \\pub struct App.Builder {
@@ -1043,7 +1198,7 @@ test "ctfe manifest evaluates Memory.Manager backend through one protocol method
         \\      name: "app",
         \\      version: "0.1.0",
         \\      kind: :bin,
-        \\      memory: Memory.NoOp
+        \\      memory: ThirdParty.ProjectArena
         \\    }
         \\  }
         \\}
@@ -1082,7 +1237,7 @@ test "ctfe manifest evaluates Memory.Manager backend through one protocol method
     try testing.expectEqualStrings("app", config.name);
     try testing.expectEqualStrings("0.1.0", config.version);
     try testing.expect(config.memory_manager != null);
-    try testing.expectEqualStrings("Memory.NoOp", config.memory_manager.?.type_name);
+    try testing.expectEqualStrings("ThirdParty.ProjectArena", config.memory_manager.?.type_name);
     try testing.expectEqualStrings("build.zap", config.memory_manager.?.adapter_source_path.?);
 }
 
@@ -1120,8 +1275,10 @@ test "ctfe manifest rejects backend methods without Memory.Manager impl" {
         .type_name = "Zap.Manifest",
         .fields = &.{
             .{ .name = "memory", .value = .{ .struct_val = .{
-                .type_name = "FakeManager",
-                .fields = &.{},
+                .type_name = "Type",
+                .fields = &.{
+                    .{ .name = "name", .value = .{ .atom = "FakeManager" } },
+                },
             } } },
         },
     } };
@@ -1143,6 +1300,10 @@ test "ctfe manifest evaluates default Memory.Manager backend when memory omitted
     const alloc = arena.allocator();
 
     const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
         \\pub protocol Memory.Manager {
         \\  fn backend(manager) -> Bool
         \\}
@@ -1163,7 +1324,7 @@ test "ctfe manifest evaluates default Memory.Manager backend when memory omitted
         \\  name :: String
         \\  version :: String
         \\  kind :: Atom
-        \\  memory :: Memory.Manager = Memory.ARC
+        \\  memory :: Type = Memory.ARC
         \\}
         \\
         \\pub struct App.Builder {
@@ -1212,21 +1373,23 @@ test "ctfe manifest evaluates default Memory.Manager backend when memory omitted
     try testing.expectEqualStrings("build.zap", config.memory_manager.?.adapter_source_path.?);
 }
 
-test "parseStructRefField preserves underscores in struct names" {
-    // Regression: struct names like `Foo_Bar.Manager` legitimately
-    // contain underscores. An earlier heuristic that rewrote `_` → `.`
-    // silently mangled such names; the fix is to return `type_name`
-    // verbatim from production CTFE (which emits the canonical dotted
-    // form via `structNameToString`).
+test "memoryManagerSelectionFromManifest preserves underscores in Type names" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     const val = zap.ctfe.ConstValue{ .struct_val = .{
-        .type_name = "Foo_Bar.Manager",
-        .fields = &.{},
+        .type_name = "Zap.Manifest",
+        .fields = &.{
+            .{ .name = "memory", .value = .{ .struct_val = .{
+                .type_name = "Type",
+                .fields = &.{
+                    .{ .name = "name", .value = .{ .atom = "Foo_Bar.Manager" } },
+                },
+            } } },
+        },
     } };
-    const got = (try parseStructRefField(alloc, val)) orelse return error.UnexpectedNull;
-    try testing.expectEqualStrings("Foo_Bar.Manager", got);
+    const selected = (try memoryManagerSelectionFromManifest(alloc, val)) orelse return error.UnexpectedNull;
+    try testing.expectEqualStrings("Foo_Bar.Manager", selected.type_name);
 }
 
 test "constValueToBuildConfig leaves memory: null when omitted" {
