@@ -1,4 +1,6 @@
-@doc = "Stringable implementation for `Atom`."
+@doc = """
+Stringable implementation for `Atom`.
+"""
 
 pub impl Stringable for Atom {
   @doc = """

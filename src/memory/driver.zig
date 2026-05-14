@@ -2328,7 +2328,7 @@ test "Phase 5 integration: Leak manager resolves via the first-party short-circu
     // declares zero capabilities and is selected for codegen-elision
     // verification builds (a binary built under Leak should contain
     // zero retain/release call sites; see `lib/zap/memory/leak.zap`'s
-    // structdoc). Pinning the short-circuit for Leak guards against a
+    // `@doc` metadata). Pinning the short-circuit for Leak guards against a
     // regression that re-engaged the external compile path and lost
     // both the dup-symbol fix and the perf-recovery win.
     //
@@ -3496,7 +3496,7 @@ test "watch-mode rebuild path: Zap.Memory.Leak resolves without REFCOUNT_V1 refu
     // Leak is the diagnostic leak-everything manager used for codegen
     // elision verification builds (a binary built under Leak should
     // contain zero refcount call sites — see
-    // `lib/zap/memory/leak.zap`'s structdoc). Watch-mode support is
+    // `lib/zap/memory/leak.zap`'s `@doc`). Watch-mode support is
     // required for the iteration loop where a contributor edits a
     // `.zap` file, rebuilds under Leak, and re-inspects the elision
     // status. The v1.0 refusal made that loop impossible without
@@ -3507,7 +3507,7 @@ test "watch-mode rebuild path: Zap.Memory.Leak resolves without REFCOUNT_V1 refu
 test "watch-mode rebuild path: Zap.Memory.Tracking resolves without REFCOUNT_V1 refusal" {
     // Tracking is the diagnostic canary/leak-detecting manager used
     // to validate the runtime's allocation lifecycle (see
-    // `lib/zap/memory/tracking.zap`'s structdoc). Like Leak it
+    // `lib/zap/memory/tracking.zap`'s `@doc`). Like Leak it
     // declares zero capabilities at the section level — its
     // hash-map bookkeeping is internal, not declared via
     // `REFCOUNT_V1` — so the watch-mode resolution path is the same

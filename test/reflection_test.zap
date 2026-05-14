@@ -3,7 +3,7 @@ pub struct ReflectionTest {
   use TestProbe
 
   describe("Struct.functions returns @doc text") {
-    test("single-line doc round-trips") {
+    test("short doc round-trips") {
       assert(add_doc() == "Adds two integers.")
     }
 
@@ -54,11 +54,11 @@ pub struct ReflectionTest {
     }
 
     test("source_line points at the function declaration") {
-      assert(add_source_line() == 10)
+      assert(add_source_line() == 13)
     }
 
     test("macro source_line points at the macro declaration") {
-      assert(twice_source_line() == 28)
+      assert(twice_source_line() == 35)
     }
   }
 

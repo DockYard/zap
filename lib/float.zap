@@ -28,7 +28,9 @@
   """
 
 pub struct Float {
-  @doc = "Converts a floating-point number to its string representation."
+  @doc = """
+  Converts a floating-point number to its string representation.
+  """
 
   pub fn to_string(value :: f16) -> String { :zig.Float.to_string_f16(value) }
   pub fn to_string(value :: f32) -> String { :zig.Float.to_string_f32(value) }
@@ -47,7 +49,9 @@ pub struct Float {
     :zig.Float.to_string_f64_precision(value, decimals)
   }
 
-  @doc = "Returns the absolute value of a float."
+  @doc = """
+  Returns the absolute value of a float.
+  """
 
   pub fn abs(value :: f16) -> f16 { :zig.Float.abs_f16(value) }
   pub fn abs(value :: f32) -> f32 { :zig.Float.abs_f32(value) }
@@ -55,7 +59,9 @@ pub struct Float {
   pub fn abs(value :: f80) -> f80 { :zig.Float.abs_f80(value) }
   pub fn abs(value :: f128) -> f128 { :zig.Float.abs_f128(value) }
 
-  @doc = "Returns the larger of two floats."
+  @doc = """
+  Returns the larger of two floats.
+  """
 
   pub fn max(first :: f16, second :: f16) -> f16 { :zig.Float.max_f16(first, second) }
   pub fn max(first :: f32, second :: f32) -> f32 { :zig.Float.max_f32(first, second) }
@@ -63,7 +69,9 @@ pub struct Float {
   pub fn max(first :: f80, second :: f80) -> f80 { :zig.Float.max_f80(first, second) }
   pub fn max(first :: f128, second :: f128) -> f128 { :zig.Float.max_f128(first, second) }
 
-  @doc = "Returns the smaller of two floats."
+  @doc = """
+  Returns the smaller of two floats.
+  """
 
   pub fn min(first :: f16, second :: f16) -> f16 { :zig.Float.min_f16(first, second) }
   pub fn min(first :: f32, second :: f32) -> f32 { :zig.Float.min_f32(first, second) }
@@ -80,7 +88,9 @@ pub struct Float {
     :zig.Float.parse(input)
   }
 
-  @doc = "Rounds a float to the nearest integer value, returned as a float."
+  @doc = """
+  Rounds a float to the nearest integer value, returned as a float.
+  """
 
   pub fn round(value :: f16) -> f16 { :zig.Float.round_f16(value) }
   pub fn round(value :: f32) -> f32 { :zig.Float.round_f32(value) }
@@ -88,7 +98,9 @@ pub struct Float {
   pub fn round(value :: f80) -> f80 { :zig.Float.round_f80(value) }
   pub fn round(value :: f128) -> f128 { :zig.Float.round_f128(value) }
 
-  @doc = "Returns the largest integer value less than or equal to the given float."
+  @doc = """
+  Returns the largest integer value less than or equal to the given float.
+  """
 
   pub fn floor(value :: f16) -> f16 { :zig.Float.floor_f16(value) }
   pub fn floor(value :: f32) -> f32 { :zig.Float.floor_f32(value) }
@@ -96,7 +108,9 @@ pub struct Float {
   pub fn floor(value :: f80) -> f80 { :zig.Float.floor_f80(value) }
   pub fn floor(value :: f128) -> f128 { :zig.Float.floor_f128(value) }
 
-  @doc = "Returns the smallest integer value greater than or equal to the given float."
+  @doc = """
+  Returns the smallest integer value greater than or equal to the given float.
+  """
 
   pub fn ceil(value :: f16) -> f16 { :zig.Float.ceil_f16(value) }
   pub fn ceil(value :: f32) -> f32 { :zig.Float.ceil_f32(value) }
@@ -104,7 +118,9 @@ pub struct Float {
   pub fn ceil(value :: f80) -> f80 { :zig.Float.ceil_f80(value) }
   pub fn ceil(value :: f128) -> f128 { :zig.Float.ceil_f128(value) }
 
-  @doc = "Truncates a float toward zero, removing the fractional part."
+  @doc = """
+  Truncates a float toward zero, removing the fractional part.
+  """
 
   pub fn truncate(value :: f16) -> f16 { :zig.Float.trunc_f16(value) }
   pub fn truncate(value :: f32) -> f32 { :zig.Float.trunc_f32(value) }
@@ -131,7 +147,9 @@ pub struct Float {
   pub fn to_integer(value :: f80) -> i64 { :zig.Float.to_i64_f80(value) }
   pub fn to_integer(value :: f128) -> i64 { :zig.Float.to_i64_f128(value) }
 
-  @doc = "Clamps a float to be within the given range."
+  @doc = """
+  Clamps a float to be within the given range.
+  """
 
   pub fn clamp(value :: f16, lower :: f16, upper :: f16) -> f16 { :zig.Float.clamp_f16(value, lower, upper) }
   pub fn clamp(value :: f32, lower :: f32, upper :: f32) -> f32 { :zig.Float.clamp_f32(value, lower, upper) }

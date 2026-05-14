@@ -1,4 +1,6 @@
-@doc = "Enumerable implementation for `Range`."
+@doc = """
+Enumerable implementation for `Range`.
+"""
 
 pub impl Enumerable(i64) for Range {
   @doc = """

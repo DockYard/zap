@@ -20,7 +20,7 @@ pub struct Zap.ZestRunnerTest {
     }
   }
 
-  @fndoc = """
+  @doc = """
     Returns the length of `Zest.Runner.options/1` for compile-time tests.
     """
 

@@ -67,6 +67,7 @@ pub struct Markdown {
     Other languages emit only HTML-escaped text so the surrounding
     `<pre><code>` reflects the source verbatim.
     """
+
   pub fn render_code_line(line :: String, code_lang :: String) -> String {
     if zap_lang?(code_lang) {
       highlight_zap_line(line)
@@ -115,6 +116,7 @@ pub struct Markdown {
     the `is_indented_code_line?` re-check, since the caller has already
     decided this line ended the indented code run.
     """
+
   pub fn classify_after_close(line :: String, rest :: [String], mode :: Atom, acc :: String) -> String {
     if String.starts_with?(line, "#### ") {
       render_lines(rest, :start, "", close_block(mode, acc) <> render_heading("h4", String.slice(line, 5, String.length(line))))
@@ -156,6 +158,7 @@ pub struct Markdown {
     four characters are spaces (or a tab). Mirrors the CommonMark
     rule used to render `@doc` Example blocks as `<pre><code>`.
     """
+
   pub fn is_indented_code_line?(line :: String) -> Bool {
     if String.length(line) < 4 {
       false
@@ -359,6 +362,7 @@ pub struct Markdown {
     back to the normal escape-and-advance path so partial bracket
     syntax in prose doesn't get mangled.
     """
+
   pub fn inline_try_link(text :: String, index :: i64, end :: i64, ch :: String, acc :: String) -> String {
     if ch == "[" {
       close_idx = find_link_text_close(text, index + 1, end)
@@ -470,6 +474,7 @@ pub struct Markdown {
     `>`, `<`, `|`). Unrecognised text passes through HTML-escaped
     so non-Zap fragments still render correctly.
     """
+
   pub fn highlight_zap_line(line :: String) -> String {
     highlight_walk(line, 0, String.length(line), "")
   }
@@ -537,6 +542,7 @@ pub struct Markdown {
     keyword highlighters where `"` appearing as content is part of
     the source rather than an attribute delimiter.
     """
+
   pub fn escape_html_no_quotes(text :: String) -> String {
     escape_no_quotes_walk(text, 0, String.length(text), "")
   }
@@ -650,6 +656,7 @@ pub struct Markdown {
     `<span class="hl-type">` so the bundled stylesheet can paint
     them with the type colour rather than as bare identifiers.
     """
+
   pub fn is_zap_primitive_type?(word :: String) -> Bool {
     if is_zap_int_type?(word) or is_zap_float_type?(word) {
       true

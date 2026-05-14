@@ -1,4 +1,6 @@
-@doc = "Updatable implementation for `Map`."
+@doc = """
+Updatable implementation for `Map`.
+"""
 
 pub impl Updatable for Map(K, V) {
   @doc = """

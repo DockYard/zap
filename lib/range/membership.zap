@@ -1,4 +1,6 @@
-@doc = "Membership implementation for `Range`."
+@doc = """
+Membership implementation for `Range`.
+"""
 
 pub impl Membership for Range {
   @doc = """

@@ -7,7 +7,10 @@
   """
 
 pub struct Zap.Doc {
-  @doc = "Render the page title — the `<h1 class=\"page-title\">` element."
+  @doc = """
+  Render the page title — the `<h1 class="page-title">` element.
+  """
+
   pub fn page_title(name :: String) -> String {
     "<h1 class=\"page-title\">" <> escape_html(name) <> "</h1>\n"
   }
@@ -17,6 +20,7 @@ pub struct Zap.Doc {
     the kind category label (`Structs`, `Protocols`, `Unions`); the
     second is the module's qualified name.
     """
+
   pub fn breadcrumb(kind :: Atom, name :: String) -> String {
     open_tag = "<nav class=\"breadcrumb\" aria-label=\"Breadcrumb\">\n"
     category = "<span>" <> kind_category_label(kind) <> "</span>\n"
@@ -25,7 +29,10 @@ pub struct Zap.Doc {
     open_tag <> category <> separator <> current <> "</nav>\n"
   }
 
-  @doc = "Map a kind atom to its sidebar group label."
+  @doc = """
+  Map a kind atom to its sidebar group label.
+  """
+
   pub fn kind_category_label(kind :: Atom) -> String {
     if kind == :struct {
       "Structs"
@@ -55,6 +62,7 @@ pub struct Zap.Doc {
     sentence of a module's `@doc` body. Empty input renders nothing
     so the caller can splice unconditionally.
     """
+
   pub fn tagline(text :: String) -> String {
     if String.length(text) == 0 {
       ""
@@ -69,6 +77,7 @@ pub struct Zap.Doc {
     pointing at its reference page. Returns the empty string for an
     empty list so the caller can splice unconditionally.
     """
+
   @doc = """
     Render one accent-bordered "Implements" link pill for a single
     protocol. The eventual `implements_row/1` builder will fold over
@@ -76,12 +85,14 @@ pub struct Zap.Doc {
     parked while a list-element type-inference snag in the recursive
     fold path is sorted out in a follow-up commit.
     """
+
   @doc = """
     Build the anchor id for a function or macro entry. The convention is
     `<name>-<arity>`; the renderer uses this both for the `id="..."`
     attribute on a function detail block and for the `href="#..."` of
     in-page links (right rail, summary table, "see also" rows).
     """
+
   pub fn anchor_id(name :: String, arity :: i64) -> String {
     name <> "-" <> Integer.to_string(arity)
   }
@@ -93,6 +104,7 @@ pub struct Zap.Doc {
     macros), a flex-spacer, and a `#`-prefixed anchor link that
     deep-links back to this entry.
     """
+
   @doc = """
     Render a single row in the per-struct summary table — name+arity
     cell on the left, doc-summary cell on the right. The first sentence
@@ -100,6 +112,7 @@ pub struct Zap.Doc {
     for `summary` produces an empty doc cell, matching the doc
     generator's behavior for undocumented functions.
     """
+
   pub fn summary_row(name :: String, arity :: i64, summary :: String) -> String {
     anchor = anchor_id(name, arity)
     name_cell = "<tr><td class=\"summary-name\"><a href=\"#" <> anchor <> "\">" <> escape_html(name) <> "/" <> Integer.to_string(arity) <> "</a></td>"
@@ -115,6 +128,7 @@ pub struct Zap.Doc {
     matching the in-tree Zig generator's plain `<code>` rendering for
     signatures the rich pill renderer can't parse.
     """
+
   pub fn signature_block(signature :: String) -> String {
     "<div class=\"signature\"><code>" <> escape_html(signature) <> "</code></div>\n"
   }
@@ -130,11 +144,13 @@ pub struct Zap.Doc {
     panels stacked). `doc_html` is the markdown-rendered prose;
     callers pass `Markdown.to_html(func.doc)`.
     """
+
   @doc = """
     Render one `<li>` row in a sidebar group's struct list. The active
     module gets `class="active"` so CSS can highlight its row with the
     accent left-border + accent-soft fill from the design tokens.
     """
+
   pub fn sidebar_item(name :: String, active? :: Bool, base :: String) -> String {
     li_open = if active? { "<li class=\"active\">" } else { "<li>" }
     li_open <> "<a href=\"" <> base <> "structs/" <> escape_html(name) <> ".html\">" <> escape_html(name) <> "</a></li>\n"
@@ -148,6 +164,7 @@ pub struct Zap.Doc {
     `base` is the relative path prefix (`""` from the landing page,
     `"../"` from a struct page).
     """
+
   pub fn sidebar_group(title :: String, members :: [String], current :: String, base :: String) -> String {
     items = render_sidebar_items(members, current, base, "")
     open_div = "<div class=\"sidebar-group\" data-group=\"" <> escape_html(title) <> "\">\n"
@@ -170,6 +187,7 @@ pub struct Zap.Doc {
     `<h2>` + `<table class="summary">` shell. Returns the empty
     string for an empty body so callers can splice unconditionally.
     """
+
   pub fn summary_table(heading :: String, anchor :: String, rows :: String) -> String {
     if String.length(rows) == 0 {
       ""
@@ -183,6 +201,7 @@ pub struct Zap.Doc {
     `<h2>` heading (`Function Details` / `Macro Details`). Returns
     the empty string for an empty body.
     """
+
   pub fn function_details_section(heading :: String, blocks :: String) -> String {
     if String.length(blocks) == 0 {
       ""
@@ -196,6 +215,7 @@ pub struct Zap.Doc {
     item is a `name/arity` link styled with a left-bordered tick that
     highlights the active section as the page scrolls.
     """
+
   pub fn toc_item(name :: String, arity :: i64) -> String {
     anchor = anchor_id(name, arity)
     "<li><a href=\"#" <> anchor <> "\">" <> escape_html(name) <> "/" <> Integer.to_string(arity) <> "</a></li>\n"
@@ -208,6 +228,7 @@ pub struct Zap.Doc {
     handled by the caller stitching `<li class="toc-section">...</li>`
     into the items body.
     """
+
   pub fn right_rail(items :: String) -> String {
     if String.length(items) == 0 {
       ""
@@ -221,6 +242,7 @@ pub struct Zap.Doc {
     the right-rail to group items under "Functions" and "Macros"
     headings.
     """
+
   pub fn toc_section_label(text :: String) -> String {
     "<li class=\"toc-section\">" <> escape_html(text) <> "</li>\n"
   }
@@ -237,6 +259,7 @@ pub struct Zap.Doc {
     is the GitHub repo URL for the project — pass empty string to
     omit the GitHub icon.
     """
+
   pub fn topbar(project_name :: String, version :: String, base :: String, source_url :: String) -> String {
     topbar_with_tabs(project_name, version, base, source_url, :none, "", "")
   }
@@ -251,6 +274,7 @@ pub struct Zap.Doc {
     `TopbarTabs` struct the legacy Zig generator passed to
     `appendPageHeader`.
     """
+
   pub fn topbar_with_tabs(project_name :: String, version :: String, base :: String, source_url :: String, tab_state :: Atom, ref_url :: String, guide_url :: String) -> String {
     open = "<header class=\"topbar\">\n"
     left = topbar_left(project_name, version, base)
@@ -299,6 +323,7 @@ pub struct Zap.Doc {
     the `active` class; `:none` returns the empty string so callers
     can splice unconditionally.
     """
+
   pub fn render_topbar_tabs(tab_state :: Atom, ref_url :: String, guide_url :: String) -> String {
     if tab_state == :none {
       ""
@@ -319,6 +344,7 @@ pub struct Zap.Doc {
     Zig generator's wrapper exactly so the in-page JS (which reads
     `meta[name=\"zap-docs-base\"]`) continues to work.
     """
+
   pub fn page_open(title :: String, project_name :: String, base :: String) -> String {
     head_open = "<!DOCTYPE html>\n<html lang=\"en\" data-theme=\"dark\">\n<head>\n"
     meta = "<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
@@ -333,6 +359,7 @@ pub struct Zap.Doc {
     `</html>`. Mirrors the existing Zig generator's footer so the
     in-page palette + theme toggle pick up the right asset paths.
     """
+
   pub fn page_close(base :: String) -> String {
     modal = search_modal()
     script = "<script src=\"" <> base <> "app.js\"></script>\n"
@@ -346,6 +373,7 @@ pub struct Zap.Doc {
     (`""` from non-module pages); `base` is the path prefix to the
     docs root.
     """
+
   @doc = """
     Wrap the page chrome around a fully-composed main column. The
     layout is a CSS grid with `<nav class="sidebar">` on the left,
@@ -355,6 +383,7 @@ pub struct Zap.Doc {
     `layout-no-toc` modifier collapses the grid to two columns so
     the content fills the freed space.
     """
+
   @doc = """
     Compose the main column of a module's reference page from its
     pre-rendered child strings:
@@ -369,6 +398,7 @@ pub struct Zap.Doc {
     - `functions_details` / `macros_details` are pre-rendered
       function detail blocks; pass `""` to suppress.
     """
+
   pub fn module_main_content(kind :: Atom, name :: String, implements :: [String], tagline_text :: String, structdoc_html :: String, functions_rows :: String, macros_rows :: String, functions_details :: String, macros_details :: String) -> String {
     head = breadcrumb(kind, name) <> page_title(name) <> implements_row(implements) <> tagline(tagline_text)
     structdoc = if String.length(structdoc_html) == 0 {
@@ -392,11 +422,13 @@ pub struct Zap.Doc {
     (`"../"` from a struct page, `""` from the index).
     `source_url` is the GitHub repo URL (`""` to omit the GH icon).
     """
+
   @doc = """
     Render summary table rows from a list of `{name, arity, summary}`
     triples. Used by the runtime walker to build the body of a
     summary table from reflection results.
     """
+
   pub fn render_summary_rows(items :: [{String, i64, String}], acc :: String) -> String {
     if List.empty?(items) {
       acc
@@ -415,6 +447,7 @@ pub struct Zap.Doc {
     string), or returns the whole text when no period is found —
     matching the in-tree Zig `extractFirstSentence` heuristic.
     """
+
   pub fn first_sentence(text :: String) -> String {
     if String.length(text) == 0 {
       ""
@@ -457,6 +490,7 @@ pub struct Zap.Doc {
     when state isn't `:none`. Mirrors the `TopbarTabs` argument the
     legacy generator threaded through `appendPageHeader`.
     """
+
   pub fn struct_page_with_tabs(project_name :: String, project_version :: String, title :: String, base :: String, source_url :: String, sidebar_html :: String, content_html :: String, rail_html :: String, tab_state :: Atom, ref_url :: String, guide_url :: String) -> String {
     head = page_open(title, project_name, base)
     bar = topbar_with_tabs(project_name, project_version, base, source_url, tab_state, ref_url, guide_url)
@@ -510,6 +544,7 @@ pub struct Zap.Doc {
     surfaces as `Integer` in the panel. When `current` matches one of
     the slugs, that entry gets the `active` class.
     """
+
   pub fn guides_sidebar_group(slugs :: [String], current :: String, base :: String) -> String {
     items = render_guide_sidebar_items(slugs, current, base, "")
     open_div = "<div class=\"sidebar-group\" data-group=\"Guides\">\n"
@@ -538,6 +573,7 @@ pub struct Zap.Doc {
     first character of each word is uppercased and underscores collapse
     to spaces.
     """
+
   pub fn title_case(slug :: String) -> String {
     title_case_walk(slug, 0, String.length(slug), true, "")
   }
@@ -633,6 +669,7 @@ pub struct Zap.Doc {
     a closure-codegen issue elsewhere in the test suite — the
     comprehension path avoids it.
     """
+
   pub fn implements_row(protocols :: [String]) -> String {
     if List.empty?(protocols) {
       ""
@@ -701,6 +738,7 @@ pub struct Zap.Doc {
     page heading and its `@doc` text as the lead paragraph; the
     sidebar highlights the current module.
     """
+
   pub fn render_summary_page(summary :: %{Atom => Term}, kind :: Atom, project_name :: String, project_version :: String, source_url :: String, structs :: [String], protocols :: [String], unions :: [String], guide_slugs :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}], all_variants :: [%{Atom => Term}], all_required :: [%{Atom => Term}]) -> String {
     name = Map.get(summary, :name, "")
     doc = Map.get(summary, :doc, "")
@@ -738,6 +776,7 @@ pub struct Zap.Doc {
     `layout` collapses to `layout-no-toc` and the content fills the
     freed column.
     """
+
   pub fn render_right_rail(functions :: [%{Atom => Term}], macros :: [%{Atom => Term}]) -> String {
     fn_section = if List.empty?(functions) { "" } else { toc_section_label("Functions") <> render_toc_items(functions, "") }
     macro_section = if List.empty?(macros) { "" } else { toc_section_label("Macros") <> render_toc_items(macros, "") }
@@ -760,6 +799,7 @@ pub struct Zap.Doc {
     `render_summary_page` so the per-module sort and render passes
     don't have to re-check the module name on every iteration.
     """
+
   pub fn filter_members_by_module(members :: [%{Atom => Term}], module_name :: String) -> [%{Atom => Term}] {
     filter_members_walk(members, module_name, [] :: [%{Atom => Term}])
   }
@@ -787,6 +827,7 @@ pub struct Zap.Doc {
     layout the legacy generator emitted — the same order an
     `@doc`-driven reader expects when scanning a module's reference page.
     """
+
   pub fn sort_members_by_source_line(members :: [%{Atom => Term}]) -> [%{Atom => Term}] {
     sort_members_walk(members, [] :: [%{Atom => Term}])
   }
@@ -827,6 +868,7 @@ pub struct Zap.Doc {
     when the location fields are identical (e.g. macro-generated
     siblings) so the order remains stable across runs.
     """
+
   pub fn member_lt?(a :: %{Atom => Term}, b :: %{Atom => Term}) -> Bool {
     file_lt_or_eq?(Map.get(a, :source_file, ""), Map.get(b, :source_file, ""), a, b)
   }
@@ -869,6 +911,7 @@ pub struct Zap.Doc {
     self-contained — `String` doesn't yet expose a public compare
     primitive.
     """
+
   pub fn string_lt?(left :: String, right :: String) -> Bool {
     string_lt_walk?(left, right, 0, String.length(left), String.length(right))
   }
@@ -891,7 +934,10 @@ pub struct Zap.Doc {
     }
   }
 
-  @doc = "True when two strings are byte-equal."
+  @doc = """
+  True when two strings are byte-equal.
+  """
+
   pub fn string_eq?(left :: String, right :: String) -> Bool {
     if String.length(left) == String.length(right) {
       string_eq_walk?(left, right, 0, String.length(left))
@@ -925,6 +971,7 @@ pub struct Zap.Doc {
     filtered to one module's entries. Each row uses the member's
     `:name`, `:arity`, and the first sentence of `:doc`.
     """
+
   pub fn render_summary_rows_from_members(members :: [%{Atom => Term}], acc :: String) -> String {
     if List.empty?(members) {
       acc
@@ -942,6 +989,7 @@ pub struct Zap.Doc {
     `render_module_member_details` but skips the per-iteration module
     filter — the caller has done that work.
     """
+
   pub fn render_member_details_sorted(members :: [%{Atom => Term}], is_macro :: Bool, source_url :: String, project_version :: String, acc :: String) -> String {
     if List.empty?(members) {
       acc
@@ -962,6 +1010,7 @@ pub struct Zap.Doc {
     the result to `module_main_content`'s `functions_details` or
     `macros_details` slot.
     """
+
   pub fn render_module_member_details(members :: [%{Atom => Term}], module_name :: String, is_macro :: Bool, source_url :: String, project_version :: String, acc :: String) -> String {
     if List.empty?(members) {
       acc
@@ -999,6 +1048,7 @@ pub struct Zap.Doc {
     renderer. Empty input returns the empty string so callers can
     splice unconditionally.
     """
+
   pub fn render_signatures(signatures_joined :: String) -> String {
     if String.length(signatures_joined) == 0 {
       ""
@@ -1029,6 +1079,7 @@ pub struct Zap.Doc {
     Falls back to the plain `<code>` form when the signature shape
     can't be parsed.
     """
+
   pub fn rich_signature_block(signature :: String) -> String {
     paren_open = String.index_of(signature, "(")
     if paren_open < 0 {
@@ -1064,6 +1115,7 @@ pub struct Zap.Doc {
     (`(T) -> R`) don't trip the scanner. Returns -1 if no match is
     found before `end_index`.
     """
+
   pub fn matching_close_paren(text :: String, index :: i64, depth :: i64, end_index :: i64) -> i64 {
     if index >= end_index {
       -1
@@ -1092,6 +1144,7 @@ pub struct Zap.Doc {
     `name<sep>::<sep><pill>type</pill>` or — if the parameter has no
     `::` — bare HTML-escaped text.
     """
+
   pub fn render_signature_params(params :: String) -> String {
     if String.length(String.trim(params)) == 0 {
       ""
@@ -1135,6 +1188,7 @@ pub struct Zap.Doc {
     the `-> ReturnType [if guard]` segment. Empty/missing portions
     return the empty string.
     """
+
   pub fn render_signature_return(rest :: String) -> String {
     trimmed = String.trim(rest)
     if String.length(trimmed) == 0 {
@@ -1193,6 +1247,7 @@ pub struct Zap.Doc {
     stay grouped because the comma inside the function type sits at
     depth > 0.
     """
+
   pub fn split_top_level_commas(text :: String) -> [String] {
     split_top_level_walk(text, 0, 0, 0, String.length(text), [] :: [String])
   }
@@ -1224,6 +1279,7 @@ pub struct Zap.Doc {
     `(T) -> R if pred` doesn't confuse the scanner. Returns -1 when no
     top-level ` if ` is present.
     """
+
   pub fn index_of_top_level_guard(text :: String) -> i64 {
     scan_top_level_if(text, 0, 0, String.length(text))
   }
@@ -1265,6 +1321,7 @@ pub struct Zap.Doc {
     capture a source location), or `source_line <= 0`. Format
     matches the historical Zig generator: `<url>/blob/v<version>/<file>#L<line>`.
     """
+
   pub fn source_link(source_file :: String, source_line :: i64, source_url :: String, project_version :: String) -> String {
     if String.length(source_url) == 0 {
       ""
@@ -1287,6 +1344,7 @@ pub struct Zap.Doc {
     sometimes attaches to relative paths. The repo URLs the
     `[Source]` link points at don't tolerate the redundant segment.
     """
+
   pub fn strip_dot_slash(path :: String) -> String {
     if String.starts_with?(path, "./") {
       String.slice(path, 2, String.length(path))
@@ -1301,20 +1359,27 @@ pub struct Zap.Doc {
     escape sequences. Other control characters are rare in stdlib
     `@doc` text.
     """
+
   pub fn json_escape(text :: String) -> String {
     step1 = String.replace(text, "\\", "\\\\")
     step2 = String.replace(step1, "\"", "\\\"")
     String.replace(step2, "\n", "\\n")
   }
 
-  @doc = "Render one struct/protocol/union summary as a JSON entry."
+  @doc = """
+  Render one struct/protocol/union summary as a JSON entry.
+  """
+
   pub fn struct_search_entry(summary :: %{Atom => Term}, kind_label :: String) -> String {
     name = Map.get(summary, :name, "")
     doc_text = Map.get(summary, :doc, "")
     "{\"struct\":\"" <> json_escape(name) <> "\",\"type\":\"" <> kind_label <> "\",\"name\":\"" <> json_escape(name) <> "\",\"summary\":\"" <> json_escape(first_sentence(doc_text)) <> "\",\"url\":\"structs/" <> json_escape(name) <> ".html\"},\n"
   }
 
-  @doc = "Walk a list of struct/protocol/union summaries, accumulating JSON search entries."
+  @doc = """
+  Walk a list of struct/protocol/union summaries, accumulating JSON search entries.
+  """
+
   pub fn render_struct_search_entries(summaries :: [%{Atom => Term}], kind_label :: String, acc :: String) -> String {
     if List.empty?(summaries) {
       acc
@@ -1335,17 +1400,24 @@ pub struct Zap.Doc {
     the body. Mirrors the `compose_member_detail` pattern used elsewhere
     in this struct.
     """
+
   pub fn compose_function_search_entry(module_name :: String, fn_name :: String, arity :: i64, doc_text :: String, kind_label :: String) -> String {
     arity_str = Integer.to_string(arity)
     "{\"struct\":\"" <> json_escape(module_name) <> "\",\"type\":\"" <> kind_label <> "\",\"name\":\"" <> json_escape(fn_name) <> "/" <> arity_str <> "\",\"summary\":\"" <> json_escape(first_sentence(doc_text)) <> "\",\"url\":\"structs/" <> json_escape(module_name) <> ".html#" <> json_escape(fn_name) <> "-" <> arity_str <> "\"},\n"
   }
 
-  @doc = "Render a `:module` + `:name` + `:arity` flat-summary entry as a JSON search entry. Used for functions and macros."
+  @doc = """
+  Render a `:module` + `:name` + `:arity` flat-summary entry as a JSON search entry. Used for functions and macros.
+  """
+
   pub fn function_search_entry(entry :: %{Atom => Term}, kind_label :: String) -> String {
     compose_function_search_entry(Map.get(entry, :module, ""), Map.get(entry, :name, ""), Map.get(entry, :arity, 0), Map.get(entry, :doc, ""), kind_label)
   }
 
-  @doc = "Walk a list of function/macro flat-summaries, accumulating JSON search entries."
+  @doc = """
+  Walk a list of function/macro flat-summaries, accumulating JSON search entries.
+  """
+
   pub fn render_function_search_entries(items :: [%{Atom => Term}], kind_label :: String, acc :: String) -> String {
     if List.empty?(items) {
       acc
@@ -1363,6 +1435,7 @@ pub struct Zap.Doc {
     branch-free (every entry adds the same suffix); the array
     closer here drops the last separator before the `]`.
     """
+
   pub fn strip_trailing_comma_newline(body :: String) -> String {
     n = String.length(body)
     if n < 2 {
@@ -1378,6 +1451,7 @@ pub struct Zap.Doc {
     matching the legacy Zig-side search index shape so the bundled
     `app.js` can index and render results without changes.
     """
+
   pub fn render_search_index(struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}]) -> String {
     structs_json = render_struct_search_entries(struct_summaries, "struct", "")
     protocols_json = render_struct_search_entries(protocol_summaries, "protocol", "")
@@ -1398,6 +1472,7 @@ pub struct Zap.Doc {
     `summary_table` so an empty filter result collapses the whole
     block.
     """
+
   pub fn render_kind_extras(kind :: Atom, name :: String, all_variants :: [%{Atom => Term}], all_required :: [%{Atom => Term}]) -> String {
     if kind == :union {
       summary_table("Variants", "variants", render_variant_rows(all_variants, name, ""))
@@ -1446,6 +1521,7 @@ pub struct Zap.Doc {
     `module_main_content` can populate the "Implements" row above the
     title without further filtering.
     """
+
   pub fn collect_implemented_protocols(impls :: [%{Atom => Term}], module_name :: String, acc :: [String]) -> [String] {
     if List.empty?(impls) {
       acc
@@ -1471,6 +1547,7 @@ pub struct Zap.Doc {
     `Implements` deduplication walk doesn't depend on a richer
     list-membership protocol.
     """
+
   pub fn list_contains?(items :: [String], needle :: String) -> Bool {
     if List.empty?(items) {
       false
@@ -1491,6 +1568,7 @@ pub struct Zap.Doc {
     Returns the empty string when no member matches so
     `summary_table` collapses the whole section.
     """
+
   pub fn render_module_member_rows(members :: [%{Atom => Term}], module_name :: String, acc :: String) -> String {
     if List.empty?(members) {
       acc
@@ -1505,6 +1583,7 @@ pub struct Zap.Doc {
     out of `render_module_member_rows` so the outer recursion stays a
     single tail call regardless of whether the member matches.
     """
+
   pub fn member_row_for_module(member :: %{Atom => Term}, module_name :: String) -> String {
     if Map.get(member, :module, "") == module_name {
       summary_row(Map.get(member, :name, ""), Map.get(member, :arity, 0), first_sentence(Map.get(member, :doc, "")))
@@ -1523,6 +1602,7 @@ pub struct Zap.Doc {
     Typically called from a project's `main/1` after invoking
     `use Zap.Doc.Builder`.
     """
+
   pub fn write_pages_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String, landing_md :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}], impl_summaries :: [%{Atom => Term}], variant_summaries :: [%{Atom => Term}], required_summaries :: [%{Atom => Term}], guide_summaries :: [%{Atom => Term}], js_content :: String) -> i64 {
     _ = File.mkdir(out_dir <> "/structs")
     structs = sort_names_alpha(manifest_names(struct_summaries, []))
@@ -1551,6 +1631,7 @@ pub struct Zap.Doc {
     `:source_path` field. Slug = filename stem (basename minus the
     `.md` extension); `guides/integer.md` becomes `integer`.
     """
+
   pub fn collect_guide_slugs(guides :: [%{Atom => Term}], acc :: [String]) -> [String] {
     if List.empty?(guides) {
       acc
@@ -1572,6 +1653,7 @@ pub struct Zap.Doc {
     empty string so the caller can filter out entries that lost their
     path during reflection.
     """
+
   pub fn guide_slug_from_source(source_path :: String) -> String {
     base = Path.basename(source_path)
     if String.ends_with?(base, ".md") {
@@ -1589,6 +1671,7 @@ pub struct Zap.Doc {
     used on per-struct pages so the look is consistent. Returns the
     number of pages successfully written.
     """
+
   pub fn write_guide_pages(out_dir :: String, guides :: [%{Atom => Term}], project_name :: String, project_version :: String, source_url :: String, structs :: [String], protocols :: [String], unions :: [String], guide_slugs :: [String], acc :: i64) -> i64 {
     if List.empty?(guides) {
       acc
@@ -1624,6 +1707,7 @@ pub struct Zap.Doc {
     chrome with the rendered markdown body wrapped in
     `<article class="guide-article structdoc">`.
     """
+
   pub fn render_guide_page(slug :: String, markdown_text :: String, project_name :: String, project_version :: String, source_url :: String, structs :: [String], protocols :: [String], unions :: [String], guide_slugs :: [String]) -> String {
     title = title_case(slug)
     body_html = Markdown.to_html(markdown_text)
@@ -1647,6 +1731,7 @@ pub struct Zap.Doc {
     that signal collapses the topbar tab switch on the corresponding
     guide page (no Reference target to link at).
     """
+
   pub fn struct_name_for_guide_slug(structs :: [String], slug :: String) -> String {
     if List.empty?(structs) {
       ""
@@ -1668,6 +1753,7 @@ pub struct Zap.Doc {
     ASCII A-Z; non-ASCII bytes pass through unchanged so the slug
     matches the file-naming convention `guides/<slug>.md`.
     """
+
   pub fn slug_for_struct_name(name :: String) -> String {
     last_segment = last_dotted_segment(name)
     downcase_ascii(last_segment)
@@ -1734,6 +1820,7 @@ pub struct Zap.Doc {
     back to a struct-card grid with the project name, version pill,
     and one card per declared struct (legacy `appendDefaultLanding`).
     """
+
   pub fn render_index_page(structs :: [String], protocols :: [String], unions :: [String], guide_slugs :: [String], struct_summaries :: [%{Atom => Term}], project_name :: String, project_version :: String, source_url :: String, landing_md :: String) -> String {
     content = if String.length(landing_md) == 0 {
       render_default_landing(structs, struct_summaries, project_name, project_version)
@@ -1751,6 +1838,7 @@ pub struct Zap.Doc {
     first sentence of its `@doc` as the lead summary. Mirrors the
     legacy `appendDefaultLanding` Zig helper.
     """
+
   pub fn render_default_landing(structs :: [String], struct_summaries :: [%{Atom => Term}], project_name :: String, project_version :: String) -> String {
     title = "<h1>" <> escape_html(project_name) <> "</h1>\n"
     version_pill = if String.length(project_version) == 0 {
@@ -1791,6 +1879,7 @@ pub struct Zap.Doc {
     is empty so the caller can emit all three section calls
     unconditionally and let the renderer drop empty kinds.
     """
+
   pub fn render_index_section(heading :: String, names :: [String], _unused :: String) -> String {
     if List.empty?(names) {
       ""
@@ -1816,12 +1905,14 @@ pub struct Zap.Doc {
     single-pass walk so callers don't have to maintain three parallel
     arrays of names alongside their summaries.
     """
+
   @doc = """
     Insertion-sort a list of qualified-name strings into ascending
     alphabetical order. Used so the sidebar groups (`Structs`,
     `Protocols`, `Unions`) and the index page list members in a
     predictable order regardless of reflection iteration order.
     """
+
   pub fn sort_names_alpha(names :: [String]) -> [String] {
     sort_names_walk(names, [] :: [String])
   }
@@ -1875,6 +1966,7 @@ pub struct Zap.Doc {
     surfaces a Bool, which we count toward the total only when true so
     a partial failure doesn't lie about how much output landed.
     """
+
   pub fn write_summary_pages(out_dir :: String, summaries :: [%{Atom => Term}], kind :: Atom, project_name :: String, project_version :: String, source_url :: String, structs :: [String], protocols :: [String], unions :: [String], guide_slugs :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}], all_variants :: [%{Atom => Term}], all_required :: [%{Atom => Term}], acc :: i64) -> i64 {
     if List.empty?(summaries) {
       acc

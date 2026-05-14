@@ -211,13 +211,19 @@ zap deps update parser
 Zap code is organized around top-level declarations:
 
 ```zap
-@doc = "A two-dimensional point."
+@doc = """
+A two-dimensional point.
+"""
+
 pub struct Point {
   x :: i64
   y :: i64
 }
 
-@doc = "Possible directions."
+@doc = """
+Possible directions.
+"""
+
 pub union Direction {
   North,
   South,
@@ -225,7 +231,10 @@ pub union Direction {
   West
 }
 
-@doc = "Values that can be converted to a string."
+@doc = """
+Values that can be converted to a string.
+"""
+
 pub protocol Stringable {
   fn to_string(value) -> String
 }
@@ -539,9 +548,15 @@ Documentation comes from `@doc` attributes placed immediately before the thing
 being documented:
 
 ```zap
-@doc = "Functions for working with points."
+@doc = """
+Functions for working with points.
+"""
+
 pub struct Point {
-  @doc = "Builds a point from x and y coordinates."
+  @doc = """
+  Builds a point from x and y coordinates.
+  """
+
   pub fn new(x :: i64, y :: i64) -> Point {
     %Point{x: x, y: y}
   }

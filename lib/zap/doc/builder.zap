@@ -201,27 +201,42 @@ pub struct Zap.Doc.Builder {
         unquote(if list_length(union_summaries) > 0 { union_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
-      @doc = "Flat list of every public function across reflected modules, each with `:module`, `:name`, `:arity`, `:doc`."
+      @doc = """
+      Flat list of every public function across reflected modules, each with `:module`, `:name`, `:arity`, `:doc`.
+      """
+
       pub fn manifest_function_summaries() -> [%{Atom => Term}] {
         unquote(if list_length(function_summaries) > 0 { function_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
-      @doc = "Flat list of every public macro across reflected modules, same shape as `manifest_function_summaries`."
+      @doc = """
+      Flat list of every public macro across reflected modules, same shape as `manifest_function_summaries`.
+      """
+
       pub fn manifest_macro_summaries() -> [%{Atom => Term}] {
         unquote(if list_length(macro_summaries) > 0 { macro_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
-      @doc = "Flat list of every protocol-impl declared across reflected modules, each with `:proto_name` and `:target` qualified names."
+      @doc = """
+      Flat list of every protocol-impl declared across reflected modules, each with `:proto_name` and `:target` qualified names.
+      """
+
       pub fn manifest_impl_summaries() -> [%{Atom => Term}] {
         unquote(if list_length(impl_summaries) > 0 { impl_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
-      @doc = "Flat list of every union variant across reflected modules, each with `:module`, `:name`, `:signature`."
+      @doc = """
+      Flat list of every union variant across reflected modules, each with `:module`, `:name`, `:signature`.
+      """
+
       pub fn manifest_variant_summaries() -> [%{Atom => Term}] {
         unquote(if list_length(variant_summaries) > 0 { variant_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
-      @doc = "Flat list of every protocol's required functions across reflected modules, each with `:module`, `:name`, `:signature`."
+      @doc = """
+      Flat list of every protocol's required functions across reflected modules, each with `:module`, `:name`, `:signature`.
+      """
+
       pub fn manifest_required_function_summaries() -> [%{Atom => Term}] {
         unquote(if list_length(required_function_summaries) > 0 { required_function_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
@@ -235,6 +250,7 @@ pub struct Zap.Doc.Builder {
         through `Markdown.to_html/1`; the sidebar derives the Guides
         group from the same manifest.
         """
+
       pub fn manifest_guide_summaries() -> [%{Atom => Term}] {
         unquote(if list_length(guide_summaries) > 0 { guide_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
@@ -250,6 +266,7 @@ pub struct Zap.Doc.Builder {
         title, and per-function `[Source]` links. Pass an empty
         string for `source_url` to suppress source links.
         """
+
       pub fn write_docs_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String) -> i64 {
         write_docs_to(out_dir, project_name, project_version, source_url, "")
       }
@@ -263,6 +280,7 @@ pub struct Zap.Doc.Builder {
         when its manifest set `landing_page: \"README.md\"`. An empty
         `landing_md` falls back to the auto-generated struct-card grid.
         """
+
       pub fn write_docs_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String, landing_md :: String) -> i64 {
         _ = File.mkdir(out_dir)
         _ = File.write(out_dir <> "/style.css", unquote(doc_css))

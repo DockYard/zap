@@ -1,4 +1,6 @@
-@doc = "Stringable implementation for `Float`."
+@doc = """
+Stringable implementation for `Float`.
+"""
 
 pub impl Stringable for Float {
   @doc = """

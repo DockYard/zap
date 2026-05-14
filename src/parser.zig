@@ -5139,7 +5139,7 @@ test "parse struct is_private false by default" {
 test "parse typed struct attribute" {
     const source =
         \\pub struct Foo {
-        \\  @doc :: String = "hello world"
+        \\  @label :: String = "hello world"
         \\  pub fn bar() -> i64 {
         \\    1
         \\  }
@@ -5157,7 +5157,7 @@ test "parse typed struct attribute" {
     // First item is the attribute
     try std.testing.expect(program.structs[0].items[0] == .attribute);
     const attr = program.structs[0].items[0].attribute;
-    try std.testing.expectEqualStrings("doc", parser.interner.get(attr.name));
+    try std.testing.expectEqualStrings("label", parser.interner.get(attr.name));
     try std.testing.expect(attr.type_expr != null);
     try std.testing.expect(attr.value != null);
     // Second item is the function
@@ -5191,7 +5191,7 @@ test "parse marker attribute" {
 test "parse multiple attributes on same function" {
     const source =
         \\pub struct Foo {
-        \\  @doc :: String = "does something"
+        \\  @label :: String = "does something"
         \\  @deprecated :: String = "use bar2 instead"
         \\  pub fn bar() -> i64 {
         \\    1
@@ -5212,8 +5212,8 @@ test "parse multiple attributes on same function" {
     try std.testing.expect(program.structs[0].items[1] == .attribute);
     try std.testing.expect(program.structs[0].items[2] == .function);
 
-    const doc = program.structs[0].items[0].attribute;
-    try std.testing.expectEqualStrings("doc", parser.interner.get(doc.name));
+    const label = program.structs[0].items[0].attribute;
+    try std.testing.expectEqualStrings("label", parser.interner.get(label.name));
 
     const dep = program.structs[0].items[1].attribute;
     try std.testing.expectEqualStrings("deprecated", parser.interner.get(dep.name));
@@ -5222,7 +5222,7 @@ test "parse multiple attributes on same function" {
 test "parse struct-level attribute" {
     const source =
         \\pub struct Foo {
-        \\  @structdoc :: String = "A struct"
+        \\  @label :: String = "A struct"
         \\  @version :: String = "1.0.0"
         \\}
     ;
@@ -5238,8 +5238,8 @@ test "parse struct-level attribute" {
     try std.testing.expect(program.structs[0].items[0] == .attribute);
     try std.testing.expect(program.structs[0].items[1] == .attribute);
 
-    const structdoc = program.structs[0].items[0].attribute;
-    try std.testing.expectEqualStrings("structdoc", parser.interner.get(structdoc.name));
+    const label = program.structs[0].items[0].attribute;
+    try std.testing.expectEqualStrings("label", parser.interner.get(label.name));
 
     const version = program.structs[0].items[1].attribute;
     try std.testing.expectEqualStrings("version", parser.interner.get(version.name));

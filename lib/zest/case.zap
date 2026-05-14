@@ -81,7 +81,9 @@ pub struct Zest.Case {
     }
 
     quote {
-      @doc = "Runs all registered Zest tests in this struct."
+      @doc = """
+      Runs all registered Zest tests in this struct.
+      """
 
       pub fn run() -> String {
         unquote_splicing(run_calls)
@@ -95,7 +97,9 @@ pub struct Zest.Case {
     struct_put_attribute(:zest_tests, test_name)
 
     quote {
-      @doc = "Generated Zest test function."
+      @doc = """
+      Generated Zest test function.
+      """
 
       pub fn unquote(test_name)() -> String {
         unquote(make_call("__block__", list_concat(list_concat(list_concat(if list_length(elem(test_expr, 2)) == 3 and setup_body != nil { [make_call("=", [ctx, setup_body])] } else { [] }, if elem(list_at(elem(test_expr, 2), -1), 0) == :__block__ { elem(list_at(elem(test_expr, 2), -1), 2) } else { [list_at(elem(test_expr, 2), -1)] }), if teardown_body != nil { [teardown_body] } else { [] }), ["ok"])))
@@ -158,7 +162,9 @@ pub struct Zest.Case {
     struct_put_attribute(:zest_tests, fn_name)
 
     quote {
-      @doc = "Generated Zest test function."
+      @doc = """
+      Generated Zest test function.
+      """
 
       pub fn unquote(fn_name)() -> String {
         unquote(body)

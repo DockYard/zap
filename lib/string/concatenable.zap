@@ -1,4 +1,6 @@
-@doc = "Concatenable implementation for `String`."
+@doc = """
+Concatenable implementation for `String`.
+"""
 
 pub impl Concatenable for String {
   @doc = """

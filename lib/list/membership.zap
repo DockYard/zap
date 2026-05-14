@@ -1,7 +1,9 @@
-@doc = "Membership implementation for `List`."
+@doc = """
+Membership implementation for `List`.
+"""
 
 pub impl Membership for List {
-  @fndoc = """
+  @doc = """
   Linear scan for `value` in `list`.
   """
 

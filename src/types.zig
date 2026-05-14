@@ -3386,7 +3386,7 @@ pub const TypeChecker = struct {
             // For @debug, validate that it's on a function with T -> T semantics
             // (This validation is done later when we see the function declaration)
         } else if (attr.type_expr == null and attr.value != null) {
-            // Value-only attribute (e.g., `@doc = "..."`) — valid
+            // Value-only attribute (e.g., a heredoc `@doc`) — valid
         } else {
             // Type without value — should not happen
             const attr_name = self.interner.get(attr.name);

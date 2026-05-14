@@ -67,7 +67,9 @@ pub struct Integer {
   pub fn abs(value :: u64) -> u64 { :zig.Integer.abs_u64(value) }
   pub fn abs(value :: u128) -> u128 { :zig.Integer.abs_u128(value) }
 
-  @doc = "Returns the larger of two integers."
+  @doc = """
+  Returns the larger of two integers.
+  """
 
   pub fn max(first :: i8, second :: i8) -> i8 { :zig.Integer.max_i8(first, second) }
   pub fn max(first :: i16, second :: i16) -> i16 { :zig.Integer.max_i16(first, second) }
@@ -80,7 +82,9 @@ pub struct Integer {
   pub fn max(first :: u64, second :: u64) -> u64 { :zig.Integer.max_u64(first, second) }
   pub fn max(first :: u128, second :: u128) -> u128 { :zig.Integer.max_u128(first, second) }
 
-  @doc = "Returns the smaller of two integers."
+  @doc = """
+  Returns the smaller of two integers.
+  """
 
   pub fn min(first :: i8, second :: i8) -> i8 { :zig.Integer.min_i8(first, second) }
   pub fn min(first :: i16, second :: i16) -> i16 { :zig.Integer.min_i16(first, second) }
@@ -102,7 +106,9 @@ pub struct Integer {
     :zig.Integer.parse(input)
   }
 
-  @doc = "Computes the remainder of integer division."
+  @doc = """
+  Computes the remainder of integer division.
+  """
 
   pub fn remainder(dividend :: i8, divisor :: i8) -> i8 { :zig.Integer.rem_i8(dividend, divisor) }
   pub fn remainder(dividend :: i16, divisor :: i16) -> i16 { :zig.Integer.rem_i16(dividend, divisor) }
@@ -115,7 +121,9 @@ pub struct Integer {
   pub fn remainder(dividend :: u64, divisor :: u64) -> u64 { :zig.Integer.rem_u64(dividend, divisor) }
   pub fn remainder(dividend :: u128, divisor :: u128) -> u128 { :zig.Integer.rem_u128(dividend, divisor) }
 
-  @doc = "Raises `base` to the power of `exponent`."
+  @doc = """
+  Raises `base` to the power of `exponent`.
+  """
 
   pub fn pow(base :: i8, exponent :: i8) -> i8 { :zig.Integer.pow_i8(base, exponent) }
   pub fn pow(base :: i16, exponent :: i16) -> i16 { :zig.Integer.pow_i16(base, exponent) }
@@ -128,7 +136,9 @@ pub struct Integer {
   pub fn pow(base :: u64, exponent :: u64) -> u64 { :zig.Integer.pow_u64(base, exponent) }
   pub fn pow(base :: u128, exponent :: u128) -> u128 { :zig.Integer.pow_u128(base, exponent) }
 
-  @doc = "Clamps a value to be within the given range."
+  @doc = """
+  Clamps a value to be within the given range.
+  """
 
   pub fn clamp(value :: i8, lower :: i8, upper :: i8) -> i8 { :zig.Integer.clamp_i8(value, lower, upper) }
   pub fn clamp(value :: i16, lower :: i16, upper :: i16) -> i16 { :zig.Integer.clamp_i16(value, lower, upper) }
@@ -141,7 +151,9 @@ pub struct Integer {
   pub fn clamp(value :: u64, lower :: u64, upper :: u64) -> u64 { :zig.Integer.clamp_u64(value, lower, upper) }
   pub fn clamp(value :: u128, lower :: u128, upper :: u128) -> u128 { :zig.Integer.clamp_u128(value, lower, upper) }
 
-  @doc = "Returns the number of decimal digits in an integer."
+  @doc = """
+  Returns the number of decimal digits in an integer.
+  """
 
   pub fn digits(value :: i8) -> i64 { :zig.Integer.digits_i8(value) }
   pub fn digits(value :: i16) -> i64 { :zig.Integer.digits_i16(value) }
@@ -154,7 +166,9 @@ pub struct Integer {
   pub fn digits(value :: u64) -> i64 { :zig.Integer.digits_u64(value) }
   pub fn digits(value :: u128) -> i64 { :zig.Integer.digits_u128(value) }
 
-  @doc = "Converts an integer to a 64-bit floating-point number."
+  @doc = """
+  Converts an integer to a 64-bit floating-point number.
+  """
 
   pub fn to_float(value :: i8) -> f64 { :zig.Integer.to_f64_i8(value) }
   pub fn to_float(value :: i16) -> f64 { :zig.Integer.to_f64_i16(value) }
@@ -167,7 +181,9 @@ pub struct Integer {
   pub fn to_float(value :: u64) -> f64 { :zig.Integer.to_f64_u64(value) }
   pub fn to_float(value :: u128) -> f64 { :zig.Integer.to_f64_u128(value) }
 
-  @doc = "Returns the number of leading zeros in the binary representation."
+  @doc = """
+  Returns the number of leading zeros in the binary representation.
+  """
 
   pub fn count_leading_zeros(value :: i8) -> i64 { :zig.Integer.clz_i8(value) }
   pub fn count_leading_zeros(value :: i16) -> i64 { :zig.Integer.clz_i16(value) }
@@ -180,7 +196,9 @@ pub struct Integer {
   pub fn count_leading_zeros(value :: u64) -> i64 { :zig.Integer.clz_u64(value) }
   pub fn count_leading_zeros(value :: u128) -> i64 { :zig.Integer.clz_u128(value) }
 
-  @doc = "Returns the number of trailing zeros in the binary representation."
+  @doc = """
+  Returns the number of trailing zeros in the binary representation.
+  """
 
   pub fn count_trailing_zeros(value :: i8) -> i64 { :zig.Integer.ctz_i8(value) }
   pub fn count_trailing_zeros(value :: i16) -> i64 { :zig.Integer.ctz_i16(value) }
@@ -193,7 +211,9 @@ pub struct Integer {
   pub fn count_trailing_zeros(value :: u64) -> i64 { :zig.Integer.ctz_u64(value) }
   pub fn count_trailing_zeros(value :: u128) -> i64 { :zig.Integer.ctz_u128(value) }
 
-  @doc = "Returns the number of set bits in the binary representation."
+  @doc = """
+  Returns the number of set bits in the binary representation.
+  """
 
   pub fn popcount(value :: i8) -> i64 { :zig.Integer.popcount_i8(value) }
   pub fn popcount(value :: i16) -> i64 { :zig.Integer.popcount_i16(value) }
@@ -206,7 +226,9 @@ pub struct Integer {
   pub fn popcount(value :: u64) -> i64 { :zig.Integer.popcount_u64(value) }
   pub fn popcount(value :: u128) -> i64 { :zig.Integer.popcount_u128(value) }
 
-  @doc = "Reverses the byte order of an integer."
+  @doc = """
+  Reverses the byte order of an integer.
+  """
 
   pub fn byte_swap(value :: i8) -> i8 { :zig.Integer.byte_swap_i8(value) }
   pub fn byte_swap(value :: i16) -> i16 { :zig.Integer.byte_swap_i16(value) }
@@ -219,7 +241,9 @@ pub struct Integer {
   pub fn byte_swap(value :: u64) -> u64 { :zig.Integer.byte_swap_u64(value) }
   pub fn byte_swap(value :: u128) -> u128 { :zig.Integer.byte_swap_u128(value) }
 
-  @doc = "Reverses all bits in the binary representation."
+  @doc = """
+  Reverses all bits in the binary representation.
+  """
 
   pub fn bit_reverse(value :: i8) -> i8 { :zig.Integer.bit_reverse_i8(value) }
   pub fn bit_reverse(value :: i16) -> i16 { :zig.Integer.bit_reverse_i16(value) }
@@ -232,7 +256,9 @@ pub struct Integer {
   pub fn bit_reverse(value :: u64) -> u64 { :zig.Integer.bit_reverse_u64(value) }
   pub fn bit_reverse(value :: u128) -> u128 { :zig.Integer.bit_reverse_u128(value) }
 
-  @doc = "Adds two integers with saturation."
+  @doc = """
+  Adds two integers with saturation.
+  """
 
   pub fn add_sat(first :: i8, second :: i8) -> i8 { :zig.Integer.add_sat_i8(first, second) }
   pub fn add_sat(first :: i16, second :: i16) -> i16 { :zig.Integer.add_sat_i16(first, second) }
@@ -245,7 +271,9 @@ pub struct Integer {
   pub fn add_sat(first :: u64, second :: u64) -> u64 { :zig.Integer.add_sat_u64(first, second) }
   pub fn add_sat(first :: u128, second :: u128) -> u128 { :zig.Integer.add_sat_u128(first, second) }
 
-  @doc = "Subtracts two integers with saturation."
+  @doc = """
+  Subtracts two integers with saturation.
+  """
 
   pub fn sub_sat(first :: i8, second :: i8) -> i8 { :zig.Integer.sub_sat_i8(first, second) }
   pub fn sub_sat(first :: i16, second :: i16) -> i16 { :zig.Integer.sub_sat_i16(first, second) }
@@ -258,7 +286,9 @@ pub struct Integer {
   pub fn sub_sat(first :: u64, second :: u64) -> u64 { :zig.Integer.sub_sat_u64(first, second) }
   pub fn sub_sat(first :: u128, second :: u128) -> u128 { :zig.Integer.sub_sat_u128(first, second) }
 
-  @doc = "Multiplies two integers with saturation."
+  @doc = """
+  Multiplies two integers with saturation.
+  """
 
   pub fn mul_sat(first :: i8, second :: i8) -> i8 { :zig.Integer.mul_sat_i8(first, second) }
   pub fn mul_sat(first :: i16, second :: i16) -> i16 { :zig.Integer.mul_sat_i16(first, second) }
@@ -271,7 +301,9 @@ pub struct Integer {
   pub fn mul_sat(first :: u64, second :: u64) -> u64 { :zig.Integer.mul_sat_u64(first, second) }
   pub fn mul_sat(first :: u128, second :: u128) -> u128 { :zig.Integer.mul_sat_u128(first, second) }
 
-  @doc = "Bitwise AND of two integers."
+  @doc = """
+  Bitwise AND of two integers.
+  """
 
   pub fn band(first :: i8, second :: i8) -> i8 { :zig.Integer.band_i8(first, second) }
   pub fn band(first :: i16, second :: i16) -> i16 { :zig.Integer.band_i16(first, second) }
@@ -284,7 +316,9 @@ pub struct Integer {
   pub fn band(first :: u64, second :: u64) -> u64 { :zig.Integer.band_u64(first, second) }
   pub fn band(first :: u128, second :: u128) -> u128 { :zig.Integer.band_u128(first, second) }
 
-  @doc = "Bitwise OR of two integers."
+  @doc = """
+  Bitwise OR of two integers.
+  """
 
   pub fn bor(first :: i8, second :: i8) -> i8 { :zig.Integer.bor_i8(first, second) }
   pub fn bor(first :: i16, second :: i16) -> i16 { :zig.Integer.bor_i16(first, second) }
@@ -297,7 +331,9 @@ pub struct Integer {
   pub fn bor(first :: u64, second :: u64) -> u64 { :zig.Integer.bor_u64(first, second) }
   pub fn bor(first :: u128, second :: u128) -> u128 { :zig.Integer.bor_u128(first, second) }
 
-  @doc = "Bitwise XOR of two integers."
+  @doc = """
+  Bitwise XOR of two integers.
+  """
 
   pub fn bxor(first :: i8, second :: i8) -> i8 { :zig.Integer.bxor_i8(first, second) }
   pub fn bxor(first :: i16, second :: i16) -> i16 { :zig.Integer.bxor_i16(first, second) }
@@ -310,7 +346,9 @@ pub struct Integer {
   pub fn bxor(first :: u64, second :: u64) -> u64 { :zig.Integer.bxor_u64(first, second) }
   pub fn bxor(first :: u128, second :: u128) -> u128 { :zig.Integer.bxor_u128(first, second) }
 
-  @doc = "Bitwise NOT of an integer."
+  @doc = """
+  Bitwise NOT of an integer.
+  """
 
   pub fn bnot(value :: i8) -> i8 { :zig.Integer.bnot_i8(value) }
   pub fn bnot(value :: i16) -> i16 { :zig.Integer.bnot_i16(value) }
@@ -323,7 +361,9 @@ pub struct Integer {
   pub fn bnot(value :: u64) -> u64 { :zig.Integer.bnot_u64(value) }
   pub fn bnot(value :: u128) -> u128 { :zig.Integer.bnot_u128(value) }
 
-  @doc = "Bitwise shift left."
+  @doc = """
+  Bitwise shift left.
+  """
 
   pub fn bsl(value :: i8, amount :: i8) -> i8 { :zig.Integer.bsl_i8(value, amount) }
   pub fn bsl(value :: i16, amount :: i16) -> i16 { :zig.Integer.bsl_i16(value, amount) }
@@ -336,7 +376,9 @@ pub struct Integer {
   pub fn bsl(value :: u64, amount :: u64) -> u64 { :zig.Integer.bsl_u64(value, amount) }
   pub fn bsl(value :: u128, amount :: u128) -> u128 { :zig.Integer.bsl_u128(value, amount) }
 
-  @doc = "Bitwise shift right."
+  @doc = """
+  Bitwise shift right.
+  """
 
   pub fn bsr(value :: i8, amount :: i8) -> i8 { :zig.Integer.bsr_i8(value, amount) }
   pub fn bsr(value :: i16, amount :: i16) -> i16 { :zig.Integer.bsr_i16(value, amount) }
@@ -349,7 +391,9 @@ pub struct Integer {
   pub fn bsr(value :: u64, amount :: u64) -> u64 { :zig.Integer.bsr_u64(value, amount) }
   pub fn bsr(value :: u128, amount :: u128) -> u128 { :zig.Integer.bsr_u128(value, amount) }
 
-  @doc = "Returns the sign of an integer."
+  @doc = """
+  Returns the sign of an integer.
+  """
 
   pub fn sign(value :: i8) -> i8 { :zig.Integer.sign_i8(value) }
   pub fn sign(value :: i16) -> i16 { :zig.Integer.sign_i16(value) }
@@ -362,7 +406,9 @@ pub struct Integer {
   pub fn sign(value :: u64) -> u64 { :zig.Integer.sign_u64(value) }
   pub fn sign(value :: u128) -> u128 { :zig.Integer.sign_u128(value) }
 
-  @doc = "Returns true if the integer is even."
+  @doc = """
+  Returns true if the integer is even.
+  """
 
   pub fn even?(value :: i8) -> Bool { :zig.Integer.is_even_i8(value) }
   pub fn even?(value :: i16) -> Bool { :zig.Integer.is_even_i16(value) }
@@ -375,7 +421,9 @@ pub struct Integer {
   pub fn even?(value :: u64) -> Bool { :zig.Integer.is_even_u64(value) }
   pub fn even?(value :: u128) -> Bool { :zig.Integer.is_even_u128(value) }
 
-  @doc = "Returns true if the integer is odd."
+  @doc = """
+  Returns true if the integer is odd.
+  """
 
   pub fn odd?(value :: i8) -> Bool { :zig.Integer.is_odd_i8(value) }
   pub fn odd?(value :: i16) -> Bool { :zig.Integer.is_odd_i16(value) }
@@ -388,7 +436,9 @@ pub struct Integer {
   pub fn odd?(value :: u64) -> Bool { :zig.Integer.is_odd_u64(value) }
   pub fn odd?(value :: u128) -> Bool { :zig.Integer.is_odd_u128(value) }
 
-  @doc = "Computes the greatest common divisor of two integers."
+  @doc = """
+  Computes the greatest common divisor of two integers.
+  """
 
   pub fn gcd(first :: i8, second :: i8) -> i8 { :zig.Integer.gcd_i8(first, second) }
   pub fn gcd(first :: i16, second :: i16) -> i16 { :zig.Integer.gcd_i16(first, second) }
@@ -401,7 +451,9 @@ pub struct Integer {
   pub fn gcd(first :: u64, second :: u64) -> u64 { :zig.Integer.gcd_u64(first, second) }
   pub fn gcd(first :: u128, second :: u128) -> u128 { :zig.Integer.gcd_u128(first, second) }
 
-  @doc = "Computes the least common multiple of two integers."
+  @doc = """
+  Computes the least common multiple of two integers.
+  """
 
   pub fn lcm(first :: i8, second :: i8) -> i8 { :zig.Integer.lcm_i8(first, second) }
   pub fn lcm(first :: i16, second :: i16) -> i16 { :zig.Integer.lcm_i16(first, second) }

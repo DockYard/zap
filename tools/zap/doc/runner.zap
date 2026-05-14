@@ -17,7 +17,9 @@
 pub struct Zap.Doc.Runner {
   use Zap.Doc.Builder, paths: ["lib/**/*.zap"]
 
-  @doc = "Render every reflected module to `docs/<name>.html` and write `style.css` + `app.js`."
+  @doc = """
+  Render every reflected module to `docs/<name>.html` and write `style.css` + `app.js`.
+  """
 
   pub fn main(_args :: [String]) -> String {
     landing_md = File.read("README.md")

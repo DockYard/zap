@@ -656,13 +656,12 @@ Do not move stdlib behavior into Zig just because it is easier.
 
 ## Documentation Style In lib/
 
-Every public function and macro in `lib/*.zap` must have `@fndoc`.
-Every public struct should have `@structdoc`.
+Every public function, macro, protocol, union, and struct in `lib/*.zap` must have `@doc`.
 
 Use heredocs:
 
 ```zap
-@fndoc = """
+@doc = """
   Returns the byte length of a string.
   """
 
@@ -673,8 +672,8 @@ pub fn length(text_value :: String) -> i64 {
 
 Rules:
 
-- `@structdoc` goes immediately inside the struct body
-- `@fndoc` goes immediately before the documented declaration
+- `@doc` goes immediately before the documented declaration
+- struct docs go outside the struct, immediately before `pub struct Name {`
 - leave a blank line after the closing `"""`
 - escape `#{` as `\#{` in doc examples
 

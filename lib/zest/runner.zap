@@ -37,7 +37,9 @@ pub struct Zest.Runner {
     quote {
       import Zest.Runner
 
-      @doc = "Generated Zest test runner entry point."
+      @doc = """
+      Generated Zest test runner entry point.
+      """
 
       pub fn main(_args :: [String]) -> String {
         Zest.Runner.configure()

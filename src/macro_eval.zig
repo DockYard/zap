@@ -2172,7 +2172,7 @@ fn structFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtV
         // listing every protocol operator alongside their own functions.
         if (family.scope_id != struct_scope_id) continue;
         const name = ctx.interner.get(family.name);
-        const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes, "fndoc") orelse "";
+        const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes) orelse "";
         const loc = declSourceLocation(ctx.graph, family.clauses.items[0].decl.meta);
         const signatures = buildReflectionClauseSignatures(env.alloc, name, family.clauses.items, ctx.interner, ctx.graph);
         try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, family.visibility, doc_text, loc.path, loc.line, signatures));
@@ -2439,7 +2439,7 @@ fn structMacrosIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValu
         if (visibility != .public) continue;
         const name = ctx.interner.get(family.name);
         if (std.mem.startsWith(u8, name, "__")) continue;
-        const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes, "fndoc") orelse "";
+        const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes) orelse "";
         const loc = declSourceLocation(ctx.graph, family.clauses.items[0].decl.meta);
         const signatures = buildReflectionClauseSignatures(env.alloc, name, family.clauses.items, ctx.interner, ctx.graph);
         try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, visibility, doc_text, loc.path, loc.line, signatures));
@@ -2474,7 +2474,7 @@ fn structInfoIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue 
     // from the source-graph reflection intrinsics are interchangeable.
     for (ctx.graph.structs.items) |entry| {
         if (!structNameMatches(ctx.interner, entry.name, struct_name)) continue;
-        const doc_text = extractStructDocAttributeText(env.alloc, ctx.interner, entry.decl.items, entry.attributes) orelse "";
+        const doc_text = extractDocAttributeText(env.alloc, ctx.interner, entry.attributes) orelse "";
         return makeDeclInfoMapWithDoc(env, ctx, struct_name, entry.decl.meta, entry.decl.is_private, doc_text);
     }
     for (ctx.graph.protocols.items) |entry| {
@@ -2501,7 +2501,7 @@ fn makeDeclInfoMap(
     is_private: bool,
     attributes: std.ArrayListUnmanaged(scope.Attribute),
 ) !CtValue {
-    const doc_text = extractDocAttributeText(env.alloc, ctx.interner, attributes, "structdoc") orelse "";
+    const doc_text = extractDocAttributeText(env.alloc, ctx.interner, attributes) orelse "";
 
     return makeDeclInfoMapWithDoc(env, ctx, name, meta, is_private, doc_text);
 }
@@ -2856,67 +2856,17 @@ fn sourceSlice(meta: ast.NodeMeta, graph: *const scope.ScopeGraph) ?[]const u8 {
     return std.mem.trim(u8, source[meta.span.start..meta.span.end], " \t\r\n");
 }
 
-/// Extract a documentation attribute from a declaration. `preferred_name`
-/// selects the modern docs attribute (`structdoc` for type pages, `fndoc` for
-/// functions and macros); legacy `doc` remains a fallback for existing code.
+/// Extract the canonical documentation attribute from a declaration.
 /// The string is heredoc-stripped (common leading whitespace removed) so
 /// multi-line docs round-trip cleanly into runtime literal strings.
 fn extractDocAttributeText(
     alloc: Allocator,
     interner: *ast.StringInterner,
     attributes: std.ArrayListUnmanaged(scope.Attribute),
-    preferred_name: []const u8,
-) ?[]const u8 {
-    if (extractNamedDocAttributeText(alloc, interner, attributes, preferred_name)) |text| {
-        return text;
-    }
-    if (!std.mem.eql(u8, preferred_name, "doc")) {
-        return extractNamedDocAttributeText(alloc, interner, attributes, "doc");
-    }
-    return null;
-}
-
-fn extractNamedDocAttributeText(
-    alloc: Allocator,
-    interner: *ast.StringInterner,
-    attributes: std.ArrayListUnmanaged(scope.Attribute),
-    wanted_name: []const u8,
 ) ?[]const u8 {
     for (attributes.items) |attr| {
         const name = interner.get(attr.name);
-        if (!std.mem.eql(u8, name, wanted_name)) continue;
-        const expr = attr.value orelse return null;
-        if (expr.* != .string_literal) return null;
-        const raw = interner.get(expr.string_literal.value);
-        return stripHeredocCommonIndent(alloc, raw);
-    }
-    return null;
-}
-
-fn extractStructDocAttributeText(
-    alloc: Allocator,
-    interner: *ast.StringInterner,
-    items: []const ast.StructItem,
-    attributes: std.ArrayListUnmanaged(scope.Attribute),
-) ?[]const u8 {
-    if (extractStructBodyDocAttributeText(alloc, interner, items)) |text| {
-        return text;
-    }
-    return extractDocAttributeText(alloc, interner, attributes, "structdoc");
-}
-
-fn extractStructBodyDocAttributeText(
-    alloc: Allocator,
-    interner: *ast.StringInterner,
-    items: []const ast.StructItem,
-) ?[]const u8 {
-    for (items) |item| {
-        const attr = switch (item) {
-            .attribute => |attribute| attribute,
-            else => continue,
-        };
-        const name = interner.get(attr.name);
-        if (!std.mem.eql(u8, name, "structdoc")) continue;
+        if (!std.mem.eql(u8, name, "doc")) continue;
         const expr = attr.value orelse return null;
         if (expr.* != .string_literal) return null;
         const raw = interner.get(expr.string_literal.value);
@@ -3258,36 +3208,28 @@ test "eval: map_get returns matching value or default" {
     try std.testing.expectEqual(@as(i64, -1), missing_result.int);
 }
 
-test "docs-reflection: preferred doc attributes are reflected before legacy doc" {
+test "docs-reflection: canonical doc attribute is reflected" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
 
-    const preferred_text = ast.Expr{ .string_literal = .{
+    const doc_text = ast.Expr{ .string_literal = .{
         .meta = .{ .span = .{ .start = 0, .end = 0 } },
         .value = try interner.intern("Function docs."),
-    } };
-    const legacy_text = ast.Expr{ .string_literal = .{
-        .meta = .{ .span = .{ .start = 0, .end = 0 } },
-        .value = try interner.intern("Legacy docs."),
     } };
 
     var attributes: std.ArrayListUnmanaged(scope.Attribute) = .empty;
     defer attributes.deinit(std.testing.allocator);
     try attributes.append(std.testing.allocator, .{
         .name = try interner.intern("doc"),
-        .value = &legacy_text,
-    });
-    try attributes.append(std.testing.allocator, .{
-        .name = try interner.intern("fndoc"),
-        .value = &preferred_text,
+        .value = &doc_text,
     });
 
-    const text = extractDocAttributeText(std.testing.allocator, &interner, attributes, "fndoc") orelse "";
+    const text = extractDocAttributeText(std.testing.allocator, &interner, attributes) orelse "";
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("Function docs.", text);
 }
 
-test "docs-reflection: structdoc inside a struct body is reflected as type docs" {
+test "docs-reflection: struct doc is read from declaration attributes" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
 
@@ -3295,16 +3237,14 @@ test "docs-reflection: structdoc inside a struct body is reflected as type docs"
         .meta = .{ .span = .{ .start = 0, .end = 0 } },
         .value = try interner.intern("Struct docs."),
     } };
-    const attr_decl = ast.AttributeDecl{
-        .meta = .{ .span = .{ .start = 0, .end = 0 } },
-        .name = try interner.intern("structdoc"),
-        .value = &doc_expr,
-    };
-    const items = [_]ast.StructItem{.{ .attribute = &attr_decl }};
     var attributes: std.ArrayListUnmanaged(scope.Attribute) = .empty;
     defer attributes.deinit(std.testing.allocator);
+    try attributes.append(std.testing.allocator, .{
+        .name = try interner.intern("doc"),
+        .value = &doc_expr,
+    });
 
-    const text = extractStructDocAttributeText(std.testing.allocator, &interner, &items, attributes) orelse "";
+    const text = extractDocAttributeText(std.testing.allocator, &interner, attributes) orelse "";
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("Struct docs.", text);
 }

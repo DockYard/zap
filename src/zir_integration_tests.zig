@@ -616,20 +616,32 @@ test "CLI: zap run doc-runner target generates documentation via Zap-side pipeli
     ;
 
     const lib_source =
-        \\@doc = "A documented example struct."
+        \\@doc = """
+        \\A documented example struct.
+        \\"""
+        \\
         \\pub struct DocExample {
-        \\  @doc = "Returns a greeting."
+        \\  @doc = """
+        \\  Returns a greeting.
+        \\  """
+        \\
         \\  pub fn greeting() -> String {
         \\    "hello"
         \\  }
         \\}
         \\
-        \\@doc = "A documented example protocol."
+        \\@doc = """
+        \\A documented example protocol.
+        \\"""
+        \\
         \\pub protocol DocProtocol {
         \\  fn convert(value :: String) -> String
         \\}
         \\
-        \\@doc = "A documented example union."
+        \\@doc = """
+        \\A documented example union.
+        \\"""
+        \\
         \\pub union DocUnion {
         \\  Empty,
         \\  Value :: String

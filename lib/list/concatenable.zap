@@ -1,7 +1,9 @@
-@doc = "Concatenable implementation for `List`."
+@doc = """
+Concatenable implementation for `List`.
+"""
 
 pub impl Concatenable for List {
-  @fndoc = """
+  @doc = """
   Concatenates two lists.
   """
 

@@ -41,7 +41,7 @@
 
 pub struct TuringMachine {
 
-  @fndoc = """
+  @doc = """
     Construct a fresh tape from an initial list of symbols. The head
     starts on the first symbol; if `initial` is empty, the head starts
     on a blank cell.
@@ -55,7 +55,7 @@ pub struct TuringMachine {
     {([] :: [String]), head, tail, blank}
   }
 
-  @fndoc = """
+  @doc = """
     Move the head one cell to the right.
     """
 
@@ -67,7 +67,7 @@ pub struct TuringMachine {
     }
   }
 
-  @fndoc = """
+  @doc = """
     Move the head one cell to the left.
     """
 
@@ -79,7 +79,7 @@ pub struct TuringMachine {
     }
   }
 
-  @fndoc = """
+  @doc = """
     Write `symbol` under the head.
     """
 
@@ -87,7 +87,7 @@ pub struct TuringMachine {
     {left, symbol, right, blank}
   }
 
-  @fndoc = """
+  @doc = """
     Move the tape in the named direction. `"L"` and `"R"` move the
     head; any other value (including `"S"`) leaves the head in place.
     """
@@ -104,7 +104,7 @@ pub struct TuringMachine {
     tape
   }
 
-  @fndoc = """
+  @doc = """
     Read the symbol currently under the head.
     """
 
@@ -112,7 +112,7 @@ pub struct TuringMachine {
     current
   }
 
-  @fndoc = """
+  @doc = """
     Build a 5-tuple transition row.
     """
 
@@ -120,7 +120,7 @@ pub struct TuringMachine {
     {state, read, next_state, write, direction}
   }
 
-  @fndoc = """
+  @doc = """
     Apply the first transition in `table` matching `(state, read)`.
     Returns `{next_state, new_tape, halted}`. When no row matches,
     returns the same state with `halted = true`.
@@ -140,7 +140,7 @@ pub struct TuringMachine {
     TuringMachine.lookup_and_step(state, tape, rest, all)
   }
 
-  @fndoc = """
+  @doc = """
     Run the machine until it halts or `max_steps` is reached.
     Returns `{final_state, final_tape, steps_taken}`.
     """
@@ -159,7 +159,7 @@ pub struct TuringMachine {
     }
   }
 
-  @fndoc = """
+  @doc = """
     Concatenate a list of single-character strings.
     """
 
@@ -171,7 +171,7 @@ pub struct TuringMachine {
     head <> TuringMachine.concat_symbols(rest)
   }
 
-  @fndoc = """
+  @doc = """
     Render the full tape as `"left[current]right"`. Useful for tracing.
     """
 
@@ -179,7 +179,7 @@ pub struct TuringMachine {
     TuringMachine.concat_symbols(List.reverse(left)) <> "[" <> current <> "]" <> TuringMachine.concat_symbols(right)
   }
 
-  @fndoc = """
+  @doc = """
     Return the tape contents with leading and trailing blanks trimmed.
     """
 
@@ -220,7 +220,7 @@ pub struct TuringMachine {
     }
   }
 
-  @fndoc = """
+  @doc = """
     Split a string into single-character symbols.
     """
 
@@ -238,7 +238,7 @@ pub struct TuringMachine {
     TuringMachine.explode(s, index + one, length, [char | acc])
   }
 
-  @fndoc = """
+  @doc = """
     Transition table for a binary-increment Turing machine.
 
     `scan` walks the head right to the end of the input; `carry`
@@ -255,7 +255,7 @@ pub struct TuringMachine {
     |> List.push(TuringMachine.t("carry", "_", "done",  "1", "S"))
   }
 
-  @fndoc = """
+  @doc = """
     Run the binary-increment TM on the digits of `bits` and return
     the resulting tape contents.
     """
@@ -267,7 +267,7 @@ pub struct TuringMachine {
     TuringMachine.tape_to_string(final_tape)
   }
 
-  @fndoc = """
+  @doc = """
     Transition table for a unary doubler: `n` ones → `2n` ones. Uses
     a marker `x` to remember which source ones have already been
     duplicated.

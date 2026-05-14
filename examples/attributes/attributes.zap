@@ -7,10 +7,15 @@
 # Run with:
 #   zap run attributes
 
-@doc :: String = "Attribute examples"
+@doc = """
+Attribute examples
+"""
 
 pub struct Attributes {
-  @doc :: String = "Entry point"
+  @doc = """
+  Entry point
+  """
+
   pub fn main(_args :: [String]) -> String {
     IO.puts("App: " <> Config.app_name())
     IO.puts("Timeout: " <> Integer.to_string(Config.timeout()))

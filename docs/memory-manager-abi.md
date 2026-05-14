@@ -1272,22 +1272,23 @@ For each memory manager, there is a Zap struct that names the manager and points
 
 ### 12.1 First-party `Zap.Memory.ARC`
 
-The `@memory_manager_source` attribute is file-level metadata that points at the manager's Zig source; the convention matches `@native_type` in `lib/list.zap` — file-top, before `pub struct`. The descriptive heredoc lives inside the struct body as `@structdoc`, matching the convention in `lib/list.zap`.
+The `@memory_manager_source` attribute is file-level metadata that points at the manager's Zig source; the convention matches `@native_type` in `lib/list.zap` — file-top, before `pub struct`. The descriptive heredoc is a canonical `@doc` placed immediately before the `pub struct` declaration.
 
 ```
 @memory_manager_source = "src/runtime/memory/arc/manager.zig"
 
+@doc = """
+Atomic reference counting memory manager.
+
+Each refcounted cell carries an inline header storing the refcount
+and type tag. Retains and releases are atomic. When a release
+brings the count to zero, the manager's release function walks the
+cell's children, releases them, and frees the cell's storage.
+
+Declared capabilities: REFCOUNT_V1.
+"""
+
 pub struct Zap.Memory.ARC {
-  @structdoc = """
-  Atomic reference counting memory manager.
-
-  Each refcounted cell carries an inline header storing the refcount
-  and type tag. Retains and releases are atomic. When a release
-  brings the count to zero, the manager's release function walks the
-  cell's children, releases them, and frees the cell's storage.
-
-  Declared capabilities: REFCOUNT_V1.
-  """
 }
 ```
 
@@ -1296,18 +1297,19 @@ pub struct Zap.Memory.ARC {
 ```
 @memory_manager_source = "src/runtime/memory/arena/manager.zig"
 
+@doc = """
+Whole-program arena memory manager.
+
+All allocations come from a single arena. Individual deallocations
+are no-ops; the entire arena is reclaimed at program exit. Because
+no per-cell refcount is tracked, the compiler omits the refcount
+header from Map, List, and String layouts, reducing per-cell
+overhead.
+
+Declared capabilities: none.
+"""
+
 pub struct Zap.Memory.Arena {
-  @structdoc = """
-  Whole-program arena memory manager.
-
-  All allocations come from a single arena. Individual deallocations
-  are no-ops; the entire arena is reclaimed at program exit. Because
-  no per-cell refcount is tracked, the compiler omits the refcount
-  header from Map, List, and String layouts, reducing per-cell
-  overhead.
-
-  Declared capabilities: none.
-  """
 }
 ```
 
@@ -1322,7 +1324,7 @@ The compiler resolves the path against the package the struct is declared in; th
 
 ### 12.4 Pseudo-emptiness of the struct
 
-The struct body is intentionally empty of fields and functions — only the `@structdoc` attribute lives inside it. The struct exists purely as a typed reference for use in `Zap.Manifest.memory:` and to carry the `@memory_manager_source` attribute (at file top) and `@structdoc` (inside the body). Future ABI versions may add type-level methods to memory-manager structs (e.g., for per-process selection in v2), but v1.0 keeps the bodies free of methods and fields.
+The struct body is intentionally empty of fields and functions. The struct exists purely as a typed reference for use in `Zap.Manifest.memory:` and to carry the `@memory_manager_source` attribute plus an immediately preceding `@doc` heredoc. Future ABI versions may add type-level methods to memory-manager structs (e.g., for per-process selection in v2), but v1.0 keeps the bodies free of methods and fields.
 
 ---
 
@@ -1488,17 +1490,18 @@ pub export const zap_memory_section: ZapMemorySection
 ```
 @memory_manager_source = "src/runtime/memory/noop/manager.zig"
 
-pub struct Zap.Memory.NoOp {
-  @structdoc = """
-  No-op memory manager. Used only for compiler integration tests:
-  allocation fails immediately, deallocation does nothing, no
-  capabilities are declared.
+@doc = """
+No-op memory manager. Used only for compiler integration tests:
+allocation fails immediately, deallocation does nothing, no
+capabilities are declared.
 
-  Programs built against this manager terminate as soon as they
-  attempt to allocate. The purpose is to validate that the build
-  pipeline accepts a minimal manager and that capability-elision
-  removes all retain/release calls.
-  """
+Programs built against this manager terminate as soon as they
+attempt to allocate. The purpose is to validate that the build
+pipeline accepts a minimal manager and that capability-elision
+removes all retain/release calls.
+"""
+
+pub struct Zap.Memory.NoOp {
 }
 ```
 
@@ -1875,15 +1878,16 @@ pub export const zap_memory_section: ZapMemorySection
 ```
 @memory_manager_source = "src/manager.zig"
 
+@doc = """
+Minimal example refcounting manager. Backs allocations with the
+page allocator and stores a 32-bit atomic refcount along with the
+original allocation's offset, size, and alignment in an inline
+header. Supports arbitrary user-requested alignment values.
+Demonstrates the smallest manager that declares REFCOUNT_V1 while
+still freeing cells correctly when the refcount reaches zero.
+"""
+
 pub struct TinyRef {
-  @structdoc = """
-  Minimal example refcounting manager. Backs allocations with the
-  page allocator and stores a 32-bit atomic refcount along with the
-  original allocation's offset, size, and alignment in an inline
-  header. Supports arbitrary user-requested alignment values.
-  Demonstrates the smallest manager that declares REFCOUNT_V1 while
-  still freeing cells correctly when the refcount reaches zero.
-  """
 }
 ```
 

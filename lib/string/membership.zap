@@ -1,4 +1,6 @@
-@doc = "Membership implementation for `String`."
+@doc = """
+Membership implementation for `String`.
+"""
 
 pub impl Membership for String {
   @doc = """

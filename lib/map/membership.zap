@@ -1,4 +1,6 @@
-@doc = "Membership implementation for `Map`."
+@doc = """
+Membership implementation for `Map`.
+"""
 
 pub impl Membership for Map(K, V) {
   @doc = """

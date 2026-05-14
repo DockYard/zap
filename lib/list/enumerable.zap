@@ -1,7 +1,9 @@
-@doc = "Enumerable implementation for `List`."
+@doc = """
+Enumerable implementation for `List`.
+"""
 
 pub impl Enumerable(member) for List(member) {
-  @fndoc = """
+  @doc = """
   Returns the next element from a list.
 
   The list itself is the iteration state. Returns `{:cont, head, tail}`

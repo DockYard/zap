@@ -1,4 +1,6 @@
-@doc = "Enumerable implementation for `String`."
+@doc = """
+Enumerable implementation for `String`.
+"""
 
 pub impl Enumerable(String) for String {
   @doc = """

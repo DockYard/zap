@@ -1,15 +1,15 @@
 @native_type = "list"
 
+@doc = """
+A flat-buffer sequence of elements.
+
+`List(t)` is backed by the runtime's single-allocation contiguous
+buffer. Lists support O(1) indexed reads, copy-on-write mutation, and
+ARC-managed lifetime for elements that own runtime resources.
+"""
+
 pub struct List {
-  @structdoc = """
-  A flat-buffer sequence of elements.
-
-  `List(t)` is backed by the runtime's single-allocation contiguous
-  buffer. Lists support O(1) indexed reads, copy-on-write mutation, and
-  ARC-managed lifetime for elements that own runtime resources.
-  """
-
-  @fndoc = """
+  @doc = """
   Allocate a list of `size` elements, each initialized to `init`.
   """
 
@@ -17,7 +17,7 @@ pub struct List {
     :zig.List.new_filled(size, init)
   }
 
-  @fndoc = """
+  @doc = """
   Allocate an empty list with at least `initial_capacity` reserved slots.
   """
 
@@ -25,7 +25,7 @@ pub struct List {
     :zig.List.new_empty(initial_capacity)
   }
 
-  @fndoc = """
+  @doc = """
   Returns `true` when the list has no elements.
   """
 
@@ -33,7 +33,7 @@ pub struct List {
     :zig.List.isEmpty(list)
   }
 
-  @fndoc = """
+  @doc = """
   Returns the number of elements in the list.
   """
 
@@ -41,7 +41,7 @@ pub struct List {
     :zig.List.length(list)
   }
 
-  @fndoc = """
+  @doc = """
   Returns the list's reserved capacity.
   """
 
@@ -49,7 +49,7 @@ pub struct List {
     :zig.List.capacity(list)
   }
 
-  @fndoc = """
+  @doc = """
   Returns the element at `index`.
   """
 
@@ -57,7 +57,7 @@ pub struct List {
     :zig.List.get(list, index)
   }
 
-  @fndoc = """
+  @doc = """
   Returns the element at `index`.
   """
 
@@ -65,7 +65,7 @@ pub struct List {
     List.get(list, index)
   }
 
-  @fndoc = """
+  @doc = """
   Returns a list with `value` stored at `index`.
   """
 
@@ -73,7 +73,7 @@ pub struct List {
     :zig.List.set(list, index, value)
   }
 
-  @fndoc = """
+  @doc = """
   Returns a list with `value` added to the end.
   """
 
@@ -81,7 +81,7 @@ pub struct List {
     :zig.List.push(list, value)
   }
 
-  @fndoc = """
+  @doc = """
   Removes the last element and returns `{list, value}`.
   """
 
@@ -91,7 +91,7 @@ pub struct List {
     {next, value}
   }
 
-  @fndoc = """
+  @doc = """
   Concatenates two lists.
   """
 
@@ -99,7 +99,7 @@ pub struct List {
     :zig.List.append(first, second)
   }
 
-  @fndoc = """
+  @doc = """
   Concatenates two lists.
   """
 
@@ -107,7 +107,7 @@ pub struct List {
     List.append(first, second)
   }
 
-  @fndoc = """
+  @doc = """
   Returns the first element, or the element type's default for an empty list.
   """
 
@@ -115,7 +115,7 @@ pub struct List {
     :zig.List.getHead(list)
   }
 
-  @fndoc = """
+  @doc = """
   Returns all elements after the first as a new list.
   """
 
@@ -123,7 +123,7 @@ pub struct List {
     :zig.List.getTail(list)
   }
 
-  @fndoc = """
+  @doc = """
   Returns `value` followed by the contents of `list`.
   """
 
@@ -131,7 +131,7 @@ pub struct List {
     :zig.List.cons(value, list)
   }
 
-  @fndoc = """
+  @doc = """
   Returns the last element, or the element type's default for an empty list.
   """
 
@@ -139,7 +139,7 @@ pub struct List {
     :zig.List.last(list)
   }
 
-  @fndoc = """
+  @doc = """
   Returns `true` when `value` is present in the list.
   """
 
@@ -147,7 +147,7 @@ pub struct List {
     :zig.List.contains(list, value)
   }
 
-  @fndoc = """
+  @doc = """
   Returns a new list with elements in reverse order.
   """
 
@@ -155,7 +155,7 @@ pub struct List {
     :zig.List.reverse(list)
   }
 
-  @fndoc = """
+  @doc = """
   Returns the first `count` elements.
   """
 
@@ -163,7 +163,7 @@ pub struct List {
     :zig.List.take(list, count)
   }
 
-  @fndoc = """
+  @doc = """
   Returns the list after dropping the first `count` elements.
   """
 
@@ -171,7 +171,7 @@ pub struct List {
     :zig.List.drop(list, count)
   }
 
-  @fndoc = """
+  @doc = """
   Returns a list with duplicate values removed.
   """
 
@@ -179,7 +179,7 @@ pub struct List {
     :zig.List.uniq(list)
   }
 
-  @fndoc = """
+  @doc = """
   Transforms each element with `callback`.
   """
 
@@ -187,7 +187,7 @@ pub struct List {
     map_walk(list, callback, 0, List.length(list), List.new_empty(List.length(list)))
   }
 
-  @fndoc = """
+  @doc = """
   Keeps elements for which `predicate` returns true.
   """
 
@@ -195,7 +195,7 @@ pub struct List {
     filter_walk(list, predicate, 0, List.length(list), List.new_empty(List.length(list)))
   }
 
-  @fndoc = """
+  @doc = """
   Folds the list from left to right.
   """
 
@@ -203,7 +203,7 @@ pub struct List {
     reduce_walk(list, callback, 0, List.length(list), initial)
   }
 
-  @fndoc = """
+  @doc = """
   Returns the first element. Raises when the list is empty.
   """
 
@@ -215,7 +215,7 @@ pub struct List {
     }
   }
 
-  @fndoc = """
+  @doc = """
   Returns the last element. Raises when the list is empty.
   """
 
@@ -227,7 +227,7 @@ pub struct List {
     }
   }
 
-  @fndoc = """
+  @doc = """
   Returns the element at `index`. Raises when `index` is out of bounds.
   """
 

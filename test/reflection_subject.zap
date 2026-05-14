@@ -6,7 +6,10 @@
   """
 
 pub struct ReflectionSubject {
-  @doc = "Adds two integers."
+  @doc = """
+  Adds two integers.
+  """
+
   pub fn add(a :: i64, b :: i64) -> i64 {
     a + b
   }
@@ -16,6 +19,7 @@ pub struct ReflectionSubject {
 
     The doc body is multi-line so the heredoc-stripping path is exercised.
     """
+
   pub fn multiply(a :: i64, b :: i64) -> i64 {
     a * b
   }
@@ -24,7 +28,10 @@ pub struct ReflectionSubject {
     value
   }
 
-  @doc = "Doubles its argument at compile time."
+  @doc = """
+  Doubles its argument at compile time.
+  """
+
   pub macro twice(value :: Expr) -> Expr {
     quote {
       unquote(value) + unquote(value)

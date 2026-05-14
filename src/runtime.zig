@@ -769,7 +769,7 @@ export fn zap_runtime_atomic_add_u32_acq_rel(ptr: *u32, delta: u32) callconv(.c)
 // the missing capability literally as `REFCOUNT_V1` so the user can
 // trace the failure back to the manifest's `memory:` selection. This
 // is a normative source-side invariant: tooling (e.g. the
-// `Zap.Memory.Arena` structdoc, the Phase 6 codegen-elision plan,
+// `Zap.Memory.Arena` `@doc`, the Phase 6 codegen-elision plan,
 // any future diagnostics layer) relies on the `REFCOUNT_V1` token
 // appearing verbatim in the panic text. Every panic site in this
 // file that gates on `active_manager_state.refcount_capability == null` is
