@@ -84,6 +84,21 @@ fn printUnexpectedCompileFailure(exit_code: u8, stdout: []const u8, stderr: []co
     }
 }
 
+fn printUnexpectedRunFailure(command: []const []const u8, exit_code: u8, stdout: []const u8, stderr: []const u8) void {
+    std.debug.print("\n=== RUN FAILED (exit {d}) ===\n", .{exit_code});
+    std.debug.print("=== command ===", .{});
+    for (command) |arg| {
+        std.debug.print(" {s}", .{arg});
+    }
+    std.debug.print("\n", .{});
+    if (stdout.len != 0) {
+        std.debug.print("=== stdout ===\n{s}\n", .{stdout});
+    }
+    if (stderr.len != 0) {
+        std.debug.print("=== stderr ===\n{s}\n", .{stderr});
+    }
+}
+
 fn runZapBuild(
     allocator: std.mem.Allocator,
     zap_binary: []const u8,
@@ -724,7 +739,7 @@ test "CLI: zap run doc-runner target generates documentation via Zap-side pipeli
         \\          kind: :bin,
         \\          root: "DocExample.Doc.Runner.main/1",
         \\          paths: ["lib/**/*.zap"],
-        \\          deps: [{:zap_stdlib, {:path, "lib"}}]
+        \\          deps: [%Zap.Dep{name: "zap_stdlib", path: "lib"}]
         \\        }
         \\      _ ->
         \\        panic("Unknown target")
@@ -791,8 +806,9 @@ test "CLI: zap run doc-runner target generates documentation via Zap-side pipeli
     const zap_binary = try resolveZapBinary(allocator);
     defer allocator.free(zap_binary);
 
+    const run_argv = &.{ zap_binary, "run", "doc" };
     const result = std.process.run(allocator, getTestIo(), .{
-        .argv = &.{ zap_binary, "run", "doc" },
+        .argv = run_argv,
         .cwd = .{ .path = tmp_dir_path },
         .stdout_limit = .limited(256 * 1024),
         .stderr_limit = .limited(256 * 1024),
@@ -805,6 +821,9 @@ test "CLI: zap run doc-runner target generates documentation via Zap-side pipeli
         else => return error.RunFailed,
     };
 
+    if (exit_code != 0) {
+        printUnexpectedRunFailure(run_argv, exit_code, result.stdout, result.stderr);
+    }
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     tmp_dir.dir.access(getTestIo(), "docs/index.html", .{}) catch return error.Unexpected;
     tmp_dir.dir.access(getTestIo(), "docs/structs/DocExample.html", .{}) catch return error.Unexpected;
