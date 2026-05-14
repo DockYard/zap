@@ -164,7 +164,7 @@ test "slab pool constants are byte-identical between runtime and arc manager" {
         }
         if (manager_value_opt == null) {
             std.debug.print(
-                "memory/arc/manager.zig is missing constant `{s}`\n",
+                "src/memory/arc/manager.zig is missing constant `{s}`\n",
                 .{name},
             );
             any_diff = true;

@@ -151,7 +151,7 @@ pub const CompileOptions = struct {
     /// capabilities" (e.g. `Memory.NoOp`); `1` (`REFCOUNT_V1_BIT`)
     /// means the manager supports the ARC retain/release contract.
     declared_caps: u64 = 0,
-    /// Absolute path to the selected manager's Zig primitive source.
+    /// Absolute path to the selected manager's Zig backend source.
     /// Registered as the `zap_active_manager` sibling module in every
     /// user-binary build. The memory driver validates the same source
     /// through the `.zapmem` object pipeline before it reaches here.
@@ -204,10 +204,10 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
         }
     }
 
-    // Register the selected adapter's primitive source as the
+    // Register the selected adapter's backend source as the
     // `zap_active_manager` sibling module so the runtime's top-level
     // `@import("zap_active_manager")` resolves under every user-binary
-    // build. The source path has already been resolved and validated by
+    // build. The backend source path has already been resolved and validated by
     // `src/memory/driver.zig` through the same pipeline for stdlib,
     // project, and dependency managers. A silent skip on an empty path
     // would mask a regression as a far-removed "module not found" Sema

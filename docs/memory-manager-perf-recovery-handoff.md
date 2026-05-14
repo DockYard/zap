@@ -26,9 +26,9 @@ compiler evaluates one adapter method during manifest CTFE:
 
 First-party and third-party managers use the same path. The adapter does not
 return a public manager name, source path, or capability mask. The build driver
-derives the backend source from the selected manager type using the package
-convention `src/memory/<manager-slug>/manager.zig`, then reads the capability
-mask from the validated `.zapmem` section.
+resolves the backend source from the adapter method's package-relative source
+file (`lib/foo/bar.zap` -> `src/foo/bar/manager.zig`), then reads the
+capability mask from the validated `.zapmem` section.
 
 ## Build Pipeline
 
@@ -36,8 +36,8 @@ For every user binary:
 
 1. `src/builder.zig` evaluates `build.zap` with CTFE and extracts the selected
    `Memory.Manager` backend binding through `backend/1`.
-2. `src/memory/driver.zig` resolves the backend source from the manager type
-   and package convention.
+2. `src/memory/driver.zig` resolves the backend source from the adapter
+   method's package source location.
 3. The selected backend source is compiled through the validation pipeline
    for every manager, including Zap stdlib managers.
 4. The `.zapmem` section is parsed and validated as the source of truth for
@@ -72,7 +72,7 @@ same integration path.
 - `lib/memory/manager.zap` — `Memory.Manager` protocol.
 - `lib/memory/*.zap` — stdlib adapter implementations.
 - `src/builder.zig` — manifest CTFE and backend binding extraction.
-- `src/memory/driver.zig` — manager backend convention resolution and `.zapmem`
+- `src/memory/driver.zig` — adapter-source backend resolution and `.zapmem`
   validation.
 - `src/zir_backend.zig` — registration of the selected backend source as
   `zap_active_manager`.

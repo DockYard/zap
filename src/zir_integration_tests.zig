@@ -531,7 +531,9 @@ test "ZIR memory manager: project-local third-party adapter builds and runs" {
         \\    }
         \\  }
         \\}
-        \\
+    ;
+
+    const adapter_source =
         \\pub struct ThirdParty.ProjectArena {
         \\}
         \\
@@ -552,7 +554,8 @@ test "ZIR memory manager: project-local third-party adapter builds and runs" {
     ;
 
     var result = try compileAndRunCustomProject(build_source, source, &.{
-        .{ .path = "src/memory/project_arena/manager.zig", .data = ARENA_MANAGER_SOURCE },
+        .{ .path = "lib/third_party/project_arena.zap", .data = adapter_source },
+        .{ .path = "src/third_party/project_arena/manager.zig", .data = ARENA_MANAGER_SOURCE },
     });
     defer result.deinit();
 
@@ -580,7 +583,9 @@ test "ZIR memory manager: dependency third-party adapter builds and runs" {
         \\    }
         \\  }
         \\}
-        \\
+    ;
+
+    const adapter_source =
         \\pub struct ThirdParty.DepArena {
         \\}
         \\
@@ -601,7 +606,8 @@ test "ZIR memory manager: dependency third-party adapter builds and runs" {
     ;
 
     var result = try compileAndRunCustomProject(build_source, source, &.{
-        .{ .path = "deps/fake_mem/src/memory/dep_arena/manager.zig", .data = ARENA_MANAGER_SOURCE },
+        .{ .path = "deps/fake_mem/lib/third_party/dep_arena.zap", .data = adapter_source },
+        .{ .path = "deps/fake_mem/src/third_party/dep_arena/manager.zig", .data = ARENA_MANAGER_SOURCE },
     });
     defer result.deinit();
 

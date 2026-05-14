@@ -6,9 +6,9 @@
 //! The driver:
 //!   1. Receives the manifest's `Memory.Manager` adapter binding as
 //!      evaluated by build.zap CTFE.
-//!   2. Resolves the manager backend source by applying the package-level
-//!      `src/memory/<manager-slug>/manager.zig` convention to the selected
-//!      manager type.
+//!   2. Resolves the manager backend source from the adapter method's
+//!      package-relative source file. An adapter at `lib/foo/bar.zap`
+//!      binds to the same package's `src/foo/bar/manager.zig`.
 //!   3. Invokes the Zig-fork primitive `zap_fork_compile_zig_to_object`
 //!      for every manager source, stdlib and project/dependency alike, then
 //!      reads the object file, extracts the `.zapmem` section, and
@@ -16,7 +16,7 @@
 //!      per spec section 3.5.
 //!   4. Exposes the resulting `ResolvedManager` to the compiler driver:
 //!      `declared_caps` flows through HIR / codegen; the selected Zig
-//!      source path is registered as `zap_active_manager` for the final
+//!      backend source path is registered as `zap_active_manager` for the final
 //!      binary; diagnostics refer to the selected manager type.
 //!
 //! The driver is build-time-only — it produces a `ResolvedManager` value
@@ -160,7 +160,7 @@ pub const ResolvedManager = struct {
     /// Concrete manager type selected by the manifest.
     type_name: []const u8,
 
-    /// Absolute path to the selected manager's Zig primitive source.
+    /// Absolute path to the selected manager's Zig backend source.
     /// The backend registers this file as `zap_active_manager`.
     active_manager_source_path: []const u8,
 
@@ -186,9 +186,8 @@ pub const ResolvedManager = struct {
 pub const ResolveError = error{
     /// The manifest did not provide an evaluated `Memory.Manager` binding.
     MissingMemoryManagerAdapter,
-    /// The manager backend source convention could not select exactly
-    /// one backend source.
-    InvalidPrimitiveSourceReference,
+    /// The adapter source could not be mapped to a package backend.
+    InvalidManagerBackendSource,
     /// The Zig backend source file for the adapter could not be opened.
     ManagerSourceNotFound,
     /// Compilation of the manager source failed; the build driver
@@ -240,12 +239,12 @@ pub const DriverDiagnostic = struct {
 
 /// Source root for the driver — the same shape used by
 /// `zap.discovery.SourceRoot`. We redeclare it locally so this module can
-/// be a leaf import without cyclic dependencies on `discovery.zig`.
+/// remain a leaf import without depending on discovery.
 pub const SourceRoot = struct {
     /// Logical name (e.g. `"project"`, `"zap_stdlib"`, `"dep:foo"`).
     name: []const u8,
     /// Absolute or workspace-relative path to a directory the driver may
-    /// recursively scan for `.zap` files.
+    /// use to identify the selected adapter's package.
     path: []const u8,
 };
 
@@ -254,9 +253,9 @@ pub const ResolveOptions = struct {
     /// Binding produced by evaluating the selected `Memory.Manager`
     /// adapter through CTFE.
     adapter: ?AdapterMetadata,
-    /// Source roots available to project and dependency manager backend
-    /// discovery.
-    source_roots: []const SourceRoot,
+    /// Source roots available to project, stdlib, and dependency
+    /// adapter source discovery.
+    source_roots: []const SourceRoot = &.{},
     /// Project root.
     project_root: []const u8,
     /// Path to the Zap source tree's root (e.g. `/Users/.../zap`).
@@ -300,7 +299,7 @@ pub fn resolve(
     };
     if (adapter.type_name.len == 0) {
         diag.write("selected `Memory.Manager` adapter returned an empty manager type", .{});
-        return ResolveError.InvalidPrimitiveSourceReference;
+        return ResolveError.InvalidManagerBackendSource;
     }
 
     const manager_zig_path_owned = try resolveBackendSourcePath(allocator, adapter, options, diag);
@@ -308,7 +307,7 @@ pub fn resolve(
 
     // Compile every selected manager source into an object file for the
     // same `.zapmem` validation pipeline. The object is build-time
-    // evidence only; the final binary registers the source path as
+    // evidence only; the final binary registers the backend source path as
     // `zap_active_manager` and does not link this validation object.
     std.Io.Dir.cwd().createDirPath(std.Options.debug_io, options.cache_dir) catch {};
     const safe_name = try makeSafeFileName(allocator, adapter.type_name);
@@ -389,116 +388,165 @@ fn resolveBackendSourcePath(
     options: ResolveOptions,
     diag: *DriverDiagnostic,
 ) ResolveError![]const u8 {
-    const manager_slug = try managerSlug(allocator, adapter.type_name);
-    defer allocator.free(manager_slug);
-
-    const relative_backend_path = try std.fs.path.join(allocator, &.{ "src", "memory", manager_slug, "manager.zig" });
-    defer allocator.free(relative_backend_path);
-
-    var candidates: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (candidates.items) |candidate| allocator.free(candidate);
-        candidates.deinit(allocator);
-    }
-
-    if (adapter.adapter_source_path) |adapter_source_path| {
-        if (packageRootForAdapterSource(allocator, adapter_source_path, options)) |package_root| {
-            defer allocator.free(package_root);
-            try appendExistingBackendCandidate(allocator, &candidates, package_root, relative_backend_path);
-        } else |err| switch (err) {
-            error.OutOfMemory => return ResolveError.OutOfMemory,
-        }
-    }
-
-    try appendExistingBackendCandidate(allocator, &candidates, options.zap_source_root, relative_backend_path);
-    try appendExistingBackendCandidate(allocator, &candidates, options.project_root, relative_backend_path);
-    for (options.source_roots) |source_root| {
-        const package_root = packageRootFromSourceRoot(allocator, source_root.path) catch return ResolveError.OutOfMemory;
-        defer allocator.free(package_root);
-        try appendExistingBackendCandidate(allocator, &candidates, package_root, relative_backend_path);
-    }
-
-    if (candidates.items.len == 0) {
+    const adapter_source_path = adapter.adapter_source_path orelse {
         diag.write(
-            "memory manager backend for '{s}' not found; expected package file '{s}'",
-            .{ adapter.type_name, relative_backend_path },
+            "memory manager adapter '{s}' did not provide a source-backed backend binding",
+            .{adapter.type_name},
+        );
+        return ResolveError.InvalidManagerBackendSource;
+    };
+
+    const backend_path = backendPathForAdapterSource(allocator, adapter_source_path, options) catch |err| switch (err) {
+        error.OutOfMemory => return ResolveError.OutOfMemory,
+        error.InvalidSourcePath => {
+            diag.write(
+                "memory manager adapter '{s}' must be declared in a `.zap` package source file, got '{s}'",
+                .{ adapter.type_name, adapter_source_path },
+            );
+            return ResolveError.InvalidManagerBackendSource;
+        },
+    };
+    errdefer allocator.free(backend_path);
+
+    std.Io.Dir.cwd().access(std.Options.debug_io, backend_path, .{}) catch {
+        diag.write(
+            "memory manager backend for '{s}' not found; expected package backend file '{s}'",
+            .{ adapter.type_name, backend_path },
         );
         return ResolveError.ManagerSourceNotFound;
-    }
-    if (candidates.items.len > 1) {
-        diag.write(
-            "memory manager backend for '{s}' is ambiguous; multiple packages provide '{s}'",
-            .{ adapter.type_name, relative_backend_path },
-        );
-        return ResolveError.InvalidPrimitiveSourceReference;
-    }
-
-    return allocator.dupe(u8, candidates.items[0]) catch return ResolveError.OutOfMemory;
-}
-
-fn appendExistingBackendCandidate(
-    allocator: std.mem.Allocator,
-    candidates: *std.ArrayListUnmanaged([]const u8),
-    package_root: []const u8,
-    relative_backend_path: []const u8,
-) ResolveError!void {
-    const candidate = std.fs.path.join(allocator, &.{ package_root, relative_backend_path }) catch return ResolveError.OutOfMemory;
-    errdefer allocator.free(candidate);
-    std.Io.Dir.cwd().access(std.Options.debug_io, candidate, .{}) catch {
-        allocator.free(candidate);
-        return;
     };
-    const canonical = canonicalPathOrSelf(allocator, candidate) catch return ResolveError.OutOfMemory;
-    defer allocator.free(canonical);
-    for (candidates.items) |existing| {
-        const existing_canonical = canonicalPathOrSelf(allocator, existing) catch return ResolveError.OutOfMemory;
-        defer allocator.free(existing_canonical);
-        if (std.mem.eql(u8, existing_canonical, canonical)) {
-            allocator.free(candidate);
-            return;
-        }
-    }
-    try candidates.append(allocator, candidate);
+
+    const canonical = canonicalPathOrSelf(allocator, backend_path) catch return ResolveError.OutOfMemory;
+    allocator.free(backend_path);
+    return canonical;
 }
 
-fn packageRootForAdapterSource(
+const BackendPathError = error{ OutOfMemory, InvalidSourcePath };
+
+fn backendPathForAdapterSource(
     allocator: std.mem.Allocator,
     adapter_source_path: []const u8,
     options: ResolveOptions,
-) ![]const u8 {
-    const roots = [_][]const u8{ options.zap_source_root, options.project_root };
-    for (roots) |root| {
-        if (pathIsUnderRoot(allocator, adapter_source_path, root)) return allocator.dupe(u8, root);
-    }
+) BackendPathError![]const u8 {
+    if (!std.mem.endsWith(u8, adapter_source_path, ".zap")) return error.InvalidSourcePath;
+    const location = try adapterPackageLocation(allocator, adapter_source_path, options);
+    defer allocator.free(location.package_root);
+    defer allocator.free(location.relative_source_path);
+
+    const source_stem = location.relative_source_path[0 .. location.relative_source_path.len - ".zap".len];
+    if (source_stem.len == 0) return error.InvalidSourcePath;
+    return std.fs.path.join(allocator, &.{ location.package_root, "src", source_stem, "manager.zig" }) catch
+        return error.OutOfMemory;
+}
+
+const AdapterPackageLocation = struct {
+    package_root: []const u8,
+    relative_source_path: []const u8,
+};
+
+fn adapterPackageLocation(
+    allocator: std.mem.Allocator,
+    adapter_source_path: []const u8,
+    options: ResolveOptions,
+) BackendPathError!AdapterPackageLocation {
+    var best_package_source_root: ?[]const u8 = null;
+    var best_location: ?AdapterPackageLocation = null;
+
     for (options.source_roots) |source_root| {
-        const package_root = try packageRootFromSourceRoot(allocator, source_root.path);
-        if (pathIsUnderRoot(allocator, adapter_source_path, package_root)) return package_root;
-        allocator.free(package_root);
+        const package_source_root = packageSourceRootForSearch(allocator, source_root.path) catch return error.OutOfMemory;
+        defer allocator.free(package_source_root);
+        const relative_source_path = (try relativePathUnderRoot(allocator, adapter_source_path, package_source_root)) orelse continue;
+        errdefer allocator.free(relative_source_path);
+        if (best_package_source_root) |best_root| {
+            if (package_source_root.len <= best_root.len) {
+                allocator.free(relative_source_path);
+                continue;
+            }
+            allocator.free(best_root);
+            allocator.free(best_location.?.package_root);
+            allocator.free(best_location.?.relative_source_path);
+        }
+        const package_root = packageRootFromSourceRoot(allocator, package_source_root) catch return error.OutOfMemory;
+        best_package_source_root = allocator.dupe(u8, package_source_root) catch return error.OutOfMemory;
+        best_location = .{
+            .package_root = package_root,
+            .relative_source_path = relative_source_path,
+        };
     }
-    return allocator.dupe(u8, options.project_root);
+
+    if (best_location) |location| {
+        allocator.free(best_package_source_root.?);
+        return location;
+    }
+
+    if (try relativePathUnderRoot(allocator, adapter_source_path, options.project_root)) |relative_source_path| {
+        return .{
+            .package_root = canonicalPathOrSelf(allocator, options.project_root) catch return error.OutOfMemory,
+            .relative_source_path = relative_source_path,
+        };
+    }
+    if (try relativePathUnderRoot(allocator, adapter_source_path, options.zap_source_root)) |relative_source_path| {
+        return .{
+            .package_root = canonicalPathOrSelf(allocator, options.zap_source_root) catch return error.OutOfMemory,
+            .relative_source_path = relative_source_path,
+        };
+    }
+
+    return error.InvalidSourcePath;
+}
+
+fn packageSourceRootForSearch(allocator: std.mem.Allocator, source_root: []const u8) ![]const u8 {
+    const canonical_root = try canonicalPathOrSelf(allocator, source_root);
+    defer allocator.free(canonical_root);
+
+    var current: ?[]const u8 = canonical_root;
+    while (current) |path| {
+        const basename = std.fs.path.basename(path);
+        if (std.mem.eql(u8, basename, "lib") or
+            std.mem.eql(u8, basename, "test") or
+            std.mem.eql(u8, basename, "tools"))
+        {
+            return allocator.dupe(u8, path);
+        }
+        current = std.fs.path.dirname(path);
+    }
+
+    return allocator.dupe(u8, canonical_root);
+}
+
+fn relativePathUnderRoot(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    root_path: []const u8,
+) BackendPathError!?[]const u8 {
+    const canonical_file = canonicalPathOrSelf(allocator, file_path) catch return error.OutOfMemory;
+    defer allocator.free(canonical_file);
+    const canonical_root = canonicalPathOrSelf(allocator, root_path) catch return error.OutOfMemory;
+    defer allocator.free(canonical_root);
+
+    if (std.mem.eql(u8, canonical_file, canonical_root)) return null;
+
+    const root_with_sep = std.fmt.allocPrint(allocator, "{s}{c}", .{ canonical_root, std.fs.path.sep }) catch
+        return error.OutOfMemory;
+    defer allocator.free(root_with_sep);
+    if (!std.mem.startsWith(u8, canonical_file, root_with_sep)) return null;
+    return allocator.dupe(u8, canonical_file[root_with_sep.len..]) catch return error.OutOfMemory;
 }
 
 fn packageRootFromSourceRoot(allocator: std.mem.Allocator, source_root: []const u8) ![]const u8 {
-    const basename = std.fs.path.basename(source_root);
+    const canonical_root = try canonicalPathOrSelf(allocator, source_root);
+    errdefer allocator.free(canonical_root);
+    const basename = std.fs.path.basename(canonical_root);
     if (std.mem.eql(u8, basename, "lib") or
         std.mem.eql(u8, basename, "test") or
         std.mem.eql(u8, basename, "tools"))
     {
-        return allocator.dupe(u8, std.fs.path.dirname(source_root) orelse source_root);
+        const parent = std.fs.path.dirname(canonical_root) orelse canonical_root;
+        const out = try allocator.dupe(u8, parent);
+        allocator.free(canonical_root);
+        return out;
     }
-    return allocator.dupe(u8, source_root);
-}
-
-fn pathIsUnderRoot(allocator: std.mem.Allocator, path: []const u8, root: []const u8) bool {
-    const canonical_path = canonicalPathOrSelf(allocator, path) catch return false;
-    defer allocator.free(canonical_path);
-    const canonical_root = canonicalPathOrSelf(allocator, root) catch return false;
-    defer allocator.free(canonical_root);
-
-    if (std.mem.eql(u8, canonical_path, canonical_root)) return true;
-    const root_with_sep = std.fmt.allocPrint(allocator, "{s}{c}", .{ canonical_root, std.fs.path.sep }) catch return false;
-    defer allocator.free(root_with_sep);
-    return std.mem.startsWith(u8, canonical_path, root_with_sep);
+    return canonical_root;
 }
 
 fn canonicalPathOrSelf(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -506,36 +554,6 @@ fn canonicalPathOrSelf(allocator: std.mem.Allocator, path: []const u8) ![]const 
         return std.fs.path.resolve(allocator, &.{path});
     defer allocator.free(real_path);
     return allocator.dupe(u8, real_path);
-}
-
-fn managerSlug(allocator: std.mem.Allocator, manager_type_name: []const u8) ![]const u8 {
-    const short_name = if (std.mem.lastIndexOfScalar(u8, manager_type_name, '.')) |dot|
-        manager_type_name[dot + 1 ..]
-    else
-        manager_type_name;
-
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    for (short_name, 0..) |char, index| {
-        if (std.ascii.isUpper(char)) {
-            const prev_is_lower_or_digit = index > 0 and
-                (std.ascii.isLower(short_name[index - 1]) or std.ascii.isDigit(short_name[index - 1]));
-            const next_is_lower = index + 1 < short_name.len and std.ascii.isLower(short_name[index + 1]);
-            const prev_is_upper = index > 0 and std.ascii.isUpper(short_name[index - 1]);
-            if (out.items.len > 0 and (prev_is_lower_or_digit or (prev_is_upper and next_is_lower))) {
-                try out.append(allocator, '_');
-            }
-            try out.append(allocator, std.ascii.toLower(char));
-        } else if (std.ascii.isAlphanumeric(char)) {
-            try out.append(allocator, char);
-        } else if (out.items.len > 0 and out.items[out.items.len - 1] != '_') {
-            try out.append(allocator, '_');
-        }
-    }
-    while (out.items.len > 0 and out.items[out.items.len - 1] == '_') {
-        _ = out.pop();
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 // ---------------------------------------------------------------------------
@@ -688,99 +706,89 @@ fn enumTag(comptime E: type, name: []const u8) ?usize {
     return null;
 }
 
-test "manager backend convention resolves zap, project, and dependency packages" {
+test "manager backend binding resolves package src backend from adapter source" {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "zap/src/memory/no_op") catch return error.Unexpected;
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "project/src/memory/project_custom") catch return error.Unexpected;
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "deps/pkg/src/memory/dep_custom") catch return error.Unexpected;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zap/src/memory/no_op/manager.zig", .data = "// stdlib" }) catch return error.Unexpected;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "project/src/memory/project_custom/manager.zig", .data = "// project" }) catch return error.Unexpected;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "deps/pkg/src/memory/dep_custom/manager.zig", .data = "// dep" }) catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "pkg/lib/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "pkg/src/memory/custom") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "pkg/lib/memory/custom.zap", .data = "// adapter" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "pkg/src/memory/custom/manager.zig", .data = "// backend" }) catch return error.Unexpected;
 
     const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_path);
-    const zap_root = try std.fs.path.join(allocator, &.{ tmp_path, "zap" });
-    defer allocator.free(zap_root);
-    const project_root = try std.fs.path.join(allocator, &.{ tmp_path, "project" });
-    defer allocator.free(project_root);
-    const dep_root = try std.fs.path.join(allocator, &.{ tmp_path, "deps/pkg" });
-    defer allocator.free(dep_root);
 
-    const options: ResolveOptions = .{
-        .adapter = null,
-        .source_roots = &.{.{ .name = "dep:pkg", .path = dep_root }},
-        .project_root = project_root,
-        .zap_source_root = zap_root,
-        .cache_dir = tmp_path,
-    };
     var diag_buf: [512]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
 
-    const zap_adapter_path = try std.fs.path.join(allocator, &.{ zap_root, "lib/memory/no_op.zap" });
-    defer allocator.free(zap_adapter_path);
-    const zap_path = try resolveBackendSourcePath(allocator, .{
-        .type_name = "Memory.NoOp",
-        .adapter_source_path = zap_adapter_path,
-    }, options, &diag);
-    defer allocator.free(zap_path);
-    try std.testing.expect(std.mem.endsWith(u8, zap_path, "zap/src/memory/no_op/manager.zig"));
-
-    const project_adapter_path = try std.fs.path.join(allocator, &.{ project_root, "lib/third_party/project_custom.zap" });
-    defer allocator.free(project_adapter_path);
-    const project_path = try resolveBackendSourcePath(allocator, .{
-        .type_name = "ThirdParty.ProjectCustom",
-        .adapter_source_path = project_adapter_path,
-    }, options, &diag);
-    defer allocator.free(project_path);
-    try std.testing.expect(std.mem.endsWith(u8, project_path, "project/src/memory/project_custom/manager.zig"));
-
-    const dep_adapter_path = try std.fs.path.join(allocator, &.{ dep_root, "lib/third_party/dep_custom.zap" });
-    defer allocator.free(dep_adapter_path);
-    const dep_path = try resolveBackendSourcePath(allocator, .{
-        .type_name = "ThirdParty.DepCustom",
-        .adapter_source_path = dep_adapter_path,
-    }, options, &diag);
-    defer allocator.free(dep_path);
-    try std.testing.expect(std.mem.endsWith(u8, dep_path, "deps/pkg/src/memory/dep_custom/manager.zig"));
+    const adapter_path = try std.fs.path.join(allocator, &.{ tmp_path, "pkg/lib/memory/custom.zap" });
+    defer allocator.free(adapter_path);
+    const source_root_path = try std.fs.path.join(allocator, &.{ tmp_path, "pkg/lib" });
+    defer allocator.free(source_root_path);
+    const source_roots = [_]SourceRoot{.{ .name = "pkg", .path = source_root_path }};
+    const backend_path = try resolveBackendSourcePath(allocator, .{
+        .type_name = "ThirdParty.Custom",
+        .adapter_source_path = adapter_path,
+    }, .{
+        .adapter = null,
+        .source_roots = &source_roots,
+        .project_root = tmp_path,
+        .zap_source_root = tmp_path,
+        .cache_dir = "",
+    }, &diag);
+    defer allocator.free(backend_path);
+    try std.testing.expect(std.mem.endsWith(u8, backend_path, "pkg/src/memory/custom/manager.zig"));
 }
 
-test "manager backend convention rejects missing and ambiguous backends" {
+test "manager backend binding rejects missing source and non-zap adapters" {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "project/src/memory/custom") catch return error.Unexpected;
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "deps/pkg/src/memory/custom") catch return error.Unexpected;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "project/src/memory/custom/manager.zig", .data = "// project" }) catch return error.Unexpected;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "deps/pkg/src/memory/custom/manager.zig", .data = "// dep" }) catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "pkg/lib/memory") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "pkg/lib/memory/missing.zap", .data = "// adapter" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "pkg/lib/memory/not_zap.txt", .data = "// adapter" }) catch return error.Unexpected;
+
     const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_path);
-    const project_root = try std.fs.path.join(allocator, &.{ tmp_path, "project" });
-    defer allocator.free(project_root);
-    const dep_root = try std.fs.path.join(allocator, &.{ tmp_path, "deps/pkg" });
-    defer allocator.free(dep_root);
-
-    const options: ResolveOptions = .{
-        .adapter = null,
-        .source_roots = &.{.{ .name = "dep:pkg", .path = dep_root }},
-        .project_root = project_root,
-        .zap_source_root = tmp_path,
-        .cache_dir = tmp_path,
-    };
+    const source_root_path = try std.fs.path.join(allocator, &.{ tmp_path, "pkg/lib" });
+    defer allocator.free(source_root_path);
+    const source_roots = [_]SourceRoot{.{ .name = "pkg", .path = source_root_path }};
     var diag_buf: [512]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
 
+    const missing_adapter_path = try std.fs.path.join(allocator, &.{ tmp_path, "pkg/lib/memory/missing.zap" });
+    defer allocator.free(missing_adapter_path);
     try std.testing.expectError(
         ResolveError.ManagerSourceNotFound,
-        resolveBackendSourcePath(allocator, .{ .type_name = "Missing.Manager" }, options, &diag),
+        resolveBackendSourcePath(allocator, .{
+            .type_name = "Missing.Manager",
+            .adapter_source_path = missing_adapter_path,
+        }, .{
+            .adapter = null,
+            .source_roots = &source_roots,
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = "",
+        }, &diag),
     );
+
+    const invalid_adapter_path = try std.fs.path.join(allocator, &.{ tmp_path, "pkg/lib/memory/not_zap.txt" });
+    defer allocator.free(invalid_adapter_path);
     try std.testing.expectError(
-        ResolveError.InvalidPrimitiveSourceReference,
-        resolveBackendSourcePath(allocator, .{ .type_name = "ThirdParty.Custom" }, options, &diag),
+        ResolveError.InvalidManagerBackendSource,
+        resolveBackendSourcePath(allocator, .{
+            .type_name = "ThirdParty.Custom",
+            .adapter_source_path = invalid_adapter_path,
+        }, .{
+            .adapter = null,
+            .source_roots = &source_roots,
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = "",
+        }, &diag),
     );
 }
 
@@ -1320,7 +1328,6 @@ test "resolve requires evaluated adapter binding" {
             std.testing.allocator,
             .{
                 .adapter = null,
-                .source_roots = &.{},
                 .project_root = ".",
                 .zap_source_root = ".",
                 .cache_dir = "/tmp/zap-driver-test-missing-adapter",
@@ -1336,14 +1343,13 @@ test "resolve rejects empty adapter backend binding before compiling" {
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
 
     try std.testing.expectError(
-        ResolveError.InvalidPrimitiveSourceReference,
+        ResolveError.InvalidManagerBackendSource,
         resolve(
             std.testing.allocator,
             .{
                 .adapter = .{
                     .type_name = "",
                 },
-                .source_roots = &.{},
                 .project_root = ".",
                 .zap_source_root = ".",
                 .cache_dir = "/tmp/zap-driver-test-bad-adapter",
@@ -1873,12 +1879,21 @@ test "Phase 2 adapters: stdlib manager resolves through generic compile validati
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/no_op") catch return error.Unexpected;
     tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/memory/no_op.zap", .data = "// adapter" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/no_op/manager.zig", .data = "// backend" }) catch return error.Unexpected;
 
     const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_path);
     const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
     defer allocator.free(cache_root);
+    const adapter_source_path = std.fs.path.join(allocator, &.{ tmp_path, "lib/memory/no_op.zap" }) catch return error.Unexpected;
+    defer allocator.free(adapter_source_path);
+    const lib_source_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(lib_source_root);
+    const source_roots = [_]SourceRoot{.{ .name = "zap_stdlib", .path = lib_source_root }};
 
     var diag_buf: [1024]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
@@ -1888,8 +1903,9 @@ test "Phase 2 adapters: stdlib manager resolves through generic compile validati
         .{
             .adapter = .{
                 .type_name = "Memory.NoOp",
+                .adapter_source_path = adapter_source_path,
             },
-            .source_roots = &.{},
+            .source_roots = &source_roots,
             .project_root = ".",
             .zap_source_root = ".",
             .cache_dir = cache_root,
@@ -1916,14 +1932,21 @@ test "Phase 2 adapters: project manager resolves through same ELF validation pat
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/project_manager") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/project_manager") catch return error.Unexpected;
     tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/project_manager.zap", .data = "// adapter" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
 
     const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_path);
     const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
     defer allocator.free(cache_root);
+    const adapter_source_path = std.fs.path.join(allocator, &.{ tmp_path, "lib/project_manager.zap" }) catch return error.Unexpected;
+    defer allocator.free(adapter_source_path);
+    const lib_source_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(lib_source_root);
+    const source_roots = [_]SourceRoot{.{ .name = "project", .path = lib_source_root }};
 
     var diag_buf: [1024]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
@@ -1933,8 +1956,9 @@ test "Phase 2 adapters: project manager resolves through same ELF validation pat
         .{
             .adapter = .{
                 .type_name = "Example.ProjectManager",
+                .adapter_source_path = adapter_source_path,
             },
-            .source_roots = &.{},
+            .source_roots = &source_roots,
             .project_root = tmp_path,
             .zap_source_root = tmp_path,
             .cache_dir = cache_root,
@@ -1945,7 +1969,7 @@ test "Phase 2 adapters: project manager resolves through same ELF validation pat
     defer freeResolved(allocator, &resolved);
 
     try std.testing.expectEqualStrings("Example.ProjectManager", resolved.type_name);
-    try std.testing.expect(std.mem.endsWith(u8, resolved.active_manager_source_path, "src/memory/project_manager/manager.zig"));
+    try std.testing.expect(std.mem.endsWith(u8, resolved.active_manager_source_path, "src/project_manager/manager.zig"));
     try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
 }
 
@@ -1955,14 +1979,21 @@ test "Phase 2 adapters: project manager resolves through same Mach-O validation 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/project_manager") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/project_manager") catch return error.Unexpected;
     tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/project_manager.zap", .data = "// adapter" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
 
     const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_path);
     const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
     defer allocator.free(cache_root);
+    const adapter_source_path = std.fs.path.join(allocator, &.{ tmp_path, "lib/project_manager.zap" }) catch return error.Unexpected;
+    defer allocator.free(adapter_source_path);
+    const lib_source_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(lib_source_root);
+    const source_roots = [_]SourceRoot{.{ .name = "project", .path = lib_source_root }};
 
     var diag_buf: [1024]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
@@ -1972,8 +2003,9 @@ test "Phase 2 adapters: project manager resolves through same Mach-O validation 
         .{
             .adapter = .{
                 .type_name = "Example.ProjectManager",
+                .adapter_source_path = adapter_source_path,
             },
-            .source_roots = &.{},
+            .source_roots = &source_roots,
             .project_root = tmp_path,
             .zap_source_root = tmp_path,
             .cache_dir = cache_root,
@@ -2383,7 +2415,7 @@ test "resolve threads compile_target through to fork_compile_fn" {
     // manager `.o` would be compiled for the host instead of the binary's
     // final target, producing a link-time mismatch on cross-builds.
     //
-    // The selected adapter's primitive source is compiled for validation
+    // The selected adapter's backend source is compiled for validation
     // regardless of whether it came from the stdlib, project, or a
     // dependency, so target plumbing must be uniform across all managers.
     const allocator = std.testing.allocator;
@@ -2391,15 +2423,22 @@ test "resolve threads compile_target through to fork_compile_fn" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/project_manager") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/project_manager") catch return error.Unexpected;
     tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/project_manager.zap", .data = "// adapter" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
 
     const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_path);
 
     const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
     defer allocator.free(cache_root);
+    const adapter_source_path = std.fs.path.join(allocator, &.{ tmp_path, "lib/project_manager.zap" }) catch return error.Unexpected;
+    defer allocator.free(adapter_source_path);
+    const lib_source_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(lib_source_root);
+    const source_roots = [_]SourceRoot{.{ .name = "project", .path = lib_source_root }};
 
     // Reset state in case prior tests touched it.
     captured_target_state = .{};
@@ -2412,8 +2451,9 @@ test "resolve threads compile_target through to fork_compile_fn" {
         .{
             .adapter = .{
                 .type_name = "Example.ProjectManager",
+                .adapter_source_path = adapter_source_path,
             },
-            .source_roots = &.{},
+            .source_roots = &source_roots,
             .project_root = tmp_path,
             .zap_source_root = tmp_path,
             .cache_dir = cache_root,
@@ -2456,15 +2496,22 @@ test "resolve passes NATIVE sentinel when compile_target is null" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/memory/project_manager") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/project_manager") catch return error.Unexpected;
     tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
-    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/memory/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/project_manager.zap", .data = "// adapter" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
 
     const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_path);
 
     const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
     defer allocator.free(cache_root);
+    const adapter_source_path = std.fs.path.join(allocator, &.{ tmp_path, "lib/project_manager.zap" }) catch return error.Unexpected;
+    defer allocator.free(adapter_source_path);
+    const lib_source_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(lib_source_root);
+    const source_roots = [_]SourceRoot{.{ .name = "project", .path = lib_source_root }};
 
     captured_target_state = .{};
 
@@ -2476,8 +2523,9 @@ test "resolve passes NATIVE sentinel when compile_target is null" {
         .{
             .adapter = .{
                 .type_name = "Example.ProjectManager",
+                .adapter_source_path = adapter_source_path,
             },
-            .source_roots = &.{},
+            .source_roots = &source_roots,
             .project_root = tmp_path,
             .zap_source_root = tmp_path,
             .cache_dir = cache_root,
@@ -2819,12 +2867,21 @@ fn simulateWatchInitForManager(
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/watch_manager") catch return error.Unexpected;
     tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/watch_manager.zap", .data = "// adapter" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/watch_manager/manager.zig", .data = "// backend" }) catch return error.Unexpected;
 
     const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_path);
     const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
     defer allocator.free(cache_root);
+    const adapter_source_path = std.fs.path.join(allocator, &.{ tmp_path, "lib/watch_manager.zap" }) catch return error.Unexpected;
+    defer allocator.free(adapter_source_path);
+    const lib_source_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(lib_source_root);
+    const source_roots = [_]SourceRoot{.{ .name = "project", .path = lib_source_root }};
 
     var diag_buf: [1024]u8 = undefined;
     var init_diag: DriverDiagnostic = .{ .buffer = &diag_buf };
@@ -2834,8 +2891,9 @@ fn simulateWatchInitForManager(
         .{
             .adapter = .{
                 .type_name = manager_type_name,
+                .adapter_source_path = adapter_source_path,
             },
-            .source_roots = &.{},
+            .source_roots = &source_roots,
             .project_root = ".",
             .zap_source_root = ".",
             .cache_dir = cache_root,

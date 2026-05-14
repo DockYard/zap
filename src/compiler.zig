@@ -3157,7 +3157,7 @@ pub fn validateOneStructPerFile(
 ///   3. The active-manager source binding marker
 ///      (`RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT`). Rewritten to true
 ///      for user binaries after the driver resolves the selected
-///      `Memory.Manager` adapter and registers its primitive Zig source
+///      `Memory.Manager` adapter and registers its backend Zig source
 ///      as `zap_active_manager`.
 ///   4. The REFCOUNT_V1 v1.1 sized-extension marker
 ///      (`RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT`). Rewritten from
@@ -3345,7 +3345,7 @@ fn rewriteRuntimeSource(req: RuntimeRewrite) []const u8 {
     }
 
     // Stage 3: source-manager binding marker rewrite. User binaries
-    // always register the selected manager source as `zap_active_manager`;
+    // always register the selected manager backend source as `zap_active_manager`;
     // host tests keep the source-level false marker and bind the
     // test-only ARC fallback through the vtable path.
     const source_needle = "const RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT: bool = false;";

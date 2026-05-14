@@ -5,8 +5,8 @@
   type to the low-level primitive backend selected for a binary.
   Stdlib managers and third-party managers use the same protocol:
   the adapter calls the backend primitive for its own type, and the
-  compiler/runtime bridge derives the implementation identity from
-  that type plus the package-level manager backend convention.
+  compiler/runtime bridge binds the implementation from the adapter
+  method's package-owned backend source.
 
   The adapter is intentionally independent of `Process`: future APIs
   such as per-process manager selection can accept values that implement

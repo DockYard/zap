@@ -46,7 +46,8 @@ pub fn build(b: *std.Build) void {
     // `active_manager_source_available == false` marker, so runtime hot
     // paths bind the test-only ARC fallback state and do not call into
     // this import. Production user binaries instead register the selected
-    // adapter's primitive source path through `zir_compilation_add_struct`;
+    // adapter's package `src/.../manager.zig` backend through
+    // `zir_compilation_add_struct`;
     // see `src/zir_backend.zig:createContext`.
     // ----------------------------------------------------------------
 
@@ -59,7 +60,6 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("zap_active_manager", .{
         .root_source_file = b.path("src/zap_active_manager_stub.zig"),
     });
-
     // -----------------------------------------------------------------------
     // Setup step: download pre-built deps
     // -----------------------------------------------------------------------

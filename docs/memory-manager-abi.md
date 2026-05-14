@@ -30,11 +30,12 @@ The source model is adapter-driven: stdlib and project managers are
 top-level structs that implement `Memory.Manager`. The selected adapter
 value in `Zap.Manifest.memory` is evaluated at build time, and the
 compiler calls one protocol function, `backend/1`, which delegates to
-`:zig.Memory.backend(manager)`. The compiler derives the backend source
-from the selected manager type using the package convention
-`src/memory/<manager-slug>/manager.zig`; declared capabilities come from
-the validated `.zapmem` section. No manager uses a special source
-attribute, compiler name table, or Zap-returned source path.
+`:zig.Memory.backend(manager)`. That call binds the adapter method's
+package-relative source file to the package's Zig backend file
+(`lib/foo/bar.zap` -> `src/foo/bar/manager.zig`);
+declared capabilities come from the validated `.zapmem` section. No
+manager uses a special source attribute, compiler name table,
+type-name-derived path, or Zap-returned source path.
 
 ### 1.1 The build pipeline at a glance
 
@@ -48,8 +49,8 @@ Resolve adapter type
 Evaluate Memory.Manager.backend/1 through CTFE
         |
         v
-Resolve src/memory/<manager-slug>/manager.zig from the selected
-manager type and compile the backend source to a validation object
+Resolve the adapter source's package backend file and compile it to a
+validation object
         |
         v
 Validate ZapMemoryManagerMetaV1 + embedded ZapMemoryManagerCoreV1
@@ -78,8 +79,9 @@ Register the selected backend source as zap_active_manager in the final Zap bina
 | `Memory.Tracking` | `Memory.Tracking` | `lib/memory/tracking.zap` | `src/memory/tracking/manager.zig` |
 
 Third-party managers follow the same `Memory.Manager` adapter contract.
-Their backend source lives at `src/memory/<manager-slug>/manager.zig`
-inside the providing package.
+Their backend source lives in the same package's `src/` tree at the
+path derived from the adapter's package-relative Zap source:
+`lib/foo/bar.zap` maps to `src/foo/bar/manager.zig`.
 Architectural conventions for a production manager (slab pooling,
 size-class buckets, atomic per-cell headers) are out of scope for this
 specification; the goal here is the wire contract, not implementation
@@ -562,7 +564,7 @@ When a manager cannot satisfy an `allocate` request:
    ```
    zap: out of memory: requested <size> bytes (alignment <alignment>) from manager <manager_name>; aborting
    ```
-   The `<manager_name>` is read from the manager's stdlib struct path (e.g., `Memory.ARC`).
+   The `<manager_name>` is the selected adapter type name (e.g., `Memory.ARC`).
 3. Managers must not call `std.process.abort`, `std.process.exit`, or perform IO during the allocation path. The runtime owns the OOM diagnostic.
 4. Behavior on allocation success but partial fill (e.g., backing-store partial failure) is undefined; managers must either fully succeed or return null.
 
@@ -1065,14 +1067,12 @@ Step 2. Resolve the adapter binding.
         adapter source file.
 
 Step 3. Resolve and compile the manager backend source.
-        The driver derives a manager slug from the final segment of the
-        selected type name, resolves
-        src/memory/<manager-slug>/manager.zig inside the package that
-        provides the adapter, and invokes the Zig-fork primitive
-        `zap_fork_compile_zig_to_object` (see section 10.1.2). This
-        object is build-time validation evidence for every manager; the
-        final binary registers the convention-resolved backend source
-        path as `zap_active_manager`.
+        The driver resolves the package `src/.../manager.zig` backend
+        for the adapter method source recorded in step 2 and invokes
+        the Zig-fork primitive `zap_fork_compile_zig_to_object` (see
+        section 10.1.2). This object is build-time validation evidence
+        for every manager; the final binary registers the resolved
+        backend source path as `zap_active_manager`.
 
 Step 4. Resolve metadata.
         The driver parses the .zapmem section from the object file using
@@ -1110,33 +1110,26 @@ Step 8. Emit the runtime startup hook.
         (see section 10.2).
 
 Step 9. Register the selected backend source.
-        The final binary registers the convention-resolved backend
-        source path as `zap_active_manager`. The runtime binds
+        The final binary registers the resolved package backend source
+        path as `zap_active_manager`. The runtime binds
         `zap_active_manager.zap_memory_section` at startup. The
         validation object from step 3 is not linked into the final
         binary.
 ```
 
-#### 10.1.1 Manager backend source convention
+#### 10.1.1 Manager backend source binding
 
 Zap adapters do not expose backend source references. The build driver
-derives the backend source path from the selected manager type and the
-package root that provides the adapter.
+binds the backend source from the source file that actually contains the
+`backend/1` implementation. If the implementation is in
+`lib/memory/arc.zap`, the backend source is `src/memory/arc/manager.zig`. If a
+third-party implementation is in `lib/third_party/project_arena.zap`, the
+backend source is `src/third_party/project_arena/manager.zig`.
 
-The manager slug is the snake_case spelling of the selected type's final
-dotted segment:
-
-- `Memory.ARC` resolves to `arc`.
-- `Memory.NoOp` resolves to `no_op`.
-- `ThirdParty.ProjectArena` resolves to `project_arena`.
-
-The backend source must live at
-`src/memory/<manager-slug>/manager.zig` under exactly one applicable
-package root. The driver searches the adapter's package root when source
-reflection identifies it, then the project, dependency, and Zap stdlib
-roots known to the build. Zero matches are a missing manager source
-error. Multiple matches are invalid because the selected adapter type
-must identify a single backend implementation.
+The compiler does not derive backend identity from the manager type name
+and does not scan package roots for name-shaped manager files. A
+selected adapter must be source-backed by a `.zap` file, and its package
+`src/.../manager.zig` backend file must exist.
 
 #### 10.1.2 `zap_fork_compile_zig_to_object`
 
@@ -1262,10 +1255,9 @@ The compiled `<manager>.o` is content-addressed by `(zig_fork_version, manager_s
 
 | Failure                                  | Stage   | Diagnostic                                                                           |
 |------------------------------------------|---------|--------------------------------------------------------------------------------------|
-| Adapter metadata missing                 | Step 2  | "build manifest did not evaluate a `Memory.Manager` adapter"                                |
+| Adapter binding missing                  | Step 2  | "build manifest did not evaluate a `Memory.Manager` adapter"                                |
 | Adapter backend binding missing          | Step 2  | "memory manager adapter `<name>` did not call `:zig.Memory.backend/1`"                |
-| Manager backend source missing           | Step 2  | "memory manager source not found at `src/memory/<manager-slug>/manager.zig` for `<name>`" |
-| Manager backend source ambiguous         | Step 2  | "memory manager source for `<name>` resolved to multiple package roots"               |
+| Manager backend source missing           | Step 2  | "memory manager backend for `<name>` not found; expected package backend file `<path>`" |
 | Manager Zig source fails to compile      | Step 3  | Forwarded Zig compiler error, prefixed with the manager package name.                |
 | `.zapmem` section absent from object     | Step 4  | "manager `<name>` did not emit a `.zapmem` metadata section; see docs/memory-manager-abi.md section 3" |
 | Magic mismatch                           | Step 5  | "manager `<name>` has invalid magic (expected `'ZMEM'`, got `<bytes>`)"               |
@@ -1288,16 +1280,17 @@ The compiled `<manager>.o` is content-addressed by `(zig_fork_version, manager_s
 The Zap source model is shared: memory managers are adapter structs
 that implement `Memory.Manager`. Stdlib and third-party adapters use
 the same compiler path: CTFE evaluates `backend/1`, the backend
-primitive records the selected manager type, the driver resolves the
-convention-based manager source, that source is compiled for `.zapmem`
-validation, and the final binary registers the same resolved source path
-as `zap_active_manager`.
+primitive records the selected manager type and adapter method source,
+the driver resolves the package Zig backend source, that source is
+compiled for `.zapmem` validation, and the final binary registers the
+same resolved source path as `zap_active_manager`.
 
 ### 11.1 What a third party ships
 
 A third-party manager is a Zap package containing:
 
-1. A self-contained Zig backend source at `src/memory/<manager-slug>/manager.zig`.
+1. A self-contained Zig backend source under package `src/`, at the
+   path derived from the Zap adapter source.
 2. A `build.zig.zon` so the package can be referenced by Zap's dependency system.
 3. A Zap adapter struct in `lib/<name>.zap` (or wherever the package
    exposes its public API) that implements `Memory.Manager`.
@@ -1313,10 +1306,9 @@ The user then references the Zap struct from their project's `build.zap`:
 ```
 
 The Zap compiler evaluates `ThirdParty.MyManager` through
-`Memory.Manager.backend/1`, resolves
-`src/memory/my_manager/manager.zig` in the package that provides the
-adapter, validates the resulting `.zapmem` metadata, and threads
-`declared_caps` into HIR and codegen.
+`Memory.Manager.backend/1`, resolves the package `src/.../manager.zig`
+backend source for the adapter, validates the resulting `.zapmem`
+metadata, and threads `declared_caps` into HIR and codegen.
 
 #### 11.1.1 Third-party manager dependencies
 
@@ -1426,9 +1418,8 @@ pub impl Memory.Manager for ThirdParty.ProjectArena {
 }
 ```
 
-The backend source for this adapter must live at
-`src/memory/project_arena/manager.zig` under the package root that
-provides `ThirdParty.ProjectArena`.
+If this adapter implementation lives at `lib/third_party/project_arena.zap`,
+its backend source must live at `src/third_party/project_arena/manager.zig`.
 
 ### 12.5 Adapter struct shape
 
@@ -1641,7 +1632,7 @@ This example shows a small but complete refcounting manager. It uses `std.heap.p
 
 The header layout is sized to support arbitrary user-requested alignments, including alignments greater than the header's own size (for example 32-byte AVX vectors or 64-byte cacheline alignment). Production managers that target only small power-of-two alignments may shrink the header further; the layout shown here is the general-case template.
 
-### 15.1 Zig source: `tinyref/src/memory/tiny_ref/manager.zig`
+### 15.1 Zig source: `tinyref/src/tinyref/manager.zig`
 
 ```zig
 const std = @import("std");

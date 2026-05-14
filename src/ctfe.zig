@@ -2933,7 +2933,7 @@ pub const Interpreter = struct {
         if (std.mem.eql(u8, cb.name, "Memory.backend") or
             std.mem.eql(u8, cb.name, ":zig.Memory.backend"))
         {
-            return self.builtinMemoryBackend(args);
+            return self.builtinMemoryBackend(args, frame);
         }
 
         // File read intrinsic
@@ -3083,7 +3083,7 @@ pub const Interpreter = struct {
         return default_value;
     }
 
-    fn builtinMemoryBackend(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
+    fn builtinMemoryBackend(self: *Interpreter, args: []const CtValue, frame: *const Frame) CtfeInterpretError!CtValue {
         if (!self.capabilities.has(.reflect_source)) {
             try self.emitError(.capability_violation, "Memory.backend requires build-time source reflection");
             return error.CtfeFailure;
@@ -3095,7 +3095,7 @@ pub const Interpreter = struct {
 
         const manager_type_name = try self.memoryManagerTypeName(args[0]);
         errdefer self.allocator.free(manager_type_name);
-        const source_path = try self.memoryManagerSourcePath(manager_type_name);
+        const source_path = try self.memoryBackendCallSourcePath(frame, manager_type_name);
         errdefer if (source_path) |path| self.allocator.free(path);
 
         self.clearMemoryBackendBinding();
@@ -3138,15 +3138,38 @@ pub const Interpreter = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    fn memoryManagerSourcePath(self: *Interpreter, manager_type_name: []const u8) CtfeInterpretError!?[]const u8 {
+    fn memoryBackendCallSourcePath(self: *Interpreter, frame: *const Frame, manager_type_name: []const u8) CtfeInterpretError!?[]const u8 {
+        const graph = self.scope_graph orelse return null;
+        const source_span = blk: {
+            if (self.call_stack.items.len > 0) {
+                if (self.call_stack.items[self.call_stack.items.len - 1].source_span) |span| break :blk span;
+            }
+            const func = for (self.program.functions) |*candidate| {
+                if (candidate.id == frame.function_id) break candidate;
+            } else return null;
+            break :blk self.resolveFunctionSourceSpan(func) orelse {
+                return self.memoryBackendImplSourcePath(manager_type_name);
+            };
+        };
+        const source_id = source_span.source_id orelse return null;
+        const path = graph.sourcePathById(source_id) orelse return null;
+        return self.allocator.dupe(u8, path) catch return error.OutOfMemory;
+    }
+
+    fn memoryBackendImplSourcePath(self: *Interpreter, manager_type_name: []const u8) CtfeInterpretError!?[]const u8 {
         const graph = self.scope_graph orelse return null;
         const current_interner = self.interner orelse return null;
 
-        for (graph.structs.items) |struct_entry| {
-            if (!structNameMatchesDottedCtfe(current_interner, struct_entry.name, manager_type_name)) continue;
-            const source_id = struct_entry.decl.meta.span.source_id orelse return null;
-            const path = graph.sourcePathById(source_id) orelse return null;
-            return self.allocator.dupe(u8, path) catch return error.OutOfMemory;
+        for (graph.impls.items) |impl_entry| {
+            if (!structNameMatchesDottedCtfe(current_interner, impl_entry.protocol_name, "Memory.Manager")) continue;
+            if (!structNameMatchesDottedCtfe(current_interner, impl_entry.target_type, manager_type_name)) continue;
+            for (impl_entry.decl.functions) |function_decl| {
+                if (!std.mem.eql(u8, current_interner.get(function_decl.name), "backend")) continue;
+                if (function_decl.clauses.len == 0) return null;
+                const source_id = function_decl.clauses[0].meta.span.source_id orelse return null;
+                const path = graph.sourcePathById(source_id) orelse return null;
+                return self.allocator.dupe(u8, path) catch return error.OutOfMemory;
+            }
         }
 
         return null;

@@ -20,10 +20,11 @@ pub const BuildConfig = struct {
     paths: []const []const u8 = &.{},
     deps: []const Dep = &.{},
     build_opts: std.StringHashMapUnmanaged([]const u8) = .empty,
-    /// Memory manager adapter binding evaluated through the
-    /// `Memory.Manager` protocol during manifest CTFE. The compiler
-    /// driver treats this as the sole resolver input; stdlib and
-    /// project/dependency managers use the same adapter path.
+    /// Memory manager selected by the manifest. Initial build.zap CTFE
+    /// records only the selected type so dependency resolution can
+    /// complete first. The adapter source path is filled by evaluating
+    /// `Memory.Manager.backend/1` after project and dependency sources
+    /// are loaded.
     memory_manager: ?MemoryManager = null,
     /// Test timeout in milliseconds (0 = no timeout). Zig 0.16 supports
     /// native unit test timeouts in the build system.
@@ -181,19 +182,12 @@ pub fn ctfeManifestDetailed(
     };
 
     var config = try constValueToBuildConfig(alloc, manifest_result.value);
-    const memory_eval = try evaluateMemoryManagerAdapter(
-        alloc,
-        &interp,
-        &ctx.collector.graph,
-        &ctx.interner,
-        manifest_result.value,
-    );
-    config.memory_manager = memory_eval.manager;
+    config.memory_manager = try memoryManagerSelectionFromManifest(alloc, manifest_result.value);
 
     return .{
         .config = config,
         .dependencies = manifest_result.dependencies,
-        .result_hash = hashManifestWithMemoryAdapter(manifest_result.result_hash, memory_eval.result_hash),
+        .result_hash = manifest_result.result_hash,
     };
 }
 
@@ -281,6 +275,49 @@ fn readLibSourceUnits(
         const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch continue;
         try source_units.append(alloc, .{ .file_path = file_path, .source = source });
     }
+}
+
+fn readLibSourceUnitsUnique(
+    alloc: std.mem.Allocator,
+    dir_path: []const u8,
+    source_units: *std.ArrayListUnmanaged(compiler.SourceUnit),
+) !void {
+    var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(std.Options.debug_io);
+    var iter = dir.iterate();
+    while (iter.next(std.Options.debug_io) catch null) |entry| {
+        if (entry.kind == .directory) {
+            const subdir_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
+            try readLibSourceUnitsUnique(alloc, subdir_path, source_units);
+            continue;
+        }
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
+        const file_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
+        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch continue;
+        try appendUniqueSourceUnit(alloc, source_units, .{ .file_path = file_path, .source = source });
+    }
+}
+
+fn appendUniqueSourceUnit(
+    alloc: std.mem.Allocator,
+    source_units: *std.ArrayListUnmanaged(compiler.SourceUnit),
+    source_unit: compiler.SourceUnit,
+) !void {
+    const source_key = canonicalSourcePath(alloc, source_unit.file_path) catch try alloc.dupe(u8, source_unit.file_path);
+    defer alloc.free(source_key);
+    for (source_units.items) |existing| {
+        const existing_key = canonicalSourcePath(alloc, existing.file_path) catch try alloc.dupe(u8, existing.file_path);
+        defer alloc.free(existing_key);
+        if (std.mem.eql(u8, existing_key, source_key)) return;
+    }
+    try source_units.append(alloc, source_unit);
+}
+
+fn canonicalSourcePath(alloc: std.mem.Allocator, file_path: []const u8) ![]const u8 {
+    return std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, file_path, alloc) catch {
+        return std.fs.path.resolve(alloc, &.{file_path});
+    };
 }
 
 fn findManifestFunction(program: *const zap.ir.Program) ?zap.ir.FunctionId {
@@ -410,10 +447,85 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
     }
 }
 
-const MemoryAdapterEval = struct {
+pub const MemoryAdapterEval = struct {
     manager: ?BuildConfig.MemoryManager,
     result_hash: u64 = 0,
 };
+
+pub fn evaluateMemoryManagerAdapterFromSources(
+    alloc: std.mem.Allocator,
+    build_source: []const u8,
+    source_units: []const compiler.SourceUnit,
+    selected_manager: ?BuildConfig.MemoryManager,
+    target_name: []const u8,
+    build_opts: std.StringHashMapUnmanaged([]const u8),
+    zap_lib_dir: ?[]const u8,
+) !MemoryAdapterEval {
+    var ctfe_source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+    try appendUniqueSourceUnit(alloc, &ctfe_source_units, .{ .file_path = "build.zap", .source = build_source });
+    if (zap_lib_dir) |lib_dir| {
+        try readLibSourceUnitsUnique(alloc, lib_dir, &ctfe_source_units);
+    }
+    for (source_units) |unit| {
+        try appendUniqueSourceUnit(alloc, &ctfe_source_units, unit);
+    }
+
+    const struct_order_data = computeStructOrder(alloc, build_source, ctfe_source_units.items, zap_lib_dir) catch null;
+    var collect_options = compiler.CompileOptions{
+        .show_progress = false,
+    };
+    if (struct_order_data) |order| {
+        collect_options.struct_order = order.struct_order;
+        collect_options.level_boundaries = order.level_boundaries;
+    }
+
+    var ctx = compiler.collectAllFromUnits(alloc, ctfe_source_units.items, collect_options) catch return error.CompileFailed;
+    const result = compiler.compileForCtfe(alloc, &ctx, .{
+        .show_progress = false,
+    }) catch return error.CompileFailed;
+
+    var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    defer interp.deinit();
+    interp.scope_graph = &ctx.collector.graph;
+    interp.interner = &ctx.interner;
+    interp.capabilities = zap.ctfe.CapabilitySet.build;
+    interp.build_opts = build_opts;
+    interp.compile_options_hash = zap.ctfe.hashCompileOptions(target_name, build_opts.get("optimize") orelse "release_safe");
+
+    const manifest_id = findManifestFunction(&result.ir_program) orelse
+        return error.ManifestNotFound;
+    const manifest_result = interp.evalAndExport(
+        manifest_id,
+        &.{buildEnvConst(target_name)},
+        zap.ctfe.CapabilitySet.build,
+    ) catch return error.CtfeFailed;
+
+    const selected = (try memoryManagerSelectionFromManifest(alloc, manifest_result.value)) orelse
+        selected_manager orelse return .{ .manager = null };
+    if (selected.type_name.len == 0) return .{ .manager = null };
+
+    const adapter_value = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = selected.type_name,
+        .fields = &.{},
+    } };
+    return evaluateMemoryManagerAdapterValue(
+        alloc,
+        &interp,
+        &ctx.collector.graph,
+        &ctx.interner,
+        selected.type_name,
+        adapter_value,
+    );
+}
+
+fn memoryManagerSelectionFromManifest(
+    alloc: std.mem.Allocator,
+    manifest_value: zap.ctfe.ConstValue,
+) !?BuildConfig.MemoryManager {
+    const adapter_value = findManifestField(manifest_value, "memory") orelse return null;
+    const adapter_type_name = (try parseStructRefField(alloc, adapter_value)) orelse return null;
+    return .{ .type_name = adapter_type_name };
+}
 
 fn evaluateMemoryManagerAdapter(
     alloc: std.mem.Allocator,
@@ -424,7 +536,17 @@ fn evaluateMemoryManagerAdapter(
 ) !MemoryAdapterEval {
     const adapter_value = findManifestField(manifest_value, "memory") orelse return .{ .manager = null };
     const adapter_type_name = (try parseStructRefField(alloc, adapter_value)) orelse return .{ .manager = null };
+    return evaluateMemoryManagerAdapterValue(alloc, interp, scope_graph, interner, adapter_type_name, adapter_value);
+}
 
+fn evaluateMemoryManagerAdapterValue(
+    alloc: std.mem.Allocator,
+    interp: *zap.ctfe.Interpreter,
+    scope_graph: *const zap.scope.ScopeGraph,
+    interner: *const zap.ast.StringInterner,
+    adapter_type_name: []const u8,
+    adapter_value: zap.ctfe.ConstValue,
+) !MemoryAdapterEval {
     try requireMemoryManagerImpl(scope_graph, interner, adapter_type_name);
 
     interp.clearMemoryBackendBinding();
@@ -450,6 +572,19 @@ fn evaluateMemoryManagerAdapter(
         },
         .result_hash = hasher.final(),
     };
+}
+
+fn buildEnvConst(target_name: []const u8) zap.ctfe.ConstValue {
+    const os_name = @tagName(@import("builtin").os.tag);
+    const arch_name = @tagName(@import("builtin").cpu.arch);
+    return zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap_Env",
+        .fields = &.{
+            .{ .name = "target", .value = .{ .atom = target_name } },
+            .{ .name = "os", .value = .{ .atom = os_name } },
+            .{ .name = "arch", .value = .{ .atom = arch_name } },
+        },
+    } };
 }
 
 fn requireMemoryManagerImpl(
@@ -525,7 +660,7 @@ fn adapterFunctionName(
     return std.fmt.allocPrint(alloc, "{s}__{s}__1", .{ prefix.items, mangled_method_name });
 }
 
-fn hashManifestWithMemoryAdapter(manifest_hash: u64, memory_adapter_hash: u64) u64 {
+pub fn hashManifestWithMemoryAdapter(manifest_hash: u64, memory_adapter_hash: u64) u64 {
     if (memory_adapter_hash == 0) return manifest_hash;
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(std.mem.asBytes(&manifest_hash));

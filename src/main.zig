@@ -1031,6 +1031,27 @@ fn buildTarget(
         std.process.exit(1);
     }
 
+    const memory_adapter_eval = builder.evaluateMemoryManagerAdapterFromSources(
+        alloc,
+        build_source,
+        source_units.items,
+        config.memory_manager,
+        target_name,
+        build_opts,
+        zap_lib_dir,
+    ) catch |err| {
+        std.debug.print("Error: failed to evaluate Memory.Manager adapter: {}\n", .{err});
+        std.process.exit(1);
+    };
+    const manifest_memory_manager = memory_adapter_eval.manager orelse {
+        std.debug.print("Error: build.zap manifest did not select a Memory.Manager adapter\n", .{});
+        std.process.exit(1);
+    };
+    const effective_manifest_hash = builder.hashManifestWithMemoryAdapter(
+        manifest_eval.result_hash,
+        memory_adapter_eval.result_hash,
+    );
+
     // Determine output path from manifest (needed for cache check)
     const output_name = if (config.asset_name) |an|
         if (an.len > 0) an else config.name
@@ -1051,31 +1072,6 @@ fn buildTarget(
         .obj => try std.fmt.allocPrint(alloc, "{s}.o", .{output_name}),
     };
     const output_path = try std.fs.path.join(alloc, &.{ out_dir, output_filename });
-
-    // Compilation caching: hash build.zap + all sources + target name
-    // plus build controls that change the emitted artifact.
-    const cache_key = computeBuildCacheKey(build_source, source_units.items, target_name, .{
-        .manifest_result_hash = manifest_eval.result_hash,
-        .collect_arc_stats = collect_arc_stats,
-    });
-    const cache_key_hex = try std.fmt.allocPrint(alloc, "{x:0>16}", .{cache_key});
-    const hash_file = try std.fmt.allocPrint(alloc, ".zap-cache/{s}.hash", .{target_name});
-
-    const cache_valid = blk: {
-        const stored = std.Io.Dir.cwd().readFileAlloc(global_io, hash_file, alloc, .limited(64)) catch break :blk false;
-        defer alloc.free(stored);
-        if (!std.mem.eql(u8, stored, cache_key_hex)) break :blk false;
-        std.Io.Dir.cwd().access(global_io, output_path, .{}) catch break :blk false;
-        break :blk true;
-    };
-
-    if (cache_valid) {
-        std.debug.print("[cached] {s}\n", .{output_path});
-        return .{
-            .path = try allocator.dupe(u8, output_path),
-            .kind = config.kind,
-        };
-    }
 
     // Determine lib_mode from manifest kind
     const lib_mode = config.kind == .lib;
@@ -1104,11 +1100,6 @@ fn buildTarget(
 
     var driver_diag_buf: [4096]u8 = undefined;
     var driver_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &driver_diag_buf };
-
-    const manifest_memory_manager = config.memory_manager orelse {
-        std.debug.print("Error: build.zap manifest did not evaluate a Memory.Manager adapter\n", .{});
-        std.process.exit(1);
-    };
 
     // `detectZapLibDir` returns the stdlib `lib/` subdirectory; the
     // source tree root is the parent of that directory, used for
@@ -1147,6 +1138,38 @@ fn buildTarget(
         std.process.exit(1);
     };
     defer zap.memory_driver.freeResolved(alloc, &resolved_manager);
+
+    const active_manager_source_hash = hashActiveManagerSource(alloc, resolved_manager.active_manager_source_path) catch |err| {
+        std.debug.print("Error: could not hash active memory manager source: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    // Compilation caching: hash build.zap + all Zap sources + target name,
+    // the selected backend source, and build controls that change the
+    // emitted artifact.
+    const cache_key = computeBuildCacheKey(build_source, source_units.items, target_name, .{
+        .manifest_result_hash = effective_manifest_hash,
+        .active_manager_source_hash = active_manager_source_hash,
+        .collect_arc_stats = collect_arc_stats,
+    });
+    const cache_key_hex = try std.fmt.allocPrint(alloc, "{x:0>16}", .{cache_key});
+    const hash_file = try std.fmt.allocPrint(alloc, ".zap-cache/{s}.hash", .{target_name});
+
+    const cache_valid = blk: {
+        const stored = std.Io.Dir.cwd().readFileAlloc(global_io, hash_file, alloc, .limited(64)) catch break :blk false;
+        defer alloc.free(stored);
+        if (!std.mem.eql(u8, stored, cache_key_hex)) break :blk false;
+        std.Io.Dir.cwd().access(global_io, output_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    if (cache_valid) {
+        std.debug.print("[cached] {s}\n", .{output_path});
+        return .{
+            .path = try allocator.dupe(u8, output_path),
+            .kind = config.kind,
+        };
+    }
 
     // Compile through frontend
     // Use per-file pipeline for import-driven discovery, legacy pipeline for glob
@@ -1324,8 +1347,7 @@ fn compileProjectFrontend(
 /// into the `zap.memory_driver.SourceRoot` shape used by the Memory
 /// Manager ABI driver. The driver lives one module-level deeper than
 /// `discovery.zig` to keep dependency direction clean, so it can't
-/// import discovery's struct directly — this helper performs the
-/// purely-syntactic field-by-field copy.
+/// import discovery's struct directly.
 fn sourceRootsForMemoryDriver(
     alloc: std.mem.Allocator,
     discovery_roots: []const zap.discovery.SourceRoot,
@@ -1337,11 +1359,41 @@ fn sourceRootsForMemoryDriver(
     return out;
 }
 
+fn collectMemoryAdapterSourceUnits(
+    alloc: std.mem.Allocator,
+    source_roots: []const zap.discovery.SourceRoot,
+) ![]const compiler.SourceUnit {
+    var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+    var discovered = std.StringHashMap(void).init(alloc);
+    for (source_roots) |root| {
+        const basename = std.fs.path.basename(root.path);
+        const should_scan_recursive =
+            std.mem.eql(u8, basename, "lib") or
+            std.mem.eql(u8, basename, "test") or
+            std.mem.eql(u8, basename, "tools") or
+            std.mem.startsWith(u8, root.name, "dep:") or
+            std.mem.eql(u8, root.name, "zap_stdlib");
+        if (!should_scan_recursive) continue;
+        try scanZapFilesRecursive(alloc, root.path, &source_files, &discovered);
+    }
+
+    var units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+    for (source_files.items) |file_path| {
+        const source = try std.Io.Dir.cwd().readFileAlloc(global_io, file_path, alloc, .limited(10 * 1024 * 1024));
+        try units.append(alloc, .{
+            .file_path = file_path,
+            .source = source,
+        });
+    }
+    return try units.toOwnedSlice(alloc);
+}
+
 /// Compute a build cache key using SHA-256 (Zig 0.16 std.crypto) for
 /// cryptographic integrity. Returns a truncated u64 for backward-compatible
 /// hex formatting, but the full hash provides collision resistance.
 const BuildCacheOptions = struct {
     manifest_result_hash: u64,
+    active_manager_source_hash: u64 = 0,
     collect_arc_stats: bool = false,
 
     const Section = extern struct {
@@ -1362,6 +1414,7 @@ const BuildCacheOptions = struct {
 
     fn updateHasher(self: BuildCacheOptions, hasher: *std.crypto.hash.sha2.Sha256) void {
         hasher.update(std.mem.asBytes(&self.manifest_result_hash));
+        hasher.update(std.mem.asBytes(&self.active_manager_source_hash));
 
         const runtime_flags = self.runtimeFlags();
         if (runtime_flags == 0) return;
@@ -1374,6 +1427,15 @@ const BuildCacheOptions = struct {
         hasher.update(std.mem.asBytes(&section));
     }
 };
+
+fn hashActiveManagerSource(alloc: std.mem.Allocator, source_path: []const u8) !u64 {
+    const source = try std.Io.Dir.cwd().readFileAlloc(global_io, source_path, alloc, .limited(10 * 1024 * 1024));
+    defer alloc.free(source);
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(source_path);
+    hasher.update(source);
+    return hasher.final();
+}
 
 fn computeBuildCacheKey(
     build_source: []const u8,
@@ -1543,7 +1605,7 @@ const IncrementalWatchState = struct {
     declared_caps: u64,
     /// Validated REFCOUNT_V1 v1.1 sized-extension availability.
     refcount_sized_extension: bool,
-    /// Resolved active manager source path. Owned by `allocator`;
+    /// Resolved active manager backend source path. Owned by `allocator`;
     /// freed in `deinit`.
     active_manager_source_path: []const u8,
 
@@ -1628,6 +1690,21 @@ const IncrementalWatchState = struct {
             } else |_| {}
         }
 
+        const memory_source_units = collectMemoryAdapterSourceUnits(alloc, watch_source_roots.items) catch return null;
+        const memory_adapter_eval = zap.builder.evaluateMemoryManagerAdapterFromSources(
+            alloc,
+            build_source,
+            memory_source_units,
+            config.memory_manager,
+            target_name,
+            build_opts,
+            zap_lib_dir,
+        ) catch |err| {
+            std.debug.print("Error: watch-mode Memory.Manager adapter evaluation failed: {}\n", .{err});
+            return null;
+        };
+        const manifest_memory_manager = memory_adapter_eval.manager orelse return null;
+
         // Resolve the active memory manager — mirror `buildTarget`'s
         // flow so the watch-session uses the same active manager source,
         // validation object, and capability bitmask that a non-watch
@@ -1645,8 +1722,6 @@ const IncrementalWatchState = struct {
             project_root;
         var driver_diag_buf: [4096]u8 = undefined;
         var driver_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &driver_diag_buf };
-        const memory_source_roots = sourceRootsForMemoryDriver(alloc, watch_source_roots.items) catch return null;
-        const manifest_memory_manager = config.memory_manager orelse return null;
         var resolved_manager = zap.memory_driver.resolve(
             alloc,
             .{
@@ -1654,7 +1729,7 @@ const IncrementalWatchState = struct {
                     .type_name = manifest_memory_manager.type_name,
                     .adapter_source_path = manifest_memory_manager.adapter_source_path,
                 },
-                .source_roots = memory_source_roots,
+                .source_roots = sourceRootsForMemoryDriver(alloc, watch_source_roots.items) catch return null,
                 .project_root = project_root,
                 .zap_source_root = zap_source_tree_root,
                 .cache_dir = ".zap-cache/memory",
@@ -2287,7 +2362,7 @@ test "Phase 2 ARC stats: build cache key separates runtime collection shape" {
     try testing.expect(default_key != stats_key);
 }
 
-test "Phase 2 ARC stats: default build cache key preserves legacy shape" {
+test "computeBuildCacheKey includes active manager source hash" {
     const build_source = "pub struct App.Builder {}";
     const units = [_]compiler.SourceUnit{
         .{ .file_path = "lib/app.zap", .source = "pub struct App {}" },
@@ -2295,23 +2370,16 @@ test "Phase 2 ARC stats: default build cache key preserves legacy shape" {
     const target_name = "default";
     const manifest_hash: u64 = 111;
 
-    var legacy_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    legacy_hasher.update(build_source);
-    for (&units) |unit| {
-        legacy_hasher.update(unit.file_path);
-        legacy_hasher.update(unit.source);
-    }
-    legacy_hasher.update(target_name);
-    legacy_hasher.update(std.mem.asBytes(&manifest_hash));
-    const legacy_digest = legacy_hasher.finalResult();
-    const legacy_key = std.mem.readInt(u64, legacy_digest[0..8], .little);
-
-    const default_key = computeBuildCacheKey(build_source, &units, target_name, .{
+    const first_key = computeBuildCacheKey(build_source, &units, target_name, .{
         .manifest_result_hash = manifest_hash,
-        .collect_arc_stats = false,
+        .active_manager_source_hash = 1,
+    });
+    const second_key = computeBuildCacheKey(build_source, &units, target_name, .{
+        .manifest_result_hash = manifest_hash,
+        .active_manager_source_hash = 2,
     });
 
-    try testing.expectEqual(legacy_key, default_key);
+    try testing.expect(first_key != second_key);
 }
 
 test "Phase 7e: object manifest kind does not guarantee executable startup prologue" {

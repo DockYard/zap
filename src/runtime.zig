@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// The selected memory manager's primitive Zig source registered alongside
+/// The selected memory manager's Zig backend source registered alongside
 /// this runtime in the user-binary build. The compiler resolves the selected
 /// `Memory.Manager` adapter, validates its `.zapmem` section, and registers
 /// the same source module as `zap_active_manager` for stdlib and project
@@ -727,7 +727,7 @@ export fn zap_runtime_atomic_add_u32_acq_rel(ptr: *u32, delta: u32) callconv(.c)
 //     REFCOUNT_V1 capability vtable when the manager declares the
 //     bit; null otherwise.
 //
-// Adapter-resolved builds register the selected manager source as the
+// Adapter-resolved builds register the selected manager backend source as the
 // `zap_active_manager` sibling module and startup binds that module's
 // exported `zap_memory_section` directly. The weak extern path remains
 // for runtime tests and external object-linked hosts.
@@ -790,7 +790,7 @@ export fn zap_runtime_atomic_add_u32_acq_rel(ptr: *u32, delta: u32) callconv(.c)
 // ============================================================
 // Active manager source binding
 //
-// User binaries register the selected manager's Zig primitive source as
+// User binaries register the selected manager's Zig backend source as
 // the `zap_active_manager` sibling module, regardless of whether that
 // manager ships with the Zap stdlib or a project/dependency. Host tests
 // import `runtime.zig` directly with the stub module from `build.zig`,
@@ -1291,7 +1291,7 @@ fn bindRefcountCapability(desc: *const AbiV1.ZapCapabilityDescV1) void {
 // Test-only ARC manager fallback.
 //
 // Production Zap binaries bind the selected manager outside this file by
-// registering its primitive source as `zap_active_manager`. Tests,
+// registering its backend source as `zap_active_manager`. Tests,
 // however, are built by `zig build test`, which compiles the runtime
 // module directly and does NOT exercise the production user-binary
 // pipeline. To keep tests green the runtime carries a minimal in-source
@@ -13740,7 +13740,7 @@ test "Phase 4: active_manager uniform interface signatures match the manager-ABI
     //
     // Pinning each alias to its expected canonical slot signature here
     // forces the compiler to type-check the source-backed arm in the host
-    // build. If an adapter's primitive source drifts from the ABI slot
+    // build. If an adapter's backend source drifts from the ABI slot
     // signature, this test fails at host-build time rather than at
     // user-binary link time.
     //
