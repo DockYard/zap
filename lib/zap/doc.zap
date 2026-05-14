@@ -8,8 +8,8 @@
 
 pub struct Zap.Doc {
   @doc = """
-  Render the page title — the `<h1 class="page-title">` element.
-  """
+    Render the page title — the `<h1 class="page-title">` element.
+    """
 
   pub fn page_title(name :: String) -> String {
     "<h1 class=\"page-title\">" <> escape_html(name) <> "</h1>\n"
@@ -30,8 +30,8 @@ pub struct Zap.Doc {
   }
 
   @doc = """
-  Map a kind atom to its sidebar group label.
-  """
+    Map a kind atom to its sidebar group label.
+    """
 
   pub fn kind_category_label(kind :: Atom) -> String {
     if kind == :struct {
@@ -935,8 +935,8 @@ pub struct Zap.Doc {
   }
 
   @doc = """
-  True when two strings are byte-equal.
-  """
+    True when two strings are byte-equal.
+    """
 
   pub fn string_eq?(left :: String, right :: String) -> Bool {
     if String.length(left) == String.length(right) {
@@ -1367,8 +1367,8 @@ pub struct Zap.Doc {
   }
 
   @doc = """
-  Render one struct/protocol/union summary as a JSON entry.
-  """
+    Render one struct/protocol/union summary as a JSON entry.
+    """
 
   pub fn struct_search_entry(summary :: %{Atom => Term}, kind_label :: String) -> String {
     name = Map.get(summary, :name, "")
@@ -1377,8 +1377,8 @@ pub struct Zap.Doc {
   }
 
   @doc = """
-  Walk a list of struct/protocol/union summaries, accumulating JSON search entries.
-  """
+    Walk a list of struct/protocol/union summaries, accumulating JSON search entries.
+    """
 
   pub fn render_struct_search_entries(summaries :: [%{Atom => Term}], kind_label :: String, acc :: String) -> String {
     if List.empty?(summaries) {
@@ -1407,16 +1407,16 @@ pub struct Zap.Doc {
   }
 
   @doc = """
-  Render a `:module` + `:name` + `:arity` flat-summary entry as a JSON search entry. Used for functions and macros.
-  """
+    Render a `:module` + `:name` + `:arity` flat-summary entry as a JSON search entry. Used for functions and macros.
+    """
 
   pub fn function_search_entry(entry :: %{Atom => Term}, kind_label :: String) -> String {
     compose_function_search_entry(Map.get(entry, :module, ""), Map.get(entry, :name, ""), Map.get(entry, :arity, 0), Map.get(entry, :doc, ""), kind_label)
   }
 
   @doc = """
-  Walk a list of function/macro flat-summaries, accumulating JSON search entries.
-  """
+    Walk a list of function/macro flat-summaries, accumulating JSON search entries.
+    """
 
   pub fn render_function_search_entries(items :: [%{Atom => Term}], kind_label :: String, acc :: String) -> String {
     if List.empty?(items) {

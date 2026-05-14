@@ -7,8 +7,8 @@
 
 pub struct ReflectionSubject {
   @doc = """
-  Adds two integers.
-  """
+    Adds two integers.
+    """
 
   pub fn add(a :: i64, b :: i64) -> i64 {
     a + b
@@ -29,8 +29,8 @@ pub struct ReflectionSubject {
   }
 
   @doc = """
-  Doubles its argument at compile time.
-  """
+    Doubles its argument at compile time.
+    """
 
   pub macro twice(value :: Expr) -> Expr {
     quote {

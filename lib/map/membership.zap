@@ -1,6 +1,6 @@
 @doc = """
-Membership implementation for `Map`.
-"""
+  Membership implementation for `Map`.
+  """
 
 pub impl Membership for Map(K, V) {
   @doc = """

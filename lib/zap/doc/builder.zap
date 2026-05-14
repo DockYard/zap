@@ -202,40 +202,40 @@ pub struct Zap.Doc.Builder {
       }
 
       @doc = """
-      Flat list of every public function across reflected modules, each with `:module`, `:name`, `:arity`, `:doc`.
-      """
+        Flat list of every public function across reflected modules, each with `:module`, `:name`, `:arity`, `:doc`.
+        """
 
       pub fn manifest_function_summaries() -> [%{Atom => Term}] {
         unquote(if list_length(function_summaries) > 0 { function_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       @doc = """
-      Flat list of every public macro across reflected modules, same shape as `manifest_function_summaries`.
-      """
+        Flat list of every public macro across reflected modules, same shape as `manifest_function_summaries`.
+        """
 
       pub fn manifest_macro_summaries() -> [%{Atom => Term}] {
         unquote(if list_length(macro_summaries) > 0 { macro_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       @doc = """
-      Flat list of every protocol-impl declared across reflected modules, each with `:proto_name` and `:target` qualified names.
-      """
+        Flat list of every protocol-impl declared across reflected modules, each with `:proto_name` and `:target` qualified names.
+        """
 
       pub fn manifest_impl_summaries() -> [%{Atom => Term}] {
         unquote(if list_length(impl_summaries) > 0 { impl_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       @doc = """
-      Flat list of every union variant across reflected modules, each with `:module`, `:name`, `:signature`.
-      """
+        Flat list of every union variant across reflected modules, each with `:module`, `:name`, `:signature`.
+        """
 
       pub fn manifest_variant_summaries() -> [%{Atom => Term}] {
         unquote(if list_length(variant_summaries) > 0 { variant_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       @doc = """
-      Flat list of every protocol's required functions across reflected modules, each with `:module`, `:name`, `:signature`.
-      """
+        Flat list of every protocol's required functions across reflected modules, each with `:module`, `:name`, `:signature`.
+        """
 
       pub fn manifest_required_function_summaries() -> [%{Atom => Term}] {
         unquote(if list_length(required_function_summaries) > 0 { required_function_summaries } else { quote { [] :: [%{Atom => Term}] } })

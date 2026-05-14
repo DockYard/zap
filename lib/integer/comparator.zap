@@ -1,11 +1,11 @@
 @doc = """
-Comparator implementation for `Integer`.
-"""
+  Comparator implementation for `Integer`.
+  """
 
 pub impl Comparator for Integer {
   @doc = """
-  Integer equality.
-  """
+    Integer equality.
+    """
 
   pub fn ==(left :: i8, right :: i8) -> Bool { :zig.Kernel.eq_i8(left, right) }
   pub fn ==(left :: i16, right :: i16) -> Bool { :zig.Kernel.eq_i16(left, right) }
@@ -19,8 +19,8 @@ pub impl Comparator for Integer {
   pub fn ==(left :: u128, right :: u128) -> Bool { :zig.Kernel.eq_u128(left, right) }
 
   @doc = """
-  Integer inequality.
-  """
+    Integer inequality.
+    """
 
   pub fn !=(left :: i8, right :: i8) -> Bool { :zig.Kernel.neq_i8(left, right) }
   pub fn !=(left :: i16, right :: i16) -> Bool { :zig.Kernel.neq_i16(left, right) }
@@ -34,8 +34,8 @@ pub impl Comparator for Integer {
   pub fn !=(left :: u128, right :: u128) -> Bool { :zig.Kernel.neq_u128(left, right) }
 
   @doc = """
-  Integer less-than.
-  """
+    Integer less-than.
+    """
 
   pub fn <(left :: i8, right :: i8) -> Bool { :zig.Kernel.lt_i8(left, right) }
   pub fn <(left :: i16, right :: i16) -> Bool { :zig.Kernel.lt_i16(left, right) }
@@ -49,8 +49,8 @@ pub impl Comparator for Integer {
   pub fn <(left :: u128, right :: u128) -> Bool { :zig.Kernel.lt_u128(left, right) }
 
   @doc = """
-  Integer greater-than.
-  """
+    Integer greater-than.
+    """
 
   pub fn >(left :: i8, right :: i8) -> Bool { :zig.Kernel.gt_i8(left, right) }
   pub fn >(left :: i16, right :: i16) -> Bool { :zig.Kernel.gt_i16(left, right) }
@@ -64,8 +64,8 @@ pub impl Comparator for Integer {
   pub fn >(left :: u128, right :: u128) -> Bool { :zig.Kernel.gt_u128(left, right) }
 
   @doc = """
-  Integer less-than-or-equal.
-  """
+    Integer less-than-or-equal.
+    """
 
   pub fn <=(left :: i8, right :: i8) -> Bool { :zig.Kernel.lte_i8(left, right) }
   pub fn <=(left :: i16, right :: i16) -> Bool { :zig.Kernel.lte_i16(left, right) }
@@ -79,8 +79,8 @@ pub impl Comparator for Integer {
   pub fn <=(left :: u128, right :: u128) -> Bool { :zig.Kernel.lte_u128(left, right) }
 
   @doc = """
-  Integer greater-than-or-equal.
-  """
+    Integer greater-than-or-equal.
+    """
 
   pub fn >=(left :: i8, right :: i8) -> Bool { :zig.Kernel.gte_i8(left, right) }
   pub fn >=(left :: i16, right :: i16) -> Bool { :zig.Kernel.gte_i16(left, right) }

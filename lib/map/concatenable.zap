@@ -1,6 +1,6 @@
 @doc = """
-Concatenable implementation for `Map`.
-"""
+  Concatenable implementation for `Map`.
+  """
 
 pub impl Concatenable for Map(K, V) {
   @doc = """

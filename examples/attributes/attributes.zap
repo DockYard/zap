@@ -8,13 +8,13 @@
 #   zap run attributes
 
 @doc = """
-Attribute examples
-"""
+  Attribute examples
+  """
 
 pub struct Attributes {
   @doc = """
-  Entry point
-  """
+    Entry point
+    """
 
   pub fn main(_args :: [String]) -> String {
     IO.puts("App: " <> Config.app_name())

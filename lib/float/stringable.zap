@@ -1,6 +1,6 @@
 @doc = """
-Stringable implementation for `Float`.
-"""
+  Stringable implementation for `Float`.
+  """
 
 pub impl Stringable for Float {
   @doc = """

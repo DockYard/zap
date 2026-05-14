@@ -1,6 +1,6 @@
 @doc = """
-Stringable implementation for `Bool`.
-"""
+  Stringable implementation for `Bool`.
+  """
 
 pub impl Stringable for Bool {
   @doc = """

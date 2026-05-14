@@ -1,6 +1,6 @@
 @doc = """
-Stringable implementation for `Integer`.
-"""
+  Stringable implementation for `Integer`.
+  """
 
 pub impl Stringable for Integer {
   @doc = """
