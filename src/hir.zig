@@ -2908,7 +2908,7 @@ pub const HirBuilder = struct {
             self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
 
         const resolved_scope = scope_id orelse return types_mod.TypeStore.UNKNOWN;
-        const family_id = self.graph.resolveFamily(resolved_scope, fr.function, fr.arity) orelse return types_mod.TypeStore.UNKNOWN;
+        const family_id = self.graph.resolveFamily(resolved_scope, fr.function, narrowedFunctionArity(fr.arity)) orelse return types_mod.TypeStore.UNKNOWN;
         const family = self.graph.getFamily(family_id);
         if (family.clauses.items.len == 0) return types_mod.TypeStore.UNKNOWN;
         const clause_ref = family.clauses.items[0];
@@ -2923,8 +2923,218 @@ pub const HirBuilder = struct {
             self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
 
         const resolved_scope = scope_id orelse return null;
-        const family_id = self.graph.resolveFamily(resolved_scope, fr.function, fr.arity) orelse return null;
+        const family_id = self.graph.resolveFamily(resolved_scope, fr.function, narrowedFunctionArity(fr.arity)) orelse return null;
         return self.family_to_group.get(family_id);
+    }
+
+    fn narrowedFunctionArity(arity: u32) u32 {
+        const narrowed: u8 = @truncate(arity);
+        return @intCast(narrowed);
+    }
+
+    fn resolveFirstClassTypeStructType(self: *HirBuilder) ?types_mod.TypeId {
+        const type_name = self.interner.lookupExisting("Type") orelse return null;
+        const type_id = self.type_store.name_to_type.get(type_name) orelse return null;
+        const typ = self.type_store.getType(type_id);
+        if (typ != .struct_type) return null;
+        if (typ.struct_type.fields.len != 1) return null;
+        const field = typ.struct_type.fields[0];
+        if (!std.mem.eql(u8, self.interner.get(field.name), "name")) return null;
+        if (field.type_id != types_mod.TypeStore.ATOM) return null;
+        return type_id;
+    }
+
+    fn resolveFirstClassFunctionStructType(self: *HirBuilder) ?types_mod.TypeId {
+        const function_name = self.interner.lookupExisting("Function") orelse return null;
+        const function_type_id = self.type_store.name_to_type.get(function_name) orelse return null;
+        const function_type = self.type_store.getType(function_type_id);
+        if (function_type != .struct_type) return null;
+        if (function_type.struct_type.fields.len != 3) return null;
+
+        const type_type_id = self.resolveFirstClassTypeStructType() orelse return null;
+        var has_struct = false;
+        var has_name = false;
+        var has_arity = false;
+        for (function_type.struct_type.fields) |field| {
+            const field_name = self.interner.get(field.name);
+            if (std.mem.eql(u8, field_name, "struct")) {
+                if (field.type_id != type_type_id) return null;
+                has_struct = true;
+            } else if (std.mem.eql(u8, field_name, "name")) {
+                if (field.type_id != types_mod.TypeStore.ATOM) return null;
+                has_name = true;
+            } else if (std.mem.eql(u8, field_name, "arity")) {
+                if (field.type_id != types_mod.TypeStore.U8) return null;
+                has_arity = true;
+            } else {
+                return null;
+            }
+        }
+        return if (has_struct and has_name and has_arity) function_type_id else null;
+    }
+
+    fn currentStructName(self: *HirBuilder) !?ast.StringId {
+        const scope_id = self.current_struct_scope orelse return null;
+        for (self.graph.structs.items) |entry| {
+            if (entry.scope_id != scope_id) continue;
+            return try self.internDottedStructName(entry.name);
+        }
+        return null;
+    }
+
+    fn resolveTypeReferenceName(self: *HirBuilder, struct_name: ast.StructName) !?ast.StringId {
+        if (struct_name.parts.len == 0) return null;
+
+        const dotted_name = try self.internDottedStructName(struct_name);
+        if (struct_name.parts.len == 1) {
+            const text = self.interner.get(dotted_name);
+            if (self.type_store.resolveTypeName(text)) |type_id| {
+                if (type_id != types_mod.TypeStore.UNKNOWN) return dotted_name;
+            }
+        }
+        if (self.type_store.name_to_type.get(dotted_name) != null) return dotted_name;
+        if (struct_name.parts.len == 1 and self.type_store.name_to_type.get(struct_name.parts[0]) != null) {
+            return struct_name.parts[0];
+        }
+        if (self.graph.findStructScope(struct_name) != null) return dotted_name;
+        return null;
+    }
+
+    fn structExprFieldValue(self: *const HirBuilder, struct_expr: ast.StructExpr, field_name_text: []const u8) ?*const ast.Expr {
+        for (struct_expr.fields) |field| {
+            if (std.mem.eql(u8, self.interner.get(field.name), field_name_text)) return field.value;
+        }
+        return null;
+    }
+
+    fn dottedTypeNameToStructName(self: *HirBuilder, type_name: ast.StringId, span: ast.SourceSpan) !ast.StructName {
+        const type_name_text = self.interner.get(type_name);
+        var parts: std.ArrayList(ast.StringId) = .empty;
+        const interner_mut = @constCast(self.interner);
+        var iterator = std.mem.splitScalar(u8, type_name_text, '.');
+        while (iterator.next()) |part_text| {
+            try parts.append(self.allocator, try interner_mut.intern(part_text));
+        }
+        return .{
+            .parts = try parts.toOwnedSlice(self.allocator),
+            .span = span,
+        };
+    }
+
+    fn staticTypeValueName(self: *HirBuilder, expr: *const ast.Expr) !?ast.StringId {
+        return switch (expr.*) {
+            .struct_ref => |struct_ref| try self.resolveTypeReferenceName(struct_ref.name),
+            .struct_expr => |struct_expr| blk: {
+                const type_struct_id = self.resolveFirstClassTypeStructType() orelse break :blk null;
+                const resolved_type_id = (try self.resolveNominalStructRefType(struct_expr.struct_name)) orelse break :blk null;
+                if (resolved_type_id != type_struct_id) break :blk null;
+                const name_value = self.structExprFieldValue(struct_expr, "name") orelse break :blk null;
+                if (name_value.* != .atom_literal) break :blk null;
+                break :blk name_value.atom_literal.value;
+            },
+            else => null,
+        };
+    }
+
+    fn staticNonNegativeArityLiteral(expr: *const ast.Expr) ?u32 {
+        if (expr.* != .int_literal) return null;
+        if (expr.int_literal.value < 0) return null;
+        const unsigned_value: u64 = @intCast(expr.int_literal.value);
+        return @truncate(unsigned_value);
+    }
+
+    const StaticFunctionValue = struct {
+        struct_name: ast.StructName,
+        function_name: ast.StringId,
+        arity: u32,
+    };
+
+    fn staticFunctionStructValue(self: *HirBuilder, struct_expr: ast.StructExpr) !?StaticFunctionValue {
+        const function_type_id = self.resolveFirstClassFunctionStructType() orelse return null;
+        const resolved_type_id = (try self.resolveNominalStructRefType(struct_expr.struct_name)) orelse return null;
+        if (resolved_type_id != function_type_id) return null;
+
+        const struct_value = self.structExprFieldValue(struct_expr, "struct") orelse return null;
+        const name_value = self.structExprFieldValue(struct_expr, "name") orelse return null;
+        const arity_value = self.structExprFieldValue(struct_expr, "arity") orelse return null;
+        const target_type_name = (try self.staticTypeValueName(struct_value)) orelse return null;
+        if (name_value.* != .atom_literal) return null;
+        const raw_arity = staticNonNegativeArityLiteral(arity_value) orelse return null;
+
+        return .{
+            .struct_name = try self.dottedTypeNameToStructName(target_type_name, struct_value.getMeta().span),
+            .function_name = name_value.atom_literal.value,
+            .arity = raw_arity,
+        };
+    }
+
+    fn buildAtomExpr(self: *HirBuilder, value: ast.StringId, span: ast.SourceSpan) !*const Expr {
+        return try self.create(Expr, .{
+            .kind = .{ .atom_lit = value },
+            .type_id = types_mod.TypeStore.ATOM,
+            .span = span,
+        });
+    }
+
+    fn buildTypeValueExpr(self: *HirBuilder, type_name: ast.StringId, span: ast.SourceSpan) !*const Expr {
+        const type_type_id = self.resolveFirstClassTypeStructType() orelse types_mod.TypeStore.UNKNOWN;
+        const interner_mut = @constCast(self.interner);
+        const name_field = try interner_mut.intern("name");
+        const name_value = try self.buildAtomExpr(type_name, span);
+        const fields = try self.allocator.alloc(StructFieldInit, 1);
+        fields[0] = .{ .name = name_field, .value = name_value };
+        return try self.create(Expr, .{
+            .kind = .{ .struct_init = .{
+                .type_id = type_type_id,
+                .fields = fields,
+            } },
+            .type_id = type_type_id,
+            .span = span,
+        });
+    }
+
+    fn buildFunctionReferenceValueExpr(self: *HirBuilder, fr: ast.FunctionRefExpr) !*const Expr {
+        const interner_mut = @constCast(self.interner);
+        const struct_field = try interner_mut.intern("struct");
+        const name_field = try interner_mut.intern("name");
+        const arity_field = try interner_mut.intern("arity");
+
+        const struct_type_name = if (fr.struct_name) |struct_name|
+            (try self.resolveTypeReferenceName(struct_name)) orelse try self.internDottedStructName(struct_name)
+        else
+            (try self.currentStructName()) orelse return try self.create(Expr, .{
+                .kind = .nil_lit,
+                .type_id = self.resolveFirstClassFunctionStructType() orelse types_mod.TypeStore.UNKNOWN,
+                .span = fr.meta.span,
+            });
+
+        const fields = try self.allocator.alloc(StructFieldInit, 3);
+        fields[0] = .{
+            .name = struct_field,
+            .value = try self.buildTypeValueExpr(struct_type_name, fr.meta.span),
+        };
+        fields[1] = .{
+            .name = name_field,
+            .value = try self.buildAtomExpr(fr.function, fr.meta.span),
+        };
+        fields[2] = .{
+            .name = arity_field,
+            .value = try self.create(Expr, .{
+                .kind = .{ .int_lit = @intCast(narrowedFunctionArity(fr.arity)) },
+                .type_id = types_mod.TypeStore.U8,
+                .span = fr.meta.span,
+            }),
+        };
+
+        const function_type_id = self.resolveFirstClassFunctionStructType() orelse types_mod.TypeStore.UNKNOWN;
+        return try self.create(Expr, .{
+            .kind = .{ .struct_init = .{
+                .type_id = function_type_id,
+                .fields = fields,
+            } },
+            .type_id = function_type_id,
+            .span = fr.meta.span,
+        });
     }
 
     fn buildFunctionValueExpr(self: *HirBuilder, group_id: u32, type_id: types_mod.TypeId, span: ast.SourceSpan) anyerror!*const Expr {
@@ -4208,6 +4418,12 @@ pub const HirBuilder = struct {
                 if (self.resolveFunctionValueGroup(v.name)) |group_id| {
                     return try self.buildFunctionValueExpr(group_id, resolved_type, v.meta.span);
                 }
+                const name_text = self.interner.get(v.name);
+                if (self.type_store.resolveTypeName(name_text)) |type_id| {
+                    if (type_id != types_mod.TypeStore.UNKNOWN) {
+                        return try self.buildTypeValueExpr(v.name, v.meta.span);
+                    }
+                }
                 // Last-resort fallback when a var_ref didn't resolve to a
                 // capture, parameter, named function, or scope-graph binding.
                 // Reaching here typically means the type checker accepted a
@@ -4348,7 +4564,56 @@ pub const HirBuilder = struct {
 
                 // Check for struct-qualified call: IO.puts(...), Math.square(...)
                 // or :zig runtime bridge: :zig.println(...)
-                const target: CallTarget = if (call.callee.* == .field_access) blk: {
+                const target: CallTarget = if (call.callee.* == .function_ref) blk: {
+                    const fr = call.callee.function_ref;
+                    const lookup_arity = narrowedFunctionArity(fr.arity);
+                    if (fr.struct_name) |struct_name| {
+                        const struct_name_text = self.structNameToString(struct_name);
+                        selected_call_info = self.resolveCallInStruct(struct_name_text, fr.function, @intCast(call.args.len), args.items);
+                        break :blk .{ .named = .{
+                            .struct_name = struct_name_text,
+                            .name = self.interner.get(fr.function),
+                            .clause_index = if (selected_call_info) |info| info.clause_index else null,
+                        } };
+                    }
+
+                    const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
+                    if (self.graph.resolveFamilyAllowingDefaults(scope_id, fr.function, lookup_arity)) |resolved| {
+                        if (self.family_to_group.get(resolved.family_id)) |group_id| {
+                            selected_call_info = self.resolveCallInScope(scope_id, fr.function, @intCast(call.args.len), args.items);
+                            break :blk .{ .direct = .{
+                                .function_group_id = group_id,
+                                .clause_index = if (selected_call_info) |info| info.clause_index else null,
+                            } };
+                        }
+                    }
+                    break :blk .{ .named = .{
+                        .struct_name = null,
+                        .name = self.interner.get(fr.function),
+                    } };
+                } else if (call.callee.* == .struct_expr) blk: {
+                    if (try self.staticFunctionStructValue(call.callee.struct_expr)) |function_value| {
+                        const struct_scope = self.graph.findStructScope(function_value.struct_name);
+                        if (struct_scope) |scope_id| {
+                            selected_call_info = self.resolveCallInScope(scope_id, function_value.function_name, @intCast(call.args.len), args.items);
+                            if (self.graph.resolveFamilyAllowingDefaults(scope_id, function_value.function_name, narrowedFunctionArity(function_value.arity))) |resolved| {
+                                if (self.family_to_group.get(resolved.family_id)) |group_id| {
+                                    break :blk .{ .direct = .{
+                                        .function_group_id = group_id,
+                                        .clause_index = if (selected_call_info) |info| info.clause_index else null,
+                                    } };
+                                }
+                            }
+                        }
+                        break :blk .{ .named = .{
+                            .struct_name = self.structNameToString(function_value.struct_name),
+                            .name = self.interner.get(function_value.function_name),
+                            .clause_index = if (selected_call_info) |info| info.clause_index else null,
+                        } };
+                    }
+                    callee_expr = try self.buildExpr(call.callee);
+                    break :blk .{ .closure = callee_expr.? };
+                } else if (call.callee.* == .field_access) blk: {
                     const fa = call.callee.field_access;
                     if (fa.object.* == .struct_ref) {
                         const func_name = self.interner.get(fa.field);
@@ -5033,15 +5298,7 @@ pub const HirBuilder = struct {
                 });
             },
             .function_ref => |fr| {
-                const function_type = try self.resolveFunctionRefType(fr);
-                if (self.resolveFunctionRefGroup(fr)) |group_id| {
-                    return try self.buildFunctionValueExpr(group_id, function_type, fr.meta.span);
-                }
-                return try self.create(Expr, .{
-                    .kind = .nil_lit,
-                    .type_id = function_type,
-                    .span = fr.meta.span,
-                });
+                return try self.buildFunctionReferenceValueExpr(fr);
             },
             .anonymous_function => |anon| {
                 var function_type = try self.resolveFunctionValueType(anon.decl.name);
@@ -5110,17 +5367,8 @@ pub const HirBuilder = struct {
                         }
                     }
                 }
-                if (try self.resolveNominalStructRefType(mr.name)) |type_id| {
-                    if (self.isFieldlessStructType(type_id)) {
-                        return try self.create(Expr, .{
-                            .kind = .{ .struct_init = .{
-                                .type_id = type_id,
-                                .fields = &.{},
-                            } },
-                            .type_id = type_id,
-                            .span = mr.meta.span,
-                        });
-                    }
+                if (try self.resolveTypeReferenceName(mr.name)) |type_name| {
+                    return try self.buildTypeValueExpr(type_name, mr.meta.span);
                 }
                 return try self.create(Expr, .{
                     .kind = .nil_lit,
@@ -6555,14 +6803,24 @@ test "HIR closure calls adopt borrowed ownership mode" {
     try std.testing.expectEqual(ValueMode.borrow, call_expr.kind.call.args[0].mode);
 }
 
-test "HIR function_ref keeps concrete function type" {
+test "HIR function_ref lowers to first-class Function struct init" {
     const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Function {
+        \\  struct :: Type
+        \\  name :: Atom
+        \\  arity :: u8
+        \\}
+        \\
         \\pub struct Test {
         \\  pub fn double(x :: i64) -> i64 {
         \\    x * 2
         \\  }
         \\
-        \\  pub fn run() -> (i64 -> i64) {
+        \\  pub fn run() -> Function {
         \\    &double/1
         \\  }
         \\}
@@ -6589,15 +6847,236 @@ test "HIR function_ref keeps concrete function type" {
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
-    const expr = hir_program.structs[0].functions[1].clauses[0].body.stmts[0].expr;
-    try std.testing.expect(expr.kind == .closure_create);
-    try std.testing.expect(expr.type_id != types_mod.TypeStore.UNKNOWN);
+    const expr = hir_program.structs[2].functions[1].clauses[0].body.stmts[0].expr;
+    try std.testing.expect(expr.kind == .struct_init);
 
+    const function_name = parser.interner.lookupExisting("Function") orelse return error.TestUnexpectedResult;
+    const function_type = checker.store.name_to_type.get(function_name) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(function_type, expr.type_id);
+
+    const function_init = expr.kind.struct_init;
+    try std.testing.expectEqual(@as(usize, 3), function_init.fields.len);
+
+    const struct_field = function_init.fields[0];
+    try std.testing.expectEqualStrings("struct", parser.interner.get(struct_field.name));
+    try std.testing.expect(struct_field.value.kind == .struct_init);
+    const type_value = struct_field.value.kind.struct_init;
+    try std.testing.expectEqual(@as(usize, 1), type_value.fields.len);
+    try std.testing.expect(type_value.fields[0].value.kind == .atom_lit);
+    try std.testing.expectEqualStrings("Test", parser.interner.get(type_value.fields[0].value.kind.atom_lit));
+
+    const name_field = function_init.fields[1];
+    try std.testing.expectEqualStrings("name", parser.interner.get(name_field.name));
+    try std.testing.expect(name_field.value.kind == .atom_lit);
+    try std.testing.expectEqualStrings("double", parser.interner.get(name_field.value.kind.atom_lit));
+
+    const arity_field = function_init.fields[2];
+    try std.testing.expectEqualStrings("arity", parser.interner.get(arity_field.name));
+    try std.testing.expect(arity_field.value.kind == .int_lit);
+    try std.testing.expectEqual(@as(i64, 1), arity_field.value.kind.int_lit);
+    try std.testing.expectEqual(types_mod.TypeStore.U8, arity_field.value.type_id);
+}
+
+test "HIR bare struct ref lowers to first-class Type struct init" {
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Arena {
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn run() -> Type {
+        \\    Arena
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const expr = hir_program.structs[2].functions[0].clauses[0].body.stmts[0].expr;
+    try std.testing.expect(expr.kind == .struct_init);
+    const type_name = parser.interner.lookupExisting("Type") orelse return error.TestUnexpectedResult;
+    const type_type = checker.store.name_to_type.get(type_name) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(type_type, expr.type_id);
+
+    const type_init = expr.kind.struct_init;
+    try std.testing.expectEqual(@as(usize, 1), type_init.fields.len);
+    try std.testing.expectEqualStrings("name", parser.interner.get(type_init.fields[0].name));
+    try std.testing.expect(type_init.fields[0].value.kind == .atom_lit);
+    try std.testing.expectEqualStrings("Arena", parser.interner.get(type_init.fields[0].value.kind.atom_lit));
+}
+
+test "HIR direct function_ref call lowers without closure dispatch" {
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Function {
+        \\  struct :: Type
+        \\  name :: Atom
+        \\  arity :: u8
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn double(x :: i64) -> i64 {
+        \\    x * 2
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    &double/1(21)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const expr = hir_program.structs[2].functions[1].clauses[0].body.stmts[0].expr;
+    try std.testing.expect(expr.kind == .call);
+    try std.testing.expect(expr.kind.call.target == .direct);
+    try std.testing.expectEqual(@as(usize, 1), expr.kind.call.args.len);
+    try std.testing.expectEqual(types_mod.TypeStore.I64, expr.type_id);
+}
+
+test "HIR static manual Function struct call lowers without closure dispatch" {
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Function {
+        \\  struct :: Type
+        \\  name :: Atom
+        \\  arity :: u8
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn target(args :: Nil) -> Nil {
+        \\    nil
+        \\  }
+        \\
+        \\  pub fn run() -> Nil {
+        \\    %Function{struct: Test, name: :target, arity: 1}(nil)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const expr = hir_program.structs[2].functions[1].clauses[0].body.stmts[0].expr;
+    try std.testing.expect(expr.kind == .call);
+    try std.testing.expect(expr.kind.call.target == .direct);
+    try std.testing.expectEqual(@as(usize, 1), expr.kind.call.args.len);
+    try std.testing.expectEqual(types_mod.TypeStore.NIL, expr.type_id);
+}
+
+test "HIR function_ref arity literal is narrowed to u8" {
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Function {
+        \\  struct :: Type
+        \\  name :: Atom
+        \\  arity :: u8
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn run() -> Function {
+        \\    &Test.run/257
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    _ = checker.checkProgram(&program) catch {};
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const expr = hir_program.structs[2].functions[0].clauses[0].body.stmts[0].expr;
+    try std.testing.expect(expr.kind == .struct_init);
     const typ = checker.store.getType(expr.type_id);
-    try std.testing.expect(typ == .function);
-    try std.testing.expectEqual(@as(usize, 1), typ.function.params.len);
-    try std.testing.expectEqual(types_mod.TypeStore.I64, typ.function.params[0]);
-    try std.testing.expectEqual(types_mod.TypeStore.I64, typ.function.return_type);
+    try std.testing.expect(typ == .struct_type);
+    const arity_field = expr.kind.struct_init.fields[2];
+    try std.testing.expectEqualStrings("arity", parser.interner.get(arity_field.name));
+    try std.testing.expect(arity_field.value.kind == .int_lit);
+    try std.testing.expectEqual(@as(i64, 1), arity_field.value.kind.int_lit);
+    try std.testing.expectEqual(types_mod.TypeStore.U8, arity_field.value.type_id);
 }
 
 test "HIR assignment rebinding shadows parameter (Elixir-style scope)" {

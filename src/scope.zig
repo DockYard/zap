@@ -683,10 +683,7 @@ pub const ScopeGraph = struct {
             .params = params,
             .attributes = .empty,
         });
-        // Register named types for global lookup (skip sentinel 0 for struct-scoped unnamed structs)
-        if (name != 0) {
-            try self.type_name_to_id.put(name, id);
-        }
+        try self.type_name_to_id.put(name, id);
         return id;
     }
 

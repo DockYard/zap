@@ -4829,18 +4829,18 @@ fn evaluateConstExpr(
         },
         .struct_ref => |s| blk: {
             const graph = interp.scope_graph orelse return error.NotComputable;
-            for (graph.structs.items) |struct_entry| {
-                if (!structNamesEqual(struct_entry.name, s.name)) continue;
-                if (struct_entry.decl.fields.len != 0 or struct_entry.decl.items.len != 0) return error.NotComputable;
-                const type_name = try structNameToString(alloc, s.name, interner);
-                const alloc_id = interp.allocation_store.alloc(alloc, .struct_val, interp.currentFunctionId());
-                break :blk .{ .struct_val = .{
-                    .alloc_id = alloc_id,
-                    .type_name = type_name,
-                    .fields = &.{},
-                } };
-            }
-            return error.NotComputable;
+            if (!try isKnownTypeReference(alloc, graph, s.name, interner)) return error.NotComputable;
+            const type_name = try structNameToString(alloc, s.name, interner);
+            break :blk try buildTypeReferenceValue(alloc, interp, type_name);
+        },
+        .function_ref => |function_ref| blk: {
+            const graph = interp.scope_graph orelse return error.NotComputable;
+            const target_struct_name = function_ref.struct_name orelse (mod_name orelse return error.NotComputable);
+            const target_scope = graph.findStructScope(target_struct_name) orelse return error.NotComputable;
+            const narrowed_arity = narrowedFunctionArity(function_ref.arity);
+            if (graph.resolveFamilyAllowingDefaults(target_scope, function_ref.function, narrowed_arity) == null) return error.NotComputable;
+            const type_name = try structNameToString(alloc, target_struct_name, interner);
+            break :blk try buildFunctionReferenceValue(alloc, interp, type_name, interner.get(function_ref.function), narrowed_arity);
         },
         .attr_ref => |ar| blk: {
             const graph = interp.scope_graph orelse return error.NotComputable;
@@ -5083,6 +5083,105 @@ fn structNameToString(
     interner: *const ast.StringInterner,
 ) ![]const u8 {
     return name.toDottedString(alloc, interner);
+}
+
+fn narrowedFunctionArity(raw_arity: u32) u8 {
+    return @as(u8, @truncate(raw_arity));
+}
+
+fn buildTypeReferenceValue(
+    alloc: std.mem.Allocator,
+    interp: *Interpreter,
+    type_name: []const u8,
+) !CtValue {
+    const fields = try alloc.alloc(CtValue.CtFieldValue, 1);
+    fields[0] = .{
+        .name = "name",
+        .value = .{ .atom = type_name },
+    };
+    const alloc_id = interp.allocation_store.alloc(alloc, .struct_val, interp.currentFunctionId());
+    return .{ .struct_val = .{
+        .alloc_id = alloc_id,
+        .type_name = "Type",
+        .fields = fields,
+    } };
+}
+
+fn buildFunctionReferenceValue(
+    alloc: std.mem.Allocator,
+    interp: *Interpreter,
+    type_name: []const u8,
+    function_name: []const u8,
+    arity: u8,
+) !CtValue {
+    const fields = try alloc.alloc(CtValue.CtFieldValue, 3);
+    fields[0] = .{
+        .name = "struct",
+        .value = try buildTypeReferenceValue(alloc, interp, type_name),
+    };
+    fields[1] = .{
+        .name = "name",
+        .value = .{ .atom = function_name },
+    };
+    fields[2] = .{
+        .name = "arity",
+        .value = .{ .int = arity },
+    };
+    const alloc_id = interp.allocation_store.alloc(alloc, .struct_val, interp.currentFunctionId());
+    return .{ .struct_val = .{
+        .alloc_id = alloc_id,
+        .type_name = "Function",
+        .fields = fields,
+    } };
+}
+
+fn isKnownTypeReference(
+    alloc: std.mem.Allocator,
+    graph: *const scope.ScopeGraph,
+    name: ast.StructName,
+    interner: *const ast.StringInterner,
+) !bool {
+    if (name.parts.len == 1 and isBuiltinTypeReferenceName(interner.get(name.parts[0]))) return true;
+    if (graph.findStructScope(name) != null) return true;
+
+    const dotted_name = try structNameToString(alloc, name, interner);
+    for (graph.types.items) |type_entry| {
+        if (std.mem.eql(u8, interner.get(type_entry.name), dotted_name)) return true;
+    }
+    return false;
+}
+
+fn isBuiltinTypeReferenceName(name: []const u8) bool {
+    const builtins = [_][]const u8{
+        "Term",
+        "Bool",
+        "String",
+        "Atom",
+        "Nil",
+        "Void",
+        "Never",
+        "i128",
+        "i64",
+        "i32",
+        "i16",
+        "i8",
+        "u128",
+        "u64",
+        "u32",
+        "u16",
+        "u8",
+        "f128",
+        "f80",
+        "f64",
+        "f32",
+        "f16",
+        "usize",
+        "isize",
+    };
+    for (&builtins) |builtin| {
+        if (std.mem.eql(u8, name, builtin)) return true;
+    }
+    return false;
 }
 
 fn structNamesEqual(left: ast.StructName, right: ast.StructName) bool {
@@ -7233,6 +7332,100 @@ test "tryEvalAttribute: literal string value" {
     const attr = &graph.structs.items[0].attributes.items[0];
     try testing.expect(attr.computed_value != null);
     try testing.expectEqualStrings("myapp", attr.computed_value.?.string);
+}
+
+test "evaluateConstExpr: struct_ref produces Type value" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+
+    var graph = scope.ScopeGraph.init(alloc);
+    const app_scope = try graph.createScope(0, .struct_scope);
+
+    var interner = ast.StringInterner.init(alloc);
+    const app_id = try interner.intern("App");
+
+    const app_decl = try alloc.create(ast.StructDecl);
+    app_decl.* = .{
+        .meta = .{ .span = .{ .start = 0, .end = 0 } },
+        .name = .{ .parts = &.{app_id}, .span = .{ .start = 0, .end = 0 } },
+        .items = &.{},
+    };
+    try graph.registerStruct(app_decl.name, app_scope, app_decl);
+
+    var interp = Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.scope_graph = &graph;
+    interp.interner = &interner;
+
+    const expr = try alloc.create(ast.Expr);
+    expr.* = .{ .struct_ref = .{
+        .meta = .{ .span = .{ .start = 0, .end = 0 } },
+        .name = app_decl.name,
+    } };
+
+    const result = try evaluateConstExpr(alloc, &interp, expr, app_decl.name, &interner);
+    try testing.expect(result == .struct_val);
+    try testing.expectEqualStrings("Type", result.struct_val.type_name);
+    try testing.expectEqual(@as(usize, 1), result.struct_val.fields.len);
+    try testing.expectEqualStrings("name", result.struct_val.fields[0].name);
+    try testing.expect(result.struct_val.fields[0].value == .atom);
+    try testing.expectEqualStrings("App", result.struct_val.fields[0].value.atom);
+}
+
+test "evaluateConstExpr: function_ref produces Function value with narrowed arity" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+
+    var graph = scope.ScopeGraph.init(alloc);
+    const app_scope = try graph.createScope(0, .struct_scope);
+
+    var interner = ast.StringInterner.init(alloc);
+    const app_id = try interner.intern("App");
+    const target_id = try interner.intern("target");
+
+    const app_decl = try alloc.create(ast.StructDecl);
+    app_decl.* = .{
+        .meta = .{ .span = .{ .start = 0, .end = 0 } },
+        .name = .{ .parts = &.{app_id}, .span = .{ .start = 0, .end = 0 } },
+        .items = &.{},
+    };
+    try graph.registerStruct(app_decl.name, app_scope, app_decl);
+    _ = try graph.createFamily(app_scope, target_id, 44, .public);
+
+    var interp = Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.scope_graph = &graph;
+    interp.interner = &interner;
+
+    const expr = try alloc.create(ast.Expr);
+    expr.* = .{ .function_ref = .{
+        .meta = .{ .span = .{ .start = 0, .end = 0 } },
+        .struct_name = null,
+        .function = target_id,
+        .arity = 300,
+    } };
+
+    const result = try evaluateConstExpr(alloc, &interp, expr, app_decl.name, &interner);
+    try testing.expect(result == .struct_val);
+    try testing.expectEqualStrings("Function", result.struct_val.type_name);
+    try testing.expectEqual(@as(usize, 3), result.struct_val.fields.len);
+    try testing.expectEqualStrings("struct", result.struct_val.fields[0].name);
+    try testing.expect(result.struct_val.fields[0].value == .struct_val);
+    try testing.expectEqualStrings("Type", result.struct_val.fields[0].value.struct_val.type_name);
+    try testing.expectEqualStrings("name", result.struct_val.fields[1].name);
+    try testing.expect(result.struct_val.fields[1].value == .atom);
+    try testing.expectEqualStrings("target", result.struct_val.fields[1].value.atom);
+    try testing.expectEqualStrings("arity", result.struct_val.fields[2].name);
+    try testing.expect(result.struct_val.fields[2].value == .int);
+    try testing.expectEqual(@as(i64, 44), result.struct_val.fields[2].value.int);
 }
 
 test "interpreter: field_set on struct" {

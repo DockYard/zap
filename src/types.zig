@@ -1162,6 +1162,23 @@ pub const TypeChecker = struct {
         clause_index: u32,
     };
 
+    const TypeReference = struct {
+        type_id: TypeId,
+        name: ast.StringId,
+    };
+
+    const FunctionReferenceTarget = struct {
+        scope_id: scope_mod.ScopeId,
+        family_id: scope_mod.FunctionFamilyId,
+        declared_arity: u32,
+    };
+
+    const StaticFunctionValue = struct {
+        struct_name: ast.StructName,
+        function_name: ast.StringId,
+        arity: u32,
+    };
+
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner, graph: *scope_mod.ScopeGraph) TypeChecker {
         const store = allocator.create(TypeStore) catch @panic("OOM");
         store.* = TypeStore.init(allocator, interner);
@@ -1556,6 +1573,270 @@ pub const TypeChecker = struct {
         }
 
         return null;
+    }
+
+    fn resolveFirstClassTypeStructType(self: *TypeChecker) ?TypeId {
+        const type_name = self.interner.lookupExisting("Type") orelse return null;
+        const type_id = self.store.name_to_type.get(type_name) orelse return null;
+        const typ = self.store.getType(type_id);
+        if (typ != .struct_type) return null;
+        const fields = typ.struct_type.fields;
+        if (fields.len != 1) return null;
+        if (!std.mem.eql(u8, self.interner.get(fields[0].name), "name")) return null;
+        if (fields[0].type_id != TypeStore.ATOM) return null;
+        return type_id;
+    }
+
+    fn resolveFirstClassFunctionStructType(self: *TypeChecker) ?TypeId {
+        const function_name = self.interner.lookupExisting("Function") orelse return null;
+        const function_type_id = self.store.name_to_type.get(function_name) orelse return null;
+        const function_type = self.store.getType(function_type_id);
+        if (function_type != .struct_type) return null;
+        if (function_type.struct_type.fields.len != 3) return null;
+
+        const type_type_id = self.resolveFirstClassTypeStructType() orelse return null;
+        var has_struct = false;
+        var has_name = false;
+        var has_arity = false;
+        for (function_type.struct_type.fields) |field| {
+            const field_name = self.interner.get(field.name);
+            if (std.mem.eql(u8, field_name, "struct")) {
+                if (field.type_id != type_type_id) return null;
+                has_struct = true;
+            } else if (std.mem.eql(u8, field_name, "name")) {
+                if (field.type_id != TypeStore.ATOM) return null;
+                has_name = true;
+            } else if (std.mem.eql(u8, field_name, "arity")) {
+                if (field.type_id != TypeStore.U8) return null;
+                has_arity = true;
+            } else {
+                return null;
+            }
+        }
+        return if (has_struct and has_name and has_arity) function_type_id else null;
+    }
+
+    fn isFirstClassFunctionStructType(self: *TypeChecker, type_id: TypeId) bool {
+        return if (self.resolveFirstClassFunctionStructType()) |function_type_id|
+            self.store.typeEquals(type_id, function_type_id)
+        else
+            false;
+    }
+
+    fn narrowedFunctionArity(arity: u32) u32 {
+        const narrowed: u8 = @truncate(arity);
+        return @intCast(narrowed);
+    }
+
+    fn resolveTypeReferenceTarget(self: *TypeChecker, struct_name: ast.StructName) !?TypeReference {
+        if (struct_name.parts.len == 0) return null;
+
+        const type_name = try self.internDottedStructName(struct_name);
+        const type_name_text = self.interner.get(type_name);
+        if (struct_name.parts.len == 1) {
+            if (self.store.resolveTypeName(type_name_text)) |type_id| {
+                if (type_id != TypeStore.UNKNOWN) {
+                    return .{ .type_id = type_id, .name = type_name };
+                }
+            }
+        }
+
+        if (self.store.name_to_type.get(type_name)) |type_id| {
+            return .{ .type_id = type_id, .name = type_name };
+        }
+
+        if (struct_name.parts.len == 1) {
+            if (self.store.name_to_type.get(struct_name.parts[0])) |type_id| {
+                return .{ .type_id = type_id, .name = struct_name.parts[0] };
+            }
+        }
+
+        if (self.graph.findStructScope(struct_name) != null) {
+            return .{ .type_id = TypeStore.UNKNOWN, .name = type_name };
+        }
+
+        return null;
+    }
+
+    fn reportUnknownTypeReference(self: *TypeChecker, struct_name: ast.StructName, span: ast.SourceSpan) !void {
+        const type_text = struct_name.joinedWith(self.allocator, self.interner, ".") catch "{type}";
+        try self.addHardError(
+            try std.fmt.allocPrint(self.allocator, "I cannot find a type named `{s}`", .{type_text}),
+            span,
+            "not found",
+            "type references must name a known builtin type or declared struct",
+        );
+    }
+
+    fn currentStructScope(self: *const TypeChecker) ?scope_mod.ScopeId {
+        var current = self.current_scope;
+        while (current) |scope_id| {
+            const scope = self.graph.getScope(scope_id);
+            if (scope.kind == .struct_scope) return scope_id;
+            current = scope.parent;
+        }
+        return null;
+    }
+
+    fn isCrossStructReference(self: *const TypeChecker, target_scope: scope_mod.ScopeId) bool {
+        const current_struct_scope = self.currentStructScope() orelse return true;
+        return current_struct_scope != target_scope;
+    }
+
+    fn resolveFunctionReferenceTarget(
+        self: *TypeChecker,
+        struct_name: ?ast.StructName,
+        function_name: ast.StringId,
+        arity: u32,
+        span: ast.SourceSpan,
+        require_public_cross_struct: bool,
+    ) !?FunctionReferenceTarget {
+        const lookup_arity = narrowedFunctionArity(arity);
+        const target_scope: scope_mod.ScopeId = if (struct_name) |name| blk: {
+            const struct_scope = self.graph.findStructScope(name) orelse {
+                try self.reportUnknownTypeReference(name, span);
+                return null;
+            };
+            break :blk struct_scope;
+        } else if (self.current_scope) |scope_id|
+            scope_id
+        else
+            return null;
+
+        const resolved = self.graph.resolveFamilyAllowingDefaults(target_scope, function_name, lookup_arity) orelse {
+            const function_text = self.interner.get(function_name);
+            const target_text = if (struct_name) |name|
+                name.joinedWith(self.allocator, self.interner, ".") catch "{struct}"
+            else
+                null;
+            const message = if (target_text) |struct_text|
+                try std.fmt.allocPrint(self.allocator, "I cannot find a function named `{s}.{s}/{d}`", .{ struct_text, function_text, lookup_arity })
+            else
+                try std.fmt.allocPrint(self.allocator, "I cannot find a function named `{s}/{d}`", .{ function_text, lookup_arity });
+            try self.addRichError(
+                message,
+                span,
+                "not found",
+                null,
+            );
+            return null;
+        };
+
+        const family = self.graph.getFamily(resolved.family_id);
+        if (require_public_cross_struct and family.visibility != .public and self.isCrossStructReference(family.scope_id)) {
+            const function_text = self.interner.get(function_name);
+            const target_text = if (struct_name) |name|
+                name.joinedWith(self.allocator, self.interner, ".") catch "{struct}"
+            else
+                self.currentStructNameText() orelse "{struct}";
+            try self.addHardError(
+                try std.fmt.allocPrint(self.allocator, "`{s}.{s}/{d}` is private", .{ target_text, function_text, lookup_arity }),
+                span,
+                "private function",
+                "cross-struct function references can only target public functions",
+            );
+            return null;
+        }
+
+        return .{
+            .scope_id = target_scope,
+            .family_id = resolved.family_id,
+            .declared_arity = resolved.declared_arity,
+        };
+    }
+
+    fn currentStructNameText(self: *const TypeChecker) ?[]const u8 {
+        const scope_id = self.currentStructScope() orelse return null;
+        for (self.graph.structs.items) |entry| {
+            if (entry.scope_id != scope_id) continue;
+            return entry.name.joinedWith(self.allocator, self.interner, ".") catch null;
+        }
+        return null;
+    }
+
+    fn acceptsIntegerLiteralForExpectedType(self: *const TypeChecker, expr: *const ast.Expr, expected: TypeId) bool {
+        if (expr.* != .int_literal) return false;
+        if (expected >= self.store.types.items.len) return false;
+        return self.store.getType(expected) == .int;
+    }
+
+    fn structExprFieldValue(self: *const TypeChecker, struct_expr: ast.StructExpr, field_name_text: []const u8) ?*const ast.Expr {
+        for (struct_expr.fields) |field| {
+            if (std.mem.eql(u8, self.interner.get(field.name), field_name_text)) return field.value;
+        }
+        return null;
+    }
+
+    fn dottedTypeNameToStructName(self: *TypeChecker, type_name: ast.StringId, span: ast.SourceSpan) !ast.StructName {
+        const type_name_text = self.interner.get(type_name);
+        var parts: std.ArrayList(ast.StringId) = .empty;
+        var iterator = std.mem.splitScalar(u8, type_name_text, '.');
+        const interner_mut = @constCast(self.interner);
+        while (iterator.next()) |part_text| {
+            try parts.append(self.allocator, try interner_mut.intern(part_text));
+        }
+        return .{
+            .parts = try parts.toOwnedSlice(self.allocator),
+            .span = span,
+        };
+    }
+
+    fn staticTypeValueName(self: *TypeChecker, expr: *const ast.Expr) !?ast.StringId {
+        return switch (expr.*) {
+            .struct_ref => |struct_ref| if (try self.resolveTypeReferenceTarget(struct_ref.name)) |target|
+                target.name
+            else
+                null,
+            .struct_expr => |struct_expr| blk: {
+                const type_struct_id = self.resolveFirstClassTypeStructType() orelse break :blk null;
+                const resolved_type_id = (try self.resolveNominalStructRefType(struct_expr.struct_name)) orelse break :blk null;
+                if (!self.store.typeEquals(type_struct_id, resolved_type_id)) break :blk null;
+                const name_value = self.structExprFieldValue(struct_expr, "name") orelse break :blk null;
+                if (name_value.* != .atom_literal) break :blk null;
+                break :blk name_value.atom_literal.value;
+            },
+            else => null,
+        };
+    }
+
+    fn staticNonNegativeArityLiteral(expr: *const ast.Expr) ?u32 {
+        if (expr.* != .int_literal) return null;
+        if (expr.int_literal.value < 0) return null;
+        const unsigned_value: u64 = @intCast(expr.int_literal.value);
+        return @truncate(unsigned_value);
+    }
+
+    fn validateStaticFunctionStructExpr(self: *TypeChecker, struct_expr: ast.StructExpr, function_type_id: TypeId) !void {
+        const resolved_type_id = (try self.resolveNominalStructRefType(struct_expr.struct_name)) orelse return;
+        if (!self.store.typeEquals(resolved_type_id, function_type_id)) return;
+
+        const static_value = (try self.staticFunctionStructValue(struct_expr)) orelse return;
+        _ = try self.resolveFunctionReferenceTarget(
+            static_value.struct_name,
+            static_value.function_name,
+            static_value.arity,
+            struct_expr.meta.span,
+            true,
+        );
+    }
+
+    fn staticFunctionStructValue(self: *TypeChecker, struct_expr: ast.StructExpr) !?StaticFunctionValue {
+        const function_type_id = self.resolveFirstClassFunctionStructType() orelse return null;
+        const resolved_type_id = (try self.resolveNominalStructRefType(struct_expr.struct_name)) orelse return null;
+        if (!self.store.typeEquals(resolved_type_id, function_type_id)) return null;
+
+        const struct_value = self.structExprFieldValue(struct_expr, "struct") orelse return null;
+        const name_value = self.structExprFieldValue(struct_expr, "name") orelse return null;
+        const arity_value = self.structExprFieldValue(struct_expr, "arity") orelse return null;
+        const target_type_name = (try self.staticTypeValueName(struct_value)) orelse return null;
+        if (name_value.* != .atom_literal) return null;
+        const raw_arity = staticNonNegativeArityLiteral(arity_value) orelse return null;
+
+        return .{
+            .struct_name = try self.dottedTypeNameToStructName(target_type_name, struct_value.getMeta().span),
+            .function_name = name_value.atom_literal.value,
+            .arity = raw_arity,
+        };
     }
 
     fn isFieldlessStructType(self: *const TypeChecker, type_id: TypeId) bool {
@@ -2053,16 +2334,19 @@ pub const TypeChecker = struct {
     }
 
     fn resolveFunctionRefSignature(self: *TypeChecker, fr: ast.FunctionRefExpr) !?FunctionSignature {
-        if (fr.struct_name) |struct_name| {
-            const struct_scope = self.graph.findStructScope(struct_name) orelse return null;
-            return try self.resolveFamilySignature(struct_scope, fr.function, fr.arity);
-        }
+        const target = (try self.resolveFunctionReferenceTarget(
+            fr.struct_name,
+            fr.function,
+            fr.arity,
+            fr.meta.span,
+            true,
+        )) orelse return null;
 
-        if (self.current_scope) |scope_id| {
-            return try self.resolveFamilySignature(scope_id, fr.function, fr.arity);
+        const family = self.graph.getFamily(target.family_id);
+        if (family.clauses.items.len == 0) {
+            return null;
         }
-
-        return null;
+        return try self.resolveClauseSignature(fr.function, narrowedFunctionArity(fr.arity), target.declared_arity, family.clauses.items[0]);
     }
 
     fn resolveFunctionValueSignature(self: *TypeChecker, scope_id: scope_mod.ScopeId, name: ast.StringId) !?FunctionSignature {
@@ -2729,10 +3013,11 @@ pub const TypeChecker = struct {
             switch (type_entry.kind) {
                 .struct_type => {
                     const name = type_entry.name;
-                    if (name == 0) continue;
                     if (self.store.name_to_type.get(name) != null) continue;
                     const name_str = self.interner.get(name);
-                    if (self.store.resolveTypeName(name_str) != null) continue; // builtin wins; pass 2 will diagnose
+                    if (self.store.resolveTypeName(name_str)) |builtin_type_id| {
+                        if (builtin_type_id != TypeStore.UNKNOWN) continue; // builtin wins; pass 2 will diagnose
+                    }
                     const type_id = try self.store.addType(.{ .struct_type = .{
                         .name = name,
                         .fields = &.{},
@@ -2742,7 +3027,9 @@ pub const TypeChecker = struct {
                 .union_type => |ud| {
                     if (self.store.name_to_type.get(ud.name) != null) continue;
                     const enum_name_str = self.interner.get(ud.name);
-                    if (self.store.resolveTypeName(enum_name_str) != null) continue;
+                    if (self.store.resolveTypeName(enum_name_str)) |builtin_type_id| {
+                        if (builtin_type_id != TypeStore.UNKNOWN) continue;
+                    }
                     const type_id = try self.store.addType(.{ .tagged_union = .{
                         .name = ud.name,
                         .variants = &.{},
@@ -2752,7 +3039,9 @@ pub const TypeChecker = struct {
                 .opaque_type => {
                     if (self.store.name_to_type.get(type_entry.name) != null) continue;
                     const opaque_name_str = self.interner.get(type_entry.name);
-                    if (self.store.resolveTypeName(opaque_name_str) != null) continue;
+                    if (self.store.resolveTypeName(opaque_name_str)) |builtin_type_id| {
+                        if (builtin_type_id != TypeStore.UNKNOWN) continue;
+                    }
                     // Inner is a real TypeId field, not a slice — use
                     // `UNKNOWN` as the placeholder; pass 2 overwrites.
                     const type_id = try self.store.addType(.{ .opaque_type = .{
@@ -2772,9 +3061,8 @@ pub const TypeChecker = struct {
             switch (type_entry.kind) {
                 .struct_type => |sd| {
                     const name = type_entry.name;
-                    if (name == 0) continue;
                     const name_str = self.interner.get(name);
-                    if (self.store.resolveTypeName(name_str) != null and
+                    if ((if (self.store.resolveTypeName(name_str)) |builtin_type_id| builtin_type_id != TypeStore.UNKNOWN else false) and
                         self.store.name_to_type.get(name) == null)
                     {
                         try self.errors.append(self.allocator, .{
@@ -2840,7 +3128,7 @@ pub const TypeChecker = struct {
                 },
                 .union_type => |ud| {
                     const enum_name_str = self.interner.get(ud.name);
-                    if (self.store.resolveTypeName(enum_name_str) != null and
+                    if ((if (self.store.resolveTypeName(enum_name_str)) |builtin_type_id| builtin_type_id != TypeStore.UNKNOWN else false) and
                         self.store.name_to_type.get(ud.name) == null)
                     {
                         try self.errors.append(self.allocator, .{
@@ -2871,7 +3159,7 @@ pub const TypeChecker = struct {
                 },
                 .opaque_type => |opaque_body| {
                     const opaque_name_str = self.interner.get(type_entry.name);
-                    if (self.store.resolveTypeName(opaque_name_str) != null and
+                    if ((if (self.store.resolveTypeName(opaque_name_str)) |builtin_type_id| builtin_type_id != TypeStore.UNKNOWN else false) and
                         self.store.name_to_type.get(type_entry.name) == null)
                     {
                         try self.errors.append(self.allocator, .{
@@ -4050,6 +4338,12 @@ pub const TypeChecker = struct {
                         );
                     }
                 }
+                const var_name = self.interner.get(vr.name);
+                if (self.store.resolveTypeName(var_name)) |type_id| {
+                    if (type_id != TypeStore.UNKNOWN) {
+                        return self.resolveFirstClassTypeStructType() orelse TypeStore.UNKNOWN;
+                    }
+                }
                 return TypeStore.UNKNOWN;
             },
 
@@ -4229,20 +4523,8 @@ pub const TypeChecker = struct {
             },
 
             .function_ref => |fr| {
-                if (try self.resolveFunctionRefSignature(fr)) |signature| {
-                    return try self.store.addFunctionType(
-                        signature.params,
-                        signature.return_type,
-                        signature.param_ownerships,
-                        signature.return_ownership,
-                    );
-                }
-
-                // Fall back to an arity-shaped unknown function type so later
-                // stages can continue and produce richer diagnostics.
-                const params = try self.allocator.alloc(TypeId, fr.arity);
-                for (params) |*p| p.* = TypeStore.UNKNOWN;
-                return try self.buildFunctionType(params, TypeStore.UNKNOWN);
+                _ = try self.resolveFunctionRefSignature(fr);
+                return self.resolveFirstClassFunctionStructType() orelse TypeStore.UNKNOWN;
             },
             .field_access => |fa| {
                 // Check for enum variant access (e.g. Color.Red)
@@ -4359,7 +4641,8 @@ pub const TypeChecker = struct {
                                         // Check field value type
                                         const val_type = try self.inferExpr(provided.value);
                                         if (val_type != TypeStore.UNKNOWN and req_field.type_id != TypeStore.UNKNOWN and
-                                            !self.store.typeEquals(val_type, req_field.type_id))
+                                            !self.store.typeEquals(val_type, req_field.type_id) and
+                                            !self.acceptsIntegerLiteralForExpectedType(provided.value, req_field.type_id))
                                         {
                                             try self.addRichError(
                                                 try std.fmt.allocPrint(self.allocator, "field `{s}` expects `{s}`, got `{s}`", .{
@@ -4451,6 +4734,9 @@ pub const TypeChecker = struct {
                                         null,
                                     );
                                 }
+                            }
+                            if (self.resolveFirstClassFunctionStructType()) |function_type_id| {
+                                try self.validateStaticFunctionStructExpr(se, function_type_id);
                             }
                             return tid;
                         }
@@ -4565,9 +4851,10 @@ pub const TypeChecker = struct {
                         }
                     }
                 }
-                if (try self.resolveNominalStructRefType(mr.name)) |tid| {
-                    if (self.isFieldlessStructType(tid)) return tid;
+                if (try self.resolveTypeReferenceTarget(mr.name)) |_| {
+                    return self.resolveFirstClassTypeStructType() orelse TypeStore.UNKNOWN;
                 }
+                try self.reportUnknownTypeReference(mr.name, mr.meta.span);
                 return TypeStore.UNKNOWN;
             },
             .string_interpolation => TypeStore.STRING,
@@ -4712,8 +4999,72 @@ pub const TypeChecker = struct {
         }
     }
 
+    fn inferStaticFunctionCall(
+        self: *TypeChecker,
+        call: *const ast.CallExpr,
+        struct_name: ast.StructName,
+        function_name: ast.StringId,
+        raw_arity: u32,
+    ) !TypeId {
+        const target = (try self.resolveFunctionReferenceTarget(
+            struct_name,
+            function_name,
+            raw_arity,
+            call.meta.span,
+            true,
+        )) orelse {
+            for (call.args) |arg| _ = try self.inferExpr(arg);
+            return TypeStore.UNKNOWN;
+        };
+
+        const family = self.graph.getFamily(target.family_id);
+        if (family.clauses.items.len == 0) {
+            for (call.args) |arg| _ = try self.inferExpr(arg);
+            return TypeStore.UNKNOWN;
+        }
+
+        const signature = (try self.resolveClauseSignature(function_name, @intCast(call.args.len), target.declared_arity, family.clauses.items[0])) orelse {
+            for (call.args) |arg| _ = try self.inferExpr(arg);
+            return TypeStore.UNKNOWN;
+        };
+
+        for (call.args, 0..) |arg, idx| {
+            const arg_type = try self.inferExpr(arg);
+            if (idx < signature.params.len) {
+                const expected = signature.params[idx];
+                if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.callMatchCost(arg_type, expected) == null) {
+                    try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
+                }
+            }
+        }
+
+        const borrowed = try self.applyCallOwnership(call.args, signature.toFunctionType());
+        defer self.endBorrowedBindings(borrowed) catch {};
+        return signature.return_type;
+    }
+
     fn inferCall(self: *TypeChecker, call: *const ast.CallExpr) !TypeId {
         const arity: u32 = @intCast(call.args.len);
+
+        if (call.callee.* == .function_ref) {
+            const function_ref = call.callee.function_ref;
+            const target_struct_name = function_ref.struct_name orelse blk: {
+                const current_name = self.currentStructNameText() orelse {
+                    for (call.args) |arg| _ = try self.inferExpr(arg);
+                    return TypeStore.UNKNOWN;
+                };
+                const interner_mut = @constCast(self.interner);
+                const current_name_id = try interner_mut.intern(current_name);
+                break :blk try self.dottedTypeNameToStructName(current_name_id, function_ref.meta.span);
+            };
+            return try self.inferStaticFunctionCall(call, target_struct_name, function_ref.function, function_ref.arity);
+        }
+
+        if (call.callee.* == .struct_expr) {
+            if (try self.staticFunctionStructValue(call.callee.struct_expr)) |function_value| {
+                return try self.inferStaticFunctionCall(call, function_value.struct_name, function_value.function_name, function_value.arity);
+            }
+        }
 
         // Special handling for direct function calls (callee is var_ref)
         if (call.callee.* == .var_ref) {
@@ -4738,6 +5089,16 @@ pub const TypeChecker = struct {
                             const borrowed = try self.applyCallOwnership(call.args, t.function);
                             defer self.endBorrowedBindings(borrowed) catch {};
                             return t.function.return_type;
+                        }
+                        if (self.isFirstClassFunctionStructType(prov.type_id)) {
+                            try self.addHardError(
+                                "dynamic Function dispatch is not supported",
+                                call.meta.span,
+                                "Function value stored in a variable",
+                                "call a static function reference directly, for example `&Struct.name/arity(args...)`",
+                            );
+                            for (call.args) |arg| _ = try self.inferExpr(arg);
+                            return TypeStore.UNKNOWN;
                         }
                     }
                 }
@@ -5087,6 +5448,10 @@ pub const TypeChecker = struct {
                         }
                     }
                 }
+                if (self.graph.findProtocol(mod_name) != null) {
+                    for (call.args) |arg| _ = try self.inferExpr(arg);
+                    return TypeStore.UNKNOWN;
+                }
             }
         }
 
@@ -5099,6 +5464,16 @@ pub const TypeChecker = struct {
                 const borrowed = try self.applyCallOwnership(call.args, ct.function);
                 defer self.endBorrowedBindings(borrowed) catch {};
                 return ct.function.return_type;
+            }
+            if (self.isFirstClassFunctionStructType(callee_type)) {
+                try self.addHardError(
+                    "dynamic Function dispatch is not supported",
+                    call.meta.span,
+                    "Function value is not statically callable here",
+                    "call a direct function reference or a compile-time Function struct literal",
+                );
+                for (call.args) |arg| _ = try self.inferExpr(arg);
+                return TypeStore.UNKNOWN;
             }
         }
 
@@ -5144,24 +5519,30 @@ pub const TypeChecker = struct {
                     }
                 }
 
-                if (self.store.resolveTypeName(name)) |tid| {
-                    if (tn.args.len > 0) {
-                        // Generic type application
-                        var arg_types: std.ArrayList(TypeId) = .empty;
-                        for (tn.args) |arg| {
-                            try arg_types.append(self.allocator, try self.resolveTypeExpr(arg));
+                const resolved_builtin_or_meta = self.store.resolveTypeName(name);
+                if (resolved_builtin_or_meta) |tid| {
+                    if (tid != TypeStore.UNKNOWN) {
+                        if (tn.args.len > 0) {
+                            // Generic type application
+                            var arg_types: std.ArrayList(TypeId) = .empty;
+                            for (tn.args) |arg| {
+                                try arg_types.append(self.allocator, try self.resolveTypeExpr(arg));
+                            }
+                            return try self.store.addType(.{
+                                .applied = .{
+                                    .base = tid,
+                                    .args = try arg_types.toOwnedSlice(self.allocator),
+                                },
+                            });
                         }
-                        return try self.store.addType(.{
-                            .applied = .{
-                                .base = tid,
-                                .args = try arg_types.toOwnedSlice(self.allocator),
-                            },
-                        });
+                        return tid;
                     }
-                    return tid;
                 }
                 // Check user-defined types registered in TypeStore
                 if (self.store.name_to_type.get(tn.name)) |tid| {
+                    return tid;
+                }
+                if (resolved_builtin_or_meta) |tid| {
                     return tid;
                 }
                 // Check user-defined types in scope graph (forward reference fallback)
@@ -6223,11 +6604,21 @@ test "typed parameter records shared ownership metadata" {
     try std.testing.expect(found_x);
 }
 
-test "function ref inference defaults param ownerships to shared" {
+test "function ref inference returns first-class Function value" {
     const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Function {
+        \\  struct :: Type
+        \\  name :: Atom
+        \\  arity :: u8
+        \\}
+        \\
         \\pub struct Test {
-        \\  pub fn main(args :: Nil) -> (Nil -> Nil) {
-        \\    &Foo.main/1
+        \\  pub fn main(args :: Nil) -> Function {
+        \\    &Test.main/1
         \\  }
         \\}
     ;
@@ -6250,16 +6641,328 @@ test "function ref inference defaults param ownerships to shared" {
 
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 
-    const main_func = program.structs[0].items[0].function;
+    const main_func = program.structs[2].items[0].function;
     const fn_ref_expr = main_func.clauses[0].body.?[0].expr;
     const inferred = try checker.inferExpr(fn_ref_expr);
-    const typ = checker.store.getType(inferred);
+    const function_name = parser.interner.lookupExisting("Function") orelse return error.TestUnexpectedResult;
+    const function_type = checker.store.name_to_type.get(function_name) orelse return error.TestUnexpectedResult;
 
-    try std.testing.expect(typ == .function);
-    try std.testing.expectEqual(@as(usize, 1), typ.function.params.len);
-    try std.testing.expectEqual(@as(usize, 1), typ.function.param_ownerships.?.len);
-    try std.testing.expectEqual(Ownership.shared, typ.function.param_ownerships.?[0]);
-    try std.testing.expectEqual(Ownership.shared, typ.function.return_ownership);
+    try std.testing.expectEqual(function_type, inferred);
+}
+
+test "bare struct reference infers first-class Type value" {
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Arena {
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn main(args :: Nil) -> Type {
+        \\    Arena
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    const main_func = program.structs[2].items[0].function;
+    const type_ref_expr = main_func.clauses[0].body.?[0].expr;
+    const inferred = try checker.inferExpr(type_ref_expr);
+    const type_name = parser.interner.lookupExisting("Type") orelse return error.TestUnexpectedResult;
+    const type_type = checker.store.name_to_type.get(type_name) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(type_type, inferred);
+}
+
+test "dotted bare struct reference infers first-class Type value" {
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Arena.Other {
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn main(args :: Nil) -> Type {
+        \\    Arena.Other
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    const main_func = program.structs[2].items[0].function;
+    const type_ref_expr = main_func.clauses[0].body.?[0].expr;
+    const inferred = try checker.inferExpr(type_ref_expr);
+    const type_name = parser.interner.lookupExisting("Type") orelse return error.TestUnexpectedResult;
+    const type_type = checker.store.name_to_type.get(type_name) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(type_type, inferred);
+}
+
+test "unknown bare struct reference is a type error" {
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn main(args :: Nil) -> Type {
+        \\    Missing
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "I cannot find a type named `Missing`") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "cross-struct function references require public target" {
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Function {
+        \\  struct :: Type
+        \\  name :: Atom
+        \\  arity :: u8
+        \\}
+        \\
+        \\pub struct Other {
+        \\  fn hidden(args :: Nil) -> Nil {
+        \\    nil
+        \\  }
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn main(args :: Nil) -> Function {
+        \\    &Other.hidden/1
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "`Other.hidden/1` is private") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "function reference arity narrows to u8 before validation" {
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Function {
+        \\  struct :: Type
+        \\  name :: Atom
+        \\  arity :: u8
+        \\}
+        \\
+        \\pub struct Other {
+        \\  pub fn target(a :: Nil) -> Nil {
+        \\    nil
+        \\  }
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn main(args :: Nil) -> Function {
+        \\    &Other.target/300
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "Other.target/44") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "static manual Function struct validates target and accepts narrowed arity field" {
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Function {
+        \\  struct :: Type
+        \\  name :: Atom
+        \\  arity :: u8
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn main(args :: Nil) -> Function {
+        \\    %Function{struct: Test, name: :main, arity: 257}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "calling Function stored in a variable is rejected as dynamic dispatch" {
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Function {
+        \\  struct :: Type
+        \\  name :: Atom
+        \\  arity :: u8
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn target(args :: Nil) -> Nil {
+        \\    nil
+        \\  }
+        \\
+        \\  pub fn main(args :: Nil) -> Nil {
+        \\    function = &Test.target/1
+        \\    function(nil)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "dynamic Function dispatch is not supported") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "anonymous closure with borrowed capture cannot escape via assignment" {
@@ -6460,6 +7163,16 @@ test "higher-order call reports callable signature mismatch for anonymous closur
 
 test "higher-order call reports callable signature mismatch for function ref" {
     const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Function {
+        \\  struct :: Type
+        \\  name :: Atom
+        \\  arity :: u8
+        \\}
+        \\
         \\pub struct Test {
         \\  pub fn double(x :: i64) -> i64 {
         \\    x * 2
