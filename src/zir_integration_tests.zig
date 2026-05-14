@@ -6,6 +6,15 @@ fn getenvSlice(name: [*:0]const u8) ?[]const u8 {
     return std.mem.span(ptr);
 }
 
+fn resolveZapBinary(allocator: std.mem.Allocator) TestError![:0]u8 {
+    const zap_binary_raw: []const u8 = getenvSlice("ZAP_BINARY") orelse "zig-out/bin/zap";
+    if (std.fs.path.isAbsolute(zap_binary_raw)) {
+        return allocator.dupeZ(u8, zap_binary_raw) catch return error.OutOfMemory;
+    }
+    return std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch
+        return error.Unexpected;
+}
+
 /// Use the test framework's own IO so spawned subprocesses inherit the
 /// parent test runner's environment (PATH, HOME, ZIG_LIB_DIR, etc.). The
 /// previous local Threaded was init'd with `.environ = .empty`, which
@@ -147,12 +156,7 @@ fn compileOnlyWithDiagnostics(source: []const u8, diagnostics: CompileFailureDia
     const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_dir_path);
 
-    const zap_binary_raw: []const u8 = getenvSlice("ZAP_BINARY") orelse "zig-out/bin/zap";
-
-    const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
-        allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
-    else
-        std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
+    const zap_binary = try resolveZapBinary(allocator);
     defer allocator.free(zap_binary);
 
     try runZapBuild(allocator, zap_binary, tmp_dir_path, false, diagnostics);
@@ -206,12 +210,7 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
     defer allocator.free(tmp_dir_path);
 
     // Get zap binary path from environment or use default.
-    const zap_binary_raw: []const u8 = getenvSlice("ZAP_BINARY") orelse "zig-out/bin/zap";
-
-    const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
-        allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
-    else
-        std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
+    const zap_binary = try resolveZapBinary(allocator);
     defer allocator.free(zap_binary);
 
     // Compile: zap build test_prog
@@ -308,12 +307,7 @@ fn compileAndRunWithEnvOptions(
         return error.Unexpected;
     defer allocator.free(tmp_dir_path);
 
-    const zap_binary_raw: []const u8 = getenvSlice("ZAP_BINARY") orelse "zig-out/bin/zap";
-
-    const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
-        allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
-    else
-        std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
+    const zap_binary = try resolveZapBinary(allocator);
     defer allocator.free(zap_binary);
 
     try runZapBuild(allocator, zap_binary, tmp_dir_path, options.collect_arc_stats, .report);
@@ -409,33 +403,45 @@ const ExtraFile = struct {
     data: []const u8,
 };
 
+const ARENA_MANAGER_SOURCE = @embedFile("memory/arena/manager.zig");
+
 /// Compile and run with additional source files alongside test_prog.zap.
 fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) TestError!TestResult {
+    return compileAndRunCustomProject(defaultTestProgBuildSource(), source, extra_files);
+}
+
+fn defaultTestProgBuildSource() []const u8 {
+    return
+    \\pub struct TestProg.Builder {
+    \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
+    \\    case env.target {
+    \\      :test_prog ->
+    \\        %Zap.Manifest{
+    \\          name: "test_prog",
+    \\          version: "0.1.0",
+    \\          kind: :bin,
+    \\          root: "TestProg.main/0",
+    \\          paths: ["lib/**/*.zap"]
+    \\        }
+    \\      _ ->
+    \\        panic("Unknown target")
+    \\    }
+    \\  }
+    \\}
+    ;
+}
+
+fn compileAndRunCustomProject(
+    build_source: []const u8,
+    source: []const u8,
+    extra_files: []const ExtraFile,
+) TestError!TestResult {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
     tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
-
-    const build_source =
-        \\pub struct TestProg.Builder {
-        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
-        \\    case env.target {
-        \\      :test_prog ->
-        \\        %Zap.Manifest{
-        \\          name: "test_prog",
-        \\          version: "0.1.0",
-        \\          kind: :bin,
-        \\          root: "TestProg.main/0",
-        \\          paths: ["lib/**/*.zap"]
-        \\        }
-        \\      _ ->
-        \\        panic("Unknown target")
-        \\    }
-        \\  }
-        \\}
-    ;
 
     tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch
         return error.Unexpected;
@@ -445,7 +451,7 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
     for (extra_files) |ef| {
         // Ensure parent directory exists
         if (std.fs.path.dirname(ef.path)) |dir| {
-            tmp_dir.dir.createDirPath(getTestIo(), dir) catch {};
+            tmp_dir.dir.createDirPath(getTestIo(), dir) catch return error.Unexpected;
         }
         tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = ef.path, .data = ef.data }) catch
             return error.Unexpected;
@@ -455,12 +461,7 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
         return error.Unexpected;
     defer allocator.free(tmp_dir_path);
 
-    const zap_binary_raw: []const u8 = getenvSlice("ZAP_BINARY") orelse "zig-out/bin/zap";
-
-    const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
-        allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
-    else
-        std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
+    const zap_binary = try resolveZapBinary(allocator);
     defer allocator.free(zap_binary);
 
     try runZapBuild(allocator, zap_binary, tmp_dir_path, false, .report);
@@ -494,6 +495,127 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
         .allocator = allocator,
         .output_dir = output_dir,
     };
+}
+
+test "ZIR memory manager: project-local third-party adapter builds and runs" {
+    const build_source =
+        \\pub struct TestProg.Builder {
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
+        \\    case env.target {
+        \\      :test_prog ->
+        \\        %Zap.Manifest{
+        \\          name: "test_prog",
+        \\          version: "0.1.0",
+        \\          kind: :bin,
+        \\          root: "TestProg.main/0",
+        \\          paths: ["lib/**/*.zap"],
+        \\          memory: ThirdParty.ProjectArena
+        \\        }
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\pub struct ThirdParty.ProjectArena {
+        \\}
+        \\
+        \\pub impl Memory.Manager for ThirdParty.ProjectArena {
+        \\  pub fn name(_manager :: ThirdParty.ProjectArena) -> String {
+        \\    "ThirdParty.ProjectArena"
+        \\  }
+        \\
+        \\  pub fn primitive_source_path(_manager :: ThirdParty.ProjectArena) -> String {
+        \\    "project:third_party/project_arena/manager.zig"
+        \\  }
+        \\
+        \\  pub fn capability_mask(_manager :: ThirdParty.ProjectArena) -> i64 {
+        \\    0
+        \\  }
+        \\
+        \\  pub fn refcount_v1?(_manager :: ThirdParty.ProjectArena) -> Bool {
+        \\    false
+        \\  }
+        \\}
+    ;
+
+    const source =
+        \\pub struct TestProg {
+        \\  pub fn main() -> String {
+        \\    IO.puts("project fake manager")
+        \\    "done"
+        \\  }
+        \\}
+    ;
+
+    var result = try compileAndRunCustomProject(build_source, source, &.{
+        .{ .path = "third_party/project_arena/manager.zig", .data = ARENA_MANAGER_SOURCE },
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("project fake manager\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR memory manager: dependency third-party adapter builds and runs" {
+    const build_source =
+        \\pub struct TestProg.Builder {
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
+        \\    case env.target {
+        \\      :test_prog ->
+        \\        %Zap.Manifest{
+        \\          name: "test_prog",
+        \\          version: "0.1.0",
+        \\          kind: :bin,
+        \\          root: "TestProg.main/0",
+        \\          paths: ["lib/**/*.zap"],
+        \\          deps: [%Zap.Dep{name: "fake_mem", path: "deps/fake_mem"}],
+        \\          memory: ThirdParty.DepArena
+        \\        }
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\pub struct ThirdParty.DepArena {
+        \\}
+        \\
+        \\pub impl Memory.Manager for ThirdParty.DepArena {
+        \\  pub fn name(_manager :: ThirdParty.DepArena) -> String {
+        \\    "ThirdParty.DepArena"
+        \\  }
+        \\
+        \\  pub fn primitive_source_path(_manager :: ThirdParty.DepArena) -> String {
+        \\    "dep:fake_mem:memory/dep_arena/manager.zig"
+        \\  }
+        \\
+        \\  pub fn capability_mask(_manager :: ThirdParty.DepArena) -> i64 {
+        \\    0
+        \\  }
+        \\
+        \\  pub fn refcount_v1?(_manager :: ThirdParty.DepArena) -> Bool {
+        \\    false
+        \\  }
+        \\}
+    ;
+
+    const source =
+        \\pub struct TestProg {
+        \\  pub fn main() -> String {
+        \\    IO.puts("dep fake manager")
+        \\    "done"
+        \\  }
+        \\}
+    ;
+
+    var result = try compileAndRunCustomProject(build_source, source, &.{
+        .{ .path = "deps/fake_mem/memory/dep_arena/manager.zig", .data = ARENA_MANAGER_SOURCE },
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("dep fake manager\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
 test "CLI: zap test runs Zest cases discovered by project-root relative pattern" {
@@ -556,11 +678,7 @@ test "CLI: zap test runs Zest cases discovered by project-root relative pattern"
         return error.Unexpected;
     defer allocator.free(tmp_dir_path);
 
-    const zap_binary_raw: []const u8 = getenvSlice("ZAP_BINARY") orelse "zig-out/bin/zap";
-    const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
-        allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
-    else
-        std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
+    const zap_binary = try resolveZapBinary(allocator);
     defer allocator.free(zap_binary);
 
     const result = std.process.run(allocator, getTestIo(), .{
@@ -670,11 +788,7 @@ test "CLI: zap run doc-runner target generates documentation via Zap-side pipeli
         return error.Unexpected;
     defer allocator.free(tmp_dir_path);
 
-    const zap_binary_raw: []const u8 = getenvSlice("ZAP_BINARY") orelse "zig-out/bin/zap";
-    const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
-        allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
-    else
-        std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
+    const zap_binary = try resolveZapBinary(allocator);
     defer allocator.free(zap_binary);
 
     const result = std.process.run(allocator, getTestIo(), .{
