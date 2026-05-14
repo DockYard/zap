@@ -8,7 +8,7 @@ pub struct Zap.Builder {
           kind: :bin,
           root: "TestRunner.main/1",
           paths: ["test/**/*_test.zap"],
-          deps: [{:zap_stdlib, {:path, "lib"}}]
+          deps: [%Zap.Dep{name: "zap_stdlib", path: "lib"}]
         }
       :doc ->
         %Zap.Manifest{
@@ -19,7 +19,7 @@ pub struct Zap.Builder {
           paths: ["tools/**/*.zap"],
           source_url: "https://github.com/DockYard/zap",
           landing_page: "README.md",
-          deps: [{:zap_stdlib, {:path, "lib"}}]
+          deps: [%Zap.Dep{name: "zap_stdlib", path: "lib"}]
         }
       _ ->
         panic("Unknown target: use 'test' or 'doc'")

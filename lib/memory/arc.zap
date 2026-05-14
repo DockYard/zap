@@ -41,34 +41,10 @@ pub struct Memory.ARC {
 
 pub impl Memory.Manager for Memory.ARC {
   @doc = """
-    Returns the public adapter name for the ARC manager.
+    Binds the ARC manager type to its primitive backend.
     """
 
-  pub fn name(_manager :: Memory.ARC) -> String {
-    "Memory.ARC"
-  }
-
-  @doc = """
-    Returns the primitive source path for the ARC manager.
-    """
-
-  pub fn primitive_source_path(_manager :: Memory.ARC) -> String {
-    "zap:src/memory/arc/manager.zig"
-  }
-
-  @doc = """
-    Returns the ARC manager's declared capability bitmask.
-    """
-
-  pub fn capability_mask(_manager :: Memory.ARC) -> i64 {
-    1
-  }
-
-  @doc = """
-    Returns true because ARC declares `REFCOUNT_V1`.
-    """
-
-  pub fn refcount_v1?(_manager :: Memory.ARC) -> Bool {
-    true
+  pub fn backend(manager :: Memory.ARC) -> Bool {
+    :zig.Memory.backend(manager)
   }
 }

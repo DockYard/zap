@@ -20,7 +20,7 @@ pub const BuildConfig = struct {
     paths: []const []const u8 = &.{},
     deps: []const Dep = &.{},
     build_opts: std.StringHashMapUnmanaged([]const u8) = .empty,
-    /// Memory manager adapter metadata evaluated through the
+    /// Memory manager adapter binding evaluated through the
     /// `Memory.Manager` protocol during manifest CTFE. The compiler
     /// driver treats this as the sole resolver input; stdlib and
     /// project/dependency managers use the same adapter path.
@@ -49,15 +49,13 @@ pub const BuildConfig = struct {
     pub const Optimize = enum { debug, release_safe, release_fast, release_small };
 
     pub const MemoryManager = struct {
-        /// Public adapter name returned by `Memory.Manager.name/1`.
-        name: []const u8,
-        /// Primitive source reference returned by
-        /// `Memory.Manager.primitive_source_path/1`.
-        primitive_source_path: []const u8,
-        /// Capability mask returned by `Memory.Manager.capability_mask/1`.
-        capability_mask: u64,
-        /// Boolean projection returned by `Memory.Manager.refcount_v1?/1`.
-        refcount_v1: bool,
+        /// Concrete manager type selected by `Zap.Manifest.memory`.
+        type_name: []const u8,
+        /// Source file that declared the adapter type, when available
+        /// through build-time source reflection. The memory driver uses
+        /// this to select the package root before applying the manager
+        /// backend convention.
+        adapter_source_path: ?[]const u8 = null,
     };
 
     pub const Dep = struct {
@@ -147,6 +145,8 @@ pub fn ctfeManifestDetailed(
     // Create CTFE interpreter with build capabilities and persistent cache
     var interp = ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interp.deinit();
+    interp.scope_graph = &ctx.collector.graph;
+    interp.interner = &ctx.interner;
     interp.capabilities = ctfe.CapabilitySet.build;
     interp.build_opts = build_opts;
     interp.compile_options_hash = ctfe.hashCompileOptions(target_name, build_opts.get("optimize") orelse "release_safe");
@@ -427,45 +427,26 @@ fn evaluateMemoryManagerAdapter(
 
     try requireMemoryManagerImpl(scope_graph, interner, adapter_type_name);
 
-    const public_name_eval = try evalAdapterFunction(alloc, interp, adapter_type_name, "name", adapter_value);
-    const primitive_source_eval = try evalAdapterFunction(alloc, interp, adapter_type_name, "primitive_source_path", adapter_value);
-    const capability_mask_eval = try evalAdapterFunction(alloc, interp, adapter_type_name, "capability_mask", adapter_value);
-    const refcount_v1_eval = try evalAdapterFunction(alloc, interp, adapter_type_name, "refcount_v1?", adapter_value);
-
-    const public_name = switch (public_name_eval.value) {
-        .string => |value| try alloc.dupe(u8, value),
-        else => return error.InvalidMemoryManagerAdapter,
-    };
-    const primitive_source_path = switch (primitive_source_eval.value) {
-        .string => |value| try alloc.dupe(u8, value),
-        else => return error.InvalidMemoryManagerAdapter,
-    };
-    const capability_mask_signed = switch (capability_mask_eval.value) {
-        .int => |value| value,
-        else => return error.InvalidMemoryManagerAdapter,
-    };
-    if (capability_mask_signed < 0) return error.InvalidMemoryManagerAdapter;
-    const capability_mask: u64 = @intCast(capability_mask_signed);
-    const refcount_v1 = switch (refcount_v1_eval.value) {
+    interp.clearMemoryBackendBinding();
+    const backend_eval = try evalAdapterFunction(alloc, interp, adapter_type_name, "backend", adapter_value);
+    const backend_called = switch (backend_eval.value) {
         .bool_val => |value| value,
         else => return error.InvalidMemoryManagerAdapter,
     };
-    if (refcount_v1 != ((capability_mask & zap.memory_abi.REFCOUNT_V1_BIT) != 0)) {
-        return error.InvalidMemoryManagerAdapter;
-    }
+    if (!backend_called) return error.InvalidMemoryManagerAdapter;
+
+    const backend_binding = interp.memory_backend_binding orelse return error.InvalidMemoryManagerAdapter;
+    if (!std.mem.eql(u8, backend_binding.manager_type_name, adapter_type_name)) return error.InvalidMemoryManagerAdapter;
 
     var hasher = std.hash.Wyhash.init(0);
-    hasher.update(std.mem.asBytes(&public_name_eval.result_hash));
-    hasher.update(std.mem.asBytes(&primitive_source_eval.result_hash));
-    hasher.update(std.mem.asBytes(&capability_mask_eval.result_hash));
-    hasher.update(std.mem.asBytes(&refcount_v1_eval.result_hash));
+    hasher.update(std.mem.asBytes(&backend_eval.result_hash));
+    hasher.update(backend_binding.manager_type_name);
+    if (backend_binding.adapter_source_path) |source_path| hasher.update(source_path);
 
     return .{
         .manager = .{
-            .name = public_name,
-            .primitive_source_path = primitive_source_path,
-            .capability_mask = capability_mask,
-            .refcount_v1 = refcount_v1,
+            .type_name = try alloc.dupe(u8, backend_binding.manager_type_name),
+            .adapter_source_path = if (backend_binding.adapter_source_path) |source_path| try alloc.dupe(u8, source_path) else null,
         },
         .result_hash = hasher.final(),
     };
@@ -883,34 +864,22 @@ test "parseStructRefField parses memory: as a struct value with canonical dotted
     try testing.expectEqualStrings("Memory.ARC", parsed);
 }
 
-test "ctfe manifest evaluates Memory.Manager adapter metadata through protocol impls" {
+test "ctfe manifest evaluates Memory.Manager backend through one protocol method" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const source =
         \\pub protocol Memory.Manager {
-        \\  fn name(manager) -> String
-        \\  fn primitive_source_path(manager) -> String
-        \\  fn capability_mask(manager) -> i64
-        \\  fn refcount_v1?(manager) -> Bool
+        \\  fn backend(manager) -> Bool
         \\}
         \\
         \\pub struct Memory.ARC {
         \\}
         \\
         \\pub impl Memory.Manager for Memory.ARC {
-        \\  pub fn name(_manager :: Memory.ARC) -> String {
-        \\    "Memory.ARC"
-        \\  }
-        \\  pub fn primitive_source_path(_manager :: Memory.ARC) -> String {
-        \\    "zap:src/memory/arc/manager.zig"
-        \\  }
-        \\  pub fn capability_mask(_manager :: Memory.ARC) -> i64 {
-        \\    1
-        \\  }
-        \\  pub fn refcount_v1?(_manager :: Memory.ARC) -> Bool {
-        \\    true
+        \\  pub fn backend(manager :: Memory.ARC) -> Bool {
+        \\    :zig.Memory.backend(manager)
         \\  }
         \\}
         \\
@@ -918,17 +887,8 @@ test "ctfe manifest evaluates Memory.Manager adapter metadata through protocol i
         \\}
         \\
         \\pub impl Memory.Manager for Memory.NoOp {
-        \\  pub fn name(_manager :: Memory.NoOp) -> String {
-        \\    "Memory.NoOp"
-        \\  }
-        \\  pub fn primitive_source_path(_manager :: Memory.NoOp) -> String {
-        \\    "project:src/memory/no_op/manager.zig"
-        \\  }
-        \\  pub fn capability_mask(_manager :: Memory.NoOp) -> i64 {
-        \\    0
-        \\  }
-        \\  pub fn refcount_v1?(_manager :: Memory.NoOp) -> Bool {
-        \\    false
+        \\  pub fn backend(manager :: Memory.NoOp) -> Bool {
+        \\    :zig.Memory.backend(manager)
         \\  }
         \\}
         \\
@@ -945,8 +905,8 @@ test "ctfe manifest evaluates Memory.Manager adapter metadata through protocol i
         \\pub struct App.Builder {
         \\  pub fn manifest(_env :: Zap.Env) -> Zap.Manifest {
         \\    %Zap.Manifest{
-        \\      name: Memory.Manager.name(Memory.NoOp),
-        \\      version: Memory.Manager.name(%Memory.NoOp{}),
+        \\      name: "app",
+        \\      version: "0.1.0",
         \\      kind: :bin,
         \\      memory: Memory.NoOp
         \\    }
@@ -963,6 +923,8 @@ test "ctfe manifest evaluates Memory.Manager adapter metadata through protocol i
 
     var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interp.deinit();
+    interp.scope_graph = &ctx.collector.graph;
+    interp.interner = &ctx.interner;
     interp.capabilities = zap.ctfe.CapabilitySet.build;
 
     const manifest_id = findManifestFunction(&result.ir_program) orelse return error.ManifestNotFound;
@@ -982,40 +944,26 @@ test "ctfe manifest evaluates Memory.Manager adapter metadata through protocol i
     );
     config.memory_manager = memory_eval.manager;
 
-    try testing.expectEqualStrings("Memory.NoOp", config.name);
-    try testing.expectEqualStrings("Memory.NoOp", config.version);
+    try testing.expectEqualStrings("app", config.name);
+    try testing.expectEqualStrings("0.1.0", config.version);
     try testing.expect(config.memory_manager != null);
-    try testing.expectEqualStrings("Memory.NoOp", config.memory_manager.?.name);
-    try testing.expectEqualStrings("project:src/memory/no_op/manager.zig", config.memory_manager.?.primitive_source_path);
-    try testing.expectEqual(@as(u64, 0), config.memory_manager.?.capability_mask);
-    try testing.expect(!config.memory_manager.?.refcount_v1);
+    try testing.expectEqualStrings("Memory.NoOp", config.memory_manager.?.type_name);
+    try testing.expectEqualStrings("build.zap", config.memory_manager.?.adapter_source_path.?);
 }
 
-test "ctfe manifest rejects memory adapter methods without Memory.Manager impl" {
+test "ctfe manifest rejects backend methods without Memory.Manager impl" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const source =
         \\pub protocol Memory.Manager {
-        \\  fn name(manager) -> String
-        \\  fn primitive_source_path(manager) -> String
-        \\  fn capability_mask(manager) -> i64
-        \\  fn refcount_v1?(manager) -> Bool
+        \\  fn backend(manager) -> Bool
         \\}
         \\
         \\pub struct FakeManager {
-        \\  pub fn name(_manager :: FakeManager) -> String {
-        \\    "FakeManager"
-        \\  }
-        \\  pub fn primitive_source_path(_manager :: FakeManager) -> String {
-        \\    "project:src/memory/fake/manager.zig"
-        \\  }
-        \\  pub fn capability_mask(_manager :: FakeManager) -> i64 {
-        \\    0
-        \\  }
-        \\  pub fn refcount_v1?(_manager :: FakeManager) -> Bool {
-        \\    false
+        \\  pub fn backend(manager :: FakeManager) -> Bool {
+        \\    :zig.Memory.backend(manager)
         \\  }
         \\}
     ;
@@ -1029,6 +977,8 @@ test "ctfe manifest rejects memory adapter methods without Memory.Manager impl" 
 
     var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interp.deinit();
+    interp.scope_graph = &ctx.collector.graph;
+    interp.interner = &ctx.interner;
     interp.capabilities = zap.ctfe.CapabilitySet.build;
 
     const manifest_value = zap.ctfe.ConstValue{ .struct_val = .{
@@ -1052,34 +1002,22 @@ test "ctfe manifest rejects memory adapter methods without Memory.Manager impl" 
     );
 }
 
-test "ctfe manifest evaluates default Memory.Manager adapter metadata when memory omitted" {
+test "ctfe manifest evaluates default Memory.Manager backend when memory omitted" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const source =
         \\pub protocol Memory.Manager {
-        \\  fn name(manager) -> String
-        \\  fn primitive_source_path(manager) -> String
-        \\  fn capability_mask(manager) -> i64
-        \\  fn refcount_v1?(manager) -> Bool
+        \\  fn backend(manager) -> Bool
         \\}
         \\
         \\pub struct Memory.ARC {
         \\}
         \\
         \\pub impl Memory.Manager for Memory.ARC {
-        \\  pub fn name(_manager :: Memory.ARC) -> String {
-        \\    "Memory.ARC"
-        \\  }
-        \\  pub fn primitive_source_path(_manager :: Memory.ARC) -> String {
-        \\    "zap:src/memory/arc/manager.zig"
-        \\  }
-        \\  pub fn capability_mask(_manager :: Memory.ARC) -> i64 {
-        \\    1
-        \\  }
-        \\  pub fn refcount_v1?(_manager :: Memory.ARC) -> Bool {
-        \\    true
+        \\  pub fn backend(manager :: Memory.ARC) -> Bool {
+        \\    :zig.Memory.backend(manager)
         \\  }
         \\}
         \\
@@ -1113,6 +1051,8 @@ test "ctfe manifest evaluates default Memory.Manager adapter metadata when memor
 
     var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interp.deinit();
+    interp.scope_graph = &ctx.collector.graph;
+    interp.interner = &ctx.interner;
     interp.capabilities = zap.ctfe.CapabilitySet.build;
 
     const manifest_id = findManifestFunction(&result.ir_program) orelse return error.ManifestNotFound;
@@ -1133,10 +1073,8 @@ test "ctfe manifest evaluates default Memory.Manager adapter metadata when memor
     config.memory_manager = memory_eval.manager;
 
     try testing.expect(config.memory_manager != null);
-    try testing.expectEqualStrings("Memory.ARC", config.memory_manager.?.name);
-    try testing.expectEqualStrings("zap:src/memory/arc/manager.zig", config.memory_manager.?.primitive_source_path);
-    try testing.expectEqual(@as(u64, 1), config.memory_manager.?.capability_mask);
-    try testing.expect(config.memory_manager.?.refcount_v1);
+    try testing.expectEqualStrings("Memory.ARC", config.memory_manager.?.type_name);
+    try testing.expectEqualStrings("build.zap", config.memory_manager.?.adapter_source_path.?);
 }
 
 test "parseStructRefField preserves underscores in struct names" {

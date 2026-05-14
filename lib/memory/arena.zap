@@ -8,14 +8,6 @@
   lock-free, so multi-threaded programs incur no synchronization
   overhead inside `allocate`.
 
-  ## Phase 5 status
-
-  As of Phase 5, `Memory.Manager.primitive_source_path/1` identifies
-  the production arena implementation: a real allocator backs
-  `core.allocate`, `core.deallocate` is a no-op, and
-  `core.get_capability_desc` returns `null` for every ID. The `.zapmem`
-  section declares zero capabilities.
-
   Because Arena declares no `REFCOUNT_V1` capability, programs that
   construct `Map`, `List`, `String`, or `MapIter` under this manager
   panic on first refcount dispatch — those types currently route
@@ -44,34 +36,10 @@ pub struct Memory.Arena {
 
 pub impl Memory.Manager for Memory.Arena {
   @doc = """
-    Returns the public adapter name for the Arena manager.
+    Binds the Arena manager type to its primitive backend.
     """
 
-  pub fn name(_manager :: Memory.Arena) -> String {
-    "Memory.Arena"
-  }
-
-  @doc = """
-    Returns the primitive source path for the Arena manager.
-    """
-
-  pub fn primitive_source_path(_manager :: Memory.Arena) -> String {
-    "zap:src/memory/arena/manager.zig"
-  }
-
-  @doc = """
-    Returns the Arena manager's declared capability bitmask.
-    """
-
-  pub fn capability_mask(_manager :: Memory.Arena) -> i64 {
-    0
-  }
-
-  @doc = """
-    Returns false because Arena does not declare `REFCOUNT_V1`.
-    """
-
-  pub fn refcount_v1?(_manager :: Memory.Arena) -> Bool {
-    false
+  pub fn backend(manager :: Memory.Arena) -> Bool {
+    :zig.Memory.backend(manager)
   }
 }

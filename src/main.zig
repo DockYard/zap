@@ -1112,7 +1112,7 @@ fn buildTarget(
 
     // `detectZapLibDir` returns the stdlib `lib/` subdirectory; the
     // source tree root is the parent of that directory, used for
-    // `zap:<path>` primitive source references.
+    // convention-resolved stdlib memory manager backend sources.
     const zap_source_tree_root: []const u8 = if (zap_lib_dir) |lib_dir|
         (std.fs.path.dirname(lib_dir) orelse project_root)
     else
@@ -1122,10 +1122,8 @@ fn buildTarget(
         alloc,
         .{
             .adapter = .{
-                .name = manifest_memory_manager.name,
-                .primitive_source_path = manifest_memory_manager.primitive_source_path,
-                .capability_mask = manifest_memory_manager.capability_mask,
-                .refcount_v1 = manifest_memory_manager.refcount_v1,
+                .type_name = manifest_memory_manager.type_name,
+                .adapter_source_path = manifest_memory_manager.adapter_source_path,
             },
             .source_roots = sourceRootsForMemoryDriver(alloc, source_roots.items) catch return error.OutOfMemory,
             .project_root = project_root,
@@ -1590,8 +1588,8 @@ const IncrementalWatchState = struct {
 
         // Build the same set of source roots `buildTarget` constructs
         // (project lib/test/tools, deps, zap_stdlib) so the memory
-        // driver can resolve `dep:<name>:<path>` primitive source
-        // references. Watch mode does not currently support
+        // driver can resolve convention-based manager backend sources.
+        // Watch mode does not currently support
         // git deps that haven't been previously resolved by a
         // `buildTarget` run; the initial full rebuild that precedes
         // `IncrementalWatchState.init` ensures the lockfile is in place.
@@ -1653,10 +1651,8 @@ const IncrementalWatchState = struct {
             alloc,
             .{
                 .adapter = .{
-                    .name = manifest_memory_manager.name,
-                    .primitive_source_path = manifest_memory_manager.primitive_source_path,
-                    .capability_mask = manifest_memory_manager.capability_mask,
-                    .refcount_v1 = manifest_memory_manager.refcount_v1,
+                    .type_name = manifest_memory_manager.type_name,
+                    .adapter_source_path = manifest_memory_manager.adapter_source_path,
                 },
                 .source_roots = memory_source_roots,
                 .project_root = project_root,

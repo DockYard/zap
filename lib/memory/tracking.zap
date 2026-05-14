@@ -15,17 +15,6 @@
       tampering detected on `core.deallocate` prints
       `USE-AFTER-FREE or OOB: canary corrupted at ptr=0x...`.
 
-  ## Phase 7 status
-
-  As of Phase 7, `Memory.Manager.primitive_source_path/1` identifies
-  the production Tracking implementation: every `core.allocate`
-  request becomes an inner `page_allocator` allocation of
-  `leading_canary + size + trailing_canary` bytes, with the user
-  pointer offset past the leading canary. Records are kept in an
-  `AutoHashMapUnmanaged(usize, AllocRecord)` keyed by user pointer
-  value; mutations are serialised by a `cmpxchg`-based spinlock.
-  The `.zapmem` section declares zero capabilities.
-
   ## Intended use cases
 
   Tracking is a CI / development tool, not a production manager.
@@ -78,34 +67,10 @@ pub struct Memory.Tracking {
 
 pub impl Memory.Manager for Memory.Tracking {
   @doc = """
-    Returns the public adapter name for the Tracking manager.
+    Binds the Tracking manager type to its primitive backend.
     """
 
-  pub fn name(_manager :: Memory.Tracking) -> String {
-    "Memory.Tracking"
-  }
-
-  @doc = """
-    Returns the primitive source path for the Tracking manager.
-    """
-
-  pub fn primitive_source_path(_manager :: Memory.Tracking) -> String {
-    "zap:src/memory/tracking/manager.zig"
-  }
-
-  @doc = """
-    Returns the Tracking manager's declared capability bitmask.
-    """
-
-  pub fn capability_mask(_manager :: Memory.Tracking) -> i64 {
-    0
-  }
-
-  @doc = """
-    Returns false because Tracking does not declare `REFCOUNT_V1`.
-    """
-
-  pub fn refcount_v1?(_manager :: Memory.Tracking) -> Bool {
-    false
+  pub fn backend(manager :: Memory.Tracking) -> Bool {
+    :zig.Memory.backend(manager)
   }
 }

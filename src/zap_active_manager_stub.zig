@@ -1,6 +1,6 @@
 //! Stub registered as `zap_active_manager` only for the host Zig test
 //! build. Compiler-driven Zap binaries register the selected
-//! `Memory.Manager` adapter's primitive source path instead.
+//! `Memory.Manager` adapter's convention-resolved backend source instead.
 //!
 //! Host tests load `runtime.zig` directly and keep
 //! `active_manager_source_available == false`, so runtime hot paths bind

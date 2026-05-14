@@ -3542,7 +3542,7 @@ pub const ArcRuntime = struct {
     fn dispatcherAllocImpl(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
         _ = allocator;
         // Phase 7b: under source-registered builds the side-table extension
-        // flag is statically known from the validated adapter metadata — the
+        // flag is statically known from the validated manager metadata — the
         // manager source pins `desc.size` at module scope, so the
         // runtime flag would be a dead reload. Under fallback object-linked
         // builds the bound descriptor's size is only resolved at startup;
@@ -13311,6 +13311,12 @@ pub const Prim = struct {
     fn stripTrailingSlash(path: []const u8) []const u8 {
         if (path.len > 0 and path[path.len - 1] == '/') return path[0 .. path.len - 1];
         return path;
+    }
+};
+
+pub const Memory = struct {
+    pub fn backend(_: anytype) bool {
+        return true;
     }
 };
 

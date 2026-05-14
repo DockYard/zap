@@ -30,34 +30,10 @@ pub struct Memory.NoOp {
 
 pub impl Memory.Manager for Memory.NoOp {
   @doc = """
-    Returns the public adapter name for the NoOp manager.
+    Binds the NoOp manager type to its primitive backend.
     """
 
-  pub fn name(_manager :: Memory.NoOp) -> String {
-    "Memory.NoOp"
-  }
-
-  @doc = """
-    Returns the primitive source path for the NoOp manager.
-    """
-
-  pub fn primitive_source_path(_manager :: Memory.NoOp) -> String {
-    "zap:src/memory/no_op/manager.zig"
-  }
-
-  @doc = """
-    Returns the NoOp manager's declared capability bitmask.
-    """
-
-  pub fn capability_mask(_manager :: Memory.NoOp) -> i64 {
-    0
-  }
-
-  @doc = """
-    Returns false because NoOp does not declare `REFCOUNT_V1`.
-    """
-
-  pub fn refcount_v1?(_manager :: Memory.NoOp) -> Bool {
-    false
+  pub fn backend(manager :: Memory.NoOp) -> Bool {
+    :zig.Memory.backend(manager)
   }
 }

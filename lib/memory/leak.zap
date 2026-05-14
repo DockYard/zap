@@ -6,14 +6,6 @@
   deliberate no-op. Memory is intentionally leaked for the entire
   lifetime of the process — the OS reclaims pages on exit.
 
-  ## Phase 7 status
-
-  As of Phase 7, `Memory.Manager.primitive_source_path/1` identifies
-  the production Leak implementation: `core.allocate` returns real
-  memory backed by `page_allocator`, `core.deallocate` is a no-op,
-  and `core.get_capability_desc` returns `null` for every ID. The
-  `.zapmem` section declares zero capabilities.
-
   ## Intended use cases
 
   Leak is NOT a general-purpose manager. Two CI use cases motivate
@@ -60,34 +52,10 @@ pub struct Memory.Leak {
 
 pub impl Memory.Manager for Memory.Leak {
   @doc = """
-    Returns the public adapter name for the Leak manager.
+    Binds the Leak manager type to its primitive backend.
     """
 
-  pub fn name(_manager :: Memory.Leak) -> String {
-    "Memory.Leak"
-  }
-
-  @doc = """
-    Returns the primitive source path for the Leak manager.
-    """
-
-  pub fn primitive_source_path(_manager :: Memory.Leak) -> String {
-    "zap:src/memory/leak/manager.zig"
-  }
-
-  @doc = """
-    Returns the Leak manager's declared capability bitmask.
-    """
-
-  pub fn capability_mask(_manager :: Memory.Leak) -> i64 {
-    0
-  }
-
-  @doc = """
-    Returns false because Leak does not declare `REFCOUNT_V1`.
-    """
-
-  pub fn refcount_v1?(_manager :: Memory.Leak) -> Bool {
-    false
+  pub fn backend(manager :: Memory.Leak) -> Bool {
+    :zig.Memory.backend(manager)
   }
 }

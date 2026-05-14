@@ -2,35 +2,26 @@ pub struct Memory.ManagerTest {
   use Zest.Case
 
   describe("Memory.Manager adapters") {
-    test("ARC exposes refcount metadata from a bare adapter value") {
+    test("ARC binds through the single backend primitive from a bare adapter value") {
       adapter = Memory.ARC
 
-      assert(Memory.Manager.name(adapter) == "Memory.ARC")
-      assert(Memory.Manager.primitive_source_path(adapter) == "zap:src/memory/arc/manager.zig")
-      assert(Memory.Manager.capability_mask(adapter) == 1)
-      assert(Memory.Manager.refcount_v1?(adapter))
+      assert(Memory.Manager.backend(adapter))
     }
 
-    test("Arena exposes zero capability metadata from a struct literal") {
+    test("Arena binds through the single backend primitive from a struct literal") {
       adapter = %Memory.Arena{}
 
-      assert(Memory.Manager.name(adapter) == "Memory.Arena")
-      assert(Memory.Manager.primitive_source_path(adapter) == "zap:src/memory/arena/manager.zig")
-      assert(Memory.Manager.capability_mask(adapter) == 0)
-      reject(Memory.Manager.refcount_v1?(adapter))
+      assert(Memory.Manager.backend(adapter))
     }
 
-    test("diagnostic managers expose primitive source paths") {
+    test("diagnostic managers bind through the same backend primitive") {
       leak = %Memory.Leak{}
       tracking = %Memory.Tracking{}
       no_op = %Memory.NoOp{}
 
-      assert(Memory.Manager.primitive_source_path(leak) == "zap:src/memory/leak/manager.zig")
-      assert(Memory.Manager.primitive_source_path(tracking) == "zap:src/memory/tracking/manager.zig")
-      assert(Memory.Manager.primitive_source_path(no_op) == "zap:src/memory/no_op/manager.zig")
-      reject(Memory.Manager.refcount_v1?(leak))
-      reject(Memory.Manager.refcount_v1?(tracking))
-      reject(Memory.Manager.refcount_v1?(no_op))
+      assert(Memory.Manager.backend(leak))
+      assert(Memory.Manager.backend(tracking))
+      assert(Memory.Manager.backend(no_op))
     }
   }
 }

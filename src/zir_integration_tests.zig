@@ -536,20 +536,8 @@ test "ZIR memory manager: project-local third-party adapter builds and runs" {
         \\}
         \\
         \\pub impl Memory.Manager for ThirdParty.ProjectArena {
-        \\  pub fn name(_manager :: ThirdParty.ProjectArena) -> String {
-        \\    "ThirdParty.ProjectArena"
-        \\  }
-        \\
-        \\  pub fn primitive_source_path(_manager :: ThirdParty.ProjectArena) -> String {
-        \\    "project:third_party/project_arena/manager.zig"
-        \\  }
-        \\
-        \\  pub fn capability_mask(_manager :: ThirdParty.ProjectArena) -> i64 {
-        \\    0
-        \\  }
-        \\
-        \\  pub fn refcount_v1?(_manager :: ThirdParty.ProjectArena) -> Bool {
-        \\    false
+        \\  pub fn backend(manager :: ThirdParty.ProjectArena) -> Bool {
+        \\    :zig.Memory.backend(manager)
         \\  }
         \\}
     ;
@@ -564,7 +552,7 @@ test "ZIR memory manager: project-local third-party adapter builds and runs" {
     ;
 
     var result = try compileAndRunCustomProject(build_source, source, &.{
-        .{ .path = "third_party/project_arena/manager.zig", .data = ARENA_MANAGER_SOURCE },
+        .{ .path = "src/memory/project_arena/manager.zig", .data = ARENA_MANAGER_SOURCE },
     });
     defer result.deinit();
 
@@ -597,20 +585,8 @@ test "ZIR memory manager: dependency third-party adapter builds and runs" {
         \\}
         \\
         \\pub impl Memory.Manager for ThirdParty.DepArena {
-        \\  pub fn name(_manager :: ThirdParty.DepArena) -> String {
-        \\    "ThirdParty.DepArena"
-        \\  }
-        \\
-        \\  pub fn primitive_source_path(_manager :: ThirdParty.DepArena) -> String {
-        \\    "dep:fake_mem:memory/dep_arena/manager.zig"
-        \\  }
-        \\
-        \\  pub fn capability_mask(_manager :: ThirdParty.DepArena) -> i64 {
-        \\    0
-        \\  }
-        \\
-        \\  pub fn refcount_v1?(_manager :: ThirdParty.DepArena) -> Bool {
-        \\    false
+        \\  pub fn backend(manager :: ThirdParty.DepArena) -> Bool {
+        \\    :zig.Memory.backend(manager)
         \\  }
         \\}
     ;
@@ -625,7 +601,7 @@ test "ZIR memory manager: dependency third-party adapter builds and runs" {
     ;
 
     var result = try compileAndRunCustomProject(build_source, source, &.{
-        .{ .path = "deps/fake_mem/memory/dep_arena/manager.zig", .data = ARENA_MANAGER_SOURCE },
+        .{ .path = "deps/fake_mem/src/memory/dep_arena/manager.zig", .data = ARENA_MANAGER_SOURCE },
     });
     defer result.deinit();
 
