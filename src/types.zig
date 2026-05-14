@@ -6227,7 +6227,7 @@ test "function ref inference defaults param ownerships to shared" {
     const source =
         \\pub struct Test {
         \\  pub fn main(args :: Nil) -> (Nil -> Nil) {
-        \\    Foo.main/1
+        \\    &Foo.main/1
         \\  }
         \\}
     ;

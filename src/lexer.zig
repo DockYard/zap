@@ -76,7 +76,9 @@ pub const Lexer = struct {
         }
 
         // Atom literals
-        if (c == ':' and self.pos + 1 < self.source.len and isIdentStart(self.source[self.pos + 1])) {
+        if (c == ':' and self.pos + 1 < self.source.len and
+            (isIdentStart(self.source[self.pos + 1]) or self.source[self.pos + 1] == '"'))
+        {
             return self.lexAtom();
         }
 
@@ -264,10 +266,43 @@ pub const Lexer = struct {
     fn lexAtom(self: *Lexer) Token {
         const start = self.pos;
         self.pos += 1; // skip ':'
+        if (self.pos < self.source.len and self.source[self.pos] == '"') {
+            return self.lexQuotedAtom(start);
+        }
         while (self.pos < self.source.len and isIdentContinue(self.source[self.pos])) {
             self.pos += 1;
         }
         return self.makeToken(.atom_literal, start, self.pos);
+    }
+
+    fn lexQuotedAtom(self: *Lexer, start: u32) Token {
+        self.pos += 1; // skip opening quote
+
+        while (self.pos < self.source.len) {
+            const ch = self.source[self.pos];
+            if (ch == '"') {
+                self.pos += 1;
+                return self.makeToken(.atom_literal, start, self.pos);
+            }
+            if (ch == '#' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == '{') {
+                const token = self.makeToken(.string_literal_start, start, self.pos);
+                self.pos += 2;
+                self.interp_depth += 1;
+                self.interp_brace_depth = 0;
+                return token;
+            }
+            if (ch == '\\' and self.pos + 1 < self.source.len) {
+                self.pos += 2;
+                continue;
+            }
+            if (ch == '\n') {
+                self.line += 1;
+                self.line_start = self.pos + 1;
+            }
+            self.pos += 1;
+        }
+
+        return self.makeToken(.invalid, start, self.pos);
     }
 
     fn lexNumber(self: *Lexer) Token {

@@ -695,10 +695,15 @@ pub const Parser = struct {
                     }
                 },
                 .keyword_struct => {
-                    if (self.parseNestedStructDecl()) |sd| {
-                        try items.append(self.allocator, .{ .struct_decl = sd });
-                    } else |_| {
-                        self.synchronize();
+                    if (self.isFieldDecl()) {
+                        const field = try self.parseStructField();
+                        try fields.append(self.allocator, field);
+                    } else {
+                        if (self.parseNestedStructDecl()) |sd| {
+                            try items.append(self.allocator, .{ .struct_decl = sd });
+                        } else |_| {
+                            self.synchronize();
+                        }
                     }
                 },
                 .keyword_union => {
@@ -811,7 +816,7 @@ pub const Parser = struct {
     }
 
     fn isFieldDecl(self: *Parser) bool {
-        if (!self.check(.identifier)) return false;
+        if (!self.checkStructFieldName()) return false;
         const saved = self.saveLexerState();
         _ = self.advance();
         const is_field = self.check(.double_colon);
@@ -821,7 +826,7 @@ pub const Parser = struct {
 
     fn parseStructField(self: *Parser) !ast.StructFieldDecl {
         const field_start = self.currentSpan();
-        const name_tok = try self.expect(.identifier);
+        const name_tok = try self.expectStructFieldName();
         const field_name = try self.internToken(name_tok);
         _ = try self.expect(.double_colon);
         const type_expr = try self.parseTypeExpr();
@@ -1261,7 +1266,7 @@ pub const Parser = struct {
             self.skipNewlines();
             if (self.check(.right_brace)) break;
 
-            const field_tok = try self.expect(.identifier);
+            const field_tok = try self.expectStructFieldName();
             const field_name = try self.internToken(field_tok);
             _ = try self.expect(.double_colon);
             const type_expr = try self.parseTypeExpr();
@@ -1322,7 +1327,7 @@ pub const Parser = struct {
             self.skipNewlines();
             if (self.check(.right_brace)) break;
 
-            const field_tok = try self.expect(.identifier);
+            const field_tok = try self.expectStructFieldName();
             const field_name = try self.internToken(field_tok);
             _ = try self.expect(.double_colon);
             const type_expr = try self.parseTypeExpr();
@@ -2339,40 +2344,6 @@ pub const Parser = struct {
                     try self.expect(.identifier); // error if neither
                 const field_name = try self.internToken(field_tok);
 
-                // Check for function reference: Struct.func/arity
-                if (self.check(.slash)) {
-                    const saved_lexer = self.lexer;
-                    const saved_current = self.current;
-                    const saved_previous = self.previous;
-                    _ = self.advance(); // consume /
-                    if (self.check(.int_literal)) {
-                        const arity_tok = self.advance();
-                        const arity_text = arity_tok.slice(self.source);
-                        const arity = std.fmt.parseInt(u32, arity_text, 10) catch 0;
-
-                        // Extract struct name from the object expression
-                        const mod_name: ?ast.StructName = switch (expr.*) {
-                            .struct_ref => |mr| mr.name,
-                            else => null,
-                        };
-
-                        expr = try self.create(ast.Expr, .{
-                            .function_ref = .{
-                                .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, ast.SourceSpan.from(arity_tok.loc)) },
-                                .struct_name = mod_name,
-                                .function = field_name,
-                                .arity = arity,
-                            },
-                        });
-                        break;
-                    } else {
-                        // Not a function ref — restore and fall through to field_access
-                        self.lexer = saved_lexer;
-                        self.current = saved_current;
-                        self.previous = saved_previous;
-                    }
-                }
-
                 expr = try self.create(ast.Expr, .{
                     .field_access = .{
                         .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, ast.SourceSpan.from(field_tok.loc)) },
@@ -2641,7 +2612,13 @@ pub const Parser = struct {
 
         // Add the literal prefix (strip opening quote, unescape)
         const prefix_raw = start_tok.slice(self.source);
-        const prefix_stripped = if (prefix_raw.len > 0 and prefix_raw[0] == '"') prefix_raw[1..] else prefix_raw;
+        const is_atom_interpolation = std.mem.startsWith(u8, prefix_raw, ":\"");
+        const prefix_stripped = if (is_atom_interpolation)
+            prefix_raw[2..]
+        else if (prefix_raw.len > 0 and prefix_raw[0] == '"')
+            prefix_raw[1..]
+        else
+            prefix_raw;
         const prefix = self.unescapeString(prefix_stripped);
         if (prefix.len > 0) {
             try parts.append(self.allocator, .{ .literal = try self.interner.intern(prefix) });
@@ -2696,11 +2673,18 @@ pub const Parser = struct {
 
     fn parseAtomLiteral(self: *Parser) !*const ast.Expr {
         const tok = self.advance();
-        const raw = tok.slice(self.source);
-        const value = if (raw.len > 0 and raw[0] == ':') raw[1..] else raw;
+        const value = self.parseAtomTokenValue(tok);
         return self.create(ast.Expr, .{
             .atom_literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = try self.interner.intern(value) },
         });
+    }
+
+    fn parseAtomTokenValue(self: *Parser, tok: Token) []const u8 {
+        const raw = tok.slice(self.source);
+        if (raw.len >= 3 and std.mem.startsWith(u8, raw, ":\"") and raw[raw.len - 1] == '"') {
+            return self.unescapeString(raw[2 .. raw.len - 1]);
+        }
+        return if (raw.len > 0 and raw[0] == ':') raw[1..] else raw;
     }
 
     fn parseBoolLiteral(self: *Parser) !*const ast.Expr {
@@ -2943,7 +2927,7 @@ pub const Parser = struct {
             if (self.check(.right_brace)) break;
 
             // Detect if this is `identifier:` (struct field) or expr -> (map)
-            if (!is_map and self.check(.identifier)) {
+            if (!is_map and self.checkStructFieldName()) {
                 // Speculatively check for identifier : value (struct field syntax)
                 const saved_lexer = self.lexer;
                 const saved_current = self.current;
@@ -2977,7 +2961,7 @@ pub const Parser = struct {
                 self.skipNewlines();
             } else {
                 // Continuing struct fields
-                const field_tok = try self.expect(.identifier);
+                const field_tok = try self.expectStructFieldName();
                 const field_name = try self.internToken(field_tok);
                 _ = try self.expect(.colon);
                 const value = try self.parseExpr();
@@ -3067,7 +3051,7 @@ pub const Parser = struct {
             self.skipNewlines();
             if (self.check(.right_brace)) break;
 
-            const field_tok = try self.expect(.identifier);
+            const field_tok = try self.expectStructFieldName();
             const field_name = try self.internToken(field_tok);
             _ = try self.expect(.colon);
             const value = try self.parseExpr();
@@ -3582,8 +3566,7 @@ pub const Parser = struct {
             },
             .atom_literal => {
                 const tok = self.advance();
-                const raw = tok.slice(self.source);
-                const value = if (raw.len > 0 and raw[0] == ':') raw[1..] else raw;
+                const value = self.parseAtomTokenValue(tok);
                 return self.create(ast.Pattern, .{
                     .literal = .{ .atom = .{
                         .meta = .{ .span = ast.SourceSpan.from(tok.loc) },
@@ -3748,11 +3731,11 @@ pub const Parser = struct {
         // Detect struct-like pattern: %{name: pattern, ...}
         // vs map pattern: %{expr => pattern, ...}
         // If first element is identifier followed by colon, treat as struct pattern fields
-        if (self.check(.identifier) and self.peekNext() == .colon) {
+        if (self.checkStructFieldName() and self.peekNext() == .colon) {
             // Struct-like destructuring pattern
             var struct_fields: std.ArrayList(ast.StructPatternField) = .empty;
             while (!self.check(.right_brace) and !self.check(.eof)) {
-                const field_tok = try self.expect(.identifier);
+                const field_tok = try self.expectStructFieldName();
                 const field_name = try self.internToken(field_tok);
                 _ = try self.expect(.colon);
                 const pattern = try self.parsePattern();
@@ -3801,7 +3784,7 @@ pub const Parser = struct {
         var fields: std.ArrayList(ast.StructPatternField) = .empty;
 
         while (!self.check(.right_brace) and !self.check(.eof)) {
-            const field_tok = try self.expect(.identifier);
+            const field_tok = try self.expectStructFieldName();
             const field_name = try self.internToken(field_tok);
             _ = try self.expect(.colon);
             const pattern = try self.parsePattern();
@@ -4232,7 +4215,7 @@ pub const Parser = struct {
         var fields: std.ArrayList(ast.TypeStructField) = .empty;
 
         while (!self.check(.right_brace) and !self.check(.eof)) {
-            const field_tok = try self.expect(.identifier);
+            const field_tok = try self.expectStructFieldName();
             const field_name = try self.internToken(field_tok);
             _ = try self.expect(.colon);
             const type_expr = try self.parseTypeExpr();
@@ -4253,8 +4236,7 @@ pub const Parser = struct {
 
     fn parseAtomType(self: *Parser) !*const ast.TypeExpr {
         const tok = self.advance();
-        const raw = tok.slice(self.source);
-        const value = if (raw.len > 0 and raw[0] == ':') raw[1..] else raw;
+        const value = self.parseAtomTokenValue(tok);
         return self.create(ast.TypeExpr, .{
             .literal = .{
                 .meta = .{ .span = ast.SourceSpan.from(tok.loc) },
@@ -4458,6 +4440,18 @@ pub const Parser = struct {
                 return error.ParseError;
             },
         }
+    }
+
+    fn checkStructFieldName(self: *const Parser) bool {
+        return self.check(.identifier) or self.check(.keyword_struct);
+    }
+
+    fn expectStructFieldName(self: *Parser) !Token {
+        if (self.checkStructFieldName()) {
+            return self.advance();
+        }
+        try self.addError("I was expecting a struct field name", self.currentSpan());
+        return error.ParseError;
     }
 
     fn expectIdentifierOrType(self: *Parser) !Token {
@@ -4838,6 +4832,90 @@ test "parse function call" {
     try std.testing.expect(body[0].expr.* == .call);
 }
 
+test "parse quoted atom literals with double quotes" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn main() {
+        \\    {:"Arena.Other", :"with-hyphen"}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const body = program.structs[0].items[0].function.clauses[0].body.?;
+    const tuple = body[0].expr;
+    try std.testing.expect(tuple.* == .tuple);
+    try std.testing.expectEqualStrings("Arena.Other", parser.interner.get(tuple.tuple.elements[0].atom_literal.value));
+    try std.testing.expectEqualStrings("with-hyphen", parser.interner.get(tuple.tuple.elements[1].atom_literal.value));
+}
+
+test "parse quoted atom interpolation syntax" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn main(name) {
+        \\    :"Arena.#{name}"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const body = program.structs[0].items[0].function.clauses[0].body.?;
+    try std.testing.expect(body[0].expr.* == .string_interpolation);
+    try std.testing.expectEqual(@as(usize, 2), body[0].expr.string_interpolation.parts.len);
+}
+
+test "parse unprefixed qualified function slash arity as expression, not function ref" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn main() {
+        \\    Arena.main/1
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const body = program.structs[0].items[0].function.clauses[0].body.?;
+    try std.testing.expect(body[0].expr.* != .function_ref);
+    try std.testing.expect(body[0].expr.* == .binary_op);
+    try std.testing.expectEqual(ast.BinaryOp.Op.div, body[0].expr.binary_op.op);
+}
+
+test "parse ampersand qualified function slash arity as function ref" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn main() {
+        \\    &Arena.main/1
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const body = program.structs[0].items[0].function.clauses[0].body.?;
+    try std.testing.expect(body[0].expr.* == .function_ref);
+    try std.testing.expectEqual(@as(u32, 1), body[0].expr.function_ref.arity);
+    try std.testing.expectEqualStrings("main", parser.interner.get(body[0].expr.function_ref.function));
+}
+
 test "parse pipe operator" {
     const source =
         \\pub struct Test {
@@ -4978,6 +5056,24 @@ test "parse top-level defstruct" {
     try std.testing.expectEqual(@as(usize, 2), sd.fields.len);
 }
 
+test "parse data struct field named struct" {
+    const source =
+        \\pub struct Function {
+        \\  struct :: Type
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const function_struct = program.top_items[0].struct_decl;
+    try std.testing.expectEqual(@as(usize, 1), function_struct.fields.len);
+    try std.testing.expectEqualStrings("struct", parser.interner.get(function_struct.fields[0].name));
+}
+
 test "parse defstruct extends" {
     const source =
         \\pub struct Shape {
@@ -5044,6 +5140,49 @@ test "parse struct extends" {
     const program = try parser.parseProgram();
     try std.testing.expectEqual(@as(usize, 2), program.structs.len);
     try std.testing.expect(program.structs[1].parent != null);
+}
+
+test "parse struct literal field named struct" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn main() {
+        \\    %Function{struct: Arena, name: :main, arity: 1}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const body = program.structs[0].items[0].function.clauses[0].body.?;
+    const literal = body[0].expr;
+    try std.testing.expect(literal.* == .struct_expr);
+    try std.testing.expectEqual(@as(usize, 3), literal.struct_expr.fields.len);
+    try std.testing.expectEqualStrings("struct", parser.interner.get(literal.struct_expr.fields[0].name));
+}
+
+test "parse struct pattern field named struct" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn main(%Function{struct: module, name: name, arity: arity}) {
+        \\    module
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const params = program.structs[0].items[0].function.clauses[0].params;
+    try std.testing.expectEqual(@as(usize, 1), params.len);
+    try std.testing.expect(params[0].pattern.* == .struct_pattern);
+    try std.testing.expectEqualStrings("struct", parser.interner.get(params[0].pattern.struct_pattern.fields[0].name));
 }
 
 test "parse struct init with type annotation" {
