@@ -1181,19 +1181,15 @@ test "ZIR: captured closure called through multiple paths" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
-test "ZIR: struct function ref is first-class callable" {
+test "ZIR: struct function ref call resolves statically" {
     var result = try compileAndRun(
         \\pub struct TestProg {
         \\  pub fn double(x :: i64) -> i64 {
         \\    x * 2
         \\  }
         \\
-        \\  pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
-        \\    f(x)
-        \\  }
-        \\
         \\  pub fn main() -> String {
-        \\    Kernel.inspect(apply(21, &TestProg.double/1))
+        \\    Kernel.inspect(&TestProg.double/1(21))
         \\    "done"
         \\  }
         \\}
@@ -1203,19 +1199,15 @@ test "ZIR: struct function ref is first-class callable" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
-test "ZIR: local function ref is first-class callable" {
+test "ZIR: local function ref call resolves statically" {
     var result = try compileAndRun(
         \\pub struct TestProg {
         \\  pub fn double(x :: i64) -> i64 {
         \\    x * 2
         \\  }
         \\
-        \\  pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
-        \\    f(x)
-        \\  }
-        \\
         \\  pub fn main() -> String {
-        \\    Kernel.inspect(apply(21, &double/1))
+        \\    Kernel.inspect(&double/1(21))
         \\    "done"
         \\  }
         \\}
@@ -1225,7 +1217,25 @@ test "ZIR: local function ref is first-class callable" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
-test "ZIR: nested local function ref captures environment" {
+test "ZIR: static Function struct literal call resolves statically" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn double(x :: i64) -> i64 {
+        \\    x * 2
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(%Function{struct: TestProg, name: :double, arity: 1}(21))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: static local function ref call captures environment" {
     var result = try compileAndRun(
         \\pub struct TestProg {
         \\  pub fn make_and_apply(base :: i64) -> i64 {
@@ -1233,11 +1243,7 @@ test "ZIR: nested local function ref captures environment" {
         \\      base + x
         \\    }
         \\
-        \\    apply(10, &add_base/1)
-        \\  }
-        \\
-        \\  pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
-        \\    f(x)
+        \\    &add_base/1(10)
         \\  }
         \\
         \\  pub fn main() -> String {

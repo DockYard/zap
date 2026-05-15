@@ -1870,6 +1870,39 @@ pub const TypeChecker = struct {
         return try interner_mut.intern(name_buf.items);
     }
 
+    fn resolveTaggedUnionVariantReference(self: *TypeChecker, struct_name: ast.StructName, span: ast.SourceSpan) !?TypeId {
+        if (struct_name.parts.len < 2) return null;
+
+        const union_name = ast.StructName{
+            .parts = struct_name.parts[0 .. struct_name.parts.len - 1],
+            .span = struct_name.span,
+        };
+        const variant_name = struct_name.parts[struct_name.parts.len - 1];
+        return try self.resolveTaggedUnionVariant(union_name, variant_name, span);
+    }
+
+    fn resolveTaggedUnionVariant(self: *TypeChecker, union_name: ast.StructName, variant_name: ast.StringId, span: ast.SourceSpan) !?TypeId {
+        const union_type_name = try self.internDottedStructName(union_name);
+        const union_type_id = self.store.name_to_type.get(union_type_name) orelse return null;
+        const union_type = self.store.getType(union_type_id);
+        if (union_type != .tagged_union) return null;
+
+        for (union_type.tagged_union.variants) |variant| {
+            if (variant.name == variant_name) return union_type_id;
+        }
+
+        try self.addHardError(
+            try std.fmt.allocPrint(self.allocator, "`{s}` is not a variant of enum `{s}`", .{
+                self.interner.get(variant_name),
+                self.interner.get(union_type.tagged_union.name),
+            }),
+            span,
+            "unknown variant",
+            null,
+        );
+        return union_type_id;
+    }
+
     fn structNamesEqual(_: *const TypeChecker, lhs: ast.StructName, rhs: ast.StructName) bool {
         if (lhs.parts.len != rhs.parts.len) return false;
         for (lhs.parts, rhs.parts) |left_part, right_part| {
@@ -4527,35 +4560,9 @@ pub const TypeChecker = struct {
                 return self.resolveFirstClassFunctionStructType() orelse TypeStore.UNKNOWN;
             },
             .field_access => |fa| {
-                // Check for enum variant access (e.g. Color.Red)
                 if (fa.object.* == .struct_ref) {
-                    const parts = fa.object.struct_ref.name.parts;
-                    if (parts.len == 1) {
-                        if (self.store.name_to_type.get(parts[0])) |tid| {
-                            const t = self.store.getType(tid);
-                            if (t == .tagged_union) {
-                                // Validate variant name
-                                var valid = false;
-                                for (t.tagged_union.variants) |v| {
-                                    if (v.name == fa.field) {
-                                        valid = true;
-                                        break;
-                                    }
-                                }
-                                if (!valid) {
-                                    try self.addHardError(
-                                        try std.fmt.allocPrint(self.allocator, "`{s}` is not a variant of enum `{s}`", .{
-                                            self.interner.get(fa.field),
-                                            self.interner.get(t.tagged_union.name),
-                                        }),
-                                        fa.meta.span,
-                                        "unknown variant",
-                                        null,
-                                    );
-                                }
-                                return tid;
-                            }
-                        }
+                    if (try self.resolveTaggedUnionVariant(fa.object.struct_ref.name, fa.field, fa.meta.span)) |type_id| {
+                        return type_id;
                     }
                 }
                 // Infer object type; for known struct types, look up field type
@@ -4823,33 +4830,8 @@ pub const TypeChecker = struct {
                 return TypeStore.UNKNOWN;
             },
             .struct_ref => |mr| {
-                // Check for enum variant access (e.g. Color.Red parsed as struct_ref ["Color", "Red"])
-                if (mr.name.parts.len == 2) {
-                    if (self.store.name_to_type.get(mr.name.parts[0])) |tid| {
-                        const t = self.store.getType(tid);
-                        if (t == .tagged_union) {
-                            // Validate variant name
-                            var valid = false;
-                            for (t.tagged_union.variants) |v| {
-                                if (v.name == mr.name.parts[1]) {
-                                    valid = true;
-                                    break;
-                                }
-                            }
-                            if (!valid) {
-                                try self.addHardError(
-                                    try std.fmt.allocPrint(self.allocator, "`{s}` is not a variant of enum `{s}`", .{
-                                        self.interner.get(mr.name.parts[1]),
-                                        self.interner.get(t.tagged_union.name),
-                                    }),
-                                    mr.meta.span,
-                                    "unknown variant",
-                                    null,
-                                );
-                            }
-                            return tid;
-                        }
-                    }
+                if (try self.resolveTaggedUnionVariantReference(mr.name, mr.meta.span)) |type_id| {
+                    return type_id;
                 }
                 if (try self.resolveTypeReferenceTarget(mr.name)) |_| {
                     return self.resolveFirstClassTypeStructType() orelse TypeStore.UNKNOWN;
@@ -6734,6 +6716,83 @@ test "dotted bare struct reference infers first-class Type value" {
     const type_type = checker.store.name_to_type.get(type_name) orelse return error.TestUnexpectedResult;
 
     try std.testing.expectEqual(type_type, inferred);
+}
+
+test "dotted tagged union variant infers union value before type reference fallback" {
+    const source =
+        \\pub union IO.Mode {
+        \\  Raw,
+        \\  Normal
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn direct() -> IO.Mode {
+        \\    IO.Mode.Normal
+        \\  }
+        \\
+        \\  pub fn bridge() -> IO.Mode {
+        \\    :zig.IO.set_terminal_mode(IO.Mode.Normal)
+        \\    IO.Mode.Raw
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "dotted tagged union variant validates final segment as variant" {
+    const source =
+        \\pub union IO.Mode {
+        \\  Raw
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn direct() -> IO.Mode {
+        \\    IO.Mode.Normal
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "`Normal` is not a variant of enum `IO.Mode`") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "unknown bare struct reference is a type error" {
