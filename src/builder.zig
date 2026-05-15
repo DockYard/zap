@@ -131,6 +131,7 @@ pub fn ctfeManifestDetailed(
 
     var collect_options = compiler.CompileOptions{
         .show_progress = false,
+        .allow_external_static_references = true,
     };
     if (struct_order_data) |order| {
         collect_options.struct_order = order.struct_order;
@@ -1185,6 +1186,85 @@ test "ctfe manifest permits target-source Type and Function references" {
 
     try testing.expect(config.root != null);
     try testing.expectEqualStrings("App.main/1", config.root.?);
+    try testing.expect(selected_memory != null);
+    try testing.expectEqualStrings("ThirdParty.ProjectArena", selected_memory.?.type_name);
+}
+
+test "ctfe manifest staged discovery permits target-source Type and Function references" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Function {
+        \\  struct :: Type
+        \\  name :: Atom
+        \\  arity :: u8
+        \\}
+        \\
+        \\pub struct Zap.Env {
+        \\  target :: Atom
+        \\}
+        \\
+        \\pub struct Zap.Manifest {
+        \\  name :: String
+        \\  version :: String
+        \\  kind :: Atom
+        \\  root :: Function | Nil = nil
+        \\  memory :: Type | Nil = nil
+        \\}
+        \\
+        \\pub struct TestProg.Builder {
+        \\  pub fn manifest(_env :: Zap.Env) -> Zap.Manifest {
+        \\    %Zap.Manifest{
+        \\      name: "test_prog",
+        \\      version: "0.1.0",
+        \\      kind: :bin,
+        \\      root: &TestProg.main/0,
+        \\      memory: ThirdParty.ProjectArena
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "build.zap", .source = source },
+    };
+    const struct_order = [_][]const u8{"TestProg.Builder"};
+    const level_boundaries = [_]u32{1};
+
+    var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+        .level_boundaries = &level_boundaries,
+        .allow_external_static_references = true,
+    });
+    const ctfe_result = try compiler.compileForCtfe(alloc, &ctx, .{
+        .show_progress = false,
+        .allow_external_static_references = true,
+    });
+
+    var interp = zap.ctfe.Interpreter.init(alloc, &ctfe_result.ir_program);
+    defer interp.deinit();
+    interp.scope_graph = &ctx.collector.graph;
+    interp.interner = &ctx.interner;
+    interp.capabilities = zap.ctfe.CapabilitySet.build;
+
+    const manifest_id = findManifestFunction(&ctfe_result.ir_program) orelse return error.ManifestNotFound;
+    const manifest_result = try interp.evalAndExport(
+        manifest_id,
+        &.{buildEnvConst("test_prog")},
+        zap.ctfe.CapabilitySet.build,
+    );
+    const config = try constValueToBuildConfig(alloc, manifest_result.value);
+    const selected_memory = try memoryManagerSelectionFromManifest(alloc, manifest_result.value);
+
+    try testing.expect(config.root != null);
+    try testing.expectEqualStrings("TestProg.main/0", config.root.?);
     try testing.expect(selected_memory != null);
     try testing.expectEqualStrings("ThirdParty.ProjectArena", selected_memory.?.type_name);
 }

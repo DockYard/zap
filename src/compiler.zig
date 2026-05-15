@@ -523,6 +523,7 @@ pub fn collectAllFromUnits(
             &interner,
             &collector,
             &diag_engine,
+            options.allow_external_static_references,
         ) catch |err| {
             if (options.show_progress) std.debug.print("\r\x1b[K", .{});
             emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
@@ -1269,6 +1270,7 @@ fn stagedMacroExpandAndDesugar(
     interner: *ast.StringInterner,
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
+    allow_external_static_references: bool,
 ) CompileError!ast.Program {
     const original_structs = buildStructPrograms(alloc, program, interner) catch return error.OutOfMemory;
     var expanded_structs: std.ArrayListUnmanaged(StructProgram) = .empty;
@@ -1313,6 +1315,7 @@ fn stagedMacroExpandAndDesugar(
             diag_engine,
             shared_store,
             group_id_offset,
+            allow_external_static_references,
         );
         const hir_ms = staged_timer.lapMs();
         group_id_offset = hir_result.next_group_id;
@@ -1546,6 +1549,7 @@ fn compileStagedStructHir(
     diag_engine: *zap.DiagnosticEngine,
     shared_store: *zap.types.TypeStore,
     group_id_offset: u32,
+    allow_external_static_references: bool,
 ) CompileError!StructHirResult {
     const error_baseline = diag_engine.errorCount();
     if (findUndesugaredMacroForm(desugared) orelse findUndesugaredMacroFormInGraphImpls(&collector.graph, desugared)) |form| {
@@ -1564,6 +1568,7 @@ fn compileStagedStructHir(
     var sub_timer = ZapTimer.start();
     var type_checker = zap.types.TypeChecker.initWithSharedStore(alloc, shared_store, interner, &collector.graph);
     defer type_checker.deinit();
+    type_checker.allow_external_static_references = allow_external_static_references;
     type_checker.checkProgram(desugared) catch {};
     const tc_ms = sub_timer.lapMs();
     for (type_checker.errors.items) |type_err| {
@@ -1580,6 +1585,7 @@ fn compileStagedStructHir(
 
     var hir_builder = zap.hir.HirBuilder.init(alloc, interner, &collector.graph, shared_store);
     hir_builder.next_group_id = group_id_offset;
+    hir_builder.allow_external_static_references = allow_external_static_references;
     sub_timer.reset();
     const hir_program = hir_builder.buildProgram(desugared) catch {
         for (hir_builder.errors.items) |hir_err| {
