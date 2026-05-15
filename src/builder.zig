@@ -453,30 +453,35 @@ pub const MemoryAdapterEval = struct {
 
 pub fn evaluateMemoryManagerAdapterFromSources(
     alloc: std.mem.Allocator,
-    build_source: []const u8,
+    source_roots: []const zap.discovery.SourceRoot,
     source_units: []const compiler.SourceUnit,
     selected_manager: ?BuildConfig.MemoryManager,
     target_name: []const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
-    zap_lib_dir: ?[]const u8,
 ) !MemoryAdapterEval {
+    const selected = selected_manager orelse return .{ .manager = null };
+    if (selected.type_name.len == 0) return .{ .manager = null };
+
+    var graph = try discoverMemoryAdapterGraph(alloc, selected.type_name, source_roots, source_units);
+    defer graph.deinit();
+    if (!graph.struct_to_file.contains(selected.type_name)) return error.InvalidMemoryManagerAdapter;
+
     var ctfe_source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
-    try appendUniqueSourceUnit(alloc, &ctfe_source_units, .{ .file_path = "build.zap", .source = build_source });
-    if (zap_lib_dir) |lib_dir| {
-        try readLibSourceUnitsUnique(alloc, lib_dir, &ctfe_source_units);
-    }
-    for (source_units) |unit| {
-        try appendUniqueSourceUnit(alloc, &ctfe_source_units, unit);
+    try appendDiscoveredSourceUnits(alloc, &ctfe_source_units, graph.topo_order.items, source_units, &graph);
+
+    var struct_order: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer struct_order.deinit(alloc);
+    for (graph.topo_order.items) |file_path| {
+        if (graph.file_to_struct.get(file_path)) |struct_name| {
+            try struct_order.append(alloc, struct_name);
+        }
     }
 
-    const struct_order_data = computeStructOrder(alloc, build_source, ctfe_source_units.items, zap_lib_dir) catch null;
     var collect_options = compiler.CompileOptions{
         .show_progress = false,
     };
-    if (struct_order_data) |order| {
-        collect_options.struct_order = order.struct_order;
-        collect_options.level_boundaries = order.level_boundaries;
-    }
+    collect_options.struct_order = struct_order.items;
+    collect_options.level_boundaries = graph.level_boundaries.items;
 
     var ctx = compiler.collectAllFromUnits(alloc, ctfe_source_units.items, collect_options) catch return error.CompileFailed;
     const result = compiler.compileForCtfe(alloc, &ctx, .{
@@ -491,18 +496,6 @@ pub fn evaluateMemoryManagerAdapterFromSources(
     interp.build_opts = build_opts;
     interp.compile_options_hash = zap.ctfe.hashCompileOptions(target_name, build_opts.get("optimize") orelse "release_safe");
 
-    const manifest_id = findManifestFunction(&result.ir_program) orelse
-        return error.ManifestNotFound;
-    const manifest_result = interp.evalAndExport(
-        manifest_id,
-        &.{buildEnvConst(target_name)},
-        zap.ctfe.CapabilitySet.build,
-    ) catch return error.CtfeFailed;
-
-    const selected = (try memoryManagerSelectionFromManifest(alloc, manifest_result.value)) orelse
-        selected_manager orelse return .{ .manager = null };
-    if (selected.type_name.len == 0) return .{ .manager = null };
-
     const adapter_value = emptyMemoryManagerValue(selected.type_name);
     return evaluateMemoryManagerAdapterValue(
         alloc,
@@ -512,6 +505,123 @@ pub fn evaluateMemoryManagerAdapterFromSources(
         selected.type_name,
         adapter_value,
     );
+}
+
+fn discoverMemoryAdapterGraph(
+    alloc: std.mem.Allocator,
+    adapter_type_name: []const u8,
+    source_roots: []const zap.discovery.SourceRoot,
+    source_units: []const compiler.SourceUnit,
+) !zap.discovery.FileGraph {
+    var graph = try zap.discovery.discoverWithSourceFiles(
+        alloc,
+        adapter_type_name,
+        source_roots,
+        &zap.discovery.BUILTIN_TYPE_NAMES,
+        &.{},
+        null,
+    );
+    if (graph.struct_to_file.contains(adapter_type_name)) return graph;
+
+    graph.deinit();
+
+    const explicit_source_files = try explicitSourceFilesDeclaringStruct(alloc, source_units, adapter_type_name);
+    var explicit_graph = try zap.discovery.discoverWithSourceFiles(
+        alloc,
+        adapter_type_name,
+        source_roots,
+        &zap.discovery.BUILTIN_TYPE_NAMES,
+        explicit_source_files,
+        null,
+    );
+    errdefer explicit_graph.deinit();
+    return explicit_graph;
+}
+
+fn explicitSourceFilesDeclaringStruct(
+    alloc: std.mem.Allocator,
+    source_units: []const compiler.SourceUnit,
+    struct_name: []const u8,
+) ![]const []const u8 {
+    var file_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (source_units) |unit| {
+        if (!try sourceDeclaresStructName(alloc, unit.source, struct_name)) continue;
+        try file_paths.append(alloc, unit.file_path);
+    }
+    return try file_paths.toOwnedSlice(alloc);
+}
+
+fn sourceDeclaresStructName(
+    alloc: std.mem.Allocator,
+    source: []const u8,
+    expected_struct_name: []const u8,
+) !bool {
+    var lexer = zap.Lexer.init(source);
+    while (true) {
+        const tok = lexer.next();
+        if (tok.tag == .eof) return false;
+        if (tok.tag != .keyword_struct) continue;
+
+        const name_tok = lexer.next();
+        if (name_tok.tag != .type_identifier) continue;
+
+        var name_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer name_buf.deinit(alloc);
+        try name_buf.appendSlice(alloc, name_tok.slice(source));
+
+        var peek = lexer;
+        while (true) {
+            const dot_tok = peek.next();
+            if (dot_tok.tag != .dot) break;
+            const next_tok = peek.next();
+            if (next_tok.tag != .type_identifier) break;
+            try name_buf.append(alloc, '.');
+            try name_buf.appendSlice(alloc, next_tok.slice(source));
+            lexer = peek;
+        }
+
+        if (std.mem.eql(u8, name_buf.items, expected_struct_name)) return true;
+    }
+}
+
+fn appendDiscoveredSourceUnits(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(compiler.SourceUnit),
+    file_paths: []const []const u8,
+    provided_units: []const compiler.SourceUnit,
+    graph: *const zap.discovery.FileGraph,
+) !void {
+    for (file_paths) |file_path| {
+        const provided = try findProvidedSourceUnit(alloc, provided_units, file_path);
+        if (provided) |unit| {
+            try appendUniqueSourceUnit(alloc, out, unit);
+            continue;
+        }
+
+        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch
+            return error.ReadError;
+        try appendUniqueSourceUnit(alloc, out, .{
+            .file_path = file_path,
+            .source = source,
+            .primary_struct_name = graph.file_to_struct.get(file_path),
+        });
+    }
+}
+
+fn findProvidedSourceUnit(
+    alloc: std.mem.Allocator,
+    provided_units: []const compiler.SourceUnit,
+    file_path: []const u8,
+) !?compiler.SourceUnit {
+    const target_key = canonicalSourcePath(alloc, file_path) catch try alloc.dupe(u8, file_path);
+    defer alloc.free(target_key);
+
+    for (provided_units) |unit| {
+        const unit_key = canonicalSourcePath(alloc, unit.file_path) catch try alloc.dupe(u8, unit.file_path);
+        defer alloc.free(unit_key);
+        if (std.mem.eql(u8, unit_key, target_key)) return unit;
+    }
+    return null;
 }
 
 fn memoryManagerSelectionFromManifest(
@@ -1543,6 +1653,74 @@ test "memoryManagerSelectionFromManifest preserves underscores in Type names" {
     } };
     const selected = (try memoryManagerSelectionFromManifest(alloc, val)) orelse return error.UnexpectedNull;
     try testing.expectEqualStrings("Foo_Bar.Manager", selected.type_name);
+}
+
+test "memory adapter source evaluation ignores unrelated project sources" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/third_party");
+
+    const manager_source =
+        \\pub struct ThirdParty.ProjectArena {
+        \\}
+        \\
+        \\pub impl Memory.Manager for ThirdParty.ProjectArena {
+        \\  pub fn backend(manager :: ThirdParty.ProjectArena) -> Bool {
+        \\    :zig.Memory.backend(manager)
+        \\  }
+        \\}
+    ;
+    const unrelated_source =
+        \\pub struct TestProg {
+        \\  pub fn main() -> String {
+        \\    Missing.call()
+        \\    "done"
+        \\  }
+        \\}
+    ;
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "lib/third_party/project_arena.zap",
+        .data = manager_source,
+    });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "lib/test_prog.zap",
+        .data = unrelated_source,
+    });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const project_lib_path = try std.fs.path.join(alloc, &.{ tmp_path, "lib" });
+    const zap_lib_path = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, "lib", alloc);
+    const manager_path = try std.fs.path.join(alloc, &.{ project_lib_path, "third_party", "project_arena.zap" });
+    const unrelated_path = try std.fs.path.join(alloc, &.{ project_lib_path, "test_prog.zap" });
+
+    const source_roots = &[_]zap.discovery.SourceRoot{
+        .{ .name = "project", .path = project_lib_path },
+        .{ .name = "zap_stdlib", .path = zap_lib_path },
+    };
+    const source_units = &[_]compiler.SourceUnit{
+        .{ .file_path = manager_path, .source = manager_source },
+        .{ .file_path = unrelated_path, .source = unrelated_source },
+    };
+
+    const build_opts = std.StringHashMapUnmanaged([]const u8).empty;
+    const memory_eval = try evaluateMemoryManagerAdapterFromSources(
+        alloc,
+        source_roots,
+        source_units,
+        .{ .type_name = "ThirdParty.ProjectArena" },
+        "test_prog",
+        build_opts,
+    );
+
+    try testing.expect(memory_eval.manager != null);
+    try testing.expectEqualStrings("ThirdParty.ProjectArena", memory_eval.manager.?.type_name);
+    try testing.expectEqualStrings(manager_path, memory_eval.manager.?.adapter_source_path.?);
 }
 
 test "constValueToBuildConfig leaves memory: null when omitted" {

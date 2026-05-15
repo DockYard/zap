@@ -1033,12 +1033,11 @@ fn buildTarget(
 
     const memory_adapter_eval = builder.evaluateMemoryManagerAdapterFromSources(
         alloc,
-        build_source,
+        source_roots.items,
         source_units.items,
         config.memory_manager,
         target_name,
         build_opts,
-        zap_lib_dir,
     ) catch |err| {
         std.debug.print("Error: failed to evaluate Memory.Manager adapter: {}\n", .{err});
         std.process.exit(1);
@@ -1693,12 +1692,11 @@ const IncrementalWatchState = struct {
         const memory_source_units = collectMemoryAdapterSourceUnits(alloc, watch_source_roots.items) catch return null;
         const memory_adapter_eval = zap.builder.evaluateMemoryManagerAdapterFromSources(
             alloc,
-            build_source,
+            watch_source_roots.items,
             memory_source_units,
             config.memory_manager,
             target_name,
             build_opts,
-            zap_lib_dir,
         ) catch |err| {
             std.debug.print("Error: watch-mode Memory.Manager adapter evaluation failed: {}\n", .{err});
             return null;
