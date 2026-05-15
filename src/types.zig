@@ -1144,6 +1144,13 @@ pub const TypeChecker = struct {
     /// emits inside `__for_N` triggering an infinite eager re-check loop.
     eager_helper_in_flight: std.AutoHashMap(ast.StringId, void) = undefined,
 
+    /// Build-manifest CTFE compiles `build.zap` before target/dependency
+    /// sources are known. In that pass, first-class `Type` and `Function`
+    /// values may intentionally name declarations outside the manifest graph.
+    /// Regular project compilation keeps this false so type references remain
+    /// strict everywhere else.
+    allow_external_static_references: bool = false,
+
     pub const Error = struct {
         message: []const u8,
         span: ast.SourceSpan,
@@ -1197,6 +1204,7 @@ pub const TypeChecker = struct {
             .analysis_program = null,
             .type_var_scope = std.StringHashMap(TypeId).init(allocator),
             .eager_helper_in_flight = std.AutoHashMap(ast.StringId, void).init(allocator),
+            .allow_external_static_references = false,
         };
     }
 
@@ -1216,6 +1224,7 @@ pub const TypeChecker = struct {
             .analysis_program = null,
             .type_var_scope = std.StringHashMap(TypeId).init(allocator),
             .eager_helper_in_flight = std.AutoHashMap(ast.StringId, void).init(allocator),
+            .allow_external_static_references = false,
         };
     }
 
@@ -1655,6 +1664,10 @@ pub const TypeChecker = struct {
             return .{ .type_id = TypeStore.UNKNOWN, .name = type_name };
         }
 
+        if (self.allow_external_static_references) {
+            return .{ .type_id = TypeStore.UNKNOWN, .name = type_name };
+        }
+
         return null;
     }
 
@@ -1811,6 +1824,9 @@ pub const TypeChecker = struct {
         if (!self.store.typeEquals(resolved_type_id, function_type_id)) return;
 
         const static_value = (try self.staticFunctionStructValue(struct_expr)) orelse return;
+        if (self.allow_external_static_references and self.graph.findStructScope(static_value.struct_name) == null) {
+            return;
+        }
         _ = try self.resolveFunctionReferenceTarget(
             static_value.struct_name,
             static_value.function_name,
@@ -2367,6 +2383,12 @@ pub const TypeChecker = struct {
     }
 
     fn resolveFunctionRefSignature(self: *TypeChecker, fr: ast.FunctionRefExpr) !?FunctionSignature {
+        if (self.allow_external_static_references) {
+            if (fr.struct_name) |struct_name| {
+                if (self.graph.findStructScope(struct_name) == null) return null;
+            }
+        }
+
         const target = (try self.resolveFunctionReferenceTarget(
             fr.struct_name,
             fr.function,

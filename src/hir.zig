@@ -2165,6 +2165,10 @@ pub const HirBuilder = struct {
     /// Maps type variable names to TypeIds within the current function clause,
     /// ensuring `a` in `fn foo(x :: a) -> a` refers to the same type variable.
     hir_type_var_scope: std.StringHashMap(types_mod.TypeId),
+    /// Mirrors the manifest CTFE type-checker policy: build.zap may emit
+    /// first-class `Type`/`Function` values that name target-source structs
+    /// before those sources are loaded.
+    allow_external_static_references: bool = false,
     errors: std.ArrayList(Error),
 
     pub const Error = struct {
@@ -2207,6 +2211,7 @@ pub const HirBuilder = struct {
             .current_capture_map = std.AutoHashMap(ast.StringId, u32).init(allocator),
             .current_capture_list = .empty,
             .hir_type_var_scope = std.StringHashMap(types_mod.TypeId).init(allocator),
+            .allow_external_static_references = false,
             .errors = .empty,
         };
     }
@@ -2997,6 +3002,7 @@ pub const HirBuilder = struct {
             return struct_name.parts[0];
         }
         if (self.graph.findStructScope(struct_name) != null) return dotted_name;
+        if (self.allow_external_static_references) return dotted_name;
         return null;
     }
 

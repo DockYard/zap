@@ -141,6 +141,7 @@ pub fn ctfeManifestDetailed(
     var ctx = compiler.collectAllFromUnits(alloc, source_units.items, collect_options) catch return error.CompileFailed;
     const result = compiler.compileForCtfe(alloc, &ctx, .{
         .show_progress = false,
+        .allow_external_static_references = true,
     }) catch return error.CompileFailed;
 
     // Create CTFE interpreter with build capabilities and persistent cache
@@ -1114,6 +1115,78 @@ test "ctfe manifest extracts root Function reference" {
 
     try testing.expect(config.root != null);
     try testing.expectEqualStrings("App.main/1", config.root.?);
+}
+
+test "ctfe manifest permits target-source Type and Function references" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Function {
+        \\  struct :: Type
+        \\  name :: Atom
+        \\  arity :: u8
+        \\}
+        \\
+        \\pub struct Zap.Env {
+        \\}
+        \\
+        \\pub struct Zap.Manifest {
+        \\  name :: String
+        \\  version :: String
+        \\  kind :: Atom
+        \\  root :: Function | Nil = nil
+        \\  memory :: Type | Nil = nil
+        \\}
+        \\
+        \\pub struct App.Builder {
+        \\  pub fn manifest(_env :: Zap.Env) -> Zap.Manifest {
+        \\    %Zap.Manifest{
+        \\      name: "app",
+        \\      version: "0.1.0",
+        \\      kind: :bin,
+        \\      root: &App.main/1,
+        \\      memory: ThirdParty.ProjectArena
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "build.zap", .source = source },
+    };
+
+    var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+    const result = try compiler.compileForCtfe(alloc, &ctx, .{
+        .show_progress = false,
+        .allow_external_static_references = true,
+    });
+
+    var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    defer interp.deinit();
+    interp.scope_graph = &ctx.collector.graph;
+    interp.interner = &ctx.interner;
+    interp.capabilities = zap.ctfe.CapabilitySet.build;
+
+    const manifest_id = findManifestFunction(&result.ir_program) orelse return error.ManifestNotFound;
+    const env_const = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Env",
+        .fields = &.{},
+    } };
+
+    const manifest_result = try interp.evalAndExport(manifest_id, &.{env_const}, zap.ctfe.CapabilitySet.build);
+    const config = try constValueToBuildConfig(alloc, manifest_result.value);
+    const selected_memory = try memoryManagerSelectionFromManifest(alloc, manifest_result.value);
+
+    try testing.expect(config.root != null);
+    try testing.expectEqualStrings("App.main/1", config.root.?);
+    try testing.expect(selected_memory != null);
+    try testing.expectEqualStrings("ThirdParty.ProjectArena", selected_memory.?.type_name);
 }
 
 test "memoryManagerSelectionFromManifest parses memory Type value" {

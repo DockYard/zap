@@ -121,6 +121,10 @@ pub const CompileOptions = struct {
     /// (`src/main.zig:compileProjectFrontend`) wires the real value
     /// from the resolved manager's `.zapmem` core vtable.
     declared_caps: u64 = 0,
+    /// Build-manifest CTFE may construct first-class Type/Function values
+    /// that name declarations in target/dependency sources not loaded during
+    /// the initial build.zap-only pass. Project compilation leaves this false.
+    allow_external_static_references: bool = false,
 };
 
 fn ctfeCompileOptionsHash(options: CompileOptions) u64 {
@@ -666,6 +670,7 @@ pub fn compileForCtfe(
     // desugared AST, now wired up to the analysis context.
     type_checker.setAnalysisContext(&analysis_result.context, &ir_program);
     type_checker.errors.clearRetainingCapacity();
+    type_checker.allow_external_static_references = options.allow_external_static_references;
     type_checker.checkProgram(&desugared) catch {};
     type_checker.checkUnusedBindings() catch {};
 
@@ -875,6 +880,7 @@ const Pipeline = struct {
             break :blk zap.types.TypeChecker.initWithSharedStore(self.alloc, store, &self.ctx.interner, &self.ctx.collector.graph);
         } else zap.types.TypeChecker.init(self.alloc, &self.ctx.interner, &self.ctx.collector.graph);
         errdefer type_checker.deinit();
+        type_checker.allow_external_static_references = self.options.allow_external_static_references;
 
         type_checker.checkProgram(desugared) catch {};
         if (check_unused) type_checker.checkUnusedBindings() catch {};
@@ -914,6 +920,7 @@ const Pipeline = struct {
         self.progress("HIR");
         var hir_builder = zap.hir.HirBuilder.init(self.alloc, &self.ctx.interner, &self.ctx.collector.graph, type_store);
         hir_builder.next_group_id = group_id_offset;
+        hir_builder.allow_external_static_references = self.options.allow_external_static_references;
         const hir_program = hir_builder.buildProgram(desugared) catch {
             for (hir_builder.errors.items) |hir_err| {
                 self.ctx.diag_engine.err(hir_err.message, hir_err.span) catch {};
