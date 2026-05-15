@@ -5006,7 +5006,7 @@ pub const TypeChecker = struct {
     fn inferStaticFunctionCall(
         self: *TypeChecker,
         call: *const ast.CallExpr,
-        struct_name: ast.StructName,
+        struct_name: ?ast.StructName,
         function_name: ast.StringId,
         raw_arity: u32,
     ) !TypeId {
@@ -5052,16 +5052,7 @@ pub const TypeChecker = struct {
 
         if (call.callee.* == .function_ref) {
             const function_ref = call.callee.function_ref;
-            const target_struct_name = function_ref.struct_name orelse blk: {
-                const current_name = self.currentStructNameText() orelse {
-                    for (call.args) |arg| _ = try self.inferExpr(arg);
-                    return TypeStore.UNKNOWN;
-                };
-                const interner_mut = @constCast(self.interner);
-                const current_name_id = try interner_mut.intern(current_name);
-                break :blk try self.dottedTypeNameToStructName(current_name_id, function_ref.meta.span);
-            };
-            return try self.inferStaticFunctionCall(call, target_struct_name, function_ref.function, function_ref.arity);
+            return try self.inferStaticFunctionCall(call, function_ref.struct_name, function_ref.function, function_ref.arity);
         }
 
         if (call.callee.* == .struct_expr) {
@@ -6652,6 +6643,38 @@ test "function ref inference returns first-class Function value" {
     const function_type = checker.store.name_to_type.get(function_name) orelse return error.TestUnexpectedResult;
 
     try std.testing.expectEqual(function_type, inferred);
+}
+
+test "direct local function ref call resolves function scope before struct scope" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn outer(base :: i64) -> i64 {
+        \\    pub fn add_base(x :: i64) -> i64 {
+        \\      base + x
+        \\    }
+        \\
+        \\    &add_base/1(10)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 }
 
 test "bare struct reference infers first-class Type value" {
