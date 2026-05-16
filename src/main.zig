@@ -905,7 +905,9 @@ fn cmdRunScript(
     }
 
     // ----- Resolve the stdlib (flag > env > exe-relative > cwd) -----------
-    const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override) catch {
+    // Single-file script mode has no project root, so the project-root
+    // stdlib tier never applies — pass `null` for it explicitly.
+    const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override, null) catch {
         std.debug.print("Error: could not resolve Zap stdlib directory\n", .{});
         std.process.exit(1);
     };
@@ -1293,7 +1295,7 @@ fn cmdDeps(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     };
 
-    const zap_lib_dir = resolveZapLibDir(allocator, zap_lib_dir_override) catch {
+    const zap_lib_dir = resolveZapLibDir(allocator, zap_lib_dir_override, project_root) catch {
         std.debug.print("Error: could not resolve Zap stdlib directory\n", .{});
         std.process.exit(1);
     };
@@ -1525,11 +1527,13 @@ const ZapLibDirError = error{
 fn chooseZapLibDir(
     flag: ?[]const u8,
     env_val: ?[]const u8,
+    project_relative: ?[]const u8,
     exe_relative: ?[]const u8,
     cwd_fallback: ?[]const u8,
 ) ?[]const u8 {
     if (flag) |f| return f;
     if (env_val) |e| return e;
+    if (project_relative) |p| return p;
     if (exe_relative) |x| return x;
     if (cwd_fallback) |c| return c;
     return null;
@@ -1591,17 +1595,34 @@ fn resolveExeRelativeZapLibDir(allocator: std.mem.Allocator) ?[]const u8 {
 /// Generalized Zap stdlib resolver.
 ///
 /// Precedence (highest wins): explicit `--zap-lib-dir` flag value, the
-/// `ZAP_LIB_DIR` environment variable, the realpath-resolved
-/// executable-relative walk-up, then the cwd `./lib` fallback. When the
-/// explicit flag or the env var is set but does not point at a directory
-/// containing `kernel.zap`, this is a hard `InvalidZapLibDir` error — an
-/// explicit override that is wrong is a configuration mistake and must
-/// not silently fall through to a lower-precedence source. Returns a
-/// caller-owned duplicate of the resolved directory, or null when no
-/// source resolves and no override was given. The returned path is
-/// always the `lib/` directory itself (never its parent), so
-/// `dirname(resolved)` remains a valid source-tree-root derivation.
-fn resolveZapLibDir(allocator: std.mem.Allocator, flag: ?[]const u8) ZapLibDirError!?[]const u8 {
+/// `ZAP_LIB_DIR` environment variable, the project-root stdlib working
+/// tree (`<project_root>/lib` when it directly contains `kernel.zap`),
+/// the realpath-resolved executable-relative walk-up, then the cwd
+/// `./lib` fallback.
+///
+/// The project-root tier exists because a project that is itself a Zap
+/// stdlib source tree is authoritative: it is the code under
+/// edit/test and is independently registered as a `project` source
+/// root by the discovery setup. Letting a lower-precedence
+/// exe-relative *installed copy* (e.g. `zig-out/lib`) win there would
+/// both (a) silently compile/test a stale snapshot instead of the
+/// developer's edits and (b) leave discovery scanning two physical
+/// copies of every stdlib file, tripping "struct already defined".
+/// Pass `null` for `project_root` when there is genuinely no project
+/// (single-file script mode); ordinary app projects are unaffected
+/// because their `lib/` is their own code, not a stdlib (no
+/// `kernel.zap`), so this tier is skipped and exe-relative still wins.
+///
+/// When the explicit flag or the env var is set but does not point at a
+/// directory containing `kernel.zap`, this is a hard `InvalidZapLibDir`
+/// error — an explicit override that is wrong is a configuration
+/// mistake and must not silently fall through to a lower-precedence
+/// source. Returns a caller-owned duplicate of the resolved directory,
+/// or null when no source resolves and no override was given. The
+/// returned path is always the `lib/` directory itself (never its
+/// parent), so `dirname(resolved)` remains a valid source-tree-root
+/// derivation.
+fn resolveZapLibDir(allocator: std.mem.Allocator, flag: ?[]const u8, project_root: ?[]const u8) ZapLibDirError!?[]const u8 {
     // 1. Explicit `--zap-lib-dir` flag — validated; wrong is fatal.
     if (flag) |flag_dir| {
         if (!zapLibDirContainsKernel(allocator, flag_dir)) {
@@ -1626,11 +1647,29 @@ fn resolveZapLibDir(allocator: std.mem.Allocator, flag: ?[]const u8) ZapLibDirEr
         return allocator.dupe(u8, env_dir) catch return error.OutOfMemory;
     }
 
-    // 3. Executable-relative walk-up (symlinks resolved via realpath).
+    // 3. Project-root stdlib working tree. When the project being built
+    //    is itself a Zap stdlib source tree (its own `lib/` directly
+    //    contains `kernel.zap`), that working tree is authoritative —
+    //    see the function doc for why this must outrank the
+    //    exe-relative installed copy. Skipped for callers without a
+    //    project root and for ordinary app projects whose `lib/` is not
+    //    a stdlib.
+    var project_relative: ?[]const u8 = null;
+    defer if (project_relative) |p| allocator.free(p);
+    if (project_root) |root| {
+        const proj_lib = std.fs.path.join(allocator, &.{ root, "lib" }) catch return error.OutOfMemory;
+        if (zapLibDirContainsKernel(allocator, proj_lib)) {
+            project_relative = proj_lib;
+        } else {
+            allocator.free(proj_lib);
+        }
+    }
+
+    // 4. Executable-relative walk-up (symlinks resolved via realpath).
     const exe_relative = resolveExeRelativeZapLibDir(allocator);
     defer if (exe_relative) |x| allocator.free(x);
 
-    // 4. cwd `./lib` fallback (unchanged from the legacy behavior):
+    // 5. cwd `./lib` fallback (unchanged from the legacy behavior):
     //    accepted only when `./lib/kernel.zap` is present.
     var cwd_fallback: ?[]const u8 = null;
     defer if (cwd_fallback) |c| allocator.free(c);
@@ -1638,7 +1677,7 @@ fn resolveZapLibDir(allocator: std.mem.Allocator, flag: ?[]const u8) ZapLibDirEr
         cwd_fallback = allocator.dupe(u8, "lib") catch return error.OutOfMemory;
     } else |_| {}
 
-    const chosen = chooseZapLibDir(null, null, exe_relative, cwd_fallback) orelse return null;
+    const chosen = chooseZapLibDir(null, null, project_relative, exe_relative, cwd_fallback) orelse return null;
     return allocator.dupe(u8, chosen) catch return error.OutOfMemory;
 }
 
@@ -1735,7 +1774,7 @@ fn buildTarget(
     };
 
     // Resolve zap lib dir for stdlib (flag > env > exe-relative > cwd).
-    const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override) catch {
+    const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override, project_root) catch {
         std.debug.print("Error: could not resolve Zap stdlib directory\n", .{});
         std.process.exit(1);
     };
@@ -3213,7 +3252,7 @@ const IncrementalWatchState = struct {
         // on every rebuild exactly as a one-shot build does.
         const build_file_path = std.fs.path.join(alloc, &.{ project_root, "build.zap" }) catch return null;
         const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_file_path, alloc, .limited(10 * 1024 * 1024)) catch return null;
-        const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override) catch return null;
+        const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override, project_root) catch return null;
         const manifest_eval = zap.builder.ctfeManifestDetailed(alloc, build_source, target_name, build_opts, zap_lib_dir) catch return null;
         var config = manifest_eval.config;
         applyBuildOverrides(&config, build_overrides);
@@ -3451,7 +3490,7 @@ const IncrementalWatchState = struct {
         // incremental rebuild keeps the CLI `-D` overrides in effect.
         const build_file_path = try std.fs.path.join(alloc, &.{ project_root, "build.zap" });
         const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_file_path, alloc, .limited(10 * 1024 * 1024)) catch return error.ReadError;
-        const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override) catch return error.ManifestError;
+        const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override, project_root) catch return error.ManifestError;
         const manifest_eval = zap.builder.ctfeManifestDetailed(alloc, build_source, target_name, build_opts, zap_lib_dir) catch return error.ManifestError;
         var config = manifest_eval.config;
         applyBuildOverrides(&config, build_overrides);
@@ -4660,6 +4699,7 @@ test "chooseZapLibDir: explicit flag wins over every lower precedence source" {
     const chosen = chooseZapLibDir(
         "/from/flag/lib",
         "/from/env/lib",
+        "/from/project/lib",
         "/from/exe/lib",
         "/from/cwd/lib",
     );
@@ -4670,14 +4710,27 @@ test "chooseZapLibDir: env wins when flag is absent" {
     const chosen = chooseZapLibDir(
         null,
         "/from/env/lib",
+        "/from/project/lib",
         "/from/exe/lib",
         "/from/cwd/lib",
     );
     try testing.expectEqualStrings("/from/env/lib", chosen.?);
 }
 
-test "chooseZapLibDir: exe-relative wins when flag and env are absent" {
+test "chooseZapLibDir: project-relative wins over exe-relative and cwd when flag/env absent" {
     const chosen = chooseZapLibDir(
+        null,
+        null,
+        "/from/project/lib",
+        "/from/exe/lib",
+        "/from/cwd/lib",
+    );
+    try testing.expectEqualStrings("/from/project/lib", chosen.?);
+}
+
+test "chooseZapLibDir: exe-relative wins when flag, env, and project are absent" {
+    const chosen = chooseZapLibDir(
+        null,
         null,
         null,
         "/from/exe/lib",
@@ -4691,13 +4744,14 @@ test "chooseZapLibDir: cwd fallback wins when all higher sources are absent" {
         null,
         null,
         null,
+        null,
         "/from/cwd/lib",
     );
     try testing.expectEqualStrings("/from/cwd/lib", chosen.?);
 }
 
 test "chooseZapLibDir: returns null when no source resolves" {
-    try testing.expect(chooseZapLibDir(null, null, null, null) == null);
+    try testing.expect(chooseZapLibDir(null, null, null, null, null) == null);
 }
 
 test "resolveZapLibDir: invalid explicit flag dir without kernel.zap is a hard error" {
@@ -4708,7 +4762,7 @@ test "resolveZapLibDir: invalid explicit flag dir without kernel.zap is a hard e
 
     try testing.expectError(
         error.InvalidZapLibDir,
-        resolveZapLibDir(testing.allocator, tmp_path),
+        resolveZapLibDir(testing.allocator, tmp_path, null),
     );
 }
 
@@ -4720,7 +4774,7 @@ test "resolveZapLibDir: valid explicit flag dir containing kernel.zap is accepte
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
-    const resolved = try resolveZapLibDir(testing.allocator, tmp_path);
+    const resolved = try resolveZapLibDir(testing.allocator, tmp_path, null);
     defer if (resolved) |r| testing.allocator.free(r);
     try testing.expect(resolved != null);
     try testing.expectEqualStrings(tmp_path, resolved.?);
@@ -4731,13 +4785,64 @@ test "resolveZapLibDir: no flag, no env behaves like the legacy exe-walk/cwd pat
     // resolver must still produce the in-repo `lib` directory because the
     // test runner's cwd is the project root containing `lib/kernel.zap`.
     // This guards the "behavior identical to today when flag/env absent"
-    // regression requirement.
-    const resolved = try resolveZapLibDir(testing.allocator, null);
+    // regression requirement. A `null` project_root means the
+    // project-root tier never applies, so this is byte-for-byte the
+    // legacy exe-walk/cwd path.
+    const resolved = try resolveZapLibDir(testing.allocator, null, null);
     defer if (resolved) |r| testing.allocator.free(r);
     try testing.expect(resolved != null);
     const kernel_path = try std.fs.path.join(testing.allocator, &.{ resolved.?, "kernel.zap" });
     defer testing.allocator.free(kernel_path);
     try std.Io.Dir.cwd().access(global_io, kernel_path, .{});
+}
+
+test "resolveZapLibDir: project-root stdlib working tree wins over exe-relative copy" {
+    // A project that is itself a Zap stdlib source tree (its own
+    // `lib/kernel.zap` exists) is authoritative: the resolver must
+    // return that working-tree `lib/`, never a lower-precedence
+    // exe-relative installed copy. This is what keeps `zap test` /
+    // `zap build` run from inside the stdlib repo compiling the edited
+    // tree, and stops discovery from scanning two physical copies of
+    // every stdlib file (the "struct already defined" regression).
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    tmp_dir.dir.createDirPath(global_io, "lib") catch return error.SkipZigTest;
+    tmp_dir.dir.writeFile(global_io, .{ .sub_path = "lib/kernel.zap", .data = "" }) catch
+        return error.SkipZigTest;
+    const proj_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", testing.allocator);
+    defer testing.allocator.free(proj_root);
+
+    const resolved = try resolveZapLibDir(testing.allocator, null, proj_root);
+    defer if (resolved) |r| testing.allocator.free(r);
+    try testing.expect(resolved != null);
+
+    const expected = try std.fs.path.join(testing.allocator, &.{ proj_root, "lib" });
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, resolved.?);
+}
+
+test "resolveZapLibDir: ordinary project lib without kernel.zap does not hijack resolution" {
+    // An ordinary app project's `lib/` holds the app's own code, not a
+    // stdlib, so the project-root tier must be skipped — resolution
+    // falls through to exe-relative / cwd exactly as before. Guards
+    // against the project tier over-reaching beyond genuine stdlib
+    // source trees.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    tmp_dir.dir.createDirPath(global_io, "lib") catch return error.SkipZigTest;
+    // Note: a `lib/` with NO `kernel.zap`.
+    const proj_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", testing.allocator);
+    defer testing.allocator.free(proj_root);
+
+    const resolved = try resolveZapLibDir(testing.allocator, null, proj_root);
+    defer if (resolved) |r| testing.allocator.free(r);
+    // Whatever resolves (exe-relative or cwd `./lib`), it must NOT be
+    // the kernel-less project lib.
+    if (resolved) |r| {
+        const proj_lib = try std.fs.path.join(testing.allocator, &.{ proj_root, "lib" });
+        defer testing.allocator.free(proj_lib);
+        try testing.expect(!std.mem.eql(u8, proj_lib, r));
+    }
 }
 
 test "parseTargetArgs: captures --zap-lib-dir and leaves other fields unchanged" {
