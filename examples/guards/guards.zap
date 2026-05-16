@@ -11,7 +11,7 @@ pub struct Guards {
     "zero"
   }
 
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     Guards.classify(-4)
     |> IO.puts()
 
@@ -20,5 +20,6 @@ pub struct Guards {
 
     Guards.classify(0)
     |> IO.puts()
+    0
   }
 }

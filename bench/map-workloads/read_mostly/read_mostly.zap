@@ -42,8 +42,9 @@ pub struct ReadMostly {
     }
   }
 
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     total = run_many(20, 0)
     "total=#{total}" |> IO.puts()
+    0
   }
 }

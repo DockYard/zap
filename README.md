@@ -255,8 +255,9 @@ Binary targets name a root function in the manifest:
 
 ```zap
 pub struct MyApp {
-  pub fn main(_args :: [String]) {
+  pub fn main(_args :: [String]) -> u8 {
     IO.puts("Hello from Zap")
+    0
   }
 }
 ```

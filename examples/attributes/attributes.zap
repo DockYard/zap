@@ -16,9 +16,10 @@ pub struct Attributes {
     Entry point
     """
 
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     IO.puts("App: " <> Config.app_name())
     IO.puts("Timeout: " <> Integer.to_string(Config.timeout()))
     IO.puts("Max retries: " <> Integer.to_string(Config.max_retries()))
+    0
   }
 }

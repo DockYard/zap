@@ -22,8 +22,9 @@ pub struct Arena {
     value + sum_to(value - 1)
   }
 
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     total = factorial(7) + sum_to(100)
     "arena_total=#{total}" |> IO.puts()
+    0
   }
 }

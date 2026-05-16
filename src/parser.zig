@@ -4751,8 +4751,9 @@ test "script-mode parser hoists single top-level main/1" {
         \\  }
         \\}
         \\
-        \\fn main(args :: [String]) -> String {
+        \\fn main(args :: [String]) -> u8 {
         \\  Greeter.greet()
+        \\  0
         \\}
     ;
 
@@ -4805,9 +4806,9 @@ test "script-mode parser hoists single top-level main/1" {
 
 test "script-mode parser preserves a single literal main/1 with no other top-level fns" {
     const source =
-        \\fn main(args :: [String]) -> String {
+        \\fn main(args :: [String]) -> u8 {
         \\  IO.puts("ok")
-        \\  "ok"
+        \\  0
         \\}
     ;
 

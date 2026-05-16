@@ -11,8 +11,9 @@
 #   zap run ctfe_basics
 
 pub struct CtfeBasics {
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     Greeter.greet("World")
     |> IO.puts()
+    0
   }
 }

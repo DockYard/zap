@@ -1767,10 +1767,41 @@ pub const TypeChecker = struct {
         return null;
     }
 
+    /// Integer literals are contextually typed: a bare literal can
+    /// satisfy any declared integer type, with narrowing handled by
+    /// the downstream typed position. This matches existing Zap
+    /// behavior for struct fields such as `Function.arity :: u8`.
     fn acceptsIntegerLiteralForExpectedType(self: *const TypeChecker, expr: *const ast.Expr, expected: TypeId) bool {
         if (expr.* != .int_literal) return false;
         if (expected >= self.store.types.items.len) return false;
-        return self.store.getType(expected) == .int;
+        const expected_type = self.store.getType(expected);
+        return expected_type == .int;
+    }
+
+    fn blockTailIntegerLiteralCanSatisfyExpectedType(self: *const TypeChecker, stmts: []const ast.Stmt, expected: TypeId) bool {
+        if (stmts.len == 0) return false;
+        const last = stmts[stmts.len - 1];
+        if (last != .expr) return false;
+        return self.exprTailIntegerLiteralCanSatisfyExpectedType(last.expr, expected);
+    }
+
+    fn exprTailIntegerLiteralCanSatisfyExpectedType(self: *const TypeChecker, expr: *const ast.Expr, expected: TypeId) bool {
+        if (self.acceptsIntegerLiteralForExpectedType(expr, expected)) return true;
+        return switch (expr.*) {
+            .if_expr => |if_expr| blk: {
+                if (!self.blockTailIntegerLiteralCanSatisfyExpectedType(if_expr.then_block, expected)) break :blk false;
+                const else_block = if_expr.else_block orelse break :blk false;
+                break :blk self.blockTailIntegerLiteralCanSatisfyExpectedType(else_block, expected);
+            },
+            .case_expr => |case_expr| blk: {
+                if (case_expr.clauses.len == 0) break :blk false;
+                for (case_expr.clauses) |case_clause| {
+                    if (!self.blockTailIntegerLiteralCanSatisfyExpectedType(case_clause.body, expected)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        };
     }
 
     fn structExprFieldValue(self: *const TypeChecker, struct_expr: ast.StructExpr, field_name_text: []const u8) ?*const ast.Expr {
@@ -4005,6 +4036,33 @@ pub const TypeChecker = struct {
         return std.mem.startsWith(u8, self.interner.get(func.name), "__anon_fn_");
     }
 
+    fn isStringListType(self: *const TypeChecker, type_id: TypeId) bool {
+        if (type_id >= self.store.types.items.len) return false;
+        const typ = self.store.getType(type_id);
+        return typ == .list and self.store.typeEquals(typ.list.element, TypeStore.STRING);
+    }
+
+    fn validateMainEntrypointReturnType(self: *TypeChecker, func: *const ast.FunctionDecl, clause: *const ast.FunctionClause, declared_return: TypeId) !void {
+        if (!std.mem.eql(u8, self.interner.get(func.name), "main")) return;
+        if (clause.params.len != 1) return;
+        const args_type_expr = clause.params[0].type_annotation orelse return;
+        const args_type = try self.resolveTypeExpr(args_type_expr);
+        if (!self.isStringListType(args_type)) return;
+        if (declared_return == TypeStore.UNKNOWN or declared_return == TypeStore.ERROR) return;
+
+        if (self.store.typeEquals(declared_return, TypeStore.U8)) {
+            return;
+        }
+
+        const got = self.typeToString(declared_return);
+        try self.addHardError(
+            try std.fmt.allocPrint(self.allocator, "executable main/1 must return `u8`, got `{s}`", .{got}),
+            clause.meta.span,
+            "invalid main/1 return type",
+            "return `u8` to set the process exit code",
+        );
+    }
+
     fn checkFunctionClause(self: *TypeChecker, func: *const ast.FunctionDecl, clause: *const ast.FunctionClause) !void {
         const prev_scope = self.current_scope;
         self.current_scope = self.graph.resolveClauseScope(clause.meta) orelse clause.meta.scope_id;
@@ -4140,6 +4198,8 @@ pub const TypeChecker = struct {
             break :blk TypeStore.UNKNOWN;
         };
 
+        try self.validateMainEntrypointReturnType(func, clause, declared_return);
+
         // Check refinement is Bool
         if (clause.refinement) |ref| {
             const ref_type = try self.inferExpr(ref);
@@ -4212,7 +4272,9 @@ pub const TypeChecker = struct {
             declared_return != TypeStore.ERROR and
             self.store.getType(declared_return) != .type_var;
         if (declared_is_checkable and body_type != TypeStore.UNKNOWN and body_type != TypeStore.ERROR) {
-            if (!self.store.typeEquals(body_type, declared_return)) {
+            const return_matches_declared = self.store.typeEquals(body_type, declared_return) or
+                if (last_expr) |expr| self.exprTailIntegerLiteralCanSatisfyExpectedType(expr, declared_return) else false;
+            if (!return_matches_declared) {
                 const expected = self.typeToString(declared_return);
                 const got = self.typeToString(body_type);
                 const diagnostics = @import("diagnostics.zig");
@@ -6517,6 +6579,175 @@ test "type check return type mismatch" {
     const err_label = checker.errors.items[0].label orelse "";
     try std.testing.expect(std.mem.find(u8, err_label, "i64") != null);
     try std.testing.expect(std.mem.find(u8, err_label, "String") != null);
+}
+
+test "type check top-level main rejects non-exit-code return type" {
+    const source =
+        \\fn main(_args :: [String]) -> String {
+        \\  "not an exit code"
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.initScript(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "main/1") != null and
+            std.mem.find(u8, err.message, "u8") != null and
+            std.mem.find(u8, err.message, "String") != null)
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "type check top-level main rejects non-u8 integer return type" {
+    const source =
+        \\fn main(_args :: [String]) -> i64 {
+        \\  1
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.initScript(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "main/1") != null and
+            std.mem.find(u8, err.message, "u8") != null and
+            std.mem.find(u8, err.message, "i64") != null)
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "type check top-level main rejects Nil return type" {
+    const source =
+        \\fn main(_args :: [String]) -> Nil {
+        \\  nil
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.initScript(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "main/1") != null and
+            std.mem.find(u8, err.message, "u8") != null and
+            std.mem.find(u8, err.message, "Nil") != null)
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "type check top-level main accepts unannotated integer literal return for u8" {
+    const source =
+        \\fn main(_args :: [String]) -> u8 {
+        \\  13
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.initScript(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |err| {
+        try std.testing.expect(std.mem.find(u8, err.message, "main/1") == null);
+        try std.testing.expect(std.mem.find(u8, err.message, "wrong type") == null);
+    }
+}
+
+test "type check top-level main accepts if branches with unannotated u8 literals" {
+    const source =
+        \\fn main(_args :: [String]) -> u8 {
+        \\  if true {
+        \\    0
+        \\  } else {
+        \\    1
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.initScript(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |err| {
+        try std.testing.expect(std.mem.find(u8, err.message, "wrong type") == null);
+    }
 }
 
 test "type provenance tracks source span on typed parameter" {

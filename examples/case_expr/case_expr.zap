@@ -14,7 +14,7 @@ pub struct CaseExpr {
     }
   }
 
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     CaseExpr.describe(0)
     |> IO.puts()
 
@@ -23,5 +23,6 @@ pub struct CaseExpr {
 
     CaseExpr.describe(42)
     |> IO.puts()
+    0
   }
 }

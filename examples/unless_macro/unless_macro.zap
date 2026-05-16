@@ -12,11 +12,12 @@ pub struct UnlessMacro {
     "small number"
   }
 
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     UnlessMacro.check(5)
     |> IO.puts()
 
     UnlessMacro.check(20)
     |> IO.puts()
+    0
   }
 }

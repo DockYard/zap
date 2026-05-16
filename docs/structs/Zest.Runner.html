@@ -163,16 +163,17 @@ timeout are set.</p>
 <div style="flex:1"></div>
 <a href="#run-0" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">run</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">run</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">u8</span></code></div>
 <div class="function-doc">
 <p>Prints the test summary with counts and exits with a
 failure code if any tests failed.</p>
 <p>Call this as the last line of the test runner's <code>main</code>
-function. It invokes <code>:zig.Zest.summary()</code> which
-outputs the final report to stdout, including the seed
-used for test ordering.</p>
+function. It invokes <code>:zig.Zest.summary()</code> which outputs
+the final report to stdout, including the seed used for
+test ordering, and maps any nonzero failure count to exit
+code <code>1</code>.</p>
 <h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> main(_args <span class="hl-op">::</span> [<span class="hl-type">String</span>]) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> main(_args <span class="hl-op">::</span> [<span class="hl-type">String</span>]) <span class="hl-op">-&gt;</span> <span class="hl-type">u8</span> {
   Zest.Runner.configure()
   Test.MyTest.run()
   Zest.Runner.run()

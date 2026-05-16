@@ -30,8 +30,9 @@ pub struct ErrorPipe {
     }
   }
 
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     IO.puts(process("two"))
     IO.puts(process("invalid"))
+    0
   }
 }

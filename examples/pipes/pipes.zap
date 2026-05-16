@@ -7,11 +7,12 @@ pub struct Pipes {
     x + 1
   }
 
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     5
     |> Pipes.double()
     |> Pipes.add_one()
     |> Integer.to_string()
     |> IO.puts()
+    0
   }
 }

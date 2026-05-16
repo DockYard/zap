@@ -84,6 +84,7 @@ pub const CompileError = error{
     BeginFuncFailed,
     EndFuncFailed,
     EmitFailed,
+    InvalidMainReturnType,
     UnknownLocal,
     CompilationCreateFailed,
     ZirInjectionFailed,

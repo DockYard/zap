@@ -7,8 +7,9 @@
 #   zap run computed_attributes
 
 pub struct ComputedAttributes {
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     IO.puts("Effective timeout: " <> Integer.to_string(Limits.effective_timeout()))
     IO.puts("Max payload: " <> Integer.to_string(Limits.max_payload()))
+    0
   }
 }

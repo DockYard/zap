@@ -1,5 +1,5 @@
 pub struct PatternMatching {
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     PatternMatch.describe(:ok)
     |> IO.puts()
 
@@ -11,5 +11,6 @@ pub struct PatternMatching {
 
     PatternMatch.describe(-100)
     |> IO.puts()
+    0
   }
 }

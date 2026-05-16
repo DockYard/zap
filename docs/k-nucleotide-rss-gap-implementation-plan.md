@@ -333,18 +333,18 @@ so phase 2-6 progress is measurable per-commit, not per-CLBG-run.
        }
      }
 
-     pub fn main() -> String {
+     pub fn main() -> u8 {
        seed = %{-1 :: i64 => 0 :: i64}
        cleared = Map.delete(seed, -1 :: i64)
        result = Probe.loop(cleared, 0 :: i64, 100000 :: i64)
        Kernel.inspect(Map.get(result, 50000 :: i64, -1 :: i64))
-       "done"
+       0
      }
    }
    ```
 
 5. Add a zir-test that runs the microbench and asserts:
-   - Output is `50000\ndone`
+   - Output is `50000`
    - With `ZAP_ARC_STATS=1`, before phase 6 lands: per-pool
      high-water-mark is `O(N)`; after phase 6: bounded (under 1024
      cells).

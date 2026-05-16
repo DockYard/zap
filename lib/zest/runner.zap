@@ -41,7 +41,7 @@ pub struct Zest.Runner {
         Generated Zest test runner entry point.
         """
 
-      pub fn main(_args :: [String]) -> String {
+      pub fn main(_args :: [String]) -> u8 {
         Zest.Runner.configure()
         unquote_splicing(run_calls)
         Zest.Runner.run()
@@ -95,22 +95,27 @@ pub struct Zest.Runner {
     failure code if any tests failed.
 
     Call this as the last line of the test runner's `main`
-    function. It invokes `:zig.Zest.summary()` which
-    outputs the final report to stdout, including the seed
-    used for test ordering.
+    function. It invokes `:zig.Zest.summary()` which outputs
+    the final report to stdout, including the seed used for
+    test ordering, and maps any nonzero failure count to exit
+    code `1`.
 
     ## Examples
 
-        pub fn main(_args :: [String]) -> String {
+        pub fn main(_args :: [String]) -> u8 {
           Zest.Runner.configure()
           Test.MyTest.run()
           Zest.Runner.run()
         }
     """
 
-  pub fn run() -> String {
-    :zig.Zest.summary()
-    "done"
+  pub fn run() -> u8 {
+    failures = :zig.Zest.summary()
+    if failures == 0 {
+      0
+    } else {
+      1
+    }
   }
 
   @doc = """

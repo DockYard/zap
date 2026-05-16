@@ -23,7 +23,7 @@ pub struct Snake {
 
   # -- Entry -------------------------------------------------------------------
 
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     "\x1b[2J\x1b[H" |> IO.print_str()
     IO.puts(green("""
       ___ _  _   _   _  _____
@@ -44,6 +44,7 @@ pub struct Snake {
       run([10], [5], 3, 2, 0, "d")
       ""
     })
+    0
   }
 
   # -- Game loop ---------------------------------------------------------------

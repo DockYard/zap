@@ -305,7 +305,7 @@ pub struct TuringMachine {
     TuringMachine.unary_ones(n - one, ["1" | acc])
   }
 
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     IO.puts("Turing machine demo")
     IO.puts("===================")
     IO.puts("")
@@ -323,6 +323,7 @@ pub struct TuringMachine {
     _ = TuringMachine.demo_double(3)
     _ = TuringMachine.demo_double(5)
     ""
+    0
   }
 
   pub fn demo_increment(input :: String) -> String {

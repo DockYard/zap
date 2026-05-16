@@ -7,10 +7,11 @@
   """
 
 pub struct MathStruct {
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     IO.puts("square(5) = " <> Integer.to_string(Scalar.square(5)))
     IO.puts("cube(3) = " <> Integer.to_string(Scalar.cube(3)))
     IO.puts("abs(-7) = " <> Integer.to_string(Scalar.abs(-7)))
     IO.puts("Math.pi = " <> Float.to_string(Math.pi()))
+    0
   }
 }

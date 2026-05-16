@@ -7,9 +7,10 @@ pub struct Factorial {
     n * factorial(n - 1)
   }
 
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     Factorial.factorial(10)
     |> Integer.to_string()
     |> IO.puts()
+    0
   }
 }

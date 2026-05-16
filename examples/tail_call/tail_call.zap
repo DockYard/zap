@@ -5,9 +5,10 @@
 # With TCO, it runs in constant stack space.
 
 pub struct TailCall {
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     Counter.countdown(100_000_000)
     |> Integer.to_string()
     |> IO.puts()
+    0
   }
 }

@@ -635,10 +635,10 @@ locally without committing):
 
 ```zap
 pub struct Probe {
-  pub fn main() -> String {
+  pub fn main() -> u8 {
     m = %{0 :: i64 => 0 :: i64}
     Kernel.inspect(Map.has_key(m, 0 :: i64))
-    "done"
+    0
   }
 }
 ```
@@ -650,13 +650,13 @@ A more aggressive reproducer that segfaults at scale:
 
 ```zap
 pub struct Probe {
-  pub fn main() -> String {
+  pub fn main() -> u8 {
     m = %{0 :: i64 => 0 :: i64}
     cleared = Map.delete(m, 0 :: i64)
     a = Map.get(cleared, 1 :: i64, -1 :: i64)
     b = Map.get(cleared, 2 :: i64, -1 :: i64)
     Kernel.inspect(a + b)
-    "done"
+    0
   }
 }
 ```
@@ -1069,10 +1069,10 @@ pub fn count_kmers_loop(seq :: String, n :: i64, k :: i64, i :: i64,
 
 ```zap
 pub struct Probe {
-  pub fn main() -> String {
+  pub fn main() -> u8 {
     m = %{0 :: i64 => 0 :: i64}
     Kernel.inspect(Map.has_key(m, 0 :: i64))
-    "done"
+    0
   }
 }
 ```

@@ -43,8 +43,9 @@ pub struct Versioned {
     }
   }
 
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     total = run_many(40, 0)
     "total=#{total}" |> IO.puts()
+    0
   }
 }

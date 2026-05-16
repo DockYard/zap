@@ -293,8 +293,9 @@ functions, and macros.</p>
 <h3>Entry Points</h3>
 <p>Binary targets name a root function in the manifest:</p>
 <pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> MyApp {
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> main(_args <span class="hl-op">::</span> [<span class="hl-type">String</span>]) {
+  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> main(_args <span class="hl-op">::</span> [<span class="hl-type">String</span>]) <span class="hl-op">-&gt;</span> <span class="hl-type">u8</span> {
     IO.puts(<span class="hl-string">"Hello from Zap"</span>)
+    <span class="hl-number">0</span>
   }
 }</code></pre>
 <h3>Functions and Pattern Matching</h3>

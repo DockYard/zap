@@ -10,7 +10,7 @@
   """
 
 pub struct Types {
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     IO.puts("=== Scalars ===")
     IO.puts(Integer.to_string(Scalars.int()))
     IO.puts(Integer.to_string(Scalars.negative()))
@@ -23,5 +23,6 @@ pub struct Types {
     IO.puts("legs: " <> Integer.to_string(rex.legs))
     IO.puts("name: " <> rex.name)
     IO.puts("good boy: " <> Bool.to_string(rex.good_boy))
+    0
   }
 }

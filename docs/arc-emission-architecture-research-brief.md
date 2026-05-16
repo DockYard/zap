@@ -81,8 +81,9 @@ pub struct Greeter {
     "Hello, " <> name <> "!"
   }
 
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     Greeter.hello("World") |> IO.puts()
+    0
   }
 }
 ```

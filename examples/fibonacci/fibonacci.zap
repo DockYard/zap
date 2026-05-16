@@ -11,9 +11,10 @@ pub struct Fibonacci {
     fib(n - 1) + fib(n - 2)
   }
 
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     Fibonacci.fib(20)
     |> Integer.to_string()
     |> IO.puts()
+    0
   }
 }

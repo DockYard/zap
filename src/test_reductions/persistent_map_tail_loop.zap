@@ -27,11 +27,12 @@ pub struct Probe {
     }
   }
 
-  pub fn main() -> String {
+  pub fn main() -> u8 {
     seed = %{-1 :: i64 => 0 :: i64}
     cleared = Map.delete(seed, -1 :: i64)
     result = Probe.loop(cleared, 0 :: i64, 100000 :: i64)
     Kernel.inspect(Map.get(result, 50000 :: i64, -1 :: i64))
-    "done"
+    IO.puts("done")
+    0
   }
 }

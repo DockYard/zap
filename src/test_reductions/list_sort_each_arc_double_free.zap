@@ -24,7 +24,7 @@
 #     GT 50
 
 pub struct ListSortEachProbe {
-  pub fn main(_args :: [String]) -> Nil {
+  pub fn main(_args :: [String]) -> u8 {
     rows = [{"AC", 100 :: i64}, {"GT", 50 :: i64}, {"AT", 150 :: i64}]
     sorted = Enum.sort(rows, fn(left :: {String, i64}, right :: {String, i64}) -> Bool {
       {_left_kmer, left_count} = left
@@ -35,6 +35,6 @@ pub struct ListSortEachProbe {
       {kmer, count} = row
       IO.puts(kmer <> " " <> Integer.to_string(count))
     })
-    nil
+    0
   }
 }

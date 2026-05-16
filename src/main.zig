@@ -1470,8 +1470,9 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     defer allocator.free(lib_path);
     const lib_source = try std.fmt.allocPrint(allocator,
         \\pub struct {s} {{
-        \\  pub fn main(_args :: [String]) {{
+        \\  pub fn main(_args :: [String]) -> u8 {{
         \\    IO.puts("Howdy!")
+        \\    0
         \\  }}
         \\}}
         \\
@@ -1484,8 +1485,9 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     defer allocator.free(test_path);
     const test_source = try std.fmt.allocPrint(allocator,
         \\pub struct {s}Test {{
-        \\  pub fn main(_args :: [String]) {{
+        \\  pub fn main(_args :: [String]) -> u8 {{
         \\    IO.puts("Test Suite TBD")
+        \\    0
         \\  }}
         \\}}
         \\

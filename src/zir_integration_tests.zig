@@ -546,9 +546,10 @@ test "ZIR memory manager: project-local third-party adapter builds and runs" {
 
     const source =
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts("project fake manager")
         \\    "done"
+        \\    0
         \\  }
         \\}
     ;
@@ -598,9 +599,10 @@ test "ZIR memory manager: dependency third-party adapter builds and runs" {
 
     const source =
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts("dep fake manager")
         \\    "done"
+        \\    0
         \\  }
         \\}
     ;
@@ -767,9 +769,10 @@ test "CLI: zap run doc-runner target generates documentation via Zap-side pipeli
         \\pub struct DocExample.Doc.Runner {
         \\  use Zap.Doc.Builder, paths: ["lib/**/*.zap"]
         \\
-        \\  pub fn main(_args :: [String]) -> String {
+        \\  pub fn main(_args :: [String]) -> u8 {
         \\    _count = write_docs_to("docs", "DocExample", "0.1.0", "")
         \\    "Documentation generated in docs/"
+        \\    0
         \\  }
         \\}
     ;
@@ -865,9 +868,10 @@ test "CLI: zap run doc-runner target generates documentation via Zap-side pipeli
 test "ZIR: integer arithmetic" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(20 + 22)
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -879,9 +883,10 @@ test "ZIR: integer arithmetic" {
 test "ZIR: string literal" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts("hello world")
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -893,9 +898,10 @@ test "ZIR: string literal" {
 test "ZIR: string escape sequences" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.print_str("line1\nline2\n")
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -907,9 +913,10 @@ test "ZIR: string escape sequences" {
 test "ZIR: boolean" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(true)
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -929,9 +936,10 @@ test "ZIR: multi-function call" {
         \\    a + b
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(add(20, 22))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -943,8 +951,9 @@ test "ZIR: multi-function call" {
 test "ZIR: void function" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -960,13 +969,14 @@ test "ZIR: void function" {
 test "ZIR: if-else true branch" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    if true {
         \\      IO.puts("yes")
         \\    } else {
         \\      IO.puts("no")
         \\    }
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -978,13 +988,14 @@ test "ZIR: if-else true branch" {
 test "ZIR: if-else false branch" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    if false {
         \\      IO.puts("yes")
         \\    } else {
         \\      IO.puts("no")
         \\    }
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1000,12 +1011,13 @@ test "ZIR: if-else false branch" {
 test "ZIR: case with atoms" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    case :ok {
         \\      :ok -> IO.puts("matched")
         \\      _ -> IO.puts("default")
         \\    }
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1017,12 +1029,13 @@ test "ZIR: case with atoms" {
 test "ZIR: case with ints" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    case 1 {
         \\      1 -> IO.puts("one")
         \\      _ -> IO.puts("other")
         \\    }
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1046,9 +1059,10 @@ test "ZIR: recursive sum" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(sum_to(5))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1068,9 +1082,10 @@ test "ZIR: multiple helper functions" {
         \\    x + 1
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(add_one(double(10)))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1094,9 +1109,10 @@ test "ZIR: lambda lifted local def" {
         \\    forty_two()
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(bar())
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1116,9 +1132,10 @@ test "ZIR: function-local captured closure" {
         \\    add(10)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(make_adder(32))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1138,9 +1155,10 @@ test "ZIR: aliased function-local captured closure" {
         \\    offset(5) + offset(3)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(compute(10))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1169,10 +1187,11 @@ test "ZIR: captured closure called through multiple paths" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(compute(100, 1))
         \\    Kernel.inspect(compute(100, 2))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1188,9 +1207,10 @@ test "ZIR: struct function ref call resolves statically" {
         \\    x * 2
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(&TestProg.double/1(21))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1206,9 +1226,10 @@ test "ZIR: local function ref call resolves statically" {
         \\    x * 2
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(&double/1(21))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1224,9 +1245,10 @@ test "ZIR: static Function struct literal call resolves statically" {
         \\    x * 2
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(%Function{struct: TestProg, name: :double, arity: 1}(21))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1246,9 +1268,10 @@ test "ZIR: static local function ref call captures environment" {
         \\    &add_base/1(10)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(make_and_apply(32))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1264,12 +1287,13 @@ test "ZIR: anonymous closure is first-class callable" {
         \\    f(x)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    add_one = fn(x :: i64) -> i64 {
         \\      x + 1
         \\    }
         \\    Kernel.inspect(apply(41, add_one))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1285,13 +1309,14 @@ test "ZIR: anonymous closure captures environment" {
         \\    f(x)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    offset = 10
         \\    add_offset = fn(x :: i64) -> i64 {
         \\      x + offset
         \\    }
         \\    Kernel.inspect(apply(32, add_offset))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1318,11 +1343,12 @@ test "ZIR: cond with comparisons (nested captured bodies)" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(describe(1))
         \\    IO.puts(describe(2))
         \\    IO.puts(describe(99))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1370,10 +1396,11 @@ test "ZIR: catch basin ~> catches unmatched multi-clause function" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(try_ok())
         \\    IO.puts(try_nope())
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1393,7 +1420,7 @@ test "ZIR: catch basin receives unmatched value" {
         \\    "2"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    result = "three"
         \\    |> parse()
         \\    ~> {
@@ -1401,6 +1428,7 @@ test "ZIR: catch basin receives unmatched value" {
         \\    }
         \\    IO.puts(result)
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1416,7 +1444,7 @@ test "ZIR: catch basin handler pattern matches on unmatched value" {
         \\    "success"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    r1 = "ok"
         \\    |> process()
         \\    ~> {
@@ -1441,6 +1469,7 @@ test "ZIR: catch basin handler pattern matches on unmatched value" {
         \\    }
         \\    IO.puts(r3)
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1460,7 +1489,7 @@ test "ZIR: catch basin short-circuits multi-step pipe" {
         \\    "formatted: " <> s
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    good = "good"
         \\    |> validate()
         \\    |> format()
@@ -1477,6 +1506,7 @@ test "ZIR: catch basin short-circuits multi-step pipe" {
         \\    }
         \\    IO.puts(bad)
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1505,9 +1535,10 @@ test "ZIR: macro generates function from trailing block" {
         \\    IO.puts("inside generated")
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(generated())
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1527,11 +1558,12 @@ test "ZIR: macro receives trailing block as AST" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    my_test("check math") {
         \\      Kernel.inspect(1 + 1)
         \\    }
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1547,12 +1579,13 @@ test "ZIR: trailing block as last argument" {
         \\    name <> ": " <> body
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    result = with_block("test") {
         \\      "hello"
         \\    }
         \\    IO.puts(result)
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1572,7 +1605,7 @@ test "ZIR: nested trailing blocks" {
         \\    "(" <> name <> " " <> body <> ")"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    result = outer("describe") {
         \\      inner("test") {
         \\        "pass"
@@ -1580,6 +1613,7 @@ test "ZIR: nested trailing blocks" {
         \\    }
         \\    IO.puts(result)
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1599,7 +1633,7 @@ test "ZIR: catch basin ~> with function handler" {
         \\    "error: " <> val
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    r1 = "one"
         \\    |> parse()
         \\    ~> handle_error()
@@ -1610,6 +1644,7 @@ test "ZIR: catch basin ~> with function handler" {
         \\    ~> handle_error()
         \\    IO.puts(r2)
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1629,12 +1664,13 @@ test "ZIR: catch basin ~> function handler with extra args" {
         \\    prefix <> val
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    r = "nope"
         \\    |> parse()
         \\    ~> fallback("unhandled: ")
         \\    IO.puts(r)
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1659,9 +1695,10 @@ test "ZIR: struct literal field access" {
         \\    p.x
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(get_x(%Point{x: 10, y: 20}))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1681,9 +1718,10 @@ test "ZIR: string interpolation with string variable" {
         \\    "Hello, #{name}!"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(greet("world"))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1695,10 +1733,11 @@ test "ZIR: string interpolation with string variable" {
 test "ZIR: string interpolation with integer via to_string" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    n = 42
         \\    IO.puts("The answer is #{n}")
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1710,11 +1749,12 @@ test "ZIR: string interpolation with integer via to_string" {
 test "ZIR: string interpolation multiple expressions" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    a = "foo"
         \\    b = "bar"
         \\    IO.puts("#{a} and #{b}")
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1737,9 +1777,10 @@ test "ZIR: binary pattern byte extraction" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(first_byte("AB"))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1758,9 +1799,10 @@ test "ZIR: binary pattern string rest" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(skip_first("Hello"))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1779,8 +1821,9 @@ test "ZIR compile: binary pattern string prefix" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1801,13 +1844,14 @@ test "ZIR: pipe chain with Integer.to_string" {
         \\    x + 1
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    5
         \\    |> double()
         \\    |> add_one()
         \\    |> Integer.to_string()
         \\    |> IO.puts()
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1827,11 +1871,12 @@ test "ZIR: multi-clause function with pipes" {
         \\    n * factorial(n - 1)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    factorial(10)
         \\    |> Integer.to_string()
         \\    |> IO.puts()
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1847,9 +1892,10 @@ test "ZIR: multi-clause function with pipes" {
 test "ZIR: string concat operator" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts("hello" <> " " <> "world")
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1877,11 +1923,12 @@ test "ZIR: function guards" {
         \\    "zero"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(classify(5))
         \\    IO.puts(classify(-3))
         \\    IO.puts(classify(0))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1909,11 +1956,12 @@ test "ZIR: multi-clause string pattern matching" {
         \\    "?"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(parse("one"))
         \\    IO.puts(parse("two"))
         \\    IO.puts(parse("three"))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1937,10 +1985,11 @@ test "ZIR: atom pattern matching in functions" {
         \\    "failure"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(status(:ok))
         \\    IO.puts(status(:error))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1960,10 +2009,11 @@ test "ZIR: default parameter values" {
         \\    a + b
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(add(5))
         \\    Kernel.inspect(add(5, 20))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -1983,9 +2033,10 @@ test "ZIR: three-argument function with string concat" {
         \\    a <> sep <> b
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(join("hello", " ", "world"))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2019,11 +2070,12 @@ test "ZIR: union variant pattern matching" {
         \\    "blue"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(color_name(Color.Red))
         \\    IO.puts(color_name(Color.Green))
         \\    IO.puts(color_name(Color.Blue))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2045,9 +2097,10 @@ test "ZIR: tuple pattern matching in case" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(sum_pair({10, 32}))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2065,9 +2118,10 @@ test "ZIR: tuple wildcard pattern" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(second({10, 42}))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2093,10 +2147,11 @@ test "ZIR: tuple destructure param preserves element types for downstream dispat
         \\    Map.get(m, k, 0 :: i64)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    m = make_map()
         \\    Kernel.inspect(lookup({m, "answer"}))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2118,9 +2173,10 @@ test "ZIR: tuple destructure param preserves String type for protocol dispatch" 
         \\    name <> " world"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(greet({"hello", 1 :: i64}))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2136,12 +2192,13 @@ test "ZIR: tuple destructure param preserves String type for protocol dispatch" 
 test "ZIR: variable assignment chain" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    a = 10
         \\    b = a + 20
         \\    c = b * 2
         \\    Kernel.inspect(c)
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2170,12 +2227,13 @@ test "ZIR: nested case expressions" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(classify(0, 0))
         \\    IO.puts(classify(0, 5))
         \\    IO.puts(classify(3, 0))
         \\    IO.puts(classify(3, 5))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2195,9 +2253,10 @@ test "ZIR: float arithmetic" {
         \\    3.14159 * radius * radius
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(area(1.0))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2222,11 +2281,12 @@ test "ZIR: exact numeric overload beats widening fallback" {
         \\    "u32"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(classify(1 :: i32))
         \\    IO.puts(classify(1 :: u32))
         \\    IO.puts(classify(1))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2250,11 +2310,12 @@ test "ZIR: numeric widening is fallback after exact overload search" {
         \\    "f64"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(classify(1 :: i32))
         \\    IO.puts(classify(1 :: u32))
         \\    IO.puts(classify(1.5 :: f32))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2270,8 +2331,9 @@ test "ZIR: unsigned integer does not widen to signed integer" {
         \\    "i64"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    classify(1 :: u32)
+        \\    0
         \\  }
         \\}
     );
@@ -2288,10 +2350,11 @@ test "ZIR: Integer overloads preserve exact integer width" {
         \\    "u32"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(accept(Integer.abs(-7 :: i32)))
         \\    IO.puts(accept(Integer.abs(7 :: u32)))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2311,10 +2374,11 @@ test "ZIR: Float overloads preserve exact float width" {
         \\    "f64"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(accept(Float.abs(-1.5 :: f32)))
         \\    IO.puts(accept(Float.abs(-2.5)))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2342,12 +2406,13 @@ test "ZIR: 128-bit integers and extended floats resolve and widen within family"
         \\    "f128"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(classify(1 :: i64))
         \\    IO.puts(classify(1 :: u64))
         \\    IO.puts(classify(1.5 :: f64))
         \\    IO.puts(classify(2.5 :: f128))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2375,7 +2440,7 @@ test "ZIR: Integer supports i128 and u128 helper overloads" {
         \\    "f64"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(accept((1 :: i128) + (2 :: i128)))
         \\    IO.puts(accept((5 :: i128) - (2 :: i128)))
         \\    IO.puts(accept((2 :: u128) * (3 :: u128)))
@@ -2414,6 +2479,7 @@ test "ZIR: Integer supports i128 and u128 helper overloads" {
         \\    IO.puts(Bool.to_string((1 :: i128) == (1 :: i128)))
         \\    IO.puts(Bool.to_string((1 :: u128) < (2 :: u128)))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2440,7 +2506,7 @@ test "ZIR: Float supports f80 and f128 helper overloads" {
         \\    "String"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(accept(Float.abs(-1.5 :: f80)))
         \\    IO.puts(accept(Float.max(1.0 :: f128, 2.0 :: f128)))
         \\    IO.puts(accept(Float.min(3.0 :: f80, 2.0 :: f80)))
@@ -2463,6 +2529,7 @@ test "ZIR: Float supports f80 and f128 helper overloads" {
         \\    IO.puts(Bool.to_string((1.0 :: f80) < (2.0 :: f80)))
         \\    IO.puts(Bool.to_string((2.0 :: f128) >= (2.0 :: f128)))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2489,10 +2556,11 @@ test "ZIR: for comprehension doubles list" {
         \\    h + sum(t)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    doubled = for x <- [1, 2, 3] { x * 2 }
         \\    Kernel.inspect(sum(doubled))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2512,12 +2580,13 @@ test "ZIR: for comprehension over string" {
         \\    h <> join(t)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    chars = for c <- "abc" {
         \\      c <> "!"
         \\    }
         \\    IO.puts(join(chars))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2537,10 +2606,11 @@ test "ZIR: for comprehension with filter" {
         \\    h + sum(t)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    evens = for x <- [1, 2, 3, 4, 5, 6], x rem 2 == 0 { x }
         \\    Kernel.inspect(sum(evens))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2559,8 +2629,9 @@ test "ZIR: protocol dispatch rejects unconstrained lowercase receiver type" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2573,8 +2644,9 @@ test "ZIR: protocol parameter rejects unconstrained lowercase argument type" {
         \\    Enum.to_list(collection)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2591,10 +2663,11 @@ test "ZIR: Enum map dispatches through exact Enumerable constraint" {
         \\    h + sum(t)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    doubled = Enum.map(1..3, fn(x :: i64) -> i64 { x * 2 })
         \\    Kernel.inspect(sum(doubled))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2606,7 +2679,7 @@ test "ZIR: Enum map dispatches through exact Enumerable constraint" {
 test "ZIR: Enum reduce maps through Enumerable entries" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    total = Enum.reduce(%{a: 10, b: 20, c: 30}, 0, fn(accumulator :: i64, entry :: {Atom, i64}) -> i64 {
         \\      case entry {
         \\        {_key, value} -> accumulator + value
@@ -2614,6 +2687,7 @@ test "ZIR: Enum reduce maps through Enumerable entries" {
         \\    })
         \\    Kernel.inspect(total)
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2625,9 +2699,10 @@ test "ZIR: Enum reduce maps through Enumerable entries" {
 test "ZIR: Enum at uses caller-provided default type" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(Enum.at(["a"], 2, "none"))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2651,9 +2726,10 @@ test "ZIR: tail recursive countdown (small)" {
         \\    countdown(n - 1)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(countdown(10))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2675,9 +2751,10 @@ test "ZIR: use Struct imports functions" {
         \\pub struct TestProg {
         \\  use Helper
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(Helper.greet("World"))
         \\    "done"
+        \\    0
         \\  }
         \\}
     , &.{
@@ -2699,9 +2776,10 @@ test "ZIR: use Struct with __using__ callback injects function" {
         \\pub struct TestProg {
         \\  use Greeter
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(hello())
         \\    "done"
+        \\    0
         \\  }
         \\}
     , &.{
@@ -2729,10 +2807,11 @@ test "ZIR: use Struct with __using__ callback injects function" {
 test "ZIR: map literal creation" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    m = %{name: "Alice", age: 30}
         \\    IO.puts(Map.get(m, :name, "unknown"))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2744,11 +2823,12 @@ test "ZIR: map literal creation" {
 test "ZIR: map get with default" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    m = %{x: 10, y: 20}
         \\    Kernel.inspect(Map.get(m, :x, 0))
         \\    Kernel.inspect(Map.get(m, :z, 99))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2760,12 +2840,13 @@ test "ZIR: map get with default" {
 test "ZIR: map update syntax" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    m = %{name: "Alice", age: 30}
         \\    m2 = %{m | name: "Bob"}
         \\    IO.puts(Map.get(m2, :name, "unknown"))
         \\    Kernel.inspect(Map.get(m2, :age, 0))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2777,7 +2858,7 @@ test "ZIR: map update syntax" {
 test "ZIR: map has_key check" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    m = %{name: "Alice", age: 30}
         \\    if Map.has_key?(m, :name) {
         \\      IO.puts("has name")
@@ -2790,6 +2871,7 @@ test "ZIR: map has_key check" {
         \\      IO.puts("no email")
         \\    }
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2805,9 +2887,10 @@ test "ZIR: map pattern matching in function" {
         \\    g <> ", " <> n <> "!"
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(greet(%{name: "World", greeting: "Hello"}))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2819,10 +2902,11 @@ test "ZIR: map pattern matching in function" {
 test "ZIR: map size" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    m = %{a: 1, b: 2, c: 3}
         \\    Kernel.inspect(Map.size(m))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2845,9 +2929,10 @@ test "ZIR: list literal and fixed-length pattern" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(sum_list([10, 20, 12]))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2866,9 +2951,10 @@ test "ZIR: list cons pattern [h | t]" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(head([42, 10, 20]))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2888,9 +2974,10 @@ test "ZIR: recursive list sum with cons pattern" {
         \\    h + sum(t)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(sum([10, 20, 12]))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2910,9 +2997,10 @@ test "ZIR: list length via recursion" {
         \\    1 + len(t)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(len([1, 2, 3, 4, 5]))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2940,9 +3028,10 @@ test "ZIR: list map via recursion" {
         \\    h + sum(t)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(sum(double_all([1, 2, 3])))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2961,9 +3050,10 @@ test "ZIR: keyword list sugar" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(get_name([name: "Brian"]))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2982,9 +3072,10 @@ test "ZIR: keyword list with multiple keys" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(get_age([name: "Brian", age: 42]))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -2996,13 +3087,14 @@ test "ZIR: keyword list with multiple keys" {
 test "ZIR: keyword list assignment pattern" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    opts = [greeting: "Hello", name: "World"]
         \\    case opts {
         \\      [greeting: g, name: n] -> IO.puts(g <> ", " <> n <> "!")
         \\      _ -> IO.puts("no match")
         \\    }
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -3022,10 +3114,11 @@ test "ZIR: list of strings with pattern matching" {
         \\    h
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(first(["hello", "world"]))
         \\    IO.puts(first([]))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -3045,9 +3138,10 @@ test "ZIR: tail recursive countdown (large, guaranteed TCO)" {
         \\    countdown(n - 1)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(countdown(100_000_000))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -3059,9 +3153,10 @@ test "ZIR: tail recursive countdown (large, guaranteed TCO)" {
 test "ZIR: String.length cross-struct call" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(String.length("hello"))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -3073,9 +3168,10 @@ test "ZIR: String.length cross-struct call" {
 test "ZIR: String.slice cross-struct call" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts(String.slice("hello", 0, 3))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -3091,9 +3187,10 @@ test "ZIR: pub fn with operator name parses and emits" {
         \\    :zig.String.concat(left, right)
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts("ok")
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -3123,12 +3220,13 @@ test "ZIR: persistent-map tail loop microbench (Phase 1 RSS reproducer)" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    seed = %{-1 :: i64 => 0 :: i64}
         \\    cleared = Map.delete(seed, -1 :: i64)
         \\    result = TestProg.loop(cleared, 0 :: i64, 1000 :: i64)
         \\    Kernel.inspect(Map.get(result, 500 :: i64, -1 :: i64))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -3160,12 +3258,13 @@ test "ZIR: Phase 4 Map microbench regression baseline" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    seed = %{-1 :: i64 => 0 :: i64}
         \\    cleared = Map.delete(seed, -1 :: i64)
         \\    result = TestProg.loop(cleared, 0 :: i64, 1000 :: i64)
         \\    Kernel.inspect(Map.get(result, 500 :: i64, -1 :: i64))
         \\    "done"
+        \\    0
         \\  }
         \\}
     );
@@ -3191,12 +3290,13 @@ test "ZIR: Phase 4 Map workload byte-exact with dense-map ownership stats" {
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    seed = %{-1 :: i64 => 0 :: i64}
         \\    cleared = Map.delete(seed, -1 :: i64)
         \\    result = TestProg.loop(cleared, 0 :: i64, 100 :: i64)
         \\    Kernel.inspect(Map.get(result, 50 :: i64, -1 :: i64))
         \\    "done"
+        \\    0
         \\  }
         \\}
     ,
@@ -3258,12 +3358,13 @@ test "ZIR: Phase 5 Map tail loop keeps return-elision counter zero and uses unch
         \\    }
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    seed = %{-1 :: i64 => 0 :: i64}
         \\    cleared = Map.delete(seed, -1 :: i64)
         \\    result = TestProg.loop(cleared, 0 :: i64, 100 :: i64)
         \\    Kernel.inspect(Map.get(result, 50 :: i64, -1 :: i64))
         \\    "done"
+        \\    0
         \\  }
         \\}
     ,
@@ -3318,9 +3419,10 @@ test "ZIR: Phase 5 return-elision counter stays zero for non-ARC workload" {
         \\    a + b
         \\  }
         \\
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    Kernel.inspect(TestProg.add(20 :: i64, 22 :: i64))
         \\    "done"
+        \\    0
         \\  }
         \\}
     ,
@@ -3395,9 +3497,10 @@ fn writeStdlibResolverProject(dir: std.Io.Dir) TestError!void {
     ;
     const prog_source =
         \\pub struct TestProg {
-        \\  pub fn main() -> String {
+        \\  pub fn main() -> u8 {
         \\    IO.puts("stdlib-resolver-ok")
         \\    "ok"
+        \\    0
         \\  }
         \\}
     ;
@@ -4067,9 +4170,10 @@ test "CLI script: top-level main/1 prints output (happy path)" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "hello.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("script-hello")
         \\  "ok"
+        \\  0
         \\}
     , &.{});
     defer r.deinit();
@@ -4089,9 +4193,10 @@ test "CLI script: main/1 uses a local struct defined in the same file" {
         \\  pub fn square(x :: i64) -> i64 { x * x }
         \\}
         \\
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("square=" <> Integer.to_string(Scalar.square(6)))
         \\  "ok"
+        \\  0
         \\}
     , &.{});
     defer r.deinit();
@@ -4123,10 +4228,11 @@ test "CLI script: main/1 uses a local protocol + impl in the same file" {
         \\  }
         \\}
         \\
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  w = Widget.make(7)
         \\  IO.puts(Widget.describe(w))
         \\  "ok"
+        \\  0
         \\}
     , &.{});
     defer r.deinit();
@@ -4142,9 +4248,10 @@ test "CLI script: main/1 uses stdlib (IO, Integer, System)" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "std.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("argc=" <> Integer.to_string(System.arg_count()))
         \\  "ok"
+        \\  0
         \\}
     , &.{ "a", "b", "c" });
     defer r.deinit();
@@ -4160,9 +4267,10 @@ test "CLI script: args after path are forwarded to main/1" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "args.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("n=" <> Integer.to_string(System.arg_count()))
         \\  "ok"
+        \\  0
         \\}
     , &.{ "one", "two", "three", "four" });
     defer r.deinit();
@@ -4177,9 +4285,10 @@ test "CLI script: args after explicit -- are forwarded verbatim" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "dd.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("n=" <> Integer.to_string(System.arg_count()))
         \\  "ok"
+        \\  0
         \\}
     , &.{ "--", "x", "y" });
     defer r.deinit();
@@ -4199,9 +4308,10 @@ test "CLI script: exit code is propagated (panic -> non-zero)" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "panic.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  panic("boom")
         \\  "unreachable"
+        \\  0
         \\}
     , &.{});
     defer r.deinit();
@@ -4215,14 +4325,67 @@ test "CLI script: exit code is propagated (normal -> zero)" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "ok.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("done")
         \\  "ok"
+        \\  0
         \\}
     , &.{});
     defer r.deinit();
 
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+}
+
+test "CLI script: main/1 u8 return is propagated as process exit code" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "exit13.zap",
+        \\fn main(_args :: [String]) -> u8 {
+        \\  IO.puts("exit-code-source")
+        \\  13
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 13), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "exit-code-source") != null);
+}
+
+test "CLI script: main/1 u8 zero return succeeds" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "exit0.zap",
+        \\fn main(_args :: [String]) -> u8 {
+        \\  IO.puts("zero-exit")
+        \\  0
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "zero-exit") != null);
+}
+
+test "CLI script: main/1 String return is rejected with entrypoint diagnostic" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "string_main.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  "not an exit code"
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "main/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "String") != null);
 }
 
 test "CLI script error: zero top-level functions" {
@@ -4247,7 +4410,7 @@ test "CLI script error: two top-level functions" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "two.zap",
-        \\fn main(_args :: [String]) -> String { "a" }
+        \\fn main(_args :: [String]) -> u8 { 0 }
         \\fn other() -> String { "b" }
     , &.{});
     defer r.deinit();
@@ -4310,9 +4473,10 @@ test "CLI script error: external dep / use of a non-stdlib package is rejected" 
     // package must actually be REFERENCED: an unreferenced `use`
     // alone is elided and would not exercise the constraint.
     var r = try runScriptInTmp(allocator, &tmp_dir, "ext.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts(SomeThirdParty.Pkg.greet())
         \\  "ok"
+        \\  0
         \\}
     , &.{});
     defer r.deinit();
@@ -4327,9 +4491,10 @@ test "CLI script: no artifacts are written next to the script" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "clean.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("clean-run")
         \\  "ok"
+        \\  0
         \\}
     , &.{});
     defer r.deinit();
@@ -4465,9 +4630,10 @@ test "CLI dispatch: a leading removed-flag-looking token is NOT a recognized fla
         // that `<stale_flag> <script>` does NOT reach script dispatch
         // (the flag, not the file, is the first positional candidate).
         var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "disp.zap",
-            \\fn main(_args :: [String]) -> String {
+            \\fn main(_args :: [String]) -> u8 {
             \\  IO.puts("dispatched-to-script")
             \\  "ok"
+            \\  0
             \\}
         , &.{stale_flag}, &.{});
         defer r.deinit();
@@ -4495,13 +4661,14 @@ test "CLI dispatch: removed-flag-looking tokens AFTER the script path forward to
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "fwd.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("argc=" <> Integer.to_string(System.arg_count()))
         \\  IO.puts("a0=" <> System.arg_at(0))
         \\  IO.puts("a1=" <> System.arg_at(1))
         \\  IO.puts("a2=" <> System.arg_at(2))
         \\  IO.puts("fwd-ran")
         \\  "ok"
+        \\  0
         \\}
     , &.{}, &.{ "--memory", "Memory.NoOp", "-O" });
     defer r.deinit();
@@ -4600,10 +4767,11 @@ fn runManifestProject(
 
     const prog_source =
         \\pub struct Cli {
-        \\  pub fn main(_args :: [String]) -> String {
+        \\  pub fn main(_args :: [String]) -> u8 {
         \\    s = "a" <> "b" <> "c"
         \\    IO.puts("manifest-marker=" <> s)
         \\    "ok"
+        \\    0
         \\  }
         \\}
     ;
@@ -4699,9 +4867,10 @@ test "CLI script flags: -Doptimize runs under each Zig optimize mode" {
         defer tmp_dir.cleanup();
 
         var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "opt.zap",
-            \\fn main(_args :: [String]) -> String {
+            \\fn main(_args :: [String]) -> u8 {
             \\  IO.puts("opt-ok=" <> Integer.to_string(2 + 3))
             \\  "ok"
+            \\  0
             \\}
         , &.{"-Doptimize=" ++ mode}, &.{});
         defer r.deinit();
@@ -4718,9 +4887,10 @@ test "CLI script flags: default (no -Doptimize) runs in Debug" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "optdef.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("default-opt-ok")
         \\  "ok"
+        \\  0
         \\}
     , &.{});
     defer r.deinit();
@@ -4753,10 +4923,11 @@ test "CLI script flags: -Dmemory runs under each stdlib manager" {
             \\  }
             \\}
             \\
-            \\fn main(_args :: [String]) -> String {
+            \\fn main(_args :: [String]) -> u8 {
             \\  s = Builder.join(5, "")
             \\  IO.puts("mem-ok=" <> s)
             \\  "ok"
+            \\  0
             \\}
         , &.{"-Dmemory=" ++ mgr}, &.{});
         defer r.deinit();
@@ -4773,10 +4944,11 @@ test "CLI script flags: default (no -Dmemory) runs with Memory.ARC" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "memdef.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  s = "x" <> "y" <> "z"
         \\  IO.puts("mem-default-ok=" <> s)
         \\  "ok"
+        \\  0
         \\}
     , &.{});
     defer r.deinit();
@@ -4792,9 +4964,10 @@ test "CLI script flags: combined -Doptimize and -Dmemory before the path" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "combo.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("combo-ok")
         \\  "ok"
+        \\  0
         \\}
     , &.{ "-Doptimize=ReleaseFast", "-Dmemory=Memory.Arena" }, &.{});
     defer r.deinit();
@@ -4810,9 +4983,10 @@ test "CLI script flags error: invalid -Doptimize value is rejected" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "badopt.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("never-runs")
         \\  "ok"
+        \\  0
         \\}
     , &.{"-Doptimize=ReleaseTurbo"}, &.{});
     defer r.deinit();
@@ -4831,9 +5005,10 @@ test "CLI script flags error: -Doptimize with no value is rejected" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "noval.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("never-runs")
         \\  "ok"
+        \\  0
         \\}
     , &.{"-Doptimize"}, &.{});
     defer r.deinit();
@@ -4849,9 +5024,10 @@ test "CLI script flags error: third-party -Dmemory is rejected (no dep graph)" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "badmem.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("never-runs")
         \\  "ok"
+        \\  0
         \\}
     , &.{"-Dmemory=MyApp.CustomArena"}, &.{});
     defer r.deinit();
@@ -4871,9 +5047,10 @@ test "CLI build flags error: unknown -D key lists supported keys" {
     // Script mode has no manifest/`System.get_build_opt` consumer, so
     // an unknown `-D` key is a hard error that lists the keys.
     var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "unk.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("never-runs")
         \\  "ok"
+        \\  0
         \\}
     , &.{"-Dnonsense=1"}, &.{});
     defer r.deinit();
@@ -4896,13 +5073,14 @@ test "CLI script flags: -D flags consumed, post-path args forward verbatim" {
     // script path (including a `-D`-looking token and a literal
     // `--`) forwards to main/1 verbatim and opaquely.
     var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "echo.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  n = System.arg_count()
         \\  IO.puts("argc=" <> Integer.to_string(n))
         \\  IO.puts("a0=" <> System.arg_at(0))
         \\  IO.puts("a1=" <> System.arg_at(1))
         \\  IO.puts("a2=" <> System.arg_at(2))
         \\  "ok"
+        \\  0
         \\}
     , &.{ "-Doptimize=ReleaseSafe", "-Dmemory=Memory.Arena" }, &.{ "-Doptimize=foo", "--", "x" });
     defer r.deinit();
@@ -4990,9 +5168,10 @@ test "CLI script: native default when neither manifest nor -Dtarget set" {
     // No `-Dtarget=`/`-Dcpu=` ⇒ the script builds and runs on the
     // host natively (the plain `zir_compilation_create` path).
     var r = try runScriptInTmp(allocator, &tmp_dir, "nat.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("native-ok")
         \\  "ok"
+        \\  0
         \\}
     , &.{});
     defer r.deinit();
@@ -5011,9 +5190,10 @@ test "CLI script: -Dcpu refines the native target (host build still runs)" {
     // arch, so the host binary still builds and runs — proving cpu is
     // threaded into the fork's target query without breaking native.
     var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "cpu.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("cpu-ok")
         \\  "ok"
+        \\  0
         \\}
     , &.{"-Dcpu=baseline"}, &.{});
     defer r.deinit();
@@ -5029,9 +5209,10 @@ test "CLI script error: invalid -Dcpu is rejected with a clear error" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "badcpu.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("never-runs")
         \\  "ok"
+        \\  0
         \\}
     , &.{"-Dcpu=totally_not_a_cpu_model"}, &.{});
     defer r.deinit();
@@ -5113,9 +5294,10 @@ fn runCrossBuild(
     ;
     const prog_source =
         \\pub struct Cross {
-        \\  pub fn main(_args :: [String]) -> String {
+        \\  pub fn main(_args :: [String]) -> u8 {
         \\    IO.puts("cross-ok")
         \\    "ok"
+        \\    0
         \\  }
         \\}
     ;
@@ -5322,9 +5504,10 @@ test "CLI Defect-2 regression: -Doptimize AFTER the target is honored" {
     ;
     const prog_source =
         \\pub struct D2 {
-        \\  pub fn main(_args :: [String]) -> String {
+        \\  pub fn main(_args :: [String]) -> u8 {
         \\    IO.puts("d2-marker=ok")
         \\    "ok"
+        \\    0
         \\  }
         \\}
     ;
@@ -5457,9 +5640,10 @@ fn runScriptCrossBuild(
     defer tmp_dir.cleanup();
 
     const script_source =
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("script-cross-ok")
         \\  "ok"
+        \\  0
         \\}
     ;
     tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "sc.zap", .data = script_source }) catch
@@ -5610,9 +5794,10 @@ test "CLI script cross: -Dtarget AFTER the script path is opaque passthrough (fo
     // guards against a regression where post-path `-D` tokens are
     // wrongly consumed as build flags (a silent wrong-arch build).
     var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "pass.zap",
-        \\fn main(args :: [String]) -> String {
+        \\fn main(args :: [String]) -> u8 {
         \\  IO.puts("passthrough-ran")
         \\  "ok"
+        \\  0
         \\}
     , &.{}, &.{"-Dtarget=x86_64-linux-musl"});
     defer r.deinit();
@@ -5846,9 +6031,10 @@ test "Phase5 script cache: unchanged script second run is a cache hit (no recomp
     defer tmp_dir.cleanup();
 
     var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "cached.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("cache-hit-marker")
         \\  "ok"
+        \\  0
         \\}
     , null, &.{}, null, &.{});
     defer r.deinit();
@@ -5882,14 +6068,16 @@ test "Phase5 script cache: editing the script source forces a recompile (new key
     defer tmp_dir.cleanup();
 
     var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "edit.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("v1-output")
         \\  "ok"
+        \\  0
         \\}
     ,
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("v2-output")
         \\  "ok"
+        \\  0
         \\}
     , &.{}, null, &.{});
     defer r.deinit();
@@ -5911,9 +6099,10 @@ test "Phase5 script cache: editing the script source forces a recompile (new key
 test "Phase5 script cache: -Doptimize change recompiles, unchanged hits" {
     const allocator = std.testing.allocator;
     const script =
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("opt-key-ok")
         \\  "ok"
+        \\  0
         \\}
     ;
     // Same flag twice ⇒ HIT.
@@ -5941,9 +6130,10 @@ test "Phase5 script cache: -Doptimize change recompiles, unchanged hits" {
 test "Phase5 script cache: -Dmemory change recompiles, unchanged hits" {
     const allocator = std.testing.allocator;
     const script =
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("mem-key-ok")
         \\  "ok"
+        \\  0
         \\}
     ;
     {
@@ -5969,9 +6159,10 @@ test "Phase5 script cache: -Dmemory change recompiles, unchanged hits" {
 test "Phase5 script cache: -Dcpu change recompiles, unchanged hits (still host-runnable)" {
     const allocator = std.testing.allocator;
     const script =
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("cpu-key-ok")
         \\  "ok"
+        \\  0
         \\}
     ;
     {
@@ -5999,9 +6190,10 @@ test "Phase5 script cache: -Dcpu change recompiles, unchanged hits (still host-r
 test "Phase5 script cache: -Dtarget change yields a distinct key (foreign target still reported, exit 0)" {
     const allocator = std.testing.allocator;
     const script =
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("tgt-key-ok")
         \\  "ok"
+        \\  0
         \\}
     ;
     // Same foreign target twice ⇒ HIT (the reported-artifact path
@@ -6112,9 +6304,10 @@ test "Phase5 script cache: a different --zap-lib-dir (different stdlib) yields a
     std.Io.Dir.cwd().deleteTree(getTestIo(), script_cache) catch {};
 
     const script =
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("stdlib-key-ok")
         \\  "ok"
+        \\  0
         \\}
     ;
 
@@ -6155,9 +6348,10 @@ test "Phase5 script cache: NOTHING is written next to the script after many runs
     std.Io.Dir.cwd().deleteTree(getTestIo(), script_cache) catch {};
 
     const script =
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("many-runs-ok")
         \\  "ok"
+        \\  0
         \\}
     ;
     // 5 runs: run 1 compiles, runs 2-5 are cache hits. After ALL
@@ -6183,9 +6377,10 @@ test "Phase5 script cache: artifacts land under the cache root, not cwd/script d
     defer tmp_dir.cleanup();
 
     var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "root.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("root-ok")
         \\  "ok"
+        \\  0
         \\}
     , null, &.{}, null, &.{});
     defer r.deinit();
@@ -6205,13 +6400,14 @@ test "Phase5 script cache: cache hit still forwards post-path args to main/1" {
     defer tmp_dir.cleanup();
 
     var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "argf.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  if System.arg_count() > 0 {
         \\    IO.puts("arg=" <> System.arg_at(0))
         \\  } else {
         \\    IO.puts("arg=NONE")
         \\  }
         \\  "ok"
+        \\  0
         \\}
     , null, &.{}, null, &.{"forwarded-value"});
     defer r.deinit();
@@ -6237,9 +6433,10 @@ test "Phase5 script cache: cache hit propagates a non-zero exit identically to a
     // (the binary itself is unchanged; only compilation is
     // skipped — the runtime contract is identical).
     var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "fail.zap",
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  panic("boom")
         \\  "never"
+        \\  0
         \\}
     , null, &.{}, null, &.{});
     defer r.deinit();
@@ -6313,9 +6510,10 @@ test "Phase5 script cache: concurrent identical runs are race-safe (atomic publi
 
     const script_name = "race.zap";
     tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = script_name, .data =
-        \\fn main(_args :: [String]) -> String {
+        \\fn main(_args :: [String]) -> u8 {
         \\  IO.puts("race-ok")
         \\  "ok"
+        \\  0
         \\}
     }) catch return error.Unexpected;
     const script_path = std.fs.path.join(allocator, &.{ tmp_dir_path, script_name }) catch

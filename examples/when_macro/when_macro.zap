@@ -4,11 +4,12 @@
 #   zap run when_macro
 
 pub struct WhenMacro {
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     Guards.check(10)
     |> IO.puts()
 
     Guards.check(-5)
     |> IO.puts()
+    0
   }
 }

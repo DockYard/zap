@@ -7,7 +7,7 @@
 #   APP_NAME=demo APP_PORT=8080 zap run env_config
 
 pub struct EnvConfig {
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     IO.puts("App name: " <> System.get_env("APP_NAME"))
     IO.puts("Port: " <> System.get_env("APP_PORT"))
 
@@ -17,5 +17,6 @@ pub struct EnvConfig {
       val ->
         IO.puts("Debug mode: " <> val)
     }
+    0
   }
 }

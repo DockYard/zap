@@ -319,12 +319,16 @@ fn emitRuntimeNamespaceField(handle: *ZirBuilderHandle, parent: u32, comptime ns
 }
 
 /// For main(), Zig requires void or u8 return type.
-/// Map integer types to u8 (exit code), keep void as void.
-fn mapMainReturnType(zig_type: ir.ZigType) u32 {
+/// Zap executable entrypoints return exact `u8` process exit status.
+/// A lower-level `.void` return is accepted only because Zig's entry
+/// ABI permits it for generated declarations that do not carry a Zap
+/// source-level value. Other Zap return types are invalid: silently
+/// lowering them to void would discard user values.
+fn mapMainReturnType(zig_type: ir.ZigType) BuildError!u32 {
     return switch (zig_type) {
         .void => 0,
-        .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .usize, .isize => @intFromEnum(Zir.Inst.Ref.u8_type),
-        else => 0, // default to void
+        .u8 => @intFromEnum(Zir.Inst.Ref.u8_type),
+        else => error.InvalidMainReturnType,
     };
 }
 
@@ -3358,7 +3362,7 @@ pub const ZirDriver = struct {
         self.current_function_is_closure = func.captures.len > 0;
         const closure_lowering = self.getClosureLowering(func.id, func.captures.len);
         var ret_type = if (is_main)
-            mapMainReturnType(func.return_type)
+            try mapMainReturnType(func.return_type)
         else
             mapReturnType(func.return_type);
         // Functions with callback params: use generic return type so Zig
@@ -8308,6 +8312,7 @@ pub const BuildError = error{
     BeginFuncFailed,
     EndFuncFailed,
     EmitFailed,
+    InvalidMainReturnType,
     UnknownLocal,
     ZirInjectionFailed,
     OutOfMemory,

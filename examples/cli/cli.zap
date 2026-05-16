@@ -7,8 +7,9 @@
 #   zap run cli
 
 pub struct Cli {
-  pub fn main(_args :: [String]) -> String {
+  pub fn main(_args :: [String]) -> u8 {
     IO.puts("Hello from CLI!")
     IO.puts("Arg count: " <> Integer.to_string(System.arg_count()))
+    0
   }
 }
