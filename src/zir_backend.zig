@@ -40,6 +40,7 @@ extern "c" fn zir_compilation_create_cross(
     is_dynamic: bool,
     link_libc: bool,
     target_triple: ?[*:0]const u8,
+    cpu_features: ?[*:0]const u8,
 ) ?*ZirContext;
 
 extern "c" fn zir_compilation_update(ctx: *ZirContext) i32;
@@ -131,6 +132,13 @@ pub const CompileOptions = struct {
     /// Cross-compilation target triple (e.g., "wasm32-wasi", "aarch64-linux-gnu").
     /// null means native target.
     target: ?[]const u8 = null,
+    /// Optional CPU model/feature set (mirrors `zig build`'s `-Dcpu=`,
+    /// e.g. "baseline", "apple_m1", "x86_64_v3"). null/"" means the
+    /// target's default CPU. Threaded into `zir_compilation_create_cross`
+    /// so the user binary is built for the same machine as the manager
+    /// `.o`. Native compilation with a non-null cpu still takes the
+    /// cross path (the triple is "native" but the CPU is explicit).
+    cpu: ?[]const u8 = null,
     /// Analysis results from the escape/region/ARC pipeline.
     analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext = null,
     /// Per-function ARC ownership tables produced by Phase 4 of the
@@ -178,10 +186,35 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
     const name_z = allocator.dupeZ(u8, options.name) catch return error.OutOfMemory;
     defer allocator.free(name_z);
 
-    const ctx = if (options.target) |target| blk: {
-        const target_z = allocator.dupeZ(u8, target) catch return error.OutOfMemory;
-        defer allocator.free(target_z);
-        break :blk zir_compilation_create_cross(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc, target_z) orelse
+    // The cross path is taken when EITHER an explicit target triple OR
+    // an explicit CPU is requested. A `-Dcpu=` with no `-Dtarget=`
+    // still needs the cross primitive (triple = "native", CPU
+    // explicit) so the CPU actually reaches `std.Target.Query`. With
+    // neither, the plain native path is used unchanged.
+    const ctx = if (options.target != null or options.cpu != null) blk: {
+        const target_z: ?[:0]const u8 = if (options.target) |t|
+            (allocator.dupeZ(u8, t) catch return error.OutOfMemory)
+        else
+            null;
+        defer if (target_z) |t| allocator.free(t);
+        const cpu_z: ?[:0]const u8 = if (options.cpu) |c|
+            (allocator.dupeZ(u8, c) catch return error.OutOfMemory)
+        else
+            null;
+        defer if (cpu_z) |c| allocator.free(c);
+        break :blk zir_compilation_create_cross(
+            zig_lib_z,
+            cache_z,
+            global_cache_z,
+            output_z,
+            name_z,
+            options.output_mode,
+            options.optimize_mode,
+            options.is_dynamic,
+            options.link_libc,
+            if (target_z) |t| t.ptr else null,
+            if (cpu_z) |c| c.ptr else null,
+        ) orelse
             return error.CompilationCreateFailed;
     } else zir_compilation_create(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc) orelse
         return error.CompilationCreateFailed;

@@ -217,6 +217,87 @@ fn stdinReadByte() ?u8 {
     return b;
 }
 
+// ============================================================
+// Linux argv via /proc/self/cmdline
+//
+// `__libc_argc`/`__libc_argv` are glibc-INTERNAL symbols. They are
+// NOT part of any stable libc ABI: musl does not define them at all,
+// and Zig's bundled cross-glibc stubs do not export them either, so
+// referencing them makes every non-host Linux cross-link fail with
+// `undefined symbol: __libc_argc`. The portable, libc-independent way
+// to recover the process argv on Linux is to read the kernel-provided
+// `/proc/self/cmdline` (NUL-separated, NUL-terminated argument list).
+// This works identically for static/dynamic and musl/glibc binaries.
+//
+// argv is process-stable, so the result is read once and cached. The
+// backing storage is a fixed static buffer plus a fixed pointer table
+// (sized generously for realistic command lines); arguments beyond the
+// limits are truncated rather than risking a heap dependency in the
+// runtime's startup path. A leading-slot guarantee is preserved: if
+// parsing yields zero entries, an empty slice is returned (callers
+// already handle an empty argv).
+const LINUX_CMDLINE_BUF_SIZE: usize = 64 * 1024;
+const LINUX_CMDLINE_MAX_ARGS: usize = 4096;
+
+var linux_cmdline_buf: [LINUX_CMDLINE_BUF_SIZE]u8 = undefined;
+var linux_cmdline_ptrs: [LINUX_CMDLINE_MAX_ARGS][*:0]const u8 = undefined;
+var linux_cmdline_argc: usize = 0;
+var linux_cmdline_loaded: bool = false;
+
+/// Read and parse `/proc/self/cmdline` into the static argv cache.
+/// Idempotent: only the first call performs I/O. Safe to call from the
+/// runtime startup path (raw syscalls only, no allocator).
+fn loadLinuxCmdline() void {
+    if (linux_cmdline_loaded) return;
+    linux_cmdline_loaded = true;
+    linux_cmdline_argc = 0;
+
+    // Use libc-level `open`/`read`/`close` (public POSIX functions
+    // present in BOTH musl and glibc), mirroring `File.read` above.
+    // This deliberately avoids any libc-internal symbol.
+    const fd = std.c.open(
+        "/proc/self/cmdline",
+        .{ .ACCMODE = .RDONLY },
+        @as(std.c.mode_t, 0),
+    );
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+
+    var total: usize = 0;
+    while (total < linux_cmdline_buf.len) {
+        const n = std.posix.read(fd, linux_cmdline_buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    if (total == 0) return;
+
+    // /proc/self/cmdline is NUL-separated. Each argument is itself
+    // NUL-terminated within the buffer, so the slice pointers are
+    // valid `[*:0]const u8` directly into `linux_cmdline_buf`.
+    var i: usize = 0;
+    var arg_start: usize = 0;
+    while (i < total and linux_cmdline_argc < linux_cmdline_ptrs.len) : (i += 1) {
+        if (linux_cmdline_buf[i] == 0) {
+            linux_cmdline_ptrs[linux_cmdline_argc] =
+                @ptrCast(&linux_cmdline_buf[arg_start]);
+            linux_cmdline_argc += 1;
+            arg_start = i + 1;
+        }
+    }
+    // Handle a final argument with no trailing NUL (kernel always
+    // NUL-terminates, but be defensive): only safe if there is room
+    // to write the terminator without overrunning the buffer.
+    if (arg_start < total and
+        linux_cmdline_argc < linux_cmdline_ptrs.len and
+        total < linux_cmdline_buf.len)
+    {
+        linux_cmdline_buf[total] = 0;
+        linux_cmdline_ptrs[linux_cmdline_argc] =
+            @ptrCast(&linux_cmdline_buf[arg_start]);
+        linux_cmdline_argc += 1;
+    }
+}
+
 /// Platform-portable access to process argv (replacement for removed getArgv() in 0.16).
 pub fn getArgv() []const [*:0]const u8 {
     if (comptime builtin.os.tag == .macos) {
@@ -228,13 +309,10 @@ pub fn getArgv() []const [*:0]const u8 {
         const argv = c._NSGetArgv().*;
         return argv[0..argc];
     } else if (comptime builtin.os.tag == .linux) {
-        // On Linux, use /proc/self/cmdline as fallback or linker-provided __libc_argv.
-        const c = struct {
-            extern "c" var __libc_argc: c_int;
-            extern "c" var __libc_argv: [*]const [*:0]const u8;
-        };
-        const argc: usize = @intCast(c.__libc_argc);
-        return c.__libc_argv[0..argc];
+        // Portable, libc-independent argv recovery. Works for static
+        // and dynamic, musl and glibc — no `__libc_argv` dependency.
+        loadLinuxCmdline();
+        return linux_cmdline_ptrs[0..linux_cmdline_argc];
     } else {
         return &.{};
     }

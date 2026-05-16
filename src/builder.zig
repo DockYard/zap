@@ -17,6 +17,17 @@ pub const BuildConfig = struct {
     root: ?[]const u8 = null,
     asset_name: ?[]const u8 = null,
     optimize: Optimize = .debug,
+    /// Cross-compilation target triple selected by the manifest
+    /// (`Zap.Manifest.target`, e.g. "aarch64-linux-gnu"). Null means
+    /// "native host" — the default when neither the manifest nor the
+    /// CLI `-Dtarget=` flag specifies one. The CLI flag overrides this
+    /// per-field (the command line is the ultimate source of truth).
+    target: ?[]const u8 = null,
+    /// Target CPU model/feature set selected by the manifest
+    /// (`Zap.Manifest.cpu`, e.g. "baseline", "apple_m1"). Null means
+    /// "the target's default CPU". Overridden per-field by the CLI
+    /// `-Dcpu=` flag.
+    cpu: ?[]const u8 = null,
     paths: []const []const u8 = &.{},
     deps: []const Dep = &.{},
     build_opts: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -86,6 +97,82 @@ pub const ManifestEval = struct {
     dependencies: []const zap.ctfe.CtDependency,
     result_hash: u64,
 };
+
+/// Synthesize the `BuildConfig` for single-file script mode
+/// (`zap run <script.zap>`), bypassing `build.zap` CTFE entirely.
+///
+/// A script has no manifest, no dependencies, and no project paths —
+/// it is one synthetic module (the reserved wrapper struct holding the
+/// hoisted top-level `main/1`) compiled against the stdlib only. The
+/// root is the canonical `"<SyntheticStruct>.main/1"` string in the
+/// exact same `"{s}.{s}/{d}"` shape `parseManifestRootFunction`
+/// produces, so the existing root→IR-entry mangler in `buildTarget`
+/// (`X.main/1` -> `X__main__1`) resolves the entry point unchanged.
+///
+/// This produces the script-mode BASE config: the synthetic defaults
+/// (Debug optimize, `Memory.ARC`, native target/cpu) that stand in for
+/// what `build.zap` CTFE yields on the manifest path. The CLI
+/// `-D<key>=<value>` overrides are applied AFTERWARD by the single
+/// shared `applyBuildOverrides` step, exactly as on the manifest path,
+/// so the CLI is the ultimate per-field source of truth and there is
+/// only one flag pipeline. No CTFE is performed here.
+pub fn scriptManifest(
+    alloc: std.mem.Allocator,
+    synthetic_struct_name: []const u8,
+) !BuildConfig {
+    const root = try std.fmt.allocPrint(alloc, "{s}.main/1", .{synthetic_struct_name});
+    return .{
+        .name = "script",
+        .version = "0.0.0",
+        .kind = .bin,
+        .root = root,
+        .asset_name = null,
+        // Synthetic script default; `applyBuildOverrides` overlays
+        // `-Doptimize=` when present, matching the manifest path.
+        .optimize = .debug,
+        // Native by default; `-Dtarget=`/`-Dcpu=` overlay per-field.
+        .target = null,
+        .cpu = null,
+        .paths = &.{},
+        .deps = &.{},
+        .build_opts = .empty,
+        // Synthetic script default; `applyBuildOverrides` overlays
+        // `-Dmemory=` (validated stdlib-only for script mode) when
+        // present, matching the manifest path's `memory:` resolution.
+        .memory_manager = SCRIPT_DEFAULT_MEMORY,
+        .test_timeout = 0,
+        .error_style = null,
+        .multiline_errors = false,
+        .source_url = null,
+        .landing_page = null,
+        .doc_groups = &.{},
+    };
+}
+
+/// Default memory manager for script mode. Single source of truth so
+/// the later flag-wiring phase overrides exactly one value. `Memory.ARC`
+/// is the stdlib default the full manifest also defaults to (see
+/// `lib/zap/manifest.zap`); `adapter_source_path` stays null because
+/// the convention-resolved adapter is discovered from the stdlib source
+/// roots by `evaluateMemoryManagerAdapterFromSources`, identical to the
+/// manifest path.
+pub const SCRIPT_DEFAULT_MEMORY: BuildConfig.MemoryManager = .{
+    .type_name = "Memory.ARC",
+    .adapter_source_path = null,
+};
+
+/// Read every `.zap` file under `dir_path` (recursively) into
+/// `source_units`. Public wrapper over the builder-internal stdlib
+/// reader so the single-file script path in the CLI can assemble the
+/// stdlib source units exactly the way the manifest path does, without
+/// duplicating the recursive scan.
+pub fn readStdlibSourceUnits(
+    alloc: std.mem.Allocator,
+    dir_path: []const u8,
+    source_units: *std.ArrayListUnmanaged(compiler.SourceUnit),
+) !void {
+    try readLibSourceUnits(alloc, dir_path, source_units);
+}
 
 /// Extract a BuildConfig by compiling build.zap and evaluating manifest/1
 /// through the CTFE interpreter. This is the production path — it compiles
@@ -338,6 +425,23 @@ fn findManifestFunction(program: *const zap.ir.Program) ?zap.ir.FunctionId {
     return null;
 }
 
+/// Extract a `target:`/`cpu:` manifest field. The manifest declares
+/// these as `Atom` (consistent with `kind`/`optimize`), so the value
+/// arrives as `.atom`. The sentinel `:native` and the empty atom both
+/// mean "host native" and map to `null` so the override model and the
+/// cross-path selection treat absence uniformly. A `.string` is also
+/// accepted for ergonomics (a quoted triple works too); anything else
+/// is `null` (native).
+fn atomTargetField(alloc: std.mem.Allocator, value: zap.ctfe.ConstValue) !?[]const u8 {
+    const raw: []const u8 = switch (value) {
+        .atom => |a| a,
+        .string => |s| s,
+        else => return null,
+    };
+    if (raw.len == 0 or std.mem.eql(u8, raw, "native")) return null;
+    return try alloc.dupe(u8, raw);
+}
+
 fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !BuildConfig {
     switch (val) {
         .struct_val => |sv| {
@@ -389,6 +493,18 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                             .release_safe,
                         else => .release_safe,
                     };
+                } else if (std.mem.eql(u8, field.name, "target")) {
+                    // A Zig target-triple atom (e.g.
+                    // `:"aarch64-linux-gnu"`), mirroring how `kind`
+                    // and `optimize` are atoms. `:native` or empty
+                    // means "host native" — stored as null so the
+                    // override model treats absence uniformly and the
+                    // cross path stays on `zir_compilation_create`.
+                    config.target = atomTargetField(alloc, field.value) catch
+                        return error.OutOfMemory;
+                } else if (std.mem.eql(u8, field.name, "cpu")) {
+                    config.cpu = atomTargetField(alloc, field.value) catch
+                        return error.OutOfMemory;
                 } else if (std.mem.eql(u8, field.name, "paths")) {
                     switch (field.value) {
                         .list => |items| {

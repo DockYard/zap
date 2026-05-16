@@ -186,111 +186,39 @@ pub fn build(b: *std.Build) void {
         .root_source_file = wrapper_source,
     });
 
-    exe.root_module.addObjectFile(.{ .cwd_relative = zig_compiler_lib_path });
+    applyNativeCompilerLinkage(exe.root_module, llvm_lib_path, zig_compiler_lib_path);
 
-    if (llvm_lib_path) |lib_path| {
-        exe.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
-
-        // Clang libraries from LLVM 21 (zig-bootstrap 0.16.0)
-        const clang_libs = [_][]const u8{
-            "clangFrontendTool",           "clangCodeGen",                "clangFrontend",
-            "clangDriver",                 "clangSerialization",          "clangSema",
-            "clangStaticAnalyzerFrontend", "clangStaticAnalyzerCheckers", "clangStaticAnalyzerCore",
-            "clangAnalysis",               "clangASTMatchers",            "clangAST",
-            "clangParse",                  "clangAPINotes",               "clangBasic",
-            "clangEdit",                   "clangLex",                    "clangRewriteFrontend",
-            "clangRewrite",                "clangCrossTU",                "clangIndex",
-            "clangToolingCore",            "clangExtractAPI",             "clangSupport",
-            "clangInstallAPI",
-        };
-        for (clang_libs) |lib_name| {
-            exe.root_module.linkSystemLibrary(lib_name, .{ .preferred_link_mode = .static });
-        }
-
-        const lld_libs = [_][]const u8{
-            "lldMinGW", "lldELF", "lldCOFF", "lldWasm", "lldMachO", "lldCommon",
-        };
-        for (lld_libs) |lib_name| {
-            exe.root_module.linkSystemLibrary(lib_name, .{ .preferred_link_mode = .static });
-        }
-
-        // LLVM 21 libraries (zig-bootstrap 0.16.0)
-        const llvm_libs = [_][]const u8{
-            "LLVMWindowsManifest",         "LLVMXRay",                  "LLVMLibDriver",
-            "LLVMDlltoolDriver",           "LLVMTelemetry",             "LLVMTextAPIBinaryReader",
-            "LLVMCoverage",                "LLVMLineEditor",            "LLVMXCoreDisassembler",
-            "LLVMXCoreCodeGen",            "LLVMXCoreDesc",             "LLVMXCoreInfo",
-            "LLVMX86TargetMCA",            "LLVMX86Disassembler",       "LLVMX86AsmParser",
-            "LLVMX86CodeGen",              "LLVMX86Desc",               "LLVMX86Info",
-            "LLVMWebAssemblyDisassembler", "LLVMWebAssemblyAsmParser",  "LLVMWebAssemblyCodeGen",
-            "LLVMWebAssemblyUtils",        "LLVMWebAssemblyDesc",       "LLVMWebAssemblyInfo",
-            "LLVMVEDisassembler",          "LLVMVEAsmParser",           "LLVMVECodeGen",
-            "LLVMVEDesc",                  "LLVMVEInfo",                "LLVMSystemZDisassembler",
-            "LLVMSystemZAsmParser",        "LLVMSystemZCodeGen",        "LLVMSystemZDesc",
-            "LLVMSystemZInfo",             "LLVMSPIRVCodeGen",          "LLVMSPIRVDesc",
-            "LLVMSPIRVInfo",               "LLVMSPIRVAnalysis",         "LLVMSparcDisassembler",
-            "LLVMSparcAsmParser",          "LLVMSparcCodeGen",          "LLVMSparcDesc",
-            "LLVMSparcInfo",               "LLVMRISCVTargetMCA",        "LLVMRISCVDisassembler",
-            "LLVMRISCVAsmParser",          "LLVMRISCVCodeGen",          "LLVMRISCVDesc",
-            "LLVMRISCVInfo",               "LLVMPowerPCDisassembler",   "LLVMPowerPCAsmParser",
-            "LLVMPowerPCCodeGen",          "LLVMPowerPCDesc",           "LLVMPowerPCInfo",
-            "LLVMNVPTXCodeGen",            "LLVMNVPTXDesc",             "LLVMNVPTXInfo",
-            "LLVMMSP430Disassembler",      "LLVMMSP430AsmParser",       "LLVMMSP430CodeGen",
-            "LLVMMSP430Desc",              "LLVMMSP430Info",            "LLVMMipsDisassembler",
-            "LLVMMipsAsmParser",           "LLVMMipsCodeGen",           "LLVMMipsDesc",
-            "LLVMMipsInfo",                "LLVMLoongArchDisassembler", "LLVMLoongArchAsmParser",
-            "LLVMLoongArchCodeGen",        "LLVMLoongArchDesc",         "LLVMLoongArchInfo",
-            "LLVMLanaiDisassembler",       "LLVMLanaiCodeGen",          "LLVMLanaiAsmParser",
-            "LLVMLanaiDesc",               "LLVMLanaiInfo",             "LLVMHexagonDisassembler",
-            "LLVMHexagonCodeGen",          "LLVMHexagonAsmParser",      "LLVMHexagonDesc",
-            "LLVMHexagonInfo",             "LLVMBPFDisassembler",       "LLVMBPFAsmParser",
-            "LLVMBPFCodeGen",              "LLVMBPFDesc",               "LLVMBPFInfo",
-            "LLVMAVRDisassembler",         "LLVMAVRAsmParser",          "LLVMAVRCodeGen",
-            "LLVMAVRDesc",                 "LLVMAVRInfo",               "LLVMARMDisassembler",
-            "LLVMARMAsmParser",            "LLVMARMCodeGen",            "LLVMARMDesc",
-            "LLVMARMUtils",                "LLVMARMInfo",               "LLVMAMDGPUTargetMCA",
-            "LLVMAMDGPUDisassembler",      "LLVMAMDGPUAsmParser",       "LLVMAMDGPUCodeGen",
-            "LLVMAMDGPUDesc",              "LLVMAMDGPUUtils",           "LLVMAMDGPUInfo",
-            "LLVMAArch64Disassembler",     "LLVMAArch64AsmParser",      "LLVMAArch64CodeGen",
-            "LLVMAArch64Desc",             "LLVMAArch64Utils",          "LLVMAArch64Info",
-            "LLVMOrcDebugging",            "LLVMOrcJIT",                "LLVMWindowsDriver",
-            "LLVMMCJIT",                   "LLVMJITLink",               "LLVMInterpreter",
-            "LLVMExecutionEngine",         "LLVMRuntimeDyld",           "LLVMOrcTargetProcess",
-            "LLVMOrcShared",               "LLVMDWP",                   "LLVMDWARFCFIChecker",
-            "LLVMDebugInfoLogicalView",    "LLVMOption",                "LLVMObjCopy",
-            "LLVMMCA",                     "LLVMMCDisassembler",        "LLVMLTO",
-            "LLVMFrontendOpenACC",         "LLVMFrontendHLSL",          "LLVMFrontendDriver",
-            "LLVMExtensions",              "LLVMPasses",                "LLVMHipStdPar",
-            "LLVMCoroutines",              "LLVMCFGuard",               "LLVMipo",
-            "LLVMInstrumentation",         "LLVMVectorize",             "LLVMSandboxIR",
-            "LLVMLinker",                  "LLVMFrontendOpenMP",        "LLVMFrontendDirective",
-            "LLVMFrontendAtomic",          "LLVMFrontendOffloading",    "LLVMObjectYAML",
-            "LLVMDWARFLinkerParallel",     "LLVMDWARFLinkerClassic",    "LLVMDWARFLinker",
-            "LLVMGlobalISel",              "LLVMMIRParser",             "LLVMAsmPrinter",
-            "LLVMSelectionDAG",            "LLVMCodeGen",               "LLVMTarget",
-            "LLVMObjCARCOpts",             "LLVMCodeGenTypes",          "LLVMCGData",
-            "LLVMIRPrinter",               "LLVMInterfaceStub",         "LLVMFileCheck",
-            "LLVMFuzzMutate",              "LLVMScalarOpts",            "LLVMInstCombine",
-            "LLVMAggressiveInstCombine",   "LLVMTransformUtils",        "LLVMBitWriter",
-            "LLVMAnalysis",                "LLVMProfileData",           "LLVMSymbolize",
-            "LLVMDebugInfoBTF",            "LLVMDebugInfoPDB",          "LLVMDebugInfoMSF",
-            "LLVMDebugInfoCodeView",       "LLVMDebugInfoGSYM",         "LLVMDebugInfoDWARF",
-            "LLVMDebugInfoDWARFLowLevel",  "LLVMObject",                "LLVMTextAPI",
-            "LLVMMCParser",                "LLVMIRReader",              "LLVMAsmParser",
-            "LLVMMC",                      "LLVMBitReader",             "LLVMFuzzerCLI",
-            "LLVMCore",                    "LLVMRemarks",               "LLVMBitstreamReader",
-            "LLVMBinaryFormat",            "LLVMTargetParser",          "LLVMSupport",
-            "LLVMDemangle",
-        };
-        for (llvm_libs) |lib_name| {
-            exe.root_module.linkSystemLibrary(lib_name, .{ .preferred_link_mode = .static });
-        }
-
-        exe.root_module.linkSystemLibrary("z", .{});
-        exe.root_module.linkSystemLibrary("zstd", .{});
-        exe.root_module.linkSystemLibrary("xml2", .{});
-        exe.root_module.linkSystemLibrary("c++", .{ .use_pkg_config = .no });
-    }
+    // -----------------------------------------------------------------------
+    // CLI unit tests (`src/main.zig`)
+    //
+    // `mod_tests` only covers `src/root.zig`'s module graph; the CLI
+    // entry point (`src/main.zig`) is a separate executable root and was
+    // therefore never test-compiled by `zig build test`. The CLI's
+    // argument parsing and the Zap stdlib resolver live here, so the
+    // unit tests in `src/main.zig` must run as part of the standard test
+    // step. This target mirrors `exe_module` exactly — same `zap`
+    // import, `build_options`, embedded Zig-lib archive, and native
+    // compiler linkage — so the tests link and run against the real CLI
+    // module graph.
+    // -----------------------------------------------------------------------
+    const main_tests_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zap", .module = mod },
+        },
+    });
+    main_tests_module.addOptions("build_options", build_options);
+    main_tests_module.addAnonymousImport("zig_lib_archive", .{
+        .root_source_file = wrapper_source,
+    });
+    applyNativeCompilerLinkage(main_tests_module, llvm_lib_path, zig_compiler_lib_path);
+    const main_tests = b.addTest(.{
+        .root_module = main_tests_module,
+    });
+    const run_main_tests = b.addRunArtifact(main_tests);
+    test_step.dependOn(&run_main_tests.step);
 
     b.installArtifact(exe);
     b.installDirectory(.{
@@ -355,6 +283,122 @@ pub fn build(b: *std.Build) void {
     const zir_test_step = b.step("zir-test", "Run ZIR integration tests");
     zir_test_step.dependOn(&run_zir_tests.step);
     zir_test_step.dependOn(b.getInstallStep());
+}
+
+/// Apply the native compiler-backend linkage (the prebuilt
+/// `libzap_compiler.a` object plus the Clang/LLD/LLVM static libraries)
+/// to `root_module`. Shared by the `zap` executable and the
+/// `src/main.zig` unit-test target so both link against an identical
+/// native module graph and do not drift.
+fn applyNativeCompilerLinkage(
+    root_module: *std.Build.Module,
+    llvm_lib_path: ?[]const u8,
+    zig_compiler_lib_path: []const u8,
+) void {
+    root_module.addObjectFile(.{ .cwd_relative = zig_compiler_lib_path });
+
+    const lib_path = llvm_lib_path orelse return;
+    root_module.addLibraryPath(.{ .cwd_relative = lib_path });
+
+    // Clang libraries from LLVM 21 (zig-bootstrap 0.16.0)
+    const clang_libs = [_][]const u8{
+        "clangFrontendTool",           "clangCodeGen",                "clangFrontend",
+        "clangDriver",                 "clangSerialization",          "clangSema",
+        "clangStaticAnalyzerFrontend", "clangStaticAnalyzerCheckers", "clangStaticAnalyzerCore",
+        "clangAnalysis",               "clangASTMatchers",            "clangAST",
+        "clangParse",                  "clangAPINotes",               "clangBasic",
+        "clangEdit",                   "clangLex",                    "clangRewriteFrontend",
+        "clangRewrite",                "clangCrossTU",                "clangIndex",
+        "clangToolingCore",            "clangExtractAPI",             "clangSupport",
+        "clangInstallAPI",
+    };
+    for (clang_libs) |lib_name| {
+        root_module.linkSystemLibrary(lib_name, .{ .preferred_link_mode = .static });
+    }
+
+    const lld_libs = [_][]const u8{
+        "lldMinGW", "lldELF", "lldCOFF", "lldWasm", "lldMachO", "lldCommon",
+    };
+    for (lld_libs) |lib_name| {
+        root_module.linkSystemLibrary(lib_name, .{ .preferred_link_mode = .static });
+    }
+
+    // LLVM 21 libraries (zig-bootstrap 0.16.0)
+    const llvm_libs = [_][]const u8{
+        "LLVMWindowsManifest",         "LLVMXRay",                  "LLVMLibDriver",
+        "LLVMDlltoolDriver",           "LLVMTelemetry",             "LLVMTextAPIBinaryReader",
+        "LLVMCoverage",                "LLVMLineEditor",            "LLVMXCoreDisassembler",
+        "LLVMXCoreCodeGen",            "LLVMXCoreDesc",             "LLVMXCoreInfo",
+        "LLVMX86TargetMCA",            "LLVMX86Disassembler",       "LLVMX86AsmParser",
+        "LLVMX86CodeGen",              "LLVMX86Desc",               "LLVMX86Info",
+        "LLVMWebAssemblyDisassembler", "LLVMWebAssemblyAsmParser",  "LLVMWebAssemblyCodeGen",
+        "LLVMWebAssemblyUtils",        "LLVMWebAssemblyDesc",       "LLVMWebAssemblyInfo",
+        "LLVMVEDisassembler",          "LLVMVEAsmParser",           "LLVMVECodeGen",
+        "LLVMVEDesc",                  "LLVMVEInfo",                "LLVMSystemZDisassembler",
+        "LLVMSystemZAsmParser",        "LLVMSystemZCodeGen",        "LLVMSystemZDesc",
+        "LLVMSystemZInfo",             "LLVMSPIRVCodeGen",          "LLVMSPIRVDesc",
+        "LLVMSPIRVInfo",               "LLVMSPIRVAnalysis",         "LLVMSparcDisassembler",
+        "LLVMSparcAsmParser",          "LLVMSparcCodeGen",          "LLVMSparcDesc",
+        "LLVMSparcInfo",               "LLVMRISCVTargetMCA",        "LLVMRISCVDisassembler",
+        "LLVMRISCVAsmParser",          "LLVMRISCVCodeGen",          "LLVMRISCVDesc",
+        "LLVMRISCVInfo",               "LLVMPowerPCDisassembler",   "LLVMPowerPCAsmParser",
+        "LLVMPowerPCCodeGen",          "LLVMPowerPCDesc",           "LLVMPowerPCInfo",
+        "LLVMNVPTXCodeGen",            "LLVMNVPTXDesc",             "LLVMNVPTXInfo",
+        "LLVMMSP430Disassembler",      "LLVMMSP430AsmParser",       "LLVMMSP430CodeGen",
+        "LLVMMSP430Desc",              "LLVMMSP430Info",            "LLVMMipsDisassembler",
+        "LLVMMipsAsmParser",           "LLVMMipsCodeGen",           "LLVMMipsDesc",
+        "LLVMMipsInfo",                "LLVMLoongArchDisassembler", "LLVMLoongArchAsmParser",
+        "LLVMLoongArchCodeGen",        "LLVMLoongArchDesc",         "LLVMLoongArchInfo",
+        "LLVMLanaiDisassembler",       "LLVMLanaiCodeGen",          "LLVMLanaiAsmParser",
+        "LLVMLanaiDesc",               "LLVMLanaiInfo",             "LLVMHexagonDisassembler",
+        "LLVMHexagonCodeGen",          "LLVMHexagonAsmParser",      "LLVMHexagonDesc",
+        "LLVMHexagonInfo",             "LLVMBPFDisassembler",       "LLVMBPFAsmParser",
+        "LLVMBPFCodeGen",              "LLVMBPFDesc",               "LLVMBPFInfo",
+        "LLVMAVRDisassembler",         "LLVMAVRAsmParser",          "LLVMAVRCodeGen",
+        "LLVMAVRDesc",                 "LLVMAVRInfo",               "LLVMARMDisassembler",
+        "LLVMARMAsmParser",            "LLVMARMCodeGen",            "LLVMARMDesc",
+        "LLVMARMUtils",                "LLVMARMInfo",               "LLVMAMDGPUTargetMCA",
+        "LLVMAMDGPUDisassembler",      "LLVMAMDGPUAsmParser",       "LLVMAMDGPUCodeGen",
+        "LLVMAMDGPUDesc",              "LLVMAMDGPUUtils",           "LLVMAMDGPUInfo",
+        "LLVMAArch64Disassembler",     "LLVMAArch64AsmParser",      "LLVMAArch64CodeGen",
+        "LLVMAArch64Desc",             "LLVMAArch64Utils",          "LLVMAArch64Info",
+        "LLVMOrcDebugging",            "LLVMOrcJIT",                "LLVMWindowsDriver",
+        "LLVMMCJIT",                   "LLVMJITLink",               "LLVMInterpreter",
+        "LLVMExecutionEngine",         "LLVMRuntimeDyld",           "LLVMOrcTargetProcess",
+        "LLVMOrcShared",               "LLVMDWP",                   "LLVMDWARFCFIChecker",
+        "LLVMDebugInfoLogicalView",    "LLVMOption",                "LLVMObjCopy",
+        "LLVMMCA",                     "LLVMMCDisassembler",        "LLVMLTO",
+        "LLVMFrontendOpenACC",         "LLVMFrontendHLSL",          "LLVMFrontendDriver",
+        "LLVMExtensions",              "LLVMPasses",                "LLVMHipStdPar",
+        "LLVMCoroutines",              "LLVMCFGuard",               "LLVMipo",
+        "LLVMInstrumentation",         "LLVMVectorize",             "LLVMSandboxIR",
+        "LLVMLinker",                  "LLVMFrontendOpenMP",        "LLVMFrontendDirective",
+        "LLVMFrontendAtomic",          "LLVMFrontendOffloading",    "LLVMObjectYAML",
+        "LLVMDWARFLinkerParallel",     "LLVMDWARFLinkerClassic",    "LLVMDWARFLinker",
+        "LLVMGlobalISel",              "LLVMMIRParser",             "LLVMAsmPrinter",
+        "LLVMSelectionDAG",            "LLVMCodeGen",               "LLVMTarget",
+        "LLVMObjCARCOpts",             "LLVMCodeGenTypes",          "LLVMCGData",
+        "LLVMIRPrinter",               "LLVMInterfaceStub",         "LLVMFileCheck",
+        "LLVMFuzzMutate",              "LLVMScalarOpts",            "LLVMInstCombine",
+        "LLVMAggressiveInstCombine",   "LLVMTransformUtils",        "LLVMBitWriter",
+        "LLVMAnalysis",                "LLVMProfileData",           "LLVMSymbolize",
+        "LLVMDebugInfoBTF",            "LLVMDebugInfoPDB",          "LLVMDebugInfoMSF",
+        "LLVMDebugInfoCodeView",       "LLVMDebugInfoGSYM",         "LLVMDebugInfoDWARF",
+        "LLVMDebugInfoDWARFLowLevel",  "LLVMObject",                "LLVMTextAPI",
+        "LLVMMCParser",                "LLVMIRReader",              "LLVMAsmParser",
+        "LLVMMC",                      "LLVMBitReader",             "LLVMFuzzerCLI",
+        "LLVMCore",                    "LLVMRemarks",               "LLVMBitstreamReader",
+        "LLVMBinaryFormat",            "LLVMTargetParser",          "LLVMSupport",
+        "LLVMDemangle",
+    };
+    for (llvm_libs) |lib_name| {
+        root_module.linkSystemLibrary(lib_name, .{ .preferred_link_mode = .static });
+    }
+
+    root_module.linkSystemLibrary("z", .{});
+    root_module.linkSystemLibrary("zstd", .{});
+    root_module.linkSystemLibrary("xml2", .{});
+    root_module.linkSystemLibrary("c++", .{ .use_pkg_config = .no });
 }
 
 fn detectBuildZigLibDir(b: *std.Build) []const u8 {

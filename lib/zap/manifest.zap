@@ -20,6 +20,21 @@
   When omitted, the manifest defaults to `Memory.ARC`. See
   `docs/memory-manager-abi.md` for the Memory Manager ABI v1.0
   contract every manager must conform to.
+
+  ## `target:` field
+
+  Selects the compilation target as a Zig target-triple atom such
+  as `:"aarch64-linux-gnu"` or `:"wasm32-wasi"`. When omitted (the
+  `:native` default), the build targets the host natively. The CLI
+  `-Dtarget=<triple>` flag overrides this per-field — the command
+  line is the ultimate source of truth.
+
+  ## `cpu:` field
+
+  Selects the target CPU model/feature set as a Zig CPU atom such
+  as `:baseline` or `:apple_m1`. When omitted (the `:native`
+  default), the target's default CPU is used. The CLI `-Dcpu=<cpu>`
+  flag overrides this per-field.
   """
 
 pub struct Zap.Manifest {
@@ -29,6 +44,8 @@ pub struct Zap.Manifest {
   root :: Function | Nil = nil
   asset_name :: String = ""
   optimize :: Atom = :release_safe
+  target :: Atom = :native
+  cpu :: Atom = :native
   paths :: [String] = []
   deps :: [Zap.Dep] = []
   memory :: Type = Memory.ARC

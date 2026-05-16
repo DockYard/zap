@@ -23,6 +23,36 @@ pub const Parser = struct {
     /// parses as `if (Foo.bar(x) { ... })` — the trailing block gets
     /// absorbed as an argument to `bar`.
     disable_trailing_block: bool = false,
+    /// Opt-in single-file script mode. Default `false` so every
+    /// non-script caller (`Parser.init`, `Parser.initWithSharedInterner`)
+    /// is byte-identical to the pre-script-mode behavior and the
+    /// top-level-`fn` prohibition stays fully intact. When `true`, a
+    /// literal top-level `fn`/`pub fn` is parsed via the SAME function
+    /// machinery used inside struct bodies and hoisted — at the AST
+    /// level, with NO source-text rewriting — into the reserved
+    /// synthetic wrapper struct `SCRIPT_WRAPPER_STRUCT_NAME`. The
+    /// file's own structs/protocols/impls keep their declared names and
+    /// compile as normal modules so the hoisted `main/1` can call them.
+    script_mode: bool = false,
+    /// Top-level functions collected while parsing in `script_mode`.
+    /// Wrapped into the synthetic struct after the parse loop. Never
+    /// populated when `script_mode == false`.
+    hoisted_script_functions: std.ArrayList(*const ast.FunctionDecl) = .empty,
+
+    /// Reserved name of the synthetic wrapper struct that holds a
+    /// script's hoisted top-level `main/1`. It CANNOT collide with any
+    /// user-declarable struct or IR symbol:
+    ///   * Zap struct-name segments must start with an uppercase letter
+    ///     (`parseStructName` requires a `.type_identifier`), so a
+    ///     `__`-prefixed name is unreachable from user source.
+    ///   * It follows the existing `__`-prefixed synthetic convention
+    ///     already used by the parser (e.g. `__anon_fn_N`).
+    ///   * As a single-segment struct name it lowers through
+    ///     `structNameToPrefix` to the literal `__ZapScriptMain`, so
+    ///     `main/1` becomes the IR symbol `__ZapScriptMain__main__1`,
+    ///     exactly matching the manifest root-name mangler
+    ///     (`X.main/1` -> `X__main__1`) with no collision risk.
+    pub const SCRIPT_WRAPPER_STRUCT_NAME = "__ZapScriptMain";
 
     pub const Error = struct {
         message: []const u8,
@@ -32,6 +62,19 @@ pub const Parser = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, source: []const u8) Parser {
+        return initWithScriptMode(allocator, source, false);
+    }
+
+    /// Construct a parser with the single-file script carve-out
+    /// enabled. Identical to `init` except `script_mode` is `true`, so
+    /// a literal top-level `fn`/`pub fn` is hoisted into the reserved
+    /// synthetic wrapper struct instead of being rejected. Used by the
+    /// `zap run <script.zap>` path; never reached by the manifest path.
+    pub fn initScript(allocator: std.mem.Allocator, source: []const u8) Parser {
+        return initWithScriptMode(allocator, source, true);
+    }
+
+    fn initWithScriptMode(allocator: std.mem.Allocator, source: []const u8, script_mode: bool) Parser {
         var lexer = Lexer.init(source);
         const first = lexer.next();
         const interner = allocator.create(ast.StringInterner) catch unreachable;
@@ -46,10 +89,27 @@ pub const Parser = struct {
             .interner = interner,
             .errors = .empty,
             .anon_function_counter = 0,
+            .script_mode = script_mode,
         };
     }
 
     pub fn initWithSharedInterner(allocator: std.mem.Allocator, source: []const u8, interner: *ast.StringInterner, source_id: u32) Parser {
+        return initWithSharedInternerScriptMode(allocator, source, interner, source_id, false);
+    }
+
+    /// Shared-interner constructor variant that opts the parsed unit
+    /// into the script carve-out. The compiler's per-unit parse paths
+    /// (`collectAllFromUnits` sequential + `parseFileTask` parallel)
+    /// route a `SourceUnit` with `script_mode == true` through here so
+    /// the script's top-level `main/1` is hoisted. Default callers go
+    /// through `initWithSharedInterner` and stay byte-identical.
+    pub fn initWithSharedInternerScriptMode(
+        allocator: std.mem.Allocator,
+        source: []const u8,
+        interner: *ast.StringInterner,
+        source_id: u32,
+        script_mode: bool,
+    ) Parser {
         var lexer = Lexer.initWithSourceId(source, source_id);
         const first = lexer.next();
         return .{
@@ -62,6 +122,7 @@ pub const Parser = struct {
             .interner = interner,
             .errors = .empty,
             .anon_function_counter = 0,
+            .script_mode = script_mode,
         };
     }
 
@@ -71,6 +132,7 @@ pub const Parser = struct {
             self.allocator.destroy(interner);
         }
         self.errors.deinit(self.allocator);
+        self.hoisted_script_functions.deinit(self.allocator);
     }
 
     // ============================================================
@@ -390,15 +452,28 @@ pub const Parser = struct {
                         },
                         .keyword_fn => {
                             self.restoreLexerState(saved);
-                            try self.addRichError(
-                                "functions cannot be defined at the top level",
-                                self.currentSpan(),
-                                null,
-                                "move this function inside a `pub struct` block",
-                            );
-                            _ = self.advance(); // skip pub
-                            _ = self.advance(); // skip fn
-                            self.synchronize();
+                            if (self.script_mode) {
+                                // Script carve-out: parse the `pub fn`
+                                // via the SAME function/clause machinery
+                                // used inside struct bodies and collect
+                                // it for AST-level hoisting. No
+                                // source-text rewriting.
+                                if (self.parseFunctionDecl(.public)) |func| {
+                                    try self.hoisted_script_functions.append(self.allocator, func);
+                                } else |_| {
+                                    self.synchronize();
+                                }
+                            } else {
+                                try self.addRichError(
+                                    "functions cannot be defined at the top level",
+                                    self.currentSpan(),
+                                    null,
+                                    "move this function inside a `pub struct` block",
+                                );
+                                _ = self.advance(); // skip pub
+                                _ = self.advance(); // skip fn
+                                self.synchronize();
+                            }
                         },
                         .keyword_macro => {
                             self.restoreLexerState(saved);
@@ -446,14 +521,28 @@ pub const Parser = struct {
                     }
                 },
                 .keyword_fn => {
-                    try self.addRichError(
-                        "functions cannot be defined at the top level",
-                        self.currentSpan(),
-                        null,
-                        "move this function inside a `pub struct` block",
-                    );
-                    _ = self.advance();
-                    self.synchronize();
+                    if (self.script_mode) {
+                        // Script carve-out: a bare top-level `fn` is
+                        // parsed through the same function/clause
+                        // machinery used in struct bodies and collected
+                        // for AST-level hoisting. The script-contract
+                        // check (exactly one, named `main`, arity 1)
+                        // runs post-parse in the script path, not here.
+                        if (self.parseFunctionDecl(.private)) |func| {
+                            try self.hoisted_script_functions.append(self.allocator, func);
+                        } else |_| {
+                            self.synchronize();
+                        }
+                    } else {
+                        try self.addRichError(
+                            "functions cannot be defined at the top level",
+                            self.currentSpan(),
+                            null,
+                            "move this function inside a `pub struct` block",
+                        );
+                        _ = self.advance();
+                        self.synchronize();
+                    }
                 },
                 // (legacy keywords removed — use `pub struct` / `struct` / `pub fn` / `fn` syntax)
                 .keyword_type => {
@@ -548,6 +637,24 @@ pub const Parser = struct {
             }
         }
 
+        // Script carve-out: wrap the collected top-level function(s)
+        // into the reserved synthetic struct. This is a pure AST-level
+        // hoist — the original function declarations (already produced
+        // by the same `parseFunctionDecl` machinery used inside struct
+        // bodies) are moved verbatim into a synthesized `StructDecl`
+        // whose name cannot collide with any user struct. The wrapper
+        // is registered both as a `StructDecl` and as a top-level
+        // `struct_decl` item so the collector treats it like any other
+        // module. The file's own structs/protocols/impls are left
+        // untouched. Whether the collected set satisfies the script
+        // contract (exactly one fn, named `main`, arity 1) is enforced
+        // by the caller post-parse — the parser only hoists.
+        if (self.hoisted_script_functions.items.len > 0) {
+            const wrapper = try self.buildScriptWrapperStruct(self.hoisted_script_functions.items);
+            try structs.append(self.allocator, wrapper);
+            try top_items.append(self.allocator, .{ .struct_decl = try self.create(ast.StructDecl, wrapper) });
+        }
+
         // If we accumulated errors during recovery, report them
         if (self.errors.items.len > 0) {
             return error.ParseError;
@@ -556,6 +663,38 @@ pub const Parser = struct {
         return .{
             .structs = try structs.toOwnedSlice(self.allocator),
             .top_items = try top_items.toOwnedSlice(self.allocator),
+        };
+    }
+
+    /// Build the reserved synthetic wrapper `StructDecl` that holds a
+    /// script's hoisted top-level function(s). The struct name is the
+    /// single interned segment `SCRIPT_WRAPPER_STRUCT_NAME`; each
+    /// hoisted `FunctionDecl` becomes a `StructItem.function` so it
+    /// lowers exactly as if it had been written inside a `pub struct`.
+    /// The span is taken from the first hoisted function so diagnostics
+    /// point at real source.
+    fn buildScriptWrapperStruct(
+        self: *Parser,
+        functions: []const *const ast.FunctionDecl,
+    ) !ast.StructDecl {
+        const wrapper_span = functions[0].meta.span;
+        const name_id = try self.interner.intern(SCRIPT_WRAPPER_STRUCT_NAME);
+
+        const name_parts = try self.allocator.alloc(ast.StringId, 1);
+        name_parts[0] = name_id;
+
+        const items = try self.allocator.alloc(ast.StructItem, functions.len);
+        for (functions, 0..) |func, i| {
+            items[i] = .{ .function = func };
+        }
+
+        return .{
+            .meta = .{ .span = wrapper_span },
+            .name = .{ .parts = name_parts, .span = wrapper_span },
+            .parent = null,
+            .items = items,
+            .fields = &.{},
+            .is_private = false,
         };
     }
 
@@ -4572,6 +4711,117 @@ test "top-level pub fn is also rejected" {
 
     const result = parser.parseProgram();
     try std.testing.expectError(error.ParseError, result);
+}
+
+test "non-script mode still rejects top-level fn" {
+    // Guards the scoping of the script-mode carve-out: a parser
+    // constructed WITHOUT script mode must keep the existing rule
+    // fully intact. Complements the unconditional `:4545`/`:4561`
+    // tests above by proving the default `Parser.init` path is
+    // byte-identical to the pre-script-mode behavior.
+    const source =
+        \\fn main(args) {
+        \\  42
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    try std.testing.expect(!parser.script_mode);
+    const result = parser.parseProgram();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "script-mode parser hoists single top-level main/1" {
+    // The script-mode carve-out parses a literal top-level
+    // `main/1` (via the same function machinery used inside struct
+    // bodies) and hoists it — AST-level, no source rewriting —
+    // into the reserved synthetic wrapper struct
+    // `__ZapScriptMain`, whose name cannot collide with any
+    // user-declarable struct (struct names must start with an
+    // uppercase letter; a `__`-prefixed name is unreachable). The
+    // file's own structs are preserved as their own modules.
+    const source =
+        \\pub struct Greeter {
+        \\  pub fn greet() -> String {
+        \\    "hi"
+        \\  }
+        \\}
+        \\
+        \\fn main(args :: [String]) -> String {
+        \\  Greeter.greet()
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.initScript(arena.allocator(), source);
+    defer parser.deinit();
+
+    try std.testing.expect(parser.script_mode);
+    const program = try parser.parseProgram();
+
+    // The user's own struct survives as a normal module.
+    var found_user_struct = false;
+    var found_synthetic = false;
+    var synthetic_struct: ?ast.StructDecl = null;
+    for (program.structs) |struct_decl| {
+        const name = try struct_decl.name.toDottedString(arena.allocator(), parser.interner);
+        if (std.mem.eql(u8, name, "Greeter")) found_user_struct = true;
+        if (std.mem.eql(u8, name, "__ZapScriptMain")) {
+            found_synthetic = true;
+            synthetic_struct = struct_decl;
+        }
+    }
+    try std.testing.expect(found_user_struct);
+    try std.testing.expect(found_synthetic);
+
+    // The synthetic wrapper holds exactly one function: main/1.
+    const wrapper = synthetic_struct.?;
+    try std.testing.expectEqual(@as(usize, 1), wrapper.items.len);
+    try std.testing.expect(wrapper.items[0] == .function);
+    const main_fn = wrapper.items[0].function;
+    try std.testing.expectEqualStrings("main", parser.interner.get(main_fn.name));
+    try std.testing.expectEqual(@as(usize, 1), main_fn.clauses.len);
+    try std.testing.expectEqual(@as(usize, 1), main_fn.clauses[0].params.len);
+
+    // It is also surfaced as a top-level struct_decl item so the
+    // collector registers it like any other module.
+    var top_items_have_synthetic = false;
+    for (program.top_items) |item| {
+        switch (item) {
+            .struct_decl => |sd| {
+                const n = try sd.name.toDottedString(arena.allocator(), parser.interner);
+                if (std.mem.eql(u8, n, "__ZapScriptMain")) top_items_have_synthetic = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(top_items_have_synthetic);
+}
+
+test "script-mode parser preserves a single literal main/1 with no other top-level fns" {
+    const source =
+        \\fn main(args :: [String]) -> String {
+        \\  IO.puts("ok")
+        \\  "ok"
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.initScript(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.structs.len);
+    const name = try program.structs[0].name.toDottedString(arena.allocator(), parser.interner);
+    try std.testing.expectEqualStrings("__ZapScriptMain", name);
+    try std.testing.expectEqual(@as(usize, 1), program.structs[0].items.len);
+    try std.testing.expect(program.structs[0].items[0] == .function);
 }
 
 test "parse simple function" {

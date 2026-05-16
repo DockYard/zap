@@ -241,6 +241,15 @@ pub const SourceUnit = struct {
     file_path: []const u8,
     source: []const u8,
     primary_struct_name: ?[]const u8 = null,
+    /// Opt-in single-file script carve-out for THIS unit. Default
+    /// `false` so every existing source unit (manifest path, stdlib,
+    /// deps) parses byte-identically. When `true`, the unit is parsed
+    /// with the parser's `script_mode` enabled, so a literal top-level
+    /// `fn`/`pub fn` is hoisted into the reserved synthetic wrapper
+    /// struct instead of being rejected. Only the single synthetic
+    /// script unit produced by the `zap run <script.zap>` path ever
+    /// sets this.
+    script_mode: bool = false,
 };
 
 fn registerSourceUnits(graph: *zap.scope.ScopeGraph, source_units: []const SourceUnit) !void {
@@ -351,7 +360,7 @@ pub fn collectAllFromUnits(
         for (all_source_units, 0..) |unit, i| {
             local_interners[i] = ast.StringInterner.init(alloc);
             parse_results[i] = .{};
-            group.async(io_val, parseFileTask, .{ alloc, unit.source, &local_interners[i], @as(u32, @intCast(i)), &parsed_programs[i], &parse_results[i] });
+            group.async(io_val, parseFileTask, .{ alloc, unit.source, &local_interners[i], @as(u32, @intCast(i)), unit.script_mode, &parsed_programs[i], &parse_results[i] });
         }
         group.await(io_val) catch {};
 
@@ -384,7 +393,7 @@ pub fn collectAllFromUnits(
         // Sequential fallback: single file or no Io available
         for (all_source_units, 0..) |unit, i| {
             local_interners[i] = ast.StringInterner.init(alloc);
-            var parser = zap.Parser.initWithSharedInterner(alloc, unit.source, &local_interners[i], @intCast(i));
+            var parser = zap.Parser.initWithSharedInternerScriptMode(alloc, unit.source, &local_interners[i], @intCast(i), unit.script_mode);
             defer parser.deinit();
 
             parsed_programs[i] = parser.parseProgram() catch {
@@ -3463,10 +3472,11 @@ fn parseFileTask(
     source: []const u8,
     interner: *ast.StringInterner,
     source_id: u32,
+    script_mode: bool,
     out_program: *ast.Program,
     out_result: *ParseTaskResult,
 ) void {
-    var parser = zap.Parser.initWithSharedInterner(alloc, source, interner, source_id);
+    var parser = zap.Parser.initWithSharedInternerScriptMode(alloc, source, interner, source_id, script_mode);
     defer parser.deinit();
 
     out_program.* = parser.parseProgram() catch {

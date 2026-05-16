@@ -80,6 +80,10 @@ pub const ForkCompileFn = *const fn (
     zig_lib_dir_opt: ?[*:0]const u8,
     local_cache_dir_opt: ?[*:0]const u8,
     global_cache_dir_opt: ?[*:0]const u8,
+    /// Optional CPU model/feature set (mirrors `zig build`'s `-Dcpu=`).
+    /// Null/"" ⇒ the resolved triple's default CPU. The manager `.o`
+    /// is built for the SAME CPU as the user binary.
+    cpu_features_opt: ?[*:0]const u8,
 ) callconv(.c) ZapForkResult;
 
 /// The real Zig fork primitive, provided by `libzap_compiler.a` in the
@@ -102,6 +106,7 @@ extern "c" fn zap_fork_compile_zig_to_object(
     zig_lib_dir_opt: ?[*:0]const u8,
     local_cache_dir_opt: ?[*:0]const u8,
     global_cache_dir_opt: ?[*:0]const u8,
+    cpu_features_opt: ?[*:0]const u8,
 ) callconv(.c) ZapForkResult;
 
 /// Thin shim that the driver invokes through `default_fork_fn_or_null`.
@@ -118,6 +123,7 @@ fn zapForkCompileShim(
     zig_lib_dir_opt: ?[*:0]const u8,
     local_cache_dir_opt: ?[*:0]const u8,
     global_cache_dir_opt: ?[*:0]const u8,
+    cpu_features_opt: ?[*:0]const u8,
 ) callconv(.c) ZapForkResult {
     return zap_fork_compile_zig_to_object(
         source_path,
@@ -129,6 +135,7 @@ fn zapForkCompileShim(
         zig_lib_dir_opt,
         local_cache_dir_opt,
         global_cache_dir_opt,
+        cpu_features_opt,
     );
 }
 
@@ -278,6 +285,13 @@ pub const ResolveOptions = struct {
     /// unsupported triples surface as `ResolveError.ManagerCompileFailed`
     /// with the primitive's diagnostic text in `diag`.
     target: ?[]const u8 = null,
+    /// Optional CPU model/feature set (mirrors `zig build`'s `-Dcpu=`,
+    /// e.g. `"baseline"`, `"apple_m1"`). Null/"" ⇒ the resolved
+    /// triple's default CPU. Threaded into the fork primitive so the
+    /// manager `.o` is built for the SAME CPU as the user binary; an
+    /// unparsable CPU surfaces as `ResolveError.ManagerCompileFailed`
+    /// with the primitive's diagnostic text in `diag`.
+    cpu: ?[]const u8 = null,
     /// Optional override for the fork compile function. When null the
     /// driver invokes the real `libzap_compiler.a` extern. Tests pass a
     /// mock that synthesises an object file without needing the LLVM
@@ -613,6 +627,17 @@ fn compileManagerSource(
         );
         return ResolveError.InternalError;
     });
+
+    // Null-terminated CPU string for the fork primitive. Empty/absent
+    // ⇒ pass null so the resolved triple's default CPU is used. A
+    // non-empty value builds the manager `.o` for the SAME CPU as the
+    // user binary so every object in the final link agrees.
+    const cpu_z: ?[:0]const u8 = if (options.cpu) |c|
+        (if (c.len == 0) null else (allocator.dupeZ(u8, c) catch return ResolveError.OutOfMemory))
+    else
+        null;
+    defer if (cpu_z) |p| allocator.free(p);
+
     const result = fork_fn(
         source_z.ptr,
         &target,
@@ -623,6 +648,7 @@ fn compileManagerSource(
         zig_lib_z,
         null,
         null,
+        if (cpu_z) |p| p.ptr else null,
     );
 
     switch (result) {
@@ -1814,6 +1840,7 @@ fn mockForkCompileNoOp(
     zig_lib_dir_opt: ?[*:0]const u8,
     local_cache_dir_opt: ?[*:0]const u8,
     global_cache_dir_opt: ?[*:0]const u8,
+    cpu_features_opt: ?[*:0]const u8,
 ) callconv(.c) ZapForkResult {
     _ = source_path;
     _ = target;
@@ -1823,6 +1850,7 @@ fn mockForkCompileNoOp(
     _ = zig_lib_dir_opt;
     _ = local_cache_dir_opt;
     _ = global_cache_dir_opt;
+    _ = cpu_features_opt;
 
     var buffer: [4096]u8 = undefined;
     const written = synthesizeNoOpElf(&buffer);
@@ -1852,6 +1880,7 @@ fn mockForkCompileNoOpMacho(
     zig_lib_dir_opt: ?[*:0]const u8,
     local_cache_dir_opt: ?[*:0]const u8,
     global_cache_dir_opt: ?[*:0]const u8,
+    cpu_features_opt: ?[*:0]const u8,
 ) callconv(.c) ZapForkResult {
     _ = source_path;
     _ = target;
@@ -1861,6 +1890,7 @@ fn mockForkCompileNoOpMacho(
     _ = zig_lib_dir_opt;
     _ = local_cache_dir_opt;
     _ = global_cache_dir_opt;
+    _ = cpu_features_opt;
 
     var buffer: [4096]u8 = undefined;
     const written = synthesizeNoOpMacho(&buffer);
@@ -2367,13 +2397,19 @@ test "assertExportsManagerSymbol handles ELF with > 256 sections" {
 /// to the fork primitive.
 var captured_target_state: struct {
     target: ZapForkTarget = std.mem.zeroes(ZapForkTarget),
+    /// Whether a non-null `cpu_features_opt` reached the fork, and its
+    /// bytes (bounded copy) so the plumbing test can assert `-Dcpu=`
+    /// is threaded all the way through `resolve()`.
+    cpu_present: bool = false,
+    cpu_buf: [64]u8 = undefined,
+    cpu_len: usize = 0,
     invoked: bool = false,
 } = .{};
 
-/// Mock `ForkCompileFn` for the compile_target plumbing test. Records
-/// the `ZapForkTarget` it received into `captured_target_state` and
-/// writes a NoOp ELF object so the surrounding `resolve()` call
-/// completes successfully.
+/// Mock `ForkCompileFn` for the compile_target/cpu plumbing test.
+/// Records the `ZapForkTarget` and `cpu_features_opt` it received into
+/// `captured_target_state` and writes a NoOp ELF object so the
+/// surrounding `resolve()` call completes successfully.
 fn mockForkCompileCaptureTarget(
     source_path: [*:0]const u8,
     target: *const ZapForkTarget,
@@ -2384,6 +2420,7 @@ fn mockForkCompileCaptureTarget(
     zig_lib_dir_opt: ?[*:0]const u8,
     local_cache_dir_opt: ?[*:0]const u8,
     global_cache_dir_opt: ?[*:0]const u8,
+    cpu_features_opt: ?[*:0]const u8,
 ) callconv(.c) ZapForkResult {
     _ = source_path;
     _ = optimize;
@@ -2395,6 +2432,16 @@ fn mockForkCompileCaptureTarget(
 
     captured_target_state.target = target.*;
     captured_target_state.invoked = true;
+    if (cpu_features_opt) |c| {
+        const slice = std.mem.span(c);
+        captured_target_state.cpu_present = true;
+        const n = @min(slice.len, captured_target_state.cpu_buf.len);
+        @memcpy(captured_target_state.cpu_buf[0..n], slice[0..n]);
+        captured_target_state.cpu_len = n;
+    } else {
+        captured_target_state.cpu_present = false;
+        captured_target_state.cpu_len = 0;
+    }
 
     var buffer: [4096]u8 = undefined;
     const written = synthesizeNoOpElf(&buffer);
@@ -2484,6 +2531,117 @@ test "resolve threads compile_target through to fork_compile_fn" {
         @as(u16, @intCast(@intFromEnum(std.Target.Abi.gnu))),
         captured_target_state.target.abi_tag,
     );
+}
+
+test "resolve threads cpu through to fork_compile_fn" {
+    // The CPU plumbing sibling of the target test: when the build
+    // supplies `-Dcpu=`, `resolve()` must pass that exact string to
+    // the fork primitive so the manager `.o` is built for the same
+    // machine as the user binary. Without this the manager `.o` would
+    // use the triple's default CPU and could ABI-mismatch the binary.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/project_manager") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/project_manager.zap", .data = "// adapter" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+    const adapter_source_path = std.fs.path.join(allocator, &.{ tmp_path, "lib/project_manager.zap" }) catch return error.Unexpected;
+    defer allocator.free(adapter_source_path);
+    const lib_source_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(lib_source_root);
+    const source_roots = [_]SourceRoot{.{ .name = "project", .path = lib_source_root }};
+
+    captured_target_state = .{};
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var resolved = try resolve(
+        allocator,
+        .{
+            .adapter = .{
+                .type_name = "Example.ProjectManager",
+                .adapter_source_path = adapter_source_path,
+            },
+            .source_roots = &source_roots,
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = cache_root,
+            .target = "x86_64-linux-gnu",
+            .cpu = "x86_64_v3",
+            .fork_compile_fn = mockForkCompileCaptureTarget,
+        },
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expect(captured_target_state.invoked);
+    try std.testing.expect(captured_target_state.cpu_present);
+    try std.testing.expectEqualStrings(
+        "x86_64_v3",
+        captured_target_state.cpu_buf[0..captured_target_state.cpu_len],
+    );
+}
+
+test "resolve passes a null cpu when none is requested" {
+    // Complementary: with no `cpu` set, the driver must pass null so
+    // the fork uses the resolved triple's default CPU.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/project_manager") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/project_manager.zap", .data = "// adapter" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/project_manager/manager.zig", .data = "// placeholder" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.Unexpected;
+    defer allocator.free(cache_root);
+    const adapter_source_path = std.fs.path.join(allocator, &.{ tmp_path, "lib/project_manager.zap" }) catch return error.Unexpected;
+    defer allocator.free(adapter_source_path);
+    const lib_source_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.Unexpected;
+    defer allocator.free(lib_source_root);
+    const source_roots = [_]SourceRoot{.{ .name = "project", .path = lib_source_root }};
+
+    captured_target_state = .{};
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var resolved = try resolve(
+        allocator,
+        .{
+            .adapter = .{
+                .type_name = "Example.ProjectManager",
+                .adapter_source_path = adapter_source_path,
+            },
+            .source_roots = &source_roots,
+            .project_root = tmp_path,
+            .zap_source_root = tmp_path,
+            .cache_dir = cache_root,
+            .fork_compile_fn = mockForkCompileCaptureTarget,
+        },
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expect(captured_target_state.invoked);
+    try std.testing.expect(!captured_target_state.cpu_present);
 }
 
 test "resolve passes NATIVE sentinel when compile_target is null" {

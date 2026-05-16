@@ -3335,3 +3335,3034 @@ test "ZIR: Phase 5 return-elision counter stays zero for non-ARC workload" {
     // Else: no stats dumped because no ARC traffic fired — also a
     // valid observation that the counter stayed at zero.
 }
+
+// ============================================================
+// CLI: generalized Zap stdlib resolver (Phase 1)
+//
+// These tests exercise the `--zap-lib-dir` flag and the
+// `ZAP_LIB_DIR` environment variable end-to-end. They build a
+// minimal Zap project whose `build.zap` uses stdlib types
+// (`Zap.Env`, `Zap.Manifest`) so the manifest CTFE — and thus
+// the build — only succeeds when the resolver locates a valid
+// stdlib directory containing `kernel.zap`. The override is
+// pointed at the in-repo `lib/` directory (resolved as an
+// absolute path from the test runner's project-root cwd), so a
+// green build proves the resolver accepted and used the
+// explicitly-provided stdlib root.
+// ============================================================
+
+/// Resolve the absolute path to the in-repo `lib/` stdlib
+/// directory. The test runner's cwd is the project root (the
+/// `zir-test` build step runs from there), so `lib/` is
+/// reachable relatively; realpath promotes it to the absolute,
+/// symlink-free form the resolver compares against.
+fn resolveRepoStdlibDir(allocator: std.mem.Allocator) TestError![]const u8 {
+    // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8`
+    // whose backing allocation is `len + 1` bytes; it MUST be freed
+    // through that sentinel slice. Returning it coerced to a
+    // `[]const u8` (length `len`) and freeing THAT under-counts by
+    // one byte and trips the debug allocator's size-class check
+    // (alloc 36 / free 35). Re-dupe into an exact-size buffer and
+    // free the sentinel temp through its true shape so every caller's
+    // plain `allocator.free(...)` is correctly sized.
+    const real_z = std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), "lib", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(real_z);
+    return allocator.dupe(u8, real_z) catch return error.OutOfMemory;
+}
+
+/// Write the shared minimal stdlib-dependent project into `dir`.
+/// The manifest references `Zap.Env`/`Zap.Manifest`, so it only
+/// CTFE-evaluates when the stdlib resolves correctly.
+fn writeStdlibResolverProject(dir: std.Io.Dir) TestError!void {
+    const build_source =
+        \\pub struct TestProg.Builder {
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
+        \\    case env.target {
+        \\      :test_prog ->
+        \\        %Zap.Manifest{
+        \\          name: "test_prog",
+        \\          version: "0.1.0",
+        \\          kind: :bin,
+        \\          root: &TestProg.main/0,
+        \\          paths: ["lib/**/*.zap"]
+        \\        }
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }
+        \\  }
+        \\}
+    ;
+    const prog_source =
+        \\pub struct TestProg {
+        \\  pub fn main() -> String {
+        \\    IO.puts("stdlib-resolver-ok")
+        \\    "ok"
+        \\  }
+        \\}
+    ;
+    dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch
+        return error.Unexpected;
+    dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
+    dir.writeFile(getTestIo(), .{ .sub_path = "lib/test_prog.zap", .data = prog_source }) catch
+        return error.Unexpected;
+}
+
+/// Run `zap build test_prog [extra_args...]` in `tmp_dir_path`
+/// with `extra_env` overlaid on the parent environment, then run
+/// the produced binary and assert it prints the success marker.
+fn buildAndRunStdlibResolverProject(
+    allocator: std.mem.Allocator,
+    tmp_dir: *std.testing.TmpDir,
+    tmp_dir_path: []const u8,
+    extra_args: []const []const u8,
+    extra_env: []const EnvEntry,
+    // Inferred error set: this helper composes `TestError`-returning
+    // calls with `std.testing.expect*` (which raise
+    // `error.TestExpectedEqual`/`TestUnexpectedResult`), so it cannot
+    // narrow to `TestError`. Matches the `!void` convention every
+    // `test` block and `expectCompileFails` already use.
+) !void {
+    const zap_binary = try resolveZapBinary(allocator);
+    defer allocator.free(zap_binary);
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, zap_binary);
+    try argv.append(allocator, "build");
+    try argv.append(allocator, "test_prog");
+    for (extra_args) |a| try argv.append(allocator, a);
+
+    var env_map = std.testing.environ.createMap(allocator) catch return error.Unexpected;
+    defer env_map.deinit();
+    for (extra_env) |entry| {
+        env_map.put(entry.name, entry.value) catch return error.OutOfMemory;
+    }
+
+    const compile_result = std.process.run(allocator, getTestIo(), .{
+        .argv = argv.items,
+        .cwd = .{ .path = tmp_dir_path },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.CompilationFailed;
+    defer allocator.free(compile_result.stdout);
+    defer allocator.free(compile_result.stderr);
+
+    const compile_exit = switch (compile_result.term) {
+        .exited => |code| code,
+        else => {
+            printUnexpectedCompileFailure(255, compile_result.stdout, compile_result.stderr);
+            return error.CompilationFailed;
+        },
+    };
+    if (compile_exit != 0) {
+        printUnexpectedCompileFailure(compile_exit, compile_result.stdout, compile_result.stderr);
+        return error.CompilationFailed;
+    }
+
+    const compiled_binary = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out/bin/test_prog", allocator) catch {
+        std.debug.print("\n=== COMPILED BINARY NOT FOUND ===\n", .{});
+        return error.CompilationFailed;
+    };
+    defer allocator.free(compiled_binary);
+
+    const run_result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{compiled_binary},
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch return error.RunFailed;
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
+
+    tmp_dir.dir.deleteTree(getTestIo(), "zap-out") catch {};
+
+    const run_exit = switch (run_result.term) {
+        .exited => |code| code,
+        else => return error.RunFailed,
+    };
+    try std.testing.expectEqual(@as(u8, 0), run_exit);
+    try std.testing.expect(std.mem.indexOf(u8, run_result.stdout, "stdlib-resolver-ok") != null);
+}
+
+test "CLI: ZAP_LIB_DIR env resolves stdlib" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeStdlibResolverProject(tmp_dir.dir);
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+
+    try buildAndRunStdlibResolverProject(
+        allocator,
+        &tmp_dir,
+        tmp_dir_path,
+        &.{},
+        &.{.{ .name = "ZAP_LIB_DIR", .value = repo_lib }},
+    );
+}
+
+test "CLI: --zap-lib-dir flag resolves stdlib" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeStdlibResolverProject(tmp_dir.dir);
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+
+    try buildAndRunStdlibResolverProject(
+        allocator,
+        &tmp_dir,
+        tmp_dir_path,
+        &.{ "--zap-lib-dir", repo_lib },
+        &.{},
+    );
+}
+
+// ------------------------------------------------------------
+// Negative / precedence isolation tests
+//
+// The positive tests above point the override at the real
+// in-repo `lib/`, which exe-relative resolution would also find,
+// so they do not by themselves prove the override was consulted.
+// These tests close that gap: each one supplies an explicit
+// override (flag and/or env) that points at a real directory
+// which exists but is NOT a valid Zap stdlib root (no
+// `kernel.zap`). The resolver MUST hard-error on such an explicit
+// override rather than silently falling through to the
+// exe-relative `lib/` (which WOULD succeed for the built
+// `zig-out/bin/zap`). A failed build with the specific
+// diagnostic therefore proves:
+//   * the override is actually consulted (not ignored), and
+//   * there is no silent fallthrough to a lower-precedence source.
+// The precedence pair additionally proves the flag wins over the
+// env var in both directions.
+// ------------------------------------------------------------
+
+/// Create a real directory under `parent` that exists but is not
+/// a valid Zap stdlib root (it deliberately contains no
+/// `kernel.zap`). Returns its absolute, symlink-free path so the
+/// resolver's `kernel.zap` access check fails for an *existing*
+/// directory — isolating "not a stdlib" from "missing directory".
+fn makeInvalidStdlibDir(
+    allocator: std.mem.Allocator,
+    parent: std.Io.Dir,
+    sub_path: []const u8,
+) TestError![]const u8 {
+    parent.createDirPath(getTestIo(), sub_path) catch return error.Unexpected;
+    // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8`
+    // (backing allocation = len + 1). Returning it coerced to a
+    // `[]const u8` and freeing THAT under-counts by one byte and
+    // trips the debug allocator's size-class check. Re-dupe into an
+    // exact-size buffer and free the sentinel temp through its true
+    // shape so the caller's plain `allocator.free(...)` is correctly
+    // sized.
+    const real_z = parent.realPathFileAlloc(getTestIo(), sub_path, allocator) catch
+        return error.Unexpected;
+    defer allocator.free(real_z);
+    return allocator.dupe(u8, real_z) catch return error.OutOfMemory;
+}
+
+/// Run `zap build test_prog [extra_args...]` in `tmp_dir_path`
+/// with `extra_env` overlaid on the parent environment, and
+/// assert the build FAILS with a non-zero exit and the resolver
+/// diagnostic `expected_diagnostic` on stderr.
+///
+/// Any inherited `ZAP_LIB_DIR` is removed from the child
+/// environment before `extra_env` is overlaid so the child sees
+/// exactly the env this test specifies — never an ambient
+/// `ZAP_LIB_DIR` that could mask the precedence being asserted.
+/// Mirrors `buildAndRunStdlibResolverProject` (same env-map
+/// creation, cwd, and `std.process.run` shape) but inverts the
+/// expectation and additionally asserts no output binary was
+/// produced (proving there was no silent fallthrough build).
+fn expectStdlibResolverBuildFails(
+    allocator: std.mem.Allocator,
+    tmp_dir: *std.testing.TmpDir,
+    tmp_dir_path: []const u8,
+    extra_args: []const []const u8,
+    extra_env: []const EnvEntry,
+    expected_diagnostic: []const u8,
+    // Inferred error set — see `buildAndRunStdlibResolverProject`.
+) !void {
+    const zap_binary = try resolveZapBinary(allocator);
+    defer allocator.free(zap_binary);
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, zap_binary);
+    try argv.append(allocator, "build");
+    try argv.append(allocator, "test_prog");
+    for (extra_args) |a| try argv.append(allocator, a);
+
+    var env_map = std.testing.environ.createMap(allocator) catch return error.Unexpected;
+    defer env_map.deinit();
+    // Strip any ambient ZAP_LIB_DIR so the child sees only what
+    // this test specifies; swapRemove is a no-op when absent.
+    _ = env_map.swapRemove("ZAP_LIB_DIR");
+    for (extra_env) |entry| {
+        env_map.put(entry.name, entry.value) catch return error.OutOfMemory;
+    }
+
+    const compile_result = std.process.run(allocator, getTestIo(), .{
+        .argv = argv.items,
+        .cwd = .{ .path = tmp_dir_path },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.CompilationFailed;
+    defer allocator.free(compile_result.stdout);
+    defer allocator.free(compile_result.stderr);
+
+    // Defensively remove any output even though we expect none —
+    // keeps the temp project clean if the resolver regresses.
+    defer tmp_dir.dir.deleteTree(getTestIo(), "zap-out") catch {};
+
+    const compile_exit = switch (compile_result.term) {
+        .exited => |code| code,
+        else => {
+            // A signal/abnormal termination is not the clean,
+            // deterministic hard-error this test asserts.
+            printUnexpectedCompileFailure(255, compile_result.stdout, compile_result.stderr);
+            return error.CompilationFailed;
+        },
+    };
+
+    // The build must hard-error: non-zero exit AND the specific
+    // resolver diagnostic on stderr. A zero exit would mean the
+    // override was ignored and the resolver silently fell through
+    // to the exe-relative `lib/` — exactly the failure mode these
+    // tests exist to catch.
+    if (compile_exit == 0) {
+        std.debug.print(
+            "\n=== EXPECTED BUILD FAILURE BUT IT SUCCEEDED ===\n" ++
+                "The override was ignored / silently fell through.\n" ++
+                "=== stdout ===\n{s}\n=== stderr ===\n{s}\n",
+            .{ compile_result.stdout, compile_result.stderr },
+        );
+        return error.Unexpected;
+    }
+    try std.testing.expect(compile_exit != 0);
+
+    if (std.mem.indexOf(u8, compile_result.stderr, expected_diagnostic) == null) {
+        std.debug.print(
+            "\n=== MISSING EXPECTED DIAGNOSTIC ===\nexpected substring: {s}\n" ++
+                "=== stdout ===\n{s}\n=== stderr ===\n{s}\n",
+            .{ expected_diagnostic, compile_result.stdout, compile_result.stderr },
+        );
+        return error.Unexpected;
+    }
+
+    // No output binary may exist: a hard-error must not have
+    // produced an artifact via any lower-precedence path.
+    if (tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out/bin/test_prog", allocator)) |stray| {
+        defer allocator.free(stray);
+        std.debug.print(
+            "\n=== UNEXPECTED OUTPUT BINARY AFTER HARD-ERROR ===\n{s}\n",
+            .{stray},
+        );
+        return error.Unexpected;
+    } else |_| {}
+}
+
+test "CLI: invalid --zap-lib-dir hard-errors instead of falling through" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeStdlibResolverProject(tmp_dir.dir);
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const invalid_dir = try makeInvalidStdlibDir(allocator, tmp_dir.dir, "not_a_stdlib");
+    defer allocator.free(invalid_dir);
+
+    try expectStdlibResolverBuildFails(
+        allocator,
+        &tmp_dir,
+        tmp_dir_path,
+        &.{ "--zap-lib-dir", invalid_dir },
+        &.{},
+        // Resolver emits:
+        //   Error: --zap-lib-dir '<dir>' is not a valid Zap stdlib
+        //   directory (no kernel.zap found)
+        "is not a valid Zap stdlib directory",
+    );
+}
+
+test "CLI: invalid ZAP_LIB_DIR hard-errors even though exe-relative would succeed" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeStdlibResolverProject(tmp_dir.dir);
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const invalid_dir = try makeInvalidStdlibDir(allocator, tmp_dir.dir, "not_a_stdlib");
+    defer allocator.free(invalid_dir);
+
+    // Strong isolation: the built `zig-out/bin/zap` is exe-relative
+    // to the real in-repo `lib/`, so exe-relative resolution WOULD
+    // succeed here. The build must still fail — proving the invalid
+    // env var is consulted and hard-errors with no fallthrough.
+    try expectStdlibResolverBuildFails(
+        allocator,
+        &tmp_dir,
+        tmp_dir_path,
+        &.{},
+        &.{.{ .name = "ZAP_LIB_DIR", .value = invalid_dir }},
+        // Resolver emits:
+        //   Error: ZAP_LIB_DIR '<dir>' is not a valid Zap stdlib
+        //   directory (no kernel.zap found)
+        "ZAP_LIB_DIR '",
+    );
+}
+
+test "CLI: invalid --zap-lib-dir wins over valid ZAP_LIB_DIR (flag precedence, no fallthrough)" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeStdlibResolverProject(tmp_dir.dir);
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const invalid_dir = try makeInvalidStdlibDir(allocator, tmp_dir.dir, "not_a_stdlib");
+    defer allocator.free(invalid_dir);
+
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+
+    // Flag is invalid, env is valid (real in-repo `lib/`). The flag
+    // has highest precedence, so the build must fail with the FLAG
+    // diagnostic — the valid env is never consulted, and there is
+    // no fallthrough to exe-relative.
+    try expectStdlibResolverBuildFails(
+        allocator,
+        &tmp_dir,
+        tmp_dir_path,
+        &.{ "--zap-lib-dir", invalid_dir },
+        &.{.{ .name = "ZAP_LIB_DIR", .value = repo_lib }},
+        // Asserting the FLAG diagnostic (not the env one) proves
+        // the flag was consulted and won over the valid env var.
+        "--zap-lib-dir '",
+    );
+}
+
+test "CLI: valid --zap-lib-dir wins over invalid ZAP_LIB_DIR (flag precedence, build succeeds)" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeStdlibResolverProject(tmp_dir.dir);
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const invalid_dir = try makeInvalidStdlibDir(allocator, tmp_dir.dir, "not_a_stdlib");
+    defer allocator.free(invalid_dir);
+
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+
+    // Flag is valid (real in-repo `lib/`), env is invalid. Because
+    // the flag has highest precedence the invalid env value is
+    // never consulted, so the build SUCCEEDS and prints the marker.
+    // (buildAndRunStdlibResolverProject overlays the invalid env
+    // onto the parent environment and asserts success.)
+    try buildAndRunStdlibResolverProject(
+        allocator,
+        &tmp_dir,
+        tmp_dir_path,
+        &.{ "--zap-lib-dir", repo_lib },
+        &.{.{ .name = "ZAP_LIB_DIR", .value = invalid_dir }},
+    );
+}
+
+// ============================================================
+// CLI: single-file script mode — `zap run <script.zap>`
+//
+// These tests exercise the end-to-end script path: dispatch
+// (an existing regular file that is not `build.zap` is a
+// script), the parser's top-level `main/1` carve-out, the
+// synthetic manifest, stdlib-only compilation, argument
+// forwarding, exit-code propagation, the script-contract
+// diagnostics, and the core no-litter invariant (NOTHING is
+// written next to the user's script).
+//
+// Each test writes ONE bare `.zap` file to a fresh tmp dir
+// that has NO `build.zap` and NO `lib/`, then invokes
+// `zap run <abs script path> [args...]` with cwd = the tmp
+// dir. Any ambient `ZAP_LIB_DIR` is stripped and replaced with
+// the in-repo `lib/` so the child sees a deterministic stdlib;
+// `ZAP_SCRIPT_CACHE_DIR` is pointed at a separate tmp tree so
+// the script artifact location is deterministic AND the
+// no-litter assertion is meaningful (any litter would land in
+// the script's own tmp dir, which we then assert contains only
+// the script).
+// ============================================================
+
+const ScriptRunResult = struct {
+    stdout: []const u8,
+    stderr: []const u8,
+    exit_code: u8,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *ScriptRunResult) void {
+        self.allocator.free(self.stdout);
+        self.allocator.free(self.stderr);
+    }
+};
+
+/// Write `script_source` to `<tmp>/<script_name>` and run
+/// `zap run <abs script path> [extra_args...]` with cwd = tmp,
+/// a deterministic stdlib, and an isolated script cache root.
+/// Returns the captured stdout/stderr/exit. The caller owns the
+/// `TmpDir` (so it can assert on directory contents before
+/// cleanup) and must `deinit` the result.
+fn runScriptInTmp(
+    allocator: std.mem.Allocator,
+    tmp_dir: *std.testing.TmpDir,
+    script_name: []const u8,
+    script_source: []const u8,
+    extra_args: []const []const u8,
+) TestError!ScriptRunResult {
+    return runScriptInTmpWithFlags(allocator, tmp_dir, script_name, script_source, &.{}, extra_args);
+}
+
+/// Like `runScriptInTmp`, but additionally places `lead_flags`
+/// BEFORE the script path — i.e. `zap run [lead_flags...] <abs
+/// script path> [extra_args...]`. This is the single source of
+/// truth for the script-process spawn; `runScriptInTmp` delegates
+/// here with no leading flags. The recognized leading flags
+/// (`-D<key>=<value>` build flags and the two-token
+/// `--zap-lib-dir <dir>` stdlib locator) are consumed from the
+/// leading region, so Phase 4 tests pass them via `lead_flags`
+/// while still exercising `extra_args`/`--` forwarding to `main/1`
+/// (everything after the script path is opaque passthrough).
+fn runScriptInTmpWithFlags(
+    allocator: std.mem.Allocator,
+    tmp_dir: *std.testing.TmpDir,
+    script_name: []const u8,
+    script_source: []const u8,
+    lead_flags: []const []const u8,
+    extra_args: []const []const u8,
+) TestError!ScriptRunResult {
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = script_name, .data = script_source }) catch
+        return error.Unexpected;
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const script_path = std.fs.path.join(allocator, &.{ tmp_dir_path, script_name }) catch
+        return error.OutOfMemory;
+    defer allocator.free(script_path);
+
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+
+    const script_cache = std.fs.path.join(allocator, &.{ tmp_dir_path, "..", "zap-script-cache" }) catch
+        return error.OutOfMemory;
+    defer allocator.free(script_cache);
+
+    const zap_binary = try resolveZapBinary(allocator);
+    defer allocator.free(zap_binary);
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, zap_binary);
+    try argv.append(allocator, "run");
+    for (lead_flags) |f| try argv.append(allocator, f);
+    try argv.append(allocator, script_path);
+    for (extra_args) |a| try argv.append(allocator, a);
+
+    var env_map = std.testing.environ.createMap(allocator) catch return error.Unexpected;
+    defer env_map.deinit();
+    // Deterministic stdlib + isolated, off-tmp script cache so the
+    // no-litter assertion is exact.
+    _ = env_map.swapRemove("ZAP_LIB_DIR");
+    env_map.put("ZAP_LIB_DIR", repo_lib) catch return error.OutOfMemory;
+    env_map.put("ZAP_SCRIPT_CACHE_DIR", script_cache) catch return error.OutOfMemory;
+
+    const result = std.process.run(allocator, getTestIo(), .{
+        .argv = argv.items,
+        .cwd = .{ .path = tmp_dir_path },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.RunFailed;
+
+    const exit_code = switch (result.term) {
+        .exited => |code| code,
+        else => {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+            return error.RunFailed;
+        },
+    };
+
+    return .{
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+        .exit_code = exit_code,
+        .allocator = allocator,
+    };
+}
+
+/// Run `zap run <run_args...>` in a fresh empty tmp dir (NO
+/// `build.zap`, NO script file, NO positional) with the deterministic
+/// stdlib and isolated script cache. Used for the genuine
+/// no-positional / missing-value cases under the current unified
+/// contract — e.g. `zap run -Doptimize` (a `-D` flag with no `=`) or
+/// `zap run --zap-lib-dir` (a two-token leading flag missing its
+/// value): the run must fail with a clear `Error:`-prefixed
+/// diagnostic and a non-zero exit rather than silently doing nothing.
+/// Caller `deinit`s the result.
+fn runZapRunRaw(
+    allocator: std.mem.Allocator,
+    run_args: []const []const u8,
+) TestError!ScriptRunResult {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+
+    const script_cache = std.fs.path.join(allocator, &.{ tmp_dir_path, "..", "zap-script-cache" }) catch
+        return error.OutOfMemory;
+    defer allocator.free(script_cache);
+
+    const zap_binary = try resolveZapBinary(allocator);
+    defer allocator.free(zap_binary);
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, zap_binary);
+    try argv.append(allocator, "run");
+    for (run_args) |a| try argv.append(allocator, a);
+
+    var env_map = std.testing.environ.createMap(allocator) catch return error.Unexpected;
+    defer env_map.deinit();
+    _ = env_map.swapRemove("ZAP_LIB_DIR");
+    env_map.put("ZAP_LIB_DIR", repo_lib) catch return error.OutOfMemory;
+    env_map.put("ZAP_SCRIPT_CACHE_DIR", script_cache) catch return error.OutOfMemory;
+
+    const result = std.process.run(allocator, getTestIo(), .{
+        .argv = argv.items,
+        .cwd = .{ .path = tmp_dir_path },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.RunFailed;
+
+    const exit_code = switch (result.term) {
+        .exited => |code| code,
+        else => {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+            return error.RunFailed;
+        },
+    };
+
+    return .{
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+        .exit_code = exit_code,
+        .allocator = allocator,
+    };
+}
+
+/// Assert the script's own directory still contains ONLY the
+/// script after a run — proving the core no-litter invariant
+/// (no `zap-out/`, `.zap-cache/`, `zap.lock`, or stub written
+/// next to the user's file).
+fn expectOnlyScriptInDir(tmp_dir: *std.testing.TmpDir, script_name: []const u8) TestError!void {
+    var dir = tmp_dir.dir.openDir(getTestIo(), ".", .{ .iterate = true }) catch
+        return error.Unexpected;
+    defer dir.close(getTestIo());
+    var it = dir.iterate();
+    while (it.next(getTestIo()) catch null) |entry| {
+        if (!std.mem.eql(u8, entry.name, script_name)) {
+            std.debug.print(
+                "\n=== NO-LITTER VIOLATION: unexpected entry '{s}' next to script ===\n",
+                .{entry.name},
+            );
+            return error.Unexpected;
+        }
+    }
+}
+
+test "CLI run: no positional and no build.zap fails (manifest path, clear non-zero)" {
+    const allocator = std.testing.allocator;
+    // `zap run` with NO positional in a dir with NO build.zap: there
+    // is nothing to dispatch as a script and no manifest project, so
+    // it must fail with a non-zero exit and a clear diagnostic — never
+    // hang or silently succeed.
+    var r = try runZapRunRaw(allocator, &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "build.zap") != null);
+}
+
+test "CLI run: leading -Doptimize with no '=' and no script is a clear hard error" {
+    const allocator = std.testing.allocator;
+    // `zap run -Doptimize` — a `-D` flag missing its `=value`, with no
+    // script positional. The shared `-D` parser must reject it with a
+    // precise diagnostic and a non-zero exit (not a confusing target
+    // error, not a silent no-op).
+    var r = try runZapRunRaw(allocator, &.{"-Doptimize"});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "optimize") != null);
+}
+
+test "CLI run: leading --zap-lib-dir with no value is a clear hard error" {
+    const allocator = std.testing.allocator;
+    // `zap run --zap-lib-dir` — the two-token stdlib locator missing
+    // its value. It must fail loudly with the specific "requires a
+    // path" diagnostic, never consume a non-existent next token.
+    var r = try runZapRunRaw(allocator, &.{"--zap-lib-dir"});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "--zap-lib-dir") != null);
+}
+
+test "CLI script: top-level main/1 prints output (happy path)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "hello.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("script-hello")
+        \\  "ok"
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "script-hello") != null);
+    try expectOnlyScriptInDir(&tmp_dir, "hello.zap");
+}
+
+test "CLI script: main/1 uses a local struct defined in the same file" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "ls.zap",
+        \\pub struct Scalar {
+        \\  pub fn square(x :: i64) -> i64 { x * x }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("square=" <> Integer.to_string(Scalar.square(6)))
+        \\  "ok"
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "square=36") != null);
+    try expectOnlyScriptInDir(&tmp_dir, "ls.zap");
+}
+
+test "CLI script: main/1 uses a local protocol + impl in the same file" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "proto.zap",
+        \\pub protocol Describable {
+        \\  fn describe(value :: Self) -> String
+        \\}
+        \\
+        \\pub struct Widget {
+        \\  size :: i64
+        \\
+        \\  pub fn make(s :: i64) -> Widget { %Widget{size: s} }
+        \\}
+        \\
+        \\pub impl Describable for Widget {
+        \\  pub fn describe(value :: Widget) -> String {
+        \\    "Widget(size=" <> Integer.to_string(value.size) <> ")"
+        \\  }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> String {
+        \\  w = Widget.make(7)
+        \\  IO.puts(Widget.describe(w))
+        \\  "ok"
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "Widget(size=7)") != null);
+    try expectOnlyScriptInDir(&tmp_dir, "proto.zap");
+}
+
+test "CLI script: main/1 uses stdlib (IO, Integer, System)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "std.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("argc=" <> Integer.to_string(System.arg_count()))
+        \\  "ok"
+        \\}
+    , &.{ "a", "b", "c" });
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "argc=3") != null);
+    try expectOnlyScriptInDir(&tmp_dir, "std.zap");
+}
+
+test "CLI script: args after path are forwarded to main/1" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "args.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("n=" <> Integer.to_string(System.arg_count()))
+        \\  "ok"
+        \\}
+    , &.{ "one", "two", "three", "four" });
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "n=4") != null);
+}
+
+test "CLI script: args after explicit -- are forwarded verbatim" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "dd.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("n=" <> Integer.to_string(System.arg_count()))
+        \\  "ok"
+        \\}
+    , &.{ "--", "x", "y" });
+    defer r.deinit();
+
+    // Locked Phase 4 contract: the post-path region is OPAQUE
+    // PASSTHROUGH — a literal `--` is forwarded VERBATIM to `main/1`,
+    // NOT consumed as a separator (see `cmdRunScript`'s doc and the
+    // passing `-Dtarget` AFTER-path passthrough test). So `-- x y`
+    // is THREE forwarded args, hence `arg_count() == 3`.
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "n=3") != null);
+}
+
+test "CLI script: exit code is propagated (panic -> non-zero)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "panic.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  panic("boom")
+        \\  "unreachable"
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+}
+
+test "CLI script: exit code is propagated (normal -> zero)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "ok.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("done")
+        \\  "ok"
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+}
+
+test "CLI script error: zero top-level functions" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "z.zap",
+        \\pub struct OnlyStruct {
+        \\  pub fn helper() -> String { "x" }
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "no top-level function") != null);
+}
+
+test "CLI script error: two top-level functions" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "two.zap",
+        \\fn main(_args :: [String]) -> String { "a" }
+        \\fn other() -> String { "b" }
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "exactly one top-level function") != null);
+}
+
+test "CLI script error: top-level fn not named main" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "named.zap",
+        \\fn run(_args :: [String]) -> String { "a" }
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "must be named `main`") != null);
+}
+
+test "CLI script error: top-level main wrong arity (0)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "a0.zap",
+        \\fn main() -> String { "a" }
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "exactly one argument") != null);
+}
+
+test "CLI script error: top-level main wrong arity (2)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "a2.zap",
+        \\fn main(a :: [String], b :: i64) -> String { "a" }
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "exactly one argument") != null);
+}
+
+test "CLI script error: external dep / use of a non-stdlib package is rejected" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Script mode supplies NO project/dep source roots — only the
+    // stdlib — so a reference to a package that is neither stdlib
+    // nor defined in this file cannot resolve. The build fails
+    // (non-zero exit) and nothing is left behind. The external
+    // package must actually be REFERENCED: an unreferenced `use`
+    // alone is elided and would not exercise the constraint.
+    var r = try runScriptInTmp(allocator, &tmp_dir, "ext.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts(SomeThirdParty.Pkg.greet())
+        \\  "ok"
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try expectOnlyScriptInDir(&tmp_dir, "ext.zap");
+}
+
+test "CLI script: no artifacts are written next to the script" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "clean.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("clean-run")
+        \\  "ok"
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    // The script's directory must contain ONLY the script — no
+    // zap-out/, .zap-cache/, zap.lock, or root stub.
+    try expectOnlyScriptInDir(&tmp_dir, "clean.zap");
+}
+
+// ------------------------------------------------------------
+// Manifest-path regression under the new dispatch
+//
+// The script dispatch must leave the manifest path byte-for-
+// byte: nothing diverts to script mode unless the first
+// positional is an existing regular file that is not
+// `build.zap`. These rebuild the existing minimal stdlib
+// project and assert the manifest flow still works for: a dir
+// containing build.zap, an explicit build.zap file positional,
+// no positional, and `<target> -- args`.
+// ------------------------------------------------------------
+
+test "CLI dispatch regression: dir-with-build.zap still uses the manifest path" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeStdlibResolverProject(tmp_dir.dir);
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    // `zap run test_prog` from inside the project (cwd has
+    // build.zap; positional is a manifest target, not an on-disk
+    // file) must take the manifest path unchanged.
+    try buildAndRunStdlibResolverProject(
+        allocator,
+        &tmp_dir,
+        tmp_dir_path,
+        &.{},
+        &.{},
+    );
+}
+
+test "CLI dispatch regression: explicit build.zap file positional uses the manifest path" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeStdlibResolverProject(tmp_dir.dir);
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+
+    const zap_binary = try resolveZapBinary(allocator);
+    defer allocator.free(zap_binary);
+
+    // First positional is the literal file `build.zap` — path
+    // semantics classify it as the manifest project, NOT a
+    // script. (`parseTargetArgs` then treats `build.zap` as the
+    // target name; the project's manifest only knows `:test_prog`,
+    // so this asserts the script carve-out did not intercept it.)
+    var env_map = std.testing.environ.createMap(allocator) catch return error.Unexpected;
+    defer env_map.deinit();
+    _ = env_map.swapRemove("ZAP_LIB_DIR");
+    env_map.put("ZAP_LIB_DIR", repo_lib) catch return error.OutOfMemory;
+
+    const result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ zap_binary, "run", "build.zap" },
+        .cwd = .{ .path = tmp_dir_path },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.CompilationFailed;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    defer tmp_dir.dir.deleteTree(getTestIo(), "zap-out") catch {};
+    defer tmp_dir.dir.deleteTree(getTestIo(), ".zap-cache") catch {};
+
+    // Manifest path was taken (not the script carve-out): the
+    // diagnostic must be a manifest/target error, never the
+    // script-contract "top-level function" message.
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "no top-level function") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "must be named `main`") == null);
+}
+
+test "CLI dispatch regression: <target> -- args still uses the manifest path" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeStdlibResolverProject(tmp_dir.dir);
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    // `zap run test_prog -- a b` — the positional is a manifest
+    // target name (no such on-disk file), so the manifest path
+    // runs unchanged and the program still produces its marker.
+    try buildAndRunStdlibResolverProject(
+        allocator,
+        &tmp_dir,
+        tmp_dir_path,
+        &.{ "--", "a", "b" },
+        &.{},
+    );
+}
+
+test "CLI dispatch: a leading removed-flag-looking token is NOT a recognized flag (clean manifest rejection, no swallow/hang)" {
+    // Phase 4 deleted the two-token `-O`/`--memory`/`--target`
+    // spellings; per the locked position contract ONLY `-D…` and
+    // `--zap-lib-dir` are recognized leading flags. A bare `--target`
+    // (etc.) BEFORE the positional is therefore NOT a recognized,
+    // value-consuming flag — it is itself the first positional
+    // candidate. Since it is not an on-disk file, dispatch correctly
+    // falls to the manifest path and the invocation is rejected
+    // CLEANLY (non-zero exit, the manifest "unexpected argument"
+    // diagnostic) — never a hang, a crash, or silent success. This is
+    // the contract-correct behavior; the regression this guards is the
+    // dead `firstPositionalIndex` entries that used to treat the token
+    // as value-consuming and additionally SWALLOW the following token
+    // (a script path) — which `firstPositionalIndex`'s own unit tests
+    // pin, and which would never even reach this clean rejection.
+    inline for (.{ "--target", "--memory", "-O" }) |stale_flag| {
+        const allocator = std.testing.allocator;
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        // A real script file IS present in the tmp dir; the point is
+        // that `<stale_flag> <script>` does NOT reach script dispatch
+        // (the flag, not the file, is the first positional candidate).
+        var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "disp.zap",
+            \\fn main(_args :: [String]) -> String {
+            \\  IO.puts("dispatched-to-script")
+            \\  "ok"
+            \\}
+        , &.{stale_flag}, &.{});
+        defer r.deinit();
+
+        // Cleanly rejected via the manifest path, not run as a script.
+        try std.testing.expect(r.exit_code != 0);
+        try std.testing.expect(std.mem.indexOf(u8, r.stdout, "dispatched-to-script") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.stderr, "unexpected argument") != null);
+        // No script-contract diagnostic (it never entered script mode).
+        try std.testing.expect(std.mem.indexOf(u8, r.stderr, "top-level function") == null);
+        try expectOnlyScriptInDir(&tmp_dir, "disp.zap");
+    }
+}
+
+test "CLI dispatch: removed-flag-looking tokens AFTER the script path forward to main/1 verbatim (real D3 guard)" {
+    // The genuine D3/position guarantee the dead `firstPositionalIndex`
+    // entries threatened: EVERYTHING after the script path is opaque
+    // passthrough. A `--memory` / `--target` / `-O` token placed AFTER
+    // the script path is NOT consumed as a build flag — it is forwarded
+    // verbatim to `main/1`'s `[String]`. The script builds NATIVE and
+    // RUNS, observing every post-path token as an argument. (A literal
+    // `--` is likewise forwarded, not a separator — pinned elsewhere.)
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "fwd.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("argc=" <> Integer.to_string(System.arg_count()))
+        \\  IO.puts("a0=" <> System.arg_at(0))
+        \\  IO.puts("a1=" <> System.arg_at(1))
+        \\  IO.puts("a2=" <> System.arg_at(2))
+        \\  IO.puts("fwd-ran")
+        \\  "ok"
+        \\}
+    , &.{}, &.{ "--memory", "Memory.NoOp", "-O" });
+    defer r.deinit();
+
+    // It RAN natively (not "Cross-compiled for ...", not a memory-mode
+    // error) and saw the three post-path tokens verbatim, in order.
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "fwd-ran") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "argc=3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "a0=--memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "a1=Memory.NoOp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "a2=-O") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "Cross-compiled for") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "unsupported memory manager") == null);
+    try expectOnlyScriptInDir(&tmp_dir, "fwd.zap");
+}
+
+// ============================================================
+// CLI: unified Zig-style `-D<key>=<value>` build flags
+//
+// Phase 4. ONE parser + ONE per-field override step shared by
+// `zap build <target>`, `zap run <target>` (manifest), and
+// `zap run <file.zap>` (script). Syntax is Zig-build-style
+// `-D<key>=<value>` ONLY (the legacy `-O`/`--memory` spellings
+// were removed). Recognized keys: `-Doptimize=`, `-Dmemory=`,
+// `-Dtarget=`, `-Dcpu=`. The CLI is the ultimate per-field
+// source of truth: a set flag overrides the manifest/synthetic
+// default; an unset flag preserves it. Script-mode flags are
+// consumed before the script path (never forwarded to main/1);
+// everything after the path forwards verbatim. Invalid/missing
+// values yield a clear `Error:`-prefixed diagnostic + non-zero
+// exit. Memory.Tracking / Memory.Leak may emit stats to stderr,
+// so those cases assert on stdout only.
+// ============================================================
+
+// ---- Manifest-mode harness -------------------------------------
+// Writes a project whose `build.zap` declares a specific
+// `optimize:` and `memory:` plus a runtime marker, builds it
+// with the supplied `-D` flags, runs the binary, and returns the
+// captured output. This is the manifest analogue of
+// `runScriptInTmp*`, used to prove the CLI overrides the
+// manifest per-field for `zap build` and `zap run <target>`.
+
+const ManifestRunResult = struct {
+    stdout: []const u8,
+    stderr: []const u8,
+    exit_code: u8,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *ManifestRunResult) void {
+        self.allocator.free(self.stdout);
+        self.allocator.free(self.stderr);
+    }
+};
+
+/// Build (`subcommand` = "build") or build+run (`subcommand` =
+/// "run") the target `cli` in a tmp project whose `build.zap`
+/// sets `manifest_memory` (a Type expression, e.g. "Memory.ARC")
+/// and `manifest_optimize` (an atom, e.g. ":release_fast"), with
+/// `flags` placed before the target name. Returns the captured
+/// process result (for "build" the build output; for "run" the
+/// program's stdout/exit).
+fn runManifestProject(
+    allocator: std.mem.Allocator,
+    subcommand: []const u8,
+    manifest_optimize: []const u8,
+    manifest_memory: []const u8,
+    flags: []const []const u8,
+) TestError!ManifestRunResult {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
+
+    const build_source = std.fmt.allocPrint(allocator,
+        \\pub struct Cli.Builder {{
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {{
+        \\    case env.target {{
+        \\      :cli ->
+        \\        %Zap.Manifest{{
+        \\          name: "cli",
+        \\          version: "0.1.0",
+        \\          kind: :bin,
+        \\          root: &Cli.main/1,
+        \\          optimize: {s},
+        \\          memory: {s},
+        \\          paths: ["lib/**/*.zap"]
+        \\        }}
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }}
+        \\  }}
+        \\}}
+    , .{ manifest_optimize, manifest_memory }) catch return error.OutOfMemory;
+    defer allocator.free(build_source);
+
+    const prog_source =
+        \\pub struct Cli {
+        \\  pub fn main(_args :: [String]) -> String {
+        \\    s = "a" <> "b" <> "c"
+        \\    IO.puts("manifest-marker=" <> s)
+        \\    "ok"
+        \\  }
+        \\}
+    ;
+
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch
+        return error.Unexpected;
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/cli.zap", .data = prog_source }) catch
+        return error.Unexpected;
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+
+    const zap_binary = try resolveZapBinary(allocator);
+    defer allocator.free(zap_binary);
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, zap_binary);
+    try argv.append(allocator, subcommand);
+    for (flags) |f| try argv.append(allocator, f);
+    try argv.append(allocator, "cli");
+
+    var env_map = std.testing.environ.createMap(allocator) catch return error.Unexpected;
+    defer env_map.deinit();
+    _ = env_map.swapRemove("ZAP_LIB_DIR");
+    env_map.put("ZAP_LIB_DIR", repo_lib) catch return error.OutOfMemory;
+
+    const result = std.process.run(allocator, getTestIo(), .{
+        .argv = argv.items,
+        .cwd = .{ .path = tmp_dir_path },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.RunFailed;
+
+    var stdout = result.stdout;
+    var stderr = result.stderr;
+
+    var exit_code: u8 = switch (result.term) {
+        .exited => |code| code,
+        else => {
+            allocator.free(stdout);
+            allocator.free(stderr);
+            return error.RunFailed;
+        },
+    };
+
+    // For `run`, the build prints to stdout then the program runs;
+    // we want the program's behavior. For `build`, the build output
+    // is what we assert on. Either way, run the produced binary for
+    // the "run" subcommand semantics already handled by `zap run`.
+    if (std.mem.eql(u8, subcommand, "build") and exit_code == 0) {
+        // Execute the produced binary so the manifest marker (and any
+        // manager stderr) is observable, mirroring what `zap run`
+        // would do, without depending on `zap run`'s own dispatch.
+        const bin_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out/bin/cli", allocator) catch {
+            return .{ .stdout = stdout, .stderr = stderr, .exit_code = exit_code, .allocator = allocator };
+        };
+        defer allocator.free(bin_path);
+        const run2 = std.process.run(allocator, getTestIo(), .{
+            .argv = &.{bin_path},
+            .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+            .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        }) catch {
+            return .{ .stdout = stdout, .stderr = stderr, .exit_code = exit_code, .allocator = allocator };
+        };
+        allocator.free(stdout);
+        allocator.free(stderr);
+        stdout = run2.stdout;
+        stderr = run2.stderr;
+        exit_code = switch (run2.term) {
+            .exited => |c| c,
+            else => 255,
+        };
+    }
+
+    return .{
+        .stdout = stdout,
+        .stderr = stderr,
+        .exit_code = exit_code,
+        .allocator = allocator,
+    };
+}
+
+test "CLI script flags: -Doptimize runs under each Zig optimize mode" {
+    const allocator = std.testing.allocator;
+    inline for (.{ "Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall" }) |mode| {
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "opt.zap",
+            \\fn main(_args :: [String]) -> String {
+            \\  IO.puts("opt-ok=" <> Integer.to_string(2 + 3))
+            \\  "ok"
+            \\}
+        , &.{"-Doptimize=" ++ mode}, &.{});
+        defer r.deinit();
+
+        try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, r.stdout, "opt-ok=5") != null);
+        try expectOnlyScriptInDir(&tmp_dir, "opt.zap");
+    }
+}
+
+test "CLI script flags: default (no -Doptimize) runs in Debug" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "optdef.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("default-opt-ok")
+        \\  "ok"
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "default-opt-ok") != null);
+    try expectOnlyScriptInDir(&tmp_dir, "optdef.zap");
+}
+
+test "CLI script flags: -Dmemory runs under each stdlib manager" {
+    const allocator = std.testing.allocator;
+    inline for (.{
+        "Memory.ARC",
+        "Memory.Arena",
+        "Memory.NoOp",
+        "Memory.Leak",
+        "Memory.Tracking",
+    }) |mgr| {
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "mem.zap",
+            \\pub struct Builder {
+            \\  pub fn join(n :: i64, acc :: String) -> String {
+            \\    if n <= 0 {
+            \\      acc
+            \\    } else {
+            \\      Builder.join(n - 1, acc <> Integer.to_string(n))
+            \\    }
+            \\  }
+            \\}
+            \\
+            \\fn main(_args :: [String]) -> String {
+            \\  s = Builder.join(5, "")
+            \\  IO.puts("mem-ok=" <> s)
+            \\  "ok"
+            \\}
+        , &.{"-Dmemory=" ++ mgr}, &.{});
+        defer r.deinit();
+
+        try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, r.stdout, "mem-ok=54321") != null);
+        try expectOnlyScriptInDir(&tmp_dir, "mem.zap");
+    }
+}
+
+test "CLI script flags: default (no -Dmemory) runs with Memory.ARC" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "memdef.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  s = "x" <> "y" <> "z"
+        \\  IO.puts("mem-default-ok=" <> s)
+        \\  "ok"
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "mem-default-ok=xyz") != null);
+    try expectOnlyScriptInDir(&tmp_dir, "memdef.zap");
+}
+
+test "CLI script flags: combined -Doptimize and -Dmemory before the path" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "combo.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("combo-ok")
+        \\  "ok"
+        \\}
+    , &.{ "-Doptimize=ReleaseFast", "-Dmemory=Memory.Arena" }, &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "combo-ok") != null);
+    try expectOnlyScriptInDir(&tmp_dir, "combo.zap");
+}
+
+test "CLI script flags error: invalid -Doptimize value is rejected" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "badopt.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("never-runs")
+        \\  "ok"
+        \\}
+    , &.{"-Doptimize=ReleaseTurbo"}, &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "unknown optimize mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "ReleaseTurbo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "never-runs") == null);
+    try expectOnlyScriptInDir(&tmp_dir, "badopt.zap");
+}
+
+test "CLI script flags error: -Doptimize with no value is rejected" {
+    const allocator = std.testing.allocator;
+    // `zap run -Doptimize script.zap` — `-D` flag with no `=`.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "noval.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("never-runs")
+        \\  "ok"
+        \\}
+    , &.{"-Doptimize"}, &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "optimize") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "never-runs") == null);
+}
+
+test "CLI script flags error: third-party -Dmemory is rejected (no dep graph)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "badmem.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("never-runs")
+        \\  "ok"
+        \\}
+    , &.{"-Dmemory=MyApp.CustomArena"}, &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "unsupported memory manager") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "MyApp.CustomArena") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "never-runs") == null);
+    try expectOnlyScriptInDir(&tmp_dir, "badmem.zap");
+}
+
+test "CLI build flags error: unknown -D key lists supported keys" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Script mode has no manifest/`System.get_build_opt` consumer, so
+    // an unknown `-D` key is a hard error that lists the keys.
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "unk.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("never-runs")
+        \\  "ok"
+        \\}
+    , &.{"-Dnonsense=1"}, &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "nonsense") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "optimize") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "never-runs") == null);
+}
+
+test "CLI script flags: -D flags consumed, post-path args forward verbatim" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // `zap run -Doptimize=ReleaseSafe -Dmemory=Memory.Arena
+    //     <echo.zap> -Doptimize=foo -- x`
+    // The leading `-D` flags are consumed; EVERYTHING after the
+    // script path (including a `-D`-looking token and a literal
+    // `--`) forwards to main/1 verbatim and opaquely.
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "echo.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  n = System.arg_count()
+        \\  IO.puts("argc=" <> Integer.to_string(n))
+        \\  IO.puts("a0=" <> System.arg_at(0))
+        \\  IO.puts("a1=" <> System.arg_at(1))
+        \\  IO.puts("a2=" <> System.arg_at(2))
+        \\  "ok"
+        \\}
+    , &.{ "-Doptimize=ReleaseSafe", "-Dmemory=Memory.Arena" }, &.{ "-Doptimize=foo", "--", "x" });
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    // The post-path region is opaque: the `-D`-looking token, the
+    // literal `--`, and `x` ALL reach main/1 verbatim, in order.
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "argc=3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "a0=-Doptimize=foo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "a1=--") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "a2=x") != null);
+    try expectOnlyScriptInDir(&tmp_dir, "echo.zap");
+}
+
+// ---- Manifest-mode override scenarios -----------------------------
+
+test "CLI manifest: -Doptimize=Debug overrides manifest optimize: :release_fast (zap build)" {
+    const allocator = std.testing.allocator;
+    // The manifest declares release_fast; the CLI forces Debug. The
+    // robust observable is that the build SUCCEEDS end-to-end under
+    // the override and the binary runs correctly — exercising the
+    // full CTFE→applyBuildOverrides→compileAndLink path with the CLI
+    // value, not the manifest value.
+    var r = try runManifestProject(allocator, "build", ":release_fast", "Memory.ARC", &.{"-Doptimize=Debug"});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "manifest-marker=abc") != null);
+}
+
+test "CLI manifest: -Doptimize overrides manifest for zap run <target>" {
+    const allocator = std.testing.allocator;
+    var r = try runManifestProject(allocator, "run", ":release_fast", "Memory.ARC", &.{"-Doptimize=Debug"});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "manifest-marker=abc") != null);
+}
+
+test "CLI manifest: -Dmemory overrides manifest memory: (Leak emits stats)" {
+    const allocator = std.testing.allocator;
+    // Manifest says Memory.ARC; `-Dmemory=Memory.Leak` overrides it.
+    // Memory.Leak is observably different — it emits a leak report to
+    // stderr on exit — proving the CLI memory value replaced the
+    // manifest one through the unified override step.
+    var r = try runManifestProject(allocator, "build", ":release_safe", "Memory.ARC", &.{"-Dmemory=Memory.Leak"});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "manifest-marker=abc") != null);
+    // Memory.Leak's distinctive end-of-run accounting on stderr.
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "leak") != null or
+        std.mem.indexOf(u8, r.stderr, "Leak") != null);
+}
+
+test "CLI manifest: unresolvable -Dmemory errors like a bad manifest memory:" {
+    const allocator = std.testing.allocator;
+    // Manifest mode resolves `-Dmemory=` through the SAME memory
+    // driver a manifest `memory:` uses, so a name no dep provides
+    // fails the build the same way an unresolvable manifest value
+    // would (NOT the script-mode stdlib-only message — manifest mode
+    // keeps third-party support, this name just doesn't exist).
+    var r = try runManifestProject(allocator, "build", ":release_safe", "Memory.ARC", &.{"-Dmemory=Totally.Missing"});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+}
+
+test "CLI manifest: no -D flags keeps the manifest values (regression)" {
+    const allocator = std.testing.allocator;
+    var r = try runManifestProject(allocator, "build", ":release_safe", "Memory.ARC", &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "manifest-marker=abc") != null);
+}
+
+// ---- target / cpu scenarios ---------------------------------------
+
+test "CLI script: native default when neither manifest nor -Dtarget set" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // No `-Dtarget=`/`-Dcpu=` ⇒ the script builds and runs on the
+    // host natively (the plain `zir_compilation_create` path).
+    var r = try runScriptInTmp(allocator, &tmp_dir, "nat.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("native-ok")
+        \\  "ok"
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "native-ok") != null);
+}
+
+test "CLI script: -Dcpu refines the native target (host build still runs)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // `-Dcpu=baseline` with no `-Dtarget=` takes the cross path
+    // (triple "native", CPU explicit). "baseline" is valid for every
+    // arch, so the host binary still builds and runs — proving cpu is
+    // threaded into the fork's target query without breaking native.
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "cpu.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("cpu-ok")
+        \\  "ok"
+        \\}
+    , &.{"-Dcpu=baseline"}, &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "cpu-ok") != null);
+    try expectOnlyScriptInDir(&tmp_dir, "cpu.zap");
+}
+
+test "CLI script error: invalid -Dcpu is rejected with a clear error" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "badcpu.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("never-runs")
+        \\  "ok"
+        \\}
+    , &.{"-Dcpu=totally_not_a_cpu_model"}, &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "never-runs") == null);
+    // Strengthened: assert the diagnostic actually names the bad CPU,
+    // not merely that *some* error occurred. The fork's
+    // `std.Target.Query.parse` failure path writes
+    // `invalid -Dcpu='<value>' for target` into the manager-`.o`
+    // driver diagnostic, surfaced verbatim by Zap.
+    try std.testing.expect(
+        std.mem.indexOf(u8, r.stderr, "totally_not_a_cpu_model") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "-Dcpu") != null);
+}
+
+// ============================================================
+// Cross-compilation via `-Dtarget=` — REAL successful cross
+// builds (not just error paths).
+//
+// These prove `-Dtarget=` actually cross-compiles: the produced
+// binary is inspected with `/usr/bin/file` and asserted to be for
+// the requested NON-NATIVE arch/OS. `*-linux-musl` is used because
+// the Zig fork bundles musl completely — no external toolchain is
+// required, isolating a genuine fork/Zap bug from a missing-libc
+// environment limitation.
+// ============================================================
+
+/// Result of a cross-build: the captured `zap build` process output
+/// plus the `/usr/bin/file` description of the produced binary (empty
+/// when the build failed / produced nothing).
+const CrossBuildResult = struct {
+    build_stdout: []const u8,
+    build_stderr: []const u8,
+    build_exit: u8,
+    file_desc: []const u8,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *CrossBuildResult) void {
+        self.allocator.free(self.build_stdout);
+        self.allocator.free(self.build_stderr);
+        self.allocator.free(self.file_desc);
+    }
+};
+
+/// Build a minimal manifest `:bin` project for `target_triple` (passed
+/// as `-Dtarget=`) and return the build result plus `/usr/bin/file`'s
+/// description of `zap-out/bin/cross`. When `target_triple` is null, a
+/// native build is performed (no `-Dtarget=`). The produced binary is
+/// NOT executed — cross binaries are foreign to the test host; the
+/// `file` description is the portable correctness oracle.
+fn runCrossBuild(
+    allocator: std.mem.Allocator,
+    target_triple: ?[]const u8,
+) TestError!CrossBuildResult {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
+
+    const build_source =
+        \\pub struct Cross.Builder {
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
+        \\    case env.target {
+        \\      :cross ->
+        \\        %Zap.Manifest{
+        \\          name: "cross",
+        \\          version: "0.1.0",
+        \\          kind: :bin,
+        \\          root: &Cross.main/1,
+        \\          paths: ["lib/**/*.zap"]
+        \\        }
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }
+        \\  }
+        \\}
+    ;
+    const prog_source =
+        \\pub struct Cross {
+        \\  pub fn main(_args :: [String]) -> String {
+        \\    IO.puts("cross-ok")
+        \\    "ok"
+        \\  }
+        \\}
+    ;
+
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch
+        return error.Unexpected;
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/cross.zap", .data = prog_source }) catch
+        return error.Unexpected;
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+
+    const zap_binary = try resolveZapBinary(allocator);
+    defer allocator.free(zap_binary);
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, zap_binary);
+    try argv.append(allocator, "build");
+    if (target_triple) |t| {
+        const flag = std.fmt.allocPrint(allocator, "-Dtarget={s}", .{t}) catch
+            return error.OutOfMemory;
+        try argv.append(allocator, flag);
+    }
+    try argv.append(allocator, "cross");
+
+    var env_map = std.testing.environ.createMap(allocator) catch return error.Unexpected;
+    defer env_map.deinit();
+    _ = env_map.swapRemove("ZAP_LIB_DIR");
+    env_map.put("ZAP_LIB_DIR", repo_lib) catch return error.OutOfMemory;
+
+    const result = std.process.run(allocator, getTestIo(), .{
+        .argv = argv.items,
+        .cwd = .{ .path = tmp_dir_path },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.RunFailed;
+
+    // Free the per-flag allocation now that the child has been spawned.
+    if (target_triple != null) allocator.free(argv.items[2]);
+
+    const build_exit: u8 = switch (result.term) {
+        .exited => |code| code,
+        else => 255,
+    };
+
+    // Inspect the produced binary with `/usr/bin/file`. If the build
+    // failed there is no binary; `file_desc` stays empty.
+    var file_desc: []const u8 = "";
+    if (build_exit == 0) {
+        const bin_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out/bin/cross", allocator) catch null;
+        if (bin_path) |bp| {
+            defer allocator.free(bp);
+            const file_run = std.process.run(allocator, getTestIo(), .{
+                .argv = &.{ "/usr/bin/file", "-b", bp },
+                .stdout_limit = .limited(64 * 1024),
+                .stderr_limit = .limited(64 * 1024),
+            }) catch null;
+            if (file_run) |fr| {
+                allocator.free(fr.stderr);
+                file_desc = fr.stdout;
+            }
+        }
+    }
+
+    return .{
+        .build_stdout = result.stdout,
+        .build_stderr = result.stderr,
+        .build_exit = build_exit,
+        .file_desc = file_desc,
+        .allocator = allocator,
+    };
+}
+
+test "CLI cross: -Dtarget=aarch64-linux-musl produces an ARM aarch64 Linux ELF" {
+    const allocator = std.testing.allocator;
+    var r = try runCrossBuild(allocator, "aarch64-linux-musl");
+    defer r.deinit();
+
+    if (r.build_exit != 0) {
+        std.debug.print(
+            "\n=== cross build FAILED (expected success) ===\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.build_stdout, r.build_stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0), r.build_exit);
+    // Must be a Linux ELF for the aarch64 architecture — NOT the
+    // macOS/host Mach-O. This is the proof that `-Dtarget=` actually
+    // cross-compiled rather than silently building for the host.
+    try std.testing.expect(std.mem.indexOf(u8, r.file_desc, "ELF") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.file_desc, "aarch64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.file_desc, "Mach-O") == null);
+}
+
+test "CLI cross: -Dtarget=x86_64-linux-musl produces an x86-64 Linux ELF" {
+    const allocator = std.testing.allocator;
+    var r = try runCrossBuild(allocator, "x86_64-linux-musl");
+    defer r.deinit();
+
+    if (r.build_exit != 0) {
+        std.debug.print(
+            "\n=== cross build FAILED (expected success) ===\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.build_stdout, r.build_stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0), r.build_exit);
+    // Different ARCH than the host (aarch64) — proves arch retargeting.
+    try std.testing.expect(std.mem.indexOf(u8, r.file_desc, "ELF") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.file_desc, "x86-64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.file_desc, "Mach-O") == null);
+}
+
+test "CLI cross: native build is unchanged (no -Dtarget regression)" {
+    const allocator = std.testing.allocator;
+    var r = try runCrossBuild(allocator, null);
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.build_exit);
+    // The native macOS host build must still produce a host Mach-O
+    // executable — the cross machinery must not perturb the native
+    // path.
+    try std.testing.expect(std.mem.indexOf(u8, r.file_desc, "Mach-O") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.file_desc, "executable") != null);
+}
+
+test "CLI cross error: invalid -Dtarget fails loudly with a naming diagnostic and no binary" {
+    const allocator = std.testing.allocator;
+    var r = try runCrossBuild(allocator, "bogus-not-a-target");
+    defer r.deinit();
+
+    // Must be a hard failure — non-zero exit, NO produced binary, and
+    // a diagnostic that names the offending triple. A silent `.Ok`
+    // (exit 0) or a host-arch fallback binary is exactly the defect
+    // this test guards.
+    try std.testing.expect(r.build_exit != 0);
+    try std.testing.expectEqualStrings("", r.file_desc);
+    try std.testing.expect(
+        std.mem.indexOf(u8, r.build_stderr, "bogus-not-a-target") != null,
+    );
+}
+
+test "CLI cross error: invalid -Dtarget on USER-binary path is graceful (no process.fatal abort)" {
+    const allocator = std.testing.allocator;
+    // A syntactically-valid-looking but unresolvable triple. The point
+    // is that NO path (manager-`.o` OR user-binary) may
+    // `std.process.fatal`-abort the whole process: the failure must be
+    // a clean non-zero exit with a diagnostic. An abort would manifest
+    // as a signal/255 term, which `runCrossBuild` maps to exit 255 AND
+    // would typically lack the structured diagnostic text.
+    var r = try runCrossBuild(allocator, "aarch64-shenzhen-quux");
+    defer r.deinit();
+
+    try std.testing.expect(r.build_exit != 0);
+    try std.testing.expectEqualStrings("", r.file_desc);
+    // Graceful diagnostic naming the triple (proves a returned error,
+    // not a hard abort).
+    try std.testing.expect(
+        std.mem.indexOf(u8, r.build_stderr, "aarch64-shenzhen-quux") != null,
+    );
+}
+
+// ============================================================
+// Defect-2 regression: a `-D` flag placed AFTER the build
+// target must still be honored (not silently dropped).
+// `zap build <proj> -Doptimize=...` — the override must reach
+// the build. A dropped flag == test failure.
+// ============================================================
+
+test "CLI Defect-2 regression: -Doptimize AFTER the target is honored" {
+    const allocator = std.testing.allocator;
+    // `runManifestProject` places `flags` BEFORE the target; here we
+    // need the flag AFTER the target, so drive the build directly.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
+
+    // Manifest declares :debug; the post-target `-Doptimize=ReleaseFast`
+    // must override it. The program prints a marker so a successful,
+    // correctly-built binary is observable.
+    const build_source =
+        \\pub struct D2.Builder {
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
+        \\    case env.target {
+        \\      :d2 ->
+        \\        %Zap.Manifest{
+        \\          name: "d2",
+        \\          version: "0.1.0",
+        \\          kind: :bin,
+        \\          root: &D2.main/1,
+        \\          optimize: :debug,
+        \\          paths: ["lib/**/*.zap"]
+        \\        }
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }
+        \\  }
+        \\}
+    ;
+    const prog_source =
+        \\pub struct D2 {
+        \\  pub fn main(_args :: [String]) -> String {
+        \\    IO.puts("d2-marker=ok")
+        \\    "ok"
+        \\  }
+        \\}
+    ;
+
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch
+        return error.Unexpected;
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/d2.zap", .data = prog_source }) catch
+        return error.Unexpected;
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+
+    const zap_binary = try resolveZapBinary(allocator);
+    defer allocator.free(zap_binary);
+
+    var env_map = std.testing.environ.createMap(allocator) catch return error.Unexpected;
+    defer env_map.deinit();
+    _ = env_map.swapRemove("ZAP_LIB_DIR");
+    env_map.put("ZAP_LIB_DIR", repo_lib) catch return error.OutOfMemory;
+
+    // Flag AFTER the target — the Defect-2 scenario.
+    const argv_with = [_][]const u8{ zap_binary, "build", "d2", "-Doptimize=ReleaseFast" };
+    const with_run = std.process.run(allocator, getTestIo(), .{
+        .argv = &argv_with,
+        .cwd = .{ .path = tmp_dir_path },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.RunFailed;
+    defer allocator.free(with_run.stdout);
+    defer allocator.free(with_run.stderr);
+
+    const with_exit: u8 = switch (with_run.term) {
+        .exited => |c| c,
+        else => 255,
+    };
+    // The build must succeed with the post-target flag applied. If the
+    // flag were dropped the build would still succeed too, so the real
+    // discriminator is that the flag is ACCEPTED and PARSED rather than
+    // being treated as a stray positional/unknown token: a dropped
+    // flag historically caused either a target-parse error or an
+    // "unknown build flag" diagnostic. Assert a clean success AND that
+    // no flag-parse error leaked to stderr.
+    if (with_exit != 0) {
+        std.debug.print(
+            "\n=== Defect-2: post-target -D flag build FAILED ===\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ with_run.stdout, with_run.stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0), with_exit);
+    try std.testing.expect(std.mem.indexOf(u8, with_run.stderr, "unknown build flag") == null);
+    try std.testing.expect(std.mem.indexOf(u8, with_run.stderr, "could not parse target") == null);
+
+    // Run the produced binary to confirm it built correctly.
+    const bin_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out/bin/d2", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(bin_path);
+    const prog_run = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{bin_path},
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.RunFailed;
+    defer allocator.free(prog_run.stdout);
+    defer allocator.free(prog_run.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, prog_run.stdout, "d2-marker=ok") != null);
+}
+
+// ============================================================
+// Single-file SCRIPT cross-compilation via `zap run <file>
+// -Dtarget=<foreign>`. This locks the script-path defect fix:
+// the script path used to UNCONDITIONALLY exec the produced
+// binary, so a cross build for a foreign arch/OS died with a
+// cryptic `error.InvalidExe` (exit 1). Correct behavior: the
+// cross-build SUCCEEDS, the foreign binary is NOT executed, the
+// artifact path is reported, and the process exits 0 — exactly
+// like `zap build -Dtarget=<foreign>`.
+//
+// `*-linux-musl` is used because the Zig fork bundles musl
+// completely (no external toolchain), isolating a genuine
+// fork/Zap bug from a missing-libc environment limitation.
+// ============================================================
+
+/// Result of a `zap run <script> -Dtarget=<t>` cross run: the
+/// process output plus `/usr/bin/file`'s description of the
+/// artifact whose path the CLI printed in the
+/// "binary written to <path>" line (empty when no such line /
+/// the build failed).
+const ScriptCrossResult = struct {
+    stdout: []const u8,
+    stderr: []const u8,
+    exit_code: u8,
+    file_desc: []const u8,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *ScriptCrossResult) void {
+        self.allocator.free(self.stdout);
+        self.allocator.free(self.stderr);
+        self.allocator.free(self.file_desc);
+    }
+};
+
+/// Extract the cross artifact path the CLI prints on a foreign
+/// `zap run` cross build: `... binary written to <path>\n`. The
+/// marker text is produced by `cmdRunScript`'s host-runnability
+/// gate in `src/main.zig`; keep these in sync.
+fn extractWrittenBinaryPath(stdout: []const u8) ?[]const u8 {
+    const marker = "binary written to ";
+    const start = std.mem.indexOf(u8, stdout, marker) orelse return null;
+    const after = stdout[start + marker.len ..];
+    const nl = std.mem.indexOfScalar(u8, after, '\n') orelse after.len;
+    const path = std.mem.trim(u8, after[0..nl], " \t\r");
+    if (path.len == 0) return null;
+    return path;
+}
+
+/// Build (do NOT execute — it is foreign) a single-file script
+/// for `target_triple` via `zap run -Dtarget=<t> <script>` (flag
+/// BEFORE the path so it is consumed, not forwarded to `main/1`).
+/// Returns the process result plus the `file` description of the
+/// reported artifact.
+fn runScriptCrossBuild(
+    allocator: std.mem.Allocator,
+    target_triple: []const u8,
+) TestError!ScriptCrossResult {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const script_source =
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("script-cross-ok")
+        \\  "ok"
+        \\}
+    ;
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "sc.zap", .data = script_source }) catch
+        return error.Unexpected;
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const script_path = std.fs.path.join(allocator, &.{ tmp_dir_path, "sc.zap" }) catch
+        return error.OutOfMemory;
+    defer allocator.free(script_path);
+
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+
+    const script_cache = std.fs.path.join(allocator, &.{ tmp_dir_path, "..", "zap-script-cache" }) catch
+        return error.OutOfMemory;
+    defer allocator.free(script_cache);
+
+    const zap_binary = try resolveZapBinary(allocator);
+    defer allocator.free(zap_binary);
+
+    const flag = std.fmt.allocPrint(allocator, "-Dtarget={s}", .{target_triple}) catch
+        return error.OutOfMemory;
+    defer allocator.free(flag);
+
+    var env_map = std.testing.environ.createMap(allocator) catch return error.Unexpected;
+    defer env_map.deinit();
+    _ = env_map.swapRemove("ZAP_LIB_DIR");
+    env_map.put("ZAP_LIB_DIR", repo_lib) catch return error.OutOfMemory;
+    env_map.put("ZAP_SCRIPT_CACHE_DIR", script_cache) catch return error.OutOfMemory;
+
+    // Flag BEFORE the script path ⇒ consumed as a build flag.
+    const argv = [_][]const u8{ zap_binary, "run", flag, script_path };
+    const result = std.process.run(allocator, getTestIo(), .{
+        .argv = &argv,
+        .cwd = .{ .path = tmp_dir_path },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.RunFailed;
+
+    const exit_code: u8 = switch (result.term) {
+        .exited => |c| c,
+        else => 255,
+    };
+
+    // The CLI emits the "binary written to <path>" line via
+    // `std.debug.print` ⇒ STDERR (along with all compile progress).
+    var file_desc: []const u8 = "";
+    if (extractWrittenBinaryPath(result.stderr)) |bin_path| {
+        const file_run = std.process.run(allocator, getTestIo(), .{
+            .argv = &.{ "/usr/bin/file", "-b", bin_path },
+            .stdout_limit = .limited(64 * 1024),
+            .stderr_limit = .limited(64 * 1024),
+        }) catch null;
+        if (file_run) |fr| {
+            allocator.free(fr.stderr);
+            file_desc = fr.stdout;
+        }
+    }
+
+    return .{
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+        .exit_code = exit_code,
+        .file_desc = file_desc,
+        .allocator = allocator,
+    };
+}
+
+test "CLI script cross: -Dtarget=x86_64-linux-musl builds a foreign x86-64 ELF, reports it, exits 0 (no InvalidExe)" {
+    const allocator = std.testing.allocator;
+    var r = try runScriptCrossBuild(allocator, "x86_64-linux-musl");
+    defer r.deinit();
+
+    if (r.exit_code != 0) {
+        std.debug.print(
+            "\n=== script cross build FAILED (expected success) ===\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.stdout, r.stderr },
+        );
+    }
+    // The cross BUILD succeeded; the foreign binary was NOT run.
+    // Before the fix this exited 1 with `error.InvalidExe`. The
+    // CLI status line is emitted via `std.debug.print` ⇒ stderr,
+    // and the script's `IO.puts` marker must be ABSENT from stdout
+    // (proving the foreign binary genuinely did not execute).
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "Cross-compiled for 'x86_64-linux-musl'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "not executed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "script-cross-ok") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "InvalidExe") == null);
+    // The reported artifact is genuinely a foreign x86-64 Linux ELF
+    // — proves the script path actually cross-compiled (not a host
+    // Mach-O, not a silently-native build).
+    try std.testing.expect(std.mem.indexOf(u8, r.file_desc, "ELF") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.file_desc, "x86-64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.file_desc, "Mach-O") == null);
+}
+
+test "CLI script cross: -Dtarget=aarch64-linux-musl builds a foreign ARM aarch64 ELF (host arch, foreign OS)" {
+    const allocator = std.testing.allocator;
+    var r = try runScriptCrossBuild(allocator, "aarch64-linux-musl");
+    defer r.deinit();
+
+    if (r.exit_code != 0) {
+        std.debug.print(
+            "\n=== script cross build FAILED (expected success) ===\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.stdout, r.stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "Cross-compiled for 'aarch64-linux-musl'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "script-cross-ok") == null);
+    // Foreign-OS ELF even though the arch matches the macOS host —
+    // the OS differs, so it is still not host-runnable.
+    try std.testing.expect(std.mem.indexOf(u8, r.file_desc, "ELF") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.file_desc, "aarch64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.file_desc, "Mach-O") == null);
+}
+
+test "CLI script cross error: invalid -Dtarget fails loudly with a naming diagnostic and no run" {
+    const allocator = std.testing.allocator;
+    var r = try runScriptCrossBuild(allocator, "bogus-not-a-target");
+    defer r.deinit();
+
+    // Hard failure: non-zero exit, the script body never ran, and
+    // the diagnostic NAMES the offending triple (a returned error,
+    // not a silent `.Ok`/host fallback and not a process abort).
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "script-cross-ok") == null);
+    try std.testing.expectEqualStrings("", r.file_desc);
+    try std.testing.expect(
+        std.mem.indexOf(u8, r.stderr, "bogus-not-a-target") != null,
+    );
+}
+
+test "CLI script cross: -Dtarget AFTER the script path is opaque passthrough (forwarded to main/1, native build runs)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Per the locked position contract, EVERYTHING after the script
+    // path forwards to `main/1` verbatim — a `-Dtarget=`-looking
+    // token there is NOT a build flag. So the script builds NATIVE
+    // and RUNS on the host, receiving the token as an arg. This
+    // guards against a regression where post-path `-D` tokens are
+    // wrongly consumed as build flags (a silent wrong-arch build).
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "pass.zap",
+        \\fn main(args :: [String]) -> String {
+        \\  IO.puts("passthrough-ran")
+        \\  "ok"
+        \\}
+    , &.{}, &.{"-Dtarget=x86_64-linux-musl"});
+    defer r.deinit();
+
+    // Native build + run on the host: it MUST execute (exit 0) and
+    // print its marker — a cross build would instead print
+    // "Cross-compiled for ..." and never run.
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "passthrough-ran") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "Cross-compiled for") == null);
+}
+
+// ============================================================
+// Phase 5: content-addressed script caching
+//
+// An UNCHANGED script must re-run with NO recompilation and
+// still write NOTHING next to the script. The script artifact
+// directory's previously-random component is replaced by a
+// strong CONTENT KEY over: the script source, the resolved
+// stdlib identity, the compiler identity, and every post-
+// override build control (optimize/memory/target/cpu). On a
+// second run with an identical key the frontend+backend+link
+// are skipped entirely and the cached binary is exec'd; the
+// fast path prints a stable `[script-cache hit]` marker to
+// stderr (mirroring the manifest path's `[cached]` signal —
+// std.debug.print ⇒ stderr, so the script's own stdout is
+// never polluted). Any input change (source edit, a flipped
+// `-D` flag, a different stdlib) yields a distinct key and a
+// fresh compile (no `[script-cache hit]`).
+//
+// These share ONE `ZAP_SCRIPT_CACHE_DIR` across both runs (the
+// real cross-invocation scenario) while keeping the script's
+// own dir isolated so the no-litter assertion stays exact.
+// ============================================================
+
+const SCRIPT_CACHE_HIT_MARKER = "[script-cache hit]";
+
+const TwoRunResult = struct {
+    first: ScriptRunResult,
+    second: ScriptRunResult,
+
+    fn deinit(self: *TwoRunResult) void {
+        self.first.deinit();
+        self.second.deinit();
+    }
+};
+
+/// The per-test-unique shared `ZAP_SCRIPT_CACHE_DIR` for a test whose
+/// tmp dir realpath is `tmp_dir_path`: a `-skcache` SIBLING of the
+/// tmp dir. SINGLE source of truth so the spawner and
+/// `countScriptKeyDirs` always resolve the IDENTICAL location, and
+/// per-test-unique (tmp dir names are unique) so concurrently- or
+/// sequentially-run Phase 5 tests can never see each other's keys.
+/// A sibling (not a child) keeps it out of the script's own dir so
+/// the no-litter assertion on the tmp dir stays exact.
+fn scriptSharedCachePath(
+    allocator: std.mem.Allocator,
+    tmp_dir_path: []const u8,
+) TestError![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}-skcache", .{tmp_dir_path}) catch
+        return error.OutOfMemory;
+}
+
+/// Write `first_source` to `<tmp>/<script_name>`, run `zap run
+/// [lead_flags...] <abs path> [extra_args...]`, then OPTIONALLY
+/// overwrite the script with `second_source` (null ⇒ leave it
+/// byte-identical) and run the exact same command again. BOTH
+/// runs share the SAME off-tmp `ZAP_SCRIPT_CACHE_DIR` and the
+/// SAME deterministic stdlib, so the content-addressed cache is
+/// genuinely exercised across invocations. The caller owns
+/// `tmp_dir` (to assert on its contents) and must `deinit` the
+/// result. `second_lead_flags`/`second_extra_args` default to
+/// the first run's when null so an "unchanged" run is literally
+/// the same command.
+fn runScriptTwiceSharedCache(
+    allocator: std.mem.Allocator,
+    tmp_dir: *std.testing.TmpDir,
+    script_name: []const u8,
+    first_source: []const u8,
+    second_source: ?[]const u8,
+    lead_flags: []const []const u8,
+    second_lead_flags: ?[]const []const u8,
+    extra_args: []const []const u8,
+) TestError!TwoRunResult {
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+
+    // A SINGLE shared cache root for BOTH runs (so run 2 is a genuine
+    // cross-invocation cache probe) that is also PER-TEST-UNIQUE and
+    // OFF the script's own directory. `tmp_dir_path` is unique per
+    // test (`std.testing.tmpDir`), so a `-skcache` SIBLING of it is
+    // unique-per-test (tests never interfere) yet not inside the
+    // script dir (so the no-litter assertion on the tmp dir stays
+    // exact). Derived through the shared `scriptSharedCachePath` so
+    // `countScriptKeyDirs` resolves the identical location.
+    const script_cache = try scriptSharedCachePath(allocator, tmp_dir_path);
+    defer allocator.free(script_cache);
+    // Start clean so a prior run of THIS test can't pre-seed a hit.
+    std.Io.Dir.cwd().deleteTree(getTestIo(), script_cache) catch {};
+
+    const first = try runScriptWithCacheRoot(
+        allocator,
+        tmp_dir,
+        tmp_dir_path,
+        repo_lib,
+        script_cache,
+        script_name,
+        first_source,
+        lead_flags,
+        extra_args,
+    );
+
+    const second = runScriptWithCacheRoot(
+        allocator,
+        tmp_dir,
+        tmp_dir_path,
+        repo_lib,
+        script_cache,
+        script_name,
+        second_source orelse first_source,
+        second_lead_flags orelse lead_flags,
+        extra_args,
+    ) catch |err| {
+        var f = first;
+        f.deinit();
+        return err;
+    };
+
+    return .{ .first = first, .second = second };
+}
+
+/// Single spawn against an explicit (possibly shared) cache
+/// root. Writes `script_source` to `<tmp>/<script_name>` then
+/// runs `zap run [lead_flags...] <abs path> [extra_args...]`
+/// with cwd = tmp, `ZAP_LIB_DIR` pinned to `repo_lib`, and
+/// `ZAP_SCRIPT_CACHE_DIR` = `script_cache`.
+fn runScriptWithCacheRoot(
+    allocator: std.mem.Allocator,
+    tmp_dir: *std.testing.TmpDir,
+    tmp_dir_path: []const u8,
+    repo_lib: []const u8,
+    script_cache: []const u8,
+    script_name: []const u8,
+    script_source: []const u8,
+    lead_flags: []const []const u8,
+    extra_args: []const []const u8,
+) TestError!ScriptRunResult {
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = script_name, .data = script_source }) catch
+        return error.Unexpected;
+
+    const script_path = std.fs.path.join(allocator, &.{ tmp_dir_path, script_name }) catch
+        return error.OutOfMemory;
+    defer allocator.free(script_path);
+
+    const zap_binary = try resolveZapBinary(allocator);
+    defer allocator.free(zap_binary);
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, zap_binary);
+    try argv.append(allocator, "run");
+    for (lead_flags) |f| try argv.append(allocator, f);
+    try argv.append(allocator, script_path);
+    for (extra_args) |a| try argv.append(allocator, a);
+
+    var env_map = std.testing.environ.createMap(allocator) catch return error.Unexpected;
+    defer env_map.deinit();
+    _ = env_map.swapRemove("ZAP_LIB_DIR");
+    env_map.put("ZAP_LIB_DIR", repo_lib) catch return error.OutOfMemory;
+    env_map.put("ZAP_SCRIPT_CACHE_DIR", script_cache) catch return error.OutOfMemory;
+
+    const result = std.process.run(allocator, getTestIo(), .{
+        .argv = argv.items,
+        .cwd = .{ .path = tmp_dir_path },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.RunFailed;
+
+    const exit_code = switch (result.term) {
+        .exited => |code| code,
+        else => {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+            return error.RunFailed;
+        },
+    };
+
+    return .{
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+        .exit_code = exit_code,
+        .allocator = allocator,
+    };
+}
+
+/// Count immediate entries under `script_cache`/zap/scripts —
+/// i.e. how many distinct content-key directories exist. A
+/// cache HIT for an unchanged script keeps this at 1; a key
+/// change adds a second sibling. Returns 0 when the tree is
+/// absent (never created).
+fn countScriptKeyDirs(
+    allocator: std.mem.Allocator,
+    tmp_dir: *std.testing.TmpDir,
+) TestError!usize {
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+    const script_cache = try scriptSharedCachePath(allocator, tmp_dir_path);
+    defer allocator.free(script_cache);
+    const scripts_dir = std.fs.path.join(allocator, &.{ script_cache, "zap", "scripts" }) catch
+        return error.OutOfMemory;
+    defer allocator.free(scripts_dir);
+
+    var dir = std.Io.Dir.cwd().openDir(getTestIo(), scripts_dir, .{ .iterate = true }) catch
+        return 0;
+    defer dir.close(getTestIo());
+    var it = dir.iterate();
+    var n: usize = 0;
+    while (it.next(getTestIo()) catch null) |_| n += 1;
+    return n;
+}
+
+test "Phase5 script cache: unchanged script second run is a cache hit (no recompile), same output + exit" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "cached.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("cache-hit-marker")
+        \\  "ok"
+        \\}
+    , null, &.{}, null, &.{});
+    defer r.deinit();
+
+    // Run 1: a genuine compile (no hit marker), correct output.
+    try std.testing.expectEqual(@as(u8, 0), r.first.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.first.stdout, "cache-hit-marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.first.stderr, SCRIPT_CACHE_HIT_MARKER) == null);
+
+    // Run 2: identical key ⇒ frontend+backend+link SKIPPED. The
+    // fast-path marker MUST be present and the program output +
+    // exit code identical to a fresh build.
+    try std.testing.expectEqual(@as(u8, 0), r.second.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.second.stdout, "cache-hit-marker") != null);
+    if (std.mem.indexOf(u8, r.second.stderr, SCRIPT_CACHE_HIT_MARKER) == null) {
+        std.debug.print(
+            "\n=== expected cache HIT on 2nd run, got recompile ===\nstderr:\n{s}\n",
+            .{r.second.stderr},
+        );
+        return error.Unexpected;
+    }
+    // Exactly ONE content-key dir (the unchanged script reused it).
+    try std.testing.expectEqual(@as(usize, 1), try countScriptKeyDirs(allocator, &tmp_dir));
+    // Still nothing beside the script after BOTH runs.
+    try expectOnlyScriptInDir(&tmp_dir, "cached.zap");
+}
+
+test "Phase5 script cache: editing the script source forces a recompile (new key)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "edit.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("v1-output")
+        \\  "ok"
+        \\}
+    ,
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("v2-output")
+        \\  "ok"
+        \\}
+    , &.{}, null, &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.first.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.first.stdout, "v1-output") != null);
+
+    // Different source ⇒ different content key ⇒ NO hit, fresh
+    // compile, and the NEW behavior runs.
+    try std.testing.expectEqual(@as(u8, 0), r.second.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.second.stdout, "v2-output") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.second.stdout, "v1-output") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.second.stderr, SCRIPT_CACHE_HIT_MARKER) == null);
+    // Two distinct keys now coexist under the shared root.
+    try std.testing.expectEqual(@as(usize, 2), try countScriptKeyDirs(allocator, &tmp_dir));
+    try expectOnlyScriptInDir(&tmp_dir, "edit.zap");
+}
+
+test "Phase5 script cache: -Doptimize change recompiles, unchanged hits" {
+    const allocator = std.testing.allocator;
+    const script =
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("opt-key-ok")
+        \\  "ok"
+        \\}
+    ;
+    // Same flag twice ⇒ HIT.
+    {
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "o.zap", script, null, &.{"-Doptimize=ReleaseSafe"}, null, &.{});
+        defer r.deinit();
+        try std.testing.expectEqual(@as(u8, 0), r.second.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, r.second.stderr, SCRIPT_CACHE_HIT_MARKER) != null);
+        try std.testing.expectEqual(@as(usize, 1), try countScriptKeyDirs(allocator, &tmp_dir));
+    }
+    // Flag flipped between runs ⇒ MISS (distinct key).
+    {
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "o.zap", script, null, &.{"-Doptimize=Debug"}, &.{"-Doptimize=ReleaseFast"}, &.{});
+        defer r.deinit();
+        try std.testing.expectEqual(@as(u8, 0), r.second.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, r.second.stderr, SCRIPT_CACHE_HIT_MARKER) == null);
+        try std.testing.expectEqual(@as(usize, 2), try countScriptKeyDirs(allocator, &tmp_dir));
+    }
+}
+
+test "Phase5 script cache: -Dmemory change recompiles, unchanged hits" {
+    const allocator = std.testing.allocator;
+    const script =
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("mem-key-ok")
+        \\  "ok"
+        \\}
+    ;
+    {
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "m.zap", script, null, &.{"-Dmemory=Memory.Arena"}, null, &.{});
+        defer r.deinit();
+        try std.testing.expectEqual(@as(u8, 0), r.second.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, r.second.stderr, SCRIPT_CACHE_HIT_MARKER) != null);
+        try std.testing.expectEqual(@as(usize, 1), try countScriptKeyDirs(allocator, &tmp_dir));
+    }
+    {
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "m.zap", script, null, &.{"-Dmemory=Memory.ARC"}, &.{"-Dmemory=Memory.NoOp"}, &.{});
+        defer r.deinit();
+        try std.testing.expectEqual(@as(u8, 0), r.second.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, r.second.stderr, SCRIPT_CACHE_HIT_MARKER) == null);
+        try std.testing.expectEqual(@as(usize, 2), try countScriptKeyDirs(allocator, &tmp_dir));
+    }
+}
+
+test "Phase5 script cache: -Dcpu change recompiles, unchanged hits (still host-runnable)" {
+    const allocator = std.testing.allocator;
+    const script =
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("cpu-key-ok")
+        \\  "ok"
+        \\}
+    ;
+    {
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "c.zap", script, null, &.{"-Dcpu=baseline"}, null, &.{});
+        defer r.deinit();
+        try std.testing.expectEqual(@as(u8, 0), r.second.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, r.second.stdout, "cpu-key-ok") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.second.stderr, SCRIPT_CACHE_HIT_MARKER) != null);
+        try std.testing.expectEqual(@as(usize, 1), try countScriptKeyDirs(allocator, &tmp_dir));
+    }
+    {
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        // baseline vs native: two distinct CPU strings ⇒ two keys.
+        var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "c.zap", script, null, &.{"-Dcpu=baseline"}, &.{"-Dcpu=native"}, &.{});
+        defer r.deinit();
+        try std.testing.expectEqual(@as(u8, 0), r.second.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, r.second.stderr, SCRIPT_CACHE_HIT_MARKER) == null);
+        try std.testing.expectEqual(@as(usize, 2), try countScriptKeyDirs(allocator, &tmp_dir));
+    }
+}
+
+test "Phase5 script cache: -Dtarget change yields a distinct key (foreign target still reported, exit 0)" {
+    const allocator = std.testing.allocator;
+    const script =
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("tgt-key-ok")
+        \\  "ok"
+        \\}
+    ;
+    // Same foreign target twice ⇒ HIT (the reported-artifact path
+    // is cached too — second run still reports + exits 0, no
+    // recompile, never execs the foreign binary).
+    {
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "t.zap", script, null, &.{"-Dtarget=x86_64-linux-musl"}, null, &.{});
+        defer r.deinit();
+        try std.testing.expectEqual(@as(u8, 0), r.first.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, r.first.stderr, "Cross-compiled for 'x86_64-linux-musl'") != null);
+        try std.testing.expectEqual(@as(u8, 0), r.second.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, r.second.stdout, "tgt-key-ok") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.second.stderr, SCRIPT_CACHE_HIT_MARKER) != null);
+        try std.testing.expectEqual(@as(usize, 1), try countScriptKeyDirs(allocator, &tmp_dir));
+    }
+    // Different target ⇒ distinct key, fresh cross build.
+    {
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "t.zap", script, null, &.{"-Dtarget=x86_64-linux-musl"}, &.{"-Dtarget=aarch64-linux-musl"}, &.{});
+        defer r.deinit();
+        try std.testing.expectEqual(@as(u8, 0), r.second.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, r.second.stderr, "Cross-compiled for 'aarch64-linux-musl'") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.second.stderr, SCRIPT_CACHE_HIT_MARKER) == null);
+        try std.testing.expectEqual(@as(usize, 2), try countScriptKeyDirs(allocator, &tmp_dir));
+    }
+}
+
+/// Recursively copy directory `src_abs` into `dst_abs` (created if
+/// absent), parents-before-children. Used to materialise a COMPLETE,
+/// usable alternate Zap stdlib root at a fresh path.
+fn copyTreeAbs(
+    allocator: std.mem.Allocator,
+    src_abs: []const u8,
+    dst_abs: []const u8,
+) TestError!void {
+    std.Io.Dir.cwd().createDirPath(getTestIo(), dst_abs) catch return error.Unexpected;
+    var src = std.Io.Dir.cwd().openDir(getTestIo(), src_abs, .{ .iterate = true }) catch
+        return error.Unexpected;
+    defer src.close(getTestIo());
+    var dst = std.Io.Dir.cwd().openDir(getTestIo(), dst_abs, .{}) catch
+        return error.Unexpected;
+    defer dst.close(getTestIo());
+    var walker = std.Io.Dir.walk(src, allocator) catch return error.Unexpected;
+    defer walker.deinit();
+    while (walker.next(getTestIo()) catch null) |entry| {
+        switch (entry.kind) {
+            .directory => dst.createDirPath(getTestIo(), entry.path) catch {},
+            .file => {
+                if (std.fs.path.dirname(entry.path)) |d|
+                    dst.createDirPath(getTestIo(), d) catch {};
+                src.copyFile(entry.path, dst, entry.path, getTestIo(), .{}) catch
+                    return error.Unexpected;
+            },
+            else => {},
+        }
+    }
+}
+
+test "Phase5 script cache: a different --zap-lib-dir (different stdlib) yields a distinct key (no false hit)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+    // The stdlib source-tree ROOT is the parent of `lib/`; it also
+    // holds the `src/memory/<mgr>/manager.zig` backends the managers
+    // resolve by convention, so a USABLE alternate stdlib needs BOTH
+    // `lib/` and `src/memory/` copied (a bare `lib/` copy cannot
+    // build — that is a stdlib-completeness requirement, not a cache
+    // concern).
+    const repo_root = std.fs.path.dirname(repo_lib) orelse return error.Unexpected;
+    const repo_src_memory = std.fs.path.join(allocator, &.{ repo_root, "src", "memory" }) catch
+        return error.OutOfMemory;
+    defer allocator.free(repo_src_memory);
+
+    // Materialise a COMPLETE alternate stdlib at a fresh path inside
+    // the (per-test-unique) tmp dir: same CONTENTS as the repo
+    // stdlib, but a different resolved path. The content key MUST
+    // still differ because the resolved stdlib dir is part of its
+    // identity — proving no false hit across stdlibs and no
+    // accidental path-insensitivity, while still being a buildable
+    // stdlib so run 2 genuinely succeeds.
+    const alt_root = std.fs.path.join(allocator, &.{ tmp_dir_path, "alt-stdlib" }) catch
+        return error.OutOfMemory;
+    defer allocator.free(alt_root);
+    const alt_lib = std.fs.path.join(allocator, &.{ alt_root, "lib" }) catch
+        return error.OutOfMemory;
+    defer allocator.free(alt_lib);
+    const alt_src_memory = std.fs.path.join(allocator, &.{ alt_root, "src", "memory" }) catch
+        return error.OutOfMemory;
+    defer allocator.free(alt_src_memory);
+    try copyTreeAbs(allocator, repo_lib, alt_lib);
+    try copyTreeAbs(allocator, repo_src_memory, alt_src_memory);
+
+    // Per-test-unique shared cache root (the shared single-source
+    // location) so the key-dir count is exact and tests never
+    // interfere.
+    const script_cache = try scriptSharedCachePath(allocator, tmp_dir_path);
+    defer allocator.free(script_cache);
+    std.Io.Dir.cwd().deleteTree(getTestIo(), script_cache) catch {};
+
+    const script =
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("stdlib-key-ok")
+        \\  "ok"
+        \\}
+    ;
+
+    // Run 1 with the repo stdlib.
+    var r1 = try runScriptWithCacheRoot(allocator, &tmp_dir, tmp_dir_path, repo_lib, script_cache, "sl.zap", script, &.{}, &.{});
+    defer r1.deinit();
+    if (r1.exit_code != 0)
+        std.debug.print("\n=== run1 FAILED ===\nstderr:\n{s}\n", .{r1.stderr});
+    try std.testing.expectEqual(@as(u8, 0), r1.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r1.stdout, "stdlib-key-ok") != null);
+
+    // Run 2 with the alternate (same-content, different-path)
+    // COMPLETE stdlib via --zap-lib-dir. Identity differs ⇒ NO false
+    // hit, a fresh compile, a distinct key dir — and it still builds
+    // and runs because the alternate stdlib is complete.
+    var r2 = try runScriptWithCacheRoot(allocator, &tmp_dir, tmp_dir_path, repo_lib, script_cache, "sl.zap", script, &.{ "--zap-lib-dir", alt_lib }, &.{});
+    defer r2.deinit();
+    if (r2.exit_code != 0)
+        std.debug.print("\n=== run2 FAILED ===\nstderr:\n{s}\n", .{r2.stderr});
+    try std.testing.expectEqual(@as(u8, 0), r2.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "stdlib-key-ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.stderr, SCRIPT_CACHE_HIT_MARKER) == null);
+    try std.testing.expectEqual(@as(usize, 2), try countScriptKeyDirs(allocator, &tmp_dir));
+}
+
+test "Phase5 script cache: NOTHING is written next to the script after many runs (incl. cache hits)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+    const script_cache = try scriptSharedCachePath(allocator, tmp_dir_path);
+    defer allocator.free(script_cache);
+    std.Io.Dir.cwd().deleteTree(getTestIo(), script_cache) catch {};
+
+    const script =
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("many-runs-ok")
+        \\  "ok"
+        \\}
+    ;
+    // 5 runs: run 1 compiles, runs 2-5 are cache hits. After ALL
+    // of them the script's own dir must contain ONLY the script.
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        var r = try runScriptWithCacheRoot(allocator, &tmp_dir, tmp_dir_path, repo_lib, script_cache, "many.zap", script, &.{}, &.{});
+        defer r.deinit();
+        try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, r.stdout, "many-runs-ok") != null);
+        if (i > 0) {
+            try std.testing.expect(std.mem.indexOf(u8, r.stderr, SCRIPT_CACHE_HIT_MARKER) != null);
+        }
+        try expectOnlyScriptInDir(&tmp_dir, "many.zap");
+    }
+    // One key dir total across all 5 invocations.
+    try std.testing.expectEqual(@as(usize, 1), try countScriptKeyDirs(allocator, &tmp_dir));
+}
+
+test "Phase5 script cache: artifacts land under the cache root, not cwd/script dir" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "root.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("root-ok")
+        \\  "ok"
+        \\}
+    , null, &.{}, null, &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.second.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.second.stderr, SCRIPT_CACHE_HIT_MARKER) != null);
+    // The content-key dir tree exists under the explicit cache
+    // root (proving the override is honored and artifacts do NOT
+    // land in cwd/the script dir).
+    try std.testing.expectEqual(@as(usize, 1), try countScriptKeyDirs(allocator, &tmp_dir));
+    try expectOnlyScriptInDir(&tmp_dir, "root.zap");
+}
+
+test "Phase5 script cache: cache hit still forwards post-path args to main/1" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "argf.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  if System.arg_count() > 0 {
+        \\    IO.puts("arg=" <> System.arg_at(0))
+        \\  } else {
+        \\    IO.puts("arg=NONE")
+        \\  }
+        \\  "ok"
+        \\}
+    , null, &.{}, null, &.{"forwarded-value"});
+    defer r.deinit();
+
+    // Run 1 compiles + forwards the arg.
+    try std.testing.expectEqual(@as(u8, 0), r.first.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.first.stdout, "arg=forwarded-value") != null);
+    // Run 2 is a cache HIT and STILL forwards the post-path arg
+    // (the skip-recompile path execs with the same arg contract).
+    try std.testing.expectEqual(@as(u8, 0), r.second.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.second.stderr, SCRIPT_CACHE_HIT_MARKER) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.second.stdout, "arg=forwarded-value") != null);
+    try expectOnlyScriptInDir(&tmp_dir, "argf.zap");
+}
+
+test "Phase5 script cache: cache hit propagates a non-zero exit identically to a fresh build" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // `main/1` panics ⇒ non-zero exit on the FIRST (fresh) run.
+    // The cached SECOND run must propagate the SAME non-zero exit
+    // (the binary itself is unchanged; only compilation is
+    // skipped — the runtime contract is identical).
+    var r = try runScriptTwiceSharedCache(allocator, &tmp_dir, "fail.zap",
+        \\fn main(_args :: [String]) -> String {
+        \\  panic("boom")
+        \\  "never"
+        \\}
+    , null, &.{}, null, &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.first.exit_code != 0);
+    const first_code = r.first.exit_code;
+    try std.testing.expect(std.mem.indexOf(u8, r.second.stderr, SCRIPT_CACHE_HIT_MARKER) != null);
+    try std.testing.expectEqual(first_code, r.second.exit_code);
+    try expectOnlyScriptInDir(&tmp_dir, "fail.zap");
+}
+
+/// Worker for the concurrency test: a self-contained blocking
+/// `zap run <script>` against the SHARED cache root, on its own
+/// page-backed arena (the testing allocator is single-thread).
+/// Records whether this invocation produced the correct output
+/// and exit 0.
+const ConcurrentRunCtx = struct {
+    tmp_dir_path: []const u8,
+    script_path: []const u8,
+    zap_binary: []const u8,
+    /// Built ONCE on the main thread and shared read-only across all
+    /// workers. `std.process.run` only READS `environ_map`, so a
+    /// single shared const map is race-safe; building one per thread
+    /// via `std.testing.environ.createMap` instead races on the
+    /// test-runner's global environ snapshot.
+    env_map: *const std.process.Environ.Map,
+    ok: bool = false,
+
+    fn run(self: *ConcurrentRunCtx) void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const argv = [_][]const u8{ self.zap_binary, "run", self.script_path };
+        const result = std.process.run(a, getTestIo(), .{
+            .argv = &argv,
+            .cwd = .{ .path = self.tmp_dir_path },
+            .environ_map = self.env_map,
+            .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+            .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        }) catch return;
+
+        const code = switch (result.term) {
+            .exited => |c| c,
+            else => return,
+        };
+        if (code == 0 and std.mem.indexOf(u8, result.stdout, "race-ok") != null) {
+            self.ok = true;
+        } else {
+            std.debug.print(
+                "\n=== concurrent run FAILED code={d} ===\nstdout:\n{s}\nstderr:\n{s}\n",
+                .{ code, result.stdout, result.stderr },
+            );
+        }
+    }
+};
+
+test "Phase5 script cache: concurrent identical runs are race-safe (atomic publish)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+    const script_cache = try scriptSharedCachePath(allocator, tmp_dir_path);
+    defer allocator.free(script_cache);
+    std.Io.Dir.cwd().deleteTree(getTestIo(), script_cache) catch {};
+
+    const script_name = "race.zap";
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = script_name, .data =
+        \\fn main(_args :: [String]) -> String {
+        \\  IO.puts("race-ok")
+        \\  "ok"
+        \\}
+    }) catch return error.Unexpected;
+    const script_path = std.fs.path.join(allocator, &.{ tmp_dir_path, script_name }) catch
+        return error.OutOfMemory;
+    defer allocator.free(script_path);
+    const zap_binary = try resolveZapBinary(allocator);
+    defer allocator.free(zap_binary);
+
+    // Launch N identical `zap run <script>` processes CONCURRENTLY
+    // (one OS thread each) against the SAME empty shared cache
+    // root. They race to compile-and-publish the SAME content
+    // key; the atomic rename publish must make every one of them
+    // succeed with correct output and exit 0 (no torn binary, no
+    // link/rename clobber, no half-written executable observed).
+    // Build the child environment ONCE on the main thread; every
+    // worker shares it read-only (race-safe — `std.process.run` only
+    // reads it). Building it per-thread would race the test-runner's
+    // global environ snapshot.
+    var env_map = std.testing.environ.createMap(allocator) catch return error.Unexpected;
+    defer env_map.deinit();
+    _ = env_map.swapRemove("ZAP_LIB_DIR");
+    env_map.put("ZAP_LIB_DIR", repo_lib) catch return error.OutOfMemory;
+    env_map.put("ZAP_SCRIPT_CACHE_DIR", script_cache) catch return error.OutOfMemory;
+
+    const N = 4;
+    var ctxs: [N]ConcurrentRunCtx = undefined;
+    var threads: [N]std.Thread = undefined;
+    for (&ctxs) |*c| c.* = .{
+        .tmp_dir_path = tmp_dir_path,
+        .script_path = script_path,
+        .zap_binary = zap_binary,
+        .env_map = &env_map,
+    };
+    for (&threads, 0..) |*t, idx| {
+        t.* = std.Thread.spawn(.{}, ConcurrentRunCtx.run, .{&ctxs[idx]}) catch
+            return error.Unexpected;
+    }
+    for (&threads) |*t| t.join();
+
+    var ok_count: usize = 0;
+    for (&ctxs) |*c| {
+        if (c.ok) ok_count += 1;
+    }
+    // EVERY concurrent invocation must have produced correct
+    // output and exit 0 — the atomic publish is race-safe.
+    try std.testing.expectEqual(@as(usize, N), ok_count);
+    // Exactly one published content-key dir despite the race.
+    try std.testing.expectEqual(@as(usize, 1), try countScriptKeyDirs(allocator, &tmp_dir));
+    try expectOnlyScriptInDir(&tmp_dir, script_name);
+}
