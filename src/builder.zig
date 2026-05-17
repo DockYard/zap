@@ -1764,24 +1764,17 @@ test "memory adapter source evaluation ignores unrelated project sources" {
 
     // This test routes through `evaluateMemoryManagerAdapterFromSources`
     // with the real Zap stdlib in `source_roots`, so collection runs
-    // `validateImplConformance` against the real Phase-2
-    // `lib/memory/manager.zap` protocol, which still declares
-    // `fn backend(manager) -> Bool` (Phase 3 removes it). The redesigned
-    // resolver keys off the impl DECL span and *ignores* `backend/1`, so
-    // a Phase-2-conformant impl resolves to the exact same path an empty
-    // impl would. The GAP-D empty-impl migration applies to the CTFE
-    // fixtures that synthesize their own empty protocol; fixtures
-    // compiled against the unchanged real stdlib must stay conformant
-    // until Phase 3 removes `backend/1` from the stdlib protocol.
+    // `validateImplConformance` against the real `lib/memory/manager.zap`
+    // protocol. Phase 3 made `Memory.Manager` a zero-method conformance
+    // marker, so the conformant adapter is an empty
+    // `impl Memory.Manager for X {}`. The resolver keys off the impl
+    // DECL span, so the empty marker resolves to the adapter's source
+    // path exactly as before.
     const manager_source =
         \\pub struct ThirdParty.ProjectArena {
         \\}
         \\
-        \\pub impl Memory.Manager for ThirdParty.ProjectArena {
-        \\  pub fn backend(manager :: ThirdParty.ProjectArena) -> Bool {
-        \\    :zig.Memory.backend(manager)
-        \\  }
-        \\}
+        \\pub impl Memory.Manager for ThirdParty.ProjectArena {}
     ;
     const unrelated_source =
         \\pub struct TestProg {

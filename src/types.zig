@@ -167,14 +167,6 @@ pub const Type = union(enum) {
 const ProtocolDispatchResolution = union(enum) {
     not_protocol,
     concrete: ast.StructName,
-    /// Like `concrete`, but the receiver was a first-class `Type`
-    /// value (e.g. `Memory.ARC`) naming the impl target rather than an
-    /// instance of it. The caller resolves the same concrete impl but
-    /// must NOT re-type-check the receiver argument against the impl's
-    /// concrete first param (a `Type` value vs `manager :: Memory.X`).
-    /// Kept distinct from `concrete` so instance dispatch keeps its
-    /// exact prior argument-validation and ARC-ownership behaviour.
-    concrete_type_value: ast.StructName,
     constrained,
     invalid,
 };
@@ -1129,15 +1121,6 @@ pub const TypeChecker = struct {
     // Ownership metadata for bindings. Phase 1 stores the foundation here,
     // but enforcement comes later.
     ownership_bindings: std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo),
-
-    // Bindings assigned a first-class `Type` value naming a concrete
-    // struct (e.g. `adapter = Memory.ARC`). Maps the binding to the
-    // interned struct name the Type value denotes, so protocol dispatch
-    // can recover the named struct through a simple local binding the
-    // same way the build-CTFE interpreter propagates the value. Mirrors
-    // `staticTypeValueName`'s direct `struct_ref` recovery, extended to
-    // flow across one assignment.
-    static_type_value_bindings: std.AutoHashMap(scope_mod.BindingId, ast.StringId),
     analysis_context: ?*const escape_lattice.AnalysisContext,
     analysis_program: ?*const ir.Program,
 
@@ -1217,7 +1200,6 @@ pub const TypeChecker = struct {
             .current_scope = null,
             .referenced_bindings = std.AutoHashMap(scope_mod.BindingId, void).init(allocator),
             .ownership_bindings = std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo).init(allocator),
-            .static_type_value_bindings = std.AutoHashMap(scope_mod.BindingId, ast.StringId).init(allocator),
             .analysis_context = null,
             .analysis_program = null,
             .type_var_scope = std.StringHashMap(TypeId).init(allocator),
@@ -1238,7 +1220,6 @@ pub const TypeChecker = struct {
             .current_scope = null,
             .referenced_bindings = std.AutoHashMap(scope_mod.BindingId, void).init(allocator),
             .ownership_bindings = std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo).init(allocator),
-            .static_type_value_bindings = std.AutoHashMap(scope_mod.BindingId, ast.StringId).init(allocator),
             .analysis_context = null,
             .analysis_program = null,
             .type_var_scope = std.StringHashMap(TypeId).init(allocator),
@@ -1256,7 +1237,6 @@ pub const TypeChecker = struct {
         self.expr_types.deinit();
         self.referenced_bindings.deinit();
         self.ownership_bindings.deinit();
-        self.static_type_value_bindings.deinit();
         self.type_var_scope.deinit();
         self.eager_helper_in_flight.deinit();
     }
@@ -1562,41 +1542,7 @@ pub const TypeChecker = struct {
             return .{ .concrete = target };
         }
 
-        // A first-class `Type` value (e.g. `Memory.ARC`, including one
-        // reached through a simple local binding) that names a struct
-        // with `impl <Protocol> for <that struct>` is a valid protocol
-        // receiver — the canonical memory-manager adapter form
-        // (`manifest.zap` carries `memory :: Type = Memory.ARC`).
-        // Mirrors the build-CTFE resolver
-        // (`Interpreter.memoryBackendImplSourcePath`): recover the named
-        // struct statically and select its concrete impl.
-        if (self.isFirstClassTypeValue(arg_type)) {
-            if (try self.staticTypeValueName(first_arg)) |named| {
-                if (self.implTargetForProtocolByName(protocol_name, named)) |target| {
-                    return .{ .concrete_type_value = target };
-                }
-            }
-        }
-
         return .invalid;
-    }
-
-    fn isFirstClassTypeValue(self: *TypeChecker, type_id: TypeId) bool {
-        const type_struct = self.resolveFirstClassTypeStructType() orelse return false;
-        return self.store.typeEquals(type_id, type_struct);
-    }
-
-    fn implTargetForProtocolByName(
-        self: *const TypeChecker,
-        protocol_name: ast.StructName,
-        struct_name_id: ast.StringId,
-    ) ?ast.StructName {
-        const wanted = self.interner.get(struct_name_id);
-        for (self.graph.impls.items) |entry| {
-            if (!self.structNamesEqual(entry.protocol_name, protocol_name)) continue;
-            if (self.structNameMatchesTypeName(entry.target_type, wanted)) return entry.target_type;
-        }
-        return null;
     }
 
     fn protocolConstraintMatches(self: *const TypeChecker, type_id: TypeId, protocol_name: ast.StructName) bool {
@@ -1883,18 +1829,6 @@ pub const TypeChecker = struct {
         return switch (expr.*) {
             .struct_ref => |struct_ref| if (try self.resolveTypeReferenceTarget(struct_ref.name)) |target|
                 target.name
-            else
-                null,
-            // A first-class `Type` value flowing through a simple local
-            // binding (`adapter = Memory.ARC`). The binding was recorded
-            // by `checkStmt`'s assignment handler; recover the named
-            // struct so protocol dispatch resolves the same impl it
-            // would for the bare reference.
-            .var_ref => |vr| if (self.current_scope) |scope_id|
-                (if (self.graph.resolveBindingHygienic(scope_id, vr.name, vr.meta.scopes)) |binding_id|
-                    self.static_type_value_bindings.get(binding_id)
-                else
-                    null)
             else
                 null,
             .struct_expr => |struct_expr| blk: {
@@ -4371,24 +4305,6 @@ pub const TypeChecker = struct {
     // Statement type checking
     // ============================================================
 
-    /// When an assignment binds a simple name to a first-class `Type`
-    /// value (e.g. `adapter = Memory.ARC`), remember the struct that
-    /// Type value names against the binding. This lets a later
-    /// `Protocol.method(adapter)` recover the named struct through the
-    /// binding via `staticTypeValueName`, the same way the build-CTFE
-    /// interpreter propagates the selected manager value. Only the
-    /// single-`.bind` shape is tracked — destructuring patterns never
-    /// carry a single Type value.
-    fn recordStaticTypeValueBinding(self: *TypeChecker, pattern: *const ast.Pattern, value: *const ast.Expr) !void {
-        if (pattern.* != .bind) return;
-        const named = (try self.staticTypeValueName(value)) orelse return;
-        const scope_id = self.current_scope orelse return;
-        const bind = pattern.bind;
-        if (self.graph.resolveBindingHygienic(scope_id, bind.name, bind.meta.scopes)) |binding_id| {
-            try self.static_type_value_bindings.put(binding_id, named);
-        }
-    }
-
     fn checkStmt(self: *TypeChecker, stmt: ast.Stmt) anyerror!TypeId {
         return switch (stmt) {
             .expr => |expr| self.inferExpr(expr),
@@ -4396,7 +4312,6 @@ pub const TypeChecker = struct {
                 try self.ensureClosureValueCanEscape(assign.value, "assignment");
                 const value_type = try self.inferExpr(assign.value);
                 try self.recordAssignmentBindingTypes(assign.pattern, value_type, assign.value.getMeta().span);
-                try self.recordStaticTypeValueBinding(assign.pattern, assign.value);
                 return value_type;
             },
             .function_decl => |func| {
@@ -5489,29 +5404,10 @@ pub const TypeChecker = struct {
             if (fa.object.* == .struct_ref) {
                 const written_mod_name = fa.object.struct_ref.name;
                 var mod_name = written_mod_name;
-                // True only for the first-class `Type`-value adapter
-                // form (`.concrete_type_value`). The receiver (arg 0)
-                // is the dispatch key already validated by
-                // `resolveProtocolDispatch`, so it must not be
-                // re-checked against the impl's concrete first param
-                // below (a `Type` value vs `manager :: Memory.X` would
-                // be a spurious mismatch). Instance dispatch
-                // (`.concrete`) deliberately leaves this false to keep
-                // its exact prior argument/ARC behaviour.
-                var dispatched_concrete = false;
                 if (call.args.len > 0) {
                     switch (try self.resolveProtocolDispatch(written_mod_name, call.args[0])) {
                         .not_protocol => {},
-                        // Instance/concrete dispatch keeps its exact
-                        // prior behaviour (receiver arg re-checked
-                        // normally) — ARC ownership analysis depends on
-                        // it. Only the first-class `Type`-value adapter
-                        // form sets `dispatched_concrete`.
                         .concrete => |target| mod_name = target,
-                        .concrete_type_value => |target| {
-                            mod_name = target;
-                            dispatched_concrete = true;
-                        },
                         .constrained => {},
                         .invalid => {
                             try self.reportInvalidProtocolDispatch(written_mod_name, call.args[0]);
@@ -5539,21 +5435,6 @@ pub const TypeChecker = struct {
                         }
                         if (match) {
                             const arg_types = try self.inferCallArgTypes(call.args);
-                            // When dispatch selected this concrete impl
-                            // by the receiver, the receiver's effective
-                            // type for clause selection is the impl
-                            // target struct itself — not the
-                            // first-class `Type` value it was written
-                            // as. Without this, `resolveFamilyCallSignature`
-                            // can't match `fn backend(manager :: Memory.X)`
-                            // against a `Type`-typed arg 0 and the call
-                            // falls through to a spurious
-                            // unknown-type error on the protocol name.
-                            if (dispatched_concrete and arg_types.len > 0) {
-                                if (try self.resolveNominalStructRefType(mod_name)) |receiver_type_id| {
-                                    @constCast(arg_types)[0] = receiver_type_id;
-                                }
-                            }
                             if (try self.resolveFamilyCallSignature(mod_entry.scope_id, fa.field, arity, arg_types)) |resolved_call| {
                                 const signature = resolved_call.signature;
                                 // Check if the signature is generic (contains type variables)
@@ -5575,11 +5456,6 @@ pub const TypeChecker = struct {
 
                                     for (call.args, 0..) |arg, idx| {
                                         const arg_type = self.inferExpr(arg) catch TypeStore.UNKNOWN;
-                                        // Receiver already validated by
-                                        // dispatch selection; infer for
-                                        // its usage side-effects but skip
-                                        // the param-type re-check.
-                                        if (dispatched_concrete and idx == 0) continue;
                                         if (idx < signature.params.len) {
                                             const expected = signature.params[idx];
                                             if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR) {
@@ -5616,11 +5492,6 @@ pub const TypeChecker = struct {
                                 // all argument types can be fully inferred.
                                 for (call.args, 0..) |arg, idx| {
                                     const arg_type = self.inferExpr(arg) catch TypeStore.UNKNOWN;
-                                    // Receiver already validated by
-                                    // dispatch selection; infer for its
-                                    // usage side-effects but skip the
-                                    // param-type re-check.
-                                    if (dispatched_concrete and idx == 0) continue;
                                     if (idx < signature.params.len) {
                                         const expected = signature.params[idx];
                                         if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.callMatchCost(arg_type, expected) == null) {
@@ -6623,67 +6494,6 @@ test "protocol dispatch accepts exact protocol constraint receiver" {
     var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
-
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
-    defer checker.deinit();
-    try checker.checkProgram(&program);
-
-    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
-}
-
-test "protocol dispatch accepts a first-class Type-value receiver naming an impl target" {
-    // A memory-manager-style adapter: a fieldless struct selected as a
-    // first-class `Type` value (the canonical form per the Memory
-    // Manager ABI — `manifest.zap` carries `memory :: Type =
-    // Memory.ARC`). `Protocol.method(typeValue)` must resolve the
-    // `impl Protocol for ThatStruct`, both when the Type value is
-    // passed directly and when it flows through a simple local binding.
-    const source =
-        \\pub struct Type {
-        \\  name :: Atom
-        \\}
-        \\
-        \\pub protocol Backend {
-        \\  fn bind(manager) -> Bool
-        \\}
-        \\
-        \\pub struct ARC {
-        \\}
-        \\
-        \\pub impl Backend for ARC {
-        \\  pub fn bind(manager :: ARC) -> Bool {
-        \\    true
-        \\  }
-        \\}
-        \\
-        \\pub struct Test {
-        \\  pub fn through_binding() -> Bool {
-        \\    adapter = ARC
-        \\    Backend.bind(adapter)
-        \\  }
-        \\
-        \\  pub fn direct() -> Bool {
-        \\    Backend.bind(ARC)
-        \\  }
-        \\}
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var parser = Parser.init(alloc, source);
-    defer parser.deinit();
-    const program = try parser.parseProgram();
-
-    var collector = Collector.init(alloc, parser.interner, null);
-    defer collector.deinit();
-    try collector.collectProgram(&program);
-    // Mirror the real compile pipeline (`compiler.zig`): impl methods
-    // are wired into their target struct's scope by a dedicated pass
-    // that runs before type-checking. Without it `Backend.bind` on the
-    // concrete `ARC` impl cannot resolve.
-    try collector.registerImplFunctionsInTargetScopes();
 
     var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();

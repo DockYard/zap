@@ -31,15 +31,12 @@ pub struct Memory.Arena {
 }
 
 @doc = """
-  `Memory.Manager` adapter implementation for `Memory.Arena`.
+  `Memory.Manager` conformance marker for `Memory.Arena`.
+
+  The protocol declares no methods; this empty impl marks
+  `Memory.Arena` as a selectable memory manager. The compiler resolves
+  the Arena primitive backend from this adapter's declaring source
+  file.
   """
 
-pub impl Memory.Manager for Memory.Arena {
-  @doc = """
-    Binds the Arena manager type to its primitive backend.
-    """
-
-  pub fn backend(manager :: Memory.Arena) -> Bool {
-    :zig.Memory.backend(manager)
-  }
-}
+pub impl Memory.Manager for Memory.Arena {}

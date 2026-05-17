@@ -490,11 +490,6 @@ pub const CtDependency = union(enum) {
     },
 };
 
-pub const MemoryBackendBinding = struct {
-    manager_type_name: []const u8,
-    adapter_source_path: ?[]const u8 = null,
-};
-
 pub const CtEvalResult = struct {
     value: ConstValue,
     dependencies: []const CtDependency,
@@ -1228,7 +1223,6 @@ pub const Interpreter = struct {
     build_opts: std.StringHashMapUnmanaged([]const u8) = .empty,
     compile_options_hash: u64 = 0,
     current_attribute_context: ?CtfeError.AttributeContext = null,
-    memory_backend_binding: ?MemoryBackendBinding = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1251,7 +1245,6 @@ pub const Interpreter = struct {
             .interner = null,
             .current_struct_scope = null,
             .current_attribute_context = null,
-            .memory_backend_binding = null,
         };
         // Build name -> id index (use func.id, NOT array index)
         for (program.functions) |func| {
@@ -1261,7 +1254,6 @@ pub const Interpreter = struct {
     }
 
     pub fn deinit(self: *Interpreter) void {
-        self.clearMemoryBackendBinding();
         self.function_by_name.deinit(self.allocator);
         self.dependencies.deinit(self.allocator);
         self.call_stack.deinit(self.allocator);
@@ -1274,14 +1266,6 @@ pub const Interpreter = struct {
         self.errors.deinit(self.allocator);
         self.memo_cache.deinit(self.allocator);
         self.allocation_store.deinit(self.allocator);
-    }
-
-    pub fn clearMemoryBackendBinding(self: *Interpreter) void {
-        if (self.memory_backend_binding) |binding| {
-            self.allocator.free(binding.manager_type_name);
-            if (binding.adapter_source_path) |path| self.allocator.free(path);
-        }
-        self.memory_backend_binding = null;
     }
 
     /// Evaluate a function by ID with given arguments.
@@ -2930,12 +2914,6 @@ pub const Interpreter = struct {
             return self.builtinMapGet(args);
         }
 
-        if (std.mem.eql(u8, cb.name, "Memory.backend") or
-            std.mem.eql(u8, cb.name, ":zig.Memory.backend"))
-        {
-            return self.builtinMemoryBackend(args, frame);
-        }
-
         // File read intrinsic
         if (std.mem.eql(u8, cb.name, "File.read") or
             std.mem.endsWith(u8, cb.name, "__File__read") or
@@ -3081,98 +3059,6 @@ pub const Interpreter = struct {
             }
         }
         return default_value;
-    }
-
-    fn builtinMemoryBackend(self: *Interpreter, args: []const CtValue, frame: *const Frame) CtfeInterpretError!CtValue {
-        if (!self.capabilities.has(.reflect_source)) {
-            try self.emitError(.capability_violation, "Memory.backend requires build-time source reflection");
-            return error.CtfeFailure;
-        }
-        if (args.len != 1) {
-            try self.emitError(.type_error, "Memory.backend expects 1 manager argument");
-            return error.CtfeFailure;
-        }
-
-        const manager_type_name = try self.memoryManagerTypeName(args[0]);
-        errdefer self.allocator.free(manager_type_name);
-        const source_path = try self.memoryBackendCallSourcePath(frame, manager_type_name);
-        errdefer if (source_path) |path| self.allocator.free(path);
-
-        self.clearMemoryBackendBinding();
-        self.memory_backend_binding = .{
-            .manager_type_name = manager_type_name,
-            .adapter_source_path = source_path,
-        };
-        return .{ .bool_val = true };
-    }
-
-    fn memoryManagerTypeName(self: *Interpreter, value: CtValue) CtfeInterpretError![]const u8 {
-        return switch (value) {
-            .struct_val => |struct_value| self.allocator.dupe(u8, struct_value.type_name) catch return error.OutOfMemory,
-            .atom => |atom_name| self.allocator.dupe(u8, atom_name) catch return error.OutOfMemory,
-            .string => |string_name| self.allocator.dupe(u8, string_name) catch return error.OutOfMemory,
-            .tuple => |tuple_value| self.memoryManagerTypeNameFromAliasTuple(tuple_value.elems),
-            else => {
-                try self.emitError(.type_error, "Memory.backend expects a manager type or manager struct value");
-                return error.CtfeFailure;
-            },
-        };
-    }
-
-    fn memoryManagerTypeNameFromAliasTuple(self: *Interpreter, elems: []const CtValue) CtfeInterpretError![]const u8 {
-        if (elems.len != 3 or elems[0] != .atom or !std.mem.eql(u8, elems[0].atom, "__aliases__") or elems[2] != .list) {
-            try self.emitError(.type_error, "Memory.backend expected a manager type alias tuple");
-            return error.CtfeFailure;
-        }
-
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer out.deinit(self.allocator);
-        for (elems[2].list.elems, 0..) |part_value, part_index| {
-            if (part_value != .atom) {
-                try self.emitError(.type_error, "Memory.backend manager alias contains a non-atom segment");
-                return error.CtfeFailure;
-            }
-            if (part_index > 0) try out.append(self.allocator, '.');
-            try out.appendSlice(self.allocator, part_value.atom);
-        }
-        return out.toOwnedSlice(self.allocator);
-    }
-
-    fn memoryBackendCallSourcePath(self: *Interpreter, frame: *const Frame, manager_type_name: []const u8) CtfeInterpretError!?[]const u8 {
-        const graph = self.scope_graph orelse return null;
-        const source_span = blk: {
-            if (self.call_stack.items.len > 0) {
-                if (self.call_stack.items[self.call_stack.items.len - 1].source_span) |span| break :blk span;
-            }
-            const func = for (self.program.functions) |*candidate| {
-                if (candidate.id == frame.function_id) break candidate;
-            } else return null;
-            break :blk self.resolveFunctionSourceSpan(func) orelse {
-                return self.memoryBackendImplSourcePath(manager_type_name);
-            };
-        };
-        const source_id = source_span.source_id orelse return null;
-        const path = graph.sourcePathById(source_id) orelse return null;
-        return self.allocator.dupe(u8, path) catch return error.OutOfMemory;
-    }
-
-    fn memoryBackendImplSourcePath(self: *Interpreter, manager_type_name: []const u8) CtfeInterpretError!?[]const u8 {
-        const graph = self.scope_graph orelse return null;
-        const current_interner = self.interner orelse return null;
-
-        for (graph.impls.items) |impl_entry| {
-            if (!structNameMatchesDottedCtfe(current_interner, impl_entry.protocol_name, "Memory.Manager")) continue;
-            if (!structNameMatchesDottedCtfe(current_interner, impl_entry.target_type, manager_type_name)) continue;
-            for (impl_entry.decl.functions) |function_decl| {
-                if (!std.mem.eql(u8, current_interner.get(function_decl.name), "backend")) continue;
-                if (function_decl.clauses.len == 0) return null;
-                const source_id = function_decl.clauses[0].meta.span.source_id orelse return null;
-                const path = graph.sourcePathById(source_id) orelse return null;
-                return self.allocator.dupe(u8, path) catch return error.OutOfMemory;
-            }
-        }
-
-        return null;
     }
 
     // --------------------------------------------------------
@@ -4145,27 +4031,6 @@ fn sourcePathsEqual(alloc: std.mem.Allocator, left: []const u8, right: []const u
     defer alloc.free(canonical_right);
 
     return std.mem.eql(u8, canonical_left, canonical_right);
-}
-
-fn structNameMatchesDottedCtfe(
-    interner: *const ast.StringInterner,
-    struct_name: ast.StructName,
-    dotted_name: []const u8,
-) bool {
-    var offset: usize = 0;
-    for (struct_name.parts, 0..) |part_id, part_index| {
-        if (part_index > 0) {
-            if (offset >= dotted_name.len or dotted_name[offset] != '.') return false;
-            offset += 1;
-        }
-
-        const part = interner.get(part_id);
-        if (offset + part.len > dotted_name.len) return false;
-        if (!std.mem.eql(u8, dotted_name[offset .. offset + part.len], part)) return false;
-        offset += part.len;
-    }
-
-    return offset == dotted_name.len;
 }
 
 fn normalizeSourcePath(path: []const u8) []const u8 {

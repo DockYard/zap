@@ -25,15 +25,11 @@ pub struct Memory.NoOp {
 }
 
 @doc = """
-  `Memory.Manager` adapter implementation for `Memory.NoOp`.
+  `Memory.Manager` conformance marker for `Memory.NoOp`.
+
+  The protocol declares no methods; this empty impl marks
+  `Memory.NoOp` as a selectable memory manager. The compiler resolves
+  the NoOp primitive backend from this adapter's declaring source file.
   """
 
-pub impl Memory.Manager for Memory.NoOp {
-  @doc = """
-    Binds the NoOp manager type to its primitive backend.
-    """
-
-  pub fn backend(manager :: Memory.NoOp) -> Bool {
-    :zig.Memory.backend(manager)
-  }
-}
+pub impl Memory.Manager for Memory.NoOp {}

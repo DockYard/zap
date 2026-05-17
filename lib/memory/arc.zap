@@ -36,15 +36,11 @@ pub struct Memory.ARC {
 }
 
 @doc = """
-  `Memory.Manager` adapter implementation for `Memory.ARC`.
+  `Memory.Manager` conformance marker for `Memory.ARC`.
+
+  The protocol declares no methods; this empty impl marks
+  `Memory.ARC` as a selectable memory manager. The compiler resolves
+  the ARC primitive backend from this adapter's declaring source file.
   """
 
-pub impl Memory.Manager for Memory.ARC {
-  @doc = """
-    Binds the ARC manager type to its primitive backend.
-    """
-
-  pub fn backend(manager :: Memory.ARC) -> Bool {
-    :zig.Memory.backend(manager)
-  }
-}
+pub impl Memory.Manager for Memory.ARC {}

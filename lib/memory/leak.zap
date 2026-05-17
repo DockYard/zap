@@ -47,15 +47,11 @@ pub struct Memory.Leak {
 }
 
 @doc = """
-  `Memory.Manager` adapter implementation for `Memory.Leak`.
+  `Memory.Manager` conformance marker for `Memory.Leak`.
+
+  The protocol declares no methods; this empty impl marks
+  `Memory.Leak` as a selectable memory manager. The compiler resolves
+  the Leak primitive backend from this adapter's declaring source file.
   """
 
-pub impl Memory.Manager for Memory.Leak {
-  @doc = """
-    Binds the Leak manager type to its primitive backend.
-    """
-
-  pub fn backend(manager :: Memory.Leak) -> Bool {
-    :zig.Memory.backend(manager)
-  }
-}
+pub impl Memory.Manager for Memory.Leak {}

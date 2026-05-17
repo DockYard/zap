@@ -1,28 +1,21 @@
 @doc = """
-  Adapter contract for Zap memory managers.
+  Conformance marker for Zap memory managers.
 
-  A memory manager adapter is a Zap-level value that binds a manager
-  type to the low-level primitive backend selected for a binary.
-  Stdlib managers and third-party managers use the same protocol:
-  the adapter calls the backend primitive for its own type, and the
-  compiler/runtime bridge binds the implementation from the adapter
-  method's package-owned backend source.
+  `Memory.Manager` is a zero-method protocol: it declares no methods
+  and carries no behavior. A manager type opts in purely by declaring
+  `impl Memory.Manager for X`, which marks `X` as a selectable memory
+  manager. Stdlib managers and third-party managers use the same
+  marker.
 
-  The adapter is intentionally independent of `Process`: future APIs
+  The primitive backend for a selected manager is resolved by the
+  compiler from the adapter's declaring source file via the package
+  convention — the adapter exposes no manager names, source paths, or
+  capability masks in Zap code. Because the protocol declares no
+  methods, conforming impls are empty.
+
+  The marker is intentionally independent of `Process`: future APIs
   such as per-process manager selection can accept values that implement
   this protocol without changing the adapter model.
   """
 
-pub protocol Memory.Manager {
-  @doc = """
-    Binds this manager type to its primitive backend.
-
-    Implementations should delegate directly to
-    `:zig.Memory.backend(manager)`. The backend primitive records the
-    selected manager type during build-time evaluation; no adapter
-    should expose manager names, source paths, or capability masks in
-    Zap code.
-    """
-
-  fn backend(manager) -> Bool
-}
+pub protocol Memory.Manager {}

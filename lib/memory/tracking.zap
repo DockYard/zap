@@ -62,15 +62,12 @@ pub struct Memory.Tracking {
 }
 
 @doc = """
-  `Memory.Manager` adapter implementation for `Memory.Tracking`.
+  `Memory.Manager` conformance marker for `Memory.Tracking`.
+
+  The protocol declares no methods; this empty impl marks
+  `Memory.Tracking` as a selectable memory manager. The compiler
+  resolves the Tracking primitive backend from this adapter's
+  declaring source file.
   """
 
-pub impl Memory.Manager for Memory.Tracking {
-  @doc = """
-    Binds the Tracking manager type to its primitive backend.
-    """
-
-  pub fn backend(manager :: Memory.Tracking) -> Bool {
-    :zig.Memory.backend(manager)
-  }
-}
+pub impl Memory.Manager for Memory.Tracking {}
