@@ -582,8 +582,8 @@ pub fn evaluateMemoryManagerAdapterFromSources(
     defer graph.deinit();
     if (!graph.struct_to_file.contains(selected.type_name)) return error.InvalidMemoryManagerAdapter;
 
-    var ctfe_source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
-    try appendDiscoveredSourceUnits(alloc, &ctfe_source_units, graph.topo_order.items, source_units, &graph);
+    var collect_source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+    try appendDiscoveredSourceUnits(alloc, &collect_source_units, graph.topo_order.items, source_units, &graph);
 
     var struct_order: std.ArrayListUnmanaged([]const u8) = .empty;
     defer struct_order.deinit(alloc);
@@ -593,34 +593,35 @@ pub fn evaluateMemoryManagerAdapterFromSources(
         }
     }
 
+    // The redesigned resolver derives the declaring `.zap` path
+    // directly from the parsed source graph. It only needs the parse
+    // + collect surface (which populates `scope_graph.impls` and
+    // registers source files); no HIR/IR lowering or CTFE interpreter
+    // is constructed here. `target_name`/`build_opts` no longer
+    // participate in adapter resolution — the active backend `.zig`
+    // content is still independently folded into the build cache key
+    // by `hashActiveManagerSource` (main.zig), so cache correctness is
+    // unchanged. They remain in the signature because every manifest
+    // entry path (build/run/test/doc/script/watch) routes through this
+    // unchanged caller signature.
+    _ = target_name;
+    _ = build_opts;
+
     var collect_options = compiler.CompileOptions{
         .show_progress = false,
     };
     collect_options.struct_order = struct_order.items;
     collect_options.level_boundaries = graph.level_boundaries.items;
 
-    var ctx = compiler.collectAllFromUnits(alloc, ctfe_source_units.items, collect_options) catch return error.CompileFailed;
-    const result = compiler.compileForCtfe(alloc, &ctx, .{
-        .show_progress = false,
-    }) catch return error.CompileFailed;
+    var ctx = compiler.collectAllFromUnits(alloc, collect_source_units.items, collect_options) catch return error.CompileFailed;
 
-    var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
-    defer interp.deinit();
-    interp.scope_graph = &ctx.collector.graph;
-    interp.interner = &ctx.interner;
-    interp.capabilities = zap.ctfe.CapabilitySet.build;
-    interp.build_opts = build_opts;
-    interp.compile_options_hash = zap.ctfe.hashCompileOptions(target_name, build_opts.get("optimize") orelse "release_safe");
-
-    const adapter_value = emptyMemoryManagerValue(selected.type_name);
-    return evaluateMemoryManagerAdapterValue(
+    const source_path = try resolveMemoryManagerBackendFromSourceGraph(
         alloc,
-        &interp,
         &ctx.collector.graph,
         &ctx.interner,
         selected.type_name,
-        adapter_value,
     );
+    return buildMemoryAdapterEval(alloc, selected.type_name, source_path);
 }
 
 fn discoverMemoryAdapterGraph(
@@ -751,54 +752,96 @@ fn memoryManagerSelectionFromManifest(
 
 fn evaluateMemoryManagerAdapter(
     alloc: std.mem.Allocator,
-    interp: *zap.ctfe.Interpreter,
     scope_graph: *const zap.scope.ScopeGraph,
     interner: *const zap.ast.StringInterner,
     manifest_value: zap.ctfe.ConstValue,
 ) !MemoryAdapterEval {
     const memory_type_value = findManifestField(manifest_value, "memory") orelse return .{ .manager = null };
     const adapter_type_name = try parseManifestMemoryType(alloc, memory_type_value);
-    const adapter_value = emptyMemoryManagerValue(adapter_type_name);
-    return evaluateMemoryManagerAdapterValue(alloc, interp, scope_graph, interner, adapter_type_name, adapter_value);
+    const source_path = try resolveMemoryManagerBackendFromSourceGraph(
+        alloc,
+        scope_graph,
+        interner,
+        adapter_type_name,
+    );
+    return buildMemoryAdapterEval(alloc, adapter_type_name, source_path);
 }
 
-fn emptyMemoryManagerValue(adapter_type_name: []const u8) zap.ctfe.ConstValue {
-    return zap.ctfe.ConstValue{ .struct_val = .{
-        .type_name = adapter_type_name,
-        .fields = &.{},
-    } };
-}
-
-fn evaluateMemoryManagerAdapterValue(
+/// Resolve the `.zap` file that declares the `impl Memory.Manager for
+/// <manager_type_name>` selected by the manifest, scanning the parsed
+/// source graph directly. This is both the conformance gate and the
+/// path resolver in a single pass over `scope_graph.impls` — there is
+/// no separate scan and no CTFE execution.
+///
+/// The redesigned `Memory.Manager` protocol declares no methods and
+/// adapters provide an empty `impl Memory.Manager for X {}`. The
+/// declaring file is derived from the impl DECL span's `source_id`,
+/// which the parser populates from the `impl`/`pub` keyword token
+/// regardless of whether the impl body is empty (see
+/// `Parser.parseImplDecl`: `meta.span = merge(start, ...)` where
+/// `start` is captured at the keyword). Per-`.zap`-file `source_id`
+/// is the unit index registered via `ScopeGraph.registerSourceFile`,
+/// so `sourcePathById` round-trips it back to the file path.
+///
+/// Returns `error.InvalidMemoryManagerAdapter` with a precise
+/// diagnostic when: (a) no `impl Memory.Manager for <X>` exists, (b)
+/// the matching impl decl span has no `source_id`, or (c) the
+/// `source_id` is not registered in the source graph.
+fn resolveMemoryManagerBackendFromSourceGraph(
     alloc: std.mem.Allocator,
-    interp: *zap.ctfe.Interpreter,
     scope_graph: *const zap.scope.ScopeGraph,
     interner: *const zap.ast.StringInterner,
-    adapter_type_name: []const u8,
-    adapter_value: zap.ctfe.ConstValue,
+    manager_type_name: []const u8,
+) ![]const u8 {
+    for (scope_graph.impls.items) |impl_entry| {
+        if (!structNameMatchesDotted(interner, impl_entry.protocol_name, "Memory.Manager")) continue;
+        if (!structNameMatchesDotted(interner, impl_entry.target_type, manager_type_name)) continue;
+
+        const source_id = impl_entry.decl.meta.span.source_id orelse {
+            std.debug.print(
+                "Error: memory manager '{s}' impl Memory.Manager has no source location\n",
+                .{manager_type_name},
+            );
+            return error.InvalidMemoryManagerAdapter;
+        };
+        const path = scope_graph.sourcePathById(source_id) orelse {
+            std.debug.print(
+                "Error: memory manager '{s}' impl Memory.Manager source file is not registered\n",
+                .{manager_type_name},
+            );
+            return error.InvalidMemoryManagerAdapter;
+        };
+        return alloc.dupe(u8, path);
+    }
+
+    std.debug.print(
+        "Error: memory manager '{s}' selected by manifest does not implement Memory.Manager\n",
+        .{manager_type_name},
+    );
+    return error.InvalidMemoryManagerAdapter;
+}
+
+/// Build the observable `MemoryAdapterEval` contract from the resolved
+/// manager type name and its declaring `.zap` path. `result_hash` is a
+/// stable Wyhash over `(type_name ++ resolved source path)` — the same
+/// `std.hash.Wyhash` approach the cache-key helpers use. It changes
+/// whenever the selected manager or its declaring file changes;
+/// backend `.zig` content changes are independently folded into the
+/// build cache key by `hashActiveManagerSource` (main.zig), so the
+/// combined cache key still invalidates on both axes.
+fn buildMemoryAdapterEval(
+    alloc: std.mem.Allocator,
+    manager_type_name: []const u8,
+    source_path: []const u8,
 ) !MemoryAdapterEval {
-    try requireMemoryManagerImpl(scope_graph, interner, adapter_type_name);
-
-    interp.clearMemoryBackendBinding();
-    const backend_eval = try evalAdapterFunction(alloc, interp, adapter_type_name, "backend", adapter_value);
-    const backend_called = switch (backend_eval.value) {
-        .bool_val => |value| value,
-        else => return error.InvalidMemoryManagerAdapter,
-    };
-    if (!backend_called) return error.InvalidMemoryManagerAdapter;
-
-    const backend_binding = interp.memory_backend_binding orelse return error.InvalidMemoryManagerAdapter;
-    if (!std.mem.eql(u8, backend_binding.manager_type_name, adapter_type_name)) return error.InvalidMemoryManagerAdapter;
-
     var hasher = std.hash.Wyhash.init(0);
-    hasher.update(std.mem.asBytes(&backend_eval.result_hash));
-    hasher.update(backend_binding.manager_type_name);
-    if (backend_binding.adapter_source_path) |source_path| hasher.update(source_path);
+    hasher.update(manager_type_name);
+    hasher.update(source_path);
 
     return .{
         .manager = .{
-            .type_name = try alloc.dupe(u8, backend_binding.manager_type_name),
-            .adapter_source_path = if (backend_binding.adapter_source_path) |source_path| try alloc.dupe(u8, source_path) else null,
+            .type_name = try alloc.dupe(u8, manager_type_name),
+            .adapter_source_path = source_path,
         },
         .result_hash = hasher.final(),
     };
@@ -815,20 +858,6 @@ fn buildEnvConst(target_name: []const u8) zap.ctfe.ConstValue {
             .{ .name = "arch", .value = .{ .atom = arch_name } },
         },
     } };
-}
-
-fn requireMemoryManagerImpl(
-    scope_graph: *const zap.scope.ScopeGraph,
-    interner: *const zap.ast.StringInterner,
-    adapter_type_name: []const u8,
-) !void {
-    for (scope_graph.impls.items) |impl_entry| {
-        if (!structNameMatchesDotted(interner, impl_entry.protocol_name, "Memory.Manager")) continue;
-        if (!structNameMatchesDotted(interner, impl_entry.target_type, adapter_type_name)) continue;
-        return;
-    }
-
-    return error.InvalidMemoryManagerAdapter;
 }
 
 fn structNameMatchesDotted(
@@ -867,32 +896,6 @@ fn findConstStructField(
         if (std.mem.eql(u8, field.name, field_name)) return field.value;
     }
     return null;
-}
-
-fn evalAdapterFunction(
-    alloc: std.mem.Allocator,
-    interp: *zap.ctfe.Interpreter,
-    adapter_type_name: []const u8,
-    method_name: []const u8,
-    adapter_value: zap.ctfe.ConstValue,
-) !zap.ctfe.CtEvalResult {
-    const function_name = try adapterFunctionName(alloc, adapter_type_name, method_name);
-    const function_id = interp.function_by_name.get(function_name) orelse return error.InvalidMemoryManagerAdapter;
-    return interp.evalAndExport(function_id, &.{adapter_value}, zap.ctfe.CapabilitySet.build) catch return error.InvalidMemoryManagerAdapter;
-}
-
-fn adapterFunctionName(
-    alloc: std.mem.Allocator,
-    adapter_type_name: []const u8,
-    method_name: []const u8,
-) ![]const u8 {
-    var prefix = std.ArrayListUnmanaged(u8).empty;
-    defer prefix.deinit(alloc);
-    for (adapter_type_name) |char| {
-        try prefix.append(alloc, if (char == '.') '_' else char);
-    }
-    const mangled_method_name = try zap.ir.mangleSymbolForZig(alloc, method_name);
-    return std.fmt.allocPrint(alloc, "{s}__{s}__1", .{ prefix.items, mangled_method_name });
 }
 
 pub fn hashManifestWithMemoryAdapter(manifest_hash: u64, memory_adapter_hash: u64) u64 {
@@ -1540,25 +1543,18 @@ test "ctfe manifest evaluates third-party Memory.Manager backend through protoco
         \\}
         \\
         \\pub protocol Memory.Manager {
-        \\  fn backend(manager) -> Bool
         \\}
         \\
         \\pub struct Memory.ARC {
         \\}
         \\
         \\pub impl Memory.Manager for Memory.ARC {
-        \\  pub fn backend(manager :: Memory.ARC) -> Bool {
-        \\    :zig.Memory.backend(manager)
-        \\  }
         \\}
         \\
         \\pub struct ThirdParty.ProjectArena {
         \\}
         \\
         \\pub impl Memory.Manager for ThirdParty.ProjectArena {
-        \\  pub fn backend(manager :: ThirdParty.ProjectArena) -> Bool {
-        \\    :zig.Memory.backend(manager)
-        \\  }
         \\}
         \\
         \\pub struct Zap.Env {
@@ -1606,7 +1602,6 @@ test "ctfe manifest evaluates third-party Memory.Manager backend through protoco
     var config = try constValueToBuildConfig(alloc, manifest_result.value);
     const memory_eval = try evaluateMemoryManagerAdapter(
         alloc,
-        &interp,
         &ctx.collector.graph,
         &ctx.interner,
         manifest_result.value,
@@ -1620,20 +1615,19 @@ test "ctfe manifest evaluates third-party Memory.Manager backend through protoco
     try testing.expectEqualStrings("build.zap", config.memory_manager.?.adapter_source_path.?);
 }
 
-test "ctfe manifest rejects backend methods without Memory.Manager impl" {
+test "ctfe manifest rejects manager without Memory.Manager impl" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
+    // Under the redesign there is no `backend` method to inspect; a
+    // struct that simply never declares `impl Memory.Manager for it`
+    // must be rejected by the resolver's conformance gate.
     const source =
         \\pub protocol Memory.Manager {
-        \\  fn backend(manager) -> Bool
         \\}
         \\
         \\pub struct FakeManager {
-        \\  pub fn backend(manager :: FakeManager) -> Bool {
-        \\    :zig.Memory.backend(manager)
-        \\  }
         \\}
     ;
 
@@ -1642,13 +1636,6 @@ test "ctfe manifest rejects backend methods without Memory.Manager impl" {
     };
 
     var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
-    const result = try compiler.compileForCtfe(alloc, &ctx, .{ .show_progress = false });
-
-    var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
-    defer interp.deinit();
-    interp.scope_graph = &ctx.collector.graph;
-    interp.interner = &ctx.interner;
-    interp.capabilities = zap.ctfe.CapabilitySet.build;
 
     const manifest_value = zap.ctfe.ConstValue{ .struct_val = .{
         .type_name = "Zap.Manifest",
@@ -1665,7 +1652,6 @@ test "ctfe manifest rejects backend methods without Memory.Manager impl" {
         error.InvalidMemoryManagerAdapter,
         evaluateMemoryManagerAdapter(
             alloc,
-            &interp,
             &ctx.collector.graph,
             &ctx.interner,
             manifest_value,
@@ -1684,16 +1670,12 @@ test "ctfe manifest evaluates default Memory.Manager backend when memory omitted
         \\}
         \\
         \\pub protocol Memory.Manager {
-        \\  fn backend(manager) -> Bool
         \\}
         \\
         \\pub struct Memory.ARC {
         \\}
         \\
         \\pub impl Memory.Manager for Memory.ARC {
-        \\  pub fn backend(manager :: Memory.ARC) -> Bool {
-        \\    :zig.Memory.backend(manager)
-        \\  }
         \\}
         \\
         \\pub struct Zap.Env {
@@ -1740,7 +1722,6 @@ test "ctfe manifest evaluates default Memory.Manager backend when memory omitted
     var config = try constValueToBuildConfig(alloc, manifest_result.value);
     const memory_eval = try evaluateMemoryManagerAdapter(
         alloc,
-        &interp,
         &ctx.collector.graph,
         &ctx.interner,
         manifest_result.value,
@@ -1781,6 +1762,17 @@ test "memory adapter source evaluation ignores unrelated project sources" {
 
     try tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/third_party");
 
+    // This test routes through `evaluateMemoryManagerAdapterFromSources`
+    // with the real Zap stdlib in `source_roots`, so collection runs
+    // `validateImplConformance` against the real Phase-2
+    // `lib/memory/manager.zap` protocol, which still declares
+    // `fn backend(manager) -> Bool` (Phase 3 removes it). The redesigned
+    // resolver keys off the impl DECL span and *ignores* `backend/1`, so
+    // a Phase-2-conformant impl resolves to the exact same path an empty
+    // impl would. The GAP-D empty-impl migration applies to the CTFE
+    // fixtures that synthesize their own empty protocol; fixtures
+    // compiled against the unchanged real stdlib must stay conformant
+    // until Phase 3 removes `backend/1` from the stdlib protocol.
     const manager_source =
         \\pub struct ThirdParty.ProjectArena {
         \\}
@@ -1837,6 +1829,107 @@ test "memory adapter source evaluation ignores unrelated project sources" {
     try testing.expect(memory_eval.manager != null);
     try testing.expectEqualStrings("ThirdParty.ProjectArena", memory_eval.manager.?.type_name);
     try testing.expectEqualStrings(manager_path, memory_eval.manager.?.adapter_source_path.?);
+}
+
+test "resolveMemoryManagerBackendFromSourceGraph resolves default Memory.ARC empty impl" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub protocol Memory.Manager {
+        \\}
+        \\
+        \\pub struct Memory.ARC {
+        \\}
+        \\
+        \\pub impl Memory.Manager for Memory.ARC {
+        \\}
+    ;
+    var source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "lib/memory/arc.zap", .source = source },
+    };
+
+    var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+
+    const resolved = try resolveMemoryManagerBackendFromSourceGraph(
+        alloc,
+        &ctx.collector.graph,
+        &ctx.interner,
+        "Memory.ARC",
+    );
+    try testing.expectEqualStrings("lib/memory/arc.zap", resolved);
+}
+
+test "resolveMemoryManagerBackendFromSourceGraph resolves explicitly selected manager" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub protocol Memory.Manager {
+        \\}
+        \\
+        \\pub struct Memory.ARC {
+        \\}
+        \\
+        \\pub impl Memory.Manager for Memory.ARC {
+        \\}
+        \\
+        \\pub struct ThirdParty.ProjectArena {
+        \\}
+        \\
+        \\pub impl Memory.Manager for ThirdParty.ProjectArena {
+        \\}
+    ;
+    var source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "build.zap", .source = source },
+    };
+
+    var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+
+    const resolved = try resolveMemoryManagerBackendFromSourceGraph(
+        alloc,
+        &ctx.collector.graph,
+        &ctx.interner,
+        "ThirdParty.ProjectArena",
+    );
+    try testing.expectEqualStrings("build.zap", resolved);
+}
+
+test "resolveMemoryManagerBackendFromSourceGraph rejects manager with no conforming impl" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub protocol Memory.Manager {
+        \\}
+        \\
+        \\pub struct Memory.ARC {
+        \\}
+        \\
+        \\pub impl Memory.Manager for Memory.ARC {
+        \\}
+        \\
+        \\pub struct NotAManager {
+        \\}
+    ;
+    var source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "build.zap", .source = source },
+    };
+
+    var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+
+    try testing.expectError(
+        error.InvalidMemoryManagerAdapter,
+        resolveMemoryManagerBackendFromSourceGraph(
+            alloc,
+            &ctx.collector.graph,
+            &ctx.interner,
+            "NotAManager",
+        ),
+    );
 }
 
 test "constValueToBuildConfig leaves memory: null when omitted" {

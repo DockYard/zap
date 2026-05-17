@@ -533,6 +533,13 @@ test "ZIR memory manager: project-local third-party adapter builds and runs" {
         \\}
     ;
 
+    // Full build+run against the real Zap stdlib: collection validates
+    // this impl against the unchanged Phase-2 `lib/memory/manager.zap`
+    // protocol, which still declares `fn backend`. The redesigned
+    // resolver keys off the impl DECL span and ignores `backend/1`, so a
+    // Phase-2-conformant impl resolves identically to an empty one.
+    // Phase 3 removes `backend/1` from the stdlib protocol; only then
+    // can this fixture become the empty-impl marker form.
     const adapter_source =
         \\pub struct ThirdParty.ProjectArena {
         \\}
@@ -586,6 +593,10 @@ test "ZIR memory manager: dependency third-party adapter builds and runs" {
         \\}
     ;
 
+    // Full build+run against the real Zap stdlib: see the project-local
+    // adapter test above — the Phase-2 stdlib protocol still declares
+    // `fn backend`, and the redesigned resolver ignores `backend/1`, so
+    // this stays conformant until Phase 3 removes it.
     const adapter_source =
         \\pub struct ThirdParty.DepArena {
         \\}
