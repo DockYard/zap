@@ -6237,57 +6237,66 @@ pub const AtomTable = struct {
 // Global Atom Table — process-wide interned atom registry
 // ============================================================
 
-// Simple atom table using fixed-size arrays to avoid std.HashMap/ArrayList
-// which require operations not yet implemented in the Zig self-hosted backend.
-const MAX_ATOMS = 256;
-const MAX_ATOM_NAME_LEN = 64;
-
-var atom_names: [MAX_ATOMS][MAX_ATOM_NAME_LEN]u8 = undefined;
-var atom_lengths: [MAX_ATOMS]u32 = [_]u32{0} ** MAX_ATOMS;
-var atom_count: u32 = 0;
+// Dynamic, length-safe atom table. Atoms are interned write-once for
+// the whole process lifetime, so names live in `runtime_arena` (never
+// individually freed) and the id->name index grows without a fixed
+// cap.
+//
+// This replaces a former fixed `[256][64]u8` / `[256]u32` design whose
+// `@memcpy(atom_names[id][0..len], name)` had NO bound on `len` against
+// the 64-byte row: any interned atom name longer than 64 bytes
+// silently overran the row into adjacent merged globals — including the
+// C allocator's bookkeeping — so the next `malloc` aborted with no
+// output. Larger programs intern more and longer (fully-qualified
+// struct/test/signature) names, which is why the crash was build-size
+// dependent. The 256-atom cap was a second defect (it silently
+// returned atom 0 once exceeded). Both are removed here: names are of
+// arbitrary length and the table is unbounded. `std.ArrayListUnmanaged`
+// + the arena are already used elsewhere in this runtime, so the old
+// "avoid std containers" rationale no longer applies.
+var atom_table: std.ArrayListUnmanaged([]const u8) = .empty;
 var atom_table_initialized: bool = false;
+
+fn atomAllocator() std.mem.Allocator {
+    return runtime_arena.allocator();
+}
 
 fn initAtomTable() void {
     if (atom_table_initialized) return;
-    // Register well-known atoms
+    atom_table_initialized = true;
+    // Well-known atoms occupy ids 0..7 in this exact order (callers and
+    // emitted code depend on the assignment being sequential and
+    // stable). These are static string literals with process lifetime,
+    // so the literal slice is stored directly — no dup needed.
     const builtins = [_][]const u8{ "nil", "true", "false", "ok", "error", "cont", "halt", "done" };
     for (builtins) |name| {
-        const id = atom_count;
-        const len: u32 = @intCast(name.len);
-        @memcpy(atom_names[id][0..len], name);
-        atom_lengths[id] = len;
-        atom_count += 1;
+        atom_table.append(atomAllocator(), name) catch {};
     }
-    atom_table_initialized = true;
 }
 
-/// Intern a string as an atom. Returns the atom's u32 ID.
+/// Intern a string as an atom. Returns the atom's u32 ID. Atom names
+/// may be of any length. Returns 0 only on genuine allocation failure
+/// (preserving the historical non-erroring contract).
 pub fn atomIntern(name: [*]const u8, len: u32) u32 {
     initAtomTable();
     const name_slice = name[0..len];
-    // Search existing atoms
-    var i: u32 = 0;
-    while (i < atom_count) : (i += 1) {
-        if (atom_lengths[i] == len) {
-            if (std.mem.eql(u8, atom_names[i][0..len], name_slice)) {
-                return i;
-            }
+    for (atom_table.items, 0..) |existing, idx| {
+        if (existing.len == len and std.mem.eql(u8, existing, name_slice)) {
+            return @intCast(idx);
         }
     }
-    // New atom
-    if (atom_count >= MAX_ATOMS) return 0;
-    const id = atom_count;
-    @memcpy(atom_names[id][0..len], name_slice);
-    atom_lengths[id] = len;
-    atom_count += 1;
-    return id;
+    // New atom: dup the name into the process-lifetime arena (the
+    // caller's `name` may be transient) and append it.
+    const owned = atomAllocator().dupe(u8, name_slice) catch return 0;
+    atom_table.append(atomAllocator(), owned) catch return 0;
+    return @intCast(atom_table.items.len - 1);
 }
 
 /// Get the string name of an atom by its u32 ID.
 pub fn atomToString(id: u32) []const u8 {
     initAtomTable();
-    if (id < atom_count) {
-        return atom_names[id][0..atom_lengths[id]];
+    if (id < atom_table.items.len) {
+        return atom_table.items[id];
     }
     return "<unknown_atom>";
 }
@@ -6446,12 +6455,9 @@ pub const String = struct {
     /// if the atom has not been previously interned.
     pub fn to_existing_atom(name: []const u8) u32 {
         initAtomTable();
-        var i: u32 = 0;
-        while (i < atom_count) : (i += 1) {
-            if (atom_lengths[i] == name.len) {
-                if (std.mem.eql(u8, atom_names[i][0..name.len], name)) {
-                    return i;
-                }
+        for (atom_table.items, 0..) |existing, idx| {
+            if (existing.len == name.len and std.mem.eql(u8, existing, name)) {
+                return @intCast(idx);
             }
         }
         return 0xFFFFFFFF;
