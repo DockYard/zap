@@ -5160,6 +5160,178 @@ test "CLI manifest: no -D flags keeps the manifest values (regression)" {
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "manifest-marker=abc") != null);
 }
 
+// ---- stdlib manager selection matrix (build pipeline) -------------
+// Build-time replacement for the deleted runtime
+// `Memory.Manager.backend(...)` Zest cases
+// (`test/zap/memory_manager_test.zap` and the WIP
+// `test/zap/memory/manager_test.zap`). Backend resolution is a
+// build-time concern — Phase 3 removed the runtime `backend/1`
+// mechanism — so the architecturally-correct surface is the build
+// pipeline against the REAL stdlib `lib/memory/<x>.zap` adapter and
+// `src/memory/<x>/manager.zig` backend.
+//
+// The deleted .zap cases only ever asserted `backend(X) == true` for
+// ARC, Arena, Leak, Tracking, NoOp. This matrix is strictly stronger:
+// for each of those five managers AND the default/omitted case it
+// drives a real end-to-end build (CTFE manifest -> source-graph
+// resolve -> compile the real backend -> validate `.zapmem` ->
+// thread `declared_caps` -> link) and then RUNS the produced binary,
+// asserting it executes correctly. The companion
+// `src/builder.zig` resolver matrix asserts the
+// selection -> backend-source -> REFCOUNT_V1-caps invariant per
+// manager; together they cover strictly more than the removed runtime
+// assertion (which never built or ran anything).
+
+/// Build+run a tmp project whose `build.zap` either sets
+/// `memory: <manifest_memory>` (when non-null) or OMITS the field
+/// entirely (when null, exercising the default `Memory.ARC` path).
+/// Returns the produced binary's captured stdout/stderr/exit.
+fn runManifestMemoryProject(
+    allocator: std.mem.Allocator,
+    manifest_memory: ?[]const u8,
+) TestError!ManifestRunResult {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
+
+    const memory_line = if (manifest_memory) |m|
+        std.fmt.allocPrint(allocator, "          memory: {s},\n", .{m}) catch return error.OutOfMemory
+    else
+        allocator.dupe(u8, "") catch return error.OutOfMemory;
+    defer allocator.free(memory_line);
+
+    const build_source = std.fmt.allocPrint(allocator,
+        \\pub struct Cli.Builder {{
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {{
+        \\    case env.target {{
+        \\      :cli ->
+        \\        %Zap.Manifest{{
+        \\          name: "cli",
+        \\          version: "0.1.0",
+        \\          kind: :bin,
+        \\          root: &Cli.main/1,
+        \\{s}          paths: ["lib/**/*.zap"]
+        \\        }}
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }}
+        \\  }}
+        \\}}
+    , .{memory_line}) catch return error.OutOfMemory;
+    defer allocator.free(build_source);
+
+    const prog_source =
+        \\pub struct Cli {
+        \\  pub fn main(_args :: [String]) -> u8 {
+        \\    s = "m" <> "a" <> "n"
+        \\    IO.puts("manager-marker=" <> s)
+        \\    "ok"
+        \\    0
+        \\  }
+        \\}
+    ;
+
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch
+        return error.Unexpected;
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/cli.zap", .data = prog_source }) catch
+        return error.Unexpected;
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const repo_lib = try resolveRepoStdlibDir(allocator);
+    defer allocator.free(repo_lib);
+
+    const zap_binary = try resolveZapBinary(allocator);
+    defer allocator.free(zap_binary);
+
+    var env_map = std.testing.environ.createMap(allocator) catch return error.Unexpected;
+    defer env_map.deinit();
+    _ = env_map.swapRemove("ZAP_LIB_DIR");
+    env_map.put("ZAP_LIB_DIR", repo_lib) catch return error.OutOfMemory;
+
+    const build_result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ zap_binary, "build", "cli" },
+        .cwd = .{ .path = tmp_dir_path },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.RunFailed;
+    allocator.free(build_result.stdout);
+    defer allocator.free(build_result.stderr);
+
+    const build_exit: u8 = switch (build_result.term) {
+        .exited => |code| code,
+        else => 255,
+    };
+    if (build_exit != 0) {
+        return .{
+            .stdout = allocator.dupe(u8, "") catch return error.OutOfMemory,
+            .stderr = allocator.dupe(u8, build_result.stderr) catch return error.OutOfMemory,
+            .exit_code = build_exit,
+            .allocator = allocator,
+        };
+    }
+
+    const bin_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out/bin/cli", allocator) catch
+        return error.CompilationFailed;
+    defer allocator.free(bin_path);
+
+    const run = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{bin_path},
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.RunFailed;
+
+    return .{
+        .stdout = run.stdout,
+        .stderr = run.stderr,
+        .exit_code = switch (run.term) {
+            .exited => |c| c,
+            else => 255,
+        },
+        .allocator = allocator,
+    };
+}
+
+test "stdlib manager matrix: each manager + default builds the real backend and runs" {
+    const allocator = std.testing.allocator;
+
+    // Exactly the managers the deleted runtime Zest cases targeted,
+    // plus the default/omitted case. `null` => `memory:` omitted from
+    // the manifest, exercising the default `Memory.ARC` resolution.
+    const cases = [_]?[]const u8{
+        null,
+        "Memory.ARC",
+        "Memory.Arena",
+        "Memory.Leak",
+        "Memory.Tracking",
+        "Memory.NoOp",
+    };
+
+    inline for (cases) |manifest_memory| {
+        var r = try runManifestMemoryProject(allocator, manifest_memory);
+        defer r.deinit();
+
+        // Selection -> backend -> link -> run end-to-end: a non-zero
+        // exit here means the real `lib/memory/<x>.zap` adapter failed
+        // to resolve, the real `src/memory/<x>/manager.zig` backend
+        // failed to compile, the `.zapmem` section failed validation,
+        // or the linked binary crashed. The deleted runtime assertion
+        // could not catch any of these.
+        if (r.exit_code != 0) {
+            std.debug.print(
+                "manager case {s} failed: exit={d}\nstderr:\n{s}\n",
+                .{ manifest_memory orelse "<default>", r.exit_code, r.stderr },
+            );
+        }
+        try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, r.stdout, "manager-marker=man") != null);
+    }
+}
+
 // ---- target / cpu scenarios ---------------------------------------
 
 test "CLI script: native default when neither manifest nor -Dtarget set" {

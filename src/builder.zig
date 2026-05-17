@@ -1925,6 +1925,195 @@ test "resolveMemoryManagerBackendFromSourceGraph rejects manager with no conform
     );
 }
 
+// ---------------------------------------------------------------------------
+// Stdlib manager selection matrix.
+//
+// This is the build-time replacement for the deleted runtime
+// `Memory.Manager.backend(...)` Zest cases (`test/zap/memory_manager_test.zap`
+// and the WIP `test/zap/memory/manager_test.zap`). Backend resolution is a
+// build-time concern (Phase 3 removed the runtime `backend/1` mechanism), so
+// the correct surface is the source-graph resolver plus the real stdlib
+// adapter/backend files — not a runtime protocol call.
+//
+// The deleted .zap cases only ever asserted `backend(X) == true` for ARC,
+// Arena, Leak, Tracking, NoOp. This matrix is strictly stronger: for each of
+// those five managers it asserts the REAL `lib/memory/<x>.zap` adapter
+// resolves through `resolveMemoryManagerBackendFromSourceGraph` to that
+// adapter's own source file (selection -> backend source), AND that the
+// REAL `src/memory/<x>/manager.zig` backend declares `REFCOUNT_V1` iff the
+// manager is `Memory.ARC` (selection -> backend -> caps). It also covers the
+// default/omitted case (`Memory.ARC`).
+
+// Backend `.zig` sources live inside this module's package (`src/`),
+// so `@embedFile` binds the test directly to the real production
+// source the build driver compiles for each manager.
+const REAL_ARC_BACKEND_SOURCE = @embedFile("memory/arc/manager.zig");
+const REAL_ARENA_BACKEND_SOURCE = @embedFile("memory/arena/manager.zig");
+const REAL_LEAK_BACKEND_SOURCE = @embedFile("memory/leak/manager.zig");
+const REAL_TRACKING_BACKEND_SOURCE = @embedFile("memory/tracking/manager.zig");
+const REAL_NO_OP_BACKEND_SOURCE = @embedFile("memory/no_op/manager.zig");
+
+const StdlibManagerCase = struct {
+    /// Manager type as it appears in `Zap.Manifest.memory`.
+    type_name: []const u8,
+    /// Workspace-relative path of the real adapter `.zap` source. The
+    /// real file is read from disk at test time (cwd is the repo root
+    /// during `zig build test`); adapter `.zap` files live outside this
+    /// module's package so `@embedFile` cannot reach them.
+    adapter_path: []const u8,
+    /// Real backend source embedded from `src/memory/<x>/manager.zig`.
+    backend_source: []const u8,
+    /// Whether the real backend declares the `REFCOUNT_V1` capability.
+    /// True only for `Memory.ARC`; the other four declare none.
+    declares_refcount: bool,
+};
+
+const stdlib_manager_matrix = [_]StdlibManagerCase{
+    .{
+        .type_name = "Memory.ARC",
+        .adapter_path = "lib/memory/arc.zap",
+        .backend_source = REAL_ARC_BACKEND_SOURCE,
+        .declares_refcount = true,
+    },
+    .{
+        .type_name = "Memory.Arena",
+        .adapter_path = "lib/memory/arena.zap",
+        .backend_source = REAL_ARENA_BACKEND_SOURCE,
+        .declares_refcount = false,
+    },
+    .{
+        .type_name = "Memory.Leak",
+        .adapter_path = "lib/memory/leak.zap",
+        .backend_source = REAL_LEAK_BACKEND_SOURCE,
+        .declares_refcount = false,
+    },
+    .{
+        .type_name = "Memory.Tracking",
+        .adapter_path = "lib/memory/tracking.zap",
+        .backend_source = REAL_TRACKING_BACKEND_SOURCE,
+        .declares_refcount = false,
+    },
+    .{
+        .type_name = "Memory.NoOp",
+        .adapter_path = "lib/memory/no_op.zap",
+        .backend_source = REAL_NO_OP_BACKEND_SOURCE,
+        .declares_refcount = false,
+    },
+};
+
+/// Read a workspace-relative file from disk. During `zig build test`
+/// the cwd is the repo root, so `lib/memory/<x>.zap` resolves to the
+/// real production adapter source — the same file collection sees in a
+/// real build. This is the established builder-test file-read pattern
+/// (see the `.zap-cache` recall helpers above).
+fn readWorkspaceFile(alloc: std.mem.Allocator, rel_path: []const u8) ![]const u8 {
+    return std.Io.Dir.cwd().readFileAlloc(
+        std.Options.debug_io,
+        rel_path,
+        alloc,
+        .limited(10 * 1024 * 1024),
+    );
+}
+
+/// True iff the real backend source declares the `REFCOUNT_V1`
+/// capability bit in its `ZapMemoryManagerMetaV1.declared_caps`. ARC
+/// declares `CAP_REFCOUNT_V1_BIT`; the other four set `declared_caps = 0`.
+/// Asserting against the embedded backend text keeps the invariant tied
+/// to the real source the build driver compiles, not a restated copy.
+fn realBackendDeclaresRefcount(backend_source: []const u8) bool {
+    const declares_bit =
+        std.mem.indexOf(u8, backend_source, ".declared_caps = CAP_REFCOUNT_V1_BIT") != null;
+    const declares_zero =
+        std.mem.indexOf(u8, backend_source, ".declared_caps = 0") != null;
+    // Exactly one of the two forms must appear so a future refactor that
+    // changes the constant name fails loudly instead of silently
+    // mis-classifying the manager.
+    std.debug.assert(declares_bit != declares_zero);
+    return declares_bit;
+}
+
+test "stdlib manager matrix: each real adapter resolves to its own backend source" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // The real adapter files reference the `Memory.Manager` protocol,
+    // which is declared in its own file. A real build collects both;
+    // the matrix mirrors that by feeding the REAL protocol source
+    // alongside each REAL adapter source.
+    const protocol_source = try readWorkspaceFile(alloc, "lib/memory/manager.zap");
+
+    inline for (stdlib_manager_matrix) |case| {
+        const adapter_source = try readWorkspaceFile(alloc, case.adapter_path);
+
+        var source_units = [_]compiler.SourceUnit{
+            .{ .file_path = "lib/memory/manager.zap", .source = protocol_source },
+            .{ .file_path = case.adapter_path, .source = adapter_source },
+        };
+
+        var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+
+        const resolved = try resolveMemoryManagerBackendFromSourceGraph(
+            alloc,
+            &ctx.collector.graph,
+            &ctx.interner,
+            case.type_name,
+        );
+        // The resolver keys off the `impl Memory.Manager for <X>` decl
+        // span, so the selected manager binds to ITS OWN adapter file —
+        // the package-backend convention (`lib/<pkg>/<name>.zap` ->
+        // `<root>/src/<stem>/manager.zig`) is applied to this path
+        // downstream by the memory driver.
+        try testing.expectEqualStrings(case.adapter_path, resolved);
+
+        // Selection -> backend -> caps: the real backend the driver would
+        // compile for this manager declares REFCOUNT_V1 iff it is ARC.
+        try testing.expectEqual(
+            case.declares_refcount,
+            realBackendDeclaresRefcount(case.backend_source),
+        );
+        try testing.expectEqual(
+            case.declares_refcount,
+            std.mem.eql(u8, case.type_name, "Memory.ARC"),
+        );
+    }
+}
+
+test "stdlib manager matrix: omitted memory: selects Memory.ARC adapter and REFCOUNT_V1 backend" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // A manifest that omits `memory:` defaults to `Memory.ARC`
+    // (`constValueToBuildConfig` leaves it null; the driver substitutes
+    // ARC). The resolver consumes only the resolved type name, so the
+    // default path is exercised by resolving "Memory.ARC" against the
+    // REAL `lib/memory/arc.zap` adapter — the same file the default
+    // build links.
+    const protocol_source = try readWorkspaceFile(alloc, "lib/memory/manager.zap");
+    const adapter_source = try readWorkspaceFile(alloc, "lib/memory/arc.zap");
+
+    var source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "lib/memory/manager.zap", .source = protocol_source },
+        .{ .file_path = "lib/memory/arc.zap", .source = adapter_source },
+    };
+
+    var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+
+    const resolved = try resolveMemoryManagerBackendFromSourceGraph(
+        alloc,
+        &ctx.collector.graph,
+        &ctx.interner,
+        "Memory.ARC",
+    );
+    try testing.expectEqualStrings("lib/memory/arc.zap", resolved);
+    try testing.expect(realBackendDeclaresRefcount(REAL_ARC_BACKEND_SOURCE));
+    try testing.expectEqual(
+        zap.memory_abi.REFCOUNT_V1_BIT,
+        @as(u64, 0x0000_0000_0000_0001),
+    );
+}
+
 test "constValueToBuildConfig leaves memory: null when omitted" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

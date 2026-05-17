@@ -13,8 +13,10 @@
 A Zap memory manager is a Zig backend plus a Zap adapter struct. The
 Zig backend supplies runtime allocation, deallocation, and optionally
 reference-counting, finalization, weak-reference, and other
-memory-related primitives. The Zap adapter implements `Memory.Manager`
-and binds the selected manager type to that backend.
+memory-related primitives. The Zap adapter struct conforms to
+`Memory.Manager` via an empty `impl Memory.Manager for X`; the
+compiler resolves that conforming impl's source file and binds the
+selected manager type to the package's Zig backend.
 Exactly one manager is selected per binary at build time via the
 project's `build.zap` manifest:
 
@@ -26,16 +28,23 @@ project's `build.zap` manifest:
 }
 ```
 
-The source model is adapter-driven: stdlib and project managers are
-top-level structs that implement `Memory.Manager`. The selected adapter
-value in `Zap.Manifest.memory` is evaluated at build time, and the
-compiler calls one protocol function, `backend/1`, which delegates to
-`:zig.Memory.backend(manager)`. That call binds the adapter method's
-package-relative source file to the package's Zig backend file
-(`lib/foo/bar.zap` -> `src/foo/bar/manager.zig`);
-declared capabilities come from the validated `.zapmem` section. No
-manager uses a special source attribute, compiler name table,
-type-name-derived path, or Zap-returned source path.
+The source model is conformance-marker-driven: stdlib and project
+managers are top-level structs that conform to `Memory.Manager`.
+`Memory.Manager` is a **zero-method conformance marker** — a manager
+opts in solely by declaring `impl Memory.Manager for X` (the impl body
+is empty). It has no protocol functions; the compiler never invokes
+anything on the adapter.
+
+The selected manager type named in `Zap.Manifest.memory` is resolved
+at build time directly from the source graph: the compiler finds the
+`impl Memory.Manager for <selected>` declaration and takes that impl
+declaration's own source file as the adapter source. The package
+backend convention (`lib/foo/bar.zap` -> `src/foo/bar/manager.zig`)
+is then applied to that path to locate the Zig backend file. Declared
+capabilities come from the validated `.zapmem` section. No manager
+uses a special source attribute, compiler name table, type-name-derived
+path, a Zap-returned source path, or any runtime/CTFE call on the
+adapter.
 
 ### 1.1 The build pipeline at a glance
 
@@ -46,7 +55,8 @@ Zap.Manifest.memory: Memory.ARC
 Resolve adapter type
         |
         v
-Evaluate Memory.Manager.backend/1 through CTFE
+Find `impl Memory.Manager for <type>` in the source graph and take
+that impl declaration's source file as the adapter source
         |
         v
 Resolve the adapter source's package backend file and compile it to a
@@ -1058,21 +1068,25 @@ Step 1. Parse the project's build.zap and load the manifest.
         The manifest's `memory:` field names a Zap memory adapter
         (e.g., Memory.ARC or Memory.Arena).
 
-Step 2. Resolve the adapter binding.
-        The build CTFE interpreter evaluates the selected manifest
-        value through the Memory.Manager protocol's single backend/1
-        function. The adapter implementation must delegate directly to
-        :zig.Memory.backend(manager), which records the concrete
-        manager type and, when source reflection is available, the
-        adapter source file.
+Step 2. Resolve the adapter source from the source graph.
+        The compiler scans the collected source graph for the
+        `impl Memory.Manager for <selected>` declaration whose target
+        type matches the manifest's resolved manager type. The source
+        file that declares that impl IS the adapter source. No CTFE
+        evaluation, protocol call, or `:zig.` primitive is involved —
+        `Memory.Manager` is a zero-method conformance marker, so the
+        only thing the compiler reads is the impl declaration's own
+        source location. If no conforming `impl Memory.Manager for
+        <selected>` exists, the build aborts (see section 10.4).
 
 Step 3. Resolve and compile the manager backend source.
-        The driver resolves the package `src/.../manager.zig` backend
-        for the adapter method source recorded in step 2 and invokes
-        the Zig-fork primitive `zap_fork_compile_zig_to_object` (see
-        section 10.1.2). This object is build-time validation evidence
-        for every manager; the final binary registers the resolved
-        backend source path as `zap_active_manager`.
+        The driver applies the package backend convention to the
+        adapter source recorded in step 2 (`lib/foo/bar.zap` ->
+        `<pkg-root>/src/foo/bar/manager.zig`) and invokes the Zig-fork
+        primitive `zap_fork_compile_zig_to_object` (see section
+        10.1.2). This object is build-time validation evidence for
+        every manager; the final binary registers the resolved backend
+        source path as `zap_active_manager`.
 
 Step 4. Resolve metadata.
         The driver parses the .zapmem section from the object file using
@@ -1120,16 +1134,19 @@ Step 9. Register the selected backend source.
 #### 10.1.1 Manager backend source binding
 
 Zap adapters do not expose backend source references. The build driver
-binds the backend source from the source file that actually contains the
-`backend/1` implementation. If the implementation is in
-`lib/memory/arc.zap`, the backend source is `src/memory/arc/manager.zig`. If a
-third-party implementation is in `lib/third_party/project_arena.zap`, the
-backend source is `src/third_party/project_arena/manager.zig`.
+binds the backend source from the source file that declares the
+`impl Memory.Manager for <selected>` conformance. If the conforming
+impl is declared in `lib/memory/arc.zap`, the backend source is
+`src/memory/arc/manager.zig`. If a third-party impl is declared in
+`lib/third_party/project_arena.zap`, the backend source is
+`src/third_party/project_arena/manager.zig`.
 
-The compiler does not derive backend identity from the manager type name
-and does not scan package roots for name-shaped manager files. A
-selected adapter must be source-backed by a `.zap` file, and its package
-`src/.../manager.zig` backend file must exist.
+The compiler does not derive backend identity from the manager type
+name, does not scan package roots for name-shaped manager files, and
+does not call any function on the adapter. A selected manager must have
+a conforming `impl Memory.Manager for <selected>` declared in a `.zap`
+file, and that file's package `src/.../manager.zig` backend file must
+exist.
 
 #### 10.1.2 `zap_fork_compile_zig_to_object`
 
@@ -1255,9 +1272,9 @@ The compiled `<manager>.o` is content-addressed by `(zig_fork_version, manager_s
 
 | Failure                                  | Stage   | Diagnostic                                                                           |
 |------------------------------------------|---------|--------------------------------------------------------------------------------------|
-| Adapter binding missing                  | Step 2  | "build manifest did not evaluate a `Memory.Manager` adapter"                                |
-| Adapter backend binding missing          | Step 2  | "memory manager adapter `<name>` did not call `:zig.Memory.backend/1`"                |
-| Manager backend source missing           | Step 2  | "memory manager backend for `<name>` not found; expected package backend file `<path>`" |
+| Manifest provided no manager type        | Step 1  | "build manifest did not select a `Memory.Manager`"                                    |
+| No conforming `impl Memory.Manager`      | Step 2  | "memory manager `<name>` selected by manifest does not implement Memory.Manager"      |
+| Manager backend source missing           | Step 3  | "memory manager backend for `<name>` not found; expected package backend file `<path>`" |
 | Manager Zig source fails to compile      | Step 3  | Forwarded Zig compiler error, prefixed with the manager package name.                |
 | `.zapmem` section absent from object     | Step 4  | "manager `<name>` did not emit a `.zapmem` metadata section; see docs/memory-manager-abi.md section 3" |
 | Magic mismatch                           | Step 5  | "manager `<name>` has invalid magic (expected `'ZMEM'`, got `<bytes>`)"               |
@@ -1278,12 +1295,14 @@ The compiled `<manager>.o` is content-addressed by `(zig_fork_version, manager_s
 ## 11. Extension model
 
 The Zap source model is shared: memory managers are adapter structs
-that implement `Memory.Manager`. Stdlib and third-party adapters use
-the same compiler path: CTFE evaluates `backend/1`, the backend
-primitive records the selected manager type and adapter method source,
-the driver resolves the package Zig backend source, that source is
-compiled for `.zapmem` validation, and the final binary registers the
-same resolved source path as `zap_active_manager`.
+that conform to `Memory.Manager` via an empty `impl Memory.Manager for
+X`. Stdlib and third-party adapters use the same compiler path: the
+compiler locates the conforming impl declaration in the source graph
+and takes its source file as the adapter source, the driver resolves
+the package Zig backend source from that path, that source is compiled
+for `.zapmem` validation, and the final binary registers the same
+resolved source path as `zap_active_manager`. No CTFE evaluation or
+adapter call occurs.
 
 ### 11.1 What a third party ships
 
@@ -1293,7 +1312,8 @@ A third-party manager is a Zap package containing:
    path derived from the Zap adapter source.
 2. A `build.zig.zon` so the package can be referenced by Zap's dependency system.
 3. A Zap adapter struct in `lib/<name>.zap` (or wherever the package
-   exposes its public API) that implements `Memory.Manager`.
+   exposes its public API) with an empty `impl Memory.Manager for
+   <struct>` conformance marker.
 
 The user then references the Zap struct from their project's `build.zap`:
 
@@ -1305,10 +1325,12 @@ The user then references the Zap struct from their project's `build.zap`:
 }
 ```
 
-The Zap compiler evaluates `ThirdParty.MyManager` through
-`Memory.Manager.backend/1`, resolves the package `src/.../manager.zig`
-backend source for the adapter, validates the resulting `.zapmem`
-metadata, and threads `declared_caps` into HIR and codegen.
+The Zap compiler finds the `impl Memory.Manager for
+ThirdParty.MyManager` declaration in the source graph, takes its
+declaring `.zap` file as the adapter source, resolves the package
+`src/.../manager.zig` backend source from that path, validates the
+resulting `.zapmem` metadata, and threads `declared_caps` into HIR and
+codegen.
 
 #### 11.1.1 Third-party manager dependencies
 
@@ -1324,22 +1346,31 @@ The third party's package version is independent of Zap's ABI version. The third
 
 ## 12. The Zap-side adapter struct
 
-For each memory manager, there is a field-free Zap adapter struct that
-implements `Memory.Manager`. The adapter is the public source-level
-model. It does not expose manager names, backend paths, or capability
-masks in Zap code; it binds the selected manager type to its backend
-through a single call to the Zig backend primitive.
+For each memory manager, there is a field-free Zap adapter struct and
+an empty `impl Memory.Manager for <struct>` conformance marker. The
+adapter is the public source-level model. It does not expose manager
+names, backend paths, or capability masks in Zap code, and it does not
+call into the runtime: the conformance marker exists solely so the
+compiler can find the declaring source file in the source graph.
 
 ### 12.1 `Memory.Manager`
 
-The top-level `Memory.Manager` protocol has one function:
+`Memory.Manager` is a **zero-method conformance marker** protocol. It
+has no functions:
 
-- `backend(manager) -> Bool`
+```
+pub protocol Memory.Manager {
+}
+```
 
-Stdlib and third-party adapters implement this protocol directly. The
-implementation must delegate to `:zig.Memory.backend(manager)`. The
-validated `.zapmem` metadata emitted by the convention-resolved backend
-source is the sole capability source of truth.
+A manager opts in solely by declaring `impl Memory.Manager for X`
+with an empty body. There is no `backend/1` (or any other) protocol
+function, no `:zig.` primitive, and no CTFE or runtime call on the
+adapter. The compiler resolves the backend by locating that impl
+declaration in the source graph and applying the package backend
+convention to its source file (section 10.1.1). The validated
+`.zapmem` metadata emitted by the convention-resolved backend source
+is the sole capability source of truth.
 
 ### 12.2 Stdlib `Memory.ARC`
 
@@ -1352,18 +1383,10 @@ pub struct Memory.ARC {
 }
 
 @doc = """
-  `Memory.Manager` adapter implementation for `Memory.ARC`.
+  `Memory.Manager` conformance marker for `Memory.ARC`.
   """
 
-pub impl Memory.Manager for Memory.ARC {
-  @doc = """
-    Binds the ARC manager type to its primitive backend.
-    """
-
-  pub fn backend(manager :: Memory.ARC) -> Bool {
-    :zig.Memory.backend(manager)
-  }
-}
+pub impl Memory.Manager for Memory.ARC {}
 ```
 
 ### 12.3 Stdlib `Memory.Arena`
@@ -1377,18 +1400,10 @@ pub struct Memory.Arena {
 }
 
 @doc = """
-  `Memory.Manager` adapter implementation for `Memory.Arena`.
+  `Memory.Manager` conformance marker for `Memory.Arena`.
   """
 
-pub impl Memory.Manager for Memory.Arena {
-  @doc = """
-    Binds the Arena manager type to its primitive backend.
-    """
-
-  pub fn backend(manager :: Memory.Arena) -> Bool {
-    :zig.Memory.backend(manager)
-  }
-}
+pub impl Memory.Manager for Memory.Arena {}
 ```
 
 ### 12.4 Third-party adapters
@@ -1404,30 +1419,26 @@ pub struct ThirdParty.ProjectArena {
 }
 
 @doc = """
-  `Memory.Manager` adapter implementation for `ThirdParty.ProjectArena`.
+  `Memory.Manager` conformance marker for `ThirdParty.ProjectArena`.
   """
 
-pub impl Memory.Manager for ThirdParty.ProjectArena {
-  @doc = """
-    Binds the ProjectArena manager type to its primitive backend.
-    """
-
-  pub fn backend(manager :: ThirdParty.ProjectArena) -> Bool {
-    :zig.Memory.backend(manager)
-  }
-}
+pub impl Memory.Manager for ThirdParty.ProjectArena {}
 ```
 
-If this adapter implementation lives at `lib/third_party/project_arena.zap`,
-its backend source must live at `src/third_party/project_arena/manager.zig`.
+If this conformance marker is declared at
+`lib/third_party/project_arena.zap`, its backend source must live at
+`src/third_party/project_arena/manager.zig`.
 
 ### 12.5 Adapter struct shape
 
-Adapter structs are intentionally field-free. The behavior lives in the
-`Memory.Manager` impl so the same protocol dispatch path can support
-stdlib and third-party managers. Future APIs may accept values that
-implement `Memory.Manager` for per-process selection; this document does
-not define `Process` behavior.
+Adapter structs are intentionally field-free, and the
+`impl Memory.Manager for <struct>` body is empty. There is no
+behavior to carry: the impl is a pure conformance marker whose only
+role is to mark the struct as a selectable manager and to anchor the
+declaring source file the compiler resolves the backend from. Future
+APIs may accept values whose type conforms to `Memory.Manager` for
+per-process selection; this document does not define `Process`
+behavior.
 
 ---
 
@@ -1600,18 +1611,10 @@ pub struct Memory.NoOp {
 }
 
 @doc = """
-  `Memory.Manager` adapter implementation for `Memory.NoOp`.
+  `Memory.Manager` conformance marker for `Memory.NoOp`.
   """
 
-pub impl Memory.Manager for Memory.NoOp {
-  @doc = """
-    Binds the NoOp manager type to its primitive backend.
-    """
-
-  pub fn backend(manager :: Memory.NoOp) -> Bool {
-    :zig.Memory.backend(manager)
-  }
-}
+pub impl Memory.Manager for Memory.NoOp {}
 ```
 
 ### 14.3 Expected behavior
@@ -1998,18 +2001,10 @@ pub struct TinyRef {
 }
 
 @doc = """
-  `Memory.Manager` adapter implementation for `TinyRef`.
+  `Memory.Manager` conformance marker for `TinyRef`.
   """
 
-pub impl Memory.Manager for TinyRef {
-  @doc = """
-    Binds the TinyRef manager type to its primitive backend.
-    """
-
-  pub fn backend(manager :: TinyRef) -> Bool {
-    :zig.Memory.backend(manager)
-  }
-}
+pub impl Memory.Manager for TinyRef {}
 ```
 
 ### 15.3 Notes on the example
