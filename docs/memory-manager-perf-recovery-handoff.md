@@ -19,27 +19,33 @@ pub struct Zap.Manifest {
 }
 ```
 
-The selected value is a first-class type reference. The compiler instantiates
-that type as an adapter value and validates that it implements the
-`Memory.Manager` protocol, then evaluates one adapter method during manifest
-CTFE:
+The selected value is a first-class type reference. `Memory.Manager` is a
+zero-method conformance marker: a manager opts in solely by declaring an empty
+`impl Memory.Manager for X`. The compiler resolves the selected manager at
+build time directly from the parsed source graph — it scans
+`scope_graph.impls` for the `impl Memory.Manager for <selected>` declaration
+and takes that impl declaration's own source file as the adapter source
+(`src/builder.zig:resolveMemoryManagerBackendFromSourceGraph`). There is no
+callable backend resolver: no `backend/1`, no `:zig.Memory.backend`, no CTFE
+evaluation, protocol call, or `:zig.` primitive on the adapter.
 
-- `backend/1` delegates to `:zig.Memory.backend(manager)`.
-
-First-party and third-party managers use the same path. The adapter does not
-return a public manager name, source path, or capability mask. The build driver
-resolves the backend source from the adapter method's package-relative source
-file (`lib/foo/bar.zap` -> `src/foo/bar/manager.zig`), then reads the
-capability mask from the validated `.zapmem` section.
+First-party and third-party managers use the same path. The adapter exposes no
+public manager name, source path, or capability mask. The build driver applies
+the package backend convention to the impl-declaring source file
+(`lib/foo/bar.zap` -> `src/foo/bar/manager.zig`), then reads the capability
+mask from the validated `.zapmem` section.
 
 ## Build Pipeline
 
 For every user binary:
 
-1. `src/builder.zig` evaluates `build.zap` with CTFE and extracts the selected
-   `Memory.Manager` backend binding through `backend/1`.
-2. `src/memory/driver.zig` resolves the backend source from the adapter
-   method's package source location.
+1. `src/builder.zig` evaluates `build.zap` with CTFE to extract the selected
+   manager `Type`, then `resolveMemoryManagerBackendFromSourceGraph` scans the
+   parsed source graph for the `impl Memory.Manager for <selected>` declaration
+   and takes that impl declaration's own `.zap` source file as the adapter
+   source.
+2. `src/memory/driver.zig` resolves the backend source by applying the package
+   convention to that impl-declaring source location.
 3. The selected backend source is compiled through the validation pipeline
    for every manager, including Zap stdlib managers.
 4. The `.zapmem` section is parsed and validated as the source of truth for
@@ -58,7 +64,8 @@ same integration path.
 ## Invariants
 
 - The compiler must not encode Zap memory-manager struct names.
-- The adapter protocol exposes only the backend binding call.
+- The adapter protocol is a zero-method conformance marker: it exposes no
+  calls, and the compiler never invokes anything on the adapter.
 - The validated `.zapmem` section is the source of truth for declared
   capabilities.
 - Every selected manager source is validated through the same object/section

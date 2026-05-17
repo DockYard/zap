@@ -33,9 +33,12 @@ pub const BuildConfig = struct {
     build_opts: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// Memory manager type selected by the manifest. Initial build.zap
     /// CTFE records only the selected `Type` so dependency resolution can
-    /// complete first. The adapter source path is filled by evaluating
-    /// `Memory.Manager.backend/1` after project and dependency sources
-    /// are loaded.
+    /// complete first. The adapter source path is filled by
+    /// `resolveMemoryManagerBackendFromSourceGraph`, which scans the
+    /// parsed source graph for the empty `impl Memory.Manager for <X>`
+    /// decl and derives its declaring `.zap` file, after project and
+    /// dependency sources are loaded. There is no callable backend
+    /// resolver — `Memory.Manager` is a zero-method conformance marker.
     memory_manager: ?MemoryManager = null,
     /// Test timeout in milliseconds (0 = no timeout). Zig 0.16 supports
     /// native unit test timeouts in the build system.

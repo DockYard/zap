@@ -539,10 +539,13 @@ What Phase 2 should do, refined based on spike findings:
 
 3. **Compiler-side manager parser** — wire `src/memory/section_parser.zig`
    (kept from the spike) into the compile pipeline at the build step.
-   The active implementation now resolves the manifest's `memory:`
-   adapter through `Memory.Manager.backend/1` and validates the
-   convention-resolved backend source; the earlier attribute-based
-   lookup described by the spike was not adopted.
+   The active implementation resolves the manifest's `memory:` adapter
+   from the parsed source graph: `Memory.Manager` is a zero-method
+   conformance marker, and `resolveMemoryManagerBackendFromSourceGraph`
+   takes the source file declaring `impl Memory.Manager for <selected>`
+   as the adapter source, then validates the convention-resolved backend
+   source. There is no `backend/1` call. Neither the earlier
+   attribute-based lookup nor a callable backend resolver was adopted.
 
 4. **Validation + diagnostic surface** — implement spec section 3.5
    validations as Phase 2 work. The diagnostics in section 10.4 form
