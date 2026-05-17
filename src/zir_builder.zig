@@ -332,6 +332,16 @@ fn mapMainReturnType(zig_type: ir.ZigType) BuildError!u32 {
     };
 }
 
+/// ZIR type Ref for a concrete integer scalar Zap type, else 0.
+/// Used to decide whether an otherwise-untyped integer literal should
+/// be emitted typed to the enclosing function's integer return type.
+fn concreteIntegerTypeRef(zig_type: ir.ZigType) u32 {
+    return switch (zig_type) {
+        .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .usize, .isize => mapReturnType(zig_type),
+        else => 0,
+    };
+}
+
 /// Map a primitive Zap type to a well-known ZIR type Ref.
 /// Returns 0 for complex types that need instruction emission (use
 /// ZirDriver.emitReturnTypeRef for full coverage).
@@ -4047,13 +4057,37 @@ pub const ZirDriver = struct {
         switch (instr) {
             // Constants
             .const_int => |ci| {
-                // Inside case blocks, emit typed i64 to avoid comptime_int
-                // depending on runtime control flow.
+                // Integer-literal typing priority:
+                //  1. Explicit IR hint (the type-checker resolved a
+                //     concrete non-default integer type for the node).
+                //  2. Inside a case block: typed `i64` so a literal that
+                //     becomes the case result does not flow out of
+                //     runtime control flow as a bare `comptime_int`.
+                //  3. Otherwise, when the enclosing function returns a
+                //     concrete integer type, emit the literal typed to
+                //     that return type. A bare `0`/`1` returned through
+                //     an `if cond { 0 } else { 1 }`-as-body lowers to an
+                //     if-else whose branch results are this literal; an
+                //     untyped `comptime_int` there is rejected by Zig
+                //     Sema ("value with comptime-only type 'comptime_int'
+                //     depends on runtime control flow"), and an `i64`
+                //     would then mismatch a narrower declared return
+                //     (e.g. `Zest.Runner.run/0 -> u8`). Typing the
+                //     literal as the declared return type makes both the
+                //     runtime branch merge and the return concrete. This
+                //     mirrors the case-block protection for the
+                //     if-else-as-tail shape, which is lowered directly
+                //     (not via case_block/switch_return).
+                //  4. Else a bare integer (Zig infers `comptime_int`),
+                //     unchanged for every straight-line use.
                 const type_hint_ref: u32 = if (ci.type_hint) |type_hint| mapReturnType(type_hint) else 0;
+                const ret_int_ref: u32 = concreteIntegerTypeRef(self.current_function_return_type);
                 const ref = if (type_hint_ref != 0)
                     zir_builder_emit_int_typed(self.handle, ci.value, type_hint_ref)
                 else if (self.current_case_dest != null)
                     zir_builder_emit_int_typed(self.handle, ci.value, @intFromEnum(Zir.Inst.Ref.i64_type))
+                else if (ret_int_ref != 0)
+                    zir_builder_emit_int_typed(self.handle, ci.value, ret_int_ref)
                 else
                     zir_builder_emit_int(self.handle, ci.value);
                 if (ref == error_ref) return error.EmitFailed;
