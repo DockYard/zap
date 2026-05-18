@@ -197,12 +197,25 @@ pub fn ctfeManifestDetailed(
     build_opts: std.StringHashMapUnmanaged([]const u8),
     zap_lib_dir: ?[]const u8,
 ) !ManifestEval {
+    return ctfeManifestDetailedWithProgress(alloc, build_source, target_name, build_opts, zap_lib_dir, null);
+}
+
+pub fn ctfeManifestDetailedWithProgress(
+    alloc: std.mem.Allocator,
+    build_source: []const u8,
+    target_name: []const u8,
+    build_opts: std.StringHashMapUnmanaged([]const u8),
+    zap_lib_dir: ?[]const u8,
+    progress: ?*zap.progress.Reporter,
+) !ManifestEval {
     const ctfe = zap.ctfe;
+    const show_progress = progress != null;
 
     // Build source units: stdlib lib files + build.zap
     var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
 
     // Read stdlib files from zap lib dir if available
+    if (progress) |reporter| reporter.stage("Manifest: reading stdlib sources", .{});
     if (zap_lib_dir) |lib_dir| {
         try readLibSourceUnits(alloc, lib_dir, &source_units);
     }
@@ -217,10 +230,13 @@ pub fn ctfeManifestDetailed(
     // `compiled_program` and falls through to AST evaluation that can't
     // execute `:zig.*` builtins. See `dispatchQualifiedComptimeCall` in
     // `macro_eval.zig` for the diagnostic path that surfaces the failure.
+    if (progress) |reporter| reporter.stage("Manifest: resolving build graph", .{});
     const struct_order_data = computeStructOrder(alloc, build_source, source_units.items, zap_lib_dir) catch null;
 
     var collect_options = compiler.CompileOptions{
-        .show_progress = false,
+        .show_progress = show_progress,
+        .progress = progress,
+        .progress_context = "Manifest",
         .allow_external_static_references = true,
     };
     if (struct_order_data) |order| {
@@ -229,17 +245,21 @@ pub fn ctfeManifestDetailed(
     }
 
     // Compile through the full frontend pipeline to get IR
+    if (progress) |reporter| reporter.stage("Manifest: compiling build.zap", .{});
     var ctx = compiler.collectAllFromUnits(alloc, source_units.items, collect_options) catch return error.CompileFailed;
     const result = compiler.compileForCtfe(alloc, &ctx, .{
-        .show_progress = false,
+        .show_progress = show_progress,
+        .progress = progress,
+        .progress_context = "Manifest",
         .allow_external_static_references = true,
     }) catch return error.CompileFailed;
 
     // Create CTFE interpreter with build capabilities and persistent cache
+    if (progress) |reporter| reporter.stage("Manifest: evaluating build.zap", .{});
     var interp = ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interp.deinit();
     interp.scope_graph = &ctx.collector.graph;
-    interp.interner = &ctx.interner;
+    interp.interner = ctx.interner;
     interp.capabilities = ctfe.CapabilitySet.build;
     interp.build_opts = build_opts;
     interp.compile_options_hash = ctfe.hashCompileOptions(target_name, build_opts.get("optimize") orelse "release_safe");
@@ -621,7 +641,7 @@ pub fn evaluateMemoryManagerAdapterFromSources(
     const source_path = try resolveMemoryManagerBackendFromSourceGraph(
         alloc,
         &ctx.collector.graph,
-        &ctx.interner,
+        ctx.interner,
         selected.type_name,
     );
     return buildMemoryAdapterEval(alloc, selected.type_name, source_path);
@@ -1334,7 +1354,7 @@ test "ctfe manifest extracts root Function reference" {
     var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interp.deinit();
     interp.scope_graph = &ctx.collector.graph;
-    interp.interner = &ctx.interner;
+    interp.interner = ctx.interner;
     interp.capabilities = zap.ctfe.CapabilitySet.build;
 
     const manifest_id = findManifestFunction(&result.ir_program) orelse return error.ManifestNotFound;
@@ -1403,7 +1423,7 @@ test "ctfe manifest permits target-source Type and Function references" {
     var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interp.deinit();
     interp.scope_graph = &ctx.collector.graph;
-    interp.interner = &ctx.interner;
+    interp.interner = ctx.interner;
     interp.capabilities = zap.ctfe.CapabilitySet.build;
 
     const manifest_id = findManifestFunction(&result.ir_program) orelse return error.ManifestNotFound;
@@ -1483,7 +1503,7 @@ test "ctfe manifest staged discovery permits target-source Type and Function ref
     var interp = zap.ctfe.Interpreter.init(alloc, &ctfe_result.ir_program);
     defer interp.deinit();
     interp.scope_graph = &ctx.collector.graph;
-    interp.interner = &ctx.interner;
+    interp.interner = ctx.interner;
     interp.capabilities = zap.ctfe.CapabilitySet.build;
 
     const manifest_id = findManifestFunction(&ctfe_result.ir_program) orelse return error.ManifestNotFound;
@@ -1592,7 +1612,7 @@ test "ctfe manifest evaluates third-party Memory.Manager backend through protoco
     var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interp.deinit();
     interp.scope_graph = &ctx.collector.graph;
-    interp.interner = &ctx.interner;
+    interp.interner = ctx.interner;
     interp.capabilities = zap.ctfe.CapabilitySet.build;
 
     const manifest_id = findManifestFunction(&result.ir_program) orelse return error.ManifestNotFound;
@@ -1606,7 +1626,7 @@ test "ctfe manifest evaluates third-party Memory.Manager backend through protoco
     const memory_eval = try evaluateMemoryManagerAdapter(
         alloc,
         &ctx.collector.graph,
-        &ctx.interner,
+        ctx.interner,
         manifest_result.value,
     );
     config.memory_manager = memory_eval.manager;
@@ -1656,7 +1676,7 @@ test "ctfe manifest rejects manager without Memory.Manager impl" {
         evaluateMemoryManagerAdapter(
             alloc,
             &ctx.collector.graph,
-            &ctx.interner,
+            ctx.interner,
             manifest_value,
         ),
     );
@@ -1712,7 +1732,7 @@ test "ctfe manifest evaluates default Memory.Manager backend when memory omitted
     var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interp.deinit();
     interp.scope_graph = &ctx.collector.graph;
-    interp.interner = &ctx.interner;
+    interp.interner = ctx.interner;
     interp.capabilities = zap.ctfe.CapabilitySet.build;
 
     const manifest_id = findManifestFunction(&result.ir_program) orelse return error.ManifestNotFound;
@@ -1726,7 +1746,7 @@ test "ctfe manifest evaluates default Memory.Manager backend when memory omitted
     const memory_eval = try evaluateMemoryManagerAdapter(
         alloc,
         &ctx.collector.graph,
-        &ctx.interner,
+        ctx.interner,
         manifest_result.value,
     );
     config.memory_manager = memory_eval.manager;
@@ -1851,7 +1871,7 @@ test "resolveMemoryManagerBackendFromSourceGraph resolves default Memory.ARC emp
     const resolved = try resolveMemoryManagerBackendFromSourceGraph(
         alloc,
         &ctx.collector.graph,
-        &ctx.interner,
+        ctx.interner,
         "Memory.ARC",
     );
     try testing.expectEqualStrings("lib/memory/arc.zap", resolved);
@@ -1887,7 +1907,7 @@ test "resolveMemoryManagerBackendFromSourceGraph resolves explicitly selected ma
     const resolved = try resolveMemoryManagerBackendFromSourceGraph(
         alloc,
         &ctx.collector.graph,
-        &ctx.interner,
+        ctx.interner,
         "ThirdParty.ProjectArena",
     );
     try testing.expectEqualStrings("build.zap", resolved);
@@ -1922,7 +1942,7 @@ test "resolveMemoryManagerBackendFromSourceGraph rejects manager with no conform
         resolveMemoryManagerBackendFromSourceGraph(
             alloc,
             &ctx.collector.graph,
-            &ctx.interner,
+            ctx.interner,
             "NotAManager",
         ),
     );
@@ -2059,7 +2079,7 @@ test "stdlib manager matrix: each real adapter resolves to its own backend sourc
         const resolved = try resolveMemoryManagerBackendFromSourceGraph(
             alloc,
             &ctx.collector.graph,
-            &ctx.interner,
+            ctx.interner,
             case.type_name,
         );
         // The resolver keys off the `impl Memory.Manager for <X>` decl
@@ -2106,7 +2126,7 @@ test "stdlib manager matrix: omitted memory: selects Memory.ARC adapter and REFC
     const resolved = try resolveMemoryManagerBackendFromSourceGraph(
         alloc,
         &ctx.collector.graph,
-        &ctx.interner,
+        ctx.interner,
         "Memory.ARC",
     );
     try testing.expectEqualStrings("lib/memory/arc.zap", resolved);

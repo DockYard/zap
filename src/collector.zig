@@ -561,6 +561,92 @@ pub const Collector = struct {
         }
     }
 
+    /// Rebind already-collected struct function families to the current AST
+    /// nodes. Incremental staged expansion reuses the surface graph from the
+    /// raw AST, then substitutes cached expanded/desugared AST per struct; the
+    /// graph must therefore be refreshed before type checking or HIR reads it.
+    pub fn refreshStructFunctionDeclarations(self: *Collector, program: *const ast.Program) !void {
+        for (program.structs) |*mod| {
+            const mod_scope = self.graph.findStructScope(mod.name) orelse continue;
+
+            var refreshed_keys = std.AutoHashMap(scope.FamilyKey, void).init(self.allocator);
+            defer refreshed_keys.deinit();
+
+            for (mod.items) |item| {
+                const func = switch (item) {
+                    .function, .priv_function => |decl| decl,
+                    else => continue,
+                };
+                const arity: u32 = if (func.clauses.len > 0) @intCast(func.clauses[0].params.len) else 0;
+                const key = scope.FamilyKey{ .name = func.name, .arity = arity };
+                const refreshed = try refreshed_keys.getOrPut(key);
+                if (refreshed.found_existing) continue;
+                if (self.graph.getScope(mod_scope).function_families.get(key)) |family_id| {
+                    self.graph.getFamilyMut(family_id).clauses.clearRetainingCapacity();
+                }
+            }
+
+            for (mod.items) |item| {
+                const func = switch (item) {
+                    .function, .priv_function => |decl| decl,
+                    else => continue,
+                };
+                try self.collectFunction(func, mod_scope);
+            }
+        }
+    }
+
+    pub fn refreshImplDeclaration(self: *Collector, impl_entry: *scope.ImplEntry, impl_d: *const ast.ImplDecl) !void {
+        var old_family_ids: std.ArrayListUnmanaged(scope.FunctionFamilyId) = .empty;
+        defer old_family_ids.deinit(self.allocator);
+
+        {
+            const impl_scope = self.graph.getScope(impl_entry.scope_id);
+            var family_iter = impl_scope.function_families.iterator();
+            while (family_iter.next()) |entry| {
+                try old_family_ids.append(self.allocator, entry.value_ptr.*);
+            }
+        }
+
+        if (self.graph.findStructScope(impl_entry.target_type)) |target_scope_id| {
+            var stale_target_keys: std.ArrayListUnmanaged(scope.FamilyKey) = .empty;
+            defer stale_target_keys.deinit(self.allocator);
+
+            const target_scope = self.graph.getScope(target_scope_id);
+            var target_iter = target_scope.function_families.iterator();
+            while (target_iter.next()) |entry| {
+                if (functionFamilyIdInSlice(old_family_ids.items, entry.value_ptr.*)) {
+                    try stale_target_keys.append(self.allocator, entry.key_ptr.*);
+                }
+            }
+
+            const target_scope_mut = self.graph.getScopeMut(target_scope_id);
+            for (stale_target_keys.items) |key| {
+                _ = target_scope_mut.function_families.remove(key);
+            }
+        }
+
+        for (old_family_ids.items) |family_id| {
+            self.graph.getFamilyMut(family_id).clauses.clearRetainingCapacity();
+        }
+        self.graph.getScopeMut(impl_entry.scope_id).function_families.clearRetainingCapacity();
+
+        impl_entry.protocol_name = impl_d.protocol_name;
+        impl_entry.target_type = impl_d.target_type;
+        impl_entry.decl = impl_d;
+        impl_entry.is_private = impl_d.is_private;
+        for (impl_d.functions) |func| {
+            try self.collectFunction(func, impl_entry.scope_id);
+        }
+    }
+
+    fn functionFamilyIdInSlice(ids: []const scope.FunctionFamilyId, needle: scope.FunctionFamilyId) bool {
+        for (ids) |id| {
+            if (id == needle) return true;
+        }
+        return false;
+    }
+
     /// Register impl functions in their target struct's scope so that
     /// calls like Range.next(state) resolve to the impl function.
     /// Must be called after all structs and impls are collected.

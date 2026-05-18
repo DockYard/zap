@@ -12,12 +12,25 @@ const zir_builder = @import("zir_builder.zig");
 const ZirContext = zir_builder.ZirContext;
 const ir = @import("ir.zig");
 const env = @import("env.zig");
+const progress_mod = @import("progress.zig");
 
 // ---------------------------------------------------------------------------
 // Extern declarations for the C-ABI functions in libzig_compiler.a
 // ---------------------------------------------------------------------------
 
 extern "c" fn zir_compilation_create(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+) ?*ZirContext;
+
+extern "c" fn zir_compilation_create_incremental(
     zig_lib_dir: [*:0]const u8,
     local_cache_dir: [*:0]const u8,
     global_cache_dir: [*:0]const u8,
@@ -43,7 +56,24 @@ extern "c" fn zir_compilation_create_cross(
     cpu_features: ?[*:0]const u8,
 ) ?*ZirContext;
 
+extern "c" fn zir_compilation_create_cross_incremental(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    target_triple: ?[*:0]const u8,
+    cpu_features: ?[*:0]const u8,
+) ?*ZirContext;
+
 extern "c" fn zir_compilation_update(ctx: *ZirContext) i32;
+extern "c" fn zir_compilation_update_with_progress(ctx: *ZirContext) i32;
+extern "c" fn zir_compilation_output_path_len(ctx: *ZirContext) usize;
+extern "c" fn zir_compilation_copy_output_path(ctx: *ZirContext, out: ?[*]u8, out_len: usize) usize;
 
 extern "c" fn zir_compilation_destroy(ctx: *ZirContext) void;
 
@@ -68,6 +98,14 @@ extern "c" fn zir_compilation_set_builder_entry(
 ) i32;
 
 extern "c" fn zir_compilation_prepare_update(ctx: *ZirContext) i32;
+extern "c" fn zir_compilation_prepare_update_selected(
+    ctx: *ZirContext,
+    names: [*]const [*]const u8,
+    name_lens: [*]const usize,
+    count: usize,
+    include_root: bool,
+) i32;
+extern "c" fn zir_compilation_abort_update(ctx: *ZirContext) i32;
 
 extern "c" fn zir_compilation_invalidate_file(ctx: *ZirContext, name: [*:0]const u8) i32;
 
@@ -130,6 +168,10 @@ pub const CompileOptions = struct {
     /// Builder mode: compile as a builder binary with a custom entry point.
     /// The entry point function name (mangled, e.g., "FooBar__Builder__manifest").
     builder_entry: ?[]const u8 = null,
+    /// Create a persistent Zig incremental compilation. Output artifacts are
+    /// emitted into Zig's cache artifact directory, then copied to
+    /// `output_path` after a successful update.
+    incremental: bool = false,
     /// Cross-compilation target triple (e.g., "wasm32-wasi", "aarch64-linux-gnu").
     /// null means native target.
     target: ?[]const u8 = null,
@@ -165,6 +207,8 @@ pub const CompileOptions = struct {
     /// user-binary build. The memory driver validates the same source
     /// through the `.zapmem` object pipeline before it reaches here.
     active_manager_source_path: []const u8,
+    /// Shared CLI progress reporter, owned by the command driver.
+    progress: ?*progress_mod.Reporter = null,
 };
 
 /// Create a ZirContext compilation context from the given options.
@@ -203,21 +247,39 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
         else
             null;
         defer if (cpu_z) |c| allocator.free(c);
-        break :blk zir_compilation_create_cross(
-            zig_lib_z,
-            cache_z,
-            global_cache_z,
-            output_z,
-            name_z,
-            options.output_mode,
-            options.optimize_mode,
-            options.is_dynamic,
-            options.link_libc,
-            if (target_z) |t| t.ptr else null,
-            if (cpu_z) |c| c.ptr else null,
-        ) orelse
+        break :blk (if (options.incremental)
+            zir_compilation_create_cross_incremental(
+                zig_lib_z,
+                cache_z,
+                global_cache_z,
+                output_z,
+                name_z,
+                options.output_mode,
+                options.optimize_mode,
+                options.is_dynamic,
+                options.link_libc,
+                if (target_z) |t| t.ptr else null,
+                if (cpu_z) |c| c.ptr else null,
+            )
+        else
+            zir_compilation_create_cross(
+                zig_lib_z,
+                cache_z,
+                global_cache_z,
+                output_z,
+                name_z,
+                options.output_mode,
+                options.optimize_mode,
+                options.is_dynamic,
+                options.link_libc,
+                if (target_z) |t| t.ptr else null,
+                if (cpu_z) |c| c.ptr else null,
+            )) orelse
             return error.CompilationCreateFailed;
-    } else zir_compilation_create(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc) orelse
+    } else (if (options.incremental)
+        zir_compilation_create_incremental(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc)
+    else
+        zir_compilation_create(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc)) orelse
         return error.CompilationCreateFailed;
 
     // Configure builder mode if entry point is specified.
@@ -262,15 +324,74 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
 /// This is the second phase of compilation. For a fresh build, call after
 /// `createContext`. For an incremental rebuild, call `prepareUpdate` first
 /// to save the old ZIR, then call this to inject new ZIR and update.
+fn outputArtifactPath(allocator: std.mem.Allocator, ctx: *ZirContext) CompileError![:0]u8 {
+    const path_len = zir_compilation_output_path_len(ctx);
+    if (path_len == 0) return error.EmitFailed;
+
+    const path = allocator.allocSentinel(u8, path_len, 0) catch return error.OutOfMemory;
+    errdefer allocator.free(path);
+
+    const written_len = zir_compilation_copy_output_path(ctx, path.ptr, path.len + 1);
+    if (written_len != path_len) return error.EmitFailed;
+    return path;
+}
+
+fn publishIncrementalOutput(allocator: std.mem.Allocator, ctx: *ZirContext, output_path: []const u8) CompileError!void {
+    const artifact_path = try outputArtifactPath(allocator, ctx);
+    defer allocator.free(artifact_path);
+
+    if (std.mem.eql(u8, artifact_path, output_path)) return;
+
+    const artifact_path_absolute = std.fs.path.isAbsolute(artifact_path);
+    const output_path_absolute = std.fs.path.isAbsolute(output_path);
+    if (artifact_path_absolute or output_path_absolute) {
+        const copy_source_path = if (artifact_path_absolute)
+            artifact_path
+        else
+            std.fs.path.resolve(allocator, &.{artifact_path}) catch return error.EmitFailed;
+        defer if (!artifact_path_absolute) allocator.free(copy_source_path);
+
+        const copy_output_path = if (output_path_absolute)
+            output_path
+        else
+            std.fs.path.resolve(allocator, &.{output_path}) catch return error.EmitFailed;
+        defer if (!output_path_absolute) allocator.free(copy_output_path);
+
+        std.Io.Dir.copyFileAbsolute(
+            copy_source_path,
+            copy_output_path,
+            std.Options.debug_io,
+            .{ .make_path = true, .replace = true },
+        ) catch return error.EmitFailed;
+        return;
+    }
+
+    std.Io.Dir.cwd().copyFile(
+        artifact_path,
+        std.Io.Dir.cwd(),
+        output_path,
+        std.Options.debug_io,
+        .{ .make_path = true, .replace = true },
+    ) catch return error.EmitFailed;
+}
+
 pub fn injectAndUpdate(allocator: std.mem.Allocator, program: ir.Program, ctx: *ZirContext, options: CompileOptions) CompileError!void {
     // Build ZIR via C-ABI calls and inject into compilation.
     const lib_mode = options.output_mode == 1;
-    try zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode, options.builder_entry, options.analysis_context, options.arc_ownership, options.declared_caps);
+    try zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode, options.builder_entry, options.analysis_context, options.arc_ownership, options.declared_caps, options.progress);
 
     // Run Sema + codegen + link.
-    if (zir_compilation_update(ctx) != 0) {
+    const update_result = if (options.progress) |progress| blk: {
+        progress.event("Zig: semantic analysis, codegen, link\n", .{});
+        break :blk zir_compilation_update_with_progress(ctx);
+    } else zir_compilation_update(ctx);
+    if (update_result != 0) {
         zir_compilation_print_errors(ctx);
         return error.CompilationFailed;
+    }
+
+    if (options.incremental) {
+        try publishIncrementalOutput(allocator, ctx, options.output_path);
     }
 }
 
@@ -280,6 +401,112 @@ pub fn prepareUpdate(ctx: *ZirContext) CompileError!void {
     if (zir_compilation_prepare_update(ctx) != 0) {
         return error.CompilationFailed;
     }
+}
+
+/// Prepare only the selected injected struct modules, plus the synthetic root
+/// module when `include_root` is true. This is the incremental one-file-change
+/// path; unchanged modules keep their current ZIR and are not placed into
+/// Zig's `prev_zir` diff set.
+pub fn prepareSelectedUpdate(
+    allocator: std.mem.Allocator,
+    ctx: *ZirContext,
+    struct_names: []const []const u8,
+    include_root: bool,
+) CompileError!void {
+    var name_ptrs = allocator.alloc([*]const u8, struct_names.len) catch return error.OutOfMemory;
+    defer allocator.free(name_ptrs);
+    var name_lens = allocator.alloc(usize, struct_names.len) catch return error.OutOfMemory;
+    defer allocator.free(name_lens);
+
+    for (struct_names, 0..) |struct_name, index| {
+        name_ptrs[index] = struct_name.ptr;
+        name_lens[index] = struct_name.len;
+    }
+
+    if (zir_compilation_prepare_update_selected(ctx, name_ptrs.ptr, name_lens.ptr, struct_names.len, include_root) != 0) {
+        return error.CompilationFailed;
+    }
+}
+
+/// Abort a prepared incremental update before Zig's update phase starts,
+/// restoring the previous injected ZIR for every prepared module.
+pub fn abortUpdate(ctx: *ZirContext) CompileError!void {
+    if (zir_compilation_abort_update(ctx) != 0) {
+        return error.CompilationFailed;
+    }
+}
+
+fn runPreparedUpdate(
+    allocator: std.mem.Allocator,
+    ctx: *ZirContext,
+    options: CompileOptions,
+) CompileError!void {
+    const update_result = if (options.progress) |progress| blk: {
+        progress.event("Zig: semantic analysis, codegen, link\n", .{});
+        break :blk zir_compilation_update_with_progress(ctx);
+    } else zir_compilation_update(ctx);
+    if (update_result != 0) {
+        zir_compilation_print_errors(ctx);
+        abortUpdate(ctx) catch {};
+        return error.CompilationFailed;
+    }
+
+    if (options.incremental) {
+        try publishIncrementalOutput(allocator, ctx, options.output_path);
+    }
+}
+
+/// Inject ZIR after `prepareUpdate` and run the incremental update. If
+/// Zap-side ZIR construction or injection fails before Zig's update phase
+/// starts, the prepared context is rolled back to the prior ZIR baseline.
+pub fn injectPreparedAndUpdate(allocator: std.mem.Allocator, program: ir.Program, ctx: *ZirContext, options: CompileOptions) CompileError!void {
+    const lib_mode = options.output_mode == 1;
+    zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode, options.builder_entry, options.analysis_context, options.arc_ownership, options.declared_caps, options.progress) catch |inject_err| {
+        abortUpdate(ctx) catch |abort_err| {
+            std.debug.print(
+                "Error: failed to abort prepared incremental update after ZIR injection failure ({s}); context must be discarded: {s}\n",
+                .{ @errorName(inject_err), @errorName(abort_err) },
+            );
+            return error.CompilationFailed;
+        };
+        return inject_err;
+    };
+    try runPreparedUpdate(allocator, ctx, options);
+}
+
+/// Inject only the prepared modules and run the incremental update.
+pub fn injectPreparedSelectedAndUpdate(
+    allocator: std.mem.Allocator,
+    program: ir.Program,
+    ctx: *ZirContext,
+    options: CompileOptions,
+    struct_names: []const []const u8,
+    include_root: bool,
+) CompileError!void {
+    const lib_mode = options.output_mode == 1;
+    zir_builder.buildAndInjectSelected(
+        allocator,
+        program,
+        ctx,
+        lib_mode,
+        options.builder_entry,
+        options.analysis_context,
+        options.arc_ownership,
+        options.declared_caps,
+        options.progress,
+        struct_names,
+        include_root,
+    ) catch |inject_err| {
+        abortUpdate(ctx) catch |abort_err| {
+            std.debug.print(
+                "Error: failed to abort prepared incremental update after selective ZIR injection failure ({s}); context must be discarded: {s}\n",
+                .{ @errorName(inject_err), @errorName(abort_err) },
+            );
+            return error.CompilationFailed;
+        };
+        return inject_err;
+    };
+    try runPreparedUpdate(allocator, ctx, options);
 }
 
 /// Mark a named struct's root file as changed for incremental recompilation.
@@ -338,6 +565,9 @@ pub fn destroyContext(ctx: *ZirContext) void {
 /// For incremental use, call `createContext`, `injectAndUpdate`, `prepareUpdate`,
 /// and `destroyContext` separately.
 pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: CompileOptions) CompileError!void {
+    if (options.progress) |progress| {
+        progress.stage("ZIR: creating Zig compilation", .{});
+    }
     const ctx = try createContext(allocator, options);
     defer destroyContext(ctx);
     try injectAndUpdate(allocator, program, ctx, options);

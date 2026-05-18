@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ir = @import("ir.zig");
 const elision = @import("memory/elision.zig");
+const progress_mod = @import("progress.zig");
 const Allocator = std.mem.Allocator;
 
 const native_endian: std.builtin.Endian = builtin.cpu.arch.endian();
@@ -112,6 +113,7 @@ extern "c" fn zir_builder_emit_elem_val_imm(handle: ?*ZirBuilderHandle, operand:
 // Generic / conditional return composition
 extern "c" fn zir_builder_set_generic_return_type(handle: ?*ZirBuilderHandle) i32;
 extern "c" fn zir_builder_emit_cond_return(handle: ?*ZirBuilderHandle, condition: u32, value: u32) i32;
+extern "c" fn zir_builder_emit_dbg_stmt(handle: ?*ZirBuilderHandle, line: u32, column: u32) i32;
 
 // Runtime safety control (for guard error semantics)
 extern "c" fn zir_builder_emit_set_runtime_safety(handle: ?*ZirBuilderHandle, enabled: u32) bool;
@@ -198,6 +200,8 @@ extern "c" fn zir_builder_inject_struct(builder_handle: ?*ZirBuilderHandle, comp
 // Struct management
 extern "c" fn zir_compilation_add_struct(ctx: ?*ZirContext, name: [*:0]const u8, source_path: [*:0]const u8) i32;
 extern "c" fn zir_compilation_add_struct_source(ctx: ?*ZirContext, name: [*:0]const u8, source_ptr: [*]const u8, source_len: u32) i32;
+extern "c" fn zir_compilation_set_root_debug_source(ctx: ?*ZirContext, source_path_ptr: [*]const u8, source_path_len: u32) i32;
+extern "c" fn zir_compilation_set_struct_debug_source(ctx: ?*ZirContext, name_ptr: [*]const u8, name_len: u32, source_path_ptr: [*]const u8, source_path_len: u32) i32;
 
 // Pointer casting
 extern "c" fn zir_builder_emit_ptr_cast(handle: ?*ZirBuilderHandle, dest_type: u32, operand: u32) u32;
@@ -443,6 +447,11 @@ pub const ZirDriver = struct {
     /// declaration pointing to this function. start.zig checks for this
     /// declaration to activate the builder runtime.
     builder_entry: ?[]const u8 = null,
+    /// Optional incremental emission filter. When set, only these Zap struct
+    /// modules are emitted; the synthetic root is emitted separately according
+    /// to `selected_emit_root`.
+    selected_structs: ?[]const []const u8 = null,
+    selected_emit_root: bool = false,
     /// Tracks the dest local of the enclosing case_block so that case_break
     /// can propagate its result value to the correct destination.
     current_case_dest: ?ir.LocalId = null,
@@ -582,6 +591,8 @@ pub const ZirDriver = struct {
     capture_param_derived_closure_map: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// Compilation context for per-struct ZIR injection.
     compilation_ctx: ?*ZirContext = null,
+    /// Shared CLI progress reporter, owned by the command driver.
+    progress: ?*progress_mod.Reporter = null,
     /// Struct currently being emitted (e.g., "IO", "Zest_Case"). Null when emitting root.
     current_emit_struct: ?[]const u8 = null,
 
@@ -608,6 +619,14 @@ pub const ZirDriver = struct {
 
     pub fn deinit(self: *ZirDriver) void {
         zir_builder_destroy(self.handle);
+        self.deinitOwnedState();
+    }
+
+    fn deinitAfterHandleConsumed(self: *ZirDriver) void {
+        self.deinitOwnedState();
+    }
+
+    fn deinitOwnedState(self: *ZirDriver) void {
         self.local_refs.deinit(self.allocator);
         self.param_refs.deinit(self.allocator);
         self.closure_function_map.deinit(self.allocator);
@@ -1938,6 +1957,37 @@ pub const ZirDriver = struct {
 
     // -- Program emission -----------------------------------------------------
 
+    fn debugSourcePathForFunctions(functions: []const ir.Function) ?[]const u8 {
+        for (functions) |func| {
+            if (func.debug_source_path) |path| {
+                if (path.len > 0) return path;
+            }
+        }
+        return null;
+    }
+
+    fn selectiveEmissionEnabled(self: *const ZirDriver) bool {
+        return self.selected_structs != null;
+    }
+
+    fn shouldEmitStruct(self: *const ZirDriver, struct_name: []const u8) bool {
+        const selected = self.selected_structs orelse return true;
+        for (selected) |selected_name| {
+            if (std.mem.eql(u8, selected_name, struct_name)) return true;
+        }
+        return false;
+    }
+
+    fn shouldEmitRoot(self: *const ZirDriver) bool {
+        return if (self.selected_structs == null) true else self.selected_emit_root;
+    }
+
+    fn emitDebugStatement(self: *ZirDriver, func: ir.Function) !void {
+        if (zir_builder_emit_dbg_stmt(self.handle, func.debug_line, func.debug_column) != 0) {
+            return error.EmitFailed;
+        }
+    }
+
     pub fn buildProgram(self: *ZirDriver, program: ir.Program) !void {
         self.program = program;
         self.capture_closure_function_map.clearRetainingCapacity();
@@ -1946,6 +1996,7 @@ pub const ZirDriver = struct {
         const ctx = self.compilation_ctx;
 
         // ── Step 1: Group functions by struct ────────────────────────
+        if (self.progress) |progress| progress.stage("ZIR: grouping functions", .{});
         var struct_funcs = std.StringHashMap(std.ArrayListUnmanaged(ir.Function)).init(self.allocator);
         var root_funcs: std.ArrayListUnmanaged(ir.Function) = .empty;
         // Track every struct name we see (including namespace-only structs
@@ -2019,32 +2070,45 @@ pub const ZirDriver = struct {
         // that has no functions in this program (typically namespace parents
         // whose only purpose is to host children via re-export). This lets
         // `@import("...")` resolve them later.
-        if (ctx) |c| {
-            var name_iter2 = all_struct_names.iterator();
-            while (name_iter2.next()) |entry| {
-                const mod_name = entry.key_ptr.*;
-                if (!struct_funcs.contains(mod_name)) {
-                    const mod_name_z = try self.allocator.dupeZ(u8, mod_name);
-                    defer self.allocator.free(mod_name_z);
-                    const stub = "comptime {}\n";
-                    _ = zir_compilation_add_struct_source(c, mod_name_z, stub.ptr, @intCast(stub.len));
+        if (self.progress) |progress| progress.stage("ZIR: registering modules", .{});
+        if (!self.selectiveEmissionEnabled()) {
+            if (ctx) |c| {
+                var name_iter2 = all_struct_names.iterator();
+                while (name_iter2.next()) |entry| {
+                    const mod_name = entry.key_ptr.*;
+                    if (!struct_funcs.contains(mod_name)) {
+                        const mod_name_z = try self.allocator.dupeZ(u8, mod_name);
+                        defer self.allocator.free(mod_name_z);
+                        const stub = "comptime {}\n";
+                        _ = zir_compilation_add_struct_source(c, mod_name_z, stub.ptr, @intCast(stub.len));
+                    }
                 }
             }
         }
 
         // ── Step 3: Emit each leaf struct as its own ZIR struct ──────
+        const struct_total = struct_funcs.count();
+        var struct_index: usize = 0;
         if (ctx) |c| {
             var leaf_iter = struct_funcs.iterator();
             while (leaf_iter.next()) |entry| {
                 const mod_name = entry.key_ptr.*;
                 const funcs = entry.value_ptr.items;
                 if (funcs.len == 0) continue;
+                if (!self.shouldEmitStruct(mod_name)) continue;
+                struct_index += 1;
+                if (self.progress) |progress| progress.stage("ZIR: emitting struct {d}/{d} {s}", .{ struct_index, struct_total, mod_name });
 
                 const mod_name_z = try self.allocator.dupeZ(u8, mod_name);
                 defer self.allocator.free(mod_name_z);
                 const stub = "comptime {}\n";
                 if (zir_compilation_add_struct_source(c, mod_name_z, stub.ptr, @intCast(stub.len)) != 0) {
                     return error.ZirInjectionFailed;
+                }
+                if (debugSourcePathForFunctions(funcs)) |debug_source_path| {
+                    if (zir_compilation_set_struct_debug_source(c, mod_name.ptr, @intCast(mod_name.len), debug_source_path.ptr, @intCast(debug_source_path.len)) != 0) {
+                        return error.ZirInjectionFailed;
+                    }
                 }
 
                 const mod_handle = zir_builder_create() orelse return error.ZirCreateFailed;
@@ -2084,6 +2148,7 @@ pub const ZirDriver = struct {
             // are skipped there. Emit a fields-only ZIR file for
             // each such struct so its `@import` resolves to a
             // canonical type with this emission's `InternPool.Index`.
+            if (self.progress) |progress| progress.stage("ZIR: emitting field-only structs", .{});
             for (self.program.?.type_defs) |type_def| {
                 if (type_def.kind != .struct_def) continue;
                 const def = type_def.kind.struct_def;
@@ -2093,6 +2158,7 @@ pub const ZirDriver = struct {
                 if (std.mem.indexOf(u8, type_def.name, ".") != null) continue;
                 // Skip any struct already covered by Step 3.
                 if (struct_funcs.contains(type_def.name)) continue;
+                if (!self.shouldEmitStruct(type_def.name)) continue;
 
                 const struct_name_z = try self.allocator.dupeZ(u8, type_def.name);
                 defer self.allocator.free(struct_name_z);
@@ -2118,106 +2184,119 @@ pub const ZirDriver = struct {
 
             // ── Step 4: Generate namespace re-export structs ─────────
             // Skip parents that are also leaf structs (they already have ZIR injected).
-            var ns_iter = namespace_children.iterator();
-            while (ns_iter.next()) |entry| {
-                const parent_name = entry.key_ptr.*;
-                // If parent is a leaf struct with ZIR functions, skip re-export
-                // (can't overwrite its ZIR with source text)
-                if (struct_funcs.contains(parent_name)) continue;
-                // If parent is a namespace-only struct already registered as
-                // an empty stub above, the re-export source below will replace
-                // it — no extra work needed here.
-                if (all_struct_names.contains(parent_name) and !struct_funcs.contains(parent_name)) {
-                    // Replace the empty stub with the re-export source
-                }
+            if (!self.selectiveEmissionEnabled()) {
+                if (self.progress) |progress| progress.stage("ZIR: emitting namespace re-exports", .{});
+                var ns_iter = namespace_children.iterator();
+                while (ns_iter.next()) |entry| {
+                    const parent_name = entry.key_ptr.*;
+                    // If parent is a leaf struct with ZIR functions, skip re-export
+                    // (can't overwrite its ZIR with source text)
+                    if (struct_funcs.contains(parent_name)) continue;
+                    // If parent is a namespace-only struct already registered as
+                    // an empty stub above, the re-export source below will replace
+                    // it — no extra work needed here.
+                    if (all_struct_names.contains(parent_name) and !struct_funcs.contains(parent_name)) {
+                        // Replace the empty stub with the re-export source
+                    }
 
-                const children = entry.value_ptr.items;
-                var source_buf: std.ArrayListUnmanaged(u8) = .empty;
-                for (children) |child| {
-                    const line = try std.fmt.allocPrint(self.allocator, "pub const {s} = @import(\"{s}\");\n", .{ child.name, child.full_struct });
-                    try source_buf.appendSlice(self.allocator, line);
-                }
-                const source = try source_buf.toOwnedSlice(self.allocator);
+                    const children = entry.value_ptr.items;
+                    var source_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    for (children) |child| {
+                        const line = try std.fmt.allocPrint(self.allocator, "pub const {s} = @import(\"{s}\");\n", .{ child.name, child.full_struct });
+                        try source_buf.appendSlice(self.allocator, line);
+                    }
+                    const source = try source_buf.toOwnedSlice(self.allocator);
 
-                const parent_z = try self.allocator.dupeZ(u8, parent_name);
-                defer self.allocator.free(parent_z);
-                // This will overwrite the empty stub if already registered
-                if (zir_compilation_add_struct_source(c, parent_z, source.ptr, @intCast(source.len)) != 0) {
-                    return error.ZirInjectionFailed;
+                    const parent_z = try self.allocator.dupeZ(u8, parent_name);
+                    defer self.allocator.free(parent_z);
+                    // This will overwrite the empty stub if already registered
+                    if (zir_compilation_add_struct_source(c, parent_z, source.ptr, @intCast(source.len)) != 0) {
+                        return error.ZirInjectionFailed;
+                    }
                 }
             }
         }
 
         // ── Step 5: Emit root struct functions ───────────────────────
-        self.current_emit_struct = null;
-        for (root_funcs.items) |func| {
-            self.reuse_backed_struct_locals.clearRetainingCapacity();
-            self.reuse_backed_union_locals.clearRetainingCapacity();
-            self.reuse_backed_tuple_locals.clearRetainingCapacity();
-            self.emitFunction(func) catch |err| {
-                std.log.err("ZIR emit failed for function {s}: {s}", .{ func.name, @errorName(err) });
-                return err;
-            };
-        }
-
-        // In builder mode, emit a zap_builder_entry function that delegates
-        // to the configured entry point. start.zig checks for this declaration
-        // to activate the builder runtime.
-        if (self.builder_entry) |entry_name| {
-            // Emit zap_builder_entry() — detected by start.zig via @hasDecl.
-            //
-            // This function calls BuilderRuntime.buildAndSerialize which:
-            // 1. Reads std.os.argv
-            // 2. Constructs Zap.Env from argv
-            // 3. Returns the env struct
-            //
-            // Then we call the manifest function with that env,
-            // and pass the result to BuilderRuntime.serializeManifest.
-            const marker_name = "zap_builder_entry";
-            if (zir_builder_begin_func(self.handle, marker_name.ptr, @intCast(marker_name.len), 0) != 0) {
-                return error.BeginFuncFailed;
+        if (self.shouldEmitRoot()) {
+            if (self.progress) |progress| progress.stage("ZIR: emitting root functions", .{});
+            self.current_emit_struct = null;
+            if (ctx) |c| {
+                if (debugSourcePathForFunctions(root_funcs.items)) |debug_source_path| {
+                    if (zir_compilation_set_root_debug_source(c, debug_source_path.ptr, @intCast(debug_source_path.len)) != 0) {
+                        return error.ZirInjectionFailed;
+                    }
+                }
+            }
+            for (root_funcs.items) |func| {
+                self.reuse_backed_struct_locals.clearRetainingCapacity();
+                self.reuse_backed_union_locals.clearRetainingCapacity();
+                self.reuse_backed_tuple_locals.clearRetainingCapacity();
+                self.emitFunction(func) catch |err| {
+                    std.log.err("ZIR emit failed for function {s}: {s}", .{ func.name, @errorName(err) });
+                    return err;
+                };
             }
 
-            // Get runtime: @import("zap_runtime")
-            const rt = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-            if (rt == error_ref) return error.EmitFailed;
+            // In builder mode, emit a zap_builder_entry function that delegates
+            // to the configured entry point. start.zig checks for this declaration
+            // to activate the builder runtime.
+            if (self.builder_entry) |entry_name| {
+                // Emit zap_builder_entry() — detected by start.zig via @hasDecl.
+                //
+                // This function calls BuilderRuntime.buildAndSerialize which:
+                // 1. Reads std.os.argv
+                // 2. Constructs Zap.Env from argv
+                // 3. Returns the env struct
+                //
+                // Then we call the manifest function with that env,
+                // and pass the result to BuilderRuntime.serializeManifest.
+                const marker_name = "zap_builder_entry";
+                if (zir_builder_begin_func(self.handle, marker_name.ptr, @intCast(marker_name.len), 0) != 0) {
+                    return error.BeginFuncFailed;
+                }
 
-            // Generated builder binaries use the rewritten runtime
-            // source whose dispatchers compile away lazy startup.
-            // Emit the explicit prologue before any BuilderRuntime
-            // helper can touch runtime-managed memory.
-            try self.emitMemoryStartupForEntryFromRuntime(rt);
+                // Get runtime: @import("zap_runtime")
+                const rt = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt == error_ref) return error.EmitFailed;
 
-            // Call BuilderRuntime.buildEnvFromArgv() → returns env struct
-            const builder_rt = emitRuntimeNamespaceField(self.handle, rt, runtime_ns.builder_runtime);
-            if (builder_rt == error_ref) return error.EmitFailed;
-            const build_env_fn = zir_builder_emit_field_val(self.handle, builder_rt, "buildEnvFromArgv", 16);
-            if (build_env_fn == error_ref) return error.EmitFailed;
-            const env = zir_builder_emit_call_ref(self.handle, build_env_fn, &.{}, 0);
-            if (env == error_ref) return error.EmitFailed;
+                // Generated builder binaries use the rewritten runtime
+                // source whose dispatchers compile away lazy startup.
+                // Emit the explicit prologue before any BuilderRuntime
+                // helper can touch runtime-managed memory.
+                try self.emitMemoryStartupForEntryFromRuntime(rt);
 
-            // Call manifest(env) — the user's entry point
-            const manifest_args = [_]u32{env};
-            const manifest = zir_builder_emit_call(
-                self.handle,
-                entry_name.ptr,
-                @intCast(entry_name.len),
-                &manifest_args,
-                1,
-            );
-            if (manifest == error_ref) return error.EmitFailed;
+                // Call BuilderRuntime.buildEnvFromArgv() → returns env struct
+                const builder_rt = emitRuntimeNamespaceField(self.handle, rt, runtime_ns.builder_runtime);
+                if (builder_rt == error_ref) return error.EmitFailed;
+                const build_env_fn = zir_builder_emit_field_val(self.handle, builder_rt, "buildEnvFromArgv", 16);
+                if (build_env_fn == error_ref) return error.EmitFailed;
+                const env = zir_builder_emit_call_ref(self.handle, build_env_fn, &.{}, 0);
+                if (env == error_ref) return error.EmitFailed;
 
-            // Call BuilderRuntime.serializeManifest(manifest)
-            const serialize_fn = zir_builder_emit_field_val(self.handle, builder_rt, "serializeManifest", 17);
-            if (serialize_fn == error_ref) return error.EmitFailed;
-            const ser_args = [_]u32{manifest};
-            _ = zir_builder_emit_call_ref(self.handle, serialize_fn, &ser_args, 1);
+                // Call manifest(env) — the user's entry point
+                const manifest_args = [_]u32{env};
+                const manifest = zir_builder_emit_call(
+                    self.handle,
+                    entry_name.ptr,
+                    @intCast(entry_name.len),
+                    &manifest_args,
+                    1,
+                );
+                if (manifest == error_ref) return error.EmitFailed;
 
-            if (zir_builder_emit_ret_void(self.handle) != 0) {
-                return error.EmitFailed;
-            }
-            if (zir_builder_end_func(self.handle) != 0) {
-                return error.EndFuncFailed;
+                // Call BuilderRuntime.serializeManifest(manifest)
+                const serialize_fn = zir_builder_emit_field_val(self.handle, builder_rt, "serializeManifest", 17);
+                if (serialize_fn == error_ref) return error.EmitFailed;
+                const ser_args = [_]u32{manifest};
+                _ = zir_builder_emit_call_ref(self.handle, serialize_fn, &ser_args, 1);
+
+                if (zir_builder_emit_ret_void(self.handle) != 0) {
+                    return error.EmitFailed;
+                }
+                if (zir_builder_end_func(self.handle) != 0) {
+                    return error.EndFuncFailed;
+                }
             }
         }
     }
@@ -3502,6 +3581,8 @@ pub const ZirDriver = struct {
             _ = try self.ensureListMethodRef(list_cell, "length", &self.cached_list_length_ref);
             _ = try self.ensureListMethodRef(list_cell, "get", &self.cached_list_get_ref);
         }
+
+        try self.emitDebugStatement(func);
 
         // Loopification prologue: when the function has by-ref params
         // and self-tail-calls, wrap the body in a `loop` block and
@@ -8362,8 +8443,10 @@ pub fn buildAndInject(
     analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext,
     arc_ownership: ?*const @import("arc_liveness.zig").ProgramArcOwnership,
     declared_caps: u64,
+    progress: ?*progress_mod.Reporter,
 ) BuildError!void {
     // Register the runtime struct if a path was provided.
+    if (progress) |reporter| reporter.stage("ZIR: registering runtime", .{});
     if (runtime_path) |rpath| {
         if (zir_compilation_add_struct(compilation_ctx, "zap_runtime", rpath) != 0) {
             return error.ZirInjectionFailed;
@@ -8377,6 +8460,7 @@ pub fn buildAndInject(
     driver.arc_ownership = arc_ownership;
     driver.declared_caps = declared_caps;
     driver.compilation_ctx = compilation_ctx;
+    driver.progress = progress;
 
     driver.buildProgram(program) catch |err| {
         driver.deinit(); // destroy builder on error path
@@ -8385,13 +8469,57 @@ pub fn buildAndInject(
 
     // zir_builder_inject consumes the builder handle (frees it internally),
     // so we must NOT call zir_builder_destroy afterward.
+    if (progress) |reporter| reporter.stage("ZIR: injecting modules", .{});
     const result = zir_builder_inject(driver.handle, compilation_ctx);
 
-    // Only clean up local_refs — handle was already freed by inject.
-    driver.local_refs.deinit(allocator);
-
     if (result != 0) {
+        driver.deinit();
         return error.ZirInjectionFailed;
+    }
+    // Only clean up Zap-side state — the C ABI consumed the builder handle.
+    driver.deinitAfterHandleConsumed();
+}
+
+pub fn buildAndInjectSelected(
+    allocator: Allocator,
+    program: ir.Program,
+    compilation_ctx: *ZirContext,
+    lib_mode: bool,
+    builder_entry: ?[]const u8,
+    analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext,
+    arc_ownership: ?*const @import("arc_liveness.zig").ProgramArcOwnership,
+    declared_caps: u64,
+    progress: ?*progress_mod.Reporter,
+    selected_structs: []const []const u8,
+    include_root: bool,
+) BuildError!void {
+    var driver = try ZirDriver.init(allocator);
+    driver.lib_mode = lib_mode;
+    driver.builder_entry = builder_entry;
+    driver.analysis_context = analysis_context;
+    driver.arc_ownership = arc_ownership;
+    driver.declared_caps = declared_caps;
+    driver.compilation_ctx = compilation_ctx;
+    driver.progress = progress;
+    driver.selected_structs = selected_structs;
+    driver.selected_emit_root = include_root;
+
+    driver.buildProgram(program) catch |err| {
+        driver.deinit();
+        return err;
+    };
+
+    if (include_root) {
+        if (progress) |reporter| reporter.stage("ZIR: injecting selected modules and root", .{});
+        const result = zir_builder_inject(driver.handle, compilation_ctx);
+        if (result != 0) {
+            driver.deinit();
+            return error.ZirInjectionFailed;
+        }
+        driver.deinitAfterHandleConsumed();
+    } else {
+        if (progress) |reporter| reporter.stage("ZIR: injecting selected modules", .{});
+        driver.deinit();
     }
 }
 

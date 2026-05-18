@@ -100,6 +100,145 @@ pub const Program = struct {
     entry: ?FunctionId,
 };
 
+const CloneError = std.mem.Allocator.Error;
+
+pub fn cloneProgram(allocator: std.mem.Allocator, program: Program) CloneError!Program {
+    const functions = try allocator.alloc(Function, program.functions.len);
+    errdefer allocator.free(functions);
+    for (program.functions, 0..) |function, index| {
+        functions[index] = try cloneFunction(allocator, function);
+    }
+
+    const type_defs = try allocator.alloc(TypeDef, program.type_defs.len);
+    errdefer allocator.free(type_defs);
+    for (program.type_defs, 0..) |type_def, index| {
+        type_defs[index] = try cloneTypeDef(allocator, type_def);
+    }
+
+    return .{
+        .functions = functions,
+        .type_defs = type_defs,
+        .entry = program.entry,
+    };
+}
+
+fn cloneBytes(allocator: std.mem.Allocator, bytes: []const u8) CloneError![]const u8 {
+    if (bytes.len == 0) return "";
+    return try allocator.dupe(u8, bytes);
+}
+
+fn cloneOptionalBytes(allocator: std.mem.Allocator, bytes: ?[]const u8) CloneError!?[]const u8 {
+    return if (bytes) |value| try cloneBytes(allocator, value) else null;
+}
+
+fn clonePlainSlice(comptime T: type, allocator: std.mem.Allocator, values: []const T) CloneError![]const T {
+    if (values.len == 0) return &.{};
+    return try allocator.dupe(T, values);
+}
+
+fn cloneMutableSlice(comptime T: type, allocator: std.mem.Allocator, values: []const T) CloneError![]T {
+    if (values.len == 0) return &.{};
+    return try allocator.dupe(T, values);
+}
+
+fn cloneStringSlice(allocator: std.mem.Allocator, values: []const []const u8) CloneError![]const []const u8 {
+    if (values.len == 0) return &.{};
+    const cloned = try allocator.alloc([]const u8, values.len);
+    for (values, 0..) |value, index| {
+        cloned[index] = try cloneBytes(allocator, value);
+    }
+    return cloned;
+}
+
+fn cloneZigTypePtr(allocator: std.mem.Allocator, value: *const ZigType) CloneError!*const ZigType {
+    const cloned = try allocator.create(ZigType);
+    cloned.* = try cloneZigType(allocator, value.*);
+    return cloned;
+}
+
+fn cloneZigTypeSlice(allocator: std.mem.Allocator, values: []const ZigType) CloneError![]const ZigType {
+    if (values.len == 0) return &.{};
+    const cloned = try allocator.alloc(ZigType, values.len);
+    for (values, 0..) |value, index| {
+        cloned[index] = try cloneZigType(allocator, value);
+    }
+    return cloned;
+}
+
+fn cloneZigType(allocator: std.mem.Allocator, value: ZigType) CloneError!ZigType {
+    return switch (value) {
+        .tuple => |items| .{ .tuple = try cloneZigTypeSlice(allocator, items) },
+        .list => |item| .{ .list = try cloneZigTypePtr(allocator, item) },
+        .map => |map_type| .{ .map = .{
+            .key = try cloneZigTypePtr(allocator, map_type.key),
+            .value = try cloneZigTypePtr(allocator, map_type.value),
+        } },
+        .struct_ref => |name| .{ .struct_ref = try cloneBytes(allocator, name) },
+        .function => |fn_type| .{ .function = .{
+            .params = try cloneZigTypeSlice(allocator, fn_type.params),
+            .return_type = try cloneZigTypePtr(allocator, fn_type.return_type),
+        } },
+        .tagged_union => |name| .{ .tagged_union = try cloneBytes(allocator, name) },
+        .optional => |item| .{ .optional = try cloneZigTypePtr(allocator, item) },
+        .ptr => |item| .{ .ptr = try cloneZigTypePtr(allocator, item) },
+        else => value,
+    };
+}
+
+fn cloneDefaultValue(allocator: std.mem.Allocator, value: DefaultValue) CloneError!DefaultValue {
+    return switch (value) {
+        .string => |string| .{ .string = try cloneBytes(allocator, string) },
+        else => value,
+    };
+}
+
+fn cloneOptionalDefaultValue(allocator: std.mem.Allocator, value: ?DefaultValue) CloneError!?DefaultValue {
+    return if (value) |default_value| try cloneDefaultValue(allocator, default_value) else null;
+}
+
+fn cloneTypeDef(allocator: std.mem.Allocator, type_def: TypeDef) CloneError!TypeDef {
+    return .{
+        .name = try cloneBytes(allocator, type_def.name),
+        .kind = switch (type_def.kind) {
+            .struct_def => |struct_def| .{ .struct_def = .{
+                .fields = try cloneStructFieldDefs(allocator, struct_def.fields),
+            } },
+            .enum_def => |enum_def| .{ .enum_def = .{
+                .variants = try cloneStringSlice(allocator, enum_def.variants),
+            } },
+            .union_def => |union_def| .{ .union_def = .{
+                .variants = try cloneUnionVariants(allocator, union_def.variants),
+            } },
+        },
+    };
+}
+
+fn cloneStructFieldDefs(allocator: std.mem.Allocator, fields: []const StructFieldDef) CloneError![]const StructFieldDef {
+    if (fields.len == 0) return &.{};
+    const cloned = try allocator.alloc(StructFieldDef, fields.len);
+    for (fields, 0..) |field, index| {
+        cloned[index] = .{
+            .name = try cloneBytes(allocator, field.name),
+            .type_expr = try cloneZigType(allocator, field.type_expr),
+            .default_value = try cloneOptionalDefaultValue(allocator, field.default_value),
+            .storage = field.storage,
+        };
+    }
+    return cloned;
+}
+
+fn cloneUnionVariants(allocator: std.mem.Allocator, variants: []const UnionVariant) CloneError![]const UnionVariant {
+    if (variants.len == 0) return &.{};
+    const cloned = try allocator.alloc(UnionVariant, variants.len);
+    for (variants, 0..) |variant, index| {
+        cloned[index] = .{
+            .name = try cloneBytes(allocator, variant.name),
+            .type_name = try cloneOptionalBytes(allocator, variant.type_name),
+        };
+    }
+    return cloned;
+}
+
 /// Per-value ownership classification at IR sites that produce or
 /// reference ARC-managed cells (parameters, locals, call results,
 /// aggregate arm results, captures, and return values).
@@ -188,6 +327,13 @@ pub const Function = struct {
     /// identify the source function group and source clause it lowers.
     source_group_id: ?FunctionId = null,
     source_clause_index: ?u32 = null,
+    /// Source-language debug file for DWARF. Null keeps the generated
+    /// synthetic Zig file path.
+    debug_source_path: ?[]const u8 = null,
+    /// Zero-based source-language line/column for the first executable
+    /// statement in this function. ZIR/AIR add one when emitting DWARF.
+    debug_line: u32 = 0,
+    debug_column: u32 = 0,
     /// Struct this function belongs to (e.g., "IO", "Zest_Runtime"). Null for top-level.
     struct_name: ?[]const u8 = null,
     /// Function name within its struct, with arity suffix (e.g., "puts__1"). Used for per-struct ZIR emission.
@@ -242,6 +388,43 @@ pub const Function = struct {
     result_convention: ResultConvention = .trivial,
 };
 
+fn cloneFunction(allocator: std.mem.Allocator, function: Function) CloneError!Function {
+    return .{
+        .id = function.id,
+        .name = try cloneBytes(allocator, function.name),
+        .source_group_id = function.source_group_id,
+        .source_clause_index = function.source_clause_index,
+        .debug_source_path = try cloneOptionalBytes(allocator, function.debug_source_path),
+        .debug_line = function.debug_line,
+        .debug_column = function.debug_column,
+        .struct_name = try cloneOptionalBytes(allocator, function.struct_name),
+        .local_name = try cloneBytes(allocator, function.local_name),
+        .scope_id = function.scope_id,
+        .arity = function.arity,
+        .params = try cloneParams(allocator, function.params),
+        .return_type = try cloneZigType(allocator, function.return_type),
+        .return_type_id = function.return_type_id,
+        .body = try cloneBlocks(allocator, function.body),
+        .is_closure = function.is_closure,
+        .captures = try cloneCaptures(allocator, function.captures),
+        .local_count = function.local_count,
+        .defaults = try cloneDefaultValues(allocator, function.defaults),
+        .loopify = function.loopify,
+        .param_conventions = try clonePlainSlice(ParamConvention, allocator, function.param_conventions),
+        .local_ownership = try cloneMutableSlice(OwnershipClass, allocator, function.local_ownership),
+        .result_convention = function.result_convention,
+    };
+}
+
+fn cloneDefaultValues(allocator: std.mem.Allocator, values: []const DefaultValue) CloneError![]const DefaultValue {
+    if (values.len == 0) return &.{};
+    const cloned = try allocator.alloc(DefaultValue, values.len);
+    for (values, 0..) |value, index| {
+        cloned[index] = try cloneDefaultValue(allocator, value);
+    }
+    return cloned;
+}
+
 pub const DefaultValue = union(enum) {
     int: i64,
     float: f64,
@@ -257,6 +440,19 @@ pub const Param = struct {
     type_id: ?types_mod.TypeId = null,
 };
 
+fn cloneParams(allocator: std.mem.Allocator, params: []const Param) CloneError![]const Param {
+    if (params.len == 0) return &.{};
+    const cloned = try allocator.alloc(Param, params.len);
+    for (params, 0..) |param, index| {
+        cloned[index] = .{
+            .name = try cloneBytes(allocator, param.name),
+            .type_expr = try cloneZigType(allocator, param.type_expr),
+            .type_id = param.type_id,
+        };
+    }
+    return cloned;
+}
+
 const OptionalDispatchCandidate = struct {
     struct_name: []const u8,
     struct_type_id: types_mod.TypeId,
@@ -269,10 +465,35 @@ pub const Capture = struct {
     ownership: hir_mod.Ownership,
 };
 
+fn cloneCaptures(allocator: std.mem.Allocator, captures: []const Capture) CloneError![]const Capture {
+    if (captures.len == 0) return &.{};
+    const cloned = try allocator.alloc(Capture, captures.len);
+    for (captures, 0..) |capture, index| {
+        cloned[index] = .{
+            .name = try cloneBytes(allocator, capture.name),
+            .type_expr = try cloneZigType(allocator, capture.type_expr),
+            .ownership = capture.ownership,
+        };
+    }
+    return cloned;
+}
+
 pub const Block = struct {
     label: LabelId,
     instructions: []const Instruction,
 };
+
+fn cloneBlocks(allocator: std.mem.Allocator, blocks: []const Block) CloneError![]const Block {
+    if (blocks.len == 0) return &.{};
+    const cloned = try allocator.alloc(Block, blocks.len);
+    for (blocks, 0..) |block, index| {
+        cloned[index] = .{
+            .label = block.label,
+            .instructions = try cloneInstructions(allocator, block.instructions),
+        };
+    }
+    return cloned;
+}
 
 // ============================================================
 // Instructions (spec §19.2)
@@ -405,6 +626,314 @@ pub const Instruction = union(enum) {
     // Phi
     phi: Phi,
 };
+
+fn cloneInstructions(allocator: std.mem.Allocator, instructions: []const Instruction) CloneError![]const Instruction {
+    if (instructions.len == 0) return &.{};
+    const cloned = try allocator.alloc(Instruction, instructions.len);
+    for (instructions, 0..) |instruction, index| {
+        cloned[index] = try cloneInstruction(allocator, instruction);
+    }
+    return cloned;
+}
+
+fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) CloneError!Instruction {
+    return switch (instruction) {
+        .const_int => |value| .{ .const_int = .{
+            .dest = value.dest,
+            .value = value.value,
+            .type_hint = if (value.type_hint) |hint| try cloneZigType(allocator, hint) else null,
+        } },
+        .const_float => |value| .{ .const_float = .{
+            .dest = value.dest,
+            .value = value.value,
+            .type_hint = if (value.type_hint) |hint| try cloneZigType(allocator, hint) else null,
+        } },
+        .const_string => |value| .{ .const_string = .{
+            .dest = value.dest,
+            .value = try cloneBytes(allocator, value.value),
+        } },
+        .const_bool,
+        .const_nil,
+        .local_get,
+        .local_set,
+        .move_value,
+        .share_value,
+        .param_get,
+        .borrow_value,
+        .copy_value,
+        .field_set,
+        .index_get,
+        .binary_op,
+        .unary_op,
+        .error_catch,
+        .set_safety,
+        .branch,
+        .cond_branch,
+        .match_int,
+        .match_float,
+        .match_error_return,
+        .ret,
+        .cond_return,
+        .case_break,
+        .jump,
+        .capture_get,
+        .optional_unwrap,
+        .bin_len_check,
+        .bin_read_int,
+        .bin_read_float,
+        .bin_slice,
+        .bin_read_utf8,
+        .retain,
+        .release,
+        .reset,
+        => instruction,
+        .const_atom => |value| .{ .const_atom = .{
+            .dest = value.dest,
+            .value = try cloneBytes(allocator, value.value),
+        } },
+        .tuple_init => |value| .{ .tuple_init = .{
+            .dest = value.dest,
+            .elements = try clonePlainSlice(LocalId, allocator, value.elements),
+            .component_types = if (value.component_types) |types| try cloneZigTypeSlice(allocator, types) else null,
+            .reuse_token = value.reuse_token,
+        } },
+        .list_init => |value| .{ .list_init = .{
+            .dest = value.dest,
+            .elements = try clonePlainSlice(LocalId, allocator, value.elements),
+            .element_type = try cloneZigType(allocator, value.element_type),
+        } },
+        .list_cons => |value| .{ .list_cons = .{
+            .dest = value.dest,
+            .head = value.head,
+            .tail = value.tail,
+            .element_type = try cloneZigType(allocator, value.element_type),
+        } },
+        .map_init => |value| .{ .map_init = .{
+            .dest = value.dest,
+            .entries = try clonePlainSlice(MapEntry, allocator, value.entries),
+            .key_type = try cloneZigType(allocator, value.key_type),
+            .value_type = try cloneZigType(allocator, value.value_type),
+        } },
+        .struct_init => |value| .{ .struct_init = .{
+            .dest = value.dest,
+            .type_name = try cloneBytes(allocator, value.type_name),
+            .fields = try cloneStructFieldInits(allocator, value.fields),
+            .reuse_token = value.reuse_token,
+        } },
+        .union_init => |value| .{ .union_init = .{
+            .dest = value.dest,
+            .union_type = try cloneBytes(allocator, value.union_type),
+            .variant_name = try cloneBytes(allocator, value.variant_name),
+            .value = value.value,
+            .reuse_token = value.reuse_token,
+        } },
+        .enum_literal => |value| .{ .enum_literal = .{
+            .dest = value.dest,
+            .type_name = try cloneBytes(allocator, value.type_name),
+            .variant = try cloneBytes(allocator, value.variant),
+        } },
+        .field_get => |value| .{ .field_get = .{
+            .dest = value.dest,
+            .object = value.object,
+            .field = try cloneBytes(allocator, value.field),
+            .struct_type = try cloneOptionalBytes(allocator, value.struct_type),
+        } },
+        .list_len_check => |value| .{ .list_len_check = .{
+            .dest = value.dest,
+            .scrutinee = value.scrutinee,
+            .expected_len = value.expected_len,
+            .minimum = value.minimum,
+            .element_type = try cloneZigType(allocator, value.element_type),
+            .via_helper = value.via_helper,
+        } },
+        .list_get => |value| .{ .list_get = .{
+            .dest = value.dest,
+            .list = value.list,
+            .index = value.index,
+            .element_type = try cloneZigType(allocator, value.element_type),
+            .via_helper = value.via_helper,
+        } },
+        .list_is_not_empty => |value| .{ .list_is_not_empty = .{
+            .dest = value.dest,
+            .list = value.list,
+            .element_type = try cloneZigType(allocator, value.element_type),
+            .via_helper = value.via_helper,
+        } },
+        .list_head => |value| .{ .list_head = try cloneListHeadTail(allocator, value) },
+        .list_tail => |value| .{ .list_tail = try cloneListHeadTail(allocator, value) },
+        .map_has_key => |value| .{ .map_has_key = .{
+            .dest = value.dest,
+            .map = value.map,
+            .key = value.key,
+            .key_type = try cloneZigType(allocator, value.key_type),
+            .value_type = try cloneZigType(allocator, value.value_type),
+        } },
+        .map_get => |value| .{ .map_get = .{
+            .dest = value.dest,
+            .map = value.map,
+            .key = value.key,
+            .default = value.default,
+            .key_type = try cloneZigType(allocator, value.key_type),
+            .value_type = try cloneZigType(allocator, value.value_type),
+        } },
+        .call_direct => |value| .{ .call_direct = .{
+            .dest = value.dest,
+            .function = value.function,
+            .clause_index = value.clause_index,
+            .args = try clonePlainSlice(LocalId, allocator, value.args),
+            .arg_modes = try clonePlainSlice(ValueMode, allocator, value.arg_modes),
+        } },
+        .call_named => |value| .{ .call_named = .{
+            .dest = value.dest,
+            .name = try cloneBytes(allocator, value.name),
+            .args = try clonePlainSlice(LocalId, allocator, value.args),
+            .arg_modes = try clonePlainSlice(ValueMode, allocator, value.arg_modes),
+        } },
+        .call_closure => |value| .{ .call_closure = .{
+            .dest = value.dest,
+            .callee = value.callee,
+            .args = try clonePlainSlice(LocalId, allocator, value.args),
+            .arg_modes = try clonePlainSlice(ValueMode, allocator, value.arg_modes),
+            .return_type = try cloneZigType(allocator, value.return_type),
+        } },
+        .call_dispatch => |value| .{ .call_dispatch = .{
+            .dest = value.dest,
+            .group_id = value.group_id,
+            .args = try clonePlainSlice(LocalId, allocator, value.args),
+            .arg_modes = try clonePlainSlice(ValueMode, allocator, value.arg_modes),
+        } },
+        .call_builtin => |value| .{ .call_builtin = .{
+            .dest = value.dest,
+            .name = try cloneBytes(allocator, value.name),
+            .args = try clonePlainSlice(LocalId, allocator, value.args),
+            .arg_modes = try clonePlainSlice(ValueMode, allocator, value.arg_modes),
+            .result_type = try cloneZigType(allocator, value.result_type),
+        } },
+        .tail_call => |value| .{ .tail_call = .{
+            .name = try cloneBytes(allocator, value.name),
+            .args = try clonePlainSlice(LocalId, allocator, value.args),
+        } },
+        .try_call_named => |value| .{ .try_call_named = .{
+            .dest = value.dest,
+            .name = try cloneBytes(allocator, value.name),
+            .args = try clonePlainSlice(LocalId, allocator, value.args),
+            .arg_modes = try clonePlainSlice(ValueMode, allocator, value.arg_modes),
+            .input_local = value.input_local,
+            .handler_instrs = try cloneInstructions(allocator, value.handler_instrs),
+            .handler_result = value.handler_result,
+            .success_instrs = try cloneInstructions(allocator, value.success_instrs),
+            .success_result = value.success_result,
+            .payload_local = value.payload_local,
+        } },
+        .if_expr => |value| .{ .if_expr = .{
+            .dest = value.dest,
+            .condition = value.condition,
+            .then_instrs = try cloneInstructions(allocator, value.then_instrs),
+            .then_result = value.then_result,
+            .else_instrs = try cloneInstructions(allocator, value.else_instrs),
+            .else_result = value.else_result,
+        } },
+        .guard_block => |value| .{ .guard_block = .{
+            .condition = value.condition,
+            .body = try cloneInstructions(allocator, value.body),
+        } },
+        .case_block => |value| .{ .case_block = .{
+            .dest = value.dest,
+            .pre_instrs = try cloneInstructions(allocator, value.pre_instrs),
+            .arms = try cloneIrCaseArms(allocator, value.arms),
+            .default_instrs = try cloneInstructions(allocator, value.default_instrs),
+            .default_result = value.default_result,
+        } },
+        .switch_tag => |value| .{ .switch_tag = .{
+            .scrutinee = value.scrutinee,
+            .cases = try cloneTagCases(allocator, value.cases),
+            .default = value.default,
+        } },
+        .switch_literal => |value| .{ .switch_literal = .{
+            .dest = value.dest,
+            .scrutinee = value.scrutinee,
+            .cases = try cloneLitCases(allocator, value.cases),
+            .default_instrs = try cloneInstructions(allocator, value.default_instrs),
+            .default_result = value.default_result,
+        } },
+        .switch_return => |value| .{ .switch_return = .{
+            .scrutinee_param = value.scrutinee_param,
+            .cases = try cloneReturnCases(allocator, value.cases),
+            .default_instrs = try cloneInstructions(allocator, value.default_instrs),
+            .default_result = value.default_result,
+        } },
+        .union_switch_return => |value| .{ .union_switch_return = .{
+            .scrutinee_param = value.scrutinee_param,
+            .cases = try cloneUnionCases(allocator, value.cases),
+        } },
+        .union_switch => |value| .{ .union_switch = .{
+            .dest = value.dest,
+            .scrutinee = value.scrutinee,
+            .cases = try cloneUnionCases(allocator, value.cases),
+        } },
+        .optional_dispatch => |value| .{ .optional_dispatch = .{
+            .scrutinee_param = value.scrutinee_param,
+            .payload_local = value.payload_local,
+            .nil_instrs = try cloneInstructions(allocator, value.nil_instrs),
+            .nil_result = value.nil_result,
+            .struct_instrs = try cloneInstructions(allocator, value.struct_instrs),
+            .struct_result = value.struct_result,
+        } },
+        .match_atom => |value| .{ .match_atom = .{
+            .dest = value.dest,
+            .scrutinee = value.scrutinee,
+            .atom_name = try cloneBytes(allocator, value.atom_name),
+            .skip_type_check = value.skip_type_check,
+        } },
+        .match_string => |value| .{ .match_string = .{
+            .dest = value.dest,
+            .scrutinee = value.scrutinee,
+            .expected = try cloneBytes(allocator, value.expected),
+            .skip_type_check = value.skip_type_check,
+        } },
+        .match_type => |value| .{ .match_type = .{
+            .dest = value.dest,
+            .scrutinee = value.scrutinee,
+            .expected_type = try cloneZigType(allocator, value.expected_type),
+            .skip_type_check = value.skip_type_check,
+            .expected_arity = value.expected_arity,
+        } },
+        .match_fail => |value| .{ .match_fail = .{
+            .message = try cloneBytes(allocator, value.message),
+            .message_local = value.message_local,
+        } },
+        .make_closure => |value| .{ .make_closure = .{
+            .dest = value.dest,
+            .function = value.function,
+            .captures = try clonePlainSlice(LocalId, allocator, value.captures),
+        } },
+        .bin_match_prefix => |value| .{ .bin_match_prefix = .{
+            .dest = value.dest,
+            .source = value.source,
+            .expected = try cloneBytes(allocator, value.expected),
+        } },
+        .reuse_alloc => |value| .{ .reuse_alloc = .{
+            .dest = value.dest,
+            .token = value.token,
+            .constructor_tag = value.constructor_tag,
+            .dest_type = try cloneZigType(allocator, value.dest_type),
+        } },
+        .int_widen => |value| .{ .int_widen = .{
+            .dest = value.dest,
+            .source = value.source,
+            .dest_type = try cloneZigType(allocator, value.dest_type),
+        } },
+        .float_widen => |value| .{ .float_widen = .{
+            .dest = value.dest,
+            .source = value.source,
+            .dest_type = try cloneZigType(allocator, value.dest_type),
+        } },
+        .phi => |value| .{ .phi = .{
+            .dest = value.dest,
+            .sources = try clonePlainSlice(PhiSource, allocator, value.sources),
+        } },
+    };
+}
 
 pub const ConstInt = struct {
     dest: LocalId,
@@ -551,6 +1080,18 @@ pub const StructFieldInit = struct {
     value: LocalId,
 };
 
+fn cloneStructFieldInits(allocator: std.mem.Allocator, fields: []const StructFieldInit) CloneError![]const StructFieldInit {
+    if (fields.len == 0) return &.{};
+    const cloned = try allocator.alloc(StructFieldInit, fields.len);
+    for (fields, 0..) |field, index| {
+        cloned[index] = .{
+            .name = try cloneBytes(allocator, field.name),
+            .value = field.value,
+        };
+    }
+    return cloned;
+}
+
 pub const UnionInit = struct {
     dest: LocalId,
     union_type: []const u8,
@@ -669,6 +1210,17 @@ pub const ListHeadTail = struct {
     consume_source: bool = false,
 };
 
+fn cloneListHeadTail(allocator: std.mem.Allocator, value: ListHeadTail) CloneError!ListHeadTail {
+    return .{
+        .dest = value.dest,
+        .list = value.list,
+        .element_type = try cloneZigType(allocator, value.element_type),
+        .start_index = value.start_index,
+        .via_helper = value.via_helper,
+        .consume_source = value.consume_source,
+    };
+}
+
 pub const MapHasKey = struct {
     dest: LocalId,
     map: LocalId,
@@ -713,6 +1265,20 @@ pub const IrCaseArm = struct {
     body_instrs: []const Instruction,
     result: ?LocalId,
 };
+
+fn cloneIrCaseArms(allocator: std.mem.Allocator, arms: []const IrCaseArm) CloneError![]const IrCaseArm {
+    if (arms.len == 0) return &.{};
+    const cloned = try allocator.alloc(IrCaseArm, arms.len);
+    for (arms, 0..) |arm, index| {
+        cloned[index] = .{
+            .cond_instrs = try cloneInstructions(allocator, arm.cond_instrs),
+            .condition = arm.condition,
+            .body_instrs = try cloneInstructions(allocator, arm.body_instrs),
+            .result = arm.result,
+        };
+    }
+    return cloned;
+}
 
 pub const IfExpr = struct {
     dest: LocalId,
@@ -871,6 +1437,18 @@ pub const TagCase = struct {
     target: LabelId,
 };
 
+fn cloneTagCases(allocator: std.mem.Allocator, cases: []const TagCase) CloneError![]const TagCase {
+    if (cases.len == 0) return &.{};
+    const cloned = try allocator.alloc(TagCase, cases.len);
+    for (cases, 0..) |case, index| {
+        cloned[index] = .{
+            .tag = try cloneBytes(allocator, case.tag),
+            .target = case.target,
+        };
+    }
+    return cloned;
+}
+
 pub const SwitchLiteral = struct {
     dest: LocalId,
     scrutinee: LocalId,
@@ -885,6 +1463,26 @@ pub const LitCase = struct {
     result: ?LocalId,
 };
 
+fn cloneLiteralValue(allocator: std.mem.Allocator, value: LiteralValue) CloneError!LiteralValue {
+    return switch (value) {
+        .string => |string| .{ .string = try cloneBytes(allocator, string) },
+        else => value,
+    };
+}
+
+fn cloneLitCases(allocator: std.mem.Allocator, cases: []const LitCase) CloneError![]const LitCase {
+    if (cases.len == 0) return &.{};
+    const cloned = try allocator.alloc(LitCase, cases.len);
+    for (cases, 0..) |case, index| {
+        cloned[index] = .{
+            .value = try cloneLiteralValue(allocator, case.value),
+            .body_instrs = try cloneInstructions(allocator, case.body_instrs),
+            .result = case.result,
+        };
+    }
+    return cloned;
+}
+
 pub const SwitchReturn = struct {
     scrutinee_param: u32,
     cases: []const ReturnCase,
@@ -897,6 +1495,19 @@ pub const ReturnCase = struct {
     body_instrs: []const Instruction,
     return_value: ?LocalId,
 };
+
+fn cloneReturnCases(allocator: std.mem.Allocator, cases: []const ReturnCase) CloneError![]const ReturnCase {
+    if (cases.len == 0) return &.{};
+    const cloned = try allocator.alloc(ReturnCase, cases.len);
+    for (cases, 0..) |case, index| {
+        cloned[index] = .{
+            .value = try cloneLiteralValue(allocator, case.value),
+            .body_instrs = try cloneInstructions(allocator, case.body_instrs),
+            .return_value = case.return_value,
+        };
+    }
+    return cloned;
+}
 
 pub const UnionSwitchReturn = struct {
     scrutinee_param: u32,
@@ -943,6 +1554,33 @@ pub const FieldBinding = struct {
     local_name: []const u8,
     local_index: LocalId,
 };
+
+fn cloneFieldBindings(allocator: std.mem.Allocator, bindings: []const FieldBinding) CloneError![]const FieldBinding {
+    if (bindings.len == 0) return &.{};
+    const cloned = try allocator.alloc(FieldBinding, bindings.len);
+    for (bindings, 0..) |binding, index| {
+        cloned[index] = .{
+            .field_name = try cloneBytes(allocator, binding.field_name),
+            .local_name = try cloneBytes(allocator, binding.local_name),
+            .local_index = binding.local_index,
+        };
+    }
+    return cloned;
+}
+
+fn cloneUnionCases(allocator: std.mem.Allocator, cases: []const UnionCase) CloneError![]const UnionCase {
+    if (cases.len == 0) return &.{};
+    const cloned = try allocator.alloc(UnionCase, cases.len);
+    for (cases, 0..) |case, index| {
+        cloned[index] = .{
+            .variant_name = try cloneBytes(allocator, case.variant_name),
+            .field_bindings = try cloneFieldBindings(allocator, case.field_bindings),
+            .body_instrs = try cloneInstructions(allocator, case.body_instrs),
+            .return_value = case.return_value,
+        };
+    }
+    return cloned;
+}
 
 pub const NumericWiden = struct {
     dest: LocalId,
@@ -1635,6 +2273,16 @@ pub const IrBuilder = struct {
             if (function_group.id == group_id) return function_group;
         }
         return null;
+    }
+
+    fn debugPathForSpan(self: *const IrBuilder, span: ast.SourceSpan) ?[]const u8 {
+        const source_id = span.source_id orelse return null;
+        const graph = self.scope_graph orelse return null;
+        return graph.sourcePathById(source_id);
+    }
+
+    fn zeroBasedSourceCoordinate(value: u32) u32 {
+        return if (value > 0) value - 1 else 0;
     }
 
     fn resolveNamedHirGroup(self: *const IrBuilder, named: hir_mod.NamedCall, arity: u32) ?*const hir_mod.FunctionGroup {
@@ -2367,11 +3015,15 @@ pub const IrBuilder = struct {
         const param_conventions = try self.computeParamConventions(final_params_typed);
         const local_ownership = try self.computeLocalOwnership(self.next_local);
         const result_convention = self.computeResultConvention(clause.return_type);
+        const debug_span = clause.debug_span;
         try self.functions.append(self.allocator, .{
             .id = func_id,
             .name = name_str,
             .source_group_id = group.id,
             .source_clause_index = clause_index,
+            .debug_source_path = self.debugPathForSpan(debug_span),
+            .debug_line = zeroBasedSourceCoordinate(debug_span.line),
+            .debug_column = zeroBasedSourceCoordinate(debug_span.col),
             .struct_name = self.current_struct_prefix,
             .local_name = local_name,
             .scope_id = group.scope_id,
@@ -2823,9 +3475,13 @@ pub const IrBuilder = struct {
         const param_conventions = try self.computeParamConventions(final_params);
         const local_ownership = try self.computeLocalOwnership(self.next_local);
         const result_convention = self.computeResultConvention(first_clause.return_type);
+        const debug_span = group.debug_span;
         try self.functions.append(self.allocator, .{
             .id = func_id,
             .name = name_str,
+            .debug_source_path = self.debugPathForSpan(debug_span),
+            .debug_line = zeroBasedSourceCoordinate(debug_span.line),
+            .debug_column = zeroBasedSourceCoordinate(debug_span.col),
             .struct_name = self.current_struct_prefix,
             .local_name = local_name,
             .scope_id = group.scope_id,
@@ -2967,6 +3623,9 @@ pub const IrBuilder = struct {
             try self.functions.append(self.allocator, .{
                 .id = try_func_id,
                 .name = try_name,
+                .debug_source_path = self.debugPathForSpan(debug_span),
+                .debug_line = zeroBasedSourceCoordinate(debug_span.line),
+                .debug_column = zeroBasedSourceCoordinate(debug_span.col),
                 .struct_name = self.current_struct_prefix,
                 .local_name = try_local_name,
                 .scope_id = group.scope_id,

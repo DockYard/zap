@@ -28,6 +28,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const abi = @import("abi.zig");
 const section_parser = @import("section_parser.zig");
+const progress_mod = @import("../progress.zig");
 
 // ---------------------------------------------------------------------------
 // Zig-fork primitive — extern declarations.
@@ -188,6 +189,26 @@ pub const ResolvedManager = struct {
     refcount_sized_extension: bool,
 };
 
+const MANAGER_VALIDATION_CACHE_SCHEMA = "zap.manager.validation.cache.v1";
+const MANAGER_VALIDATION_SIDECAR_MAGIC: u32 = 0x4d_56_43_5a; // "ZCVM" little-endian
+const MANAGER_VALIDATION_SIDECAR_VERSION: u16 = 1;
+const MANAGER_VALIDATION_SIDECAR_LEN: usize = 168;
+
+/// Lightweight, owned resolution of the selected manager backend source.
+///
+/// This is the part of `resolve()` that is safe to run before a build
+/// artifact cache check: it validates the manifest-provided adapter
+/// binding and resolves the package-convention backend source path, but
+/// does not create cache directories, compile a validation object, read
+/// `.zapmem`, or inspect object symbols.
+pub const ManagerSourceSelection = struct {
+    /// Concrete manager type selected by the manifest.
+    type_name: []const u8,
+
+    /// Absolute path to the selected manager's Zig backend source.
+    active_manager_source_path: []const u8,
+};
+
 /// Driver-level errors. Each variant maps to a build-time diagnostic in
 /// the normative table from spec section 10.4.
 pub const ResolveError = error{
@@ -274,6 +295,17 @@ pub const ResolveOptions = struct {
     /// Optional Zig stdlib directory passed through to the fork primitive.
     /// When null the primitive auto-detects.
     zig_lib_dir: ?[]const u8 = null,
+    /// Identity hash for the running Zap compiler / Zig fork toolchain.
+    /// Production call sites must pass the already-computed value from
+    /// `src/main.zig`; test-only defaults are accepted so focused unit
+    /// tests can construct minimal options without a full toolchain
+    /// identity scan.
+    compiler_identity_hash: ?u64 = null,
+    /// Identity hash for the Zig stdlib directory used by the fork.
+    /// Production call sites must pass the already-computed value from
+    /// `src/main.zig`; test-only defaults are accepted alongside
+    /// `compiler_identity_hash`.
+    zig_lib_identity_hash: ?u64 = null,
     /// Optimize mode forwarded to the fork primitive.
     optimize: ZapForkOptimize = .ReleaseSafe,
     /// Cross-compile target triple (e.g. `"aarch64-linux-gnu"`). Null
@@ -298,6 +330,8 @@ pub const ResolveOptions = struct {
     /// stack. Production builds (the `zap` binary) always leave this
     /// null so the real fork primitive runs.
     fork_compile_fn: ?ForkCompileFn = null,
+    /// Optional CLI progress reporter owned by the build command.
+    progress: ?*progress_mod.Reporter = null,
 };
 
 /// Resolve the active memory manager for the build. Returns a
@@ -307,32 +341,88 @@ pub fn resolve(
     options: ResolveOptions,
     diag: *DriverDiagnostic,
 ) ResolveError!ResolvedManager {
-    const adapter = options.adapter orelse {
-        diag.write("build manifest did not evaluate a `Memory.Manager` adapter", .{});
-        return ResolveError.MissingMemoryManagerAdapter;
-    };
-    if (adapter.type_name.len == 0) {
-        diag.write("selected `Memory.Manager` adapter returned an empty manager type", .{});
-        return ResolveError.InvalidManagerBackendSource;
+    var source_selection = try resolveManagerSource(allocator, options, diag);
+    errdefer freeManagerSourceSelection(allocator, &source_selection);
+
+    const identities = try resolveCacheIdentities(options, diag);
+
+    // Compile selected manager sources into keyed validation objects.
+    // The object is build-time evidence only; the final binary registers
+    // the backend source path as `zap_active_manager` and does not link
+    // this validation object.
+    if (options.progress) |progress| progress.stage("Memory: preparing manager validation cache", .{});
+    std.Io.Dir.cwd().createDirPath(std.Options.debug_io, options.cache_dir) catch {};
+    var cache_entry = try managerValidationCacheEntry(allocator, source_selection, options, identities, diag);
+    defer cache_entry.deinit(allocator);
+
+    if (try readValidationSidecar(allocator, cache_entry.sidecar_path, cache_entry.record_identity)) |metadata| {
+        if (options.progress) |progress| progress.stage("Memory: using cached manager metadata", .{});
+        return resolvedFromValidation(source_selection, metadata);
     }
 
-    const manager_zig_path_owned = try resolveBackendSourcePath(allocator, adapter, options, diag);
-    defer allocator.free(manager_zig_path_owned);
+    const validation_from_object = validateManagerObjectAtPath(
+        allocator,
+        source_selection.type_name,
+        cache_entry.object_path,
+        diag,
+    ) catch |err| switch (err) {
+        ResolveError.ObjectReadFailed,
+        ResolveError.SectionInvalid,
+        ResolveError.BadMagic,
+        ResolveError.AbiMajorMismatch,
+        ResolveError.ValidationFailed,
+        ResolveError.ReservedCapabilityDeclared,
+        => null,
+        else => return err,
+    };
+    if (validation_from_object) |metadata| {
+        try writeValidationSidecar(allocator, cache_entry.sidecar_path, cache_entry.record_identity, metadata);
+        return resolvedFromValidation(source_selection, metadata);
+    }
 
-    // Compile every selected manager source into an object file for the
-    // same `.zapmem` validation pipeline. The object is build-time
-    // evidence only; the final binary registers the backend source path as
-    // `zap_active_manager` and does not link this validation object.
-    std.Io.Dir.cwd().createDirPath(std.Options.debug_io, options.cache_dir) catch {};
-    const safe_name = try makeSafeFileName(allocator, adapter.type_name);
-    defer allocator.free(safe_name);
-    const object_basename = try std.fmt.allocPrint(allocator, "{s}.o", .{safe_name});
-    defer allocator.free(object_basename);
-    const object_path = std.fs.path.join(allocator, &.{ options.cache_dir, object_basename }) catch return ResolveError.OutOfMemory;
-    defer allocator.free(object_path);
+    if (options.progress) |progress| {
+        progress.stage("Memory: compiling manager object", .{});
+        progress.commitLine();
+    }
+    try compileManagerSource(
+        allocator,
+        source_selection.type_name,
+        source_selection.active_manager_source_path,
+        cache_entry.object_path,
+        options,
+        diag,
+    );
 
-    try compileManagerSource(allocator, adapter.type_name, manager_zig_path_owned, object_path, options, diag);
+    const validated = try validateManagerObjectAtPath(
+        allocator,
+        source_selection.type_name,
+        cache_entry.object_path,
+        diag,
+    );
+    try writeValidationSidecar(allocator, cache_entry.sidecar_path, cache_entry.record_identity, validated);
 
+    return resolvedFromValidation(source_selection, validated);
+}
+
+fn resolvedFromValidation(
+    source_selection: ManagerSourceSelection,
+    validated: ValidatedSection,
+) ResolvedManager {
+    return .{
+        .type_name = source_selection.type_name,
+        .active_manager_source_path = source_selection.active_manager_source_path,
+        .declared_caps = validated.declared_caps,
+        .abi_minor = validated.abi_minor,
+        .refcount_sized_extension = validated.refcount_sized_extension,
+    };
+}
+
+fn validateManagerObjectAtPath(
+    allocator: std.mem.Allocator,
+    manager_name: []const u8,
+    object_path: []const u8,
+    diag: *DriverDiagnostic,
+) ResolveError!ValidatedSection {
     // Read the resulting object file and locate the `.zapmem` section.
     const object_bytes = std.Io.Dir.cwd().readFileAlloc(
         std.Options.debug_io,
@@ -349,39 +439,32 @@ pub fn resolve(
         switch (err) {
             error.SectionNotFound => diag.write(
                 "manager '{s}' did not emit a `.zapmem` metadata section; see docs/memory-manager-abi.md section 3",
-                .{adapter.type_name},
+                .{manager_name},
             ),
             error.SectionTooSmall => diag.write(
                 "manager '{s}' emitted a `.zapmem` section smaller than the v1.0 metadata header (32 bytes)",
-                .{adapter.type_name},
+                .{manager_name},
             ),
             error.InvalidObject => diag.write(
                 "manager '{s}' produced a malformed object file at '{s}'",
-                .{ adapter.type_name, object_path },
+                .{ manager_name, object_path },
             ),
             error.UnsupportedFormat => diag.write(
                 "manager '{s}' object file uses an unsupported format (Phase 3 supports ELF and Mach-O 64-bit)",
-                .{adapter.type_name},
+                .{manager_name},
             ),
         }
         return ResolveError.SectionInvalid;
     };
 
     // Static validation per spec section 3.5.
-    const validated = try validateSection(adapter.type_name, section_bytes, diag);
+    const validated = try validateSection(manager_name, section_bytes, diag);
 
     // Build-time check: source registration later binds
     // `zap_active_manager.zap_memory_section`; the validation object
     // must export the same section payload symbol.
-    try assertExportsManagerSymbol(adapter.type_name, object_bytes, diag);
-
-    return .{
-        .type_name = try allocator.dupe(u8, adapter.type_name),
-        .active_manager_source_path = try allocator.dupe(u8, manager_zig_path_owned),
-        .declared_caps = validated.declared_caps,
-        .abi_minor = validated.abi_minor,
-        .refcount_sized_extension = validated.refcount_sized_extension,
-    };
+    try assertExportsManagerSymbol(manager_name, object_bytes, diag);
+    return validated;
 }
 
 /// Free the owned memory inside a `ResolvedManager`. Safe to call once.
@@ -390,6 +473,42 @@ pub fn freeResolved(allocator: std.mem.Allocator, resolved: *ResolvedManager) vo
     allocator.free(resolved.active_manager_source_path);
     resolved.type_name = "";
     resolved.active_manager_source_path = "";
+}
+
+/// Resolve only the selected manager backend source. The returned
+/// strings are owned by `allocator` and must be released with
+/// `freeManagerSourceSelection`.
+pub fn resolveManagerSource(
+    allocator: std.mem.Allocator,
+    options: ResolveOptions,
+    diag: *DriverDiagnostic,
+) ResolveError!ManagerSourceSelection {
+    const adapter = options.adapter orelse {
+        diag.write("build manifest did not evaluate a `Memory.Manager` adapter", .{});
+        return ResolveError.MissingMemoryManagerAdapter;
+    };
+    if (adapter.type_name.len == 0) {
+        diag.write("selected `Memory.Manager` adapter returned an empty manager type", .{});
+        return ResolveError.InvalidManagerBackendSource;
+    }
+
+    const type_name = allocator.dupe(u8, adapter.type_name) catch return ResolveError.OutOfMemory;
+    errdefer allocator.free(type_name);
+    const manager_source_path = try resolveBackendSourcePath(allocator, adapter, options, diag);
+    errdefer allocator.free(manager_source_path);
+
+    return .{
+        .type_name = type_name,
+        .active_manager_source_path = manager_source_path,
+    };
+}
+
+/// Free the owned memory inside a `ManagerSourceSelection`. Safe to call once.
+pub fn freeManagerSourceSelection(allocator: std.mem.Allocator, selection: *ManagerSourceSelection) void {
+    allocator.free(selection.type_name);
+    allocator.free(selection.active_manager_source_path);
+    selection.type_name = "";
+    selection.active_manager_source_path = "";
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +690,363 @@ fn canonicalPathOrSelf(allocator: std.mem.Allocator, path: []const u8) ![]const 
 }
 
 // ---------------------------------------------------------------------------
+// Manager validation artifact cache
+// ---------------------------------------------------------------------------
+
+const CacheIdentities = struct {
+    compiler_identity_hash: u64,
+    zig_lib_identity_hash: u64,
+};
+
+const ManagerValidationRecordIdentity = struct {
+    key_digest: [32]u8,
+    source_content_digest: [32]u8,
+    manager_name_hash: u64,
+    source_path_hash: u64,
+    zig_lib_path_hash: u64,
+    target_hash: u64,
+    cpu_hash: u64,
+    host_arch_hash: u64,
+    host_os_hash: u64,
+    host_abi_hash: u64,
+    compiler_identity_hash: u64,
+    zig_lib_identity_hash: u64,
+    optimize_tag: u8,
+    target_is_native: bool,
+};
+
+const ManagerValidationCacheEntry = struct {
+    object_path: []const u8,
+    sidecar_path: []const u8,
+    record_identity: ManagerValidationRecordIdentity,
+
+    fn deinit(self: *ManagerValidationCacheEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.object_path);
+        allocator.free(self.sidecar_path);
+    }
+};
+
+fn resolveCacheIdentities(options: ResolveOptions, diag: *DriverDiagnostic) ResolveError!CacheIdentities {
+    const compiler_identity_hash = options.compiler_identity_hash orelse blk: {
+        if (builtin.is_test) {
+            break :blk 0;
+        } else {
+            diag.write(
+                "memory manager driver: production resolve omitted compiler identity hash",
+                .{},
+            );
+            return ResolveError.InternalError;
+        }
+    };
+    const zig_lib_identity_hash = options.zig_lib_identity_hash orelse blk: {
+        if (builtin.is_test) {
+            break :blk 0;
+        } else {
+            diag.write(
+                "memory manager driver: production resolve omitted Zig lib identity hash",
+                .{},
+            );
+            return ResolveError.InternalError;
+        }
+    };
+    return .{
+        .compiler_identity_hash = compiler_identity_hash,
+        .zig_lib_identity_hash = zig_lib_identity_hash,
+    };
+}
+
+fn managerValidationCacheEntry(
+    allocator: std.mem.Allocator,
+    source_selection: ManagerSourceSelection,
+    options: ResolveOptions,
+    identities: CacheIdentities,
+    diag: *DriverDiagnostic,
+) ResolveError!ManagerValidationCacheEntry {
+    const source_bytes = std.Io.Dir.cwd().readFileAlloc(
+        std.Options.debug_io,
+        source_selection.active_manager_source_path,
+        allocator,
+        .limited(64 * 1024 * 1024),
+    ) catch {
+        diag.write(
+            "memory manager backend source for '{s}' could not be read at '{s}'",
+            .{ source_selection.type_name, source_selection.active_manager_source_path },
+        );
+        return ResolveError.ManagerSourceNotFound;
+    };
+    defer allocator.free(source_bytes);
+
+    const source_content_digest = sha256Digest(source_bytes);
+    const target_descriptor = try targetDescriptorForOptions(source_selection.type_name, options, diag);
+    const zig_lib_path = options.zig_lib_dir orelse "";
+    const cpu = options.cpu orelse "";
+    const host_arch = @tagName(builtin.cpu.arch);
+    const host_os = @tagName(builtin.os.tag);
+    const host_abi = @tagName(builtin.abi);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashField(&hasher, MANAGER_VALIDATION_CACHE_SCHEMA);
+    hashField(&hasher, source_selection.type_name);
+    hashField(&hasher, source_selection.active_manager_source_path);
+    hasher.update(&source_content_digest);
+    hashInt(&hasher, @as(u8, @intCast(@intFromEnum(options.optimize))));
+    hashBool(&hasher, target_descriptor.is_native);
+    hashField(&hasher, target_descriptor.identity_text);
+    hashInt(&hasher, target_descriptor.target.arch_tag);
+    hashInt(&hasher, target_descriptor.target.os_tag);
+    hashInt(&hasher, target_descriptor.target.abi_tag);
+    hashField(&hasher, cpu);
+    hashField(&hasher, zig_lib_path);
+    hashInt(&hasher, identities.zig_lib_identity_hash);
+    hashInt(&hasher, identities.compiler_identity_hash);
+    if (target_descriptor.is_native) {
+        hashField(&hasher, host_arch);
+        hashField(&hasher, host_os);
+        hashField(&hasher, host_abi);
+    }
+    var key_digest: [32]u8 = undefined;
+    hasher.final(&key_digest);
+
+    var key_hex_buf: [64]u8 = undefined;
+    const key_hex = digestHex(&key_hex_buf, key_digest);
+    const safe_name = try makeSafeFileName(allocator, source_selection.type_name);
+    defer allocator.free(safe_name);
+    const object_basename = std.fmt.allocPrint(
+        allocator,
+        "{s}-{s}.o",
+        .{ safe_name, key_hex },
+    ) catch return ResolveError.OutOfMemory;
+    defer allocator.free(object_basename);
+    const sidecar_basename = std.fmt.allocPrint(
+        allocator,
+        "{s}-{s}.zapmem",
+        .{ safe_name, key_hex },
+    ) catch return ResolveError.OutOfMemory;
+    defer allocator.free(sidecar_basename);
+
+    const object_path = std.fs.path.join(allocator, &.{ options.cache_dir, object_basename }) catch return ResolveError.OutOfMemory;
+    errdefer allocator.free(object_path);
+    const sidecar_path = std.fs.path.join(allocator, &.{ options.cache_dir, sidecar_basename }) catch return ResolveError.OutOfMemory;
+
+    return .{
+        .object_path = object_path,
+        .sidecar_path = sidecar_path,
+        .record_identity = .{
+            .key_digest = key_digest,
+            .source_content_digest = source_content_digest,
+            .manager_name_hash = stableHash(source_selection.type_name),
+            .source_path_hash = stableHash(source_selection.active_manager_source_path),
+            .zig_lib_path_hash = stableHash(zig_lib_path),
+            .target_hash = stableHash(target_descriptor.identity_text),
+            .cpu_hash = stableHash(cpu),
+            .host_arch_hash = stableHash(host_arch),
+            .host_os_hash = stableHash(host_os),
+            .host_abi_hash = stableHash(host_abi),
+            .compiler_identity_hash = identities.compiler_identity_hash,
+            .zig_lib_identity_hash = identities.zig_lib_identity_hash,
+            .optimize_tag = @intCast(@intFromEnum(options.optimize)),
+            .target_is_native = target_descriptor.is_native,
+        },
+    };
+}
+
+const TargetDescriptor = struct {
+    target: ZapForkTarget,
+    identity_text: []const u8,
+    is_native: bool,
+};
+
+fn targetDescriptorForOptions(
+    manager_name: []const u8,
+    options: ResolveOptions,
+    diag: *DriverDiagnostic,
+) ResolveError!TargetDescriptor {
+    if (options.target) |triple| {
+        return .{
+            .target = parseTargetTriple(triple) orelse {
+                diag.write(
+                    "memory manager '{s}' could not build for cross-compile target '{s}': unrecognised triple (expected arch-os-abi)",
+                    .{ manager_name, triple },
+                );
+                return ResolveError.ManagerCompileFailed;
+            },
+            .identity_text = triple,
+            .is_native = false,
+        };
+    }
+
+    return .{
+        .target = .{
+            .arch_tag = ZAP_FORK_ARCH_NATIVE,
+            .os_tag = 0,
+            .abi_tag = 0,
+            ._reserved = 0,
+        },
+        .identity_text = "native",
+        .is_native = true,
+    };
+}
+
+fn readValidationSidecar(
+    allocator: std.mem.Allocator,
+    sidecar_path: []const u8,
+    identity: ManagerValidationRecordIdentity,
+) ResolveError!?ValidatedSection {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        std.Options.debug_io,
+        sidecar_path,
+        allocator,
+        .limited(MANAGER_VALIDATION_SIDECAR_LEN + 1),
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return ResolveError.OutOfMemory,
+        else => return null,
+    };
+    defer allocator.free(bytes);
+    if (bytes.len != MANAGER_VALIDATION_SIDECAR_LEN) return null;
+
+    var cursor: usize = 0;
+    if (readScalar(u32, bytes, &cursor) != MANAGER_VALIDATION_SIDECAR_MAGIC) return null;
+    if (readScalar(u16, bytes, &cursor) != MANAGER_VALIDATION_SIDECAR_VERSION) return null;
+    if (readScalar(u8, bytes, &cursor) != 0) return null;
+    const refcount_sized_extension = switch (readScalar(u8, bytes, &cursor)) {
+        0 => false,
+        1 => true,
+        else => return null,
+    };
+
+    if (!std.mem.eql(u8, bytes[cursor..][0..32], &identity.key_digest)) return null;
+    cursor += 32;
+    if (!std.mem.eql(u8, bytes[cursor..][0..32], &identity.source_content_digest)) return null;
+    cursor += 32;
+    if (readScalar(u64, bytes, &cursor) != identity.manager_name_hash) return null;
+    if (readScalar(u64, bytes, &cursor) != identity.source_path_hash) return null;
+    if (readScalar(u64, bytes, &cursor) != identity.zig_lib_path_hash) return null;
+    if (readScalar(u64, bytes, &cursor) != identity.target_hash) return null;
+    if (readScalar(u64, bytes, &cursor) != identity.cpu_hash) return null;
+    if (readScalar(u64, bytes, &cursor) != identity.host_arch_hash) return null;
+    if (readScalar(u64, bytes, &cursor) != identity.host_os_hash) return null;
+    if (readScalar(u64, bytes, &cursor) != identity.host_abi_hash) return null;
+    if (readScalar(u64, bytes, &cursor) != identity.compiler_identity_hash) return null;
+    if (readScalar(u64, bytes, &cursor) != identity.zig_lib_identity_hash) return null;
+    if (readScalar(u8, bytes, &cursor) != identity.optimize_tag) return null;
+    if ((readScalar(u8, bytes, &cursor) != 0) != identity.target_is_native) return null;
+    if (readScalar(u16, bytes, &cursor) != 0) return null;
+
+    const declared_caps = readScalar(u64, bytes, &cursor);
+    const abi_minor = readScalar(u16, bytes, &cursor);
+    if (readScalar(u16, bytes, &cursor) != 0) return null;
+    if (cursor != MANAGER_VALIDATION_SIDECAR_LEN) return null;
+    return .{
+        .declared_caps = declared_caps,
+        .abi_minor = abi_minor,
+        .refcount_sized_extension = refcount_sized_extension,
+    };
+}
+
+fn writeValidationSidecar(
+    allocator: std.mem.Allocator,
+    sidecar_path: []const u8,
+    identity: ManagerValidationRecordIdentity,
+    metadata: ValidatedSection,
+) ResolveError!void {
+    var bytes: [MANAGER_VALIDATION_SIDECAR_LEN]u8 = undefined;
+    var cursor: usize = 0;
+    writeScalar(u32, &bytes, &cursor, MANAGER_VALIDATION_SIDECAR_MAGIC);
+    writeScalar(u16, &bytes, &cursor, MANAGER_VALIDATION_SIDECAR_VERSION);
+    writeScalar(u8, &bytes, &cursor, 0);
+    writeScalar(u8, &bytes, &cursor, if (metadata.refcount_sized_extension) 1 else 0);
+    @memcpy(bytes[cursor..][0..32], &identity.key_digest);
+    cursor += 32;
+    @memcpy(bytes[cursor..][0..32], &identity.source_content_digest);
+    cursor += 32;
+    writeScalar(u64, &bytes, &cursor, identity.manager_name_hash);
+    writeScalar(u64, &bytes, &cursor, identity.source_path_hash);
+    writeScalar(u64, &bytes, &cursor, identity.zig_lib_path_hash);
+    writeScalar(u64, &bytes, &cursor, identity.target_hash);
+    writeScalar(u64, &bytes, &cursor, identity.cpu_hash);
+    writeScalar(u64, &bytes, &cursor, identity.host_arch_hash);
+    writeScalar(u64, &bytes, &cursor, identity.host_os_hash);
+    writeScalar(u64, &bytes, &cursor, identity.host_abi_hash);
+    writeScalar(u64, &bytes, &cursor, identity.compiler_identity_hash);
+    writeScalar(u64, &bytes, &cursor, identity.zig_lib_identity_hash);
+    writeScalar(u8, &bytes, &cursor, identity.optimize_tag);
+    writeScalar(u8, &bytes, &cursor, if (identity.target_is_native) 1 else 0);
+    writeScalar(u16, &bytes, &cursor, 0);
+    writeScalar(u64, &bytes, &cursor, metadata.declared_caps);
+    writeScalar(u16, &bytes, &cursor, metadata.abi_minor);
+    writeScalar(u16, &bytes, &cursor, 0);
+    std.debug.assert(cursor == MANAGER_VALIDATION_SIDECAR_LEN);
+    writeFileAtomic(allocator, sidecar_path, &bytes) catch return ResolveError.InternalError;
+}
+
+fn writeFileAtomic(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    contents: []const u8,
+) !void {
+    _ = allocator;
+    if (std.fs.path.dirname(path)) |dir| {
+        try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir);
+    }
+    var atomic = try std.Io.Dir.cwd().createFileAtomic(std.Options.debug_io, path, .{
+        .replace = true,
+        .make_path = true,
+    });
+    defer atomic.deinit(std.Options.debug_io);
+    atomic.file.writeStreamingAll(std.Options.debug_io, contents) catch |err| {
+        atomic.file.close(std.Options.debug_io);
+        atomic.file_open = false;
+        return err;
+    };
+    try atomic.replace(std.Options.debug_io);
+}
+
+fn sha256Digest(bytes: []const u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &out, .{});
+    return out;
+}
+
+fn digestHex(buffer: *[64]u8, digest: [32]u8) []const u8 {
+    const alphabet = "0123456789abcdef";
+    for (digest, 0..) |byte, index| {
+        buffer[index * 2] = alphabet[byte >> 4];
+        buffer[index * 2 + 1] = alphabet[byte & 0x0f];
+    }
+    return buffer[0..];
+}
+
+fn stableHash(bytes: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, bytes);
+}
+
+fn hashField(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
+    hashInt(hasher, bytes.len);
+    hasher.update(bytes);
+}
+
+fn hashBool(hasher: *std.crypto.hash.sha2.Sha256, value: bool) void {
+    hasher.update(&[_]u8{if (value) 1 else 0});
+}
+
+fn hashInt(hasher: *std.crypto.hash.sha2.Sha256, value: anytype) void {
+    const bytes = std.mem.asBytes(&value);
+    hasher.update(bytes);
+}
+
+fn writeScalar(comptime T: type, bytes: []u8, cursor: *usize, value: T) void {
+    @memcpy(bytes[cursor.*..][0..@sizeOf(T)], std.mem.asBytes(&value));
+    cursor.* += @sizeOf(T);
+}
+
+fn readScalar(comptime T: type, bytes: []const u8, cursor: *usize) T {
+    var value: T = undefined;
+    @memcpy(std.mem.asBytes(&value), bytes[cursor.*..][0..@sizeOf(T)]);
+    cursor.* += @sizeOf(T);
+    return value;
+}
+
+// ---------------------------------------------------------------------------
 // Compile manager via the Zig fork primitive
 // ---------------------------------------------------------------------------
 
@@ -591,6 +1067,8 @@ fn compileManagerSource(
         break :blk dup.ptr;
     } else null;
     defer if (zig_lib_z) |p| allocator.free(std.mem.span(p));
+    const cache_dir_z = allocator.dupeZ(u8, options.cache_dir) catch return ResolveError.OutOfMemory;
+    defer allocator.free(cache_dir_z);
 
     // When the build is cross-compiling (`compile_target` is set on
     // the manifest), pass the matching `ZapForkTarget` to the fork
@@ -598,21 +1076,7 @@ fn compileManagerSource(
     // Otherwise pass the NATIVE sentinel — the fork's
     // `isSupportedTriple` whitelist gates which native hosts are
     // accepted.
-    const target: ZapForkTarget = if (options.target) |triple|
-        parseTargetTriple(triple) orelse {
-            diag.write(
-                "memory manager '{s}' could not build for cross-compile target '{s}': unrecognised triple (expected arch-os-abi)",
-                .{ manager_name, triple },
-            );
-            return ResolveError.ManagerCompileFailed;
-        }
-    else
-        .{
-            .arch_tag = ZAP_FORK_ARCH_NATIVE,
-            .os_tag = 0,
-            .abi_tag = 0,
-            ._reserved = 0,
-        };
+    const target = (try targetDescriptorForOptions(manager_name, options, diag)).target;
 
     // Diagnostic buffer threaded into the fork primitive. We size it
     // generously so multi-error bundles fit; the primitive truncates and
@@ -646,8 +1110,8 @@ fn compileManagerSource(
         &fork_diag_buf,
         fork_diag_buf.len,
         zig_lib_z,
-        null,
-        null,
+        cache_dir_z.ptr,
+        cache_dir_z.ptr,
         if (cpu_z) |p| p.ptr else null,
     );
 
@@ -766,6 +1230,94 @@ test "manager backend binding resolves package src backend from adapter source" 
     }, &diag);
     defer allocator.free(backend_path);
     try std.testing.expect(std.mem.endsWith(u8, backend_path, "pkg/src/memory/custom/manager.zig"));
+}
+
+test "manager source selection resolves backend without validation artifacts" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "pkg/lib/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "pkg/src/memory/custom") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "pkg/lib/memory/custom.zap", .data = "// adapter" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "pkg/src/memory/custom/manager.zig", .data = "// backend" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+    const adapter_path = try std.fs.path.join(allocator, &.{ tmp_path, "pkg/lib/memory/custom.zap" });
+    defer allocator.free(adapter_path);
+    const source_root_path = try std.fs.path.join(allocator, &.{ tmp_path, "pkg/lib" });
+    defer allocator.free(source_root_path);
+    const cache_root = try std.fs.path.join(allocator, &.{ tmp_path, "cache" });
+    defer allocator.free(cache_root);
+    const source_roots = [_]SourceRoot{.{ .name = "pkg", .path = source_root_path }};
+
+    var diag_buf: [512]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    var selection = try resolveManagerSource(allocator, .{
+        .adapter = .{
+            .type_name = "ThirdParty.Custom",
+            .adapter_source_path = adapter_path,
+        },
+        .source_roots = &source_roots,
+        .project_root = tmp_path,
+        .zap_source_root = tmp_path,
+        .cache_dir = cache_root,
+    }, &diag);
+    defer freeManagerSourceSelection(allocator, &selection);
+
+    try std.testing.expectEqualStrings("ThirdParty.Custom", selection.type_name);
+    try std.testing.expect(std.mem.endsWith(u8, selection.active_manager_source_path, "pkg/src/memory/custom/manager.zig"));
+    try std.testing.expectError(error.FileNotFound, tmp_dir.dir.access(std.Options.debug_io, "cache", .{}));
+}
+
+test "resolve uses the same selected manager source as lightweight resolution" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "pkg/lib/memory") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "pkg/src/memory/custom") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "pkg/lib/memory/custom.zap", .data = "// adapter" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "pkg/src/memory/custom/manager.zig", .data = "// backend" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+    const adapter_path = try std.fs.path.join(allocator, &.{ tmp_path, "pkg/lib/memory/custom.zap" });
+    defer allocator.free(adapter_path);
+    const source_root_path = try std.fs.path.join(allocator, &.{ tmp_path, "pkg/lib" });
+    defer allocator.free(source_root_path);
+    const cache_root = try std.fs.path.join(allocator, &.{ tmp_path, "cache" });
+    defer allocator.free(cache_root);
+    const source_roots = [_]SourceRoot{.{ .name = "pkg", .path = source_root_path }};
+    const options: ResolveOptions = .{
+        .adapter = .{
+            .type_name = "ThirdParty.Custom",
+            .adapter_source_path = adapter_path,
+        },
+        .source_roots = &source_roots,
+        .project_root = tmp_path,
+        .zap_source_root = tmp_path,
+        .cache_dir = cache_root,
+        .fork_compile_fn = mockForkCompileNoOp,
+    };
+
+    var selection_diag_buf: [512]u8 = undefined;
+    var selection_diag: DriverDiagnostic = .{ .buffer = &selection_diag_buf };
+    var selection = try resolveManagerSource(allocator, options, &selection_diag);
+    defer freeManagerSourceSelection(allocator, &selection);
+
+    var resolve_diag_buf: [1024]u8 = undefined;
+    var resolve_diag: DriverDiagnostic = .{ .buffer = &resolve_diag_buf };
+    var resolved = try resolve(allocator, options, &resolve_diag);
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expectEqualStrings(selection.type_name, resolved.type_name);
+    try std.testing.expectEqualStrings(selection.active_manager_source_path, resolved.active_manager_source_path);
+    try std.testing.expectEqual(@as(u64, 0), resolved.declared_caps);
 }
 
 test "manager backend binding rejects missing source and non-zap adapters" {
@@ -1830,6 +2382,8 @@ fn synthesizeMachoWithCaps(buffer: []u8, declared_caps: u64) usize {
 
 /// Mock `ForkCompileFn` used by the ELF integration test. Writes a
 /// NoOp-style ELF object to the requested output path and returns `.Ok`.
+var mock_noop_compile_count: usize = 0;
+
 fn mockForkCompileNoOp(
     source_path: [*:0]const u8,
     target: *const ZapForkTarget,
@@ -1852,6 +2406,8 @@ fn mockForkCompileNoOp(
     _ = global_cache_dir_opt;
     _ = cpu_features_opt;
 
+    mock_noop_compile_count += 1;
+
     var buffer: [4096]u8 = undefined;
     const written = synthesizeNoOpElf(&buffer);
     const path_slice = std.mem.span(out_object_path);
@@ -1862,6 +2418,188 @@ fn mockForkCompileNoOp(
     defer file.close(std.Options.debug_io);
     file.writeStreamingAll(std.Options.debug_io, buffer[0..written]) catch return .InternalError;
     return .Ok;
+}
+
+const CacheTestProject = struct {
+    tmp_path: [:0]u8,
+    cache_root: []const u8,
+    adapter_source_path: []const u8,
+    lib_source_root: []const u8,
+    manager_source_path: []const u8,
+    source_roots: [1]SourceRoot,
+
+    fn deinit(self: *CacheTestProject, allocator: std.mem.Allocator) void {
+        allocator.free(self.tmp_path);
+        allocator.free(self.cache_root);
+        allocator.free(self.adapter_source_path);
+        allocator.free(self.lib_source_root);
+        allocator.free(self.manager_source_path);
+    }
+
+    fn options(self: *const CacheTestProject, fork_compile_fn: ForkCompileFn) ResolveOptions {
+        return .{
+            .adapter = .{
+                .type_name = "Example.CachedManager",
+                .adapter_source_path = self.adapter_source_path,
+            },
+            .source_roots = self.source_roots[0..],
+            .project_root = self.tmp_path,
+            .zap_source_root = self.tmp_path,
+            .cache_dir = self.cache_root,
+            .zig_lib_dir = self.tmp_path,
+            .compiler_identity_hash = 0x1234_5678,
+            .zig_lib_identity_hash = 0x8765_4321,
+            .fork_compile_fn = fork_compile_fn,
+        };
+    }
+};
+
+fn makeCacheTestProject(
+    allocator: std.mem.Allocator,
+    tmp_dir: *std.testing.TmpDir,
+    manager_source: []const u8,
+) !CacheTestProject {
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "src/cached_manager") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "cache") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/cached_manager.zap", .data = "// adapter" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/cached_manager/manager.zig", .data = manager_source }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    errdefer allocator.free(tmp_path);
+    const cache_root = std.fs.path.join(allocator, &.{ tmp_path, "cache" }) catch return error.OutOfMemory;
+    errdefer allocator.free(cache_root);
+    const adapter_source_path = std.fs.path.join(allocator, &.{ tmp_path, "lib/cached_manager.zap" }) catch return error.OutOfMemory;
+    errdefer allocator.free(adapter_source_path);
+    const lib_source_root = std.fs.path.join(allocator, &.{ tmp_path, "lib" }) catch return error.OutOfMemory;
+    errdefer allocator.free(lib_source_root);
+    const manager_source_path = std.fs.path.join(allocator, &.{ tmp_path, "src/cached_manager/manager.zig" }) catch return error.OutOfMemory;
+    errdefer allocator.free(manager_source_path);
+
+    return .{
+        .tmp_path = tmp_path,
+        .cache_root = cache_root,
+        .adapter_source_path = adapter_source_path,
+        .lib_source_root = lib_source_root,
+        .manager_source_path = manager_source_path,
+        .source_roots = .{.{ .name = "project", .path = lib_source_root }},
+    };
+}
+
+fn cacheEntryForTest(
+    allocator: std.mem.Allocator,
+    options: ResolveOptions,
+    diag: *DriverDiagnostic,
+) !ManagerValidationCacheEntry {
+    var selection = try resolveManagerSource(allocator, options, diag);
+    defer freeManagerSourceSelection(allocator, &selection);
+    return managerValidationCacheEntry(allocator, selection, options, try resolveCacheIdentities(options, diag), diag);
+}
+
+test "manager validation cache skips fork compile on identical resolve" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var project = try makeCacheTestProject(allocator, &tmp_dir, "// backend v1");
+    defer project.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const options = project.options(mockForkCompileNoOp);
+
+    mock_noop_compile_count = 0;
+    var first = try resolve(allocator, options, &diag);
+    defer freeResolved(allocator, &first);
+    try std.testing.expectEqual(@as(usize, 1), mock_noop_compile_count);
+
+    var cache_entry = try cacheEntryForTest(allocator, options, &diag);
+    defer cache_entry.deinit(allocator);
+    try writeFileAtomic(allocator, cache_entry.object_path, "corrupt object that must not be read on sidecar hit");
+
+    diag.written = 0;
+    if (diag.buffer.len > 0) diag.buffer[0] = 0;
+    var second = try resolve(allocator, options, &diag);
+    defer freeResolved(allocator, &second);
+
+    try std.testing.expectEqual(@as(usize, 1), mock_noop_compile_count);
+    try std.testing.expectEqualStrings(first.type_name, second.type_name);
+    try std.testing.expectEqual(first.declared_caps, second.declared_caps);
+    try std.testing.expectEqual(first.abi_minor, second.abi_minor);
+    try std.testing.expectEqual(first.refcount_sized_extension, second.refcount_sized_extension);
+}
+
+test "manager validation cache refreshes corrupt sidecar from keyed object without recompiling" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var project = try makeCacheTestProject(allocator, &tmp_dir, "// backend v1");
+    defer project.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const options = project.options(mockForkCompileNoOp);
+
+    mock_noop_compile_count = 0;
+    var first = try resolve(allocator, options, &diag);
+    defer freeResolved(allocator, &first);
+    try std.testing.expectEqual(@as(usize, 1), mock_noop_compile_count);
+
+    var cache_entry = try cacheEntryForTest(allocator, options, &diag);
+    defer cache_entry.deinit(allocator);
+    try writeFileAtomic(allocator, cache_entry.sidecar_path, "corrupt sidecar");
+
+    diag.written = 0;
+    if (diag.buffer.len > 0) diag.buffer[0] = 0;
+    var second = try resolve(allocator, options, &diag);
+    defer freeResolved(allocator, &second);
+
+    try std.testing.expectEqual(@as(usize, 1), mock_noop_compile_count);
+    const refreshed = try readValidationSidecar(allocator, cache_entry.sidecar_path, cache_entry.record_identity);
+    try std.testing.expect(refreshed != null);
+    try std.testing.expectEqual(first.declared_caps, second.declared_caps);
+}
+
+test "manager validation cache key changes with source target cpu and optimize inputs" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var project = try makeCacheTestProject(allocator, &tmp_dir, "// backend v1");
+    defer project.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const base_options = project.options(mockForkCompileNoOp);
+
+    mock_noop_compile_count = 0;
+    var first = try resolve(allocator, base_options, &diag);
+    defer freeResolved(allocator, &first);
+    try std.testing.expectEqual(@as(usize, 1), mock_noop_compile_count);
+
+    try writeFileAtomic(allocator, project.manager_source_path, "// backend v2");
+    var source_changed = try resolve(allocator, base_options, &diag);
+    defer freeResolved(allocator, &source_changed);
+    try std.testing.expectEqual(@as(usize, 2), mock_noop_compile_count);
+
+    var target_options = base_options;
+    target_options.target = "x86_64-linux-gnu";
+    var target_changed = try resolve(allocator, target_options, &diag);
+    defer freeResolved(allocator, &target_changed);
+    try std.testing.expectEqual(@as(usize, 3), mock_noop_compile_count);
+
+    var cpu_options = target_options;
+    cpu_options.cpu = "x86_64_v3";
+    var cpu_changed = try resolve(allocator, cpu_options, &diag);
+    defer freeResolved(allocator, &cpu_changed);
+    try std.testing.expectEqual(@as(usize, 4), mock_noop_compile_count);
+
+    var optimize_options = cpu_options;
+    optimize_options.optimize = .ReleaseFast;
+    var optimize_changed = try resolve(allocator, optimize_options, &diag);
+    defer freeResolved(allocator, &optimize_changed);
+    try std.testing.expectEqual(@as(usize, 5), mock_noop_compile_count);
 }
 
 /// Mock `ForkCompileFn` used by the Mach-O integration test. Writes a
@@ -1951,9 +2689,35 @@ test "Phase 2 adapters: stdlib manager resolves through generic compile validati
     try std.testing.expectEqual(@as(u16, 0), resolved.abi_minor);
     try std.testing.expect(!resolved.refcount_sized_extension);
 
-    const validation_object = std.fs.path.join(allocator, &.{ cache_root, "Memory_NoOp.o" }) catch return error.Unexpected;
-    defer allocator.free(validation_object);
-    std.Io.Dir.cwd().access(std.Options.debug_io, validation_object, .{}) catch return error.Unexpected;
+    var selection = try resolveManagerSource(allocator, .{
+        .adapter = .{
+            .type_name = "Memory.NoOp",
+            .adapter_source_path = adapter_source_path,
+        },
+        .source_roots = &source_roots,
+        .project_root = ".",
+        .zap_source_root = ".",
+        .cache_dir = cache_root,
+        .fork_compile_fn = mockForkCompileNoOp,
+    }, &diag);
+    defer freeManagerSourceSelection(allocator, &selection);
+    var cache_entry = try managerValidationCacheEntry(allocator, selection, .{
+        .adapter = .{
+            .type_name = "Memory.NoOp",
+            .adapter_source_path = adapter_source_path,
+        },
+        .source_roots = &source_roots,
+        .project_root = ".",
+        .zap_source_root = ".",
+        .cache_dir = cache_root,
+        .fork_compile_fn = mockForkCompileNoOp,
+    }, .{
+        .compiler_identity_hash = 0,
+        .zig_lib_identity_hash = 0,
+    }, &diag);
+    defer cache_entry.deinit(allocator);
+    std.Io.Dir.cwd().access(std.Options.debug_io, cache_entry.object_path, .{}) catch return error.Unexpected;
+    std.Io.Dir.cwd().access(std.Options.debug_io, cache_entry.sidecar_path, .{}) catch return error.Unexpected;
 }
 
 test "Phase 2 adapters: project manager resolves through same ELF validation path" {
@@ -2403,6 +3167,12 @@ var captured_target_state: struct {
     cpu_present: bool = false,
     cpu_buf: [64]u8 = undefined,
     cpu_len: usize = 0,
+    local_cache_present: bool = false,
+    global_cache_present: bool = false,
+    local_cache_buf: [256]u8 = undefined,
+    local_cache_len: usize = 0,
+    global_cache_buf: [256]u8 = undefined,
+    global_cache_len: usize = 0,
     invoked: bool = false,
 } = .{};
 
@@ -2427,8 +3197,6 @@ fn mockForkCompileCaptureTarget(
     _ = out_diagnostic_buffer;
     _ = out_diagnostic_capacity;
     _ = zig_lib_dir_opt;
-    _ = local_cache_dir_opt;
-    _ = global_cache_dir_opt;
 
     captured_target_state.target = target.*;
     captured_target_state.invoked = true;
@@ -2441,6 +3209,26 @@ fn mockForkCompileCaptureTarget(
     } else {
         captured_target_state.cpu_present = false;
         captured_target_state.cpu_len = 0;
+    }
+    if (local_cache_dir_opt) |local_cache_dir| {
+        const slice = std.mem.span(local_cache_dir);
+        captured_target_state.local_cache_present = true;
+        const n = @min(slice.len, captured_target_state.local_cache_buf.len);
+        @memcpy(captured_target_state.local_cache_buf[0..n], slice[0..n]);
+        captured_target_state.local_cache_len = n;
+    } else {
+        captured_target_state.local_cache_present = false;
+        captured_target_state.local_cache_len = 0;
+    }
+    if (global_cache_dir_opt) |global_cache_dir| {
+        const slice = std.mem.span(global_cache_dir);
+        captured_target_state.global_cache_present = true;
+        const n = @min(slice.len, captured_target_state.global_cache_buf.len);
+        @memcpy(captured_target_state.global_cache_buf[0..n], slice[0..n]);
+        captured_target_state.global_cache_len = n;
+    } else {
+        captured_target_state.global_cache_present = false;
+        captured_target_state.global_cache_len = 0;
     }
 
     var buffer: [4096]u8 = undefined;
@@ -2642,6 +3430,39 @@ test "resolve passes a null cpu when none is requested" {
 
     try std.testing.expect(captured_target_state.invoked);
     try std.testing.expect(!captured_target_state.cpu_present);
+}
+
+test "resolve passes cache dir pointers to fork compile primitive" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var project = try makeCacheTestProject(allocator, &tmp_dir, "// backend v1");
+    defer project.deinit(allocator);
+
+    captured_target_state = .{};
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    var resolved = try resolve(
+        allocator,
+        project.options(mockForkCompileCaptureTarget),
+        &diag,
+    );
+    defer freeResolved(allocator, &resolved);
+
+    try std.testing.expect(captured_target_state.invoked);
+    try std.testing.expect(captured_target_state.local_cache_present);
+    try std.testing.expect(captured_target_state.global_cache_present);
+    try std.testing.expectEqualStrings(
+        project.cache_root,
+        captured_target_state.local_cache_buf[0..captured_target_state.local_cache_len],
+    );
+    try std.testing.expectEqualStrings(
+        project.cache_root,
+        captured_target_state.global_cache_buf[0..captured_target_state.global_cache_len],
+    );
 }
 
 test "resolve passes NATIVE sentinel when compile_target is null" {

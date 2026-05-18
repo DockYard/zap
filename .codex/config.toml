@@ -57,6 +57,24 @@ approval_mode = "approve"
 [mcp_servers.cog.tools.debug_modules]
 approval_mode = "approve"
 
+[mcp_servers.cog.tools.debug_scopes]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_variable_location]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_dap_request]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_find_symbol]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_memory]
+approval_mode = "approve"
+
+[mcp_servers.cog.tools.debug_disassemble]
+approval_mode = "approve"
+
 [agents.cog-code-query]
 description = "Explore code structure using the Cog SCIP index"
 developer_instructions = """

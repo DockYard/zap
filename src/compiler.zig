@@ -13,6 +13,7 @@ const ast = zap.ast;
 
 const runtime_source = @embedFile("runtime.zig");
 const lexer = @import("lexer.zig");
+const progress_mod = @import("progress.zig");
 
 /// Per-stage timing diagnostic. Gated by `ZAP_PROFILE`: production builds
 /// stay quiet, but `ZAP_PROFILE=1 zap test` (or any compile-driving
@@ -92,6 +93,11 @@ pub const CompileError = error{
 pub const CompileOptions = struct {
     /// Show progress output to stderr.
     show_progress: bool = true,
+    /// Shared CLI progress reporter. When present, compiler phases update the
+    /// caller-owned line instead of printing their own standalone header.
+    progress: ?*progress_mod.Reporter = null,
+    /// Optional namespace for progress labels, e.g. "Manifest" or "Frontend".
+    progress_context: []const u8 = "",
     /// lib mode — skip main function emission in ZIR.
     lib_mode: bool = false,
     /// Struct names in dependency order for CTFE evaluation.
@@ -132,6 +138,37 @@ fn ctfeCompileOptionsHash(options: CompileOptions) u64 {
         zap.ctfe.hashCompileOptions(options.ctfe_target orelse "", options.ctfe_optimize orelse "")
     else
         0;
+}
+
+fn progressHeader(options: CompileOptions) void {
+    if (!options.show_progress) return;
+    if (options.progress) |progress| {
+        progress.begin();
+    } else {
+        std.debug.print("Compiling\n", .{});
+    }
+}
+
+fn progressStage(options: CompileOptions, comptime format: []const u8, args: anytype) void {
+    if (!options.show_progress) return;
+    if (options.progress) |progress| {
+        progress.stagePrefixed(options.progress_context, format, args);
+    } else {
+        std.debug.print("\r\x1b[K  ", .{});
+        if (options.progress_context.len > 0) {
+            std.debug.print("{s}: ", .{options.progress_context});
+        }
+        std.debug.print(format, args);
+    }
+}
+
+fn progressClear(options: CompileOptions) void {
+    if (!options.show_progress) return;
+    if (options.progress) |progress| {
+        progress.clearLine();
+    } else {
+        std.debug.print("\r\x1b[K", .{});
+    }
 }
 
 /// Compile Zap source text through the full frontend pipeline:
@@ -195,7 +232,7 @@ pub const CompilationContext = struct {
     source_units: []const SourceUnit,
 
     /// String interner shared across all parsed source units.
-    interner: ast.StringInterner,
+    interner: *ast.StringInterner,
 
     /// Scope graph populated by the collector. `collector.graph.structs`
     /// is the per-struct scope view (one entry per struct containing
@@ -251,6 +288,436 @@ pub const SourceUnit = struct {
     /// sets this.
     script_mode: bool = false,
 };
+
+pub const FrontendDependencyGraph = struct {
+    file_to_structs: *const std.StringHashMap([]const []const u8),
+    file_imported_by: *const std.StringHashMap([]const []const u8),
+    file_compile_after_globs: *const std.StringHashMap(void),
+};
+
+pub const FrontendIncrementalState = struct {
+    allocator: std.mem.Allocator,
+    interner: ast.StringInterner,
+    parsed_files: std.StringHashMap(*CachedParsedFile),
+    expanded_structs: std.StringHashMap(*CachedExpandedStruct),
+    expanded_top_level: ?*CachedExpandedTopLevel = null,
+    final_arena: ?std.heap.ArenaAllocator = null,
+    final_program: ?ir.Program = null,
+    initialized: bool = false,
+
+    const CachedParsedFile = struct {
+        arena: std.heap.ArenaAllocator,
+        file_path: []const u8,
+        source_hash: u64,
+        script_mode: bool,
+        primary_struct_name: ?[]const u8,
+        program: ast.Program,
+
+        fn destroy(self: *CachedParsedFile, allocator: std.mem.Allocator) void {
+            self.arena.deinit();
+            allocator.destroy(self);
+        }
+    };
+
+    const CachedExpandedStruct = struct {
+        arena: std.heap.ArenaAllocator,
+        name: []const u8,
+        declares_macro_provider: bool,
+        program: ast.Program,
+
+        fn destroy(self: *CachedExpandedStruct, allocator: std.mem.Allocator) void {
+            self.arena.deinit();
+            allocator.destroy(self);
+        }
+    };
+
+    const CachedExpandedTopLevel = struct {
+        arena: std.heap.ArenaAllocator,
+        signature: u64,
+        program: ast.Program,
+
+        fn destroy(self: *CachedExpandedTopLevel, allocator: std.mem.Allocator) void {
+            self.arena.deinit();
+            allocator.destroy(self);
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator) FrontendIncrementalState {
+        return .{
+            .allocator = allocator,
+            .interner = ast.StringInterner.init(allocator),
+            .parsed_files = std.StringHashMap(*CachedParsedFile).init(allocator),
+            .expanded_structs = std.StringHashMap(*CachedExpandedStruct).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *FrontendIncrementalState) void {
+        var parsed_iter = self.parsed_files.iterator();
+        while (parsed_iter.next()) |entry| entry.value_ptr.*.destroy(self.allocator);
+        self.parsed_files.deinit();
+
+        var expanded_iter = self.expanded_structs.iterator();
+        while (expanded_iter.next()) |entry| entry.value_ptr.*.destroy(self.allocator);
+        self.expanded_structs.deinit();
+        if (self.expanded_top_level) |artifact| artifact.destroy(self.allocator);
+        self.expanded_top_level = null;
+
+        if (self.final_arena) |*arena| arena.deinit();
+        self.final_arena = null;
+        self.final_program = null;
+
+        self.interner.deinit();
+    }
+
+    pub fn prepare(
+        self: *FrontendIncrementalState,
+        alloc: std.mem.Allocator,
+        source_units: []const SourceUnit,
+        graph: FrontendDependencyGraph,
+        options: CompileOptions,
+    ) CompileError!FrontendIncrementalPrepared {
+        var diag_engine = zap.DiagnosticEngine.init(alloc);
+        diag_engine.use_color = zap.diagnostics.detectColor();
+        setDiagnosticSources(&diag_engine, source_units);
+        diag_engine.setLineOffset(0);
+
+        progressHeader(options);
+        progressStage(options, "[1/11] Parse", .{});
+
+        var changed_files: std.ArrayListUnmanaged([]const u8) = .empty;
+        var new_parsed_files: std.ArrayListUnmanaged(*CachedParsedFile) = .empty;
+        errdefer destroyCachedParsedFiles(self.allocator, new_parsed_files.items);
+
+        const parsed_programs = try alloc.alloc(ast.Program, source_units.len);
+        for (source_units, 0..) |unit, source_index| {
+            const current_hash = hashSourceBytes(unit.source);
+            const cached = self.parsed_files.get(unit.file_path);
+            if (cached) |entry| {
+                if (entry.source_hash == current_hash and
+                    entry.script_mode == unit.script_mode and
+                    optionalStringEql(entry.primary_struct_name, unit.primary_struct_name))
+                {
+                    parsed_programs[source_index] = entry.program;
+                    continue;
+                }
+            }
+
+            try changed_files.append(alloc, unit.file_path);
+            const parsed = try self.parseSourceUnit(unit, source_units, source_index, current_hash, alloc, &diag_engine);
+            try new_parsed_files.append(alloc, parsed);
+            parsed_programs[source_index] = parsed.program;
+        }
+
+        if (diag_engine.hasErrors()) {
+            progressClear(options);
+            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, source_units, diag_engine.use_color);
+            return error.ParseFailed;
+        }
+
+        var invalidated_structs = std.StringHashMap(void).init(alloc);
+        try self.computeInvalidatedStructs(
+            alloc,
+            source_units,
+            graph,
+            changed_files.items,
+            &invalidated_structs,
+        );
+
+        var new_expanded_structs: std.ArrayListUnmanaged(*CachedExpandedStruct) = .empty;
+        errdefer destroyCachedExpandedStructs(self.allocator, new_expanded_structs.items);
+        var new_expanded_top_level: ?*CachedExpandedTopLevel = null;
+        errdefer if (new_expanded_top_level) |artifact| artifact.destroy(self.allocator);
+
+        var expansion_cache = ExpansionCacheWork{
+            .state = self,
+            .invalidated_structs = &invalidated_structs,
+            .new_expanded_structs = &new_expanded_structs,
+            .new_expanded_top_level = &new_expanded_top_level,
+        };
+
+        var ctx = try collectAllFromParsedPrograms(
+            alloc,
+            source_units,
+            parsed_programs,
+            &self.interner,
+            options,
+            diag_engine,
+            &expansion_cache,
+        );
+
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        if (options.struct_order) |graph_order| {
+            for (graph_order) |struct_name| {
+                names.append(alloc, struct_name) catch {};
+            }
+        } else {
+            for (ctx.struct_programs) |mp| {
+                names.append(alloc, mp.name) catch {};
+            }
+        }
+
+        const result = try compileStructByStructIncrementalFinal(
+            alloc,
+            &ctx,
+            names.items,
+            options,
+            self.final_program,
+            &invalidated_structs,
+        );
+
+        var final_arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer final_arena.deinit();
+        const final_program = ir.cloneProgram(final_arena.allocator(), result.ir_program) catch return error.OutOfMemory;
+
+        return .{
+            .state = self,
+            .result = result,
+            .new_parsed_files = try new_parsed_files.toOwnedSlice(alloc),
+            .new_expanded_structs = try new_expanded_structs.toOwnedSlice(alloc),
+            .new_expanded_top_level = new_expanded_top_level,
+            .clear_expanded_top_level = !expansion_cache.has_unassigned_top_level_items,
+            .new_final_arena = final_arena,
+            .new_final_program = final_program,
+        };
+    }
+
+    fn parseSourceUnit(
+        self: *FrontendIncrementalState,
+        unit: SourceUnit,
+        source_units: []const SourceUnit,
+        source_index: usize,
+        source_hash: u64,
+        alloc: std.mem.Allocator,
+        diag_engine: *zap.DiagnosticEngine,
+    ) CompileError!*CachedParsedFile {
+        const artifact = self.allocator.create(CachedParsedFile) catch return error.OutOfMemory;
+        artifact.* = .{
+            .arena = std.heap.ArenaAllocator.init(self.allocator),
+            .file_path = &.{},
+            .source_hash = source_hash,
+            .script_mode = unit.script_mode,
+            .primary_struct_name = null,
+            .program = .{ .structs = &.{}, .top_items = &.{} },
+        };
+        errdefer artifact.destroy(self.allocator);
+
+        const artifact_alloc = artifact.arena.allocator();
+        artifact.file_path = artifact_alloc.dupe(u8, unit.file_path) catch return error.OutOfMemory;
+        artifact.primary_struct_name = if (unit.primary_struct_name) |name|
+            artifact_alloc.dupe(u8, name) catch return error.OutOfMemory
+        else
+            null;
+
+        var parser = zap.Parser.initWithSharedInternerScriptMode(
+            artifact_alloc,
+            unit.source,
+            &self.interner,
+            @intCast(source_index),
+            unit.script_mode,
+        );
+        defer parser.deinit();
+
+        artifact.program = parser.parseProgram() catch {
+            emitParseErrorsFromUnits(alloc, parser.errors.items, source_units, diag_engine.use_color);
+            return error.ParseFailed;
+        };
+
+        for (parser.errors.items) |parse_err| {
+            diag_engine.reportDiagnostic(.{
+                .severity = .@"error",
+                .message = parse_err.message,
+                .span = parse_err.span,
+                .label = parse_err.label,
+                .help = parse_err.help,
+            }) catch {};
+        }
+
+        return artifact;
+    }
+
+    fn computeInvalidatedStructs(
+        self: *FrontendIncrementalState,
+        alloc: std.mem.Allocator,
+        source_units: []const SourceUnit,
+        graph: FrontendDependencyGraph,
+        changed_files: []const []const u8,
+        invalidated_structs: *std.StringHashMap(void),
+    ) CompileError!void {
+        if (!self.initialized) {
+            try addAllSourceStructs(alloc, source_units, graph, invalidated_structs);
+            return;
+        }
+
+        if (changed_files.len == 0) return;
+
+        var affected_files = std.StringHashMap(void).init(alloc);
+        var queue: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (changed_files) |file_path| {
+            if (mustInvalidateWholeFrontend(file_path, graph, true)) {
+                try addAllSourceStructs(alloc, source_units, graph, invalidated_structs);
+                return;
+            }
+            try queue.append(alloc, file_path);
+            try affected_files.put(file_path, {});
+        }
+
+        var cursor: usize = 0;
+        while (cursor < queue.items.len) : (cursor += 1) {
+            const file_path = queue.items[cursor];
+            if (graph.file_imported_by.get(file_path)) |dependents| {
+                for (dependents) |dependent_file| {
+                    if (affected_files.contains(dependent_file)) continue;
+                    if (mustInvalidateWholeFrontend(dependent_file, graph, false)) {
+                        try addAllSourceStructs(alloc, source_units, graph, invalidated_structs);
+                        return;
+                    }
+                    try affected_files.put(dependent_file, {});
+                    try queue.append(alloc, dependent_file);
+                }
+            }
+        }
+
+        var affected_iter = affected_files.iterator();
+        while (affected_iter.next()) |entry| {
+            const structs = graph.file_to_structs.get(entry.key_ptr.*) orelse {
+                try addAllSourceStructs(alloc, source_units, graph, invalidated_structs);
+                return;
+            };
+            if (structs.len == 0) {
+                try addAllSourceStructs(alloc, source_units, graph, invalidated_structs);
+                return;
+            }
+            for (structs) |struct_name| {
+                try invalidated_structs.put(struct_name, {});
+            }
+        }
+    }
+};
+
+pub const FrontendIncrementalPrepared = struct {
+    state: *FrontendIncrementalState,
+    result: CompileResult,
+    new_parsed_files: []const *FrontendIncrementalState.CachedParsedFile,
+    new_expanded_structs: []const *FrontendIncrementalState.CachedExpandedStruct,
+    new_expanded_top_level: ?*FrontendIncrementalState.CachedExpandedTopLevel,
+    clear_expanded_top_level: bool,
+    new_final_arena: std.heap.ArenaAllocator,
+    new_final_program: ir.Program,
+    committed: bool = false,
+
+    pub fn commit(self: *FrontendIncrementalPrepared) !void {
+        try self.state.parsed_files.ensureUnusedCapacity(@intCast(self.new_parsed_files.len));
+        try self.state.expanded_structs.ensureUnusedCapacity(@intCast(self.new_expanded_structs.len));
+
+        for (self.new_parsed_files) |parsed| {
+            if (self.state.parsed_files.fetchRemove(parsed.file_path)) |old| {
+                old.value.destroy(self.state.allocator);
+            }
+            try self.state.parsed_files.put(parsed.file_path, parsed);
+        }
+
+        for (self.new_expanded_structs) |expanded| {
+            if (self.state.expanded_structs.fetchRemove(expanded.name)) |old| {
+                old.value.destroy(self.state.allocator);
+            }
+            try self.state.expanded_structs.put(expanded.name, expanded);
+        }
+
+        if (self.new_expanded_top_level) |expanded_top_level| {
+            if (self.state.expanded_top_level) |old| old.destroy(self.state.allocator);
+            self.state.expanded_top_level = expanded_top_level;
+        } else if (self.clear_expanded_top_level) {
+            if (self.state.expanded_top_level) |old| old.destroy(self.state.allocator);
+            self.state.expanded_top_level = null;
+        }
+
+        if (self.state.final_arena) |*arena| arena.deinit();
+        self.state.final_arena = self.new_final_arena;
+        self.state.final_program = self.new_final_program;
+
+        self.state.initialized = true;
+        self.committed = true;
+    }
+
+    pub fn deinit(self: *FrontendIncrementalPrepared) void {
+        if (self.committed) return;
+        destroyCachedParsedFiles(self.state.allocator, self.new_parsed_files);
+        destroyCachedExpandedStructs(self.state.allocator, self.new_expanded_structs);
+        if (self.new_expanded_top_level) |expanded_top_level| expanded_top_level.destroy(self.state.allocator);
+        self.new_final_arena.deinit();
+    }
+};
+
+const ExpansionCacheWork = struct {
+    state: *FrontendIncrementalState,
+    invalidated_structs: *const std.StringHashMap(void),
+    new_expanded_structs: *std.ArrayListUnmanaged(*FrontendIncrementalState.CachedExpandedStruct),
+    new_expanded_top_level: *?*FrontendIncrementalState.CachedExpandedTopLevel,
+    has_unassigned_top_level_items: bool = false,
+};
+
+const StagedExpansionResult = struct {
+    program: ast.Program,
+    cache_hit: bool,
+};
+
+fn destroyCachedParsedFiles(
+    allocator: std.mem.Allocator,
+    parsed_files: []const *FrontendIncrementalState.CachedParsedFile,
+) void {
+    for (parsed_files) |parsed| parsed.destroy(allocator);
+}
+
+fn destroyCachedExpandedStructs(
+    allocator: std.mem.Allocator,
+    expanded_structs: []const *FrontendIncrementalState.CachedExpandedStruct,
+) void {
+    for (expanded_structs) |expanded| expanded.destroy(allocator);
+}
+
+fn hashSourceBytes(source: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(source);
+    return hasher.final();
+}
+
+fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null and right == null) return true;
+    if (left == null or right == null) return false;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn mustInvalidateWholeFrontend(file_path: []const u8, graph: FrontendDependencyGraph, file_is_direct_change: bool) bool {
+    // Editing a compile-after/reflection provider must invalidate the
+    // compile-after consumer, but it does not by itself make every sibling
+    // provider stale. Editing the compile-after declaration file itself is
+    // different: the glob/pattern/provider contract may have changed, so the
+    // whole frontend is invalidated unless a narrower reflection dependency
+    // signature is available.
+    if (file_is_direct_change and graph.file_compile_after_globs.contains(file_path)) return true;
+    const structs = graph.file_to_structs.get(file_path) orelse return true;
+    if (structs.len == 0) return true;
+    for (structs) |struct_name| {
+        if (std.mem.eql(u8, struct_name, zap.discovery.kernel_struct_name)) return true;
+    }
+    return false;
+}
+
+fn addAllSourceStructs(
+    alloc: std.mem.Allocator,
+    source_units: []const SourceUnit,
+    graph: FrontendDependencyGraph,
+    invalidated_structs: *std.StringHashMap(void),
+) CompileError!void {
+    for (source_units) |unit| {
+        if (graph.file_to_structs.get(unit.file_path)) |structs| {
+            for (structs) |struct_name| {
+                try invalidated_structs.put(struct_name, {});
+            }
+        }
+    }
+    _ = alloc;
+}
 
 fn registerSourceUnits(graph: *zap.scope.ScopeGraph, source_units: []const SourceUnit) !void {
     for (source_units, 0..) |unit, source_index| {
@@ -327,9 +794,7 @@ pub fn collectAllFromUnits(
     var step: u32 = 0;
     const total_steps: u32 = 11;
 
-    if (options.show_progress) {
-        std.debug.print("Compiling\n", .{});
-    }
+    progressHeader(options);
 
     var diag_engine = zap.DiagnosticEngine.init(alloc);
     diag_engine.use_color = zap.diagnostics.detectColor();
@@ -338,7 +803,7 @@ pub fn collectAllFromUnits(
     // interners and remap AST StringIds. This architecture supports
     // parallel parsing (each parser is independent).
     step += 1;
-    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Parse", .{ step, total_steps });
+    progressStage(options, "[{d}/{d}] Parse", .{ step, total_steps });
 
     const all_source_units = source_units;
 
@@ -386,7 +851,7 @@ pub fn collectAllFromUnits(
             _ = i;
         }
         if (any_failed) {
-            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+            progressClear(options);
             return error.ParseFailed;
         }
     } else {
@@ -398,7 +863,7 @@ pub fn collectAllFromUnits(
 
             parsed_programs[i] = parser.parseProgram() catch {
                 emitParseErrorsFromUnits(alloc, parser.errors.items, all_source_units, diag_engine.use_color);
-                if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+                progressClear(options);
                 return error.ParseFailed;
             };
 
@@ -421,10 +886,11 @@ pub fn collectAllFromUnits(
         remapProgram(alloc, &parsed_programs[i], remap) catch
             return error.OutOfMemory;
     }
-    var interner = global_interner;
+    const interner = try alloc.create(ast.StringInterner);
+    interner.* = global_interner;
 
     if (diag_engine.hasErrors()) {
-        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+        progressClear(options);
         emitDiagnostics(&diag_engine, alloc);
         return error.ParseFailed;
     }
@@ -434,16 +900,16 @@ pub fn collectAllFromUnits(
     // Collect declarations from the merged program first (needed for
     // macro expansion to resolve Kernel macros etc.)
     step += 1;
-    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Collect", .{ step, total_steps });
+    progressStage(options, "[{d}/{d}] Collect", .{ step, total_steps });
 
     // Intern the auto-imported Kernel struct's name once — needed for
     // auto-import injection. The literal name lives in
     // `discovery.kernel_struct_name`.
     const kernel_name_id = try interner.intern(zap.discovery.kernel_struct_name);
-    var collector = zap.Collector.init(alloc, &interner, kernel_name_id);
+    var collector = zap.Collector.init(alloc, interner, kernel_name_id);
     try registerSourceUnits(&collector.graph, all_source_units);
     {
-        const pre_struct_programs = try buildStructPrograms(alloc, &program, &interner);
+        const pre_struct_programs = try buildStructPrograms(alloc, &program, interner);
 
         // Collect Kernel FIRST so its scope exists when other structs'
         // auto-import resolves. This mirrors Elixir's bootstrap ordering.
@@ -459,7 +925,7 @@ pub fn collectAllFromUnits(
                 for (collector.errors.items) |collect_err| {
                     diag_engine.err(collect_err.message, collect_err.span) catch {};
                 }
-                if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+                progressClear(options);
                 emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
                 return error.CollectFailed;
             };
@@ -471,7 +937,7 @@ pub fn collectAllFromUnits(
                 for (collector.errors.items) |collect_err| {
                     diag_engine.err(collect_err.message, collect_err.span) catch {};
                 }
-                if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+                progressClear(options);
                 emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
                 return error.CollectFailed;
             };
@@ -483,7 +949,7 @@ pub fn collectAllFromUnits(
             for (collector.errors.items) |collect_err| {
                 diag_engine.err(collect_err.message, collect_err.span) catch {};
             }
-            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+            progressClear(options);
             emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
             return error.CollectFailed;
         }
@@ -494,7 +960,7 @@ pub fn collectAllFromUnits(
             for (collector.errors.items) |collect_err| {
                 diag_engine.err(collect_err.message, collect_err.span) catch {};
             }
-            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+            progressClear(options);
             emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
             return error.CollectFailed;
         };
@@ -504,7 +970,7 @@ pub fn collectAllFromUnits(
         diag_engine.err(collect_err.message, collect_err.span) catch {};
     }
     if (diag_engine.hasErrors()) {
-        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+        progressClear(options);
         emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
         return error.CollectFailed;
     }
@@ -514,7 +980,7 @@ pub fn collectAllFromUnits(
     // each `MacroFamily.required_caps` reflects what the body actually does.
     // Replaces the historical `@requires` annotation; macro authors no
     // longer write capability sets by hand.
-    zap.capability_inference.inferAndApply(alloc, &collector.graph, &interner) catch {};
+    zap.capability_inference.inferAndApply(alloc, &collector.graph, interner) catch {};
 
     // Run macro expansion and desugaring. When the discovery graph supplies a
     // struct order, expand one struct at a time and compile each completed
@@ -522,19 +988,19 @@ pub fn collectAllFromUnits(
     // functions through CTFE. Without a graph order, keep the legacy merged
     // expansion path.
     step += 1;
-    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Macro expand", .{ step, total_steps });
+    progressStage(options, "[{d}/{d}] Macro expand", .{ step, total_steps });
 
     const desugared_program = if (options.struct_order) |struct_order|
         stagedMacroExpandAndDesugar(
             alloc,
             &program,
             struct_order,
-            &interner,
+            interner,
             &collector,
             &diag_engine,
-            options.allow_external_static_references,
+            options,
         ) catch |err| {
-            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+            progressClear(options);
             emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
             return err;
         }
@@ -542,21 +1008,21 @@ pub fn collectAllFromUnits(
         legacyMacroExpandAndDesugar(
             alloc,
             &program,
-            &interner,
+            interner,
             &collector,
             &diag_engine,
         ) catch |err| {
-            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+            progressClear(options);
             emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
             return err;
         };
 
     step += 1;
-    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Desugar", .{ step, total_steps });
+    progressStage(options, "[{d}/{d}] Desugar", .{ step, total_steps });
 
     // NOW split into per-struct programs from the expanded/desugared AST.
     // All if_expr nodes are gone, all pipes desugared, all macros expanded.
-    const struct_programs = try buildStructPrograms(alloc, &desugared_program, &interner);
+    const struct_programs = try buildStructPrograms(alloc, &desugared_program, interner);
 
     // Rebuild the scope graph from the desugared AST. The original collector
     // was built from pre-expansion AST, so its function declaration pointers
@@ -564,9 +1030,9 @@ pub fn collectAllFromUnits(
     // which functions belong to the current struct, so the scope graph must
     // reference the same AST nodes as the desugared struct programs.
     step += 1;
-    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Re-collect", .{ step, total_steps });
+    progressStage(options, "[{d}/{d}] Re-collect", .{ step, total_steps });
 
-    var final_collector = zap.Collector.init(alloc, &interner, kernel_name_id);
+    var final_collector = zap.Collector.init(alloc, interner, kernel_name_id);
     try registerSourceUnits(&final_collector.graph, all_source_units);
     // Collect Kernel first in the second pass too
     for (struct_programs) |entry| {
@@ -581,7 +1047,7 @@ pub fn collectAllFromUnits(
             for (final_collector.errors.items) |collect_err| {
                 diag_engine.err(collect_err.message, collect_err.span) catch {};
             }
-            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+            progressClear(options);
             emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
             return error.CollectFailed;
         };
@@ -615,7 +1081,210 @@ pub fn collectAllFromUnits(
     // Re-run capability inference on the post-expansion graph so any
     // downstream consumer (HIR, runtime CTFE) reads the same inferred
     // capability sets the macro engine used.
-    zap.capability_inference.inferAndApply(alloc, &final_collector.graph, &interner) catch {};
+    zap.capability_inference.inferAndApply(alloc, &final_collector.graph, interner) catch {};
+
+    const units = try buildCompilationUnits(alloc, struct_programs, all_source_units);
+
+    return .{
+        .alloc = alloc,
+        .merged_program = desugared_program,
+        .struct_programs = struct_programs,
+        .units = units,
+        .source_units = all_source_units,
+        .interner = interner,
+        .collector = final_collector,
+        .diag_engine = diag_engine,
+    };
+}
+
+fn collectAllFromParsedPrograms(
+    alloc: std.mem.Allocator,
+    all_source_units: []const SourceUnit,
+    parsed_programs: []const ast.Program,
+    interner: *ast.StringInterner,
+    options: CompileOptions,
+    diag_engine_value: zap.DiagnosticEngine,
+    expansion_cache: ?*ExpansionCacheWork,
+) CompileError!CompilationContext {
+    var diag_engine = diag_engine_value;
+    var step: u32 = 1;
+    const total_steps: u32 = 11;
+
+    if (diag_engine.hasErrors()) {
+        progressClear(options);
+        emitDiagnostics(&diag_engine, alloc);
+        return error.ParseFailed;
+    }
+
+    const program = try mergePrograms(alloc, parsed_programs);
+
+    step += 1;
+    progressStage(options, "[{d}/{d}] Collect", .{ step, total_steps });
+
+    const kernel_name_id = try interner.intern(zap.discovery.kernel_struct_name);
+    var collector = zap.Collector.init(alloc, interner, kernel_name_id);
+    try registerSourceUnits(&collector.graph, all_source_units);
+    {
+        const pre_struct_programs = try buildStructPrograms(alloc, &program, interner);
+
+        for (pre_struct_programs) |entry| {
+            if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) {
+                collector.collectProgramSurface(&entry.program) catch {};
+                break;
+            }
+        }
+        for (pre_struct_programs) |entry| {
+            if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) continue;
+            collector.collectProgramSurface(&entry.program) catch {
+                for (collector.errors.items) |collect_err| {
+                    diag_engine.err(collect_err.message, collect_err.span) catch {};
+                }
+                progressClear(options);
+                emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+                return error.CollectFailed;
+            };
+        }
+
+        if (program.top_items.len > 0) {
+            const top_only = ast.Program{ .structs = &.{}, .top_items = program.top_items };
+            collector.collectProgramSurface(&top_only) catch {
+                for (collector.errors.items) |collect_err| {
+                    diag_engine.err(collect_err.message, collect_err.span) catch {};
+                }
+                progressClear(options);
+                emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+                return error.CollectFailed;
+            };
+        }
+        collector.validateImplConformance() catch {};
+        collector.registerImplFunctionsInTargetScopes() catch {};
+        if (collector.errors.items.len > 0) {
+            for (collector.errors.items) |collect_err| {
+                diag_engine.err(collect_err.message, collect_err.span) catch {};
+            }
+            progressClear(options);
+            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+            return error.CollectFailed;
+        }
+
+        const pre_slices = try alloc.alloc(ast.Program, pre_struct_programs.len);
+        for (pre_struct_programs, 0..) |entry, i| pre_slices[i] = entry.program;
+        collector.finalizeCollectedPrograms(pre_slices) catch {
+            for (collector.errors.items) |collect_err| {
+                diag_engine.err(collect_err.message, collect_err.span) catch {};
+            }
+            progressClear(options);
+            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+            return error.CollectFailed;
+        };
+    }
+
+    for (collector.errors.items) |collect_err| {
+        diag_engine.err(collect_err.message, collect_err.span) catch {};
+    }
+    if (diag_engine.hasErrors()) {
+        progressClear(options);
+        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        return error.CollectFailed;
+    }
+
+    zap.capability_inference.inferAndApply(alloc, &collector.graph, interner) catch {};
+
+    step += 1;
+    progressStage(options, "[{d}/{d}] Macro expand", .{ step, total_steps });
+
+    const desugared_program = if (options.struct_order) |struct_order| blk: {
+        if (expansion_cache) |cache| {
+            break :blk stagedMacroExpandAndDesugarCached(
+                alloc,
+                &program,
+                struct_order,
+                interner,
+                &collector,
+                &diag_engine,
+                options,
+                cache,
+            ) catch |err| {
+                progressClear(options);
+                emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+                return err;
+            };
+        }
+        break :blk stagedMacroExpandAndDesugar(
+            alloc,
+            &program,
+            struct_order,
+            interner,
+            &collector,
+            &diag_engine,
+            options,
+        ) catch |err| {
+            progressClear(options);
+            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+            return err;
+        };
+    } else legacyMacroExpandAndDesugar(
+        alloc,
+        &program,
+        interner,
+        &collector,
+        &diag_engine,
+    ) catch |err| {
+        progressClear(options);
+        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        return err;
+    };
+
+    step += 1;
+    progressStage(options, "[{d}/{d}] Desugar", .{ step, total_steps });
+
+    const struct_programs = try buildStructPrograms(alloc, &desugared_program, interner);
+
+    step += 1;
+    progressStage(options, "[{d}/{d}] Re-collect", .{ step, total_steps });
+
+    var final_collector = zap.Collector.init(alloc, interner, kernel_name_id);
+    try registerSourceUnits(&final_collector.graph, all_source_units);
+    for (struct_programs) |entry| {
+        if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) {
+            final_collector.collectProgramSurface(&entry.program) catch {};
+            break;
+        }
+    }
+    for (struct_programs) |entry| {
+        if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) continue;
+        final_collector.collectProgramSurface(&entry.program) catch {
+            for (final_collector.errors.items) |collect_err| {
+                diag_engine.err(collect_err.message, collect_err.span) catch {};
+            }
+            progressClear(options);
+            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+            return error.CollectFailed;
+        };
+    }
+    if (desugared_program.top_items.len > 0) {
+        const top_only = ast.Program{ .structs = &.{}, .top_items = desugared_program.top_items };
+        final_collector.collectProgramSurface(&top_only) catch {
+            for (final_collector.errors.items) |collect_err| {
+                diag_engine.err(collect_err.message, collect_err.span) catch {};
+            }
+            return error.CollectFailed;
+        };
+    }
+    final_collector.validateImplConformance() catch {};
+    final_collector.registerImplFunctionsInTargetScopes() catch {};
+    {
+        const slices = try alloc.alloc(ast.Program, struct_programs.len);
+        for (struct_programs, 0..) |entry, i| slices[i] = entry.program;
+        final_collector.finalizeCollectedPrograms(slices) catch {
+            for (final_collector.errors.items) |collect_err| {
+                diag_engine.err(collect_err.message, collect_err.span) catch {};
+            }
+            return error.CollectFailed;
+        };
+    }
+
+    zap.capability_inference.inferAndApply(alloc, &final_collector.graph, interner) catch {};
 
     const units = try buildCompilationUnits(alloc, struct_programs, all_source_units);
 
@@ -672,7 +1341,7 @@ pub fn compileForCtfe(
     // `.retain { kind }` / `.release { kind }` IR instructions so
     // the whole-program codegen path consumes the same canonical
     // IR shape as `compileStructByStruct`'s merged path.
-    try materializeAnalysisArcOps(alloc, &ir_program, &analysis_result.context, type_checker.store, options.declared_caps);
+    try materializeAnalysisArcOps(alloc, &ir_program, &analysis_result.context, type_checker.store, options.declared_caps, options);
 
     // Second type-check pass — borrow / move diagnostics live behind
     // the analysis context, so they only fire on this re-check.
@@ -773,12 +1442,14 @@ const Pipeline = struct {
     fn progress(self: *Pipeline, name: []const u8) void {
         self.step += 1;
         if (self.progress_enabled) {
-            std.debug.print("\r\x1b[K  [{d}/{d}] {s}", .{ self.step, self.total_steps, name });
+            progressStage(self.options, "[{d}/{d}] {s}", .{ self.step, self.total_steps, name });
         }
     }
 
     fn clearProgress(self: *const Pipeline) void {
-        if (self.progress_enabled) std.debug.print("\r\x1b[K", .{});
+        if (self.options.show_progress and (self.progress_enabled or self.options.progress != null)) {
+            progressClear(self.options);
+        }
     }
 
     /// Generic-message failure: the underlying call returned an error
@@ -806,7 +1477,7 @@ const Pipeline = struct {
             self.alloc,
             program,
             &self.ctx.collector.graph,
-            &self.ctx.interner,
+            self.ctx.interner,
             &subst_errors,
         ) catch return self.failWith("Error during attribute substitution", error.DesugarFailed);
         for (subst_errors.items) |subst_err| {
@@ -818,7 +1489,7 @@ const Pipeline = struct {
 
     fn runMacroExpand(self: *Pipeline, program: *const ast.Program) CompileError!ast.Program {
         self.progress("Expand macros");
-        var macro_engine = zap.MacroEngine.init(self.alloc, &self.ctx.interner, &self.ctx.collector.graph);
+        var macro_engine = zap.MacroEngine.init(self.alloc, self.ctx.interner, &self.ctx.collector.graph);
         defer macro_engine.deinit();
         const expanded = macro_engine.expandProgram(program) catch {
             for (macro_engine.errors.items) |macro_err| {
@@ -835,7 +1506,7 @@ const Pipeline = struct {
 
     fn runDesugar(self: *Pipeline, program: *const ast.Program) CompileError!ast.Program {
         self.progress("Desugar");
-        var desugarer = zap.Desugarer.init(self.alloc, &self.ctx.interner, &self.ctx.collector.graph);
+        var desugarer = zap.Desugarer.init(self.alloc, self.ctx.interner, &self.ctx.collector.graph);
         return desugarer.desugarProgram(program) catch
             self.failWith("Error during desugaring", error.DesugarFailed);
     }
@@ -887,8 +1558,8 @@ const Pipeline = struct {
             // call-site-specific inferred signatures from the previous
             // struct so they don't leak between structs.
             store.inferred_signatures.clearRetainingCapacity();
-            break :blk zap.types.TypeChecker.initWithSharedStore(self.alloc, store, &self.ctx.interner, &self.ctx.collector.graph);
-        } else zap.types.TypeChecker.init(self.alloc, &self.ctx.interner, &self.ctx.collector.graph);
+            break :blk zap.types.TypeChecker.initWithSharedStore(self.alloc, store, self.ctx.interner, &self.ctx.collector.graph);
+        } else zap.types.TypeChecker.init(self.alloc, self.ctx.interner, &self.ctx.collector.graph);
         errdefer type_checker.deinit();
         type_checker.allow_external_static_references = self.options.allow_external_static_references;
 
@@ -928,7 +1599,7 @@ const Pipeline = struct {
         group_id_offset: u32,
     ) CompileError!HirBuildResult {
         self.progress("HIR");
-        var hir_builder = zap.hir.HirBuilder.init(self.alloc, &self.ctx.interner, &self.ctx.collector.graph, type_store);
+        var hir_builder = zap.hir.HirBuilder.init(self.alloc, self.ctx.interner, &self.ctx.collector.graph, type_store);
         hir_builder.next_group_id = group_id_offset;
         hir_builder.allow_external_static_references = self.options.allow_external_static_references;
         const hir_program = hir_builder.buildProgram(desugared) catch {
@@ -950,7 +1621,7 @@ const Pipeline = struct {
         type_store: *zap.types.TypeStore,
         next_group_id: *u32,
     ) CompileError!zap.hir.Program {
-        const result = zap.monomorphize.monomorphize(self.alloc, hir_program, type_store, next_group_id, &self.ctx.interner) catch
+        const result = zap.monomorphize.monomorphize(self.alloc, hir_program, type_store, next_group_id, self.ctx.interner) catch
             return self.failWith("Error during monomorphization", error.HirFailed);
         return result.program;
     }
@@ -969,7 +1640,7 @@ const Pipeline = struct {
         type_store: *zap.types.TypeStore,
     ) CompileError!IrLoweringResult {
         self.progress("IR");
-        var ir_builder = zap.ir.IrBuilder.init(self.alloc, &self.ctx.interner);
+        var ir_builder = zap.ir.IrBuilder.init(self.alloc, self.ctx.interner);
         ir_builder.type_store = type_store;
         ir_builder.scope_graph = &self.ctx.collector.graph;
         defer ir_builder.deinit();
@@ -996,7 +1667,7 @@ const Pipeline = struct {
         // `arc_drop_insertion`. Both passes are stubs at this phase
         // (no IR mutation, no rejected programs); they exist so the
         // wiring is in place when subsequent phases populate them.
-        runArcOwnershipAndVerify(self.alloc, &program, &ownership, type_store) catch
+        runArcOwnershipAndVerify(self.alloc, &program, &ownership, type_store, self.options) catch
             return self.failWith("Error during ARC ownership classification or verification", error.IrFailed);
         // Phase E.9: `runArcOwnershipAndVerify` rewrote share/release
         // pairs into move/(no-release) for owned-convention call
@@ -1026,7 +1697,7 @@ const Pipeline = struct {
         // drop-insertion to `compileStructByStruct`'s Phase 5b so the
         // post-merge uniqueness inference sees a clean `last_use_map` (see
         // the note in `runIrLoweringWithTryIdSeed`).
-        runArcDropInsertion(self.alloc, &program, &ownership, type_store) catch
+        runArcDropInsertion(self.alloc, &program, &ownership, type_store, self.options) catch
             return self.failWith("Error during ARC drop insertion", error.IrFailed);
         return .{ .program = program, .arc_ownership = ownership };
     }
@@ -1046,7 +1717,7 @@ const Pipeline = struct {
         known_name_program: ?*const zap.hir.Program,
     ) CompileError!IrLoweringResult {
         self.progress("IR");
-        var ir_builder = zap.ir.IrBuilder.init(self.alloc, &self.ctx.interner);
+        var ir_builder = zap.ir.IrBuilder.init(self.alloc, self.ctx.interner);
         ir_builder.type_store = type_store;
         ir_builder.scope_graph = &self.ctx.collector.graph;
         ir_builder.next_try_id = next_try_id.*;
@@ -1135,7 +1806,7 @@ const Pipeline = struct {
                 self.alloc,
                 ir_program,
                 &self.ctx.collector.graph,
-                &self.ctx.interner,
+                self.ctx.interner,
                 order,
                 cache_dir,
                 opts_hash,
@@ -1145,7 +1816,7 @@ const Pipeline = struct {
                 self.alloc,
                 ir_program,
                 &self.ctx.collector.graph,
-                &self.ctx.interner,
+                self.ctx.interner,
                 cache_dir,
                 opts_hash,
             ) catch {};
@@ -1164,7 +1835,7 @@ const Pipeline = struct {
             self.alloc,
             mod_ir,
             &self.ctx.collector.graph,
-            &self.ctx.interner,
+            self.ctx.interner,
             mod_name,
             self.options.cache_dir,
             ctfeCompileOptionsHash(self.options),
@@ -1279,7 +1950,7 @@ fn stagedMacroExpandAndDesugar(
     interner: *ast.StringInterner,
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
-    allow_external_static_references: bool,
+    options: CompileOptions,
 ) CompileError!ast.Program {
     const original_structs = buildStructPrograms(alloc, program, interner) catch return error.OutOfMemory;
     var expanded_structs: std.ArrayListUnmanaged(StructProgram) = .empty;
@@ -1300,8 +1971,9 @@ fn stagedMacroExpandAndDesugar(
     var group_id_offset: u32 = 0;
 
     var staged_timer = ZapTimer.start();
-    for (struct_order) |struct_name| {
+    for (struct_order, 0..) |struct_name, struct_index| {
         const original = lookupStructProgramInSlice(original_structs, struct_name) orelse continue;
+        progressStage(options, "[macro {d}/{d}] {s}", .{ struct_index + 1, struct_order.len, struct_name });
         staged_timer.reset();
         const desugared = try expandAndDesugarStagedStruct(
             alloc,
@@ -1324,7 +1996,7 @@ fn stagedMacroExpandAndDesugar(
             diag_engine,
             shared_store,
             group_id_offset,
-            allow_external_static_references,
+            options.allow_external_static_references,
         );
         const hir_ms = staged_timer.lapMs();
         group_id_offset = hir_result.next_group_id;
@@ -1344,8 +2016,9 @@ fn stagedMacroExpandAndDesugar(
         }
     }
 
-    for (original_structs) |original| {
+    for (original_structs, 0..) |original, original_index| {
         if (seen_structs.contains(original.name)) continue;
+        progressStage(options, "[macro extra {d}/{d}] {s}", .{ original_index + 1, original_structs.len, original.name });
         const desugared = try expandAndDesugarStagedStruct(
             alloc,
             &original,
@@ -1379,6 +2052,363 @@ fn stagedMacroExpandAndDesugar(
         slices[expanded_structs.items.len] = top_program;
     }
     return mergePrograms(alloc, slices) catch return error.OutOfMemory;
+}
+
+fn stagedMacroExpandAndDesugarCached(
+    alloc: std.mem.Allocator,
+    program: *const ast.Program,
+    struct_order: []const []const u8,
+    interner: *ast.StringInterner,
+    collector: *zap.Collector,
+    diag_engine: *zap.DiagnosticEngine,
+    options: CompileOptions,
+    cache: *ExpansionCacheWork,
+) CompileError!ast.Program {
+    const original_structs = buildStructPrograms(alloc, program, interner) catch return error.OutOfMemory;
+    var ordered_structs: std.ArrayListUnmanaged(*const StructProgram) = .empty;
+    var ordered_seen_structs = std.StringHashMap(void).init(alloc);
+    for (struct_order) |struct_name| {
+        const original = lookupStructProgramInSlice(original_structs, struct_name) orelse continue;
+        try ordered_structs.append(alloc, original);
+        try ordered_seen_structs.put(original.name, {});
+    }
+    for (original_structs) |*original| {
+        if (ordered_seen_structs.contains(original.name)) continue;
+        try ordered_structs.append(alloc, original);
+    }
+
+    const top_level_items = try collectUnassignedTopLevelItems(alloc, program);
+    cache.has_unassigned_top_level_items = top_level_items.len > 0;
+    const top_level_signature = topLevelItemsSignature(&collector.graph, top_level_items);
+    const top_level_expansion_required = topLevelExpansionRequired(
+        top_level_items,
+        top_level_signature,
+        cache,
+        original_structs,
+    );
+    const expansion_required = try alloc.alloc(bool, ordered_structs.items.len);
+    for (ordered_structs.items, 0..) |original, index| {
+        expansion_required[index] = cache.invalidated_structs.contains(original.name) or
+            cache.state.expanded_structs.get(original.name) == null;
+    }
+    const later_expansion_required = try alloc.alloc(bool, ordered_structs.items.len);
+    var later_required = top_level_expansion_required;
+    var reverse_index = ordered_structs.items.len;
+    while (reverse_index > 0) {
+        reverse_index -= 1;
+        later_expansion_required[reverse_index] = later_required;
+        later_required = later_required or expansion_required[reverse_index];
+    }
+
+    var expanded_structs: std.ArrayListUnmanaged(StructProgram) = .empty;
+
+    var cumulative_ir = ir.Program{
+        .functions = &.{},
+        .type_defs = &.{},
+        .entry = null,
+    };
+    var compiled_executor = @import("macro.zig").CompiledMacroExecutor.init(alloc, &cumulative_ir);
+    defer compiled_executor.deinit();
+
+    const shared_store = alloc.create(zap.types.TypeStore) catch return error.OutOfMemory;
+    shared_store.* = zap.types.TypeStore.init(alloc, interner);
+
+    var hir_results: std.ArrayListUnmanaged(StructHirResult) = .empty;
+    var group_id_offset: u32 = 0;
+    var staged_ir_dirty = false;
+
+    var staged_timer = ZapTimer.start();
+    for (ordered_structs.items, 0..) |original, struct_index| {
+        progressStage(options, "[macro {d}/{d}] {s}", .{ struct_index + 1, ordered_structs.items.len, original.name });
+        staged_timer.reset();
+
+        var rebuild_ms: u64 = 0;
+        if (expansion_required[struct_index] and staged_ir_dirty) {
+            cumulative_ir = try rebuildStagedIr(
+                alloc,
+                hir_results.items,
+                interner,
+                collector,
+                shared_store,
+                group_id_offset,
+            );
+            rebuild_ms = staged_timer.lapMs();
+            staged_ir_dirty = false;
+        }
+
+        const expanded = try cachedOrExpandStagedStruct(
+            alloc,
+            original,
+            interner,
+            collector,
+            diag_engine,
+            &compiled_executor,
+            cache,
+        );
+        const desugared = expanded.program;
+        const expand_ms = staged_timer.lapMs();
+        try expanded_structs.append(alloc, .{ .name = original.name, .program = desugared });
+
+        if (!later_expansion_required[struct_index]) {
+            if (profilingEnabled() and expand_ms >= 100) {
+                std.debug.print("\n[staged struct={s} expand+desugar_ms={d} stagedHIR_ms=0 rebuildIR_ms=0]\n", .{ original.name, expand_ms });
+            }
+            continue;
+        }
+
+        const hir_result = try compileStagedStructHir(
+            alloc,
+            &desugared,
+            original.name,
+            interner,
+            collector,
+            diag_engine,
+            shared_store,
+            group_id_offset,
+            options.allow_external_static_references,
+        );
+        const hir_ms = staged_timer.lapMs();
+        group_id_offset = hir_result.next_group_id;
+        try hir_results.append(alloc, hir_result);
+        staged_ir_dirty = true;
+        if (profilingEnabled() and (expand_ms + hir_ms + rebuild_ms) >= 100) {
+            std.debug.print("\n[staged struct={s} expand+desugar_ms={d} stagedHIR_ms={d} rebuildIR_ms={d}]\n", .{ original.name, expand_ms, hir_ms, rebuild_ms });
+        }
+    }
+
+    if (top_level_expansion_required and staged_ir_dirty) {
+        cumulative_ir = try rebuildStagedIr(
+            alloc,
+            hir_results.items,
+            interner,
+            collector,
+            shared_store,
+            group_id_offset,
+        );
+        staged_ir_dirty = false;
+    }
+
+    const top_level_program = try cachedOrExpandTopLevelProgram(
+        alloc,
+        top_level_items,
+        top_level_signature,
+        top_level_expansion_required,
+        interner,
+        collector,
+        diag_engine,
+        &compiled_executor,
+        cache,
+    );
+
+    const extra_top_level_count: usize = if (top_level_program != null) 1 else 0;
+    const slices = try alloc.alloc(ast.Program, expanded_structs.items.len + extra_top_level_count);
+    for (expanded_structs.items, 0..) |entry, index| {
+        slices[index] = entry.program;
+    }
+    if (top_level_program) |top_program| {
+        slices[expanded_structs.items.len] = top_program;
+    }
+    return mergePrograms(alloc, slices) catch return error.OutOfMemory;
+}
+
+fn topLevelExpansionRequired(
+    top_level_items: []const ast.TopItem,
+    top_level_signature: ?u64,
+    cache: *ExpansionCacheWork,
+    original_structs: []const StructProgram,
+) bool {
+    if (top_level_items.len == 0) return false;
+    const signature = top_level_signature orelse return true;
+    if (invalidatedStructsMayAffectTopLevelMacros(original_structs, cache)) return true;
+    const cached = cache.state.expanded_top_level orelse return true;
+    return cached.signature != signature;
+}
+
+fn invalidatedStructsMayAffectTopLevelMacros(
+    original_structs: []const StructProgram,
+    cache: *ExpansionCacheWork,
+) bool {
+    var invalidated_iter = cache.invalidated_structs.keyIterator();
+    while (invalidated_iter.next()) |struct_name| {
+        if (lookupStructProgramInSlice(original_structs, struct_name.*)) |current| {
+            if (structProgramDeclaresMacro(current.program)) return true;
+        }
+        if (cache.state.expanded_structs.get(struct_name.*)) |previous| {
+            if (previous.declares_macro_provider) return true;
+        }
+    }
+    return false;
+}
+
+fn structProgramDeclaresMacro(program: ast.Program) bool {
+    for (program.structs) |struct_decl| {
+        for (struct_decl.items) |item| {
+            switch (item) {
+                .macro, .priv_macro => return true,
+                else => {},
+            }
+        }
+    }
+    for (program.top_items) |item| {
+        switch (item) {
+            .macro, .priv_macro => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn topLevelItemsSignature(
+    graph: *const zap.scope.ScopeGraph,
+    top_level_items: []const ast.TopItem,
+) ?u64 {
+    if (top_level_items.len == 0) return null;
+
+    var hasher = std.hash.Wyhash.init(0);
+    var item_count: u64 = @intCast(top_level_items.len);
+    hasher.update(std.mem.asBytes(&item_count));
+
+    for (top_level_items) |item| {
+        const tag_value: u32 = @intFromEnum(std.meta.activeTag(item));
+        hasher.update(std.mem.asBytes(&tag_value));
+
+        const span = topItemSourceSpan(item);
+        const source_id = span.source_id orelse return null;
+        const source = graph.sourceContentById(source_id);
+        if (source.len == 0) return null;
+        if (span.start >= span.end) return null;
+        if (span.end > source.len) return null;
+
+        var start: u32 = span.start;
+        var end: u32 = span.end;
+        hasher.update(std.mem.asBytes(&source_id));
+        hasher.update(std.mem.asBytes(&start));
+        hasher.update(std.mem.asBytes(&end));
+        hasher.update(source[start..end]);
+    }
+
+    return hasher.final();
+}
+
+fn topItemSourceSpan(item: ast.TopItem) ast.SourceSpan {
+    return switch (item) {
+        .struct_decl => |decl| decl.meta.span,
+        .priv_struct_decl => |decl| decl.meta.span,
+        .protocol => |decl| decl.meta.span,
+        .priv_protocol => |decl| decl.meta.span,
+        .impl_decl => |decl| decl.meta.span,
+        .priv_impl_decl => |decl| decl.meta.span,
+        .type_decl => |decl| decl.meta.span,
+        .opaque_decl => |decl| decl.meta.span,
+        .union_decl => |decl| decl.meta.span,
+        .function => |decl| decl.meta.span,
+        .priv_function => |decl| decl.meta.span,
+        .macro => |decl| decl.meta.span,
+        .priv_macro => |decl| decl.meta.span,
+        .attribute => |decl| decl.meta.span,
+    };
+}
+
+fn cachedOrExpandTopLevelProgram(
+    alloc: std.mem.Allocator,
+    top_level_items: []const ast.TopItem,
+    top_level_signature: ?u64,
+    expansion_required: bool,
+    interner: *ast.StringInterner,
+    collector: *zap.Collector,
+    diag_engine: *zap.DiagnosticEngine,
+    compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
+    cache: *ExpansionCacheWork,
+) CompileError!?ast.Program {
+    if (top_level_items.len == 0) return null;
+
+    if (!expansion_required) {
+        if (cache.state.expanded_top_level) |entry| {
+            try updateImplDeclsInProgram(collector, &entry.program);
+            return entry.program;
+        }
+    }
+
+    const signature = top_level_signature orelse {
+        const expanded = try expandAndDesugarTopLevelProgram(
+            alloc,
+            top_level_items,
+            interner,
+            collector,
+            diag_engine,
+            compiled_executor,
+        );
+        try updateImplDeclsInProgram(collector, &expanded);
+        return expanded;
+    };
+
+    const artifact = cache.state.allocator.create(FrontendIncrementalState.CachedExpandedTopLevel) catch
+        return error.OutOfMemory;
+    artifact.* = .{
+        .arena = std.heap.ArenaAllocator.init(cache.state.allocator),
+        .signature = signature,
+        .program = .{ .structs = &.{}, .top_items = &.{} },
+    };
+    errdefer artifact.destroy(cache.state.allocator);
+
+    const artifact_alloc = artifact.arena.allocator();
+    const expanded_program = try expandAndDesugarTopLevelProgram(
+        artifact_alloc,
+        top_level_items,
+        interner,
+        collector,
+        diag_engine,
+        compiled_executor,
+    );
+    artifact.program = try cloneAstProgramOwned(artifact_alloc, expanded_program, interner);
+    try updateImplDeclsInProgram(collector, &artifact.program);
+    cache.new_expanded_top_level.* = artifact;
+    return artifact.program;
+}
+
+fn cachedOrExpandStagedStruct(
+    alloc: std.mem.Allocator,
+    original: *const StructProgram,
+    interner: *ast.StringInterner,
+    collector: *zap.Collector,
+    diag_engine: *zap.DiagnosticEngine,
+    compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
+    cache: *ExpansionCacheWork,
+) CompileError!StagedExpansionResult {
+    const cached = cache.state.expanded_structs.get(original.name);
+    if (!cache.invalidated_structs.contains(original.name)) {
+        if (cached) |entry| {
+            try reCollectFunctionsInProgram(collector, &entry.program);
+            try updateImplDeclsInProgram(collector, &entry.program);
+            return .{ .program = entry.program, .cache_hit = true };
+        }
+    }
+
+    const artifact = cache.state.allocator.create(FrontendIncrementalState.CachedExpandedStruct) catch
+        return error.OutOfMemory;
+    artifact.* = .{
+        .arena = std.heap.ArenaAllocator.init(cache.state.allocator),
+        .name = &.{},
+        .declares_macro_provider = structProgramDeclaresMacro(original.program),
+        .program = .{ .structs = &.{}, .top_items = &.{} },
+    };
+    errdefer artifact.destroy(cache.state.allocator);
+
+    const artifact_alloc = artifact.arena.allocator();
+    artifact.name = artifact_alloc.dupe(u8, original.name) catch return error.OutOfMemory;
+    const expanded_program = try expandAndDesugarStagedStruct(
+        artifact_alloc,
+        original,
+        interner,
+        collector,
+        diag_engine,
+        compiled_executor,
+    );
+    artifact.program = try cloneAstProgramOwned(artifact_alloc, expanded_program, interner);
+    try reCollectFunctionsInProgram(collector, &artifact.program);
+    try updateImplDeclsInProgram(collector, &artifact.program);
+    try cache.new_expanded_structs.append(alloc, artifact);
+    return .{ .program = artifact.program, .cache_hit = false };
 }
 
 fn collectUnassignedTopLevelItems(
@@ -1481,16 +2511,16 @@ fn expandAndDesugarStagedStruct(
     }
     if (diag_engine.errorCount() > error_baseline) return error.MacroExpansionFailed;
 
-    reCollectFunctionsInProgram(collector, &expanded);
-    updateImplDeclsInProgram(collector, &expanded);
+    try reCollectFunctionsInProgram(collector, &expanded);
+    try updateImplDeclsInProgram(collector, &expanded);
 
     var desugarer = zap.Desugarer.init(alloc, interner, &collector.graph);
     const desugared = desugarer.desugarProgram(&expanded) catch {
         diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch {};
         return error.DesugarFailed;
     };
-    reCollectFunctionsInProgram(collector, &desugared);
-    updateImplDeclsInProgram(collector, &desugared);
+    try reCollectFunctionsInProgram(collector, &desugared);
+    try updateImplDeclsInProgram(collector, &desugared);
     try expandGraphImplsForProgram(alloc, &desugared, interner, collector, diag_engine, compiled_executor);
     return desugared;
 }
@@ -1540,11 +2570,14 @@ fn expandGraphImplsForProgram(
             return error.DesugarFailed;
         };
         if (desugared_impl_program.top_items.len > 0) {
-            entry.decl = switch (desugared_impl_program.top_items[0]) {
+            const desugared_impl = switch (desugared_impl_program.top_items[0]) {
                 .impl_decl => |decl| decl,
                 .priv_impl_decl => |decl| decl,
                 else => entry.decl,
             };
+            entry.protocol_name = desugared_impl.protocol_name;
+            entry.target_type = desugared_impl.target_type;
+            entry.decl = desugared_impl;
         }
     }
 }
@@ -1841,26 +2874,14 @@ fn lookupStructProgramInSlice(struct_programs: []const StructProgram, struct_nam
     return null;
 }
 
-fn reCollectFunctionsInProgram(collector: *zap.Collector, program: *const ast.Program) void {
-    for (program.structs) |*mod| {
-        const mod_scope = collector.graph.findStructScope(mod.name) orelse continue;
-        for (mod.items) |item| {
-            switch (item) {
-                .function, .priv_function => |func| {
-                    const arity: u8 = if (func.clauses.len > 0) @intCast(func.clauses[0].params.len) else 0;
-                    const key = zap.scope.FamilyKey{ .name = func.name, .arity = arity };
-                    const scope_data = collector.graph.getScope(mod_scope);
-                    if (scope_data.function_families.get(key) == null) {
-                        collector.collectFunction(func, mod_scope) catch {};
-                    }
-                },
-                else => {},
-            }
-        }
-    }
+fn reCollectFunctionsInProgram(collector: *zap.Collector, program: *const ast.Program) CompileError!void {
+    collector.refreshStructFunctionDeclarations(program) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CollectFailed,
+    };
 }
 
-fn updateImplDeclsInProgram(collector: *zap.Collector, program: *const ast.Program) void {
+fn updateImplDeclsInProgram(collector: *zap.Collector, program: *const ast.Program) CompileError!void {
     for (program.top_items) |item| {
         const impl = switch (item) {
             .impl_decl => |decl| decl,
@@ -1870,10 +2891,13 @@ fn updateImplDeclsInProgram(collector: *zap.Collector, program: *const ast.Progr
         for (collector.graph.impls.items) |*entry| {
             if (!structNamesEqual(entry.protocol_name, impl.protocol_name)) continue;
             if (!structNamesEqual(entry.target_type, impl.target_type)) continue;
-            entry.decl = impl;
-            break;
+            collector.refreshImplDeclaration(entry, impl) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.CollectFailed,
+            };
         }
     }
+    collector.registerImplFunctionsInTargetScopes() catch return error.OutOfMemory;
 }
 
 fn structNamesEqual(left: ast.StructName, right: ast.StructName) bool {
@@ -1898,57 +2922,32 @@ fn structNamesEqual(left: ast.StructName, right: ast.StructName) bool {
 /// with all structs' declarations. Each struct compiles against the full
 /// scope graph (for cross-struct type resolution) but only processes its
 /// own AST through the pipeline.
-pub fn compileStructByStruct(
+const PreFinalIrResult = struct {
+    shared_store: *zap.types.TypeStore,
+    program: ir.Program,
+    arc_ownership: zap.arc_liveness.ProgramArcOwnership,
+};
+
+fn compileStructsToPreFinalIr(
     alloc: std.mem.Allocator,
     ctx: *CompilationContext,
     struct_order: []const []const u8,
     options: CompileOptions,
-) CompileError!CompileResult {
-    var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
-    pipeline.defer_render = true;
-
-    // Collect all IR functions and type defs across structs.
-    var all_functions: std.ArrayListUnmanaged(ir.Function) = .empty;
-    var all_type_defs: std.ArrayListUnmanaged(ir.TypeDef) = .empty;
-    var entry_id: ?ir.FunctionId = null;
-
-    // Shared TypeStore + globally-unique group IDs pipeline.
-    const shared_store = alloc.create(zap.types.TypeStore) catch return error.OutOfMemory;
-    shared_store.* = zap.types.TypeStore.init(alloc, &ctx.interner);
-
-    // Phase 1: every struct → HIR. Shared TypeStore and globally-
-    // unique group IDs let later phases monomorphize across struct
-    // boundaries.
-    //
-    // Dedupe `struct_order` defensively. Discovery already canonicalizes
-    // file paths so the same on-disk struct cannot be queued twice via
-    // different surface paths, but per-struct HIR lowering must run at
-    // most once per struct regardless: a second lowering would emit a
-    // second `ir.Function` record for every public function with the
-    // same name but a different `FunctionId`, which silently breaks
-    // every downstream pass that maps function names to IDs (the uniqueness
-    // fixpoint signature table, the ARC convention `lift_set`, the
-    // chain-consistency audit). Treat upstream duplicates as a bug to
-    // surface — once discovery is the single source of truth this
-    // guard becomes a defensive no-op, but it also keeps callers that
-    // assemble `struct_order` themselves from triggering the same
-    // hazard.
+) CompileError!PreFinalIrResult {
     var phase_timer = ZapTimer.start();
     var per_struct_timer = ZapTimer.start();
     var hir_results: std.ArrayListUnmanaged(StructHirResult) = .empty;
     var group_id_offset: u32 = 0;
+
+    const shared_store = alloc.create(zap.types.TypeStore) catch return error.OutOfMemory;
+    shared_store.* = zap.types.TypeStore.init(alloc, ctx.interner);
+
     var lowered_structs = std.StringHashMap(void).init(alloc);
     defer lowered_structs.deinit();
     for (struct_order, 0..) |mod_name, mod_idx| {
         if (lowered_structs.contains(mod_name)) continue;
-        if (options.show_progress) {
-            std.debug.print("\r\x1b[K  [hir {d}/{d}] {s}", .{ mod_idx + 1, struct_order.len, mod_name });
-        }
+        progressStage(options, "[hir {d}/{d}] {s}", .{ mod_idx + 1, struct_order.len, mod_name });
         const mod_program = lookupStructProgram(ctx, mod_name) orelse continue;
-        // Per-struct failures are routed through the diagnostic
-        // engine inside the helper; the loop continues so other
-        // structs still compile and the user sees as many errors as
-        // possible in one run.
         per_struct_timer.reset();
         const hir_result = compileSingleStructHir(alloc, ctx, mod_name, mod_program, shared_store, group_id_offset, options) catch continue;
         const hir_elapsed_ms = per_struct_timer.readMs();
@@ -1965,7 +2964,7 @@ pub fn compileStructByStruct(
         _ = phase_timer.lapMs();
     }
 
-    // Phase 2: merge per-struct HIR programs.
+    progressStage(options, "HIR: merge", .{});
     var all_hir_structs: std.ArrayListUnmanaged(zap.hir.Struct) = .empty;
     var all_hir_top_fns: std.ArrayListUnmanaged(zap.hir.FunctionGroup) = .empty;
     var all_hir_protocols: std.ArrayListUnmanaged(zap.hir.ProtocolInfo) = .empty;
@@ -1974,11 +2973,11 @@ pub fn compileStructByStruct(
         for (result.hir_program.structs) |mod| {
             all_hir_structs.append(alloc, mod) catch return error.OutOfMemory;
         }
-        for (result.hir_program.top_functions) |tf| {
-            all_hir_top_fns.append(alloc, tf) catch return error.OutOfMemory;
+        for (result.hir_program.top_functions) |top_function| {
+            all_hir_top_fns.append(alloc, top_function) catch return error.OutOfMemory;
         }
-        for (result.hir_program.protocols) |proto| {
-            all_hir_protocols.append(alloc, proto) catch return error.OutOfMemory;
+        for (result.hir_program.protocols) |protocol| {
+            all_hir_protocols.append(alloc, protocol) catch return error.OutOfMemory;
         }
         for (result.hir_program.impls) |impl_info| {
             all_hir_impls.append(alloc, impl_info) catch return error.OutOfMemory;
@@ -1997,8 +2996,10 @@ pub fn compileStructByStruct(
         _ = phase_timer.lapMs();
     }
 
-    // Phase 3: whole-program monomorphization.
+    progressStage(options, "Monomorphize", .{});
     var mono_next = group_id_offset;
+    var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
+    pipeline.defer_render = true;
     combined_hir = try pipeline.runMonomorphize(&combined_hir, shared_store, &mono_next);
     if (profilingEnabled()) {
         std.debug.print("\n[stage Phase3-Monomorphize] ms={d}\n", .{phase_timer.lapMs()});
@@ -2006,26 +3007,20 @@ pub fn compileStructByStruct(
         _ = phase_timer.lapMs();
     }
 
-    // Phase 4: each struct's HIR → IR. Function IDs are already
-    // globally unique from the HIR stage (group_id_offset advancement
-    // in phase 1), so no cloneWithOffset is needed — collect
-    // functions directly. `next_try_id` is threaded across structs so
-    // synthesized `__try` variants get globally unique IDs that don't
-    // collide with another struct's regular HIR groups.
+    var all_functions: std.ArrayListUnmanaged(ir.Function) = .empty;
+    var all_type_defs: std.ArrayListUnmanaged(ir.TypeDef) = .empty;
+    var entry_id: ?ir.FunctionId = null;
     var next_try_id: u32 = mono_next;
-    // Merged ARC ownership table aggregated across every per-struct
-    // IR-lowering call. Each per-struct call returns its own
-    // `ProgramArcOwnership`; we move the entries into this combined
-    // map so downstream phases can look up any function by id without
-    // tracking which struct it came from.
     var combined_arc_ownership = zap.arc_liveness.ProgramArcOwnership.init(alloc);
     errdefer combined_arc_ownership.deinit();
-    for (combined_hir.structs) |mod| {
+
+    for (combined_hir.structs, 0..) |mod, mod_index| {
+        const mod_name_str = if (mod.name.parts.len > 0) ctx.interner.get(mod.name.parts[mod.name.parts.len - 1]) else "unknown";
+        progressStage(options, "[ir {d}/{d}] {s}", .{ mod_index + 1, combined_hir.structs.len, mod_name_str });
         const single_mod_hir = zap.hir.Program{
             .structs = try alloc.dupe(zap.hir.Struct, &.{mod}),
             .top_functions = &.{},
         };
-        const mod_name_str = if (mod.name.parts.len > 0) ctx.interner.get(mod.name.parts[mod.name.parts.len - 1]) else "unknown";
         per_struct_timer.reset();
         const mod_lower = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options, &next_try_id, &combined_hir) catch {
             continue;
@@ -2036,15 +3031,17 @@ pub fn compileStructByStruct(
         if (profilingEnabled() and ir_elapsed_ms >= 100) {
             std.debug.print("\n[stage IR struct={s}] ms={d}\n", .{ mod_name_str, ir_elapsed_ms });
         }
-        for (mod_ir.functions) |func| {
-            all_functions.append(alloc, func) catch return error.OutOfMemory;
+        for (mod_ir.functions) |function| {
+            all_functions.append(alloc, function) catch return error.OutOfMemory;
         }
-        if (mod_ir.entry) |eid| entry_id = eid;
-        for (mod_ir.type_defs) |td| {
-            all_type_defs.append(alloc, td) catch return error.OutOfMemory;
+        if (mod_ir.entry) |entry| entry_id = entry;
+        for (mod_ir.type_defs) |type_def| {
+            all_type_defs.append(alloc, type_def) catch return error.OutOfMemory;
         }
     }
+
     if (combined_hir.top_functions.len > 0) {
+        progressStage(options, "IR: top-level functions", .{});
         const top_hir = zap.hir.Program{
             .structs = &.{},
             .top_functions = combined_hir.top_functions,
@@ -2053,12 +3050,12 @@ pub fn compileStructByStruct(
         const mod_lower = compileHirToIr(alloc, ctx, "top", &top_hir, shared_store, options, &next_try_id, &combined_hir) catch return error.IrFailed;
         const mod_ir = mod_lower.program;
         try mergeArcOwnership(alloc, &combined_arc_ownership, mod_lower.arc_ownership);
-        for (mod_ir.functions) |func| {
-            all_functions.append(alloc, func) catch return error.OutOfMemory;
+        for (mod_ir.functions) |function| {
+            all_functions.append(alloc, function) catch return error.OutOfMemory;
         }
-        if (mod_ir.entry) |eid| entry_id = eid;
-        for (mod_ir.type_defs) |td| {
-            all_type_defs.append(alloc, td) catch return error.OutOfMemory;
+        if (mod_ir.entry) |entry| entry_id = entry;
+        for (mod_ir.type_defs) |type_def| {
+            all_type_defs.append(alloc, type_def) catch return error.OutOfMemory;
         }
     }
 
@@ -2068,12 +3065,31 @@ pub fn compileStructByStruct(
         _ = phase_timer.lapMs();
     }
 
-    // Phase 5: analysis + contification on the merged IR.
-    var merged_ir = ir.Program{
-        .functions = all_functions.items,
-        .type_defs = all_type_defs.items,
-        .entry = entry_id,
+    return .{
+        .shared_store = shared_store,
+        .program = .{
+            .functions = all_functions.items,
+            .type_defs = all_type_defs.items,
+            .entry = entry_id,
+        },
+        .arc_ownership = combined_arc_ownership,
     };
+}
+
+fn finishMergedIr(
+    alloc: std.mem.Allocator,
+    ctx: *CompilationContext,
+    options: CompileOptions,
+    shared_store: *zap.types.TypeStore,
+    pre_final_program: ir.Program,
+    pre_final_arc_ownership: zap.arc_liveness.ProgramArcOwnership,
+) CompileError!CompileResult {
+    var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
+    pipeline.defer_render = true;
+    var phase_timer = ZapTimer.start();
+
+    progressStage(options, "Analysis: escape and contification", .{});
+    var merged_ir = pre_final_program;
     var analysis_result = try pipeline.runAnalysisAndContify(&merged_ir);
     if (profilingEnabled()) {
         std.debug.print("\n[stage Phase5-AnalysisAndContify] ms={d}\n", .{phase_timer.lapMs()});
@@ -2081,67 +3097,33 @@ pub fn compileStructByStruct(
         _ = phase_timer.lapMs();
     }
 
-    // Phase 5b: re-run the ARC convention inference + ownership rewriting
-    // on the merged IR so cross-struct call sites can promote callee
-    // params from `.borrowed` to `.owned`. The per-struct pipeline only
-    // sees its own struct's call sites (the per-struct `name_to_id`
-    // table only contains that struct's functions), so wrappers like
-    // `List.set` and `Map.put` whose only callers live in OTHER
-    // structs (e.g. user code in `FannkuchRedux`, `KNucleotide`) are
-    // missed by the per-struct inference. This pass runs against the
-    // merged program so EVERY caller is visible.
-    //
-    // Idempotency: every pass in this block is idempotent against
-    // post-per-struct IR — `arc_param_convention` is monotonic
-    // (.borrowed → .owned, never the other way); `rewriteOwnedConsumeBuiltinSites`,
-    // `classifyAndNormalize`, and `rewriteOwnedConsumeSites` look for
-    // pre-rewrite IR shapes that no longer exist after the first run;
-    // `arc_drop_insertion` recomputes liveness against the current IR
-    // and only adds releases for locals genuinely live-before-ret
-    // (existing releases are already "uses" in the recomputed view).
-    //
-    // This wiring fix unblocks the rc-1 fast path for ARC-managed
-    // wrappers whose callers are in other structs — without it, every
-    // `List.set`/`Map.put`/etc. call from user code enters the
-    // runtime at refcount >= 2 and triggers the COW clone path.
+    var combined_arc_ownership = pre_final_arc_ownership;
     {
-        // Recompute ownership against the merged IR so the inference
-        // sees the post-Phase-5 last-use map (contification may have
-        // moved instructions; arc_param_convention reads
-        // `last_use_map` to gate share-source promotions).
+        progressStage(options, "ARC: ownership and drops", .{});
+        progressStage(options, "ARC: computing merged ownership", .{});
         var merged_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, &merged_ir, shared_store) catch
             return error.IrFailed;
+        progressStage(options, "ARC: inferring parameter conventions", .{});
         zap.arc_param_convention.inferConventions(alloc, &merged_ir, &merged_ownership, shared_store) catch {
             merged_ownership.deinit();
             return error.IrFailed;
         };
-        runArcOwnershipAndVerify(alloc, &merged_ir, &merged_ownership, shared_store) catch {
+        runArcOwnershipAndVerify(alloc, &merged_ir, &merged_ownership, shared_store, options) catch {
             merged_ownership.deinit();
             return error.IrFailed;
         };
-        // Recompute ownership AFTER the rewrites so drop-insertion
-        // sees the post-rewrite liveness shape.
+        progressStage(options, "ARC: recomputing post-rewrite ownership", .{});
         merged_ownership.deinit();
         merged_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, &merged_ir, shared_store) catch
             return error.IrFailed;
-        runArcDropInsertion(alloc, &merged_ir, &merged_ownership, shared_store) catch {
+        runArcDropInsertion(alloc, &merged_ir, &merged_ownership, shared_store, options) catch {
             merged_ownership.deinit();
             return error.IrFailed;
         };
-        // Phase 2: materialize the analysis-context records
-        // (arc_ops, drop_specializations) into first-class
-        // `.retain { kind }` / `.release { kind }` IR instructions
-        // inserted directly into the function body. Records that
-        // can't be resolved against the merged IR remain in the
-        // analysis context for the V10 audit to surface.
-        materializeAnalysisArcOps(alloc, &merged_ir, &analysis_result.context, shared_store, options.declared_caps) catch {
+        materializeAnalysisArcOps(alloc, &merged_ir, &analysis_result.context, shared_store, options.declared_caps, options) catch {
             merged_ownership.deinit();
             return error.IrFailed;
         };
-        // Replace the per-struct combined ownership with the
-        // recomputed merged ownership so downstream consumers
-        // (ZIR backend, `arc_share_skipped`, etc.) see the
-        // post-merge analysis.
         combined_arc_ownership.deinit();
         combined_arc_ownership = merged_ownership;
         if (profilingEnabled()) {
@@ -2151,10 +3133,6 @@ pub fn compileStructByStruct(
         }
     }
 
-    // Single rendering pass for all per-struct diagnostics. Each
-    // sub-pipeline accumulated into the shared engine without flushing,
-    // so we emit exactly once here regardless of how many structs
-    // failed.
     if (ctx.diag_engine.hasErrors()) {
         pipeline.clearProgress();
         emitContextDiagnostics(ctx, alloc);
@@ -2164,6 +3142,372 @@ pub fn compileStructByStruct(
         .ir_program = merged_ir,
         .analysis_context = analysis_result.context,
         .arc_ownership = combined_arc_ownership,
+    };
+}
+
+pub fn compileStructByStruct(
+    alloc: std.mem.Allocator,
+    ctx: *CompilationContext,
+    struct_order: []const []const u8,
+    options: CompileOptions,
+) CompileError!CompileResult {
+    const pre_final = try compileStructsToPreFinalIr(alloc, ctx, struct_order, options);
+    return finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
+}
+
+fn compileStructByStructIncrementalFinal(
+    alloc: std.mem.Allocator,
+    ctx: *CompilationContext,
+    struct_order: []const []const u8,
+    options: CompileOptions,
+    cached_final_program: ?ir.Program,
+    invalidated_structs: *const std.StringHashMap(void),
+) CompileError!CompileResult {
+    var pre_final = try compileStructsToPreFinalIr(alloc, ctx, struct_order, options);
+    const cached_program = cached_final_program orelse {
+        return finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
+    };
+
+    var affected_functions = std.AutoHashMap(ir.FunctionId, void).init(alloc);
+    try seedAffectedFunctionsFromStructs(alloc, pre_final.program, invalidated_structs, &affected_functions);
+    if (affected_functions.count() == 0) {
+        pre_final.arc_ownership.deinit();
+        return .{
+            .ir_program = cached_program,
+            .analysis_context = null,
+            .arc_ownership = null,
+        };
+    }
+
+    try expandAffectedFunctionsToCallers(alloc, pre_final.program, &affected_functions);
+    if (affected_functions.count() == pre_final.program.functions.len) {
+        return finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
+    }
+
+    if (!finalFunctionLayoutStable(pre_final.program, cached_program) or
+        !unaffectedFunctionIdentitiesStable(pre_final.program, cached_program, &affected_functions))
+    {
+        return finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
+    }
+    if (!typeDefinitionsStable(pre_final.program.type_defs, cached_program.type_defs)) {
+        return finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
+    }
+
+    const component_program = try buildAffectedPreFinalProgram(alloc, pre_final.program, &affected_functions);
+    const component_pre_ownership = zap.arc_liveness.ProgramArcOwnership.init(alloc);
+    const component_result = try finishMergedIr(
+        alloc,
+        ctx,
+        options,
+        pre_final.shared_store,
+        component_program,
+        component_pre_ownership,
+    );
+    pre_final.arc_ownership.deinit();
+
+    const merged_program = try mergeCachedAndAffectedFinalProgram(
+        alloc,
+        pre_final.program,
+        cached_program,
+        component_result.ir_program,
+        &affected_functions,
+    );
+
+    return .{
+        .ir_program = merged_program,
+        .analysis_context = component_result.analysis_context,
+        .arc_ownership = component_result.arc_ownership,
+    };
+}
+
+fn finalFunctionLayoutStable(current: ir.Program, cached: ir.Program) bool {
+    if (current.functions.len != cached.functions.len) return false;
+    for (current.functions, cached.functions) |current_function, cached_function| {
+        if (current_function.id != cached_function.id) return false;
+    }
+    return true;
+}
+
+fn unaffectedFunctionIdentitiesStable(
+    current: ir.Program,
+    cached: ir.Program,
+    affected_functions: *const std.AutoHashMap(ir.FunctionId, void),
+) bool {
+    if (current.functions.len != cached.functions.len) return false;
+    for (current.functions, cached.functions) |current_function, cached_function| {
+        if (affected_functions.contains(current_function.id)) continue;
+        if (current_function.id != cached_function.id) return false;
+        if (!std.mem.eql(u8, current_function.name, cached_function.name)) return false;
+        if (!optionalStringEql(current_function.struct_name, cached_function.struct_name)) return false;
+        if (!std.mem.eql(u8, current_function.local_name, cached_function.local_name)) return false;
+        if (current_function.arity != cached_function.arity) return false;
+    }
+    return true;
+}
+
+fn typeDefinitionsStable(current: []const ir.TypeDef, cached: []const ir.TypeDef) bool {
+    if (current.len != cached.len) return false;
+    for (current, cached) |current_type, cached_type| {
+        if (!typeDefinitionEqual(current_type, cached_type)) return false;
+    }
+    return true;
+}
+
+fn typeDefinitionEqual(left: ir.TypeDef, right: ir.TypeDef) bool {
+    if (!std.mem.eql(u8, left.name, right.name)) return false;
+    if (std.meta.activeTag(left.kind) != std.meta.activeTag(right.kind)) return false;
+    return switch (left.kind) {
+        .struct_def => |left_struct| blk: {
+            const right_struct = right.kind.struct_def;
+            if (left_struct.fields.len != right_struct.fields.len) break :blk false;
+            for (left_struct.fields, right_struct.fields) |left_field, right_field| {
+                if (!std.mem.eql(u8, left_field.name, right_field.name)) break :blk false;
+                if (!zigTypeEqual(left_field.type_expr, right_field.type_expr)) break :blk false;
+                if (left_field.storage != right_field.storage) break :blk false;
+            }
+            break :blk true;
+        },
+        .enum_def => |left_enum| blk: {
+            const right_enum = right.kind.enum_def;
+            if (left_enum.variants.len != right_enum.variants.len) break :blk false;
+            for (left_enum.variants, right_enum.variants) |left_variant, right_variant| {
+                if (!std.mem.eql(u8, left_variant, right_variant)) break :blk false;
+            }
+            break :blk true;
+        },
+        .union_def => |left_union| blk: {
+            const right_union = right.kind.union_def;
+            if (left_union.variants.len != right_union.variants.len) break :blk false;
+            for (left_union.variants, right_union.variants) |left_variant, right_variant| {
+                if (!std.mem.eql(u8, left_variant.name, right_variant.name)) break :blk false;
+                if (!optionalStringEql(left_variant.type_name, right_variant.type_name)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+fn zigTypeEqual(left: ir.ZigType, right: ir.ZigType) bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    return switch (left) {
+        .tuple => |left_items| blk: {
+            const right_items = right.tuple;
+            if (left_items.len != right_items.len) break :blk false;
+            for (left_items, right_items) |left_item, right_item| {
+                if (!zigTypeEqual(left_item, right_item)) break :blk false;
+            }
+            break :blk true;
+        },
+        .list => |left_item| zigTypeEqual(left_item.*, right.list.*),
+        .map => |left_map| zigTypeEqual(left_map.key.*, right.map.key.*) and zigTypeEqual(left_map.value.*, right.map.value.*),
+        .struct_ref => |left_name| std.mem.eql(u8, left_name, right.struct_ref),
+        .function => |left_fn| blk: {
+            const right_fn = right.function;
+            if (left_fn.params.len != right_fn.params.len) break :blk false;
+            for (left_fn.params, right_fn.params) |left_param, right_param| {
+                if (!zigTypeEqual(left_param, right_param)) break :blk false;
+            }
+            break :blk zigTypeEqual(left_fn.return_type.*, right_fn.return_type.*);
+        },
+        .tagged_union => |left_name| std.mem.eql(u8, left_name, right.tagged_union),
+        .optional => |left_item| zigTypeEqual(left_item.*, right.optional.*),
+        .ptr => |left_item| zigTypeEqual(left_item.*, right.ptr.*),
+        else => true,
+    };
+}
+
+fn seedAffectedFunctionsFromStructs(
+    alloc: std.mem.Allocator,
+    program: ir.Program,
+    invalidated_structs: *const std.StringHashMap(void),
+    affected_functions: *std.AutoHashMap(ir.FunctionId, void),
+) CompileError!void {
+    _ = alloc;
+    for (program.functions) |function| {
+        const struct_name = function.struct_name orelse {
+            if (invalidated_structs.contains("")) try affected_functions.put(function.id, {});
+            continue;
+        };
+        if (invalidated_structs.contains(struct_name)) {
+            try affected_functions.put(function.id, {});
+        }
+    }
+}
+
+fn functionById(program: ir.Program, function_id: ir.FunctionId) ?*const ir.Function {
+    for (program.functions) |*function| {
+        if (function.id == function_id) return function;
+    }
+    return null;
+}
+
+fn functionIdByName(program: ir.Program, name: []const u8) ?ir.FunctionId {
+    for (program.functions) |function| {
+        if (std.mem.eql(u8, function.name, name)) return function.id;
+    }
+    return null;
+}
+
+fn addReverseCallEdgeTarget(
+    alloc: std.mem.Allocator,
+    program: ir.Program,
+    caller_id: ir.FunctionId,
+    target_id: ir.FunctionId,
+    callers_by_callee: *std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
+) CompileError!void {
+    if (functionById(program, target_id) == null) return;
+    const gop = try callers_by_callee.getOrPut(target_id);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    try gop.value_ptr.append(alloc, caller_id);
+}
+
+fn addCallEdgesFromInstructions(
+    alloc: std.mem.Allocator,
+    program: ir.Program,
+    caller_id: ir.FunctionId,
+    instructions: []const ir.Instruction,
+    callers_by_callee: *std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
+) CompileError!void {
+    for (instructions) |instruction| {
+        switch (instruction) {
+            .call_direct => |call| try addReverseCallEdgeTarget(alloc, program, caller_id, call.function, callers_by_callee),
+            .make_closure => |closure| try addReverseCallEdgeTarget(alloc, program, caller_id, closure.function, callers_by_callee),
+            .call_named => |call| {
+                if (functionIdByName(program, call.name)) |target_id| {
+                    try addReverseCallEdgeTarget(alloc, program, caller_id, target_id, callers_by_callee);
+                }
+            },
+            .tail_call => |call| {
+                if (functionIdByName(program, call.name)) |target_id| {
+                    try addReverseCallEdgeTarget(alloc, program, caller_id, target_id, callers_by_callee);
+                }
+            },
+            .try_call_named => |call| {
+                if (functionIdByName(program, call.name)) |target_id| {
+                    try addReverseCallEdgeTarget(alloc, program, caller_id, target_id, callers_by_callee);
+                }
+                try addCallEdgesFromInstructions(alloc, program, caller_id, call.handler_instrs, callers_by_callee);
+                try addCallEdgesFromInstructions(alloc, program, caller_id, call.success_instrs, callers_by_callee);
+            },
+            .if_expr => |value| {
+                try addCallEdgesFromInstructions(alloc, program, caller_id, value.then_instrs, callers_by_callee);
+                try addCallEdgesFromInstructions(alloc, program, caller_id, value.else_instrs, callers_by_callee);
+            },
+            .guard_block => |value| try addCallEdgesFromInstructions(alloc, program, caller_id, value.body, callers_by_callee),
+            .case_block => |value| {
+                try addCallEdgesFromInstructions(alloc, program, caller_id, value.pre_instrs, callers_by_callee);
+                for (value.arms) |arm| {
+                    try addCallEdgesFromInstructions(alloc, program, caller_id, arm.cond_instrs, callers_by_callee);
+                    try addCallEdgesFromInstructions(alloc, program, caller_id, arm.body_instrs, callers_by_callee);
+                }
+                try addCallEdgesFromInstructions(alloc, program, caller_id, value.default_instrs, callers_by_callee);
+            },
+            .switch_literal => |value| {
+                for (value.cases) |case| {
+                    try addCallEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, callers_by_callee);
+                }
+                try addCallEdgesFromInstructions(alloc, program, caller_id, value.default_instrs, callers_by_callee);
+            },
+            .switch_return => |value| {
+                for (value.cases) |case| {
+                    try addCallEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, callers_by_callee);
+                }
+                try addCallEdgesFromInstructions(alloc, program, caller_id, value.default_instrs, callers_by_callee);
+            },
+            .union_switch => |value| {
+                for (value.cases) |case| {
+                    try addCallEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, callers_by_callee);
+                }
+            },
+            .union_switch_return => |value| {
+                for (value.cases) |case| {
+                    try addCallEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, callers_by_callee);
+                }
+            },
+            .optional_dispatch => |value| {
+                try addCallEdgesFromInstructions(alloc, program, caller_id, value.nil_instrs, callers_by_callee);
+                try addCallEdgesFromInstructions(alloc, program, caller_id, value.struct_instrs, callers_by_callee);
+            },
+            else => {},
+        }
+    }
+}
+
+fn expandAffectedFunctionsToCallers(
+    alloc: std.mem.Allocator,
+    program: ir.Program,
+    affected_functions: *std.AutoHashMap(ir.FunctionId, void),
+) CompileError!void {
+    var callers_by_callee = std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)).init(alloc);
+    defer {
+        var lists = callers_by_callee.valueIterator();
+        while (lists.next()) |list| list.deinit(alloc);
+        callers_by_callee.deinit();
+    }
+
+    for (program.functions) |function| {
+        for (function.body) |block| {
+            try addCallEdgesFromInstructions(alloc, program, function.id, block.instructions, &callers_by_callee);
+        }
+    }
+
+    var queue: std.ArrayListUnmanaged(ir.FunctionId) = .empty;
+    var affected_iter = affected_functions.keyIterator();
+    while (affected_iter.next()) |function_id| try queue.append(alloc, function_id.*);
+
+    var cursor: usize = 0;
+    while (cursor < queue.items.len) : (cursor += 1) {
+        const function_id = queue.items[cursor];
+        const callers = callers_by_callee.get(function_id) orelse continue;
+        for (callers.items) |caller_id| {
+            if (affected_functions.contains(caller_id)) continue;
+            try affected_functions.put(caller_id, {});
+            try queue.append(alloc, caller_id);
+        }
+    }
+}
+
+fn buildAffectedPreFinalProgram(
+    alloc: std.mem.Allocator,
+    program: ir.Program,
+    affected_functions: *const std.AutoHashMap(ir.FunctionId, void),
+) CompileError!ir.Program {
+    var functions: std.ArrayListUnmanaged(ir.Function) = .empty;
+    for (program.functions) |function| {
+        if (affected_functions.contains(function.id)) {
+            try functions.append(alloc, function);
+        }
+    }
+    const entry = if (program.entry) |entry_id|
+        if (affected_functions.contains(entry_id)) entry_id else null
+    else
+        null;
+    return .{
+        .functions = try functions.toOwnedSlice(alloc),
+        .type_defs = program.type_defs,
+        .entry = entry,
+    };
+}
+
+fn mergeCachedAndAffectedFinalProgram(
+    alloc: std.mem.Allocator,
+    current_pre_final: ir.Program,
+    cached_final: ir.Program,
+    affected_final: ir.Program,
+    affected_functions: *const std.AutoHashMap(ir.FunctionId, void),
+) CompileError!ir.Program {
+    const functions = try alloc.alloc(ir.Function, current_pre_final.functions.len);
+    for (current_pre_final.functions, 0..) |current_function, index| {
+        if (affected_functions.contains(current_function.id)) {
+            functions[index] = (functionById(affected_final, current_function.id) orelse return error.IrFailed).*;
+        } else {
+            functions[index] = (functionById(cached_final, current_function.id) orelse return error.IrFailed).*;
+        }
+    }
+    return .{
+        .functions = functions,
+        .type_defs = current_pre_final.type_defs,
+        .entry = current_pre_final.entry,
     };
 }
 
@@ -2200,6 +3544,7 @@ fn runArcOwnershipAndVerify(
     program: *ir.Program,
     ownership: *const zap.arc_liveness.ProgramArcOwnership,
     type_store: *const zap.types.TypeStore,
+    options: CompileOptions,
 ) CompileError!void {
     // Phase 4 (dense Map): rewrite owned-mutating call_builtin sites
     // (`Map.put`/`.delete`/`.merge`) at last-use BEFORE
@@ -2216,12 +3561,14 @@ fn runArcOwnershipAndVerify(
     // clears the receiver's owns bit at the call site so
     // `arc_drop_insertion` doesn't emit a stale post-call release on
     // top of the runtime's consume).
+    progressStage(options, "ARC: rewriting owned builtins", .{});
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
         const fn_ownership = ownership.get(function.id) orelse continue;
         zap.arc_ownership.rewriteOwnedConsumeBuiltinSites(alloc, function, fn_ownership) catch return error.OutOfMemory;
     }
 
+    progressStage(options, "ARC: classifying ownership", .{});
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
         const fn_ownership = ownership.get(function.id) orelse continue;
@@ -2234,6 +3581,7 @@ fn runArcOwnershipAndVerify(
     // release. The callee's own scope-exit drop (Phase B's filter
     // releases `.owned` parameters) becomes the sole decrement,
     // closing the per-iteration leak that survived Phase E.8.
+    progressStage(options, "ARC: rewriting owned calls", .{});
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
         zap.arc_ownership.rewriteOwnedConsumeSites(alloc, function, program) catch return error.OutOfMemory;
@@ -2258,6 +3606,7 @@ fn runArcOwnershipAndVerify(
     // run BEFORE `arc_drop_insertion` so it sees the post-rewrite
     // `local_ownership` and skips scope-exit releases for the now-
     // borrowed aliases.
+    progressStage(options, "ARC: eliding borrowed pass-throughs", .{});
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
         zap.arc_ownership.elideBorrowedPassThroughShares(alloc, function, program) catch return error.OutOfMemory;
@@ -2312,11 +3661,13 @@ fn runArcOwnershipAndVerify(
     //
     // All three are then consumed by `analyzeUniquenessFull` for the
     // per-function rewrite pass.
+    progressStage(options, "ARC: computing uniqueness ownership", .{});
     var post_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, program, type_store) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer post_ownership.deinit();
 
+    progressStage(options, "ARC: computing uniqueness signatures", .{});
     var signatures = zap.uniqueness_fixpoint.computeSignaturesWithOwnership(alloc, program, &post_ownership) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -2334,6 +3685,7 @@ fn runArcOwnershipAndVerify(
     // Pass `signatures` and `post_ownership` so the fixpoint's
     // per-iteration intraprocedural pass propagates per-component
     // uniqueness through tuple destructure (Phase 2.5).
+    progressStage(options, "ARC: interprocedural uniqueness", .{});
     var program_uniqueness = zap.uniqueness_interprocedural.analyzeProgramFull(
         alloc,
         program,
@@ -2344,6 +3696,7 @@ fn runArcOwnershipAndVerify(
     };
     defer program_uniqueness.deinit(alloc);
 
+    progressStage(options, "ARC: rewriting unique call sites", .{});
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
         const fn_ownership = post_ownership.get(function.id);
@@ -2379,6 +3732,7 @@ fn runArcOwnershipAndVerify(
             zap.arc_ownership.rewriteOwnedConsumeBuiltinSites(alloc, function, ownership_for_function) catch return error.OutOfMemory;
         }
     }
+    progressStage(options, "ARC: verifying ownership invariants", .{});
     for (program.functions) |*function| {
         const fn_ownership = post_ownership.get(function.id);
         zap.arc_verifier.verifyFull(
@@ -2425,12 +3779,14 @@ fn materializeAnalysisArcOps(
     analysis_context: *zap.escape_lattice.AnalysisContext,
     type_store: *const zap.types.TypeStore,
     declared_caps: u64,
+    options: CompileOptions,
 ) CompileError!void {
+    progressStage(options, "ARC: materializing analysis operations", .{});
     for (program.functions, 0..) |_, fi| {
         const function: *ir.Function = @constCast(&program.functions[fi]);
         zap.arc_materialize.materializeAnalysisArcOps(alloc, function, analysis_context, declared_caps) catch return error.IrFailed;
     }
-    try runArcVerifier(alloc, program, type_store);
+    try runArcVerifier(alloc, program, type_store, options);
 }
 
 /// Run V1-V11 (fixpoint) + V8/V9 (post-drop reachability) over
@@ -2442,21 +3798,25 @@ fn runArcVerifier(
     alloc: std.mem.Allocator,
     program: *ir.Program,
     type_store: *const zap.types.TypeStore,
+    options: CompileOptions,
 ) CompileError!void {
     // Recompute Phase-2.5 inputs against the post-materialize IR so the
     // fixpoint and verifier observe the same Phase 2.5 semantics the
     // Phase 5b rewriter observed. Without this the verifier rejects
     // unchecked sites the rewriter legitimately produced.
+    progressStage(options, "ARC: verifying materialized ownership", .{});
     var post_materialize_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, program, type_store) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer post_materialize_ownership.deinit();
 
+    progressStage(options, "ARC: verifying materialized signatures", .{});
     var post_materialize_signatures = zap.uniqueness_fixpoint.computeSignaturesWithOwnership(alloc, program, &post_materialize_ownership) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer post_materialize_signatures.deinit(alloc);
 
+    progressStage(options, "ARC: verifying interprocedural uniqueness", .{});
     var program_uniqueness = zap.uniqueness_interprocedural.analyzeProgramFull(
         alloc,
         program,
@@ -2467,6 +3827,7 @@ fn runArcVerifier(
     };
     defer program_uniqueness.deinit(alloc);
 
+    progressStage(options, "ARC: verifying materialized functions", .{});
     for (program.functions) |*function| {
         const fn_ownership = post_materialize_ownership.get(function.id);
         zap.arc_verifier.verifyFull(
@@ -2492,7 +3853,9 @@ fn runArcDropInsertion(
     program: *ir.Program,
     ownership: *const zap.arc_liveness.ProgramArcOwnership,
     type_store: *const zap.types.TypeStore,
+    options: CompileOptions,
 ) CompileError!void {
+    progressStage(options, "ARC: inserting scope-exit drops", .{});
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
         const fn_ownership = ownership.get(function.id) orelse continue;
@@ -2514,16 +3877,19 @@ fn runArcDropInsertion(
     // verifier rejects unchecked sites that the rewriter legitimately
     // produced — Phase 2.5 tuple-destructure propagation only fires
     // when both signatures and ownership are threaded through.
+    progressStage(options, "ARC: verifying drop ownership", .{});
     var post_drop_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, program, type_store) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer post_drop_ownership.deinit();
 
+    progressStage(options, "ARC: verifying drop signatures", .{});
     var post_drop_signatures = zap.uniqueness_fixpoint.computeSignaturesWithOwnership(alloc, program, &post_drop_ownership) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer post_drop_signatures.deinit(alloc);
 
+    progressStage(options, "ARC: verifying drop uniqueness", .{});
     var program_uniqueness = zap.uniqueness_interprocedural.analyzeProgramFull(
         alloc,
         program,
@@ -2534,6 +3900,7 @@ fn runArcDropInsertion(
     };
     defer program_uniqueness.deinit(alloc);
 
+    progressStage(options, "ARC: verifying drop functions", .{});
     for (program.functions) |*function| {
         const fn_ownership = post_drop_ownership.get(function.id);
         zap.arc_verifier.verifyFull(
@@ -2892,6 +4259,20 @@ fn mergePrograms(alloc: std.mem.Allocator, programs: []const ast.Program) !ast.P
         top_index += program.top_items.len;
     }
     return .{ .structs = structs, .top_items = top_items };
+}
+
+fn cloneAstProgramOwned(
+    alloc: std.mem.Allocator,
+    program: ast.Program,
+    interner: *const ast.StringInterner,
+) !ast.Program {
+    var cloned = program;
+    const identity_remap = try alloc.alloc(ast.StringId, interner.strings.items.len);
+    for (identity_remap, 0..) |*slot, index| {
+        slot.* = @intCast(index);
+    }
+    try remapProgram(alloc, &cloned, identity_remap);
+    return cloned;
 }
 
 fn emitParseErrorsFromUnits(

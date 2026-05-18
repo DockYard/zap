@@ -64,6 +64,7 @@ pub const FunctionGroup = struct {
     scope_id: scope_mod.ScopeId,
     name: ast.StringId,
     arity: u32,
+    debug_span: ast.SourceSpan = .{ .start = 0, .end = 0 },
     is_local: bool = false,
     captures: []const Capture = &.{},
     clauses: []const Clause,
@@ -79,6 +80,7 @@ pub const Capture = struct {
 pub const Clause = struct {
     params: []const TypedParam,
     return_type: TypeId,
+    debug_span: ast.SourceSpan = .{ .start = 0, .end = 0 },
     decision: *const Decision, // compiled match decision
     body: *const Block,
     refinement: ?*const Expr,
@@ -3582,11 +3584,13 @@ pub const HirBuilder = struct {
         }
 
         const first = decls[0];
+        const fallback_span: ast.SourceSpan = if (first.clauses.len > 0) first.clauses[0].meta.span else .{ .start = 0, .end = 0 };
         return .{
             .id = group_id,
             .scope_id = scope_id,
             .name = first.name,
             .arity = arity,
+            .debug_span = if (clauses.items.len > 0) clauses.items[0].debug_span else fallback_span,
             .is_local = false,
             .captures = &.{},
             .clauses = try clauses.toOwnedSlice(self.allocator),
@@ -3725,16 +3729,29 @@ pub const HirBuilder = struct {
         self.current_case_bindings = saved_case_bindings;
         self.parent_assignment_bindings = saved_parent_bindings;
 
+        const fallback_span: ast.SourceSpan = if (func.clauses.len > 0) func.clauses[0].meta.span else .{ .start = 0, .end = 0 };
         return .{
             .id = group_id,
             .scope_id = scope_id,
             .name = func.name,
             .arity = arity,
+            .debug_span = if (clauses.items.len > 0) clauses.items[0].debug_span else fallback_span,
             .is_local = is_local,
             .captures = captures,
             .clauses = try clauses.toOwnedSlice(self.allocator),
             .fallback_parent = fallback_parent,
         };
+    }
+
+    fn firstExecutableSpan(block: *const Block) ?ast.SourceSpan {
+        for (block.stmts) |stmt| {
+            switch (stmt) {
+                .expr => |expr| return expr.span,
+                .local_set => |local_set| return local_set.value.span,
+                .function_group => {},
+            }
+        }
+        return null;
     }
 
     /// Check if a HIR block contains a call to raise() or a ! function.
@@ -4099,6 +4116,7 @@ pub const HirBuilder = struct {
         return .{
             .params = try params.toOwnedSlice(self.allocator),
             .return_type = return_type,
+            .debug_span = firstExecutableSpan(body) orelse clause.meta.span,
             .decision = decision,
             .body = body,
             .refinement = refinement_expr,
