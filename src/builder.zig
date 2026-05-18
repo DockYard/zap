@@ -54,6 +54,9 @@ pub const BuildConfig = struct {
     landing_page: ?[]const u8 = null,
     /// Additional documentation page groups: [{group_name, [file_paths]}].
     doc_groups: []const DocGroup = &.{},
+    /// Optional manifest-level build pipeline. Null preserves the
+    /// historical behavior: compile the manifest artifact only.
+    pipeline: ?Pipeline = null,
 
     pub const DocGroup = struct {
         name: []const u8,
@@ -62,6 +65,22 @@ pub const BuildConfig = struct {
 
     pub const Kind = enum { bin, lib, obj };
     pub const Optimize = enum { debug, release_safe, release_fast, release_small };
+
+    pub const Pipeline = struct {
+        steps: []const Step = &.{},
+    };
+
+    pub const Step = union(enum) {
+        compile: Compile,
+        run: Run,
+    };
+
+    pub const Compile = struct {};
+
+    pub const Run = struct {
+        args: []const []const u8 = &.{},
+        forward_args: bool = true,
+    };
 
     pub const MemoryManager = struct {
         /// Concrete manager type selected by `Zap.Manifest.memory`.
@@ -574,6 +593,8 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                         },
                         else => {},
                     }
+                } else if (std.mem.eql(u8, field.name, "pipeline")) {
+                    config.pipeline = try constValueToPipeline(alloc, field.value);
                 }
             }
 
@@ -929,6 +950,91 @@ pub fn hashManifestWithMemoryAdapter(manifest_hash: u64, memory_adapter_hash: u6
     return hasher.final();
 }
 
+fn constValueToPipeline(
+    alloc: std.mem.Allocator,
+    val: zap.ctfe.ConstValue,
+) !?BuildConfig.Pipeline {
+    if (val == .nil) return null;
+    if (val != .struct_val) return error.InvalidManifestPipeline;
+
+    const pipeline_value = val.struct_val;
+    const steps_value = findConstStructField(pipeline_value, "steps") orelse
+        return error.InvalidManifestPipeline;
+    const step_values = switch (steps_value) {
+        .list => |items| items,
+        else => return error.InvalidManifestPipeline,
+    };
+
+    var steps: std.ArrayListUnmanaged(BuildConfig.Step) = .empty;
+    for (step_values) |step_value| {
+        try steps.append(alloc, try constValueToPipelineStep(alloc, step_value));
+    }
+    if (steps.items.len == 0) return error.InvalidManifestPipeline;
+    return BuildConfig.Pipeline{ .steps = try steps.toOwnedSlice(alloc) };
+}
+
+fn constValueToPipelineStep(
+    alloc: std.mem.Allocator,
+    val: zap.ctfe.ConstValue,
+) !BuildConfig.Step {
+    if (val != .struct_val) return error.InvalidManifestPipeline;
+
+    var parsed_step: ?BuildConfig.Step = null;
+    for (val.struct_val.fields) |field| {
+        if (std.mem.eql(u8, field.name, "compile")) {
+            if (field.value == .nil) continue;
+            if (parsed_step != null) return error.InvalidManifestPipeline;
+            parsed_step = .{ .compile = try constValueToPipelineCompile(field.value) };
+        } else if (std.mem.eql(u8, field.name, "run")) {
+            if (field.value == .nil) continue;
+            if (parsed_step != null) return error.InvalidManifestPipeline;
+            parsed_step = .{ .run = try constValueToPipelineRun(alloc, field.value) };
+        }
+    }
+
+    return parsed_step orelse error.InvalidManifestPipeline;
+}
+
+fn constValueToPipelineCompile(val: zap.ctfe.ConstValue) !BuildConfig.Compile {
+    if (val != .struct_val) return error.InvalidManifestPipeline;
+    return .{};
+}
+
+fn constValueToPipelineRun(
+    alloc: std.mem.Allocator,
+    val: zap.ctfe.ConstValue,
+) !BuildConfig.Run {
+    if (val != .struct_val) return error.InvalidManifestPipeline;
+
+    var run: BuildConfig.Run = .{};
+    var args: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (args.items) |arg| alloc.free(arg);
+        args.deinit(alloc);
+    }
+    for (val.struct_val.fields) |field| {
+        if (std.mem.eql(u8, field.name, "args")) {
+            const arg_values = switch (field.value) {
+                .list => |items| items,
+                else => return error.InvalidManifestPipeline,
+            };
+            for (arg_values) |arg_value| {
+                switch (arg_value) {
+                    .string => |arg| try args.append(alloc, try alloc.dupe(u8, arg)),
+                    else => return error.InvalidManifestPipeline,
+                }
+            }
+        } else if (std.mem.eql(u8, field.name, "forward_args")) {
+            run.forward_args = switch (field.value) {
+                .bool_val => |forward_args| forward_args,
+                else => return error.InvalidManifestPipeline,
+            };
+        }
+    }
+    run.args = try args.toOwnedSlice(alloc);
+    return run;
+}
+
 fn constValueToDocGroup(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !?BuildConfig.DocGroup {
     // Expecting a tuple: {group_name, [page_paths]}
     switch (val) {
@@ -1219,6 +1325,155 @@ test "constValueToBuildConfig parses deps and build opts" {
     try testing.expectEqualStrings("v1.2.3", config.deps[1].source.git.tag.?);
     try testing.expectEqualStrings("release_fast", config.build_opts.get("optimize").?);
     try testing.expectEqualStrings("true", config.build_opts.get("feature_x").?);
+}
+
+test "constValueToBuildConfig leaves pipeline null when omitted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap_Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "app" } },
+            .{ .name = "version", .value = .{ .string = "0.1.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+        },
+    } };
+
+    const config = try constValueToBuildConfig(alloc, val);
+    try testing.expect(config.pipeline == null);
+}
+
+test "constValueToBuildConfig parses compile and run pipeline steps" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap_Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "app" } },
+            .{ .name = "version", .value = .{ .string = "0.1.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+            .{ .name = "pipeline", .value = .{ .struct_val = .{
+                .type_name = "Zap.Build.Pipeline",
+                .fields = &.{
+                    .{ .name = "steps", .value = .{ .list = &.{
+                        .{ .struct_val = .{
+                            .type_name = "Zap.Build.Step",
+                            .fields = &.{
+                                .{ .name = "compile", .value = .{ .struct_val = .{
+                                    .type_name = "Zap.Build.Compile",
+                                    .fields = &.{},
+                                } } },
+                            },
+                        } },
+                        .{ .struct_val = .{
+                            .type_name = "Zap.Build.Step",
+                            .fields = &.{
+                                .{ .name = "run", .value = .{ .struct_val = .{
+                                    .type_name = "Zap.Build.Run",
+                                    .fields = &.{
+                                        .{ .name = "args", .value = .{ .list = &.{
+                                            .{ .string = "--only" },
+                                            .{ .string = "math" },
+                                        } } },
+                                        .{ .name = "forward_args", .value = .{ .bool_val = true } },
+                                    },
+                                } } },
+                            },
+                        } },
+                    } } },
+                },
+            } } },
+        },
+    } };
+
+    const config = try constValueToBuildConfig(alloc, val);
+    const pipeline = config.pipeline orelse return error.ExpectedPipeline;
+    try testing.expectEqual(@as(usize, 2), pipeline.steps.len);
+    try testing.expect(pipeline.steps[0] == .compile);
+    try testing.expect(pipeline.steps[1] == .run);
+    try testing.expectEqualStrings("--only", pipeline.steps[1].run.args[0]);
+    try testing.expectEqualStrings("math", pipeline.steps[1].run.args[1]);
+    try testing.expect(pipeline.steps[1].run.forward_args);
+}
+
+test "constValueToBuildConfig rejects an empty pipeline override" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap_Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "app" } },
+            .{ .name = "version", .value = .{ .string = "0.1.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+            .{ .name = "pipeline", .value = .{ .struct_val = .{
+                .type_name = "Zap.Build.Pipeline",
+                .fields = &.{
+                    .{ .name = "steps", .value = .{ .list = &.{} } },
+                },
+            } } },
+        },
+    } };
+
+    try testing.expectError(error.InvalidManifestPipeline, constValueToBuildConfig(alloc, val));
+}
+
+test "constValueToBuildConfig rejects a pipeline override without steps" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap_Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "app" } },
+            .{ .name = "version", .value = .{ .string = "0.1.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+            .{ .name = "pipeline", .value = .{ .struct_val = .{
+                .type_name = "Zap.Build.Pipeline",
+                .fields = &.{},
+            } } },
+        },
+    } };
+
+    try testing.expectError(error.InvalidManifestPipeline, constValueToBuildConfig(alloc, val));
+}
+
+test "constValueToBuildConfig rejects a pipeline step with multiple actions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap_Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "app" } },
+            .{ .name = "version", .value = .{ .string = "0.1.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+            .{ .name = "pipeline", .value = .{ .struct_val = .{
+                .type_name = "Zap.Build.Pipeline",
+                .fields = &.{
+                    .{ .name = "steps", .value = .{ .list = &.{
+                        .{ .struct_val = .{
+                            .type_name = "Zap.Build.Step",
+                            .fields = &.{
+                                .{ .name = "compile", .value = .{ .struct_val = .{
+                                    .type_name = "Zap.Build.Compile",
+                                    .fields = &.{},
+                                } } },
+                                .{ .name = "run", .value = .{ .struct_val = .{
+                                    .type_name = "Zap.Build.Run",
+                                    .fields = &.{},
+                                } } },
+                            },
+                        } },
+                    } } },
+                },
+            } } },
+        },
+    } };
+
+    try testing.expectError(error.InvalidManifestPipeline, constValueToBuildConfig(alloc, val));
 }
 
 test "constValueToBuildConfig parses root Function value" {

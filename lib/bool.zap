@@ -32,11 +32,11 @@ pub struct Bool {
         Bool.negate(false)  # => true
     """
 
-  pub fn negate(value :: Bool) -> Bool {
-    if value {
-      false
-    } else {
-      true
-    }
+  pub fn negate(true) -> Bool {
+    true
+  }
+
+  pub fn negate(false) -> Bool {
+    false
   }
 }

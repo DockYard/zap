@@ -35,6 +35,12 @@
   as `:baseline` or `:apple_m1`. When omitted (the `:native`
   default), the target's default CPU is used. The CLI `-Dcpu=<cpu>`
   flag overrides this per-field.
+
+  ## `pipeline:` field
+
+  Overrides the command pipeline for this manifest. When omitted, Zap
+  compiles the current artifact only. A pipeline can opt into explicit
+  compile and run steps while reusing the same artifact build path.
   """
 
 pub struct Zap.Manifest {
@@ -56,4 +62,5 @@ pub struct Zap.Manifest {
   source_url :: String = ""
   landing_page :: String = ""
   doc_groups :: [{String, [String]}] = []
+  pipeline :: Zap.Build.Pipeline | Nil = nil
 }

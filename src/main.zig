@@ -1232,6 +1232,124 @@ fn appendTestRunArgs(
     }
 }
 
+fn buildPipelineRunArgs(
+    allocator: std.mem.Allocator,
+    run_step: zap.builder.BuildConfig.Run,
+    forwarded_args: []const []const u8,
+) ![]const []const u8 {
+    var args: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer args.deinit(allocator);
+
+    for (run_step.args) |arg| {
+        try args.append(allocator, arg);
+    }
+    if (run_step.forward_args) {
+        for (forwarded_args) |arg| {
+            try args.append(allocator, arg);
+        }
+    }
+    return try args.toOwnedSlice(allocator);
+}
+
+const PipelineRunMode = enum {
+    tests,
+};
+
+fn pipelineError(comptime message: []const u8, args: anytype) noreturn {
+    std.debug.print("Error: invalid build pipeline: " ++ message ++ "\n", args);
+    std.process.exit(1);
+}
+
+fn runPipelineArtifactAndExit(
+    allocator: std.mem.Allocator,
+    artifact: BuildArtifact,
+    run_args: []const []const u8,
+    mode: PipelineRunMode,
+) noreturn {
+    if (artifact.kind != .bin) {
+        pipelineError("run step requires a bin artifact, got {s}", .{@tagName(artifact.kind)});
+    }
+
+    if (!targetIsHostRunnable(artifact.target)) {
+        switch (mode) {
+            .tests => std.debug.print(
+                "Error: cannot run tests — they were cross-compiled for '{s}', " ++
+                    "a foreign architecture/OS this host cannot execute.\n" ++
+                    "  The test binary was written to {s}; run it on a matching target " ++
+                    "(or drop -Dtarget= to test natively).\n",
+                .{ artifact.target.?, artifact.path },
+            ),
+        }
+        std.process.exit(1);
+    }
+
+    switch (mode) {
+        .tests => std.debug.print("Running tests\n", .{}),
+    }
+    const exit_code = compiler.runBinary(allocator, global_io, artifact.path, run_args) catch |err| {
+        switch (mode) {
+            .tests => std.debug.print("Error running tests: {}\n", .{err}),
+        }
+        std.process.exit(1);
+    };
+    std.process.exit(exit_code);
+}
+
+fn executePipelineAfterInitialCompile(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    target_name: []const u8,
+    build_opts: std.StringHashMapUnmanaged([]const u8),
+    build_overrides: BuildOverrides,
+    collect_arc_stats: bool,
+    zap_lib_dir_override: ?[]const u8,
+    initial_artifact: BuildArtifact,
+    pipeline: zap.builder.BuildConfig.Pipeline,
+    forwarded_args: []const []const u8,
+    mode: PipelineRunMode,
+) !void {
+    var unused_initial_artifact: ?BuildArtifact = initial_artifact;
+    defer if (unused_initial_artifact) |artifact| artifact.deinit(allocator);
+
+    const execution_pipeline = try cloneBuildPipeline(allocator, pipeline);
+    defer freeBuildPipeline(allocator, execution_pipeline);
+
+    var current_artifact: ?BuildArtifact = null;
+    defer if (current_artifact) |artifact| artifact.deinit(allocator);
+
+    for (execution_pipeline.steps) |step| {
+        switch (step) {
+            .compile => {
+                if (current_artifact) |artifact| artifact.deinit(allocator);
+                current_artifact = null;
+
+                if (unused_initial_artifact) |artifact| {
+                    current_artifact = artifact;
+                    unused_initial_artifact = null;
+                } else {
+                    current_artifact = try buildTarget(
+                        allocator,
+                        project_root,
+                        target_name,
+                        build_opts,
+                        build_overrides,
+                        collect_arc_stats,
+                        zap_lib_dir_override,
+                    );
+                }
+            },
+            .run => |run_step| {
+                const artifact = current_artifact orelse
+                    pipelineError("run step appeared before a compile step", .{});
+                const run_args = try buildPipelineRunArgs(allocator, run_step, forwarded_args);
+                defer allocator.free(run_args);
+                runPipelineArtifactAndExit(allocator, artifact, run_args, mode);
+            },
+        }
+    }
+    pipelineError("completed without a run step", .{});
+}
+
 fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var parsed = try parseTargetArgs(allocator, args);
     defer parsed.deinit(allocator);
@@ -1250,6 +1368,22 @@ fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     const artifact = try buildTarget(allocator, project_root, "test", parsed.build_opts, parsed.build_overrides, parsed.collect_arc_stats, parsed.zap_lib_dir);
+    if (artifact.pipeline) |pipeline| {
+        try executePipelineAfterInitialCompile(
+            allocator,
+            project_root,
+            "test",
+            parsed.build_opts,
+            parsed.build_overrides,
+            parsed.collect_arc_stats,
+            parsed.zap_lib_dir,
+            artifact,
+            pipeline,
+            test_run_args.items,
+            .tests,
+        );
+        return;
+    }
     defer artifact.deinit(allocator);
 
     // `zap test` exists to RUN the test binary. A foreign cross
@@ -1503,7 +1637,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\
         \\## Test
         \\
-        \\    zap run test
+        \\    zap test
         \\
     , .{project_name});
     defer allocator.free(readme);
@@ -1539,7 +1673,10 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\      kind: :bin,
         \\      root: &{s}Test.main/1,
         \\      paths: ["lib/**/*.zap", "test/**/*.zap"],
-        \\      optimize: :debug
+        \\      optimize: :debug,
+        \\      pipeline: %Zap.Build.Pipeline{{
+        \\        steps: [%Zap.Build.Step{{compile: %Zap.Build.Compile{{}}}}, %Zap.Build.Step{{run: %Zap.Build.Run{{forward_args: true}}}}]
+        \\      }}
         \\    }}
         \\  }}
         \\}}
@@ -1779,6 +1916,10 @@ const BuildArtifact = struct {
     /// (durable dup, like `path`); freed alongside the artifact. `null`
     /// is the native sentinel and allocates nothing.
     target: ?[]const u8,
+    /// Optional manifest pipeline copied out of the manifest/config
+    /// arena. Cached and daemon-backed artifacts carry this too, so a
+    /// pipeline override survives every build path.
+    pipeline: ?zap.builder.BuildConfig.Pipeline = null,
 
     /// Free both owned allocations (`path` and, when non-null,
     /// `target`). Use this everywhere the whole artifact is discarded
@@ -1789,14 +1930,43 @@ const BuildArtifact = struct {
     fn deinit(self: BuildArtifact, gpa: std.mem.Allocator) void {
         gpa.free(self.path);
         if (self.target) |t| gpa.free(t);
+        if (self.pipeline) |pipeline| freeBuildPipeline(gpa, pipeline);
     }
 
-    /// Free only the `target` dup, for the watch-mode site that moves
-    /// `path` ownership into a longer-lived `output_path` variable.
+    /// Free metadata dups, for the watch-mode site that moves `path`
+    /// ownership into a longer-lived `output_path` variable.
     fn freeTargetOnly(self: BuildArtifact, gpa: std.mem.Allocator) void {
         if (self.target) |t| gpa.free(t);
+        if (self.pipeline) |pipeline| freeBuildPipeline(gpa, pipeline);
     }
 };
+
+fn makeBuildArtifact(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    kind: zap.builder.BuildConfig.Kind,
+    target: ?[]const u8,
+    pipeline: ?zap.builder.BuildConfig.Pipeline,
+) !BuildArtifact {
+    const path_copy = try allocator.dupe(u8, path);
+    errdefer allocator.free(path_copy);
+
+    const target_copy = if (target) |target_value|
+        try allocator.dupe(u8, target_value)
+    else
+        null;
+    errdefer if (target_copy) |target_value| allocator.free(target_value);
+
+    const pipeline_copy = try cloneOptionalBuildPipeline(allocator, pipeline);
+    errdefer if (pipeline_copy) |pipeline_value| freeBuildPipeline(allocator, pipeline_value);
+
+    return .{
+        .path = path_copy,
+        .kind = kind,
+        .target = target_copy,
+        .pipeline = pipeline_copy,
+    };
+}
 
 fn targetTripleUsesDarwinDebugMap(target: []const u8) bool {
     return std.mem.indexOf(u8, target, "macos") != null or
@@ -2078,6 +2248,72 @@ fn configKindFromBuildCache(kind: build_cache.ArtifactKind) zap.builder.BuildCon
     };
 }
 
+fn buildCachePipelineFromConfig(
+    alloc: std.mem.Allocator,
+    pipeline: ?zap.builder.BuildConfig.Pipeline,
+) !?build_cache.Pipeline {
+    const config_pipeline = pipeline orelse return null;
+    const steps = try alloc.alloc(build_cache.PipelineStep, config_pipeline.steps.len);
+    var initialized_count: usize = 0;
+    errdefer {
+        for (steps[0..initialized_count]) |step| {
+            switch (step) {
+                .compile => {},
+                .run => |run_step| {
+                    for (run_step.args) |arg| alloc.free(arg);
+                    alloc.free(run_step.args);
+                },
+            }
+        }
+        alloc.free(steps);
+    }
+
+    for (config_pipeline.steps, 0..) |step, index| {
+        steps[index] = switch (step) {
+            .compile => .compile,
+            .run => |run_step| .{ .run = .{
+                .args = try cloneStringSlice(alloc, run_step.args),
+                .forward_args = run_step.forward_args,
+            } },
+        };
+        initialized_count += 1;
+    }
+    return .{ .steps = steps };
+}
+
+fn configPipelineFromBuildCache(
+    allocator: std.mem.Allocator,
+    pipeline: ?build_cache.Pipeline,
+) !?zap.builder.BuildConfig.Pipeline {
+    const cache_pipeline = pipeline orelse return null;
+    const steps = try allocator.alloc(zap.builder.BuildConfig.Step, cache_pipeline.steps.len);
+    var initialized_count: usize = 0;
+    errdefer {
+        for (steps[0..initialized_count]) |step| {
+            switch (step) {
+                .compile => {},
+                .run => |run_step| {
+                    for (run_step.args) |arg| allocator.free(arg);
+                    allocator.free(run_step.args);
+                },
+            }
+        }
+        allocator.free(steps);
+    }
+
+    for (cache_pipeline.steps, 0..) |step, index| {
+        steps[index] = switch (step) {
+            .compile => .{ .compile = .{} },
+            .run => |run_step| .{ .run = .{
+                .args = try cloneStringSlice(allocator, run_step.args),
+                .forward_args = run_step.forward_args,
+            } },
+        };
+        initialized_count += 1;
+    }
+    return .{ .steps = steps };
+}
+
 fn tryManifestSnapshotHit(
     artifact_allocator: std.mem.Allocator,
     scratch_allocator: std.mem.Allocator,
@@ -2109,10 +2345,16 @@ fn tryManifestSnapshotHit(
             return null;
         };
     } else null;
+    const pipeline = configPipelineFromBuildCache(artifact_allocator, stable_snapshot.snapshot.pipeline) catch {
+        artifact_allocator.free(path);
+        if (target) |target_value| artifact_allocator.free(target_value);
+        return null;
+    };
     return .{
         .path = path,
         .kind = configKindFromBuildCache(stable_snapshot.snapshot.kind),
         .target = target,
+        .pipeline = pipeline,
     };
 }
 
@@ -3227,7 +3469,13 @@ fn buildTarget(
         collect_arc_stats,
         zap_lib_dir_override,
     )) |artifact| {
-        return artifact;
+        if (tryManifestSnapshotHit(allocator, alloc, manifest_snapshot_path, manifest_invocation_identity, progress_reporter)) |validated_artifact| {
+            artifact.deinit(allocator);
+            return validated_artifact;
+        }
+
+        artifact.deinit(allocator);
+        progress.stage("Manifest: daemon result stale; rebuilding", .{});
     }
 
     // Extract manifest from build.zap via CTFE.
@@ -3602,6 +3850,7 @@ fn compileAndLink(
                 .kind = buildCacheKindFromConfig(config.kind),
                 .target = config.target,
                 .debug_symbols_required = needsDarwinDebugSymbols(config),
+                .pipeline = try buildCachePipelineFromConfig(alloc, config.pipeline),
             };
             installCachedManifestArtifact(alloc, snapshot_for_install) catch |err| {
                 std.debug.print("Error: could not install cached artifact: {s}\n", .{@errorName(err)});
@@ -3617,11 +3866,7 @@ fn compileAndLink(
             } else {
                 std.debug.print("[cached] {s}\n", .{output_path});
             }
-            return .{
-                .path = try allocator.dupe(u8, output_path),
-                .kind = config.kind,
-                .target = if (compile_target) |t| try allocator.dupe(u8, t) else null,
-            };
+            return try makeBuildArtifact(allocator, output_path, config.kind, compile_target, config.pipeline);
         }
     }
 
@@ -3786,11 +4031,7 @@ fn compileAndLink(
     };
 
     // Return a durable copy of the output path
-    return .{
-        .path = try allocator.dupe(u8, output_path),
-        .kind = config.kind,
-        .target = if (compile_target) |t| try allocator.dupe(u8, t) else null,
-    };
+    return try makeBuildArtifact(allocator, output_path, config.kind, compile_target, config.pipeline);
 }
 
 fn compileProjectFrontend(
@@ -3907,6 +4148,7 @@ fn refreshManifestSnapshot(
         .kind = buildCacheKindFromConfig(config.kind),
         .target = config.target,
         .debug_symbols_required = needsDarwinDebugSymbols(config),
+        .pipeline = try buildCachePipelineFromConfig(alloc, config.pipeline),
         .files = files.items,
         .directories = directories.items,
         .env_vars = env_vars.items,
@@ -4511,7 +4753,15 @@ fn cloneOptionalString(allocator: std.mem.Allocator, value: ?[]const u8) !?[]con
 
 fn cloneStringSlice(allocator: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
     const cloned = try allocator.alloc([]const u8, values.len);
-    for (values, 0..) |value, index| cloned[index] = try allocator.dupe(u8, value);
+    var cloned_count: usize = 0;
+    errdefer {
+        for (cloned[0..cloned_count]) |value| allocator.free(value);
+        allocator.free(cloned);
+    }
+    for (values, 0..) |value, index| {
+        cloned[index] = try allocator.dupe(u8, value);
+        cloned_count += 1;
+    }
     return cloned;
 }
 
@@ -4567,6 +4817,61 @@ fn cloneBuildConfigDocGroups(
     return cloned;
 }
 
+fn cloneBuildPipeline(
+    allocator: std.mem.Allocator,
+    pipeline: zap.builder.BuildConfig.Pipeline,
+) !zap.builder.BuildConfig.Pipeline {
+    const steps = try allocator.alloc(zap.builder.BuildConfig.Step, pipeline.steps.len);
+    var initialized_count: usize = 0;
+    errdefer {
+        for (steps[0..initialized_count]) |step| {
+            switch (step) {
+                .compile => {},
+                .run => |run_step| {
+                    for (run_step.args) |arg| allocator.free(arg);
+                    allocator.free(run_step.args);
+                },
+            }
+        }
+        allocator.free(steps);
+    }
+
+    for (pipeline.steps, 0..) |step, index| {
+        steps[index] = switch (step) {
+            .compile => .{ .compile = .{} },
+            .run => |run_step| .{ .run = .{
+                .args = try cloneStringSlice(allocator, run_step.args),
+                .forward_args = run_step.forward_args,
+            } },
+        };
+        initialized_count += 1;
+    }
+    return .{ .steps = steps };
+}
+
+fn cloneOptionalBuildPipeline(
+    allocator: std.mem.Allocator,
+    pipeline: ?zap.builder.BuildConfig.Pipeline,
+) !?zap.builder.BuildConfig.Pipeline {
+    return if (pipeline) |some| try cloneBuildPipeline(allocator, some) else null;
+}
+
+fn freeBuildPipeline(
+    allocator: std.mem.Allocator,
+    pipeline: zap.builder.BuildConfig.Pipeline,
+) void {
+    for (pipeline.steps) |step| {
+        switch (step) {
+            .compile => {},
+            .run => |run_step| {
+                for (run_step.args) |arg| allocator.free(arg);
+                allocator.free(run_step.args);
+            },
+        }
+    }
+    allocator.free(pipeline.steps);
+}
+
 fn cloneBuildConfig(
     allocator: std.mem.Allocator,
     config: zap.builder.BuildConfig,
@@ -4593,6 +4898,7 @@ fn cloneBuildConfig(
         .source_url = try cloneOptionalString(allocator, config.source_url),
         .landing_page = try cloneOptionalString(allocator, config.landing_page),
         .doc_groups = try cloneBuildConfigDocGroups(allocator, config.doc_groups),
+        .pipeline = try cloneOptionalBuildPipeline(allocator, config.pipeline),
     };
 }
 
@@ -5271,6 +5577,16 @@ const IncrementalWatchState = struct {
         // Zig's prev_zir set.
         const prepared_update = self.baseline_established;
         const needs_backend_update = !prepared_update or selection.include_root or selection.struct_names.len > 0;
+        // A source mutation that maps to no backend work is only safe if
+        // every invalidation layer proves a semantic no-op. Today the daemon
+        // publishes content-addressed artifacts keyed by source bytes, so a
+        // missed invalidation would poison the cache with an old binary under
+        // a new key. Re-establishing the context makes that case a full,
+        // source-truth rebuild instead of trusting the stale baseline.
+        if (prepared_update and changed_paths.len > 0 and !needs_backend_update) {
+            return error.ContextInvalidated;
+        }
+
         if (prepared_update and needs_backend_update) {
             if (progress) |reporter| reporter.stage("Backend: preparing incremental update", .{});
             var update_prepared = false;
@@ -5380,10 +5696,12 @@ const IncrementalWatchState = struct {
     };
 };
 
-fn runWatchArtifact(
+fn runWatchBuiltArtifact(
     allocator: std.mem.Allocator,
     target_name: []const u8,
-    state: *const IncrementalWatchState,
+    artifact_path: []const u8,
+    artifact_kind: zap.builder.BuildConfig.Kind,
+    artifact_target: ?[]const u8,
     run_mode: WatchRunMode,
     run_args: []const []const u8,
 ) void {
@@ -5392,25 +5710,25 @@ fn runWatchArtifact(
         .program, .tests => {},
     }
 
-    if (state.kind != .bin) {
-        std.debug.print("Error: target :{s} is {s}, not runnable\n", .{ target_name, @tagName(state.kind) });
+    if (artifact_kind != .bin) {
+        std.debug.print("Error: target :{s} is {s}, not runnable\n", .{ target_name, @tagName(artifact_kind) });
         return;
     }
 
-    if (!targetIsHostRunnable(state.target)) {
-        if (state.target) |target| {
+    if (!targetIsHostRunnable(artifact_target)) {
+        if (artifact_target) |target| {
             switch (run_mode) {
                 .tests => std.debug.print(
                     "Error: cannot run tests — they were cross-compiled for '{s}', " ++
                         "a foreign architecture/OS this host cannot execute.\n" ++
                         "  The test binary was written to {s}; run it on a matching target " ++
                         "(or drop -Dtarget= to test natively).\n",
-                    .{ target, state.output_path },
+                    .{ target, artifact_path },
                 ),
                 .program => std.debug.print(
                     "Cross-compiled for '{s}': binary written to {s}\n" ++
                         "  (not executed - it targets a foreign architecture/OS this host cannot run)\n",
-                    .{ target, state.output_path },
+                    .{ target, artifact_path },
                 ),
                 .none => unreachable,
             }
@@ -5422,7 +5740,7 @@ fn runWatchArtifact(
         std.debug.print("Running tests\n", .{});
     }
 
-    const exit_code = compiler.runBinary(allocator, global_io, state.output_path, run_args) catch |err| {
+    const exit_code = compiler.runBinary(allocator, global_io, artifact_path, run_args) catch |err| {
         switch (run_mode) {
             .tests => std.debug.print("Error running tests: {}\n", .{err}),
             .program => std.debug.print("Error running program: {}\n", .{err}),
@@ -5437,6 +5755,75 @@ fn runWatchArtifact(
             .none => unreachable,
         }
     }
+}
+
+fn runWatchPipelineArtifact(
+    allocator: std.mem.Allocator,
+    target_name: []const u8,
+    state: *const IncrementalWatchState,
+    pipeline: zap.builder.BuildConfig.Pipeline,
+    run_mode: WatchRunMode,
+    forwarded_args: []const []const u8,
+) void {
+    var compiled = false;
+    var ran = false;
+    for (pipeline.steps) |step| {
+        switch (step) {
+            .compile => compiled = true,
+            .run => |run_step| {
+                if (!compiled) {
+                    std.debug.print("Error: invalid build pipeline: run step appeared before a compile step\n", .{});
+                    return;
+                }
+                const run_args = buildPipelineRunArgs(allocator, run_step, forwarded_args) catch {
+                    std.debug.print("Error: out of memory preparing build pipeline run arguments\n", .{});
+                    return;
+                };
+                defer allocator.free(run_args);
+                runWatchBuiltArtifact(
+                    allocator,
+                    target_name,
+                    state.output_path,
+                    state.kind,
+                    state.target,
+                    run_mode,
+                    run_args,
+                );
+                ran = true;
+            },
+        }
+    }
+    if (!ran) {
+        std.debug.print("Error: invalid build pipeline: completed without a run step\n", .{});
+    }
+}
+
+fn runWatchArtifact(
+    allocator: std.mem.Allocator,
+    target_name: []const u8,
+    state: *const IncrementalWatchState,
+    run_mode: WatchRunMode,
+    run_args: []const []const u8,
+) void {
+    switch (run_mode) {
+        .none => return,
+        .program, .tests => {},
+    }
+
+    if (state.manifest_config.pipeline) |pipeline| {
+        runWatchPipelineArtifact(allocator, target_name, state, pipeline, run_mode, run_args);
+        return;
+    }
+
+    runWatchBuiltArtifact(
+        allocator,
+        target_name,
+        state.output_path,
+        state.kind,
+        state.target,
+        run_mode,
+        run_args,
+    );
 }
 
 const WatchSnapshot = struct {
@@ -5550,7 +5937,7 @@ fn refreshWatchSnapshotFromSourceRoots(
 const MANIFEST_DAEMON_DIR = ".zap-cache/daemon";
 const MANIFEST_DAEMON_REQUEST_MAGIC: u32 = 0x5a_44_52_31; // "ZDR1"
 const MANIFEST_DAEMON_RESPONSE_MAGIC: u32 = 0x5a_44_53_31; // "ZDS1"
-const MANIFEST_DAEMON_PROTOCOL_VERSION: u16 = 1;
+const MANIFEST_DAEMON_PROTOCOL_VERSION: u16 = 2;
 const MANIFEST_DAEMON_IDLE_TIMEOUT_MS: i32 = 5 * 60 * 1000;
 
 const ManifestDaemonRequestMode = enum(u8) {
@@ -5654,6 +6041,96 @@ fn readDaemonOptionalString(allocator: std.mem.Allocator, reader: *std.Io.Reader
         1 => try readDaemonString(allocator, reader),
         else => error.InvalidDaemonProtocol,
     };
+}
+
+fn writeDaemonPipeline(writer: *std.Io.Writer, pipeline: ?zap.builder.BuildConfig.Pipeline) !void {
+    try writer.writeByte(if (pipeline != null) 1 else 0);
+    const concrete_pipeline = pipeline orelse return;
+    try writer.writeInt(u32, @intCast(concrete_pipeline.steps.len), .little);
+    for (concrete_pipeline.steps) |step| {
+        switch (step) {
+            .compile => try writer.writeByte(1),
+            .run => |run_step| {
+                try writer.writeByte(2);
+                try writer.writeByte(if (run_step.forward_args) 1 else 0);
+                try writer.writeInt(u32, @intCast(run_step.args.len), .little);
+                for (run_step.args) |arg| {
+                    try writeDaemonString(writer, arg);
+                }
+            },
+        }
+    }
+}
+
+fn readDaemonPipeline(allocator: std.mem.Allocator, reader: *std.Io.Reader) !?zap.builder.BuildConfig.Pipeline {
+    const present = try reader.takeInt(u8, .little);
+    switch (present) {
+        0 => return null,
+        1 => {},
+        else => return error.InvalidDaemonProtocol,
+    }
+
+    var steps: std.ArrayListUnmanaged(zap.builder.BuildConfig.Step) = .empty;
+    var initialized_count: usize = 0;
+    errdefer {
+        for (steps.items[0..initialized_count]) |step| {
+            switch (step) {
+                .compile => {},
+                .run => |run_step| {
+                    for (run_step.args) |arg| allocator.free(arg);
+                    allocator.free(run_step.args);
+                },
+            }
+        }
+        steps.deinit(allocator);
+    }
+
+    const step_count = try reader.takeInt(u32, .little);
+    var step_index: u32 = 0;
+    while (step_index < step_count) : (step_index += 1) {
+        const tag = try reader.takeInt(u8, .little);
+        switch (tag) {
+            1 => {
+                try steps.append(allocator, .{ .compile = .{} });
+                initialized_count += 1;
+            },
+            2 => {
+                const forward_args_tag = try reader.takeInt(u8, .little);
+                const forward_args = switch (forward_args_tag) {
+                    0 => false,
+                    1 => true,
+                    else => return error.InvalidDaemonProtocol,
+                };
+                var args: std.ArrayListUnmanaged([]const u8) = .empty;
+                var args_transferred = false;
+                errdefer {
+                    if (!args_transferred) {
+                        for (args.items) |arg| allocator.free(arg);
+                        args.deinit(allocator);
+                    }
+                }
+                const arg_count = try reader.takeInt(u32, .little);
+                var arg_index: u32 = 0;
+                while (arg_index < arg_count) : (arg_index += 1) {
+                    try args.append(allocator, try readDaemonString(allocator, reader));
+                }
+                const owned_args = try args.toOwnedSlice(allocator);
+                args_transferred = true;
+                errdefer {
+                    for (owned_args) |arg| allocator.free(arg);
+                    allocator.free(owned_args);
+                }
+                try steps.append(allocator, .{ .run = .{
+                    .args = owned_args,
+                    .forward_args = forward_args,
+                } });
+                initialized_count += 1;
+            },
+            else => return error.InvalidDaemonProtocol,
+        }
+    }
+
+    return .{ .steps = try steps.toOwnedSlice(allocator) };
 }
 
 fn writeDaemonBuildOverrides(writer: *std.Io.Writer, overrides: BuildOverrides) !void {
@@ -5775,6 +6252,7 @@ fn writeManifestDaemonOkResponse(writer: *std.Io.Writer, state: *const Increment
     });
     try writeDaemonOptionalString(writer, state.target);
     try writeDaemonString(writer, state.output_path);
+    try writeDaemonPipeline(writer, state.manifest_config.pipeline);
 }
 
 fn writeManifestDaemonErrorResponse(writer: *std.Io.Writer, message: []const u8) !void {
@@ -5806,11 +6284,19 @@ fn readManifestDaemonResponse(
                 else => return error.InvalidDaemonProtocol,
             };
             const target = try readDaemonOptionalString(allocator, reader);
+            errdefer if (target) |target_value| allocator.free(target_value);
+
             const path = try readDaemonString(allocator, reader);
+            errdefer allocator.free(path);
+
+            const pipeline = try readDaemonPipeline(allocator, reader);
+            errdefer if (pipeline) |pipeline_value| freeBuildPipeline(allocator, pipeline_value);
+
             break :blk .{ .ok = .{
                 .path = path,
                 .kind = kind,
                 .target = target,
+                .pipeline = pipeline,
             } };
         },
         .failed => .{ .failed = try readDaemonString(allocator, reader) },
@@ -7102,6 +7588,35 @@ test "appendTestRunArgs preserves forwarded test args without a seed" {
     try testing.expectEqual(@as(usize, 2), args.items.len);
     try testing.expectEqualStrings("--list", args.items[0]);
     try testing.expectEqualStrings("--verbose", args.items[1]);
+}
+
+test "buildPipelineRunArgs appends forwarded runtime args when requested" {
+    const run_step: zap.builder.BuildConfig.Run = .{
+        .args = &.{ "--only", "math" },
+        .forward_args = true,
+    };
+
+    const args = try buildPipelineRunArgs(testing.allocator, run_step, &.{ "--seed", "123" });
+    defer testing.allocator.free(args);
+
+    try testing.expectEqual(@as(usize, 4), args.len);
+    try testing.expectEqualStrings("--only", args[0]);
+    try testing.expectEqualStrings("math", args[1]);
+    try testing.expectEqualStrings("--seed", args[2]);
+    try testing.expectEqualStrings("123", args[3]);
+}
+
+test "buildPipelineRunArgs omits forwarded runtime args when disabled" {
+    const run_step: zap.builder.BuildConfig.Run = .{
+        .args = &.{"--list"},
+        .forward_args = false,
+    };
+
+    const args = try buildPipelineRunArgs(testing.allocator, run_step, &.{ "--seed", "123" });
+    defer testing.allocator.free(args);
+
+    try testing.expectEqual(@as(usize, 1), args.len);
+    try testing.expectEqualStrings("--list", args[0]);
 }
 
 // ---------------------------------------------------------------------------

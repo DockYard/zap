@@ -11,7 +11,7 @@ const env = @import("env.zig");
 const glob = @import("glob.zig");
 
 const MAGIC: u64 = 0x4e_41_4c_50_42_50_41_5a; // "ZAPBPLAN" little-endian
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STABLE_SNAPSHOT_READ_ATTEMPTS: usize = 3;
@@ -44,6 +44,20 @@ pub const OverrideIdentity = struct {
     memory: ?[]const u8 = null,
     target: ?[]const u8 = null,
     cpu: ?[]const u8 = null,
+};
+
+pub const Pipeline = struct {
+    steps: []const PipelineStep = &.{},
+};
+
+pub const PipelineStep = union(enum) {
+    compile,
+    run: PipelineRunStep,
+};
+
+pub const PipelineRunStep = struct {
+    args: []const []const u8 = &.{},
+    forward_args: bool = true,
 };
 
 pub const InvocationInputs = struct {
@@ -160,6 +174,7 @@ pub const Snapshot = struct {
     kind: ArtifactKind,
     target: ?[]const u8 = null,
     debug_symbols_required: bool,
+    pipeline: ?Pipeline = null,
     files: []const FileFingerprint = &.{},
     directories: []const DirectoryFingerprint = &.{},
     env_vars: []const EnvFingerprint = &.{},
@@ -170,6 +185,7 @@ pub const Snapshot = struct {
         allocator.free(self.cached_artifact_path);
         allocator.free(self.output_path);
         if (self.target) |target| allocator.free(target);
+        if (self.pipeline) |pipeline| freePipeline(allocator, pipeline);
         for (self.files) |fingerprint| allocator.free(fingerprint.path);
         allocator.free(self.files);
         for (self.directories) |fingerprint| allocator.free(fingerprint.path);
@@ -580,6 +596,7 @@ fn serializeInto(
     try appendInt(allocator, u8, bytes, @intFromEnum(snapshot.kind));
     try appendOptionalString(allocator, bytes, snapshot.target);
     try appendBool(allocator, bytes, snapshot.debug_symbols_required);
+    try appendOptionalPipeline(allocator, bytes, snapshot.pipeline);
 
     try appendInt(allocator, u32, bytes, @intCast(snapshot.files.len));
     for (snapshot.files) |fingerprint| {
@@ -657,6 +674,13 @@ fn deserialize(allocator: std.mem.Allocator, bytes: []const u8) !Snapshot {
         if (target) |target_path| allocator.free(target_path);
         return err;
     };
+    const pipeline = readOptionalPipeline(allocator, &reader) catch |err| {
+        allocator.free(cache_key_hex);
+        allocator.free(cached_artifact_path);
+        allocator.free(output_path);
+        if (target) |target_path| allocator.free(target_path);
+        return err;
+    };
 
     var snapshot: Snapshot = .{
         .invocation_identity = invocation_identity,
@@ -666,6 +690,7 @@ fn deserialize(allocator: std.mem.Allocator, bytes: []const u8) !Snapshot {
         .kind = kind,
         .target = target,
         .debug_symbols_required = debug_symbols_required,
+        .pipeline = pipeline,
     };
     errdefer snapshot.deinit(allocator);
 
@@ -795,6 +820,64 @@ const Reader = struct {
     }
 };
 
+fn readPipeline(allocator: std.mem.Allocator, reader: *Reader) !Pipeline {
+    var steps: std.ArrayListUnmanaged(PipelineStep) = .empty;
+    errdefer {
+        for (steps.items) |step| {
+            switch (step) {
+                .compile => {},
+                .run => |run_step| {
+                    for (run_step.args) |arg| allocator.free(arg);
+                    allocator.free(run_step.args);
+                },
+            }
+        }
+        steps.deinit(allocator);
+    }
+
+    const step_count = try reader.readCount();
+    var step_index: usize = 0;
+    while (step_index < step_count) : (step_index += 1) {
+        const tag = try reader.readInt(u8);
+        switch (tag) {
+            1 => try steps.append(allocator, .compile),
+            2 => {
+                const forward_args = try reader.readBool();
+                var args: std.ArrayListUnmanaged([]const u8) = .empty;
+                var args_transferred = false;
+                errdefer {
+                    if (!args_transferred) {
+                        for (args.items) |arg| allocator.free(arg);
+                        args.deinit(allocator);
+                    }
+                }
+                const arg_count = try reader.readCount();
+                var arg_index: usize = 0;
+                while (arg_index < arg_count) : (arg_index += 1) {
+                    try args.append(allocator, try reader.readString(allocator));
+                }
+                const owned_args = try args.toOwnedSlice(allocator);
+                args_transferred = true;
+                errdefer {
+                    for (owned_args) |arg| allocator.free(arg);
+                    allocator.free(owned_args);
+                }
+                try steps.append(allocator, .{ .run = .{
+                    .args = owned_args,
+                    .forward_args = forward_args,
+                } });
+            },
+            else => return error.InvalidSnapshot,
+        }
+    }
+
+    return .{ .steps = try steps.toOwnedSlice(allocator) };
+}
+
+fn readOptionalPipeline(allocator: std.mem.Allocator, reader: *Reader) !?Pipeline {
+    return if (try reader.readBool()) try readPipeline(allocator, reader) else null;
+}
+
 fn appendInt(allocator: std.mem.Allocator, comptime T: type, bytes: *std.ArrayListUnmanaged(u8), value: T) !void {
     var buf: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &buf, value, .little);
@@ -813,6 +896,45 @@ fn appendString(allocator: std.mem.Allocator, bytes: *std.ArrayListUnmanaged(u8)
 fn appendOptionalString(allocator: std.mem.Allocator, bytes: *std.ArrayListUnmanaged(u8), value: ?[]const u8) !void {
     try appendBool(allocator, bytes, value != null);
     if (value) |some| try appendString(allocator, bytes, some);
+}
+
+fn freePipeline(allocator: std.mem.Allocator, pipeline: Pipeline) void {
+    for (pipeline.steps) |step| {
+        switch (step) {
+            .compile => {},
+            .run => |run_step| {
+                for (run_step.args) |arg| allocator.free(arg);
+                allocator.free(run_step.args);
+            },
+        }
+    }
+    allocator.free(pipeline.steps);
+}
+
+fn appendPipeline(allocator: std.mem.Allocator, bytes: *std.ArrayListUnmanaged(u8), pipeline: Pipeline) !void {
+    try appendInt(allocator, u32, bytes, @intCast(pipeline.steps.len));
+    for (pipeline.steps) |step| {
+        switch (step) {
+            .compile => try appendInt(allocator, u8, bytes, 1),
+            .run => |run_step| {
+                try appendInt(allocator, u8, bytes, 2);
+                try appendBool(allocator, bytes, run_step.forward_args);
+                try appendInt(allocator, u32, bytes, @intCast(run_step.args.len));
+                for (run_step.args) |arg| {
+                    try appendString(allocator, bytes, arg);
+                }
+            },
+        }
+    }
+}
+
+fn appendOptionalPipeline(
+    allocator: std.mem.Allocator,
+    bytes: *std.ArrayListUnmanaged(u8),
+    pipeline: ?Pipeline,
+) !void {
+    try appendBool(allocator, bytes, pipeline != null);
+    if (pipeline) |some| try appendPipeline(allocator, bytes, some);
 }
 
 fn hashBytes(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
@@ -2162,4 +2284,41 @@ test "snapshot validation rejects changed file cached artifact glob env and miss
     var env_mismatch = snapshot;
     env_mismatch.env_vars = &bad_env;
     try std.testing.expect(!validateSnapshot(allocator, env_mismatch, inputs));
+}
+
+test "snapshot serialization preserves an opt-in build pipeline" {
+    const allocator = std.testing.allocator;
+
+    const run_args = [_][]const u8{ "--only", "math" };
+    const steps = [_]PipelineStep{
+        .compile,
+        .{ .run = .{
+            .args = &run_args,
+            .forward_args = true,
+        } },
+    };
+    const snapshot: Snapshot = .{
+        .invocation_identity = 99,
+        .cache_key_hex = "abcd",
+        .cached_artifact_path = ".zap-cache/o/abcd/app",
+        .output_path = "zap-out/bin/app",
+        .kind = .bin,
+        .debug_symbols_required = false,
+        .pipeline = .{ .steps = &steps },
+    };
+
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(allocator);
+    try serializeInto(allocator, &bytes, snapshot);
+
+    var restored = try deserialize(allocator, bytes.items);
+    defer restored.deinit(allocator);
+
+    const pipeline = restored.pipeline orelse return error.ExpectedPipeline;
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steps.len);
+    try std.testing.expect(pipeline.steps[0] == .compile);
+    try std.testing.expect(pipeline.steps[1] == .run);
+    try std.testing.expectEqualStrings("--only", pipeline.steps[1].run.args[0]);
+    try std.testing.expectEqualStrings("math", pipeline.steps[1].run.args[1]);
+    try std.testing.expect(pipeline.steps[1].run.forward_args);
 }

@@ -59,22 +59,22 @@ pub struct Zest {
     reject_check(value, message)
   }
 
-  fn assert_check(value :: Bool, _message :: String) -> String {
+  fn assert_check(value :: Bool, message :: String) -> String {
     if value {
       :zig.Zest.pass_assertion()
       "."
     } else {
-      :zig.Zest.fail_assertion()
+      :zig.Zest.fail_assertion_with_message(message)
       "F"
     }
   }
 
-  fn reject_check(value :: Bool, _message :: String) -> String {
+  fn reject_check(value :: Bool, message :: String) -> String {
     if not value {
       :zig.Zest.pass_assertion()
       "."
     } else {
-      :zig.Zest.fail_assertion()
+      :zig.Zest.fail_assertion_with_message(message)
       "F"
     }
   }

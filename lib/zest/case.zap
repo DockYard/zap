@@ -71,14 +71,7 @@ pub struct Zest.Case {
         tests
       }
     }
-    run_calls = for test <- test_list {
-      quote {
-        :zig.Zest.begin_test()
-        unquote(make_call(".", [env, test]))()
-        :zig.Zest.end_test()
-        :zig.Zest.print_result()
-      }
-    }
+    run_calls = for test <- test_list { build_run_call(env, test) }
 
     quote {
       @doc = """
@@ -88,6 +81,36 @@ pub struct Zest.Case {
       pub fn run() -> String {
         unquote_splicing(run_calls)
         "ok"
+      }
+    }
+  }
+
+  macro build_run_call(env :: Expr, test :: Expr) -> Expr {
+    test_display_name = alias_name(env) <> "." <> atom_name(test)
+
+    quote {
+      :zig.Zest.begin_named_test(unquote(test_display_name))
+      unquote(make_call(".", [env, test]))()
+      :zig.Zest.end_test()
+      :zig.Zest.print_result()
+    }
+  }
+
+  macro alias_name(struct_alias :: Expr) -> Expr {
+    alias_name_parts(elem(struct_alias, 2), 0)
+  }
+
+  macro alias_name_parts(parts :: Expr, index :: Expr) -> Expr {
+    if index >= list_length(parts) {
+      ""
+    } else {
+      name = atom_name(list_at(parts, index))
+      rest = alias_name_parts(parts, index + 1)
+
+      if rest == "" {
+        name
+      } else {
+        name <> "." <> rest
       }
     }
   }
@@ -207,11 +230,22 @@ pub struct Zest.Case {
     """
 
   pub fn assert(value :: Bool) -> String {
+    assert(value, "assertion failed")
+  }
+
+  @doc = """
+    Asserts that a boolean value is `true` with a custom message.
+
+    Non-fatal: returns "F" on failure, records the message, and does
+    not stop execution.
+    """
+
+  pub fn assert(value :: Bool, message :: String) -> String {
     if value {
       :zig.Zest.pass_assertion()
       "."
     } else {
-      :zig.Zest.fail_assertion()
+      :zig.Zest.fail_assertion_with_message(message)
       "F"
     }
   }
@@ -223,11 +257,22 @@ pub struct Zest.Case {
     """
 
   pub fn reject(value :: Bool) -> String {
+    reject(value, "rejection failed")
+  }
+
+  @doc = """
+    Asserts that a boolean value is `false` with a custom message.
+
+    Non-fatal: returns "F" on failure, records the message, and does
+    not stop execution.
+    """
+
+  pub fn reject(value :: Bool, message :: String) -> String {
     if not value {
       :zig.Zest.pass_assertion()
       "."
     } else {
-      :zig.Zest.fail_assertion()
+      :zig.Zest.fail_assertion_with_message(message)
       "F"
     }
   }

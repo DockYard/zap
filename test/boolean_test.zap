@@ -63,6 +63,13 @@ pub struct BooleanTest {
     }
   }
 
+  describe("negate/1") {
+    test("will negate bool") {
+      assert(Bool.negate(false))
+      reject(Bool.negate(true))
+    }
+  }
+
   fn check_positive(x :: i64) -> String {
     case x > 0 {
       true -> "positive"

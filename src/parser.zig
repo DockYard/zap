@@ -2452,7 +2452,22 @@ pub const Parser = struct {
                     if (!self.match(.comma)) break;
                 }
 
-                const end_tok = try self.expect(.right_paren);
+                const end_span = if (self.check(.right_paren)) blk: {
+                    const end_tok = self.advance();
+                    break :blk ast.SourceSpan.from(end_tok.loc);
+                } else blk: {
+                    if (self.check(.left_brace)) {
+                        try self.addRichError(
+                            "I was expecting `)` before this block",
+                            self.currentSpan(),
+                            "block starts here, but the call argument list is still open",
+                            "add `)` before `{` to close the call argument list",
+                        );
+                        break :blk self.previousSpan();
+                    }
+                    const end_tok = try self.expect(.right_paren);
+                    break :blk ast.SourceSpan.from(end_tok.loc);
+                };
 
                 // Trailing block: func(args) { body } → body becomes last argument
                 // Disabled in guard expressions where { starts the function body.
@@ -2463,7 +2478,7 @@ pub const Parser = struct {
 
                 expr = try self.create(ast.Expr, .{
                     .call = .{
-                        .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, ast.SourceSpan.from(end_tok.loc)) },
+                        .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, end_span) },
                         .callee = expr,
                         .args = try args.toOwnedSlice(self.allocator),
                     },
@@ -5997,6 +6012,70 @@ test "parse nested trailing blocks" {
     try std.testing.expect(expr.call.args[0].* == .string_literal);
     // The block contains a test(...) { ... } call
     try std.testing.expect(expr.call.args[1].* == .block);
+}
+
+test "missing call paren before trailing block reports one focused parser error" {
+    const source =
+        \\pub struct BooleanTest {
+        \\  describe("negate/1" {
+        \\    test("will negate bool") {
+        \\      assert(Bool.negate(false))
+        \\      reject(Bool.negate(true))
+        \\    }
+        \\  }
+        \\
+        \\  fn check_positive(x :: i64) -> String {
+        \\    case x > 0 {
+        \\      true -> "positive"
+        \\      false -> "not positive"
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const result = parser.parseProgram();
+    try std.testing.expectError(error.ParseError, result);
+    try std.testing.expectEqual(@as(usize, 1), parser.errors.items.len);
+
+    const parse_error = parser.errors.items[0];
+    try std.testing.expectEqualStrings("I was expecting `)` before this block", parse_error.message);
+    try std.testing.expect(parse_error.label != null);
+    try std.testing.expectEqualStrings("block starts here, but the call argument list is still open", parse_error.label.?);
+    try std.testing.expect(parse_error.help != null);
+    try std.testing.expectEqualStrings("add `)` before `{` to close the call argument list", parse_error.help.?);
+    try std.testing.expectEqual(@as(u8, '{'), source[parse_error.span.start]);
+}
+
+test "missing call paren before body block preserves disabled trailing block boundary" {
+    const source =
+        \\pub struct GuardRecovery {
+        \\  fn classify(x :: i64) -> String if Bool.negate(x > 0 {
+        \\    "not positive"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const result = parser.parseProgram();
+    try std.testing.expectError(error.ParseError, result);
+    try std.testing.expectEqual(@as(usize, 1), parser.errors.items.len);
+
+    const parse_error = parser.errors.items[0];
+    try std.testing.expectEqualStrings("I was expecting `)` before this block", parse_error.message);
+    try std.testing.expect(parse_error.label != null);
+    try std.testing.expectEqualStrings("block starts here, but the call argument list is still open", parse_error.label.?);
+    try std.testing.expect(parse_error.help != null);
+    try std.testing.expectEqualStrings("add `)` before `{` to close the call argument list", parse_error.help.?);
+    try std.testing.expectEqual(@as(u8, '{'), source[parse_error.span.start]);
 }
 
 test "parse sigil desugars to function call" {

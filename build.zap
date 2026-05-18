@@ -8,7 +8,10 @@ pub struct Zap.Builder {
           kind: :bin,
           root: &TestRunner.main/1,
           paths: ["test/**/*_test.zap"],
-          deps: [%Zap.Dep{name: "zap_stdlib", path: "lib"}]
+          deps: [%Zap.Dep{name: "zap_stdlib", path: "lib"}],
+          pipeline: %Zap.Build.Pipeline{
+            steps: [%Zap.Build.Step{compile: %Zap.Build.Compile{}}, %Zap.Build.Step{run: %Zap.Build.Run{forward_args: true}}]
+          }
         }
       :doc ->
         %Zap.Manifest{

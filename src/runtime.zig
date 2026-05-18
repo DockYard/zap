@@ -7657,11 +7657,19 @@ const BufWriter = struct {
 // ============================================================
 
 pub const Zest = struct {
+    const FailureReport = struct {
+        test_name: []const u8,
+        message: []const u8,
+    };
+
     var test_count: i64 = 0;
     var test_failures: i64 = 0;
     var assertion_count: i64 = 0;
     var assertion_failures: i64 = 0;
     var current_test_failed: bool = false;
+    var current_test_name: []const u8 = "<unknown test>";
+    var failure_reports: std.ArrayListUnmanaged(FailureReport) = .empty;
+    var failure_report_allocation_failed: bool = false;
     var seed: i64 = 0;
     var seed_set: bool = false;
     var timeout_ms: i64 = 0; // per-test timeout in milliseconds (0 = no timeout)
@@ -7694,7 +7702,12 @@ pub const Zest = struct {
     }
 
     pub fn begin_test() void {
+        begin_named_test("<unknown test>");
+    }
+
+    pub fn begin_named_test(name: []const u8) void {
         current_test_failed = false;
+        current_test_name = duplicateFailureString(name) orelse name;
         test_count += 1;
         if (timeout_ms > 0) {
             var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
@@ -7713,6 +7726,7 @@ pub const Zest = struct {
         if (elapsed_ns > timeout_ns) {
             current_test_failed = true;
             timeout_count += 1;
+            recordFailure("test timed out");
             stdoutPrint("\x1b[1;33mT\x1b[0m", .{}); // yellow T for timeout
             return true;
         }
@@ -7738,9 +7752,14 @@ pub const Zest = struct {
     }
 
     pub fn fail_assertion() void {
+        fail_assertion_with_message("assertion failed");
+    }
+
+    pub fn fail_assertion_with_message(message: []const u8) void {
         assertion_count += 1;
         assertion_failures += 1;
         current_test_failed = true;
+        recordFailure(message);
     }
 
     pub fn print_dot() void {
@@ -7752,6 +7771,7 @@ pub const Zest = struct {
     }
 
     pub fn summary() i64 {
+        printFailureReports();
         stdoutPrint("\n\nSeed: ", .{});
         writeI64(get_seed());
         if (timeout_ms > 0) {
@@ -7777,6 +7797,59 @@ pub const Zest = struct {
         return test_failures;
     }
 
+    fn duplicateFailureString(value: []const u8) ?[]const u8 {
+        return runtime_arena.allocator().dupe(u8, value) catch {
+            failure_report_allocation_failed = true;
+            return null;
+        };
+    }
+
+    fn recordFailure(message: []const u8) void {
+        const report = FailureReport{
+            .test_name = duplicateFailureString(current_test_name) orelse current_test_name,
+            .message = duplicateFailureString(message) orelse message,
+        };
+        failure_reports.append(runtime_arena.allocator(), report) catch {
+            failure_report_allocation_failed = true;
+        };
+    }
+
+    fn printFailureReports() void {
+        if (failure_reports.items.len == 0) {
+            if (failure_report_allocation_failed) {
+                stdoutPrint("\n\nFailures: unable to allocate failure reports", .{});
+            }
+            return;
+        }
+
+        stdoutPrint("\n\nFailures:", .{});
+        for (failure_reports.items, 0..) |report, index| {
+            stdoutPrint("\n\n", .{});
+            writeI64(@intCast(index + 1));
+            stdoutPrint(") {s}\n   {s}", .{ report.test_name, report.message });
+        }
+
+        if (failure_report_allocation_failed) {
+            stdoutPrint("\n\nAdditional failure reports could not be allocated.", .{});
+        }
+    }
+
+    fn testOnlyReset() void {
+        test_count = 0;
+        test_failures = 0;
+        assertion_count = 0;
+        assertion_failures = 0;
+        current_test_failed = false;
+        current_test_name = "<unknown test>";
+        failure_reports.clearRetainingCapacity();
+        failure_report_allocation_failed = false;
+        seed = 0;
+        seed_set = false;
+        timeout_ms = 0;
+        test_start_ns = 0;
+        timeout_count = 0;
+    }
+
     fn writeI64(val: i64) void {
         if (val < 0) {
             stdoutPrint("-", .{});
@@ -7791,6 +7864,23 @@ pub const Zest = struct {
         stdoutWrite(&buf);
     }
 };
+
+test "Zest records named assertion failure reports" {
+    Zest.testOnlyReset();
+    defer Zest.testOnlyReset();
+
+    Zest.begin_named_test("SampleTest.test_reports_failures");
+    Zest.fail_assertion_with_message("expected true");
+    Zest.end_test();
+
+    try std.testing.expectEqual(@as(i64, 1), Zest.test_count);
+    try std.testing.expectEqual(@as(i64, 1), Zest.test_failures);
+    try std.testing.expectEqual(@as(i64, 1), Zest.assertion_count);
+    try std.testing.expectEqual(@as(i64, 1), Zest.assertion_failures);
+    try std.testing.expectEqual(@as(usize, 1), Zest.failure_reports.items.len);
+    try std.testing.expectEqualStrings("SampleTest.test_reports_failures", Zest.failure_reports.items[0].test_name);
+    try std.testing.expectEqualStrings("expected true", Zest.failure_reports.items[0].message);
+}
 
 // ============================================================
 // BinaryHelpers — concrete binary pattern matching operations
