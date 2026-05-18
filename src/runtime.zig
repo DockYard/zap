@@ -7826,11 +7826,29 @@ pub const Zest = struct {
         for (failure_reports.items, 0..) |report, index| {
             stdoutPrint("\n\n", .{});
             writeI64(@intCast(index + 1));
-            stdoutPrint(") {s}\n   {s}", .{ report.test_name, report.message });
+            stdoutPrint(") {s}\n", .{report.test_name});
+            printIndentedMessage(report.message);
         }
 
         if (failure_report_allocation_failed) {
             stdoutPrint("\n\nAdditional failure reports could not be allocated.", .{});
+        }
+    }
+
+    fn printIndentedMessage(message: []const u8) void {
+        var line_start: usize = 0;
+        while (line_start <= message.len) {
+            var line_end = line_start;
+            while (line_end < message.len and message[line_end] != '\n') : (line_end += 1) {}
+
+            stdoutPrint("   ", .{});
+            if (line_end > line_start) {
+                stdoutPrint("{s}", .{message[line_start..line_end]});
+            }
+
+            if (line_end == message.len) break;
+            stdoutPrint("\n", .{});
+            line_start = line_end + 1;
         }
     }
 

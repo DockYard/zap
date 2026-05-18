@@ -687,14 +687,10 @@ Write tests like this:
 pub struct Test.MyFeatureTest {
   use Zest.Case
 
-  pub fn run() -> String {
-    describe("my feature") {
-      test("it works") {
-        assert(1 + 1 == 2)
-      }
+  test("my feature") {
+    case("it works") {
+      assert(1 + 1 == 2)
     }
-
-    "MyFeatureTest: passed"
   }
 }
 ```

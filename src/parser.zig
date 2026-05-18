@@ -1570,7 +1570,7 @@ pub const Parser = struct {
     /// (so `pub fn <>(...)`, `pub macro |>(...)`, `pub fn rem(...)` all parse).
     fn parseSymbolicName(self: *Parser) !Token {
         if (self.check(.identifier)) return self.advance();
-        if (self.check(.keyword_if) or self.check(.keyword_cond) or
+        if (self.check(.keyword_if) or self.check(.keyword_case) or self.check(.keyword_cond) or
             self.check(.keyword_and) or self.check(.keyword_or) or
             self.check(.keyword_not) or self.check(.keyword_rem) or
             self.check(.keyword_in) or self.check(.keyword_fn) or
@@ -2546,7 +2546,10 @@ pub const Parser = struct {
             .percent => return self.parseStructExpr(),
             .left_angle_angle => return self.parseBinaryExpr(),
             .keyword_if => return self.parseIfExpr(),
-            .keyword_case => return self.parseCaseExpr(),
+            .keyword_case => {
+                if (self.peekNext() == .left_paren) return self.parseVarRef();
+                return self.parseCaseExpr();
+            },
             .keyword_cond => return self.parseCondExpr(),
             .keyword_for => return self.parseForExpr(),
             .keyword_panic => return self.parsePanicExpr(),
@@ -5520,6 +5523,41 @@ test "parse defmacrop inside struct" {
     try std.testing.expectEqual(@as(usize, 1), program.structs[0].items.len);
     try std.testing.expect(program.structs[0].items[0] == .priv_macro);
     try std.testing.expectEqual(ast.FunctionDecl.Visibility.private, program.structs[0].items[0].priv_macro.visibility);
+}
+
+test "parse macro named case and case call expression" {
+    const source =
+        \\pub struct Foo {
+        \\  pub macro case(name :: Expr, body :: Expr) -> Expr {
+        \\    body
+        \\  }
+        \\
+        \\  pub fn run() -> String {
+        \\    case("label") {
+        \\      "ok"
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.structs.len);
+    try std.testing.expectEqual(@as(usize, 2), program.structs[0].items.len);
+    try std.testing.expect(program.structs[0].items[0] == .macro);
+
+    const run_function = program.structs[0].items[1].function;
+    const body = run_function.clauses[0].body.?;
+    try std.testing.expectEqual(@as(usize, 1), body.len);
+    try std.testing.expect(body[0] == .expr);
+    try std.testing.expect(body[0].expr.* == .call);
+    try std.testing.expect(body[0].expr.call.callee.* == .var_ref);
+    const callee_name = parser.interner.get(body[0].expr.call.callee.var_ref.name);
+    try std.testing.expectEqualStrings("case", callee_name);
 }
 
 test "parse struct is_private false by default" {

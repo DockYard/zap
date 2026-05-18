@@ -1146,6 +1146,8 @@ pub const Collector = struct {
                 // Register block scope in node_scope_map so the TypeChecker's
                 // body traversal can enter it for binding type propagation.
                 try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(blk.meta.span), blk_scope);
+                const expr_mut: *ast.Expr = @constCast(expr);
+                expr_mut.block.meta.scope_id = blk_scope;
                 try self.collectBlock(blk.stmts, blk_scope);
             },
             .anonymous_function => |anon| {

@@ -38,6 +38,7 @@ pub fn capabilityForBuiltin(name: []const u8) ?CapabilitySet {
     if (std.mem.eql(u8, name, "struct_macros")) return CapabilitySet.pure_only.with(.reflect_source);
     if (std.mem.eql(u8, name, "union_variants")) return CapabilitySet.pure_only.with(.reflect_source);
     if (std.mem.eql(u8, name, "protocol_required_functions")) return CapabilitySet.pure_only.with(.reflect_source);
+    if (std.mem.eql(u8, name, "source_text")) return CapabilitySet.pure_only.with(.reflect_source);
 
     return null;
 }

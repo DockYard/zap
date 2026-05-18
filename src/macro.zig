@@ -4930,6 +4930,62 @@ test "comptime intrinsics: slugify produces snake_case from string" {
     try std.testing.expect(found_slug);
 }
 
+test "comptime intrinsics: source_text returns user expression source" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro capture_code(expr :: Expr) -> Expr {
+        \\    code = source_text(expr)
+        \\    quote { unquote(code) }
+        \\  }
+        \\
+        \\  pub fn check() -> String {
+        \\    capture_code(1 + 2)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var parser = Parser.initWithSharedInterner(alloc, source, &interner, 0);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+    try collector.graph.registerSourceFileWithContent(0, "source_text_test.zap", source);
+    try @import("capability_inference.zig").inferAndApply(alloc, &collector.graph, parser.interner);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var found_code = false;
+    for (expanded.structs) |mod| {
+        for (mod.items) |item| {
+            if (item != .function) continue;
+            const name = parser.interner.get(item.function.name);
+            if (!std.mem.eql(u8, name, "check")) continue;
+            for (item.function.clauses) |clause| {
+                const body = clause.body orelse continue;
+                for (body) |stmt| {
+                    if (stmt != .expr) continue;
+                    if (stmt.expr.* == .string_literal) {
+                        const text = parser.interner.get(stmt.expr.string_literal.value);
+                        if (std.mem.eql(u8, text, "1 + 2")) {
+                            found_code = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_code);
+}
+
 test "comptime intrinsics: slugify + intern produces dynamic fn name" {
     // Compose the comptime intrinsics: take a user-provided string,
     // slugify it into an identifier, intern it as an atom, and

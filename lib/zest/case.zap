@@ -1,32 +1,32 @@
 @doc = """
   Test case DSL for the Zest test framework.
 
-  Provides `describe`, `test`, `assert`, `reject`, `setup`, and
-  `teardown` for writing structured test cases with test tracking.
+  Provides `test`, `case`, `assert`, `reject`, `setup`, and `teardown`
+  for writing structured test cases with test tracking.
 
-  Setup runs fresh before EACH test that requests context.
-  Teardown runs after each test. Assertions are non-fatal.
+  `test("subject") { ... }` is a grouping macro. Each nested
+  `case("behavior") { ... }` is an executable leaf. Setup and teardown
+  blocks inside a `test` group run once per case.
 
-  The `describe` and `test` macros expand into function declarations
-  so that each test becomes a named pub function (test_*). `use Zest.Case`
-  installs a compile-time hook that generates `run/0` for the enclosing
-  struct after all tests have been registered.
+  `describe("subject") { test("behavior") { ... } }` remains supported
+  as a compatibility alias during the DSL migration. It lowers to the
+  same internal case records as `test/case`.
 
   ## Examples
 
       pub struct Test.MyTest {
         use Zest.Case
 
-        describe("my feature") {
+        test("my feature") {
           setup() {
             42
           }
 
-          test("uses context", ctx) {
+          case("uses context", ctx) {
             assert(ctx == 42)
           }
 
-          test("no context needed") {
+          case("no context needed") {
             assert(true)
           }
 
@@ -55,9 +55,10 @@ pub struct Zest.Case {
   @doc = """
     Generates the `run/0` function for a test struct.
 
-    The hook reads the tests registered by `describe/2` and `test/2`,
-    then emits a single public runner function that executes each test
-    with Zest tracking around the call.
+    The hook reads accumulated case records registered by `test/case`
+    and compatibility `describe/test`, then emits a single public
+    runner function that executes each case with Zest tracking around
+    the generated function call.
     """
 
   pub macro __before_compile__(env :: Expr) -> Decl {
@@ -71,11 +72,11 @@ pub struct Zest.Case {
         tests
       }
     }
-    run_calls = for test <- test_list { build_run_call(env, test) }
+    run_calls = for test_record <- test_list { build_run_call(env, test_record) }
 
     quote {
       @doc = """
-        Runs all registered Zest tests in this struct.
+        Runs all registered Zest cases in this struct.
         """
 
       pub fn run() -> String {
@@ -85,14 +86,25 @@ pub struct Zest.Case {
     }
   }
 
-  macro build_run_call(env :: Expr, test :: Expr) -> Expr {
-    test_display_name = alias_name(env) <> "." <> atom_name(test)
+  macro build_run_call(env :: Expr, test_record :: Expr) -> Expr {
+    generated_function_name = elem(test_record, 0)
+    test_label = elem(test_record, 1)
+    case_label = elem(test_record, 2)
+    test_display_name = display_name(alias_name(env), test_label, case_label)
 
     quote {
       :zig.Zest.begin_named_test(unquote(test_display_name))
-      unquote(make_call(".", [env, test]))()
+      unquote(make_call(".", [env, generated_function_name]))()
       :zig.Zest.end_test()
       :zig.Zest.print_result()
+    }
+  }
+
+  macro display_name(struct_name :: Expr, test_label :: Expr, case_label :: Expr) -> Expr {
+    if case_label == "" {
+      struct_name <> " - " <> test_label
+    } else {
+      struct_name <> " - " <> test_label <> " - " <> case_label
     }
   }
 
@@ -115,85 +127,136 @@ pub struct Zest.Case {
     }
   }
 
-  macro build_describe_test(desc_slug :: Expr, test_expr :: Expr, setup_body :: Expr, teardown_body :: Expr) -> Expr {
-    test_name = intern_atom("test_" <> desc_slug <> "_" <> slugify(list_at(elem(test_expr, 2), 0)))
-    struct_put_attribute(:zest_tests, test_name)
+  macro build_case_decl(test_name :: Expr, test_slug :: Expr, setup_expr :: Expr, teardown_expr :: Expr, case_expr :: Expr) -> Expr {
+    case_args = elem(case_expr, 2)
+    case_name = list_at(case_args, 0)
+    case_body = list_at(case_args, -1)
+    generated_function_name = intern_atom("test_" <> test_slug <> "_" <> slugify(case_name))
+    test_label = test_name <> ""
+    case_label = case_name <> ""
+    struct_put_attribute(:zest_tests, tuple(generated_function_name, test_label, case_label))
+
+    context_setup = if list_length(case_args) == 3 and setup_expr != nil {
+      [make_call("=", [list_at(case_args, 1), setup_expr])]
+    } else {
+      []
+    }
+    case_body_statements = if elem(case_body, 0) == :__block__ { elem(case_body, 2) } else { [case_body] }
+    teardown_statements = if teardown_expr != nil { [teardown_expr] } else { [] }
+    generated_body = make_call("__block__", list_concat(list_concat(list_concat(context_setup, case_body_statements), teardown_statements), ["ok"]))
 
     quote {
       @doc = """
-        Generated Zest test function.
+        Generated Zest case function.
         """
 
-      pub fn unquote(test_name)() -> String {
-        unquote(make_call("__block__", list_concat(list_concat(list_concat(if list_length(elem(test_expr, 2)) == 3 and setup_body != nil { [make_call("=", [ctx, setup_body])] } else { [] }, if elem(list_at(elem(test_expr, 2), -1), 0) == :__block__ { elem(list_at(elem(test_expr, 2), -1), 2) } else { [list_at(elem(test_expr, 2), -1)] }), if teardown_body != nil { [teardown_body] } else { [] }), ["ok"])))
+      pub fn unquote(generated_function_name)() -> String {
+        unquote(generated_body)
       }
     }
   }
 
   @doc = """
-    Groups related tests under a descriptive label.
+    Defines a test group.
 
-    Scans the body for `setup` and `teardown` blocks, then
-    transforms each `test` call into a pub function declaration
-    and registers the generated function for `run/0`.
+    Nested `case/2` or `case/3` calls become executable test cases.
+    Setup and teardown blocks in the group run once per case.
+
+    If no nested case is present, `test/2` falls back to the legacy
+    leaf-test behavior for migration compatibility.
 
     ## Examples
 
-        describe("math") {
-          setup() { 42 }
+        test("math") {
+          setup() { 40 }
 
-          test("addition", ctx) {
-            assert(ctx == 42)
+          case("addition", ctx) {
+            assert(ctx + 2 == 42)
           }
         }
     """
 
-  pub macro describe(name :: Expr, body :: Expr) -> Expr {
-    stmts = elem(body, 2)
-    setup_matches = for s <- stmts, elem(s, 0) == :setup { list_at(elem(s, 2), -1) }
-    teardown_matches = for s <- stmts, elem(s, 0) == :teardown { list_at(elem(s, 2), -1) }
-    setup_body = list_at(setup_matches, 0)
-    teardown_body = list_at(teardown_matches, 0)
-    desc_slug = slugify(name)
+  pub macro test(name :: Expr, body :: Expr) -> Expr {
+    stmts = if elem(body, 0) == :__block__ { elem(body, 2) } else { [body] }
+    case_stmts = for stmt <- stmts, elem(stmt, 0) == :case { stmt }
 
-    per_test = for t <- stmts, elem(t, 0) == :test {
-      build_describe_test(desc_slug, t, setup_body, teardown_body)
+    if list_length(case_stmts) == 0 {
+      generated_function_name = intern_atom("test_" <> slugify(name))
+      test_label = name <> ""
+      struct_put_attribute(:zest_tests, tuple(generated_function_name, test_label, ""))
+
+      quote {
+        @doc = """
+          Generated Zest compatibility test function.
+          """
+
+        pub fn unquote(generated_function_name)() -> String {
+          unquote(body)
+          "ok"
+        }
+      }
+    } else {
+      setup_matches = for stmt <- stmts, elem(stmt, 0) == :setup { list_at(elem(stmt, 2), -1) }
+      teardown_matches = for stmt <- stmts, elem(stmt, 0) == :teardown { list_at(elem(stmt, 2), -1) }
+      setup_expr = list_at(setup_matches, 0)
+      teardown_expr = list_at(teardown_matches, 0)
+      test_slug = slugify(name)
+
+      per_case = for case_expr <- case_stmts { build_case_decl(name, test_slug, setup_expr, teardown_expr, case_expr) }
+
+      passthrough = for stmt <- stmts, elem(stmt, 0) != :case and elem(stmt, 0) != :setup and elem(stmt, 0) != :teardown { stmt }
+      all_stmts = list_concat(per_case, passthrough)
+
+      quote { unquote_splicing(all_stmts) }
     }
-
-    passthrough = for s <- stmts, elem(s, 0) != :test and elem(s, 0) != :setup and elem(s, 0) != :teardown { s }
-
-    all_stmts = list_concat(per_test, passthrough)
-
-    quote { unquote_splicing(all_stmts) }
   }
 
   @doc = """
-    Defines a test case without context.
+    Declares an executable case inside a `test` group.
 
-    Expands into a pub function declaration named test_<slugified_name>
-    with begin_test/end_test/print_result tracking calls wrapping the body.
-
-    ## Examples
-
-        test("true is true") {
-          assert(true == true)
-        }
+    `case("label") { ... }` runs without setup context. Use
+    `case("label", ctx) { ... }` to bind the value returned by the
+    group's setup block to a context variable.
     """
 
-  pub macro test(name :: Expr, body :: Expr) -> Expr {
-    fn_name = intern_atom("test_" <> slugify(name))
-    struct_put_attribute(:zest_tests, fn_name)
+  pub macro case(_name :: Expr, body :: Expr) -> Expr {
+    quote { unquote(body) }
+  }
 
-    quote {
-      @doc = """
-        Generated Zest test function.
-        """
+  @doc = """
+    Declares an executable case with setup context inside a `test` group.
 
-      pub fn unquote(fn_name)() -> String {
-        unquote(body)
-        "ok"
-      }
-    }
+    This macro exists so `case("label", ctx) { ... }` is a first-class
+    Zest form even before the enclosing `test` group consumes it.
+    """
+
+  pub macro case(_name :: Expr, _context :: Expr, body :: Expr) -> Expr {
+    quote { unquote(body) }
+  }
+
+  @doc = """
+    Compatibility alias for the pre-migration Zest DSL.
+
+    `describe("subject") { test("behavior") { ... } }` is still
+    accepted and lowers to the same case records as the primary
+    `test("subject") { case("behavior") { ... } }` DSL.
+    """
+
+  pub macro describe(name :: Expr, body :: Expr) -> Expr {
+    stmts = if elem(body, 0) == :__block__ { elem(body, 2) } else { [body] }
+    setup_matches = for stmt <- stmts, elem(stmt, 0) == :setup { list_at(elem(stmt, 2), -1) }
+    teardown_matches = for stmt <- stmts, elem(stmt, 0) == :teardown { list_at(elem(stmt, 2), -1) }
+    setup_expr = list_at(setup_matches, 0)
+    teardown_expr = list_at(teardown_matches, 0)
+    test_slug = slugify(name)
+
+    test_stmts = for stmt <- stmts, elem(stmt, 0) == :test { stmt }
+    per_case = for test_expr <- test_stmts { build_case_decl(name, test_slug, setup_expr, teardown_expr, test_expr) }
+
+    passthrough = for stmt <- stmts, elem(stmt, 0) != :test and elem(stmt, 0) != :setup and elem(stmt, 0) != :teardown { stmt }
+    all_stmts = list_concat(per_case, passthrough)
+
+    quote { unquote_splicing(all_stmts) }
   }
 
   @doc = """
@@ -224,70 +287,326 @@ pub struct Zest.Case {
   }
 
   @doc = """
-    Asserts that a boolean value is `true`.
+    Asserts that an expression evaluates to `true`.
 
-    Non-fatal: returns :fail on failure, does not stop execution.
+    The expression is received as AST so Zest can report source code,
+    evaluated values, and comparison operands without evaluating
+    operands more than once.
     """
 
-  pub fn assert(value :: Bool) -> String {
-    assert(value, "assertion failed")
-  }
+  pub macro assert(expression :: Expr) -> Expr {
+    operator_name = atom_name(elem(expression, 0))
+    args = elem(expression, 2)
 
-  @doc = """
-    Asserts that a boolean value is `true` with a custom message.
+    if comparison_operator?(operator_name) and list_length(args) == 2 {
+      left_expression = list_at(args, 0)
+      right_expression = list_at(args, 1)
+      code = source_text(expression)
+      left_code = source_text(left_expression)
+      right_code = source_text(right_expression)
 
-    Non-fatal: returns "F" on failure, records the message, and does
-    not stop execution.
-    """
-
-  pub fn assert(value :: Bool, message :: String) -> String {
-    if value {
-      :zig.Zest.pass_assertion()
-      "."
-    } else {
-      :zig.Zest.fail_assertion_with_message(message)
-      "F"
-    }
-  }
-
-  @doc = """
-    Asserts that a boolean value is `false`.
-
-    Non-fatal: returns "F" on failure, does not stop execution.
-    """
-
-  pub fn reject(value :: Bool) -> String {
-    reject(value, "rejection failed")
-  }
-
-  @doc = """
-    Asserts that a boolean value is `false` with a custom message.
-
-    Non-fatal: returns "F" on failure, records the message, and does
-    not stop execution.
-    """
-
-  pub fn reject(value :: Bool, message :: String) -> String {
-    if not value {
-      :zig.Zest.pass_assertion()
-      "."
-    } else {
-      :zig.Zest.fail_assertion_with_message(message)
-      "F"
-    }
-  }
-
-  @doc = """
-    Declares setup code that runs before each test with context.
-
-    Place inside a `describe` block. The return value is bound
-    to `ctx` in each `test/3` call. Runs fresh for every test.
-
-    ## Examples
-
-        setup() {
-          connect_db()
+      if operator_name == "==" {
+        quote {
+          zest_assertion_left_value = unquote(left_expression)
+          zest_assertion_right_value = unquote(right_expression)
+          Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value == zest_assertion_right_value, "")
         }
+      } else {
+        if operator_name == "!=" {
+          quote {
+            zest_assertion_left_value = unquote(left_expression)
+            zest_assertion_right_value = unquote(right_expression)
+            Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value != zest_assertion_right_value, "")
+          }
+        } else {
+          if operator_name == "<" {
+            quote {
+              zest_assertion_left_value = unquote(left_expression)
+              zest_assertion_right_value = unquote(right_expression)
+              Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value < zest_assertion_right_value, "")
+            }
+          } else {
+            if operator_name == ">" {
+              quote {
+                zest_assertion_left_value = unquote(left_expression)
+                zest_assertion_right_value = unquote(right_expression)
+                Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value > zest_assertion_right_value, "")
+              }
+            } else {
+              if operator_name == "<=" {
+                quote {
+                  zest_assertion_left_value = unquote(left_expression)
+                  zest_assertion_right_value = unquote(right_expression)
+                  Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value <= zest_assertion_right_value, "")
+                }
+              } else {
+                quote {
+                  zest_assertion_left_value = unquote(left_expression)
+                  zest_assertion_right_value = unquote(right_expression)
+                  Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value >= zest_assertion_right_value, "")
+                }
+              }
+            }
+          }
+        }
+      }
+    } else {
+      code = source_text(expression)
+
+      quote {
+        zest_assertion_value = unquote(expression)
+        Zest.Assertion.truthy_result("assert", unquote(code), Kernel.to_string(zest_assertion_value), zest_assertion_value, "")
+      }
+    }
+  }
+
+  @doc = """
+    Asserts that an expression evaluates to `true` with a custom message.
+
+    Custom messages supplement the structural assertion diagnostics.
+    """
+
+  pub macro assert(expression :: Expr, message :: Expr) -> Expr {
+    operator_name = atom_name(elem(expression, 0))
+    args = elem(expression, 2)
+
+    if comparison_operator?(operator_name) and list_length(args) == 2 {
+      left_expression = list_at(args, 0)
+      right_expression = list_at(args, 1)
+      code = source_text(expression)
+      left_code = source_text(left_expression)
+      right_code = source_text(right_expression)
+
+      if operator_name == "==" {
+        quote {
+          zest_assertion_left_value = unquote(left_expression)
+          zest_assertion_right_value = unquote(right_expression)
+          Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value == zest_assertion_right_value, unquote(message))
+        }
+      } else {
+        if operator_name == "!=" {
+          quote {
+            zest_assertion_left_value = unquote(left_expression)
+            zest_assertion_right_value = unquote(right_expression)
+            Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value != zest_assertion_right_value, unquote(message))
+          }
+        } else {
+          if operator_name == "<" {
+            quote {
+              zest_assertion_left_value = unquote(left_expression)
+              zest_assertion_right_value = unquote(right_expression)
+              Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value < zest_assertion_right_value, unquote(message))
+            }
+          } else {
+            if operator_name == ">" {
+              quote {
+                zest_assertion_left_value = unquote(left_expression)
+                zest_assertion_right_value = unquote(right_expression)
+                Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value > zest_assertion_right_value, unquote(message))
+              }
+            } else {
+              if operator_name == "<=" {
+                quote {
+                  zest_assertion_left_value = unquote(left_expression)
+                  zest_assertion_right_value = unquote(right_expression)
+                  Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value <= zest_assertion_right_value, unquote(message))
+                }
+              } else {
+                quote {
+                  zest_assertion_left_value = unquote(left_expression)
+                  zest_assertion_right_value = unquote(right_expression)
+                  Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value >= zest_assertion_right_value, unquote(message))
+                }
+              }
+            }
+          }
+        }
+      }
+    } else {
+      code = source_text(expression)
+
+      quote {
+        zest_assertion_value = unquote(expression)
+        Zest.Assertion.truthy_result("assert", unquote(code), Kernel.to_string(zest_assertion_value), zest_assertion_value, unquote(message))
+      }
+    }
+  }
+
+  @doc = """
+    Asserts that an expression evaluates to `false`.
+
+    The expression is received as AST so Zest can report source code,
+    evaluated values, and comparison operands without evaluating
+    operands more than once.
+    """
+
+  pub macro reject(expression :: Expr) -> Expr {
+    operator_name = atom_name(elem(expression, 0))
+    args = elem(expression, 2)
+
+    if comparison_operator?(operator_name) and list_length(args) == 2 {
+      left_expression = list_at(args, 0)
+      right_expression = list_at(args, 1)
+      code = source_text(expression)
+      left_code = source_text(left_expression)
+      right_code = source_text(right_expression)
+
+      if operator_name == "==" {
+        quote {
+          zest_assertion_left_value = unquote(left_expression)
+          zest_assertion_right_value = unquote(right_expression)
+          Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value == zest_assertion_right_value, "")
+        }
+      } else {
+        if operator_name == "!=" {
+          quote {
+            zest_assertion_left_value = unquote(left_expression)
+            zest_assertion_right_value = unquote(right_expression)
+            Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value != zest_assertion_right_value, "")
+          }
+        } else {
+          if operator_name == "<" {
+            quote {
+              zest_assertion_left_value = unquote(left_expression)
+              zest_assertion_right_value = unquote(right_expression)
+              Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value < zest_assertion_right_value, "")
+            }
+          } else {
+            if operator_name == ">" {
+              quote {
+                zest_assertion_left_value = unquote(left_expression)
+                zest_assertion_right_value = unquote(right_expression)
+                Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value > zest_assertion_right_value, "")
+              }
+            } else {
+              if operator_name == "<=" {
+                quote {
+                  zest_assertion_left_value = unquote(left_expression)
+                  zest_assertion_right_value = unquote(right_expression)
+                  Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value <= zest_assertion_right_value, "")
+                }
+              } else {
+                quote {
+                  zest_assertion_left_value = unquote(left_expression)
+                  zest_assertion_right_value = unquote(right_expression)
+                  Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value >= zest_assertion_right_value, "")
+                }
+              }
+            }
+          }
+        }
+      }
+    } else {
+      code = source_text(expression)
+
+      quote {
+        zest_assertion_value = unquote(expression)
+        Zest.Assertion.truthy_result("reject", unquote(code), Kernel.to_string(zest_assertion_value), zest_assertion_value, "")
+      }
+    }
+  }
+
+  @doc = """
+    Asserts that an expression evaluates to `false` with a custom message.
+
+    Custom messages supplement the structural rejection diagnostics.
+    """
+
+  pub macro reject(expression :: Expr, message :: Expr) -> Expr {
+    operator_name = atom_name(elem(expression, 0))
+    args = elem(expression, 2)
+
+    if comparison_operator?(operator_name) and list_length(args) == 2 {
+      left_expression = list_at(args, 0)
+      right_expression = list_at(args, 1)
+      code = source_text(expression)
+      left_code = source_text(left_expression)
+      right_code = source_text(right_expression)
+
+      if operator_name == "==" {
+        quote {
+          zest_assertion_left_value = unquote(left_expression)
+          zest_assertion_right_value = unquote(right_expression)
+          Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value == zest_assertion_right_value, unquote(message))
+        }
+      } else {
+        if operator_name == "!=" {
+          quote {
+            zest_assertion_left_value = unquote(left_expression)
+            zest_assertion_right_value = unquote(right_expression)
+            Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value != zest_assertion_right_value, unquote(message))
+          }
+        } else {
+          if operator_name == "<" {
+            quote {
+              zest_assertion_left_value = unquote(left_expression)
+              zest_assertion_right_value = unquote(right_expression)
+              Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value < zest_assertion_right_value, unquote(message))
+            }
+          } else {
+            if operator_name == ">" {
+              quote {
+                zest_assertion_left_value = unquote(left_expression)
+                zest_assertion_right_value = unquote(right_expression)
+                Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value > zest_assertion_right_value, unquote(message))
+              }
+            } else {
+              if operator_name == "<=" {
+                quote {
+                  zest_assertion_left_value = unquote(left_expression)
+                  zest_assertion_right_value = unquote(right_expression)
+                  Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value <= zest_assertion_right_value, unquote(message))
+                }
+              } else {
+                quote {
+                  zest_assertion_left_value = unquote(left_expression)
+                  zest_assertion_right_value = unquote(right_expression)
+                  Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value >= zest_assertion_right_value, unquote(message))
+                }
+              }
+            }
+          }
+        }
+      }
+    } else {
+      code = source_text(expression)
+
+      quote {
+        zest_assertion_value = unquote(expression)
+        Zest.Assertion.truthy_result("reject", unquote(code), Kernel.to_string(zest_assertion_value), zest_assertion_value, unquote(message))
+      }
+    }
+  }
+
+  macro comparison_operator?(operator_name :: Expr) -> Expr {
+    if operator_name == "==" {
+      true
+    } else {
+      if operator_name == "!=" {
+        true
+      } else {
+        if operator_name == "<" {
+          true
+        } else {
+          if operator_name == ">" {
+            true
+          } else {
+            if operator_name == "<=" {
+              true
+            } else {
+              operator_name == ">="
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @doc = """
+    Declares setup code that runs before each case in a `test` group.
+
+    The return value can be bound by cases that declare a context
+    variable with `case("label", ctx) { ... }`.
     """
 
   pub macro setup(body :: Expr) -> Expr {
@@ -295,16 +614,10 @@ pub struct Zest.Case {
   }
 
   @doc = """
-    Declares teardown code that runs after each test.
+    Declares teardown code that runs after each case in a `test` group.
 
-    Place inside a `describe` block. Runs after every test body,
-    even if assertions fail (non-fatal assertions).
-
-    ## Examples
-
-        teardown() {
-          disconnect_db()
-        }
+    Assertions are non-fatal, so teardown still runs after assertion
+    failures in the case body.
     """
 
   pub macro teardown(body :: Expr) -> Expr {

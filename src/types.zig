@@ -4600,7 +4600,11 @@ pub const TypeChecker = struct {
 
             .block => |blk| {
                 const prev_scope = self.current_scope;
-                if (self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(blk.meta.span))) |block_scope| {
+                const resolved_block_scope: ?scope_mod.ScopeId = if (blk.meta.scope_id != 0)
+                    blk.meta.scope_id
+                else
+                    self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(blk.meta.span));
+                if (resolved_block_scope) |block_scope| {
                     self.current_scope = block_scope;
                 }
                 defer self.current_scope = prev_scope;
@@ -6052,6 +6056,79 @@ test "borrow state returns to available when borrow ends" {
 
 const Parser = @import("parser.zig").Parser;
 const Collector = @import("collector.zig").Collector;
+const MacroEngine = @import("macro.zig").MacroEngine;
+
+test "macro-generated block scopes are attached to block metadata" {
+    const source =
+        \\pub struct TestDsl {
+        \\  pub macro make_test(name :: Expr, body :: Expr) -> Expr {
+        \\    function_name = intern_atom("generated_" <> name)
+        \\    quote {
+        \\      pub fn unquote(function_name)() -> i64 {
+        \\        unquote(body)
+        \\      }
+        \\    }
+        \\  }
+        \\
+        \\  pub macro capture(expr :: Expr) -> Expr {
+        \\    quote {
+        \\      value = unquote(expr)
+        \\      value
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\pub struct First {
+        \\  import TestDsl
+        \\
+        \\  make_test("one") {
+        \\    capture(helper())
+        \\  }
+        \\
+        \\  fn helper() -> i64 {
+        \\    1
+        \\  }
+        \\}
+        \\
+        \\pub struct Second {
+        \\  import TestDsl
+        \\
+        \\  make_test("two") {
+        \\    capture(2)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var macro_engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer macro_engine.deinit();
+    const expanded = try macro_engine.expandProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), macro_engine.errors.items.len);
+
+    var expanded_collector = Collector.init(alloc, parser.interner, null);
+    defer expanded_collector.deinit();
+    try expanded_collector.collectProgram(&expanded);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &expanded_collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&expanded);
+
+    for (checker.errors.items) |err| {
+        std.debug.print("Unexpected type error: {s}\n", .{err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
 
 test "type check simple function" {
     const source =

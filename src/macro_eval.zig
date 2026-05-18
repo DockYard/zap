@@ -650,6 +650,9 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             if (std.mem.eql(u8, form_name, "atom_name")) {
                 return atomNameIntrinsic(env, arg_elems);
             }
+            if (std.mem.eql(u8, form_name, "source_text")) {
+                return sourceTextIntrinsic(env, arg_elems);
+            }
 
             // make_call(form_name_string, args_list) — build a
             // 3-tuple AST node `{atom(form_name), [], args}`. The form
@@ -1967,6 +1970,56 @@ fn atomNameIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
     const buf = env.alloc.alloc(u8, name.len) catch return .nil;
     @memcpy(buf, name);
     return CtValue{ .string = buf };
+}
+
+/// `source_text(expr)`: return the exact source slice for an AST node.
+/// Missing spans, generated nodes, or unavailable source content return
+/// the empty string so macros can fall back without failing expansion.
+fn sourceTextIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return CtValue{ .string = "" };
+    if (!hasReflectionCapability(env)) {
+        env.last_capability_error = std.fmt.allocPrint(
+            env.alloc,
+            "macro `{s}` reached `source_text` without the inferred reflect_source capability — capability inference is out of sync with the call graph",
+            .{env.current_macro_name orelse "<top-level>"},
+        ) catch return MacroEvalError.EvalFailed;
+        return MacroEvalError.EvalFailed;
+    }
+
+    const value = try eval(env, args[0]);
+    const ctx = env.struct_ctx orelse return CtValue{ .string = "" };
+    const meta = ctValueNodeMeta(value) orelse return CtValue{ .string = "" };
+    const text = sourceSlice(meta, ctx.graph) orelse "";
+    const buf = env.alloc.alloc(u8, text.len) catch return MacroEvalError.OutOfMemory;
+    @memcpy(buf, text);
+    return CtValue{ .string = buf };
+}
+
+fn ctValueNodeMeta(value: CtValue) ?ast.NodeMeta {
+    if (value != .tuple or value.tuple.elems.len != 3) return null;
+    const meta_value = value.tuple.elems[1];
+    if (meta_value != .list) return null;
+
+    var span = ast.SourceSpan{ .start = 0, .end = 0 };
+    for (meta_value.list.elems) |pair| {
+        if (pair != .tuple or pair.tuple.elems.len != 2) continue;
+        if (pair.tuple.elems[0] != .atom or pair.tuple.elems[1] != .int) continue;
+        const key = pair.tuple.elems[0].atom;
+        const value_int = pair.tuple.elems[1].int;
+        if (std.mem.eql(u8, key, "start")) {
+            span.start = @intCast(value_int);
+        } else if (std.mem.eql(u8, key, "end")) {
+            span.end = @intCast(value_int);
+        } else if (std.mem.eql(u8, key, "line")) {
+            span.line = @intCast(value_int);
+        } else if (std.mem.eql(u8, key, "col")) {
+            span.col = @intCast(value_int);
+        } else if (std.mem.eql(u8, key, "source_id")) {
+            span.source_id = @intCast(value_int);
+        }
+    }
+
+    return ast.NodeMeta{ .span = span };
 }
 
 /// `slugify(string_value)`: convert a string to a snake-

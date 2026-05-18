@@ -511,12 +511,12 @@ Use `Zest.Case` for the test DSL and assertions:
 pub struct MathTest {
   use Zest.Case
 
-  describe("addition") {
-    test("adds two integers") {
+  test("addition") {
+    case("adds two integers") {
       assert(1 + 1 == 2)
     }
 
-    test("rejects false conditions") {
+    case("rejects false conditions") {
       reject(1 + 1 == 3)
     }
   }
