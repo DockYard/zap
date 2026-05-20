@@ -1,0 +1,865 @@
+# Research Brief: A First-Class, Production-Grade Error System for the Zap Programming Language
+
+**Audience:** A deep-research agent or new contributor with **zero prior context** on Zap, its
+compiler, or its Zig fork.
+**Goal:** Drive design and implementation of a production-grade error system covering compilation
+errors, runtime errors, stack traces, and memory leaks — with comprehensive, descriptive, useful
+messages and consistent tooling.
+
+This revision incorporates two completed deep-research passes; the architectural decisions in
+Part VII are now defended with primary sources rather than presented as open questions.
+
+---
+
+## 0. How to use this document
+
+Read Part I to understand the language and toolchain from nothing. Part II states the problem and
+what "production-grade" means here. Part III is the evidence-based current state (with `file:line`
+pointers). Part IV is the unifying thesis. Part V sketches the design per domain. Part VI lists
+the project invariants **and** cross-cutting non-negotiables any solution must respect. Part VII
+gives the defended position on each major design fork with primary-source citations. Part VIII is
+the phased roadmap (with an explicit "highest-leverage first step"). Part IX lists what still
+needs validation. Part X is the bibliography. Appendices A–B are the file map and glossary.
+
+The four problem domains in scope:
+
+1. **Runtime errors** (raising/handling, exception values, recoverable vs. unrecoverable).
+2. **Compilation errors** (diagnostics quality, recovery, structured output, explainability).
+3. **Stack traces** (debug info, runtime backtrace capture, symbolication, crash reports).
+4. **Memory leaks** (attribution, reporting, ARC reference cycles, test-time enforcement).
+
+---
+
+# PART I — BACKGROUND (assume zero context)
+
+## 1. What Zap is
+
+Zap is an **early-stage, statically typed, natively compiled, functional programming language**,
+heavily influenced by **Elixir/Erlang** in surface syntax and semantics, but with native compilation,
+a static type system, and explicit resource semantics rather than a BEAM VM.
+
+Salient properties:
+
+- **Native binaries. No VM, no interpreter, no bytecode.**
+- **Struct-centered.** Code is organized around `pub struct`/`pub union`/`pub protocol`. A struct is
+  the unit of code organization; there is no separate namespace/module construct.
+- **Pattern-matched, multi-clause functions** with typed overload resolution and guards:
+  ```zap
+  pub fn factorial(0 :: i64) -> i64 { 1 }
+  pub fn factorial(n :: i64) -> i64 { n * factorial(n - 1) }
+  ```
+- **Static type system**: signed/unsigned ints (`i8..i128`, `u8..u128`), floats (`f16..f128`),
+  `Bool`, `String`, `Atom`, `Nil`, a bottom type `Never`, tuples, lists, maps, ranges, structs,
+  unions. Explicit types at boundaries; exact-first numeric overload resolution.
+- **Protocols + impls** for compile-time dispatch (`Enumerable`, `Stringable`, `Comparator`, …).
+- **Macros are Zap code** that return quoted Zap AST. Core control flow (`if`, `unless`, `and`, `or`,
+  `|>`, sigils) is *implemented as macros in `lib/kernel.zap`*, not hardcoded in the compiler.
+- **Build manifest is Zap code** (`build.zap`) evaluated at compile time.
+- **Test framework (Zest)** with compile-time test discovery; doc generation from `@doc`.
+- **Algebraic effects system** (see §4) — Zap already has a working effects implementation.
+
+Elixir-inherited error idioms currently present *by convention only*:
+
+- `{:ok, value}` / `{:error, reason}` tuples returned from fallible functions.
+- A pipe `|>` and a **catch-basin operator `~>`** that handles an unmatched piped value and skips
+  remaining pipe steps:
+  ```zap
+  input |> parse_number() |> format_number() ~> { _ -> "unrecognized" }
+  ```
+
+There is **no** exception type, **no** `try`/`rescue`/`after`, **no** `Result` type, **no** error
+propagation operator, and **no** typed error sets today. `raise/1` exists but is a hard process
+abort (Part III).
+
+## 2. The compilation pipeline
+
+Source → native binary, in order:
+
+1. Parse source files (`src/parser.zig`, `src/lexer.zig`, `src/ast.zig`).
+2. Collect declarations into a **source graph** and **scope graph**.
+3. Stage and expand **macros**.
+4. Desugar high-level syntax.
+5. **Type-check**, resolve overloads/protocols/generics.
+6. Lower to **HIR**.
+7. **Monomorphize** generic functions.
+8. Lower to **IR**.
+9. Analysis passes: escape, lambda-set, **Perceus** reuse, ARC ownership/liveness.
+10. Emit per-struct **ZIR** through the Zig-fork **C-ABI** (`src/zir_backend.zig`,
+    `src/zir_builder.zig`).
+11. The Zig fork runs **Sema** + LLVM to produce the native artifact.
+
+`src/diagnostics.zig` is the cross-cutting compiler diagnostic engine. `src/runtime.zig` is the
+embedded Zap runtime (intrinsics reachable from Zap as `:zig.Struct.fn(...)`), including the
+panic / `raise` paths and ARC machinery.
+
+**Hard rule (project policy):** Zap *only* lowers to ZIR via `src/zir_builder.zig` → fork C-ABI.
+`src/codegen.zig` is **legacy dead code**; there is no text-codegen backend. If a feature cannot be
+expressed through ZIR, the correct fix is to add a C-ABI function to the fork — never to text-generate.
+
+## 3. The Zig fork
+
+Zap does **not** target standard Zig. It links against a **maintained fork of the Zig compiler** (the
+0.16 line), kept at `~/projects/zig`. The fork exposes Zig's normally-internal **ZIR** (Zig
+Intermediate Representation) as a stable **C-ABI library** (`libzap_compiler.a`), defined in
+`~/projects/zig/src/zir_api.zig`.
+
+- Zap calls ~176 exported `zir_*` builder functions to construct ZIR directly (no Zig source text),
+  then calls a compilation/update entry that runs Sema + codegen + LLVM.
+- The fork therefore *is* the backend: it owns Sema, error bundles, DWARF/debug-info emission, LLVM,
+  linking, and the `std.debug` machinery (stack walking, DWARF symbolization).
+- **We are explicitly permitted and expected to modify the fork** when a primitive is genuinely
+  needed there. The same code-quality bar applies to the fork as to Zap.
+
+Critically for this brief: **the fork already has the hard parts of debug info and stack walking**.
+It exports `zir_builder_emit_dbg_stmt` (at `~/projects/zig/src/zir_api.zig:3115`). Zap's
+`src/zir_builder.zig` **does not currently call it** — see Part III §3.
+
+## 4. The effects system (pivotal context)
+
+Zap has a working **hybrid algebraic-effects system**:
+
+- ≈90% of effect usage is resolved by **static monomorphization** (zero-cost specialization).
+- ≈10% falls back to **defunctionalized CPS** (continuation-passing) for dynamic cases.
+- v1 constraints: effects are **opt-in**; **no multi-shot resumptions**; **lexical handler scope**;
+  **nominal effect declarations**; static resolution prioritized.
+- Effect sets are carried on `Type.FunctionType` only; a `null` effect set means **effect-polymorphic**.
+
+The **no-multi-shot-resumption** constraint is the precise precondition that makes
+*one-shot abortive* effects (i.e. exceptions) compilable directly to error-unions instead of CPS —
+Leijen's "selective CPS" theorem (POPL 2017). This is the formal justification for the unwinding
+choice in Part VII.
+
+## 5. Memory model
+
+- **Atomic Reference Counting (ARC)** is the default. **No tracing GC.**
+- ARC retain/release is compiler-driven via **Perceus**-style precise reference counting with reuse
+  (Reinking, Xie, de Moura, Leijen, PLDI 2021).
+- The memory manager is a **first-class, build-time-selected type** chosen in the manifest
+  (`Zap.Manifest.memory :: Type`, default `Memory.ARC`). Built-in managers: `Memory.ARC`,
+  `Memory.Arena`, `Memory.NoOp`, `Memory.Leak`, `Memory.Tracking`; third parties can implement the
+  zero-method `Memory.Manager` marker. Exactly one manager per binary.
+- **Pure Perceus is garbage-free only for cycle-free programs** (PLDI 2021 §1). Zap has no cycle
+  collector and no `weak`/`unowned` references today.
+
+---
+
+# PART II — THE PROBLEM
+
+We want a **first-class, production-grade error system** for Zap with **comprehensive, descriptive,
+useful messages**, spanning runtime errors, compilation errors, stack traces, and memory leaks.
+
+"Production-grade" concretely means, at minimum:
+
+- **Correct and principled** — no workarounds; integrated with the type system and effects system,
+  not bolted on. (Project policy forbids hacks; the *correct* fix is required regardless of cost.)
+- **Comprehensive** — full lifecycle: a wrong program is caught at compile time with a great message;
+  a failing program at runtime produces a precise, sourced, actionable report; a leaking program is
+  told exactly what leaked and where.
+- **Descriptive & useful** — messages name the thing, show the source with context, explain *why*,
+  and suggest a fix. The bar is Rust/Elm-class diagnostics and Elixir-class runtime reports.
+- **Consistent** — one visual/text language and one structured-output schema across all four domains
+  so it *feels* like one system, and so tooling (LSP, CI, debugger, profiler) consumes one format.
+- **Toolable** — structured (JSON) output; debugger/profiler interop; test-time enforcement.
+
+Out of scope to *decide* here (but in scope to *inform*): the eventual process/concurrency model.
+Zap is Elixir-influenced and will likely gain processes/supervision; the error system should be
+designed so "let it crash" + per-process crash reports are a natural later addition, not a redesign.
+
+A useful operational rule (consistent with Rust/Zig/Go/Erlang patterns):
+
+> If callers are expected to branch on the failure, use a typed error value.
+> If the program has violated an invariant, panic (abandonment).
+> If the failure should be isolated and restarted, let a supervisor/task boundary handle it.
+
+---
+
+# PART III — CURRENT STATE (evidence)
+
+### 1. Runtime errors — minimal, non-recoverable
+
+- `lib/kernel.zap:357` — `pub fn raise(message :: String) -> Never { :zig.Kernel.raise(message) }`.
+- `src/runtime.zig:7041` — `pub fn raise(message: []const u8) noreturn` writes
+  `** (RuntimeError) <message>\n` to stderr and calls `std.process.exit(1)`.
+- `src/runtime.zig:6804` — `pub fn panic(message)` is the same with `** (NilError) `.
+- Consequence: **no exception value, no exception type/struct, no metadata, no source location, no
+  stack trace, and no way to catch or recover.** `raise` returns `Never` (the bottom type).
+- Recoverable errors are an **ad-hoc convention**: bare `{:ok,_}` / `{:error,_}` tuples + the `~>`
+  catch-basin operator. There is no `Result` type, no `try`/`rescue`/`after`, no `with`, no
+  `?`-style propagation, no typed error sets.
+- The `~>` operator is real and lowered: HIR `buildErrorPipe` flattens the pipe chain; IR
+  `lowerErrorPipeChain` emits nested `UnionSwitch`; `try_call_named` calls a `__try` function
+  variant returning an error union; `match_error_return` emits an *error return* instead of a panic
+  so a pattern-match failure in a `__try` propagates as `error.NoMatchingClause` (catchable) rather
+  than aborting; `Call.Flags` **bit 4 `pop_error_return_trace`** must be set on error-returning
+  calls or Sema mishandles the error-return-trace stack.
+- **Landmine:** the IR assumes Result-like Ok/Error with *empty field bindings* — payload-sensitive
+  handler semantics are not represented yet. (Mitigation: see Part V — `TryProject` IR node.)
+
+### 2. Compilation errors — strong renderer, systemic gaps
+
+`src/diagnostics.zig` (`DiagnosticEngine`) is already high quality at *rendering*:
+
+- `Severity` = `{error, warning, note, help}`.
+- `Diagnostic` carries `severity, message, span, notes[], label, secondary_spans[], help, suggestion,
+  code`. `Suggestion` includes a machine-applicable `replacement` + `description`.
+- Caret (`^^^`) primary + tilde (`~~~`) secondary underlines, box-drawing gutter (`│`, `└─`), one
+  line of context above, color with `NO_COLOR`, `max_errors` cap with overflow message,
+  `line_offset` correction, multi-source via `span.source_id`. Tested in-file.
+- Specialized constructors: `typeError`, `undefinedVariable`, `undefinedFunction`,
+  `ambiguousOverload`, `nonExhaustiveMatch`, `unreachableClause`. Parser produces conversational
+  "I was expecting…" messages with `label`/`help`. `TypeProvenance` (type_id + source span) exists
+  in `src/scope.zig`. Fuzzy "did you mean?" is fed by `collectVisibleBindingNames` +
+  `src/similarity.zig`.
+
+Systemic gaps (not cosmetic):
+
+- **Parser bails on the first error.** No error-tolerant AST / poisoned sentinel nodes;
+  `synchronize()` exists but is **unwired**. You get one diagnostic per compile.
+- **Internal compiler failures escape unstructured.** Compiler/linker OOM surfaces as
+  `zir_api: update failed: OutOfMemory` with **zero error-bundle diagnostics**. There is no
+  "internal compiler error / please report" diagnostic class.
+- **No stable error-code catalog**, no `zap explain Zxxxx`, no minimal-repro+fix registry.
+- **No structured (JSON) diagnostic output** for LSP/CI/`zap fix`.
+- **No macro-expansion backtrace** in diagnostics; spans don't carry expansion provenance.
+- `TypeProvenance` exists but is not systematically used to show both sides of a type mismatch.
+- Diagnostic ordering is insertion order from possibly-parallel passes (mutex-appended); not a stable
+  deterministic sort.
+
+### 3. Stack traces — effectively absent
+
+- The fork **exports `zir_builder_emit_dbg_stmt`** (`~/projects/zig/src/zir_api.zig:3115`) and owns
+  full DWARF emission + `std.debug` stack walking/symbolization (it is the Zig compiler).
+- **Zap's `src/zir_builder.zig` never calls `zir_builder_emit_dbg_stmt`** (verified: no `dbg_stmt`
+  emission site). Therefore Zap binaries carry **no source-location debug info mapped to Zap
+  source**.
+- No runtime backtrace capture, no symbolizer mapping mangled Zig symbols → Zap symbols, no wired
+  error-return traces (only the `pop_error_return_trace` Call flag hook exists), no formatted crash
+  report.
+- Optimize modes: `Debug / ReleaseSafe / ReleaseFast / ReleaseSmall`. Debug-info strip differs by
+  build path (`root_strip` is `false` on one path, `true` on another in the fork) — needs a
+  deliberate per-mode policy.
+- Net: every crash today is a single unsourced line (`** (RuntimeError) <msg>`), with no Zap
+  file:line even though the underlying toolchain is fully capable of DWARF.
+
+### 4. Memory leaks — primitive
+
+- `lib/memory/{leak,tracking}.zap` are zero-method `Memory.Manager` conformance markers; the real
+  logic is the Zig backends `src/memory/{leak,tracking}/manager.zig`.
+- `Memory.Tracking` detects three classes and prints raw stderr lines:
+  - leaks: `LEAK: ptr=0x..., size=N, alignment=A`
+  - invalid frees: `INVALID FREE: ptr=0x... not allocated by this manager`
+  - UAF/OOB: 16-byte `0xCC` canaries → `USE-AFTER-FREE or OOB: canary corrupted at ptr=0x...`
+- **No allocation site, no Zap type name, no backtrace, no diagnostic-engine rendering, no summary,
+  no deterministic ordering, no CI fail mode integration.**
+- ARC is default and **silently leaks reference cycles** — no detector, no `weak`/`unowned`. This
+  is a *correctness* gap, not just a tooling gap.
+- Two known live issues this tooling would directly illuminate: (a) an **intentional** leak —
+  `FieldStorage.indirect` heap slots are allocated but not released on struct drop (deliberately
+  preferred over a use-after-free, pending full ARC integration with indirect storage); (b) an
+  **open defect** — the full ~86-module `zap test` binary deterministically SIGTRAPs at startup in
+  libc malloc due to a fixed-capacity static registration table whose compiler-emitted bounds check
+  covers only the first sub-table while the store writes into a second merged-globals region,
+  corrupting libc freelist metadata.
+
+---
+
+# PART IV — ANALYSIS & UNIFYING THESIS
+
+A first-class system is **one model with four surfaces and one renderer**, not four bolt-ons:
+
+1. **Type surface: effect-typed; codegen: error-unions.** Recoverable errors appear in signatures as
+   an *error effect row* layered on Zap's existing effects system, **and are lowered to Zig-style
+   tagged error unions with an attached error-return trace (ERT)**. This is *not* "errors as full
+   algebraic-effect handlers" — there is no continuation reify, no CPS for the exception effect.
+   The formal justification is Leijen's selective-CPS theorem (POPL 2017): one-shot abortive
+   handlers admit direct lowering. Zap's v1 effects constraint (no multi-shot resumptions) is the
+   precise precondition that keeps this sound. Practical benefits: zero happy-path cost (Kelley's
+   "secret first-parameter pointer in a register" — Zig ERT), effect-polymorphism for generic
+   combinators (`Enum.map` propagates a callback's error effect for free without monomorphization),
+   exhaustiveness checking, statically flagged unhandled errors. The existing
+   `~>`/`match_error_return`/`try_call_named`/`pop_error_return_trace` infrastructure is already
+   ~60% of this mechanism.
+
+2. **Recoverable vs. unrecoverable is explicit and separate** (Midori's two-pronged model — Duffy
+   2016 — and Rust's `Result`/`panic!` split): `Result(t,e)` + `?`-propagation + `with` for the 99%
+   value path; `raise` + exception structs for *defects* with a rich formatted crash report.
+   Bugs are not recoverable errors. Bridges are type-checked (`Foo` vs `Foo!` convention).
+
+3. **One backtrace subsystem** in the fork's C-ABI, reusing the fork's mature DWARF/`std.debug`
+   symbolizer — consumed by panics, error-return traces, **leak attribution**, and later
+   process-crash/profiler integration. Stack traces are *foundational infrastructure*; leak
+   attribution is a consumer of it. Build it first.
+
+4. **One canonical Error IR + one renderer.** A single schema — `domain, code, severity,
+   message_template, primary_span, related_spans, notes, help, fixits, cause_chain, trace_policy,
+   machine_data, visibility` — feeds the CLI renderer, JSON output, and (later) LSP. Compile
+   errors, runtime panics, ERT traces, and leak reports all use it. Consistency *is* the
+   production-grade feeling and the tooling-integration story. The schema is a projection of the
+   LSP `Diagnostic` shape plus rustc-style `code`/`explain`/`MachineApplicable` fields, not a
+   parallel invention.
+
+5. **Everything in Zap that can be.** Per project policy: exception structs, the `Error` protocol,
+   stdlib exception types, `try`/`rescue`/`with` macros, `Result`, report *formatting*, Zest leak
+   assertions → `lib/*.zap`. Only genuine primitives → fork/runtime: `dbg_stmt` wiring,
+   `zap_capture_backtrace`/`zap_symbolize` C-ABI, error-union/ERT ZIR lowering, a reversible
+   name-mangling side-table, and an allocation-site hook in the memory ABI.
+
+---
+
+# PART V — DESIGN PER DOMAIN
+
+### Runtime errors
+
+- **`pub error` declaration form** — the canonical way to declare an exception type.
+  **Front-end-only desugar** (`src/desugar.zig`) to `pub struct X + pub impl Error for X`. After
+  HIR, the rest of the pipeline sees a normal struct and a normal protocol impl; no downstream
+  stage knows about errors specifically. Project policy satisfied: surface sugar over existing
+  machinery, the same mechanism class as `use Struct` or `quote { … }`.
+
+  ```zap
+  @code Z3041
+
+  pub error ParseError {
+    message :: String = "parse error"
+    line :: u32
+    column :: u32
+  }
+  ```
+
+- **Auto-injected fields** (synthesized into the desugared struct only if the user did not declare
+  them — user declarations always win):
+  - `message :: String = "<TypeName>"` — every error has a presentable message; default is the
+    type's display name.
+  - `cause :: ?Error = nil` — the source/causal chain (Rust `Error::source` analog). Delivers
+    non-negotiable #1 uniformly without per-type discipline.
+
+- **Field defaults are a general `pub struct` feature** introduced alongside `pub error`:
+  `field :: Type = expr`. The default is evaluated at construction time when the field is omitted
+  in a struct literal. `pub error` uses this same mechanism — no error-specific machinery.
+
+- **Auto-generated `Error` impl** for every `pub error`:
+  - `message/1` returns `self.message`
+  - `kind/1` returns the snake-cased type name as an atom (e.g. `:parse_error`)
+  - `source/1` returns `self.cause`
+  - `code/1` returns the value of the optional `@code` attribute, else `nil`
+
+  **Inline methods inside the `pub error` body override the auto-generated default.** This is the
+  escape hatch for computed messages and custom protocol behavior — e.g. a `KeyError` whose
+  `message/1` is computed from `key`/`map` fields rather than carried as a string.
+
+- **Visibility is the `pub` keyword.** `pub error X` = matchable API surface (part of the API
+  contract; callers may `rescue` on the type). Bare `error X` = renderable-only/private (used for
+  internal-compiler errors and library internals; the renderer can print its message but callers
+  cannot pattern-match on it). Delivers non-negotiable #10 with no new mechanism — same `pub`
+  convention as the rest of Zap.
+
+- **`@code Zxxxx` attribute** — stable numeric code for diagnostic identity. Optional in the
+  declaration; CI-linted as required on any `pub error` reaching a `pub` API surface. Codes are
+  public API; never reuse a retired code.
+
+- **`raise "string"` shorthand** — sugar for `raise %RuntimeError{message: "string"}`. Kept for
+  ergonomic scripting and test code; CI-linted on `pub` API surfaces to push production code
+  toward named errors. `RuntimeError` is itself defined as `pub error RuntimeError {}` in stdlib —
+  the auto-injected `message` field and default carry the shorthand's payload.
+
+- **Polymorphic `raise`**: `raise %SomeError{…}` raises a struct value implementing `Error`;
+  `raise "string"` invokes the shorthand. Captures a backtrace into the ERT side-channel (not the
+  struct value), preserving zero-cost happy path for `Result`-returned errors.
+
+- **Stdlib `pub error` types**: `RuntimeError`, `ArgumentError`, `ArithmeticError`, `KeyError`,
+  `MatchError`, `IndexError`, `OutOfMemoryError`, `AssertionError`. All in `lib/`.
+
+- **Parametric errors**: `pub error DeserializeError(T) { … }` — same parametric syntax as
+  `pub struct`.
+
+- **`try { } rescue { pat -> … } after { }`** as typed, exhaustiveness-checked effect handlers.
+  `after` is finally-semantics and must be ARC-correct on the unwinding path — it interacts with
+  drop insertion and the restricted retain/release emission sites.
+
+- **`errdefer`** (Zig's error-only cleanup) as a distinct construct — `defer` runs always, `errdefer`
+  runs only on error return. Both registered in the ARC retain/release allow-list with explicit tests.
+
+- **`Result(t,e)`** as the canonical recoverable type (`union { Ok(t), Error(e) }`). Bare tuple
+  sugar retained for Elixir familiarity, with a `tuple_to_result/1` stdlib shim for migration.
+
+- **`?`-propagation operator** (Rust/Swift/Zig style): early-returns the `Error` variant. Desugar:
+  `expr?` → `case expr { Ok(v) -> v; Error(e) -> return Error(e) }`. Critically, ERT recording is a
+  **guarded out-of-line call** so `tail-return foo()?` remains a tail call (Zig's choice — Kelley
+  2018).
+
+- **`with` macro** (Elixir-style multi-step Result composition) — sugar over chained `?`.
+
+- **Effect-row typing**: `fn parse(...) -> i64 raises ParseError` declares the row.
+  **Inferred-by-default, optional-but-checked when written.** A function whose body uses `?` or
+  `raise` infers the appropriate `raises` row. Stdlib leaf functions get explicit rows from day
+  one to anchor inference.
+
+- **The `TryProject(value, ok_var, err_var)` IR node** is the strictly-additive fix for the
+  payload-insensitive `~>` IR landmine. The existing `~>` becomes a degenerate case where both
+  bindings are `_`. Mirrors Rust RFC 3058's `ControlFlow` with distinct residual types.
+
+- **`raise` as defect / `Result` as recoverable.** Unrescued `raise` → formatted crash report +
+  nonzero exit now, → per-process termination once a process model lands (same renderer either way).
+  Bugs are not recoverable errors (Midori).
+
+### Compilation errors
+
+Generalize `DiagnosticEngine` into the shared report core (Part IV §4). Add:
+
+- **Error-tolerant parsing + poisoned `Error` AST node** so type-checking continues and *all* errors
+  surface per compile (highest-leverage compile investment; required for a good LSP).
+- **Stable code catalog + `zap explain Zxxxx`** with minimal-repro + fix. **Numeric codes are public
+  API from day one — never reuse a retired code.**
+- **ICE diagnostic class** (failing pass + "compiler bug, please report" with stable internal
+  code) — nothing internal ever escapes unstructured.
+- **Two-sided type errors** via `TypeProvenance` + `secondary_spans` ("expected i64 from here ↓,
+  got String from this literal ↑").
+- **`--error-format=json`** with a stable schema (LSP-projectable; Part IV §4).
+- Deterministic sort/dedup ordering.
+- **Macro-expansion backtraces** (spans gain `expanded_from: ?*SourceSpan`).
+- **Error-effect diagnostic class** ("unhandled `ParseError` — add `rescue` or declare `raises`")
+  with `MachineApplicable` suggestion that LSP can project as a code action.
+- **Suggestion applicability tags**: `MachineApplicable | MaybeIncorrect | HasPlaceholders |
+  Unspecified` (rustc).
+
+### Stack traces
+
+- **Phase 0 (foundational): wire `zir_builder_emit_dbg_stmt`/`dbg_var`** at statement boundaries
+  carrying the Zap `SourceSpan`, plus a reversible mangled-name ↔ Zap-symbol side-table section.
+  This yields **real DWARF keyed to Zap source for free** — lldb/gdb/perf/samply/the fork's panic
+  handler immediately show Zap file:line.
+- **Per-mode debug-info policy table:** keep `root_strip=false` for Debug/ReleaseSafe; allow strip
+  for ReleaseFast/ReleaseSmall with an `-Ddebug-info` override. Keep frame pointers in ReleaseSafe
+  (unlocks all sampling profilers; ~1-3% perf cost). Ship split-debug
+  (`.dwo`/`.dSYM`/`debuginfod`-keyed by build ID) for stripped releases.
+- **Backtrace C-ABI in the fork**: `zap_capture_backtrace(buf, max) -> n`,
+  `zap_symbolize(addr) -> {name, file, line}`. Reuse the fork's `std.debug` DWARF reader; do not
+  reinvent.
+- **Error-return traces** for the value-error path: reuse the fork's machinery; flip
+  `pop_error_return_trace` on the relevant calls. Zig's signature feature — nearly free here.
+- **Crash-report renderer** shares the diagnostic visual language (exception + caret'd Zap source
+  line at the raise site + symbolized Zap backtrace + error-return trace), honors a
+  `ZAP_BACKTRACE=full|short|0` convention and `NO_COLOR`/TTY.
+- **`zap-addr2line` tool**: a thin CLI reusing the fork's DWARF reader for cross-compilation
+  post-mortem from stripped releases + a build-ID-keyed symbol service.
+
+### Memory leaks
+
+- **`Memory.Tracking` records a captured backtrace + Zap type + size + refcount per allocation.**
+  At `deinit`, survivors are reported **through the shared renderer**:
+  > Leaked 1 `%User{}` (48 B), allocated at lib/app.zap:88, refcount 2
+  with a deterministic summary table and `--leaks-fatal` for CI.
+- **`@expect_leak` test attribute** — handles the intentional `FieldStorage.indirect` leak: Zest
+  reads the attribute and subtracts those allocations from the live set before asserting empty.
+- **Zest leak assertions** (`assert_no_leaks`, `assert_no_cycles`) make "no leaks in this block" a
+  first-class test primitive.
+- **ARC cycle detector — Bacon–Rajan trial-deletion (ECOOP 2001).** Synchronous "purple" candidate
+  buffer: when a decrement leaves a *positive* count, the object is added to the buffer; later the
+  buffer is drained via local SCC search. Zero cost on the common Perceus path (decrement → 0).
+  Default-on in `Memory.Tracking`; default-off in `Memory.ARC` behind `--enable-cycle-check`.
+- **`weak`/`unowned` field annotations** (Swift model) as the production cycle fix — Phase 5.
+  Natural alongside Zap's existing `shared`/`unique`/`borrowed` ownership syntax. Deferred because
+  it changes the static type of stored references and would invalidate today's IR.
+- Existing canary UAF/double-free reports upgrade to the same attributed, symbolized, rendered
+  format — directly tooling the open SIGTRAP defect.
+
+---
+
+# PART VI — CONSTRAINTS, INVARIANTS, AND CROSS-CUTTING NON-NEGOTIABLES
+
+## VI.A — Project invariants (any proposal must respect)
+
+1. **Zap-first.** Behavior belongs in `lib/*.zap`. The compiler must stay general-purpose — no
+   hardcoded Zap struct/function names in Zig. Only true primitives go in `src/*.zig` or the fork.
+2. **No workarounds/hacks.** The correct, long-term fix is required regardless of cost or scope,
+   including deep changes to the fork or core data structures.
+3. **ZIR-only codegen.** The single codegen path is `src/zir_builder.zig` → fork C-ABI. No text
+   codegen. Missing capabilities → add a C-ABI function to the fork.
+4. **Fork changes are allowed** and held to the same quality bar.
+5. **Effects-system v1 limits:** opt-in, no multi-shot resumptions, lexical handler scope, nominal
+   effect declarations, static resolution prioritized. Exceptions are one-shot abortive (compatible).
+6. **ARC, no GC.** Cycles are unreclaimed today. Any cycle solution must not impose unconditional
+   production cost without opt-in.
+7. **Performance:** happy path stays zero-cost; error-path cost is acceptable.
+8. **Determinism:** diagnostics and reports must be deterministically ordered (CI, golden tests).
+9. **Known landmines:** intentional `FieldStorage.indirect` leak; open startup SIGTRAP defect;
+   restricted ARC retain/release emission sites; payload-insensitive `~>` IR; `@debug`-annotated
+   functions are erased in release and must be `T -> T` pass-through.
+10. **`@doc` on every `pub` declaration** is mandatory for any new Zap stdlib surface.
+
+## VI.B — Cross-cutting non-negotiables (must be designed in from day one)
+
+These are decisions that, if deferred, will require painful retrofits later. Both research passes
+flag each independently.
+
+| # | Non-negotiable | Why now |
+|---|---|---|
+| 1 | **`cause :: ?Error` auto-injected into every `pub error`** | Rust `Error::source` precedent; the keyword guarantees uniform causal-chain support from day one without per-type discipline. Manual `impl Error for SomeStruct` (the escape hatch) must declare the field explicitly. |
+| 2 | **Stable numeric error codes from day one** | Codes are API surface (rustc precedent); never reuse a retired code. Force every diagnostic to declare a code so the catalog grows monotonically. |
+| 3 | **OOM under ARC = abandonment, not recoverable** | Infallible allocation by default in `Memory.ARC`; an explicit `try_alloc` builder for fallible code (CI runners, embedded). Aligns with Midori; both Roc and Koka punt on this and pay later. |
+| 4 | **Async-signal-safe crash printer** | Must be reachable from a SIGTRAP/SIGSEGV handler. **No `malloc`, only `write`/`_exit`** and other POSIX async-signal-safe calls. Reuse the fork's `std.debug` paths which are already signal-aware. Required to reach the known startup SIGTRAP defect from its signal handler. |
+| 5 | **Panic-in-`defer` / double-fault containment** | Second panic during unwind → immediate `abort` with a distinct exit code (e.g. `137 + double-fault marker`), no further user code. Rust precedent. |
+| 6 | **Three-tier contracts** — `assert` (always-on), `debug_assert` (debug-only), `precondition` (release-elided) | Eiffel/Ada/SPARK/Swift precedent. Avoids ambiguity about which assertions survive a release build. |
+| 7 | **Per-optimize-mode arithmetic overflow / bounds policy** | Trap in Debug/ReleaseSafe; wrap in ReleaseFast (Zig's model). Document explicitly that traps `raise %ArithmeticError`. |
+| 8 | **Tail-call + `?` interaction** | ERT recording is a guarded out-of-line call so `tail-return foo()?` stays a tail call. Kelley 2018. |
+| 9 | **Diagnostic security tiers** — developer-local / CI-internal / user-safe | Strip absolute paths in release reports; never include heap contents in the default report; emit ASLR-relative offsets when symbolication is unavailable. Sanitizer runtimes are **never** linked into production builds. |
+| 10 | **Public-vs-private error visibility via the `pub` keyword** | `pub error X` = matchable API surface; bare `error X` = renderable-only/private. Same `pub` convention as the rest of Zap — no new mechanism. Go wrapping precedent. |
+| 11 | **Deterministic diagnostic snapshots** | Golden-test the renderer (rustc UI-test pattern). All four surfaces — compile, runtime, ERT, leak — produce snapshot-stable output. |
+| 12 | **Restricted ARC retain/release emission sites are an enforced allow-list** | Every new lowering primitive (`?`, `rescue` handler entry, `errdefer`, `after`) registers in the allow-list or fails CI. |
+| 13 | **Split-debug + frame-pointer per-mode policy** | Debug/ReleaseSafe: full DWARF, FP on. ReleaseFast/Small: split-debug shipped separately, FP off optionally. Build-ID keyed symbol service for CI/crash analysis. |
+
+---
+
+# PART VII — DEFENDED DECISIONS
+
+### Decision 1 — Unwinding mechanism: **hybrid (effect-typed surface, error-union codegen)**
+
+**Defense.** Leijen's "selective CPS" theorem (POPL 2017, *Type Directed Compilation of Row-Typed
+Algebraic Effects*, §6) establishes that *one-shot abortive* effect handlers — i.e. exceptions —
+admit direct lowering to early-return / error-union instead of full continuation reify. Sivaramakrishnan
+et al. (PLDI 2021, *Retrofitting Effect Handlers onto OCaml*) measured 1% mean overhead for effect
+handlers in production OCaml, conditional on DWARF cooperation — feasible for Zap but unnecessary
+work for the *exception* effect specifically. Kelley's ERT design (2018) provides the codegen
+template the fork already implements ("secret first-parameter pointer kept in a register…
+practically free"). Duffy's Midori retrospective (2016) is the strongest industrial precedent for a
+*two-pronged* checked-recoverable + abandonment model.
+
+Why not pure algebraic-effects/CPS: Zap's effects-v1 forbids multi-shot resumption — building CPS
+plumbing for a use case that resolves to one-shot abortive is overkill, and Koka/OCaml 5 numbers
+are good but not better than error-unions plus ERT.
+
+Why not setjmp / DWARF-personality: setjmp pollutes every protected scope; DWARF unwinding
+requires async-signal-unsafe table walks and is the source of much C++ trouble. Midori chose
+checked exceptions only after substantial codegen work — work Zap would have to redo.
+
+### Decision 2 — Typed-error strictness: **inferred + optional-but-checked `raises`**
+
+**Defense.** Swift SE-0413 (Gregor et al., accepted Dec 2023, shipped Swift 6.0) explicitly retains
+untyped `throws` as the recommended default: "Errors are usually propagated or rendered, but not
+exhaustively handled, so even with the addition of typed throws to Swift, untyped throws is better
+for most scenarios" (proposal text). The closure type-inference component of SE-0413 was *removed*
+from Swift 6.0 because it could not ship — a direct caution against mandatory typed errors as v1.
+Koka uses inferred effect rows by default with optional explicit annotations; OCaml 5 is the same
+pattern. Elixir-classic untyped is incompatible with Zap's static-type charter.
+
+Inference-by-default is also the only path that permits effect-polymorphic generics without
+monomorphization blow-up: generics that don't annotate stay effect-polymorphic and do not
+monomorphize per error type. Cost is paid only by code that opts in.
+
+### Decision 3 — ARC cycles: **diagnostic detector now + `weak`/`unowned` later**
+
+**Defense.** Perceus (Reinking, Xie, de Moura, Leijen, PLDI 2021) is explicit that it is
+"garbage-free" only for *cycle-free* programs. Bacon & Rajan's synchronous trial-deletion algorithm
+(ECOOP 2001) is the canonical primary source for an on-by-default cycle *detector* (not collector)
+with zero cost on acyclic decrements. Lobster (van Oortmerssen, 2020) is the shipped precedent for
+using cycle detection as a *test/diagnostic* mechanism rather than a runtime collector. Koka itself
+uses exactly this option.
+
+Why not `weak`/`unowned` only: forces premature API churn before users know where cycles live.
+Why not an opt-in tracing backup collector: violates Zap's "no tracing GC" charter and reintroduces
+stop-the-world semantics Zap was built to avoid.
+
+### Decision 4 — Scope/sequencing: **approve and iterate phase-by-phase**
+
+The design surface (effect-typed errors, ERT plumbing, diagnostic-engine generalization, leak
+reports, cycle detector, three-tier contracts) is too large to land atomically without freezing the
+language. Phase boundaries also align with what can be *measured*: each phase has a concrete
+acceptance test (Part VIII).
+
+---
+
+# PART VIII — PHASED ROADMAP
+
+### Phase 0 — DWARF foundation *(direction settled)*
+
+- Wire `zir_builder_emit_dbg_stmt` + `dbg_var` at statement boundaries carrying Zap `SourceSpan`.
+- Reversible mangled-name ↔ Zap-symbol side-table section.
+- Per-mode debug-info policy table; FP-on in ReleaseSafe; split-debug for ReleaseFast/Small.
+- **Acceptance:** lldb/gdb/perf/samply show Zap file:line at every existing crash site. The fork's
+  panic handler prints Zap symbols.
+
+### Phase 1 *(highest-leverage first step)* — `Result(t,e)` + `?` + inferred `raises` + `TryProject` IR + `pub error`
+
+- **`pub error` declaration form** (front-end-only desugar to `pub struct + pub impl Error`) with
+  auto-injected `message :: String = "<TypeName>"` and `cause :: ?Error = nil` fields, optional
+  `@code Zxxxx` attribute, and inline method override.
+- **Field defaults** (`field :: Type = expr`) as a general `pub struct` feature, used uniformly by
+  `pub error`.
+- **`Error` protocol** with `message/1`, `kind/1`, `source/1`, `code/1` methods. Auto-implemented
+  for every `pub error`; manual `impl Error for SomeStruct` is the escape hatch.
+- **`raise "string"` shorthand** kept; desugars to `raise %RuntimeError{message: "string"}` via the
+  stdlib's `pub error RuntimeError {}`. CI lint flags string-`raise` on `pub` API surfaces.
+- Stdlib `Result(t,e) = union { Ok(t), Error(e) }`.
+- `?` operator desugar to `match` with early return (via the additive `TryProject(value, ok_var,
+  err_var)` IR node — strictly additive; the existing `~>` is a degenerate case).
+- `~>` rewritten as a macro over `match` on `Result` so the payload-insensitive IR landmine is
+  retired in place.
+- `raises` annotation parsed; inferred by default; checked when written. Stdlib leaf functions
+  annotate explicitly.
+- `tuple_to_result/1` migration shim for `{:ok,_}`/`{:error,_}` users; deprecation lint window.
+- Numeric error codes mandatory on every new diagnostic; `@code` attribute lints on `pub error`
+  reaching public surfaces.
+- Per-optimize-mode arithmetic overflow / bounds policy lands here (it produces typed errors).
+- **Acceptance:** every existing convention-based error path compiles; Zest produces diagnostics
+  for unhandled `Result`; `~>` is a thin macro; `TryProject` is wired and tested; `pub error`
+  desugar produces well-typed structs and protocol impls across the test corpus.
+
+### Phase 2 — Unrecoverable model + crash reports + three-tier contracts
+
+- Stdlib `pub error` types in `lib/`: `RuntimeError`, `ArgumentError`, `ArithmeticError`, `KeyError`,
+  `MatchError`, `IndexError`, `OutOfMemoryError`, `AssertionError`. Each gets a `@code Zxxxx` so the
+  catalog seeds with stable codes from day one.
+- `raise` accepts any value whose type implements `Error` (uniformly produced by `pub error`).
+  Captures a backtrace via the Phase-0 DWARF + a new `zap_capture_backtrace` C-ABI in the fork.
+- Crash printer: **async-signal-safe**, reuses fork's `std.debug.dumpStackTraceFromBase`, prints
+  exception + caret'd Zap source line at raise site + symbolized stack trace + ERT.
+- Panic-in-`defer` / double-fault: second panic → distinct exit code + immediate abort, no further
+  user code.
+- Three-tier contracts: `assert` (always-on), `debug_assert` (debug-only), `precondition`
+  (release-elided). Maps to `AssertionError` at trap sites where appropriate.
+- `defer` and `errdefer` lowering wired into the ARC retain/release allow-list with tests.
+- `ZAP_BACKTRACE=full|short|0` convention.
+- **Acceptance:** the known startup SIGTRAP defect produces a symbolicated report; a double-fault
+  is contained; release builds strip per the per-mode policy and `zap-addr2line` symbolizes from
+  the split-debug artifact.
+
+### Phase 3 — Effect-row surface, `rescue` as handler, `with` macro
+
+- Wire the `raises` row into the existing effects system as a *nominal* effect.
+- `rescue` is the effect handler that handles that effect abortively (exhaustiveness-checked
+  pattern matching on `Error` values).
+- `try { } rescue { } after { }` surface syntax.
+- `with` macro: sugar for sequencing `?`-bearing expressions (Elixir-style).
+- Migrate `~>` to a `rescue` macro (the Phase-1 `match` desugar is intermediate).
+- Effect inference handles higher-order combinators (`map`, `fold`, `pipe`) effect-polymorphically
+  without monomorphization blow-up.
+- Public-vs-private error visibility enforced via the `pub` keyword on `pub error` (already enforced
+  at Phase 1; here `rescue` patterns honor it — bare `error` types are rejected as `rescue` match
+  patterns at the type-check stage).
+- **Acceptance:** round-tripping Elixir-shaped pipelines is identical to today; effect-polymorphic
+  combinators compose without explicit annotation; mandatory-`raises` lint mode passes on `lib/*`.
+
+### Phase 4 — Unified diagnostic renderer + leak/cycle subsystem
+
+- Generalize `src/diagnostics.zig` into the canonical Error IR (Part IV §4) — one renderer for
+  compile errors, runtime panics, ERT, leak reports.
+- Single LSP-projectable JSON schema; single TTY/`NO_COLOR` policy; deterministic sort/dedup.
+- **Compile-error systemics now:** error-tolerant parsing + poisoned `Error` AST node;
+  multi-error per compile; ICE diagnostic class; `zap explain Zxxxx` long-form catalog;
+  macro-expansion backtraces; two-sided `TypeProvenance` rendering; suggestion applicability tags.
+- `Memory.Tracking` records allocation-site backtrace + Zap type per alloc; ships Bacon–Rajan
+  cycle detection at test teardown.
+- Zest: `assert_no_leaks`, `assert_no_cycles`; `@expect_leak` attribute (handles the intentional
+  `FieldStorage.indirect` leak).
+- Diagnostic security tiers (developer-local / CI-internal / user-safe) enforced in the renderer.
+- **Zap-native golden diagnostic corpus** becomes a first-class project artifact (the primary
+  benchmark; external suites are secondary).
+- **Acceptance:** every diagnostic emitted by Zap (compile, runtime, ERT, leak) round-trips through
+  one JSON schema and one renderer; the golden corpus is the authoritative regression suite.
+
+### Phase 5 *(deferred)* — `weak`/`unowned`, LSP code-actions, OTel hooks, WASM unwinding
+
+- `weak`/`unowned` field annotations (Swift model) — production fix for cycles.
+- LSP `CodeAction` projection of `MachineApplicable` suggestions; pull-based diagnostics with
+  result IDs (LSP 3.17).
+- Optional `on_panic(report)` hook for OpenTelemetry/Sentry-style crash upload.
+- WASM exception-handling integration when the upstream proposal stabilizes.
+
+### Must-not-skip-for-production
+
+Error-source chaining; numeric error codes from day one; async-signal-safe crash printer;
+per-optimize-mode overflow/bounds policy; split-debug for release; deterministic diagnostic
+snapshots; `@expect_leak` for `FieldStorage.indirect`; double-fault containment; restricted ARC
+emission allow-list.
+
+### Defer-safely
+
+i18n; OTel/Sentry; full LSP code-actions; WASM exception-handling; `weak`/`unowned`;
+OOM-as-recoverable (keep infallible-by-default with opt-in `try_alloc`).
+
+---
+
+# PART IX — REMAINING VALIDATION ASK
+
+The big design questions are settled. The following items remain *empirical* and should be
+validated by experiment, measurement, or implementation spike — not by further survey.
+
+1. **`TryProject` IR node feasibility.** Prototype against the current `~>` IR and confirm the
+   existing lowering becomes a strict refinement. Specifically verify the interaction with
+   `match_error_return` and `pop_error_return_trace` on `__try` variants.
+2. **Async-signal-safety audit of the crash-printer prototype.** Static analysis or audit pass:
+   no `malloc`, only POSIX async-signal-safe calls; reaches the known SIGTRAP defect from its
+   signal handler.
+3. **OOM-under-ARC trade-offs in practice.** Measure: does `infallible default + try_alloc` blow up
+   the surface area of `:zig.` allocator calls in `lib/*.zap`? Identify the few sites that need to
+   become fallible (CI runners, large parsers).
+4. **Migration cost across `lib/*.zap`.** Survey existing `{:ok,_}`/`{:error,_}` sites: count,
+   group, identify the ones that should annotate `raises` explicitly vs. let it infer. Confirm the
+   `tuple_to_result/1` shim covers them.
+5. **DWARF size & build-time impact.** Measure binary-size and build-time deltas for ReleaseSafe
+   with full DWARF and split-debug; confirm the per-mode policy stays within budget.
+6. **Bacon–Rajan candidate-buffer behavior under Perceus.** Measure how often Perceus's static
+   elimination already prevents purple-buffer entries on representative workloads (Lobster
+   reports 95%+ elimination; verify the order of magnitude for Zap).
+7. **Frame-pointer cost in ReleaseSafe.** Measure on representative benchmarks; confirm the
+   ~1-3% number holds for Zap workloads.
+8. **`AddressSanitizer` / `LeakSanitizer` numbers from the original Serebryany et al. paper** —
+   verify primary citations before publication (one of the reports flagged this as
+   citation-from-memory rather than freshly verified).
+
+Items genuinely deferred to v2 design rounds: WASM unwinding, full LSP code-action ergonomics,
+i18n/localization, telemetry hook contract, process-model integration ("let it crash" at task
+boundaries).
+
+---
+
+# PART X — BIBLIOGRAPHY (primary sources, ★ = load-bearing)
+
+★ **Armstrong, Joe.** *Making Reliable Distributed Systems in the Presence of Software Errors.* PhD
+thesis, Royal Institute of Technology (KTH), Stockholm, December 2003. — The "let it crash"
+foundation; processes, not functions, are the error boundary.
+
+★ **Bacon, David F. and V. T. Rajan.** "Concurrent Cycle Collection in Reference Counted Systems."
+*ECOOP 2001 — Object-Oriented Programming,* LNCS 2072, pp. 207–235. Springer. — The cycle detector
+algorithm referenced by Decision 3.
+
+★ **Clebsch, Sylvan, Juliana Franco, Sophia Drossopoulou, Albert Mingkun Yang, Tobias Wrigstad, Jan
+Vitek.** "Orca: GC and Type System Co-Design for Actor Languages." *Proc. ACM Program. Lang.* 1,
+OOPSLA, Article 72 (October 2017). — Strongest precedent for RC + type-system co-design eliminating
+cycles structurally.
+
+★ **Czaplicki, Evan.** "Compilers as Assistants." elm-lang.org/blog, November 2015. — Cultural
+primary source for empathetic diagnostics (the "teacher, not judge" discipline).
+
+★ **Duffy, Joe.** "The Error Model." joeduffyblog.com, February 7, 2016. — The Midori retrospective:
+two-pronged abandonment + statically checked exceptions; the six design criteria scorecard.
+
+★ **Gregor, Doug et al.** *Swift Evolution Proposal SE-0413: Typed throws.* Accepted Dec 7, 2023;
+shipped Swift 6.0. — Defends Decision 2; the closure-inference removal is the cautionary data point
+against mandatory typed throws.
+
+★ **Kelley, Andrew.** "Zig: January 2018 in Review." andrewkelley.me, January 2018. — Error-return
+trace cost model: "secret first-parameter pointer kept in a register… practically free."
+
+★ **Leijen, Daan.** "Type Directed Compilation of Row-Typed Algebraic Effects." *Proceedings of
+POPL 2017,* pp. 486–499. ACM. — Defends Decision 1; the selective-CPS theorem proves abortive
+handlers admit direct lowering.
+
+★ **Lindley, Sam, Conor McBride, Craig McLaughlin.** "Do Be Do Be Do." *POPL 2017.* — Frank
+calculus; effect-typing foundations.
+
+★ **McMurray, Scott.** *Rust RFC 3058: try_trait_v2.* Accepted. rust-lang.github.io/rfcs. — `Try`/
+`FromResidual` split with distinct residual types; precedent for the `TryProject` IR node.
+
+★ **Reinking, Alex, Ningning Xie, Leonardo de Moura, Daan Leijen.** "Perceus: Garbage Free
+Reference Counting with Reuse." *PLDI 2021* (Distinguished Paper). Extended TR MSR-TR-2020-42. —
+The algorithm Zap already uses; explicit about garbage-free *for cycle-free programs*.
+
+★ **Sivaramakrishnan, KC, Stephen Dolan, Leo White, Tom Kelly, Sadiq Jaffer, Anil Madhavapeddy.**
+"Retrofitting Effect Handlers onto OCaml." *PLDI 2021,* arXiv:2104.00250. — 1% production overhead
+for effect handlers; effects + DWARF coexistence.
+
+★ **van Oortmerssen, Wouter.** *Compile Time Reference Counting & Lifetime Analysis in Lobster.*
+strlen.com/lobster, 2020. — Cycle detection at exit as a *diagnostic* mechanism, not a collector.
+
+★ **Serebryany, Konstantin, Derek Bruening, Alexander Potapenko, Dmitriy Vyukov.** "AddressSanitizer:
+A Fast Address Sanity Checker." *USENIX ATC 2012.* — The leak-detector design template for
+`Memory.Tracking`. (Citation flagged for primary-source re-verification before publication.)
+
+**Secondary sources referenced:**
+
+- DWARF 5 specification (dwarfstd.org).
+- Language Server Protocol 3.17 (Microsoft).
+- rustc-dev-guide, chapters on diagnostics and `--error-format=json`.
+- Rust RFCs 243 (`?`), 1236 (cleaner panic), 1513 (panic-strategy), 1644 (JSON diagnostics), 1859
+  (first `Try` trait), 2603 (v0 symbol mangling).
+- Go `errors` package, `errors.Is`/`As`/`Join`, Go 1.13/1.20 release notes.
+- Zig Language Reference: error sets, error unions, `errdefer`, error-return traces.
+- Eiffel Design by Contract (Bertrand Meyer); Ada/SPARK reference manual.
+- Clang command-line reference (frame pointers, split-debug); GDB separate debug files; `debuginfod`;
+  Linux `perf`.
+
+---
+
+# APPENDIX A — Key file map
+
+| Path | Role |
+|---|---|
+| `lib/kernel.zap` | Core macros/builtins; `raise/1` (currently a hard abort) |
+| `lib/memory/{arc,arena,leak,tracking,no_op,manager}.zap` | Memory-manager marker types |
+| `src/diagnostics.zig` | Compiler `DiagnosticEngine`; to be generalized into the shared report core |
+| `src/runtime.zig` | Embedded runtime; `raise`/`panic` (~7041 / ~6804), ARC machinery |
+| `src/parser.zig`, `src/lexer.zig`, `src/ast.zig` | Front end; spans/`SourceSpan`; parser bails first error |
+| `src/scope.zig` | Scopes; `TypeProvenance`; visible-name collection for suggestions |
+| `src/hir.zig` / `src/ir.zig` | Lowering; `buildErrorPipe` / `lowerErrorPipeChain` / `match_error_return` / `try_call_named` (`~>`) |
+| `src/zir_backend.zig` / `src/zir_builder.zig` | The only codegen path; **no `dbg_stmt` emission today** |
+| `src/memory/{leak,tracking}/manager.zig` | Zig leak/tracking backends (raw stderr reports) |
+| `src/monomorphize.zig`, `src/perceus.zig`, `src/arc_*.zig` | Monomorphization, Perceus reuse, ARC ownership/liveness |
+| `~/projects/zig` | The Zig fork. `src/zir_api.zig` = C-ABI; exports `zir_builder_emit_dbg_stmt` (~:3115); owns Sema, DWARF, LLVM, `std.debug` |
+
+# APPENDIX B — Glossary
+
+- **`pub error`** — Zap declaration form for exception types. **Front-end-only desugar**
+  (`src/desugar.zig`) to `pub struct X + pub impl Error for X`. Auto-injects `message :: String =
+  "<TypeName>"` and `cause :: ?Error = nil` fields if the user did not declare them. Auto-generates
+  `message/1`, `kind/1`, `source/1`, `code/1` methods on the `Error` protocol. Inline methods inside
+  the body override the auto-generated defaults. `pub` makes the type matchable as API surface;
+  bare `error` (no `pub`) is renderable-only/private.
+- **Field default** — general `pub struct` syntax for declaring a default value on a field:
+  `field :: Type = expr`. Evaluated at construction time when the field is omitted in a struct
+  literal. Introduced alongside `pub error` but applies to any `pub struct`.
+- **Auto-injected field** — a field synthesized by a desugar pass (currently only `pub error`'s
+  desugar). `pub error` injects `message :: String = "<TypeName>"` and `cause :: ?Error = nil` only
+  when the user has not declared them; user declarations always win.
+- **`@code Zxxxx`** — optional attribute on a `pub error` declaration specifying a stable numeric
+  error code. CI lint requires it on any `pub error` reaching a `pub` API surface. Codes are public
+  API; never reuse a retired code.
+- **`raise "string"` shorthand** — sugar for `raise %RuntimeError{message: "string"}`. `RuntimeError`
+  is the stdlib's `pub error RuntimeError {}`; the auto-injected `message` field carries the
+  shorthand payload. CI lint flags string-`raise` on `pub` API surfaces.
+- **ZIR** — Zig Intermediate Representation. Zap emits ZIR directly via the fork's C-ABI; the fork
+  runs Sema + LLVM on it. There is no Zig source-text codegen.
+- **Sema** — the Zig compiler's semantic-analysis stage (type checking, comptime) inside the fork.
+- **HIR / IR** — Zap's high-level and lower intermediate representations before ZIR.
+- **Monomorphization** — specializing generic functions per concrete type (zero-cost generics).
+- **ARC** — Atomic Reference Counting; Zap's default memory management. No tracing GC; cycles leak
+  without intervention.
+- **Perceus** — compile-time reference-counting + reuse analysis (PLDI 2021). Zap uses Perceus to
+  insert drops/reuses precisely. Garbage-free for cycle-free programs only.
+- **Bacon–Rajan** — synchronous cycle detector (ECOOP 2001). Maintains a "purple" candidate buffer
+  populated when a refcount decrement leaves a *positive* count; drains via local SCC search. Zero
+  cost on the common Perceus path (decrement → 0).
+- **Effect / effect row / handler** — algebraic-effects terms. Zap has a hybrid effects system
+  (monomorphization + defunctionalized CPS). The error effect is *one-shot abortive* — admits
+  direct lowering per Leijen 2017's selective-CPS theorem.
+- **One-shot abortive handler** — an effect handler that never resumes its continuation. The
+  subset of algebraic-effect handlers compilable to error-unions without CPS plumbing.
+- **Selective CPS** — Leijen's compilation strategy: translate only effectful parts to CPS, leaving
+  the pure happy path direct-style.
+- **Catch-basin (`~>`)** — Zap operator: handle an unmatched piped value and skip remaining pipe
+  steps. Today's `~>` IR is payload-insensitive (a known landmine).
+- **`TryProject(value, ok_var, err_var)`** — *proposed* additive IR node that supplies the
+  payload-binding shape the existing `~>` IR lacks. The existing `~>` becomes a degenerate case
+  where both bindings are `_`.
+- **ERT / error-return trace** — Zig feature: a trace of where an error value was first returned
+  and each propagation point. Distinct from a call stack. The fork supports it; Zap currently only
+  has the `pop_error_return_trace` Call-flag hook wired.
+- **`errdefer`** — Zig's error-only cleanup: runs only when the enclosing function returns an
+  error. Distinct from `defer`, which always runs.
+- **Infallible allocation** — allocator API contract that allocation either succeeds or the program
+  is abandoned (vs. fallible allocation that returns an error). Zap's `Memory.ARC` is infallible
+  by default; `try_alloc` opts into fallible code paths.
+- **Abandonment** — fail-fast for bugs / impossible states; *not* a recoverable error. Midori's
+  term for what `raise`/`panic` does to defects.
+- **`Never`** — Zap's bottom/uninhabited type; `raise/1` currently returns `Never`.
+- **`Memory.Tracking` / `Memory.Leak`** — diagnostic build-time memory managers; CI tools, not
+  production. Currently emit raw stderr lines with no Zap-level attribution.
+- **`zap explain Zxxxx`** — *proposed* (does not exist): `rustc --explain`-style long-form
+  documentation keyed by stable numeric error code.
+- **`MachineApplicable` / `MaybeIncorrect`** — rustc's suggestion-applicability taxonomy; controls
+  whether an automated tool may apply the suggested fix.
+- **Split-debug** — debug info shipped separately from the stripped release binary, keyed by build
+  ID (`.dwo`/`.dSYM`/`debuginfod`). Lets release binaries stay lean while still being symbolicable.
+- **`:zig.Struct.fn(...)`** — Zap syntax to call an embedded-runtime/Zig primitive from Zap code.
+
+*End of brief.*
