@@ -272,26 +272,23 @@ pub const Reader = struct {
     bytes: []const u8,
     entry_count: u32,
     string_blob: []const u8,
-    /// Pointer-cast view of the packed entries. Length = entry_count.
-    /// The on-disk layout is little-endian; this reader assumes the
-    /// host matches (every Zap target so far is little-endian).
-    entries_raw: []const PackedEntry,
+    /// Byte offset into `bytes` where the packed entry table starts.
+    /// Entries are decoded on demand via `std.mem.readInt` from this
+    /// offset so the reader makes no alignment assumptions about the
+    /// backing buffer (the sidecar file is loaded by callers via
+    /// `Dir.readFile` -> `[]u8` whose alignment is host-dependent).
+    entries_offset: usize,
 
-    pub const PackedEntry = extern struct {
-        mangled_offset: u32,
-        mangled_length: u32,
-        zap_struct_offset: u32,
-        zap_struct_length: u32,
-        zap_local_offset: u32,
-        zap_local_length: u32,
-        zap_arity: u32,
-    };
+    /// Width of one packed entry on disk. Hand-computed instead of
+    /// `@sizeOf(extern struct { ... })` so the on-disk encoding
+    /// stays decoupled from the in-memory packing of any struct
+    /// the host might use to describe the entry.
+    const packed_entry_size: usize = @sizeOf(u32) * 7;
 
     pub const ParseError = error{
         BadMagic,
         UnsupportedVersion,
         TruncatedBlob,
-        UnalignedEntries,
     };
 
     /// Decode the header and validate the blob's structure. Returns
@@ -306,23 +303,13 @@ pub const Reader = struct {
         const entry_count = std.mem.readInt(u32, bytes[magic.len + 4 ..][0..4], .little);
         const blob_size = std.mem.readInt(u32, bytes[magic.len + 8 ..][0..4], .little);
         const entries_offset = header_size + blob_size;
-        const entries_bytes: usize = @as(usize, entry_count) * @sizeOf(PackedEntry);
+        const entries_bytes: usize = @as(usize, entry_count) * packed_entry_size;
         if (bytes.len < entries_offset + entries_bytes) return error.TruncatedBlob;
-        // The pointer cast below requires natural alignment for
-        // PackedEntry, which a u32-aligned blob satisfies trivially
-        // (the magic is 4 bytes, header is u32-aligned, blob is
-        // byte-aligned but we land on a 4-byte-aligned offset only
-        // when blob_size is a multiple of 4).
-        if ((entries_offset % @alignOf(PackedEntry)) != 0) return error.UnalignedEntries;
-        const entries_raw = std.mem.bytesAsSlice(
-            PackedEntry,
-            bytes[entries_offset .. entries_offset + entries_bytes],
-        );
         return .{
             .bytes = bytes,
             .entry_count = entry_count,
             .string_blob = bytes[header_size..entries_offset],
-            .entries_raw = entries_raw,
+            .entries_offset = entries_offset,
         };
     }
 
@@ -341,18 +328,27 @@ pub const Reader = struct {
     };
 
     /// Decode entry at `index`. Indices are 0-based and dense in
-    /// the range `[0, entry_count)`.
+    /// the range `[0, entry_count)`. Reads u32 fields one at a time
+    /// via `std.mem.readInt` so the backing buffer's alignment is
+    /// irrelevant.
     pub fn entry(self: Reader, index: u32) View {
-        const raw = self.entries_raw[index];
-        const zap_struct: ?[]const u8 = if (raw.zap_struct_length == 0)
+        const offset = self.entries_offset + @as(usize, index) * packed_entry_size;
+        const mangled_offset = std.mem.readInt(u32, self.bytes[offset + 0 ..][0..4], .little);
+        const mangled_length = std.mem.readInt(u32, self.bytes[offset + 4 ..][0..4], .little);
+        const zap_struct_offset = std.mem.readInt(u32, self.bytes[offset + 8 ..][0..4], .little);
+        const zap_struct_length = std.mem.readInt(u32, self.bytes[offset + 12 ..][0..4], .little);
+        const zap_local_offset = std.mem.readInt(u32, self.bytes[offset + 16 ..][0..4], .little);
+        const zap_local_length = std.mem.readInt(u32, self.bytes[offset + 20 ..][0..4], .little);
+        const zap_arity = std.mem.readInt(u32, self.bytes[offset + 24 ..][0..4], .little);
+        const zap_struct: ?[]const u8 = if (zap_struct_length == 0)
             null
         else
-            self.stringAt(raw.zap_struct_offset, raw.zap_struct_length);
+            self.stringAt(zap_struct_offset, zap_struct_length);
         return .{
-            .mangled = self.stringAt(raw.mangled_offset, raw.mangled_length),
+            .mangled = self.stringAt(mangled_offset, mangled_length),
             .zap_struct = zap_struct,
-            .zap_local = self.stringAt(raw.zap_local_offset, raw.zap_local_length),
-            .zap_arity = raw.zap_arity,
+            .zap_local = self.stringAt(zap_local_offset, zap_local_length),
+            .zap_arity = zap_arity,
         };
     }
 
@@ -503,4 +499,30 @@ test "Reader.init rejects truncated blob, bad magic, wrong version" {
     std.mem.writeInt(u32, fake_bad_version[8..][0..4], 0, .little);
     std.mem.writeInt(u32, fake_bad_version[12..][0..4], 0, .little);
     try std.testing.expectError(error.UnsupportedVersion, Reader.init(&fake_bad_version));
+}
+
+test "Reader decodes from a byte-aligned buffer regardless of alignment" {
+    // Phase-2's crash printer maps the sidecar file via mmap, which
+    // hands back a page-aligned buffer; tooling like \`zap-addr2line\`
+    // reads the file into an arena-allocated \`[]u8\` whose alignment
+    // is host-dependent. Exercise the by-offset decoder against a
+    // deliberately byte-aligned buffer to make sure no future change
+    // re-introduces a pointer-cast that would crash on those callers.
+    var builder = Builder.init(std.testing.allocator);
+    defer builder.deinit();
+    try builder.record("Mod.fn__1", "Mod", "fn", 1);
+
+    const blob = try builder.encode();
+    defer std.testing.allocator.free(blob);
+
+    // Allocate a byte slice and offset by one to force misalignment.
+    const padded = try std.testing.allocator.alloc(u8, blob.len + 1);
+    defer std.testing.allocator.free(padded);
+    @memcpy(padded[1..], blob);
+
+    const reader = try Reader.init(padded[1..]);
+    const v = reader.findByMangled("Mod.fn__1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Mod", v.zap_struct.?);
+    try std.testing.expectEqualStrings("fn", v.zap_local);
+    try std.testing.expectEqual(@as(u32, 1), v.zap_arity);
 }

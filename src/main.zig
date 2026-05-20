@@ -10631,7 +10631,14 @@ test "Phase 2 ARC stats: parse build flag for runtime counter collection" {
     try testing.expect(parsed.collect_arc_stats);
 }
 
-test "Darwin debug symbols: required only for Debug binary Mach-O artifacts" {
+test "Darwin debug symbols: bundled for Debug and ReleaseSafe Mach-O binaries" {
+    // Phase 0 of the error-system roadmap broadened the dSYM-bundling
+    // criterion from "Debug only" to "any optimize mode whose
+    // resolved debug-info policy embeds DWARF" — Debug AND
+    // ReleaseSafe land here so panic / lldb / addr2line resolve to
+    // Zap source on release-safe builds. ReleaseFast / ReleaseSmall
+    // strip; their split-debug artifact is produced from a sibling
+    // invocation, not by `needsDarwinDebugSymbols`.
     const debug_macos = zap.builder.BuildConfig{
         .name = "probe",
         .version = "0.0.0",
@@ -10641,14 +10648,35 @@ test "Darwin debug symbols: required only for Debug binary Mach-O artifacts" {
     };
     try testing.expect(needsDarwinDebugSymbols(debug_macos));
 
-    var release_macos = debug_macos;
-    release_macos.optimize = .release_safe;
-    try testing.expect(!needsDarwinDebugSymbols(release_macos));
+    var release_safe_macos = debug_macos;
+    release_safe_macos.optimize = .release_safe;
+    try testing.expect(needsDarwinDebugSymbols(release_safe_macos));
 
+    var release_fast_macos = debug_macos;
+    release_fast_macos.optimize = .release_fast;
+    try testing.expect(!needsDarwinDebugSymbols(release_fast_macos));
+
+    var release_small_macos = debug_macos;
+    release_small_macos.optimize = .release_small;
+    try testing.expect(!needsDarwinDebugSymbols(release_small_macos));
+
+    // The explicit `-Ddebug-info=full` override pulls ReleaseFast
+    // into the dSYM-emitting path; `-Ddebug-info=none` strips Debug.
+    var release_fast_full = release_fast_macos;
+    release_fast_full.debug_info = .full;
+    try testing.expect(needsDarwinDebugSymbols(release_fast_full));
+
+    var debug_none = debug_macos;
+    debug_none.debug_info = .none;
+    try testing.expect(!needsDarwinDebugSymbols(debug_none));
+
+    // Non-Darwin targets never bundle a dSYM regardless of policy.
     var debug_linux = debug_macos;
     debug_linux.target = "aarch64-linux-gnu";
     try testing.expect(!needsDarwinDebugSymbols(debug_linux));
 
+    // Static-library outputs never bundle a dSYM (no executable
+    // to attach the debug map to).
     var debug_library = debug_macos;
     debug_library.kind = .lib;
     try testing.expect(!needsDarwinDebugSymbols(debug_library));
