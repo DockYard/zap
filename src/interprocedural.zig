@@ -1085,6 +1085,9 @@ pub const InterproceduralAnalyzer = struct {
                 .switch_tag => {},
                 .branch, .cond_branch, .jump, .case_break, .match_fail, .match_error_return => {},
                 .set_safety => {},
+                // Debug-info markers: no alias or escape effect — pure
+                // metadata consumed by the ZIR debug-info wiring.
+                .dbg_stmt, .dbg_var => {},
             }
         }
     }

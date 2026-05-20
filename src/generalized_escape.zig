@@ -662,6 +662,9 @@ pub const GeneralizedEscapeAnalyzer = struct {
             .case_break => {},
             .match_fail, .match_error_return => {},
             .set_safety => {},
+            // Debug-info markers: no escape behavior — they are metadata
+            // that maps Zap source positions / local names into DWARF.
+            .dbg_stmt, .dbg_var => {},
         }
     }
 

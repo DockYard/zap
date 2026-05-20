@@ -3829,6 +3829,13 @@ pub fn collectUses(instr: ir.Instruction, buf: *UseList) void {
             if (x.nil_result) |l| buf.append(allocator, l) catch {};
             if (x.struct_result) |l| buf.append(allocator, l) catch {};
         },
+        // `.dbg_var` references the named local as a debug-info use; the
+        // liveness analysis must treat it as a real use so the local
+        // stays alive across the marker, otherwise an earlier release
+        // could destroy a value the debugger expects to observe.
+        // `.dbg_stmt` has no operands.
+        .dbg_stmt => {},
+        .dbg_var => |x| buf.append(allocator, x.value) catch {},
     }
 }
 

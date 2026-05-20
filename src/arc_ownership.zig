@@ -1375,6 +1375,14 @@ fn recordInstructionUses(
         .match_fail,
         .match_error_return,
         => {},
+        // Debug-info markers do not affect ownership analysis. Treat
+        // `.dbg_var` as a non-consuming use of its named local so the
+        // ownership classifier does not promote the operand into an
+        // owned-consume site for a debug marker.
+        .dbg_stmt => {},
+        .dbg_var => |dv| {
+            try summary.recordUse(allocator, dv.value, true);
+        },
     }
 }
 

@@ -114,6 +114,13 @@ extern "c" fn zir_builder_emit_elem_val_imm(handle: ?*ZirBuilderHandle, operand:
 extern "c" fn zir_builder_set_generic_return_type(handle: ?*ZirBuilderHandle) i32;
 extern "c" fn zir_builder_emit_cond_return(handle: ?*ZirBuilderHandle, condition: u32, value: u32) i32;
 extern "c" fn zir_builder_emit_dbg_stmt(handle: ?*ZirBuilderHandle, line: u32, column: u32) i32;
+// Phase 0 — DWARF foundation: dbg_var (named local variable) ABI.
+// `name_ptr`/`name_len` are the Zap source identifier (not null-terminated;
+// the fork interns its own copy). `operand` is the ZIR Ref of the local's
+// value (for `_val`) or pointer (for `_ptr`). Returns 0 on success, -1 on
+// error. Implemented in ~/projects/zig/src/zir_api.zig.
+extern "c" fn zir_builder_emit_dbg_var_val(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, operand: u32) i32;
+extern "c" fn zir_builder_emit_dbg_var_ptr(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, operand: u32) i32;
 
 // Runtime safety control (for guard error semantics)
 extern "c" fn zir_builder_emit_set_runtime_safety(handle: ?*ZirBuilderHandle, enabled: u32) bool;
@@ -5298,6 +5305,58 @@ pub const ZirDriver = struct {
                     @intFromEnum(Zir.Inst.Ref.bool_false);
                 _ = zir_builder_emit_set_runtime_safety(self.handle, ref);
             },
+            // Phase 0 — DWARF foundation: emit a ZIR `dbg_stmt` at every
+            // Zap statement boundary, carrying the Zap source line and
+            // column. The Zig fork's Sema lowers this into a DWARF line
+            // entry, which is what lldb/gdb/addr2line/perf/samply read
+            // when mapping a machine address back to source. The IR
+            // payload uses zero-based coordinates (Zap's `SourceSpan`
+            // convention); the fork's `addDbgStmt` expects one-based
+            // values to match the DWARF standard, so we add one in the
+            // single canonical conversion site here. Skip emission when
+            // either coordinate is zero (the IR builder uses 0,0 as a
+            // synthetic-statement sentinel for IR nodes that did not
+            // originate from user source — emitting them would point
+            // the debugger at the file header).
+            .dbg_stmt => |ds| {
+                if (ds.line == 0 and ds.column == 0) return;
+                // Pass zero-based coordinates through unchanged: the fork's
+                // LLVM backend (FuncGen.airDbgStmt) computes the final
+                // DWARF line as `base_line + dbg_stmt.line + 1`. Zap
+                // currently leaves `base_line = 0` for every function
+                // (the `pub_const_simple` declaration's `src_line` flag
+                // is hard-zeroed in the ZIR builder), so the +1 there
+                // alone produces the one-based DWARF coordinate the
+                // standard requires.
+                if (zir_builder_emit_dbg_stmt(self.handle, ds.line, ds.column) != 0) {
+                    return error.EmitFailed;
+                }
+            },
+            // Phase 0 — DWARF foundation: emit a ZIR `dbg_var_val` (or
+            // `dbg_var_ptr`) carrying the Zap source identifier for a
+            // named local binding. The fork's Sema preserves the name
+            // into AIR `dbg_var_*`, which the LLVM backend emits as a
+            // DWARF `.debug_info` local variable record. Debuggers
+            // display this name — `x` instead of synthetic `__local_5`.
+            //
+            // The binding's runtime value lives in `dv.value`. If the
+            // ZIR ref for that local isn't materialized yet (e.g., a
+            // local whose value was inlined into a sibling expression
+            // and never spilled), we skip emission rather than
+            // synthesize a fake ref — DWARF would point at garbage.
+            .dbg_var => |dv| {
+                // Materialize the operand the same way every other
+                // instruction does — `local_refs` may store either a
+                // direct inst ref or a deferred decl ref, and the
+                // `materializeValueRef` helper handles both.
+                if (!self.local_refs.contains(dv.value)) return;
+                const operand_ref = try self.refForLocal(dv.value);
+                const result = if (dv.is_ptr)
+                    zir_builder_emit_dbg_var_ptr(self.handle, dv.name.ptr, @intCast(dv.name.len), operand_ref)
+                else
+                    zir_builder_emit_dbg_var_val(self.handle, dv.name.ptr, @intCast(dv.name.len), operand_ref);
+                if (result != 0) return error.EmitFailed;
+            },
             .guard_block => |gb| {
                 // Body-tracked emission: place body instructions inside a
                 // condbr_inline's then branch so Sema only analyzes (and
@@ -7684,6 +7743,9 @@ pub const ZirDriver = struct {
             .release,
             .bin_read_utf8,
             .tail_call,
+            // Debug-info markers do not define a destination local.
+            .dbg_stmt,
+            .dbg_var,
             => null,
         };
     }

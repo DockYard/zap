@@ -625,6 +625,23 @@ pub const Instruction = union(enum) {
 
     // Phi
     phi: Phi,
+
+    // Debug info (Phase 0 — DWARF foundation)
+    /// Marker for the start of a Zap source-level statement. Carries the
+    /// Zap source `line` and `column` so the ZIR backend can emit a
+    /// `dbg_stmt` ZIR instruction; the Zig fork's DWARF emitter projects
+    /// those into the resulting binary's debug-line section, which is
+    /// what lldb/gdb/addr2line/perf/samply consume to map machine
+    /// addresses back to Zap source.
+    dbg_stmt: DbgStmt,
+    /// Marker for a named local-variable binding. Carries the Zap source
+    /// identifier `name` and the `value` local that holds the binding,
+    /// plus an `is_ptr` flag distinguishing pointer-bound locals (Zig
+    /// `dbg_var_ptr`) from value-bound locals (`dbg_var_val`). The ZIR
+    /// backend emits `dbg_var_val`/`dbg_var_ptr`, which preserves the
+    /// Zap identifier in DWARF's `.debug_info` so debuggers display
+    /// Zap-named locals instead of synthetic IR slot names.
+    dbg_var: DbgVar,
 };
 
 fn cloneInstructions(allocator: std.mem.Allocator, instructions: []const Instruction) CloneError![]const Instruction {
@@ -686,7 +703,13 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
         .retain,
         .release,
         .reset,
+        .dbg_stmt,
         => instruction,
+        .dbg_var => |value| .{ .dbg_var = .{
+            .name = try cloneBytes(allocator, value.name),
+            .value = value.value,
+            .is_ptr = value.is_ptr,
+        } },
         .const_atom => |value| .{ .const_atom = .{
             .dest = value.dest,
             .value = try cloneBytes(allocator, value.value),
@@ -939,6 +962,40 @@ pub const ConstInt = struct {
     dest: LocalId,
     value: i64,
     type_hint: ?ZigType = null,
+};
+
+/// Payload for the `.dbg_stmt` instruction. The `line` and `column`
+/// are the **zero-based** Zap source coordinates of the statement that
+/// is about to execute. The ZIR builder converts them to the
+/// fork's one-based DWARF representation when emitting.
+///
+/// Statement boundaries are determined during HIR -> IR lowering by
+/// the IR builder's `lowerBlock`. Every `hir.Stmt` (expression
+/// statement, local-set, or nested function declaration) emits one
+/// `.dbg_stmt` immediately before its own instructions, so any
+/// runtime trap inside that statement (panic, arithmetic overflow,
+/// nil-deref, etc.) maps back to the statement's source line — not
+/// to the previous statement's line or the enclosing function's
+/// header line.
+pub const DbgStmt = struct {
+    line: u32,
+    column: u32,
+};
+
+/// Payload for the `.dbg_var` instruction. The `name` is the Zap
+/// source identifier of a named local binding (e.g., the LHS of
+/// `x = expr`). The `value` is the IR local that holds the binding
+/// after lowering. `is_ptr` is `true` when the local stores a pointer
+/// (lowered as Zig `dbg_var_ptr`), `false` when the local stores a
+/// value (lowered as Zig `dbg_var_val`); Zap bindings are values, so
+/// the default is `false`. The ZIR backend interns `name` into the
+/// fork's string table and emits the corresponding `dbg_var_*` ZIR
+/// instruction, which Sema/AIR propagate into DWARF `.debug_info` so
+/// debuggers display Zap-named locals instead of synthetic slot ids.
+pub const DbgVar = struct {
+    name: []const u8,
+    value: LocalId,
+    is_ptr: bool = false,
 };
 
 pub const ConstFloat = struct {
@@ -6662,9 +6719,59 @@ pub const IrBuilder = struct {
         };
     }
 
+    /// Emit a `.dbg_stmt` IR instruction carrying the Zap source span
+    /// of `stmt`. Called by `lowerBlock` once per HIR statement so the
+    /// ZIR backend produces a DWARF line entry at every Zap statement
+    /// boundary — every runtime trap (panic, arithmetic overflow,
+    /// nil-deref, divide-by-zero, ...) inside the statement maps
+    /// back to the statement's source line.
+    ///
+    /// The emitted span is the *driving* HIR `Expr`'s span:
+    ///   - `expr` statements: the expression's own span.
+    ///   - `local_set` statements: the RHS expression's span (the
+    ///     assignment's start), which matches user intuition of
+    ///     "the statement is the assignment line".
+    ///   - `function_group` statements: skipped — nested function
+    ///     declarations don't produce executable instructions in the
+    ///     enclosing block; their bodies carry their own dbg_stmts.
+    ///
+    /// A zero `line` (synthetic statement with no source origin) is
+    /// emitted unchanged; the ZIR builder treats `{line: 0, column: 0}`
+    /// as a sentinel and skips ZIR emission. Doing the sentinel check
+    /// once at the ZIR boundary keeps every IR-level analysis pass
+    /// agnostic to the distinction.
+    fn emitDbgStmtForStmt(self: *IrBuilder, stmt: hir_mod.Stmt) !void {
+        const span: ast.SourceSpan = switch (stmt) {
+            .expr => |expr| expr.span,
+            .local_set => |ls| ls.value.span,
+            .function_group => return,
+        };
+        // The lexer emits 1-based line/column, the existing IR
+        // function-level `debug_line`/`debug_column` are stored
+        // zero-based (see `zeroBasedSourceCoordinate`). Convert here
+        // so the IR payload's contract is identical: zero-based,
+        // sentinel `{0,0}` means "no source origin". The ZIR builder
+        // adds one back when calling the fork's `addDbgStmt` (which
+        // expects DWARF's one-based convention).
+        try self.current_instrs.append(self.allocator, .{
+            .dbg_stmt = .{
+                .line = zeroBasedSourceCoordinate(span.line),
+                .column = zeroBasedSourceCoordinate(span.col),
+            },
+        });
+    }
+
     fn lowerBlock(self: *IrBuilder, block: *const hir_mod.Block) anyerror!?LocalId {
         var last_local: ?LocalId = null;
         for (block.stmts, 0..) |stmt, stmt_index| {
+            // Phase 0 — DWARF foundation: emit a `.dbg_stmt` at every
+            // Zap statement boundary so the ZIR backend can produce a
+            // DWARF line entry for it. Source coordinates come from
+            // the HIR Expr's span; statements with no user-visible
+            // source (synthetic helper assignments produced by
+            // pattern destructuring, etc.) carry a zero span, which
+            // the ZIR builder treats as a sentinel and skips.
+            try self.emitDbgStmtForStmt(stmt);
             switch (stmt) {
                 .expr => |expr| {
                     const saved_expected_type = self.current_expected_type;
@@ -6693,6 +6800,22 @@ pub const IrBuilder = struct {
                     // ARC-managed and need a retain on alias.
                     if (self.local_hir_types.get(val)) |src_hir_type| {
                         try self.local_hir_types.put(ls.index, src_hir_type);
+                    }
+                    // Phase 0 — DWARF foundation: record the Zap source
+                    // identifier for this local so the ZIR backend can
+                    // emit a `dbg_var_val`, preserving the name into
+                    // DWARF `.debug_info`. Only emitted when the
+                    // assignment was a plain `name = expr` (destructure
+                    // bindings record their own per-leaf names via
+                    // `lowerAssignmentDestructure` and its descendants).
+                    if (ls.name) |name_id| {
+                        try self.current_instrs.append(self.allocator, .{
+                            .dbg_var = .{
+                                .name = self.interner.get(name_id),
+                                .value = ls.index,
+                                .is_ptr = false,
+                            },
+                        });
                     }
                     last_local = ls.index;
                 },

@@ -426,6 +426,14 @@ pub const Stmt = union(enum) {
 pub const LocalSet = struct {
     index: u32,
     value: *const Expr,
+    /// Zap source identifier of the binding, when the assignment is
+    /// `name = expr` (the `.bind` pattern). Null for destructured
+    /// bindings (`{a,b} = pair`, `[h|t] = lst`, …) whose intermediate
+    /// `local_set`s hold synthetic extractor values that have no
+    /// user-visible name. Read by the IR builder to emit a
+    /// `.dbg_var` IR instruction so DWARF records the Zap identifier
+    /// for this slot.
+    name: ?ast.StringId = null,
 };
 
 // ============================================================
@@ -4340,8 +4348,18 @@ pub const HirBuilder = struct {
                     } else try self.buildExpr(assign.value);
                     const value_local = self.next_local;
                     self.next_local += 1;
+                    // For `name = expr`, record the Zap identifier on the
+                    // local_set so the IR builder can emit a `.dbg_var`
+                    // referring to the binding's source name (Phase 0
+                    // DWARF). Destructured patterns have no single
+                    // user-visible name for `value_local`, so `name`
+                    // stays null there.
+                    const binding_name: ?ast.StringId = if (assign.pattern.* == .bind)
+                        assign.pattern.bind.name
+                    else
+                        null;
                     try hir_stmts.append(self.allocator, .{
-                        .local_set = .{ .index = value_local, .value = value },
+                        .local_set = .{ .index = value_local, .value = value, .name = binding_name },
                     });
 
                     // For `name = expr`, just bind the name to `value_local`.

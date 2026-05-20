@@ -1177,6 +1177,15 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             }
         },
         .set_safety => {},
+        .dbg_stmt => |v| {
+            hasher.update(std.mem.asBytes(&v.line));
+            hasher.update(std.mem.asBytes(&v.column));
+        },
+        .dbg_var => |v| {
+            hasher.update(std.mem.asBytes(&v.value));
+            hasher.update(std.mem.asBytes(&v.is_ptr));
+            hasher.update(v.name);
+        },
     }
 }
 
@@ -2227,6 +2236,10 @@ pub const Interpreter = struct {
 
             // === Safety (no-op at CTFE) ===
             .set_safety => return .continued,
+
+            // === Debug info (no-op at CTFE; metadata only — DWARF
+            //     emission happens in the ZIR backend) ===
+            .dbg_stmt, .dbg_var => return .continued,
 
             // === Dead instructions (never emitted by IR builder) ===
             .phi,

@@ -851,6 +851,12 @@ pub const UseDefInfo = struct {
             // Non-data instructions.
             .branch, .jump, .match_fail, .match_error_return => {},
             .set_safety => {},
+            // Debug-info markers: `.dbg_stmt` has no operands;
+            // `.dbg_var` references its named local as a debug-info
+            // use so the local's live range extends through the
+            // debugger-visible scope.
+            .dbg_stmt => {},
+            .dbg_var => |dv| try info.recordUse(dv.value, block),
         }
     }
 
