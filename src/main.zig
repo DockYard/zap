@@ -696,7 +696,113 @@ const BuildOverrides = struct {
     target: ?[]const u8 = null,
     /// Zig CPU model/feature string (e.g. "baseline", "apple_m1").
     cpu: ?[]const u8 = null,
+    /// Phase 0 — DWARF foundation: per-mode debug-info policy
+    /// override. `-Ddebug-info=<full|split|none>` lets the user
+    /// force a specific policy regardless of optimize mode. `full`
+    /// embeds DWARF in the artifact; `split` is the build-time
+    /// pairing of stripped main binary + sibling debug artifact
+    /// (lowered through the toolchain's split-debug machinery,
+    /// `.dSYM` on Mach-O); `none` strips and produces no debug
+    /// info at all. Null leaves the per-optimize-mode default in
+    /// place (Debug / ReleaseSafe: full; ReleaseFast / ReleaseSmall:
+    /// none with a split-debug sibling).
+    debug_info: ?DebugInfoOverride = null,
+    /// Phase 0 — DWARF foundation: `-Dframe-pointers=on|off`
+    /// override. Frame pointers unlock `perf` / `samply` /
+    /// stack-walking-via-FP without DWARF unwinder tables; they
+    /// cost ~1-3% in optimized builds. Null defers to the
+    /// per-mode default: on in Debug / ReleaseSafe, off in
+    /// ReleaseFast / ReleaseSmall. Threaded into the per-mode
+    /// `DebugInfoPolicyResolution` returned by
+    /// `resolveDebugInfoPolicy`.
+    frame_pointers: ?bool = null,
 };
+
+/// Phase 0 — DWARF foundation: parsed `-Ddebug-info` flag value.
+/// Distinct from the on-disk `zir_backend.DebugInfoPolicy` enum
+/// because this layer additionally understands `split` — a build-
+/// time concept that affects sidecar emission, not the in-binary
+/// DWARF stripping decision.
+pub const DebugInfoOverride = enum {
+    full,
+    split,
+    none,
+};
+
+/// Phase 0 — DWARF foundation: the resolved policy a single
+/// `compileAndLink` invocation observes. Encodes both the
+/// in-binary stripping decision and whether the build pipeline
+/// should produce a sibling split-debug artifact + frame-pointer
+/// retention.
+pub const DebugInfoPolicyResolution = struct {
+    /// In-binary DWARF policy passed through to the fork via
+    /// `zir_backend.CompileOptions.debug_info_policy`. `null`
+    /// keeps the V1 ABI (legacy Debug-only behavior); a non-null
+    /// value forces the V2 ABI.
+    in_binary: ?zir_backend.DebugInfoPolicy,
+    /// True when the build should produce a split-debug artifact
+    /// alongside the stripped main binary. Mach-O: emit `.dSYM`;
+    /// ELF: emit `.dwo` / `.dwp` keyed by build-id for `debuginfod`.
+    /// False suppresses sidecar emission (typical for Debug /
+    /// ReleaseSafe where DWARF is already embedded).
+    want_split_debug: bool,
+    /// True when the build should keep frame pointers on every
+    /// function so `perf` / `samply` / async-signal-safe crash
+    /// printers can walk the stack without unwinder tables.
+    frame_pointers: bool,
+};
+
+/// Phase 0 — DWARF foundation: resolve the effective debug-info
+/// policy for a given optimize mode + CLI overrides.
+///
+/// Order of precedence:
+///   1. Explicit `-Ddebug-info=<...>` value wins for the in-binary
+///      stripping decision.
+///   2. Explicit `-Dframe-pointers=<on|off>` wins for the
+///      frame-pointer decision.
+///   3. Optimize-mode defaults fill in everything else (see the
+///      Phase 0 spec table):
+///        * Debug, ReleaseSafe -> full DWARF, FP on, no split.
+///        * ReleaseFast, ReleaseSmall -> strip in-binary DWARF,
+///          emit a sibling split-debug artifact, FP off.
+///
+/// The output is consumed by both `compileAndLink` (it sets
+/// `CompileOptions.debug_info_policy`) and the dSYM-bundling code
+/// path (which honors `want_split_debug`).
+pub fn resolveDebugInfoPolicy(
+    optimize: zap.builder.BuildConfig.Optimize,
+    override: ?DebugInfoOverride,
+    frame_pointers_override: ?bool,
+) DebugInfoPolicyResolution {
+    const debug_or_safe = switch (optimize) {
+        .debug, .release_safe => true,
+        .release_fast, .release_small => false,
+    };
+    const in_binary: zir_backend.DebugInfoPolicy = blk: {
+        if (override) |ov| {
+            break :blk switch (ov) {
+                .full => .full,
+                .split, .none => .none,
+            };
+        }
+        break :blk if (debug_or_safe) .full else .none;
+    };
+    const want_split: bool = blk: {
+        if (override) |ov| {
+            break :blk switch (ov) {
+                .split => true,
+                .full, .none => false,
+            };
+        }
+        break :blk !debug_or_safe;
+    };
+    const frame_pointers: bool = frame_pointers_override orelse debug_or_safe;
+    return .{
+        .in_binary = in_binary,
+        .want_split_debug = want_split,
+        .frame_pointers = frame_pointers,
+    };
+}
 
 /// Result of the single `-D` parser: the typed overrides, or an owned,
 /// fully-formatted diagnostic (no trailing newline) describing the
@@ -718,6 +824,8 @@ const BUILD_FLAG_KEYS = [_][]const u8{
     "memory",
     "target",
     "cpu",
+    "debug-info",
+    "frame-pointers",
 };
 
 /// Format the supported-keys list for diagnostics straight from
@@ -818,6 +926,34 @@ fn parseBuildOverrides(
             overrides.target = value;
         } else if (std.mem.eql(u8, key, "cpu")) {
             overrides.cpu = value;
+        } else if (std.mem.eql(u8, key, "debug-info")) {
+            // Phase 0 — DWARF foundation: explicit override of the
+            // per-mode debug-info policy.
+            overrides.debug_info = if (std.mem.eql(u8, value, "full"))
+                .full
+            else if (std.mem.eql(u8, value, "split"))
+                .split
+            else if (std.mem.eql(u8, value, "none"))
+                .none
+            else
+                return .{ .err = try std.fmt.allocPrint(
+                    alloc,
+                    "unknown -Ddebug-info value '{s}' (valid: full, split, none)",
+                    .{value},
+                ) };
+        } else if (std.mem.eql(u8, key, "frame-pointers")) {
+            // Phase 0 — DWARF foundation: explicit override of the
+            // per-mode frame-pointer policy.
+            overrides.frame_pointers = if (std.mem.eql(u8, value, "on") or std.mem.eql(u8, value, "true"))
+                true
+            else if (std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "false"))
+                false
+            else
+                return .{ .err = try std.fmt.allocPrint(
+                    alloc,
+                    "unknown -Dframe-pointers value '{s}' (valid: on, off)",
+                    .{value},
+                ) };
         } else {
             return .{ .err = try std.fmt.allocPrint(
                 alloc,
@@ -851,6 +987,18 @@ fn applyBuildOverrides(config: *zap.builder.BuildConfig, overrides: BuildOverrid
     }
     if (overrides.target) |t| config.target = t;
     if (overrides.cpu) |c| config.cpu = c;
+    // Phase 0 — DWARF foundation: thread the per-mode debug-info and
+    // frame-pointer overrides into the BuildConfig so every downstream
+    // consumer (compile, dSYM bundling, manifest cache) sees a single
+    // source of truth.
+    if (overrides.debug_info) |dbg| {
+        config.debug_info = switch (dbg) {
+            .full => .full,
+            .split => .split,
+            .none => .none,
+        };
+    }
+    if (overrides.frame_pointers) |fp| config.frame_pointers = fp;
 }
 
 /// Pure parser for the script-mode `--zap-lib-dir <dir>` leading flag
@@ -2149,7 +2297,22 @@ fn hostUsesDarwinDebugMap() bool {
 }
 
 fn needsDarwinDebugSymbols(config: zap.builder.BuildConfig) bool {
-    if (config.kind != .bin or config.optimize != .debug) return false;
+    if (config.kind != .bin) return false;
+    // Phase 0 — DWARF foundation: bundle a `.dSYM` whenever the
+    // resolved policy embeds DWARF in the artifact. Debug and
+    // ReleaseSafe default to full DWARF; ReleaseFast / ReleaseSmall
+    // strip it (the matching split-debug artifact would be produced
+    // by a sibling toolchain invocation, not the user binary's
+    // compile). A user `-Ddebug-info=full` override pulls
+    // ReleaseFast/Small into the dSYM-emitting path too.
+    const override: ?DebugInfoOverride = if (config.debug_info) |dbg| switch (dbg) {
+        .full => @as(DebugInfoOverride, .full),
+        .split => @as(DebugInfoOverride, .split),
+        .none => @as(DebugInfoOverride, .none),
+    } else null;
+    const resolution = resolveDebugInfoPolicy(config.optimize, override, config.frame_pointers);
+    const policy = resolution.in_binary orelse return false;
+    if (policy == .none) return false;
     if (config.target) |target| return targetTripleUsesDarwinDebugMap(target);
     return hostUsesDarwinDebugMap();
 }
@@ -4613,6 +4776,19 @@ fn compileAndLink(
     // Map optimize mode from manifest
     const optimize_mode: u8 = optimize_policy.backend_optimize_mode;
 
+    // Phase 0 — DWARF foundation: resolve the per-mode debug-info
+    // policy ONCE here (single source of truth for the build path)
+    // from `config.optimize` + the CLI `-Ddebug-info` /
+    // `-Dframe-pointers` overrides already overlaid onto `config`.
+    const debug_info_resolution = blk: {
+        const override: ?DebugInfoOverride = if (config.debug_info) |dbg| switch (dbg) {
+            .full => @as(DebugInfoOverride, .full),
+            .split => @as(DebugInfoOverride, .split),
+            .none => @as(DebugInfoOverride, .none),
+        } else null;
+        break :blk resolveDebugInfoPolicy(config.optimize, override, config.frame_pointers);
+    };
+
     // Memory manager resolution happened above (Phase 6 needs the
     // resulting `declared_caps` before the front-end). The object path
     // and capability bitmask flow into the ZIR backend below.
@@ -4660,6 +4836,12 @@ fn compileAndLink(
         // Zig 0.16 error formatting options from manifest
         .error_style = config.error_style,
         .multiline_errors = config.multiline_errors,
+        // Phase 0 — DWARF foundation: force the in-binary DWARF
+        // policy resolved above so Debug + ReleaseSafe keep DWARF
+        // and ReleaseFast + ReleaseSmall strip it. Setting `null`
+        // would fall back to the V1 ABI (Debug-only DWARF) and
+        // skip the ReleaseSafe coverage Phase 0 promises.
+        .debug_info_policy = debug_info_resolution.in_binary,
     }) catch |err| {
         // stderr writer removed in 0.16. The error name discriminates
         // EmitFailed (Zap-side ZIR builder failures) from
@@ -5968,6 +6150,20 @@ const IncrementalWatchState = struct {
         // resolved manager's capability surface — Phase 6 inline-header
         // layout and codegen elision both consult this value.
         if (progress) |reporter| reporter.stage("ZIR: creating Zig compilation", .{});
+        // Phase 0 — DWARF foundation: resolve the per-mode debug-info
+        // policy ONCE here so the persistent context's `root_strip`
+        // matches every subsequent `injectAndUpdate`. Watch sessions
+        // hold this context across many rebuilds; baking the policy
+        // in at creation time means a `-Ddebug-info=` override applied
+        // at startup persists for the lifetime of the daemon.
+        const watch_dbg_resolution = blk: {
+            const override: ?DebugInfoOverride = if (config.debug_info) |dbg| switch (dbg) {
+                .full => @as(DebugInfoOverride, .full),
+                .split => @as(DebugInfoOverride, .split),
+                .none => @as(DebugInfoOverride, .none),
+            } else null;
+            break :blk resolveDebugInfoPolicy(config.optimize, override, config.frame_pointers);
+        };
         const ctx = zir_backend.createContext(allocator, .{
             .zig_lib_dir = zig_lib_duped,
             .cache_dir = ".zap-cache",
@@ -5990,6 +6186,7 @@ const IncrementalWatchState = struct {
             .incremental = true,
             .declared_caps = declared_caps,
             .active_manager_source_path = active_manager_source_path_owned,
+            .debug_info_policy = watch_dbg_resolution.in_binary,
         }) catch {
             allocator.free(zig_lib_duped);
             allocator.free(output_path_duped);
@@ -6086,6 +6283,26 @@ const IncrementalWatchState = struct {
         progress: ?*zap.progress.Reporter,
     ) zir_backend.CompileOptions {
         _ = allocator;
+        // Phase 0 — DWARF foundation: resolve the per-mode debug-info
+        // policy for this rebuild from the manifest config that
+        // pinned the daemon (`manifest_config` carries the user's
+        // `-Ddebug-info=` override after `applyBuildOverrides`). The
+        // resolution runs once per rebuild so each incremental update
+        // produces a binary with the same DWARF policy as the initial
+        // build — `IncrementalWatchState` itself only exists for the
+        // lifetime of a single manifest, so the resolution is stable.
+        const dbg_resolution = blk: {
+            const override: ?DebugInfoOverride = if (self.manifest_config.debug_info) |dbg| switch (dbg) {
+                .full => @as(DebugInfoOverride, .full),
+                .split => @as(DebugInfoOverride, .split),
+                .none => @as(DebugInfoOverride, .none),
+            } else null;
+            break :blk resolveDebugInfoPolicy(
+                self.manifest_config.optimize,
+                override,
+                self.manifest_config.frame_pointers,
+            );
+        };
         return .{
             .zig_lib_dir = self.zig_lib_dir,
             .cache_dir = ".zap-cache",
@@ -6109,6 +6326,7 @@ const IncrementalWatchState = struct {
             .declared_caps = self.declared_caps,
             .active_manager_source_path = self.active_manager_source_path,
             .progress = progress,
+            .debug_info_policy = dbg_resolution.in_binary,
         };
     }
 

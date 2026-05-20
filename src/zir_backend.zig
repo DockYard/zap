@@ -70,6 +70,67 @@ extern "c" fn zir_compilation_create_cross_incremental(
     cpu_features: ?[*:0]const u8,
 ) ?*ZirContext;
 
+// Phase 0 — DWARF foundation: V2 of every `create_*` ABI. Identical
+// shape to the V1 calls plus a trailing `debug_info_policy: u8` (see
+// `DebugInfoPolicy` below). Callers either use V1 (historical
+// behavior) or V2 (explicit policy); the two are equivalent when
+// `debug_info_policy == 0` (default).
+extern "c" fn zir_compilation_create_v2(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    debug_info_policy: u8,
+) ?*ZirContext;
+
+extern "c" fn zir_compilation_create_incremental_v2(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    debug_info_policy: u8,
+) ?*ZirContext;
+
+extern "c" fn zir_compilation_create_cross_v2(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    target_triple: ?[*:0]const u8,
+    cpu_features: ?[*:0]const u8,
+    debug_info_policy: u8,
+) ?*ZirContext;
+
+extern "c" fn zir_compilation_create_cross_incremental_v2(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    target_triple: ?[*:0]const u8,
+    cpu_features: ?[*:0]const u8,
+    debug_info_policy: u8,
+) ?*ZirContext;
+
 extern "c" fn zir_compilation_update(ctx: *ZirContext) i32;
 extern "c" fn zir_compilation_update_with_progress(ctx: *ZirContext) i32;
 extern "c" fn zir_compilation_output_path_len(ctx: *ZirContext) usize;
@@ -227,6 +288,54 @@ pub const CompileOptions = struct {
     /// load-bearing — do not change it without updating the
     /// runtime-side loader.
     emit_symbol_table_sidecar: bool = true,
+    /// Phase 0 — DWARF foundation: the per-mode debug-info policy
+    /// resolved from the optimize mode plus any CLI override. See
+    /// `DebugInfoPolicy` for the value semantics. `null` falls
+    /// back to the legacy V1 ABI (Debug keeps DWARF, every other
+    /// mode strips) which preserves source-mode behavior for
+    /// callers that haven't migrated.
+    debug_info_policy: ?DebugInfoPolicy = null,
+};
+
+/// Per-mode debug-info policy. Mirrors the fork's `DebugInfoPolicy`
+/// in `~/projects/zig/src/zir_api.zig` byte-for-byte — the raw `u8`
+/// encoding is the C-ABI contract. Resolution rules (driven by
+/// Phase 0 of the error-system roadmap, `docs/error-system-research-brief.md`
+/// §VIII):
+///
+/// * **Debug / ReleaseSafe** -> `.full`. Full DWARF; lldb / addr2line
+///   / the panic handler can resolve every machine address back to
+///   the Zap source line that produced it.
+/// * **ReleaseFast / ReleaseSmall** -> `.none`. The main binary
+///   ships stripped; the matching DWARF lives in a sibling
+///   split-debug artifact (`.dSYM` on Mach-O, `.dwo` /
+///   `debuginfod`-keyed elsewhere) produced from a parallel build.
+/// * **`-Ddebug-info=<full|split|none>`** explicit CLI override —
+///   the user can force any policy regardless of optimize mode.
+///   `split` is semantically equivalent to `none` for this enum
+///   (the split-debug artifact is produced from a sibling
+///   invocation, not by this knob); the distinction matters for
+///   the build-time choice "ship debug-info? where?", not the
+///   per-`zir_compilation_create_v2` decision "embed DWARF in
+///   THIS binary?".
+pub const DebugInfoPolicy = enum(u8) {
+    default = 0,
+    full = 1,
+    none = 2,
+
+    /// The default policy for a given optimize mode when the user
+    /// has not passed an explicit `-Ddebug-info` override. Encodes
+    /// the per-mode policy table from the Phase 0 spec.
+    pub fn fromOptimizeMode(optimize_mode: u8) DebugInfoPolicy {
+        return switch (optimize_mode) {
+            // 0 = Debug, 1 = ReleaseSafe — both keep full DWARF.
+            0, 1 => .full,
+            // 2 = ReleaseFast, 3 = ReleaseSmall — strip; split-debug
+            // is shipped separately, not embedded.
+            2, 3 => .none,
+            else => .default,
+        };
+    }
 };
 
 /// Create a ZirContext compilation context from the given options.
@@ -265,7 +374,32 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
         else
             null;
         defer if (cpu_z) |c| allocator.free(c);
-        break :blk (if (options.incremental)
+        // Phase 0 — DWARF foundation: when the caller requested an
+        // explicit debug-info policy (`Debug`/`ReleaseSafe` -> `full`,
+        // `ReleaseFast`/`ReleaseSmall` -> `none`, or a CLI override),
+        // route through the V2 ABI which threads the policy into the
+        // fork's `Compilation.Config.root_strip`. Callers that left
+        // `debug_info_policy = null` keep the V1 ABI (Debug keeps
+        // DWARF, every other mode strips) for byte-identical
+        // backwards-compatibility.
+        const dbg_policy_byte: u8 = @intFromEnum(options.debug_info_policy orelse DebugInfoPolicy.default);
+        const has_explicit_policy = options.debug_info_policy != null;
+        break :blk (if (options.incremental and has_explicit_policy)
+            zir_compilation_create_cross_incremental_v2(
+                zig_lib_z,
+                cache_z,
+                global_cache_z,
+                output_z,
+                name_z,
+                options.output_mode,
+                options.optimize_mode,
+                options.is_dynamic,
+                options.link_libc,
+                if (target_z) |t| t.ptr else null,
+                if (cpu_z) |c| c.ptr else null,
+                dbg_policy_byte,
+            )
+        else if (options.incremental)
             zir_compilation_create_cross_incremental(
                 zig_lib_z,
                 cache_z,
@@ -278,6 +412,21 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
                 options.link_libc,
                 if (target_z) |t| t.ptr else null,
                 if (cpu_z) |c| c.ptr else null,
+            )
+        else if (has_explicit_policy)
+            zir_compilation_create_cross_v2(
+                zig_lib_z,
+                cache_z,
+                global_cache_z,
+                output_z,
+                name_z,
+                options.output_mode,
+                options.optimize_mode,
+                options.is_dynamic,
+                options.link_libc,
+                if (target_z) |t| t.ptr else null,
+                if (cpu_z) |c| c.ptr else null,
+                dbg_policy_byte,
             )
         else
             zir_compilation_create_cross(
@@ -294,11 +443,19 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
                 if (cpu_z) |c| c.ptr else null,
             )) orelse
             return error.CompilationCreateFailed;
-    } else (if (options.incremental)
-        zir_compilation_create_incremental(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc)
-    else
-        zir_compilation_create(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc)) orelse
-        return error.CompilationCreateFailed;
+    } else native_path: {
+        const dbg_policy_byte: u8 = @intFromEnum(options.debug_info_policy orelse DebugInfoPolicy.default);
+        const has_explicit_policy = options.debug_info_policy != null;
+        break :native_path (if (options.incremental and has_explicit_policy)
+            zir_compilation_create_incremental_v2(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc, dbg_policy_byte)
+        else if (options.incremental)
+            zir_compilation_create_incremental(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc)
+        else if (has_explicit_policy)
+            zir_compilation_create_v2(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc, dbg_policy_byte)
+        else
+            zir_compilation_create(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc)) orelse
+            return error.CompilationCreateFailed;
+    };
 
     // Configure builder mode if entry point is specified.
     if (options.builder_entry) |entry| {

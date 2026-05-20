@@ -17,6 +17,20 @@ pub const BuildConfig = struct {
     root: ?[]const u8 = null,
     asset_name: ?[]const u8 = null,
     optimize: Optimize = .debug,
+    /// Phase 0 — DWARF foundation: optional per-build debug-info
+    /// override. Null defers to the optimize-mode default
+    /// (Debug/ReleaseSafe -> full DWARF embedded; ReleaseFast /
+    /// ReleaseSmall -> stripped main binary + sibling split-debug
+    /// artifact). The CLI flag `-Ddebug-info=<full|split|none>`
+    /// sets this. See `main.zig`'s `resolveDebugInfoPolicy` for
+    /// the full resolution rules.
+    debug_info: ?DebugInfo = null,
+    /// Phase 0 — DWARF foundation: optional frame-pointer override.
+    /// Null defers to the optimize-mode default (Debug/ReleaseSafe
+    /// keep frame pointers so sampling profilers work; ReleaseFast
+    /// / ReleaseSmall drop them for the ~1-3% perf delta). The
+    /// CLI flag `-Dframe-pointers=<on|off>` sets this.
+    frame_pointers: ?bool = null,
     /// Cross-compilation target triple selected by the manifest
     /// (`Zap.Manifest.target`, e.g. "aarch64-linux-gnu"). Null means
     /// "native host" — the default when neither the manifest nor the
@@ -65,6 +79,11 @@ pub const BuildConfig = struct {
 
     pub const Kind = enum { bin, lib, obj };
     pub const Optimize = enum { debug, release_safe, release_fast, release_small };
+    /// Phase 0 — DWARF foundation: per-build override values.
+    /// Mirrors `main.DebugInfoOverride` byte-for-byte; defined
+    /// here so `BuildConfig` (a manifest-CTFE-visible struct) is
+    /// self-contained.
+    pub const DebugInfo = enum { full, split, none };
 
     pub const Pipeline = struct {
         steps: []const Step = &.{},
