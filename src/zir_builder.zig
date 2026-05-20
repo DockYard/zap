@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const ir = @import("ir.zig");
 const elision = @import("memory/elision.zig");
 const progress_mod = @import("progress.zig");
+const zap_symbol_table = @import("zap_symbol_table.zig");
 const Allocator = std.mem.Allocator;
 
 const native_endian: std.builtin.Endian = builtin.cpu.arch.endian();
@@ -450,6 +451,14 @@ pub const ZirDriver = struct {
     allocator: Allocator,
     program: ?ir.Program,
     lib_mode: bool = false,
+    /// Reversible mangled-name ↔ Zap-symbol table populated as each
+    /// IR function is emitted (see Phase 0 of the error-system
+    /// roadmap). Owned by the driver; flushed to a sidecar
+    /// `<artifact>.zap-symbols` file by the build path after
+    /// linking finishes (`flushSymbolTable`). Lazy-initialized on
+    /// the first `recordSymbolMapping` call so library / synthetic
+    /// builds that never emit a function pay no memory cost.
+    symbol_table_builder: ?zap_symbol_table.Builder = null,
     /// Builder entry point: when set, emits a `pub const zap_builder_entry`
     /// declaration pointing to this function. start.zig checks for this
     /// declaration to activate the builder runtime.
@@ -650,6 +659,46 @@ pub const ZirDriver = struct {
         self.reuse_backed_tuple_locals.deinit(self.allocator);
         self.capture_param_refs.deinit(self.allocator);
         self.pending_ret_ty_untracked.deinit(self.allocator);
+        if (self.symbol_table_builder) |*sym| sym.deinit();
+    }
+
+    /// Record one Zap → Zig mangled-name mapping in the side table.
+    /// Called from `emitFunction` for every Zap function the ZIR
+    /// driver hands to the fork. Lazy-initializes the underlying
+    /// builder on first use so library builds without functions pay
+    /// no cost.
+    ///
+    /// `mangled` is the Zig declaration name the linker will see
+    /// (typically `<struct_path>.<local_name>`); for the entry-point
+    /// rewrite to `main` we record both that the Zap function is
+    /// owned by some struct (`zap_struct`) *and* that the linker
+    /// will publish the symbol as `main` — the reverse lookup from
+    /// `main` then resolves to the original Zap function.
+    fn recordSymbolMapping(
+        self: *ZirDriver,
+        mangled: []const u8,
+        func: ir.Function,
+    ) !void {
+        if (self.symbol_table_builder == null) {
+            self.symbol_table_builder = zap_symbol_table.Builder.init(self.allocator);
+        }
+        const local = if (func.local_name.len > 0) func.local_name else func.name;
+        const stripped = zap_symbol_table.Builder.stripAritySuffix(local);
+        const arity: u32 = stripped.arity orelse func.arity;
+        try self.symbol_table_builder.?.record(mangled, func.struct_name, stripped.base, arity);
+    }
+
+    /// Encode the accumulated symbol table to its canonical binary
+    /// form. Returns an owned `[]u8` (caller must free). Returns
+    /// `null` when no mappings were recorded — a library build, an
+    /// entry-only stub, or a misuse like calling this before any
+    /// `emitFunction`. Callers that want a deterministic empty blob
+    /// can synthesize one via `zap_symbol_table.Builder.init` +
+    /// `encode`.
+    pub fn encodeSymbolTable(self: *ZirDriver) !?[]u8 {
+        const builder = if (self.symbol_table_builder) |*b| b else return null;
+        if (builder.entries.items.len == 0) return null;
+        return try builder.encode();
     }
 
     /// Mark a local whose ownership was transferred into the function's
@@ -3489,6 +3538,18 @@ pub const ZirDriver = struct {
             func.name;
         if (zir_builder_begin_func(self.handle, emit_name.ptr, @intCast(emit_name.len), ret_type) != 0) {
             return error.BeginFuncFailed;
+        }
+        // Phase 0 — DWARF foundation: record the mangled-symbol ↔
+        // Zap-symbol mapping for the side table that ships alongside
+        // the binary. Skip when the function has no Zap source
+        // identity (synthetic helpers may have a blank `func.name`).
+        if (func.local_name.len > 0 or func.name.len > 0) {
+            const mangled = if (self.current_emit_struct) |s|
+                try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ s, emit_name })
+            else
+                try self.allocator.dupe(u8, emit_name);
+            defer self.allocator.free(mangled);
+            try self.recordSymbolMapping(mangled, func);
         }
 
         if (is_main) {
@@ -8493,6 +8554,11 @@ pub const BuildError = error{
     UnknownLocal,
     ZirInjectionFailed,
     OutOfMemory,
+    /// Phase 0 — DWARF foundation: two emitted functions hashed to
+    /// the same Zig-mangled symbol name. Surfaces a monomorphization
+    /// bug; the symbol table cannot be made reversible until the
+    /// collision is fixed.
+    DuplicateMangledName,
 };
 
 pub fn buildAndInject(
@@ -8506,6 +8572,15 @@ pub fn buildAndInject(
     arc_ownership: ?*const @import("arc_liveness.zig").ProgramArcOwnership,
     declared_caps: u64,
     progress: ?*progress_mod.Reporter,
+    /// Phase 0 — DWARF foundation: when non-null, the encoded
+    /// reversible mangled-symbol ↔ Zap-symbol side table is
+    /// written here on success. Caller takes ownership of the
+    /// returned slice (alloc'd from `allocator`) and frees it
+    /// after writing the sidecar / embedding it. `null` means the
+    /// caller does not want a table (e.g. the legacy test harness
+    /// or a builder run that emitted no functions); the driver
+    /// still records mappings, but they are discarded.
+    out_symbol_table: ?*?[]u8,
 ) BuildError!void {
     // Register the runtime struct if a path was provided.
     if (progress) |reporter| reporter.stage("ZIR: registering runtime", .{});
@@ -8528,6 +8603,18 @@ pub fn buildAndInject(
         driver.deinit(); // destroy builder on error path
         return err;
     };
+
+    // Encode the symbol table BEFORE handing the builder to the
+    // injection step (which frees it). Failure to encode is fatal
+    // for the build — a duplicate mangled name signals a real bug
+    // in monomorphization. The caller may pass null to opt out.
+    if (out_symbol_table) |out_ptr| {
+        const encoded = driver.encodeSymbolTable() catch |err| {
+            driver.deinit();
+            return err;
+        };
+        out_ptr.* = encoded;
+    }
 
     // zir_builder_inject consumes the builder handle (frees it internally),
     // so we must NOT call zir_builder_destroy afterward.

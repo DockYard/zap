@@ -138,6 +138,12 @@ pub const CompileError = error{
     /// maps to this error.
     LinkObjectFileNotReadable,
     OutOfMemory,
+    /// Phase 0 — DWARF foundation: the symbol-table builder hit a
+    /// duplicate mangled name across two emitted functions. Bubbles
+    /// up through `injectAndUpdate` so the caller can surface a
+    /// build-fatal diagnostic instead of writing a non-reversible
+    /// sidecar.
+    DuplicateMangledName,
 };
 
 pub const CompileOptions = struct {
@@ -210,6 +216,17 @@ pub const CompileOptions = struct {
     active_manager_source_path: []const u8,
     /// Shared CLI progress reporter, owned by the command driver.
     progress: ?*progress_mod.Reporter = null,
+    /// Phase 0 — DWARF foundation: when true (the default), the ZIR
+    /// backend writes the reversible mangled-symbol ↔ Zap-symbol
+    /// side table to `<output_path>.zap-symbols` on a successful
+    /// compile. Disabled automatically for lib/obj outputs (those
+    /// link as static archives or object files and have no symbol
+    /// resolver to drive). Phase-2's crash printer locates the
+    /// sidecar by deriving the same `<artifact>.zap-symbols` path
+    /// from the executable path at startup, so the convention is
+    /// load-bearing — do not change it without updating the
+    /// runtime-side loader.
+    emit_symbol_table_sidecar: bool = true,
 };
 
 /// Create a ZirContext compilation context from the given options.
@@ -379,7 +396,23 @@ fn publishIncrementalOutput(allocator: std.mem.Allocator, ctx: *ZirContext, outp
 pub fn injectAndUpdate(allocator: std.mem.Allocator, program: ir.Program, ctx: *ZirContext, options: CompileOptions) CompileError!void {
     // Build ZIR via C-ABI calls and inject into compilation.
     const lib_mode = options.output_mode == 1;
-    try zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode, options.builder_entry, options.analysis_context, options.arc_ownership, options.declared_caps, options.progress);
+    const want_sidecar = options.emit_symbol_table_sidecar and options.output_mode == 0 and options.output_path.len > 0;
+    var symbol_table_bytes: ?[]u8 = null;
+    defer if (symbol_table_bytes) |bytes| allocator.free(bytes);
+    const out_sym_ptr: ?*?[]u8 = if (want_sidecar) &symbol_table_bytes else null;
+    try zir_builder.buildAndInject(
+        allocator,
+        program,
+        ctx,
+        null,
+        lib_mode,
+        options.builder_entry,
+        options.analysis_context,
+        options.arc_ownership,
+        options.declared_caps,
+        options.progress,
+        out_sym_ptr,
+    );
 
     // Run Sema + codegen + link.
     const update_result = if (options.progress) |progress| blk: {
@@ -396,6 +429,41 @@ pub fn injectAndUpdate(allocator: std.mem.Allocator, program: ir.Program, ctx: *
     if (options.incremental) {
         try publishIncrementalOutput(allocator, ctx, options.output_path);
     }
+
+    if (want_sidecar) {
+        if (symbol_table_bytes) |bytes| {
+            const sidecar_path = try std.fmt.allocPrint(allocator, "{s}.zap-symbols", .{options.output_path});
+            defer allocator.free(sidecar_path);
+            writeSymbolTableSidecar(sidecar_path, bytes) catch |err| {
+                std.debug.print(
+                    "Warning: failed to write zap symbol-table sidecar at {s}: {s}\n",
+                    .{ sidecar_path, @errorName(err) },
+                );
+            };
+        }
+    }
+}
+
+/// Write the encoded symbol-table blob to `path`, creating parent
+/// directories as needed. Atomic via a temp-file + rename so a partial
+/// write (out of disk space, signal during write) never leaves a
+/// half-decoded sidecar in place. Phase 2's crash printer reads this
+/// file directly; a corrupt blob would point the printer at a bogus
+/// Zap symbol.
+fn writeSymbolTableSidecar(path: []const u8, bytes: []const u8) !void {
+    const io = std.Options.debug_io;
+    if (std.fs.path.dirname(path)) |dir| {
+        std.Io.Dir.cwd().createDirPath(io, dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    var tmp_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
+    // Write to a temp file first, then rename, so a partial write
+    // never publishes a half-decoded sidecar.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp_path, .data = bytes });
+    try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, io);
 }
 
 /// Prepare the context for an incremental update by saving current ZIR as
@@ -493,7 +561,23 @@ fn runPreparedUpdate(
 /// starts, the prepared context is rolled back to the prior ZIR baseline.
 pub fn injectPreparedAndUpdate(allocator: std.mem.Allocator, program: ir.Program, ctx: *ZirContext, options: CompileOptions) CompileError!void {
     const lib_mode = options.output_mode == 1;
-    zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode, options.builder_entry, options.analysis_context, options.arc_ownership, options.declared_caps, options.progress) catch |inject_err| {
+    const want_sidecar = options.emit_symbol_table_sidecar and options.output_mode == 0 and options.output_path.len > 0;
+    var symbol_table_bytes: ?[]u8 = null;
+    defer if (symbol_table_bytes) |bytes| allocator.free(bytes);
+    const out_sym_ptr: ?*?[]u8 = if (want_sidecar) &symbol_table_bytes else null;
+    zir_builder.buildAndInject(
+        allocator,
+        program,
+        ctx,
+        null,
+        lib_mode,
+        options.builder_entry,
+        options.analysis_context,
+        options.arc_ownership,
+        options.declared_caps,
+        options.progress,
+        out_sym_ptr,
+    ) catch |inject_err| {
         abortUpdate(ctx) catch |abort_err| {
             std.debug.print(
                 "Error: failed to abort prepared incremental update after ZIR injection failure ({s}); context must be discarded: {s}\n",
@@ -504,6 +588,19 @@ pub fn injectPreparedAndUpdate(allocator: std.mem.Allocator, program: ir.Program
         return inject_err;
     };
     try runPreparedUpdate(allocator, ctx, options);
+
+    if (want_sidecar) {
+        if (symbol_table_bytes) |bytes| {
+            const sidecar_path = try std.fmt.allocPrint(allocator, "{s}.zap-symbols", .{options.output_path});
+            defer allocator.free(sidecar_path);
+            writeSymbolTableSidecar(sidecar_path, bytes) catch |err| {
+                std.debug.print(
+                    "Warning: failed to write zap symbol-table sidecar at {s}: {s}\n",
+                    .{ sidecar_path, @errorName(err) },
+                );
+            };
+        }
+    }
 }
 
 /// Inject only the prepared modules and run the incremental update.
