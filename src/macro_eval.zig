@@ -653,6 +653,9 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             if (std.mem.eql(u8, form_name, "source_text")) {
                 return sourceTextIntrinsic(env, arg_elems);
             }
+            if (std.mem.eql(u8, form_name, "source_location")) {
+                return sourceLocationIntrinsic(env, arg_elems);
+            }
 
             // make_call(form_name_string, args_list) — build a
             // 3-tuple AST node `{atom(form_name), [], args}`. The form
@@ -1993,6 +1996,37 @@ fn sourceTextIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue 
     const buf = env.alloc.alloc(u8, text.len) catch return MacroEvalError.OutOfMemory;
     @memcpy(buf, text);
     return CtValue{ .string = buf };
+}
+
+/// `source_location(expr)`: return `path:line` for an AST node.
+/// Missing spans, generated nodes, or unavailable source metadata return the
+/// empty string so macros can omit location output without failing expansion.
+fn sourceLocationIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return CtValue{ .string = "" };
+    if (!hasReflectionCapability(env)) {
+        env.last_capability_error = std.fmt.allocPrint(
+            env.alloc,
+            "macro `{s}` reached `source_location` without the inferred reflect_source capability — capability inference is out of sync with the call graph",
+            .{env.current_macro_name orelse "<top-level>"},
+        ) catch return MacroEvalError.EvalFailed;
+        return MacroEvalError.EvalFailed;
+    }
+
+    const value = try eval(env, args[0]);
+    const ctx = env.struct_ctx orelse return CtValue{ .string = "" };
+    const meta = ctValueNodeMeta(value) orelse return CtValue{ .string = "" };
+    const source_id = meta.span.source_id orelse return CtValue{ .string = "" };
+    const path = ctx.graph.sourcePathById(source_id) orelse return CtValue{ .string = "" };
+    if (path.len == 0) return CtValue{ .string = "" };
+
+    const source = ctx.graph.sourceContentById(source_id);
+    const line = if (source.len > 0)
+        lineNumberFromOffset(source, meta.span.start)
+    else
+        meta.span.line;
+    if (line == 0) return CtValue{ .string = "" };
+
+    return CtValue{ .string = std.fmt.allocPrint(env.alloc, "{s}:{d}", .{ path, line }) catch return MacroEvalError.OutOfMemory };
 }
 
 fn ctValueNodeMeta(value: CtValue) ?ast.NodeMeta {

@@ -432,7 +432,7 @@ test "ArcOptimizer marks borrowed params as skippable" {
     const lambda_sets_arr = try alloc.alloc(lattice.LambdaSet, 1);
     defer alloc.free(lambda_sets_arr);
     lambda_sets_arr[0] = lattice.LambdaSet.empty();
-    try ctx.function_summaries.put(0, .{
+    try ctx.putFunctionSummaryClone(0, .{
         .param_summaries = param_summaries,
         .return_summary = lattice.ReturnSummary.unknown(),
         .may_diverge = false,

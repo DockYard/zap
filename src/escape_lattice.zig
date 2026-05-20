@@ -558,15 +558,69 @@ pub const FunctionSummary = struct {
 
     pub fn conservative(num_params: usize, allocator: std.mem.Allocator) !FunctionSummary {
         const params = try allocator.alloc(ParamSummary, num_params);
+        errdefer allocator.free(params);
         @memset(params, ParamSummary.conservative());
+
         const lambda_sets = try allocator.alloc(LambdaSet, num_params);
+        errdefer allocator.free(lambda_sets);
         @memset(lambda_sets, LambdaSet.empty());
+
         return .{
             .param_summaries = params,
             .return_summary = ReturnSummary.unknown(),
             .may_diverge = true,
             .param_lambda_sets = lambda_sets,
         };
+    }
+
+    /// Deep-clone every slice owned by this summary into `allocator`.
+    pub fn clone(self: FunctionSummary, allocator: std.mem.Allocator) !FunctionSummary {
+        const param_summaries = try allocator.dupe(ParamSummary, self.param_summaries);
+        errdefer allocator.free(param_summaries);
+
+        const return_summary = try self.return_summary.clone(allocator);
+        errdefer {
+            var owned_return_summary = return_summary;
+            owned_return_summary.deinit(allocator);
+        }
+
+        const param_lambda_sets = try allocator.alloc(LambdaSet, self.param_lambda_sets.len);
+        errdefer allocator.free(param_lambda_sets);
+
+        var initialized_lambda_sets: usize = 0;
+        errdefer {
+            for (param_lambda_sets[0..initialized_lambda_sets]) |*lambda_set| {
+                lambda_set.deinit(allocator);
+            }
+        }
+
+        for (self.param_lambda_sets, 0..) |lambda_set, index| {
+            param_lambda_sets[index] = try lambda_set.clone(allocator);
+            initialized_lambda_sets += 1;
+        }
+
+        return .{
+            .param_summaries = param_summaries,
+            .return_summary = return_summary,
+            .may_diverge = self.may_diverge,
+            .param_lambda_sets = param_lambda_sets,
+        };
+    }
+
+    /// Free slices owned by this summary.
+    pub fn deinit(self: *FunctionSummary, allocator: std.mem.Allocator) void {
+        allocator.free(self.param_summaries);
+        self.param_summaries = &.{};
+
+        self.return_summary.deinit(allocator);
+
+        for (@constCast(self.param_lambda_sets)) |*lambda_set| {
+            lambda_set.deinit(allocator);
+        }
+        allocator.free(self.param_lambda_sets);
+        self.param_lambda_sets = &.{};
+
+        self.may_diverge = false;
     }
 };
 
@@ -661,6 +715,18 @@ pub const ReturnSummary = struct {
             .fresh_alloc = true,
         };
     }
+
+    pub fn clone(self: ReturnSummary, allocator: std.mem.Allocator) !ReturnSummary {
+        return .{
+            .param_sources = try allocator.dupe(u32, self.param_sources),
+            .fresh_alloc = self.fresh_alloc,
+        };
+    }
+
+    pub fn deinit(self: *ReturnSummary, allocator: std.mem.Allocator) void {
+        allocator.free(self.param_sources);
+        self.* = ReturnSummary.unknown();
+    }
 };
 
 // ============================================================
@@ -680,6 +746,15 @@ pub const LambdaSet = struct {
     pub fn singleton(func: ir.FunctionId) LambdaSet {
         // Note: Caller must ensure the slice lives long enough.
         return .{ .members = &.{func} };
+    }
+
+    pub fn clone(self: LambdaSet, allocator: std.mem.Allocator) !LambdaSet {
+        return .{ .members = try allocator.dupe(ir.FunctionId, self.members) };
+    }
+
+    pub fn deinit(self: *LambdaSet, allocator: std.mem.Allocator) void {
+        allocator.free(self.members);
+        self.* = LambdaSet.empty();
     }
 
     pub fn size(self: LambdaSet) usize {
@@ -1035,7 +1110,8 @@ pub const AnalysisContext = struct {
     /// re-walking the IR.
     alloc_site_for_value: std.AutoHashMap(ValueKey, AllocSiteId),
 
-    /// Per-function interprocedural summary.
+    /// Per-function interprocedural summary. Values stored here are deep-owned
+    /// clones; insert through `putFunctionSummaryClone`.
     function_summaries: std.AutoHashMap(ir.FunctionId, FunctionSummary),
 
     /// Lambda sets per function-typed binding.
@@ -1119,6 +1195,11 @@ pub const AnalysisContext = struct {
         self.ownership_states.deinit();
         self.alloc_summaries.deinit();
         self.alloc_site_for_value.deinit();
+
+        var summary_iter = self.function_summaries.iterator();
+        while (summary_iter.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
         self.function_summaries.deinit();
 
         // Clean up lambda set member slices (allocated by toLambdaSet).
@@ -1261,7 +1342,19 @@ pub const AnalysisContext = struct {
 
     /// Record a function summary.
     pub fn putFunctionSummary(self: *AnalysisContext, func: ir.FunctionId, summary: FunctionSummary) !void {
-        try self.function_summaries.put(func, summary);
+        try self.putFunctionSummaryClone(func, summary);
+    }
+
+    /// Record a deep-owned clone of a function summary.
+    pub fn putFunctionSummaryClone(self: *AnalysisContext, func: ir.FunctionId, summary: FunctionSummary) !void {
+        var owned_summary = try summary.clone(self.allocator);
+        errdefer owned_summary.deinit(self.allocator);
+
+        const entry = try self.function_summaries.getOrPut(func);
+        if (entry.found_existing) {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        entry.value_ptr.* = owned_summary;
     }
 
     /// Record a borrow verdict.
@@ -1412,6 +1505,59 @@ test "lambda set specialization decisions" {
 
     // Contifiable always wins.
     try std.testing.expectEqual(SpecializationDecision.contified, specializationForLambdaSet(empty, true));
+}
+
+test "AnalysisContext clones function summaries and owns slices" {
+    const allocator = std.testing.allocator;
+
+    var source = try FunctionSummary.conservative(2, allocator);
+    errdefer source.deinit(allocator);
+
+    source.return_summary = .{
+        .param_sources = try allocator.dupe(u32, &.{ 0, 1 }),
+        .fresh_alloc = false,
+    };
+
+    const source_param_summaries = @constCast(source.param_summaries);
+    source_param_summaries[0] = ParamSummary.safe();
+    source_param_summaries[1] = ParamSummary.conservative();
+
+    const source_lambda_sets = @constCast(source.param_lambda_sets);
+    source_lambda_sets[1] = .{
+        .members = try allocator.dupe(ir.FunctionId, &.{ 42, 99 }),
+    };
+
+    var context = AnalysisContext.init(allocator);
+    defer context.deinit();
+    try context.putFunctionSummaryClone(7, source);
+
+    source_param_summaries[0].read_only = false;
+    @constCast(source.return_summary.param_sources)[0] = 1;
+    @constCast(source_lambda_sets[1].members)[0] = 123;
+    source.deinit(allocator);
+
+    const stored = context.getFunctionSummary(7).?;
+    try std.testing.expect(stored.param_summaries[0].read_only);
+    try std.testing.expectEqual(@as(u32, 0), stored.return_summary.param_sources[0]);
+    try std.testing.expectEqual(@as(ir.FunctionId, 42), stored.param_lambda_sets[1].members[0]);
+}
+
+test "AnalysisContext deinitializes replaced function summary" {
+    const allocator = std.testing.allocator;
+
+    var first = try FunctionSummary.conservative(1, allocator);
+    defer first.deinit(allocator);
+    var second = try FunctionSummary.conservative(2, allocator);
+    defer second.deinit(allocator);
+
+    var context = AnalysisContext.init(allocator);
+    defer context.deinit();
+
+    try context.putFunctionSummaryClone(3, first);
+    try context.putFunctionSummaryClone(3, second);
+
+    const stored = context.getFunctionSummary(3).?;
+    try std.testing.expectEqual(@as(usize, 2), stored.param_summaries.len);
 }
 
 test "FieldEscapeMap join" {

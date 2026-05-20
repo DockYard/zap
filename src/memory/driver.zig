@@ -189,10 +189,12 @@ pub const ResolvedManager = struct {
     refcount_sized_extension: bool,
 };
 
-const MANAGER_VALIDATION_CACHE_SCHEMA = "zap.manager.validation.cache.v1";
+const MANAGER_VALIDATION_CACHE_SCHEMA = "zap.manager.validation.cache.v2";
 const MANAGER_VALIDATION_SIDECAR_MAGIC: u32 = 0x4d_56_43_5a; // "ZCVM" little-endian
-const MANAGER_VALIDATION_SIDECAR_VERSION: u16 = 1;
-const MANAGER_VALIDATION_SIDECAR_LEN: usize = 168;
+const MANAGER_VALIDATION_SIDECAR_VERSION: u16 = 2;
+const MANAGER_VALIDATION_SIDECAR_LEN: usize = 216;
+const TOOLCHAIN_IDENTITY_DIGEST_LEN: usize = std.crypto.hash.sha2.Sha256.digest_length;
+const ToolchainIdentityDigest = [TOOLCHAIN_IDENTITY_DIGEST_LEN]u8;
 
 /// Lightweight, owned resolution of the selected manager backend source.
 ///
@@ -295,17 +297,17 @@ pub const ResolveOptions = struct {
     /// Optional Zig stdlib directory passed through to the fork primitive.
     /// When null the primitive auto-detects.
     zig_lib_dir: ?[]const u8 = null,
-    /// Identity hash for the running Zap compiler / Zig fork toolchain.
+    /// Identity digest for the running Zap compiler / Zig fork toolchain.
     /// Production call sites must pass the already-computed value from
     /// `src/main.zig`; test-only defaults are accepted so focused unit
     /// tests can construct minimal options without a full toolchain
     /// identity scan.
-    compiler_identity_hash: ?u64 = null,
-    /// Identity hash for the Zig stdlib directory used by the fork.
+    compiler_identity_digest: ?ToolchainIdentityDigest = null,
+    /// Identity digest for the Zig stdlib directory used by the fork.
     /// Production call sites must pass the already-computed value from
     /// `src/main.zig`; test-only defaults are accepted alongside
-    /// `compiler_identity_hash`.
-    zig_lib_identity_hash: ?u64 = null,
+    /// `compiler_identity_digest`.
+    zig_lib_identity_digest: ?ToolchainIdentityDigest = null,
     /// Optimize mode forwarded to the fork primitive.
     optimize: ZapForkOptimize = .ReleaseSafe,
     /// Cross-compile target triple (e.g. `"aarch64-linux-gnu"`). Null
@@ -694,8 +696,8 @@ fn canonicalPathOrSelf(allocator: std.mem.Allocator, path: []const u8) ![]const 
 // ---------------------------------------------------------------------------
 
 const CacheIdentities = struct {
-    compiler_identity_hash: u64,
-    zig_lib_identity_hash: u64,
+    compiler_identity_digest: ToolchainIdentityDigest,
+    zig_lib_identity_digest: ToolchainIdentityDigest,
 };
 
 const ManagerValidationRecordIdentity = struct {
@@ -709,8 +711,8 @@ const ManagerValidationRecordIdentity = struct {
     host_arch_hash: u64,
     host_os_hash: u64,
     host_abi_hash: u64,
-    compiler_identity_hash: u64,
-    zig_lib_identity_hash: u64,
+    compiler_identity_digest: ToolchainIdentityDigest,
+    zig_lib_identity_digest: ToolchainIdentityDigest,
     optimize_tag: u8,
     target_is_native: bool,
 };
@@ -727,31 +729,31 @@ const ManagerValidationCacheEntry = struct {
 };
 
 fn resolveCacheIdentities(options: ResolveOptions, diag: *DriverDiagnostic) ResolveError!CacheIdentities {
-    const compiler_identity_hash = options.compiler_identity_hash orelse blk: {
+    const compiler_identity_digest = options.compiler_identity_digest orelse blk: {
         if (builtin.is_test) {
-            break :blk 0;
+            break :blk zeroToolchainIdentityDigest();
         } else {
             diag.write(
-                "memory manager driver: production resolve omitted compiler identity hash",
+                "memory manager driver: production resolve omitted compiler identity digest",
                 .{},
             );
             return ResolveError.InternalError;
         }
     };
-    const zig_lib_identity_hash = options.zig_lib_identity_hash orelse blk: {
+    const zig_lib_identity_digest = options.zig_lib_identity_digest orelse blk: {
         if (builtin.is_test) {
-            break :blk 0;
+            break :blk zeroToolchainIdentityDigest();
         } else {
             diag.write(
-                "memory manager driver: production resolve omitted Zig lib identity hash",
+                "memory manager driver: production resolve omitted Zig lib identity digest",
                 .{},
             );
             return ResolveError.InternalError;
         }
     };
     return .{
-        .compiler_identity_hash = compiler_identity_hash,
-        .zig_lib_identity_hash = zig_lib_identity_hash,
+        .compiler_identity_digest = compiler_identity_digest,
+        .zig_lib_identity_digest = zig_lib_identity_digest,
     };
 }
 
@@ -797,8 +799,8 @@ fn managerValidationCacheEntry(
     hashInt(&hasher, target_descriptor.target.abi_tag);
     hashField(&hasher, cpu);
     hashField(&hasher, zig_lib_path);
-    hashInt(&hasher, identities.zig_lib_identity_hash);
-    hashInt(&hasher, identities.compiler_identity_hash);
+    hasher.update(&identities.zig_lib_identity_digest);
+    hasher.update(&identities.compiler_identity_digest);
     if (target_descriptor.is_native) {
         hashField(&hasher, host_arch);
         hashField(&hasher, host_os);
@@ -842,8 +844,8 @@ fn managerValidationCacheEntry(
             .host_arch_hash = stableHash(host_arch),
             .host_os_hash = stableHash(host_os),
             .host_abi_hash = stableHash(host_abi),
-            .compiler_identity_hash = identities.compiler_identity_hash,
-            .zig_lib_identity_hash = identities.zig_lib_identity_hash,
+            .compiler_identity_digest = identities.compiler_identity_digest,
+            .zig_lib_identity_digest = identities.zig_lib_identity_digest,
             .optimize_tag = @intCast(@intFromEnum(options.optimize)),
             .target_is_native = target_descriptor.is_native,
         },
@@ -926,8 +928,10 @@ fn readValidationSidecar(
     if (readScalar(u64, bytes, &cursor) != identity.host_arch_hash) return null;
     if (readScalar(u64, bytes, &cursor) != identity.host_os_hash) return null;
     if (readScalar(u64, bytes, &cursor) != identity.host_abi_hash) return null;
-    if (readScalar(u64, bytes, &cursor) != identity.compiler_identity_hash) return null;
-    if (readScalar(u64, bytes, &cursor) != identity.zig_lib_identity_hash) return null;
+    if (!std.mem.eql(u8, bytes[cursor..][0..TOOLCHAIN_IDENTITY_DIGEST_LEN], &identity.compiler_identity_digest)) return null;
+    cursor += TOOLCHAIN_IDENTITY_DIGEST_LEN;
+    if (!std.mem.eql(u8, bytes[cursor..][0..TOOLCHAIN_IDENTITY_DIGEST_LEN], &identity.zig_lib_identity_digest)) return null;
+    cursor += TOOLCHAIN_IDENTITY_DIGEST_LEN;
     if (readScalar(u8, bytes, &cursor) != identity.optimize_tag) return null;
     if ((readScalar(u8, bytes, &cursor) != 0) != identity.target_is_native) return null;
     if (readScalar(u16, bytes, &cursor) != 0) return null;
@@ -967,8 +971,10 @@ fn writeValidationSidecar(
     writeScalar(u64, &bytes, &cursor, identity.host_arch_hash);
     writeScalar(u64, &bytes, &cursor, identity.host_os_hash);
     writeScalar(u64, &bytes, &cursor, identity.host_abi_hash);
-    writeScalar(u64, &bytes, &cursor, identity.compiler_identity_hash);
-    writeScalar(u64, &bytes, &cursor, identity.zig_lib_identity_hash);
+    @memcpy(bytes[cursor..][0..TOOLCHAIN_IDENTITY_DIGEST_LEN], &identity.compiler_identity_digest);
+    cursor += TOOLCHAIN_IDENTITY_DIGEST_LEN;
+    @memcpy(bytes[cursor..][0..TOOLCHAIN_IDENTITY_DIGEST_LEN], &identity.zig_lib_identity_digest);
+    cursor += TOOLCHAIN_IDENTITY_DIGEST_LEN;
     writeScalar(u8, &bytes, &cursor, identity.optimize_tag);
     writeScalar(u8, &bytes, &cursor, if (identity.target_is_native) 1 else 0);
     writeScalar(u16, &bytes, &cursor, 0);
@@ -1005,6 +1011,14 @@ fn sha256Digest(bytes: []const u8) [32]u8 {
     var out: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &out, .{});
     return out;
+}
+
+fn zeroToolchainIdentityDigest() ToolchainIdentityDigest {
+    return [_]u8{0} ** TOOLCHAIN_IDENTITY_DIGEST_LEN;
+}
+
+fn testToolchainIdentityDigest(byte: u8) ToolchainIdentityDigest {
+    return [_]u8{byte} ** TOOLCHAIN_IDENTITY_DIGEST_LEN;
 }
 
 fn digestHex(buffer: *[64]u8, digest: [32]u8) []const u8 {
@@ -2447,8 +2461,8 @@ const CacheTestProject = struct {
             .zap_source_root = self.tmp_path,
             .cache_dir = self.cache_root,
             .zig_lib_dir = self.tmp_path,
-            .compiler_identity_hash = 0x1234_5678,
-            .zig_lib_identity_hash = 0x8765_4321,
+            .compiler_identity_digest = testToolchainIdentityDigest(0x12),
+            .zig_lib_identity_digest = testToolchainIdentityDigest(0x87),
             .fork_compile_fn = fork_compile_fn,
         };
     }
@@ -2712,8 +2726,8 @@ test "Phase 2 adapters: stdlib manager resolves through generic compile validati
         .cache_dir = cache_root,
         .fork_compile_fn = mockForkCompileNoOp,
     }, .{
-        .compiler_identity_hash = 0,
-        .zig_lib_identity_hash = 0,
+        .compiler_identity_digest = zeroToolchainIdentityDigest(),
+        .zig_lib_identity_digest = zeroToolchainIdentityDigest(),
     }, &diag);
     defer cache_entry.deinit(allocator);
     std.Io.Dir.cwd().access(std.Options.debug_io, cache_entry.object_path, .{}) catch return error.Unexpected;

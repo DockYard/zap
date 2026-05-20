@@ -3,7 +3,8 @@
 
   `use Zest.Runner` expands into a test runner `main/1` that discovers
   Zap source files from configured glob patterns, reflects their structs,
-  invokes each discovered struct's `run/0`, and then prints the summary.
+  runs the discovered Zest cases in seeded order, and then prints the
+  summary.
   """
 
 pub struct Zest.Runner {
@@ -25,12 +26,15 @@ pub struct Zest.Runner {
     source_structs = list_flatten(for source_path <- source_paths {
       SourceGraph.structs(source_path)
     })
-    test_structs = for s <- source_structs, Struct.has_function?(s, "run", 0) {
+    test_structs = for s <- source_structs, Struct.has_function?(s, "zest_run_selected_case", 1) and Struct.has_function?(s, "zest_case_count", 0) {
       s
     }
-    run_calls = for s <- test_structs {
+    total_case_count = build_total_case_count(test_structs, 0)
+    selected_suite_scans = for s <- test_structs {
       quote {
-        unquote(s).run()
+        if :zig.Zest.enter_selected_suite(unquote(s).zest_case_count()) {
+          unquote(s).zest_run_selected_case(:zig.Zest.selected_suite_index())
+        }
       }
     }
 
@@ -43,8 +47,36 @@ pub struct Zest.Runner {
 
       pub fn main(_args :: [String]) -> u8 {
         Zest.Runner.configure()
-        unquote_splicing(run_calls)
+        zest_run_discovered_cases(0, zest_total_case_count())
         Zest.Runner.run()
+      }
+
+      fn zest_total_case_count() -> i64 {
+        unquote(total_case_count)
+      }
+
+      fn zest_run_discovered_cases(position :: i64, total_count :: i64) -> String {
+        if position >= total_count {
+          "ok"
+        } else {
+          :zig.Zest.begin_shuffle_pass(position, total_count)
+          unquote_splicing(selected_suite_scans)
+          :zig.Zest.end_shuffle_pass()
+          zest_run_discovered_cases(position + 1, total_count)
+        }
+      }
+    }
+  }
+
+  macro build_total_case_count(test_structs :: Expr, index :: Expr) -> Expr {
+    if index >= list_length(test_structs) {
+      quote { 0 }
+    } else {
+      test_struct = list_at(test_structs, index)
+      rest = build_total_case_count(test_structs, index + 1)
+
+      quote {
+        unquote(test_struct).zest_case_count() + unquote(rest)
       }
     }
   }
@@ -73,17 +105,21 @@ pub struct Zest.Runner {
   }
 
   @doc = """
-    Parses `--seed` and `--timeout` from CLI arguments and applies
-    them to the test tracker. If `--seed <integer>` is present,
-    sets the seed explicitly for reproducible ordering. Otherwise
-    the tracker generates a seed from the system clock.
+    Parses Zest runtime options from CLI arguments and applies them
+    to the test tracker. If `--seed <integer>` is present, sets the
+    seed explicitly for reproducible ordering. Otherwise the tracker
+    generates a seed from the system clock.
 
     If `--timeout <milliseconds>` is present, sets a per-test
     timeout. Tests exceeding the timeout are marked as failed
     with a yellow "T" indicator.
 
+    If `--timings` is present, the summary prints every test case
+    duration in execution order. If `--slowest <count>` is present,
+    the summary prints the slowest `count` test cases.
+
     Call this before running any tests to ensure the seed and
-    timeout are set.
+    reporting options are set.
     """
 
   pub fn configure() -> Atom {
@@ -119,8 +155,8 @@ pub struct Zest.Runner {
   }
 
   @doc = """
-    Recursively scans CLI arguments for `--seed <value>` and
-    `--timeout <milliseconds>`, applying each to the test tracker.
+    Recursively scans CLI arguments for Zest runtime options and applies
+    each to the test tracker.
     """
 
   pub fn parse_cli_args(index :: i64, count :: i64) -> Atom {
@@ -143,7 +179,21 @@ pub struct Zest.Runner {
             :ok
           }
         } else {
-          parse_cli_args(index + 1, count)
+          if System.arg_at(index) == "--timings" {
+            :zig.Zest.enable_timings()
+            parse_cli_args(index + 1, count)
+          } else {
+            if System.arg_at(index) == "--slowest" {
+              if index + 1 < count {
+                :zig.Zest.set_slowest_limit(Integer.parse(System.arg_at(index + 1)))
+                parse_cli_args(index + 2, count)
+              } else {
+                :ok
+              }
+            } else {
+              parse_cli_args(index + 1, count)
+            }
+          }
         }
       }
     }

@@ -108,6 +108,7 @@ extern "c" fn zir_compilation_prepare_update_selected(
 extern "c" fn zir_compilation_abort_update(ctx: *ZirContext) i32;
 
 extern "c" fn zir_compilation_invalidate_file(ctx: *ZirContext, name: [*:0]const u8) i32;
+extern "c" fn zir_compilation_invalidate_root(ctx: *ZirContext) i32;
 
 extern "c" fn zir_compilation_add_link_lib(ctx: *ZirContext, name: [*:0]const u8) i32;
 
@@ -383,9 +384,11 @@ pub fn injectAndUpdate(allocator: std.mem.Allocator, program: ir.Program, ctx: *
     // Run Sema + codegen + link.
     const update_result = if (options.progress) |progress| blk: {
         progress.event("Zig: semantic analysis, codegen, link\n", .{});
+        progress.handoffExternalOutput(.clear);
         break :blk zir_compilation_update_with_progress(ctx);
     } else zir_compilation_update(ctx);
     if (update_result != 0) {
+        if (options.progress) |progress| progress.handoffExternalOutput(.clear);
         zir_compilation_print_errors(ctx);
         return error.CompilationFailed;
     }
@@ -403,15 +406,30 @@ pub fn prepareUpdate(ctx: *ZirContext) CompileError!void {
     }
 }
 
+pub const SelectedUpdateInvalidationPolicy = enum {
+    /// Preserve Zig's old-ZIR/new-ZIR instruction mapping and invalidate only
+    /// declarations/functions whose associated source hashes changed.
+    compare_source_hashes,
+    /// Force every tracked source hash in each prepared injected ZIR file stale.
+    /// Use this only for structural rebuilds where source-hash comparison is not
+    /// a valid semantic boundary.
+    force_all_source_hashes,
+};
+
 /// Prepare only the selected injected struct modules, plus the synthetic root
-/// module when `include_root` is true. This is the incremental one-file-change
-/// path; unchanged modules keep their current ZIR and are not placed into
-/// Zig's `prev_zir` diff set.
+/// module when `include_root` is true. Unchanged modules keep their current ZIR
+/// and are not placed into Zig's `prev_zir` diff set.
+///
+/// Normal selected updates must use `.compare_source_hashes`; this preserves
+/// Zig's own `updateZirRefs` compare-hash path. `.force_all_source_hashes` is
+/// reserved for frontend force-full/structural updates that intentionally give
+/// up per-declaration precision.
 pub fn prepareSelectedUpdate(
     allocator: std.mem.Allocator,
     ctx: *ZirContext,
     struct_names: []const []const u8,
     include_root: bool,
+    invalidation: SelectedUpdateInvalidationPolicy,
 ) CompileError!void {
     var name_ptrs = allocator.alloc([*]const u8, struct_names.len) catch return error.OutOfMemory;
     defer allocator.free(name_ptrs);
@@ -425,6 +443,18 @@ pub fn prepareSelectedUpdate(
 
     if (zir_compilation_prepare_update_selected(ctx, name_ptrs.ptr, name_lens.ptr, struct_names.len, include_root) != 0) {
         return error.CompilationFailed;
+    }
+
+    switch (invalidation) {
+        .compare_source_hashes => {},
+        .force_all_source_hashes => {
+            if (include_root) {
+                try forceInvalidatePreparedRoot(ctx);
+            }
+            for (struct_names) |struct_name| {
+                try forceInvalidatePreparedFile(ctx, struct_name, allocator);
+            }
+        },
     }
 }
 
@@ -443,9 +473,11 @@ fn runPreparedUpdate(
 ) CompileError!void {
     const update_result = if (options.progress) |progress| blk: {
         progress.event("Zig: semantic analysis, codegen, link\n", .{});
+        progress.handoffExternalOutput(.clear);
         break :blk zir_compilation_update_with_progress(ctx);
     } else zir_compilation_update(ctx);
     if (update_result != 0) {
+        if (options.progress) |progress| progress.handoffExternalOutput(.clear);
         zir_compilation_print_errors(ctx);
         abortUpdate(ctx) catch {};
         return error.CompilationFailed;
@@ -509,11 +541,21 @@ pub fn injectPreparedSelectedAndUpdate(
     try runPreparedUpdate(allocator, ctx, options);
 }
 
-/// Mark a named struct's root file as changed for incremental recompilation.
-pub fn invalidateFile(ctx: *ZirContext, name: []const u8, allocator: std.mem.Allocator) CompileError!void {
+/// Force every source hash in a prepared named struct's injected ZIR file stale.
+/// Ordinary selected updates should not call this path; they rely on Zig's
+/// compare-hash update mode after `prepareSelectedUpdate`.
+fn forceInvalidatePreparedFile(ctx: *ZirContext, name: []const u8, allocator: std.mem.Allocator) CompileError!void {
     const name_z = allocator.dupeZ(u8, name) catch return error.OutOfMemory;
     defer allocator.free(name_z);
     if (zir_compilation_invalidate_file(ctx, name_z) != 0) {
+        return error.CompilationFailed;
+    }
+}
+
+/// Force every source hash in the prepared synthetic root injected ZIR file
+/// stale. Ordinary selected root updates should use compare-hash mode.
+fn forceInvalidatePreparedRoot(ctx: *ZirContext) CompileError!void {
+    if (zir_compilation_invalidate_root(ctx) != 0) {
         return error.CompilationFailed;
     }
 }

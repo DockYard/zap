@@ -99,6 +99,26 @@ fn printUnexpectedRunFailure(command: []const []const u8, exit_code: u8, stdout:
     }
 }
 
+fn expectTimingOrderDiffers(first_stdout: []const u8, second_stdout: []const u8, names: []const []const u8) !void {
+    var differs = false;
+
+    for (names, 0..) |left_name, left_index| {
+        const first_left = std.mem.indexOf(u8, first_stdout, left_name) orelse return error.TestUnexpectedResult;
+        const second_left = std.mem.indexOf(u8, second_stdout, left_name) orelse return error.TestUnexpectedResult;
+
+        for (names[left_index + 1 ..]) |right_name| {
+            const first_right = std.mem.indexOf(u8, first_stdout, right_name) orelse return error.TestUnexpectedResult;
+            const second_right = std.mem.indexOf(u8, second_stdout, right_name) orelse return error.TestUnexpectedResult;
+
+            if ((first_left < first_right) != (second_left < second_right)) {
+                differs = true;
+            }
+        }
+    }
+
+    try std.testing.expect(differs);
+}
+
 fn runZapBuild(
     allocator: std.mem.Allocator,
     zap_binary: []const u8,
@@ -664,6 +684,14 @@ test "CLI: zap test runs Zest cases discovered by project-root relative pattern"
         \\    test("two") {
         \\      reject(false)
         \\    }
+        \\
+        \\    test("three") {
+        \\      assert(1 + 1 == 2)
+        \\    }
+        \\
+        \\    test("four") {
+        \\      reject(1 + 1 == 3)
+        \\    }
         \\  }
         \\}
     ;
@@ -682,23 +710,48 @@ test "CLI: zap test runs Zest cases discovered by project-root relative pattern"
     const zap_binary = try resolveZapBinary(allocator);
     defer allocator.free(zap_binary);
 
-    const result = std.process.run(allocator, getTestIo(), .{
-        .argv = &.{ zap_binary, "test", "--seed", "123" },
+    const first = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ zap_binary, "test", "--seed", "123", "--timings" },
         .cwd = .{ .path = tmp_dir_path },
         .stdout_limit = .limited(256 * 1024),
         .stderr_limit = .limited(256 * 1024),
     }) catch return error.RunFailed;
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+    defer allocator.free(first.stdout);
+    defer allocator.free(first.stderr);
 
-    const exit_code = switch (result.term) {
+    const first_exit_code = switch (first.term) {
         .exited => |code| code,
         else => return error.RunFailed,
     };
 
-    try std.testing.expectEqual(@as(u8, 0), exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "2 tests, 0 failures") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "2 assertions, 0 failures") != null);
+    const second = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ zap_binary, "test", "--seed", "456", "--timings" },
+        .cwd = .{ .path = tmp_dir_path },
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch return error.RunFailed;
+    defer allocator.free(second.stdout);
+    defer allocator.free(second.stderr);
+
+    const second_exit_code = switch (second.term) {
+        .exited => |code| code,
+        else => return error.RunFailed,
+    };
+
+    try std.testing.expectEqual(@as(u8, 0), first_exit_code);
+    try std.testing.expectEqual(@as(u8, 0), second_exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, first.stdout, "4 tests, 0 failures") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first.stdout, "4 assertions, 0 failures") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.stdout, "4 tests, 0 failures") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.stdout, "4 assertions, 0 failures") != null);
+
+    const names = [_][]const u8{
+        "SampleTest - sample - one",
+        "SampleTest - sample - two",
+        "SampleTest - sample - three",
+        "SampleTest - sample - four",
+    };
+    try expectTimingOrderDiffers(first.stdout, second.stdout, &names);
 }
 
 test "CLI: zap run doc-runner target generates documentation via Zap-side pipeline" {

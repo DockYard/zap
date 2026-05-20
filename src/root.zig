@@ -53,6 +53,8 @@ pub const project = @import("project.zig");
 pub const compiler = @import("compiler.zig");
 pub const builder = @import("builder.zig");
 pub const build_cache = @import("build_cache.zig");
+pub const frontend_policy = @import("frontend_policy.zig");
+pub const incremental_graph = @import("incremental_graph.zig");
 pub const progress = @import("progress.zig");
 pub const discovery = @import("discovery.zig");
 pub const glob = @import("glob.zig");
@@ -108,6 +110,8 @@ test {
     _ = @import("similarity.zig");
     _ = @import("project.zig");
     _ = @import("compiler.zig");
+    _ = @import("frontend_policy.zig");
+    _ = @import("incremental_graph.zig");
     _ = @import("builder.zig");
     _ = @import("build_cache.zig");
     _ = @import("discovery.zig");

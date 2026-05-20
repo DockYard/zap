@@ -80,6 +80,18 @@ pub const FileGraph = struct {
     /// the runner is querying.
     file_compile_after_globs: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
 
+    /// File path → matched source files from `@compile_after_glob`.
+    /// These are order-only dependencies for topological sorting. They
+    /// are deliberately separate from `file_imports`/`file_imported_by`
+    /// so incremental invalidation does not treat every globbed file as
+    /// an ordinary import dependency of the reflecting file.
+    file_compile_after_files: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
+
+    /// Reverse index of `file_compile_after_files`, used only by
+    /// topological sorting to release dependents when an order-only
+    /// provider file has been emitted.
+    file_compile_after_by: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
+
     pub fn init(allocator: std.mem.Allocator) FileGraph {
         return .{
             .allocator = allocator,
@@ -96,6 +108,8 @@ pub const FileGraph = struct {
             .file_source_root = std.StringHashMap([]const u8).init(allocator),
             .struct_is_private = std.StringHashMap(bool).init(allocator),
             .file_compile_after_globs = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
+            .file_compile_after_files = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
+            .file_compile_after_by = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
         };
     }
 
@@ -133,6 +147,16 @@ pub const FileGraph = struct {
             while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
         }
         self.file_compile_after_globs.deinit();
+        {
+            var it = self.file_compile_after_files.iterator();
+            while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        }
+        self.file_compile_after_files.deinit();
+        {
+            var it = self.file_compile_after_by.iterator();
+            while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        }
+        self.file_compile_after_by.deinit();
     }
 
     pub fn structForFile(self: *const FileGraph, file_path: []const u8) ?[]const u8 {
@@ -256,12 +280,9 @@ pub fn discoverWithSourceFiles(
         try drainDiscoveryQueue(alloc, &graph, &queue, source_roots, &native_type_structs);
     }
 
-    // Resolve `@compile_after_glob` declarations into struct-name imports.
-    // Now that every file is in the graph, we can glob-expand each pattern
-    // and append the matching files' primary struct names to the
-    // declaring file's imports list. The topological sort treats those as
-    // ordinary dependency edges so the declaring file always lands after
-    // its globbed peers.
+    // Resolve `@compile_after_glob` declarations into order-only file
+    // dependencies. They affect topological/evaluation order, but are not
+    // ordinary imports and must not feed broad incremental invalidation.
     try resolveCompileAfterGlobs(alloc, &graph);
 
     // Build imported_by (reverse index)
@@ -986,9 +1007,10 @@ fn extractCompileAfterGlobs(alloc: std.mem.Allocator, source: []const u8) ![]con
 }
 
 /// For each file with `@compile_after_glob` patterns, glob-expand each
-/// pattern and append the primary struct name of every matching file to
-/// the file's imports list. The topological sort then orders the
-/// declaring file after each matched peer.
+/// pattern and record matched files as order-only dependencies. The
+/// topological sort then orders the declaring file after each matched
+/// peer without exposing those edges as ordinary imports to later
+/// incremental invalidation.
 fn resolveCompileAfterGlobs(alloc: std.mem.Allocator, graph: *FileGraph) !void {
     var glob_it = graph.file_compile_after_globs.iterator();
     while (glob_it.next()) |entry| {
@@ -1010,27 +1032,49 @@ fn resolveCompileAfterGlobs(alloc: std.mem.Allocator, graph: *FileGraph) !void {
                     break :blk matched_path;
                 };
                 if (std.mem.eql(u8, lookup_key, declaring_file)) continue;
-                const struct_name = graph.file_to_struct.get(lookup_key) orelse continue;
-                const imports_entry = graph.file_imports.getOrPut(declaring_file) catch return error.OutOfMemory;
-                if (!imports_entry.found_existing) {
-                    imports_entry.value_ptr.* = .empty;
-                }
-                // Avoid duplicate edges — the topological sort caps each
-                // edge at one anyway, but cleaner imports are easier to
-                // debug when the discovery log is dumped.
-                var already_present = false;
-                for (imports_entry.value_ptr.items) |existing| {
-                    if (std.mem.eql(u8, existing, struct_name)) {
-                        already_present = true;
-                        break;
-                    }
-                }
-                if (!already_present) {
-                    imports_entry.value_ptr.append(alloc, struct_name) catch return error.OutOfMemory;
-                }
+                if (!graph.known_files.contains(lookup_key)) continue;
+                try appendCompileAfterFileEdge(alloc, graph, declaring_file, lookup_key);
             }
         }
     }
+}
+
+fn appendCompileAfterFileEdge(
+    alloc: std.mem.Allocator,
+    graph: *FileGraph,
+    declaring_file: []const u8,
+    matched_file: []const u8,
+) !void {
+    const owned_matched_file = blk: {
+        if (graph.file_compile_after_files.get(declaring_file)) |existing_matches| {
+            for (existing_matches.items) |existing| {
+                if (std.mem.eql(u8, existing, matched_file)) return;
+            }
+        }
+        break :blk try alloc.dupe(u8, matched_file);
+    };
+
+    {
+        const entry = try graph.file_compile_after_files.getOrPut(declaring_file);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        try entry.value_ptr.append(alloc, owned_matched_file);
+    }
+
+    {
+        const entry = try graph.file_compile_after_by.getOrPut(owned_matched_file);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        for (entry.value_ptr.items) |existing| {
+            if (std.mem.eql(u8, existing, declaring_file)) return;
+        }
+        try entry.value_ptr.append(alloc, declaring_file);
+    }
+}
+
+fn indexOfPath(paths: []const []const u8, needle: []const u8) ?usize {
+    for (paths, 0..) |path, index| {
+        if (std.mem.eql(u8, path, needle)) return index;
+    }
+    return null;
 }
 
 fn topologicalSort(alloc: std.mem.Allocator, graph: *FileGraph) DiscoveryError!void {
@@ -1063,6 +1107,17 @@ fn topologicalSort(alloc: std.mem.Allocator, graph: *FileGraph) DiscoveryError!v
         }
     }
 
+    var compile_after_it = graph.file_compile_after_files.iterator();
+    while (compile_after_it.next()) |entry| {
+        const declaring_file = entry.key_ptr.*;
+        const deg = in_degree.getPtr(declaring_file) orelse continue;
+        for (entry.value_ptr.items) |matched_file| {
+            if (std.mem.eql(u8, matched_file, declaring_file)) continue;
+            if (!graph.known_files.contains(matched_file)) continue;
+            deg.* += 1;
+        }
+    }
+
     // Seed the current wave with all files that have in-degree 0 (no dependencies — leaf libraries).
     // Process in waves: each wave contains files whose dependencies are all in previous waves.
     // Files within the same wave are independent and can be compiled in parallel.
@@ -1088,6 +1143,18 @@ fn topologicalSort(alloc: std.mem.Allocator, graph: *FileGraph) DiscoveryError!v
             // Decrement in-degree of all files that depend on this file.
             // If a dependent's in-degree reaches 0, it belongs in the next wave.
             if (graph.file_imported_by.get(file)) |dependents| {
+                for (dependents.items) |dependent_file| {
+                    if (in_degree.getPtr(dependent_file)) |deg| {
+                        if (deg.* > 0) {
+                            deg.* -= 1;
+                            if (deg.* == 0) {
+                                next_wave.append(alloc, dependent_file) catch return error.OutOfMemory;
+                            }
+                        }
+                    }
+                }
+            }
+            if (graph.file_compile_after_by.get(file)) |dependents| {
                 for (dependents.items) |dependent_file| {
                     if (in_degree.getPtr(dependent_file)) |deg| {
                         if (deg.* > 0) {
@@ -1441,6 +1508,49 @@ test "discoverWithSourceFiles keeps structless source files in graph" {
     try std.testing.expect(graph.known_files.contains(impl_path));
     try std.testing.expect(graph.structForFile(impl_path) == null);
     try std.testing.expectEqual(@as(usize, 2), graph.topo_order.items.len);
+}
+
+test "compile_after_glob is order-only and not an import dependent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const runner_path = try std.fs.path.join(alloc, &.{ tmp_path, "test_runner.zap" });
+    const provider_path = try std.fs.path.join(alloc, &.{ tmp_path, "provider_test.zap" });
+
+    const runner_source = try std.fmt.allocPrint(
+        alloc,
+        "@compile_after_glob = \"{s}\"\n\n" ++
+            "pub struct TestRunner {{\n" ++
+            "  pub fn main() -> i64 {{\n" ++
+            "    0\n" ++
+            "  }}\n" ++
+            "}}\n",
+        .{provider_path},
+    );
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "test_runner.zap",
+        .data = runner_source,
+    });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "provider_test.zap",
+        .data = "pub struct ProviderTest {\n  pub fn value() -> i64 {\n    1\n  }\n}\n",
+    });
+
+    const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
+
+    var graph = try discoverWithSourceFiles(alloc, "TestRunner", roots, &BUILTIN_TYPE_NAMES, &.{provider_path}, null);
+    defer graph.deinit();
+
+    try std.testing.expect(graph.file_imported_by.get(provider_path) == null);
+    try std.testing.expect(graph.file_compile_after_by.get(provider_path) != null);
+    const provider_index = indexOfPath(graph.topo_order.items, provider_path).?;
+    const runner_index = indexOfPath(graph.topo_order.items, runner_path).?;
+    try std.testing.expect(provider_index < runner_index);
 }
 
 test "discover: circular dependency detected" {

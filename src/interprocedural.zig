@@ -400,11 +400,7 @@ pub const InterproceduralAnalyzer = struct {
     pub fn deinit(self: *InterproceduralAnalyzer) void {
         var iter = self.summaries.iterator();
         while (iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.param_summaries);
-            self.allocator.free(entry.value_ptr.param_lambda_sets);
-            if (entry.value_ptr.return_summary.param_sources.len > 0) {
-                self.allocator.free(entry.value_ptr.return_summary.param_sources);
-            }
+            entry.value_ptr.deinit(self.allocator);
         }
         self.summaries.deinit();
         self.call_graph.deinit();
@@ -429,8 +425,11 @@ pub const InterproceduralAnalyzer = struct {
                 if (is_self_recursive) {
                     try self.analyzeSccFixpoint(scc);
                 } else {
-                    const summary = try self.analyzeFunction(func_id, false);
-                    try self.summaries.put(func_id, summary);
+                    {
+                        var summary = try self.analyzeFunction(func_id, false);
+                        errdefer summary.deinit(self.allocator);
+                        try self.summaries.put(func_id, summary);
+                    }
                 }
             } else {
                 // Multi-function SCC: mutual recursion → may_diverge.
@@ -462,6 +461,7 @@ pub const InterproceduralAnalyzer = struct {
         const num_params = func.params.len;
 
         const param_summaries = try self.allocator.alloc(lattice.ParamSummary, num_params);
+        errdefer self.allocator.free(param_summaries);
         for (param_summaries) |*ps| {
             ps.* = lattice.ParamSummary.safe();
         }
@@ -522,8 +522,13 @@ pub const InterproceduralAnalyzer = struct {
             .param_sources = try return_sources.toOwnedSlice(),
             .fresh_alloc = return_sources.has_fresh,
         };
+        errdefer {
+            var owned_return_summary = return_summary;
+            owned_return_summary.deinit(self.allocator);
+        }
 
         const lambda_sets = try self.allocator.alloc(lattice.LambdaSet, num_params);
+        errdefer self.allocator.free(lambda_sets);
         @memset(lambda_sets, lattice.LambdaSet.empty());
 
         return .{
@@ -1149,8 +1154,11 @@ pub const InterproceduralAnalyzer = struct {
         // Initialize all SCC members with conservative summaries
         for (scc) |func_id| {
             const func = self.getFunction(func_id) orelse continue;
-            const summary = try lattice.FunctionSummary.conservative(func.params.len, self.allocator);
-            try self.summaries.put(func_id, summary);
+            {
+                var summary = try lattice.FunctionSummary.conservative(func.params.len, self.allocator);
+                errdefer summary.deinit(self.allocator);
+                try self.summaries.put(func_id, summary);
+            }
         }
 
         const max_iterations: usize = 100;
@@ -1159,15 +1167,18 @@ pub const InterproceduralAnalyzer = struct {
             var changed = false;
 
             for (scc) |func_id| {
-                const new_summary = try self.analyzeFunction(func_id, true);
-                const old_summary = self.summaries.get(func_id).?;
+                {
+                    var new_summary = try self.analyzeFunction(func_id, true);
+                    errdefer new_summary.deinit(self.allocator);
+                    const old_summary = self.summaries.getPtr(func_id).?;
 
-                if (!summariesEqual(old_summary, new_summary)) {
-                    freeSummary(self.allocator, old_summary);
-                    try self.summaries.put(func_id, new_summary);
-                    changed = true;
-                } else {
-                    freeSummary(self.allocator, new_summary);
+                    if (!summariesEqual(old_summary.*, new_summary)) {
+                        old_summary.deinit(self.allocator);
+                        old_summary.* = new_summary;
+                        changed = true;
+                    } else {
+                        new_summary.deinit(self.allocator);
+                    }
                 }
             }
 
@@ -1349,15 +1360,6 @@ fn summariesEqual(a: lattice.FunctionSummary, b: lattice.FunctionSummary) bool {
     }
 
     return true;
-}
-
-/// Free a FunctionSummary's owned memory.
-fn freeSummary(allocator: std.mem.Allocator, summary: lattice.FunctionSummary) void {
-    allocator.free(summary.param_summaries);
-    allocator.free(summary.param_lambda_sets);
-    if (summary.return_summary.param_sources.len > 0) {
-        allocator.free(summary.return_summary.param_sources);
-    }
 }
 
 // ============================================================
@@ -2145,22 +2147,19 @@ test "ParamSet operations" {
 
 test "summariesEqual: identical summaries" {
     const allocator = std.testing.allocator;
-    const s1 = try lattice.FunctionSummary.conservative(2, allocator);
-    defer allocator.free(s1.param_summaries);
-    defer allocator.free(s1.param_lambda_sets);
+    var s1 = try lattice.FunctionSummary.conservative(2, allocator);
+    defer s1.deinit(allocator);
 
-    const s2 = try lattice.FunctionSummary.conservative(2, allocator);
-    defer allocator.free(s2.param_summaries);
-    defer allocator.free(s2.param_lambda_sets);
+    var s2 = try lattice.FunctionSummary.conservative(2, allocator);
+    defer s2.deinit(allocator);
 
     try std.testing.expect(summariesEqual(s1, s2));
 }
 
 test "summariesEqual: different summaries" {
     const allocator = std.testing.allocator;
-    const s1 = try lattice.FunctionSummary.conservative(2, allocator);
-    defer allocator.free(s1.param_summaries);
-    defer allocator.free(s1.param_lambda_sets);
+    var s1 = try lattice.FunctionSummary.conservative(2, allocator);
+    defer s1.deinit(allocator);
 
     const param_sums = try allocator.alloc(lattice.ParamSummary, 2);
     param_sums[0] = lattice.ParamSummary.safe();

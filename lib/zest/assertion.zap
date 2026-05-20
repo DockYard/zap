@@ -18,6 +18,17 @@ pub struct Zest.Assertion {
     """
 
   pub fn truthy_result(kind :: String, code :: String, value :: String, result :: Bool, custom_message :: String) -> String {
+    truthy_result(kind, code, value, result, custom_message, "")
+  }
+
+  @doc = """
+    Records the result of a truthy assertion or rejection with a source location.
+
+    `location` is a `file:line` string captured at macro expansion time.
+    It is included in the rendered failure report when available.
+    """
+
+  pub fn truthy_result(kind :: String, code :: String, value :: String, result :: Bool, custom_message :: String, location :: String) -> String {
     passed = if kind == "assert" {
       result
     } else {
@@ -28,7 +39,7 @@ pub struct Zest.Assertion {
       :zig.Zest.pass_assertion()
       "."
     } else {
-      :zig.Zest.fail_assertion_with_message(format_truthy_failure(kind, code, value, custom_message))
+      :zig.Zest.fail_assertion_with_message(format_truthy_failure(kind, code, value, custom_message, location))
       "F"
     }
   }
@@ -43,6 +54,17 @@ pub struct Zest.Assertion {
     """
 
   pub fn comparison_result(kind :: String, operator :: String, code :: String, left_label :: String, left_value :: String, right_label :: String, right_value :: String, comparison_result :: Bool, custom_message :: String) -> String {
+    comparison_result(kind, operator, code, left_label, left_value, right_label, right_value, comparison_result, custom_message, "")
+  }
+
+  @doc = """
+    Records the result of a comparison assertion or rejection with a source location.
+
+    `location` is a `file:line` string captured at macro expansion time.
+    It is included in the rendered failure report when available.
+    """
+
+  pub fn comparison_result(kind :: String, operator :: String, code :: String, left_label :: String, left_value :: String, right_label :: String, right_value :: String, comparison_result :: Bool, custom_message :: String, location :: String) -> String {
     passed = if kind == "assert" {
       comparison_result
     } else {
@@ -53,17 +75,17 @@ pub struct Zest.Assertion {
       :zig.Zest.pass_assertion()
       "."
     } else {
-      :zig.Zest.fail_assertion_with_message(format_comparison_failure(kind, operator, code, left_label, left_value, right_label, right_value, comparison_result, custom_message))
+      :zig.Zest.fail_assertion_with_message(format_comparison_failure(kind, operator, code, left_label, left_value, right_label, right_value, comparison_result, custom_message, location))
       "F"
     }
   }
 
-  fn format_truthy_failure(kind :: String, code :: String, value :: String, custom_message :: String) -> String {
-    heading(kind) <> "\ncode: " <> display_text(code, "expression") <> "\nvalue: " <> value <> custom_message_block(custom_message)
+  fn format_truthy_failure(kind :: String, code :: String, value :: String, custom_message :: String, location :: String) -> String {
+    heading(kind) <> location_block(location) <> "\ncode: " <> display_text(code, "expression") <> "\nvalue: " <> value <> custom_message_block(custom_message)
   }
 
-  fn format_comparison_failure(kind :: String, operator :: String, code :: String, left_label :: String, left_value :: String, right_label :: String, right_value :: String, comparison_result :: Bool, custom_message :: String) -> String {
-    heading(kind) <> "\ncode: " <> display_text(code, "comparison") <> "\noperator: " <> operator <> "\nleft: " <> display_text(left_label, "left") <> " = " <> left_value <> "\nright: " <> display_text(right_label, "right") <> " = " <> right_value <> "\nresult: " <> Kernel.to_string(comparison_result) <> custom_message_block(custom_message)
+  fn format_comparison_failure(kind :: String, operator :: String, code :: String, left_label :: String, left_value :: String, right_label :: String, right_value :: String, comparison_result :: Bool, custom_message :: String, location :: String) -> String {
+    heading(kind) <> location_block(location) <> "\ncode: " <> display_text(code, "comparison") <> "\noperator: " <> operator <> "\nleft: " <> display_text(left_label, "left") <> " = " <> left_value <> "\nright: " <> display_text(right_label, "right") <> " = " <> right_value <> "\nresult: " <> Kernel.to_string(comparison_result) <> custom_message_block(custom_message)
   }
 
   fn heading(kind :: String) -> String {
@@ -79,6 +101,14 @@ pub struct Zest.Assertion {
       fallback
     } else {
       value
+    }
+  }
+
+  fn location_block(location :: String) -> String {
+    if location == "" {
+      ""
+    } else {
+      "\nlocation: " <> location
     }
   }
 

@@ -72,7 +72,9 @@ pub struct Zest.Case {
         tests
       }
     }
+    test_count = list_length(test_list)
     run_calls = for test_record <- test_list { build_run_call(env, test_record) }
+    selected_run_calls = for test_record <- test_list { build_selected_run_call(env, test_record) }
 
     quote {
       @doc = """
@@ -81,6 +83,25 @@ pub struct Zest.Case {
 
       pub fn run() -> String {
         unquote_splicing(run_calls)
+        "ok"
+      }
+
+      @doc = """
+        Returns the number of Zest cases generated for this struct.
+        """
+
+      pub fn zest_case_count() -> i64 {
+        unquote(test_count)
+      }
+
+      @doc = """
+        Scans this struct's generated Zest cases and runs the selected case.
+        """
+
+      pub fn zest_run_selected_case(selected_index :: i64) -> String {
+        :zig.Zest.begin_selected_case(selected_index)
+        unquote_splicing(selected_run_calls)
+        :zig.Zest.end_selected_case()
         "ok"
       }
     }
@@ -123,6 +144,16 @@ pub struct Zest.Case {
         name
       } else {
         name <> "." <> rest
+      }
+    }
+  }
+
+  macro build_selected_run_call(env :: Expr, test_record :: Expr) -> Expr {
+    run_call = build_run_call(env, test_record)
+
+    quote {
+      if :zig.Zest.should_run_selected_case() {
+        unquote(run_call)
       }
     }
   }
@@ -290,8 +321,8 @@ pub struct Zest.Case {
     Asserts that an expression evaluates to `true`.
 
     The expression is received as AST so Zest can report source code,
-    evaluated values, and comparison operands without evaluating
-    operands more than once.
+    source locations, evaluated values, and comparison operands
+    without evaluating operands more than once.
     """
 
   pub macro assert(expression :: Expr) -> Expr {
@@ -304,46 +335,47 @@ pub struct Zest.Case {
       code = source_text(expression)
       left_code = source_text(left_expression)
       right_code = source_text(right_expression)
+      location = source_location(expression)
 
       if operator_name == "==" {
         quote {
           zest_assertion_left_value = unquote(left_expression)
           zest_assertion_right_value = unquote(right_expression)
-          Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value == zest_assertion_right_value, "")
+          Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value == zest_assertion_right_value, "", unquote(location))
         }
       } else {
         if operator_name == "!=" {
           quote {
             zest_assertion_left_value = unquote(left_expression)
             zest_assertion_right_value = unquote(right_expression)
-            Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value != zest_assertion_right_value, "")
+            Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value != zest_assertion_right_value, "", unquote(location))
           }
         } else {
           if operator_name == "<" {
             quote {
               zest_assertion_left_value = unquote(left_expression)
               zest_assertion_right_value = unquote(right_expression)
-              Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value < zest_assertion_right_value, "")
+              Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value < zest_assertion_right_value, "", unquote(location))
             }
           } else {
             if operator_name == ">" {
               quote {
                 zest_assertion_left_value = unquote(left_expression)
                 zest_assertion_right_value = unquote(right_expression)
-                Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value > zest_assertion_right_value, "")
+                Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value > zest_assertion_right_value, "", unquote(location))
               }
             } else {
               if operator_name == "<=" {
                 quote {
                   zest_assertion_left_value = unquote(left_expression)
                   zest_assertion_right_value = unquote(right_expression)
-                  Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value <= zest_assertion_right_value, "")
+                  Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value <= zest_assertion_right_value, "", unquote(location))
                 }
               } else {
                 quote {
                   zest_assertion_left_value = unquote(left_expression)
                   zest_assertion_right_value = unquote(right_expression)
-                  Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value >= zest_assertion_right_value, "")
+                  Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value >= zest_assertion_right_value, "", unquote(location))
                 }
               }
             }
@@ -352,10 +384,11 @@ pub struct Zest.Case {
       }
     } else {
       code = source_text(expression)
+      location = source_location(expression)
 
       quote {
         zest_assertion_value = unquote(expression)
-        Zest.Assertion.truthy_result("assert", unquote(code), Kernel.to_string(zest_assertion_value), zest_assertion_value, "")
+        Zest.Assertion.truthy_result("assert", unquote(code), Kernel.to_string(zest_assertion_value), zest_assertion_value, "", unquote(location))
       }
     }
   }
@@ -376,46 +409,47 @@ pub struct Zest.Case {
       code = source_text(expression)
       left_code = source_text(left_expression)
       right_code = source_text(right_expression)
+      location = source_location(expression)
 
       if operator_name == "==" {
         quote {
           zest_assertion_left_value = unquote(left_expression)
           zest_assertion_right_value = unquote(right_expression)
-          Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value == zest_assertion_right_value, unquote(message))
+          Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value == zest_assertion_right_value, unquote(message), unquote(location))
         }
       } else {
         if operator_name == "!=" {
           quote {
             zest_assertion_left_value = unquote(left_expression)
             zest_assertion_right_value = unquote(right_expression)
-            Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value != zest_assertion_right_value, unquote(message))
+            Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value != zest_assertion_right_value, unquote(message), unquote(location))
           }
         } else {
           if operator_name == "<" {
             quote {
               zest_assertion_left_value = unquote(left_expression)
               zest_assertion_right_value = unquote(right_expression)
-              Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value < zest_assertion_right_value, unquote(message))
+              Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value < zest_assertion_right_value, unquote(message), unquote(location))
             }
           } else {
             if operator_name == ">" {
               quote {
                 zest_assertion_left_value = unquote(left_expression)
                 zest_assertion_right_value = unquote(right_expression)
-                Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value > zest_assertion_right_value, unquote(message))
+                Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value > zest_assertion_right_value, unquote(message), unquote(location))
               }
             } else {
               if operator_name == "<=" {
                 quote {
                   zest_assertion_left_value = unquote(left_expression)
                   zest_assertion_right_value = unquote(right_expression)
-                  Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value <= zest_assertion_right_value, unquote(message))
+                  Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value <= zest_assertion_right_value, unquote(message), unquote(location))
                 }
               } else {
                 quote {
                   zest_assertion_left_value = unquote(left_expression)
                   zest_assertion_right_value = unquote(right_expression)
-                  Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value >= zest_assertion_right_value, unquote(message))
+                  Zest.Assertion.comparison_result("assert", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value >= zest_assertion_right_value, unquote(message), unquote(location))
                 }
               }
             }
@@ -424,10 +458,11 @@ pub struct Zest.Case {
       }
     } else {
       code = source_text(expression)
+      location = source_location(expression)
 
       quote {
         zest_assertion_value = unquote(expression)
-        Zest.Assertion.truthy_result("assert", unquote(code), Kernel.to_string(zest_assertion_value), zest_assertion_value, unquote(message))
+        Zest.Assertion.truthy_result("assert", unquote(code), Kernel.to_string(zest_assertion_value), zest_assertion_value, unquote(message), unquote(location))
       }
     }
   }
@@ -436,8 +471,8 @@ pub struct Zest.Case {
     Asserts that an expression evaluates to `false`.
 
     The expression is received as AST so Zest can report source code,
-    evaluated values, and comparison operands without evaluating
-    operands more than once.
+    source locations, evaluated values, and comparison operands
+    without evaluating operands more than once.
     """
 
   pub macro reject(expression :: Expr) -> Expr {
@@ -450,46 +485,47 @@ pub struct Zest.Case {
       code = source_text(expression)
       left_code = source_text(left_expression)
       right_code = source_text(right_expression)
+      location = source_location(expression)
 
       if operator_name == "==" {
         quote {
           zest_assertion_left_value = unquote(left_expression)
           zest_assertion_right_value = unquote(right_expression)
-          Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value == zest_assertion_right_value, "")
+          Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value == zest_assertion_right_value, "", unquote(location))
         }
       } else {
         if operator_name == "!=" {
           quote {
             zest_assertion_left_value = unquote(left_expression)
             zest_assertion_right_value = unquote(right_expression)
-            Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value != zest_assertion_right_value, "")
+            Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value != zest_assertion_right_value, "", unquote(location))
           }
         } else {
           if operator_name == "<" {
             quote {
               zest_assertion_left_value = unquote(left_expression)
               zest_assertion_right_value = unquote(right_expression)
-              Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value < zest_assertion_right_value, "")
+              Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value < zest_assertion_right_value, "", unquote(location))
             }
           } else {
             if operator_name == ">" {
               quote {
                 zest_assertion_left_value = unquote(left_expression)
                 zest_assertion_right_value = unquote(right_expression)
-                Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value > zest_assertion_right_value, "")
+                Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value > zest_assertion_right_value, "", unquote(location))
               }
             } else {
               if operator_name == "<=" {
                 quote {
                   zest_assertion_left_value = unquote(left_expression)
                   zest_assertion_right_value = unquote(right_expression)
-                  Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value <= zest_assertion_right_value, "")
+                  Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value <= zest_assertion_right_value, "", unquote(location))
                 }
               } else {
                 quote {
                   zest_assertion_left_value = unquote(left_expression)
                   zest_assertion_right_value = unquote(right_expression)
-                  Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value >= zest_assertion_right_value, "")
+                  Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value >= zest_assertion_right_value, "", unquote(location))
                 }
               }
             }
@@ -498,10 +534,11 @@ pub struct Zest.Case {
       }
     } else {
       code = source_text(expression)
+      location = source_location(expression)
 
       quote {
         zest_assertion_value = unquote(expression)
-        Zest.Assertion.truthy_result("reject", unquote(code), Kernel.to_string(zest_assertion_value), zest_assertion_value, "")
+        Zest.Assertion.truthy_result("reject", unquote(code), Kernel.to_string(zest_assertion_value), zest_assertion_value, "", unquote(location))
       }
     }
   }
@@ -522,46 +559,47 @@ pub struct Zest.Case {
       code = source_text(expression)
       left_code = source_text(left_expression)
       right_code = source_text(right_expression)
+      location = source_location(expression)
 
       if operator_name == "==" {
         quote {
           zest_assertion_left_value = unquote(left_expression)
           zest_assertion_right_value = unquote(right_expression)
-          Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value == zest_assertion_right_value, unquote(message))
+          Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value == zest_assertion_right_value, unquote(message), unquote(location))
         }
       } else {
         if operator_name == "!=" {
           quote {
             zest_assertion_left_value = unquote(left_expression)
             zest_assertion_right_value = unquote(right_expression)
-            Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value != zest_assertion_right_value, unquote(message))
+            Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value != zest_assertion_right_value, unquote(message), unquote(location))
           }
         } else {
           if operator_name == "<" {
             quote {
               zest_assertion_left_value = unquote(left_expression)
               zest_assertion_right_value = unquote(right_expression)
-              Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value < zest_assertion_right_value, unquote(message))
+              Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value < zest_assertion_right_value, unquote(message), unquote(location))
             }
           } else {
             if operator_name == ">" {
               quote {
                 zest_assertion_left_value = unquote(left_expression)
                 zest_assertion_right_value = unquote(right_expression)
-                Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value > zest_assertion_right_value, unquote(message))
+                Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value > zest_assertion_right_value, unquote(message), unquote(location))
               }
             } else {
               if operator_name == "<=" {
                 quote {
                   zest_assertion_left_value = unquote(left_expression)
                   zest_assertion_right_value = unquote(right_expression)
-                  Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value <= zest_assertion_right_value, unquote(message))
+                  Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value <= zest_assertion_right_value, unquote(message), unquote(location))
                 }
               } else {
                 quote {
                   zest_assertion_left_value = unquote(left_expression)
                   zest_assertion_right_value = unquote(right_expression)
-                  Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value >= zest_assertion_right_value, unquote(message))
+                  Zest.Assertion.comparison_result("reject", unquote(operator_name), unquote(code), unquote(left_code), Kernel.to_string(zest_assertion_left_value), unquote(right_code), Kernel.to_string(zest_assertion_right_value), zest_assertion_left_value >= zest_assertion_right_value, unquote(message), unquote(location))
                 }
               }
             }
@@ -570,10 +608,11 @@ pub struct Zest.Case {
       }
     } else {
       code = source_text(expression)
+      location = source_location(expression)
 
       quote {
         zest_assertion_value = unquote(expression)
-        Zest.Assertion.truthy_result("reject", unquote(code), Kernel.to_string(zest_assertion_value), zest_assertion_value, unquote(message))
+        Zest.Assertion.truthy_result("reject", unquote(code), Kernel.to_string(zest_assertion_value), zest_assertion_value, unquote(message), unquote(location))
       }
     }
   }

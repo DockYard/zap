@@ -25,6 +25,23 @@ fn profileEnabled() bool {
     return std.c.getenv("ZAP_PROFILE") != null;
 }
 
+var incremental_trace_enabled_override: ?bool = null;
+
+fn setIncrementalTraceEnabledOverride(enabled: ?bool) void {
+    incremental_trace_enabled_override = enabled;
+}
+
+fn incrementalTraceEnabled() bool {
+    if (incremental_trace_enabled_override) |enabled| return enabled;
+    return std.c.getenv("ZAP_INCREMENTAL_TRACE") != null or
+        std.c.getenv("ZAP_TRACE_INCREMENTAL") != null;
+}
+
+fn incrementalTrace(comptime format: []const u8, args: anytype) void {
+    if (!incrementalTraceEnabled()) return;
+    std.debug.print("\n[incremental trace] " ++ format ++ "\n", args);
+}
+
 const ProfileTimer = struct {
     last_ns: i128,
 
@@ -143,6 +160,11 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("Error: manifest incremental daemon failed to start: {s}\n", .{@errorName(err)});
             std.process.exit(2);
         };
+    } else if (std.mem.eql(u8, command, "__manifest-incremental-daemon-shutdown-all")) {
+        shutdownManifestDaemonsInCwd(allocator) catch |err| {
+            std.debug.print("Error: manifest incremental daemon shutdown failed: {s}\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
     } else {
         // stderr writer removed in 0.16
         std.debug.print("Error: unknown command: {s}\n\nRun 'zap --help' for usage.\n", .{command});
@@ -180,6 +202,8 @@ fn printUsage() void {
         \\  --watch, -w       Watch source files and rebuild on changes
         \\  --collect-arc-stats Compile ARC counter increments into the generated runtime
         \\  --seed <integer>  Set the test seed for deterministic ordering
+        \\  --timings         Print every Zest test case duration
+        \\  --slowest <count> Print the slowest Zest test cases
         \\  -- <args...>      Pass arguments to the program or test binary
         \\
         \\Script mode (zap run <file.zap>): -D flags precede the script path
@@ -261,7 +285,7 @@ const RunPositionalKind = union(enum) {
 /// The value-consuming set here MUST mirror EXACTLY the two-token flags
 /// `parseTargetArgs` (and the manifest-side `manifestLeadingFlagEnd` /
 /// `buildFlagScanSkip` scanners) recognize: `--build-file`,
-/// `--zap-lib-dir`, `--seed`. Phase 4 collapsed every build option to
+/// `--zap-lib-dir`, `--seed`, `--slowest`. Phase 4 collapsed every build option to
 /// the single Zig-style `-D<key>=<value>` token form and DELETED the
 /// old two-token script spellings (`-O <mode>`, `--memory <name>`,
 /// `--target <triple>`) entirely — none are recognized by any other
@@ -270,9 +294,10 @@ const RunPositionalKind = union(enum) {
 /// the following token (the actual script path), mis-dispatching
 /// `zap run --target ./s.zap` to the manifest path with a confusing
 /// "unexpected argument" instead of running the script. Per the
-/// locked position contract only `-D…` and `--zap-lib-dir` are
-/// recognized leading flags; any other dash-token is just a normal
-/// flag/positional and must not consume the next token.
+/// locked position contract only `-D…`, `--zap-lib-dir`, and the
+/// dedicated test-runner options are recognized leading flags; any
+/// other dash-token is just a normal flag/positional and must not
+/// consume the next token.
 fn firstPositionalIndex(args: []const []const u8) ?usize {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -280,7 +305,8 @@ fn firstPositionalIndex(args: []const []const u8) ?usize {
         if (std.mem.eql(u8, arg, "--")) return null;
         if (std.mem.eql(u8, arg, "--build-file") or
             std.mem.eql(u8, arg, "--zap-lib-dir") or
-            std.mem.eql(u8, arg, "--seed"))
+            std.mem.eql(u8, arg, "--seed") or
+            std.mem.eql(u8, arg, "--slowest"))
         {
             i += 1; // value-consuming: skip the flag's value too
             continue;
@@ -289,6 +315,7 @@ fn firstPositionalIndex(args: []const []const u8) ?usize {
             std.mem.eql(u8, arg, "-w") or
             std.mem.eql(u8, arg, "--collect-arc-stats") or
             std.mem.eql(u8, arg, "--no-deps") or
+            std.mem.eql(u8, arg, "--timings") or
             std.mem.startsWith(u8, arg, "-D"))
         {
             continue;
@@ -591,6 +618,35 @@ fn parseScriptOptimizeMode(name: []const u8) ?zap.builder.BuildConfig.Optimize {
     return null;
 }
 
+const BuildOptimizePolicy = struct {
+    frontend_optimize_mode: compiler.FrontendOptimizeMode,
+    frontend_policy_tag: u64,
+    backend_optimize_mode: u8,
+    memory_driver_optimize: zap.memory_driver.ZapForkOptimize,
+};
+
+fn buildOptimizePolicy(
+    frontend_optimize_mode: compiler.FrontendOptimizeMode,
+    backend_optimize_mode: u8,
+    memory_driver_optimize: zap.memory_driver.ZapForkOptimize,
+) BuildOptimizePolicy {
+    return .{
+        .frontend_optimize_mode = frontend_optimize_mode,
+        .frontend_policy_tag = frontend_optimize_mode.cacheTag(),
+        .backend_optimize_mode = backend_optimize_mode,
+        .memory_driver_optimize = memory_driver_optimize,
+    };
+}
+
+fn optimizePolicyForBuildConfig(optimize: zap.builder.BuildConfig.Optimize) BuildOptimizePolicy {
+    return switch (optimize) {
+        .debug => buildOptimizePolicy(.debug, 0, .Debug),
+        .release_safe => buildOptimizePolicy(.release_safe, 1, .ReleaseSafe),
+        .release_fast => buildOptimizePolicy(.release_fast, 2, .ReleaseFast),
+        .release_small => buildOptimizePolicy(.release_small, 3, .ReleaseSmall),
+    };
+}
+
 /// Pure helper: return `true` iff `name` is one of the stdlib memory
 /// managers script mode supports. Script mode has no dependency
 /// mechanism and no project source root, so a third-party or
@@ -703,7 +759,8 @@ fn buildFlagScanSkip(args: []const []const u8, i: usize, end: usize) ?usize {
     if (std.mem.eql(u8, a, "--")) return end; // program-args boundary
     if (std.mem.eql(u8, a, "--build-file") or
         std.mem.eql(u8, a, "--zap-lib-dir") or
-        std.mem.eql(u8, a, "--seed"))
+        std.mem.eql(u8, a, "--seed") or
+        std.mem.eql(u8, a, "--slowest"))
     {
         return i + 2; // skip the flag AND its value token
     }
@@ -1007,20 +1064,22 @@ fn cmdRunScript(
         std.process.exit(1);
     };
     applyBuildOverrides(&config, overrides);
+    const script_optimize_policy = optimizePolicyForBuildConfig(config.optimize);
 
     // ----- Content-addressed skip-recompile key -------------------------
     // The artifact directory's previously-random component is replaced
     // by a strong content key over the script source, the resolved
     // stdlib identity, the running-compiler identity, and the
-    // post-override build controls (optimize/memory/target/cpu — read
-    // off `config`, the single source of truth, mirroring exactly what
-    // `computeBuildCacheKey` folds in for the manifest path). An
+    // post-override build controls (optimize/frontend policy/memory/
+    // target/cpu — read off `config`, the single source of truth,
+    // mirroring exactly what `computeBuildCacheKey` folds in for the
+    // manifest path). An
     // UNCHANGED script therefore resolves to the SAME directory across
     // invocations, enabling a true no-recompile fast path, while a
     // change to ANY input yields a distinct directory (no stale-binary
-    // false hit). Identity-hash failures are HARD errors: a silent 0
-    // would collapse distinct stdlibs/compilers into one key.
-    const stdlib_identity = hashStdlibIdentity(alloc, zap_lib) catch |err| {
+    // false hit). Identity-digest failures are HARD errors: a silent zero
+    // digest would collapse distinct stdlibs/compilers into one key.
+    const stdlib_identity_digest = hashStdlibIdentity(alloc, zap_lib) catch |err| {
         std.debug.print("Error: could not hash Zap stdlib identity for the script cache key: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -1032,16 +1091,17 @@ fn cmdRunScript(
         std.debug.print("Error: out of memory resolving the toolchain identity cache directory\n", .{});
         std.process.exit(1);
     };
-    const compiler_identity = hashCompilerIdentity(alloc, script_toolchain_cache_dir) catch |err| {
+    const compiler_identity_digest = hashCompilerIdentity(alloc, script_toolchain_cache_dir) catch |err| {
         std.debug.print("Error: could not hash compiler identity for the script cache key: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    const zig_lib_identity = hashZigLibIdentity(alloc, script_toolchain_cache_dir, zig_lib_dir) catch |err| {
+    const zig_lib_identity_digest = hashZigLibIdentity(alloc, script_toolchain_cache_dir, zig_lib_dir) catch |err| {
         std.debug.print("Error: could not hash Zig lib identity for the script cache key: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    const content_key = computeScriptContentKey(alloc, script_source, stdlib_identity, compiler_identity, zig_lib_identity, .{
+    const content_key = computeScriptContentKey(alloc, script_source, stdlib_identity_digest, compiler_identity_digest, zig_lib_identity_digest, .{
         .optimize = config.optimize,
+        .frontend_policy_tag = script_optimize_policy.frontend_policy_tag,
         .memory_manager_name = if (config.memory_manager) |m| m.type_name else "",
         .target = config.target orelse "",
         .cpu = config.cpu orelse "",
@@ -1117,8 +1177,8 @@ fn cmdRunScript(
         .build_opts = .empty,
         .zap_lib_dir = zap_lib_dir,
         .zig_lib_dir = zig_lib_dir,
-        .compiler_identity_hash = compiler_identity,
-        .zig_lib_identity_hash = zig_lib_identity,
+        .compiler_identity_digest = compiler_identity_digest,
+        .zig_lib_identity_digest = zig_lib_identity_digest,
         // The stdlib source-tree root (parent of `lib/`) is the
         // convention root the memory driver uses; identical to the
         // invariant `buildTarget` relies on.
@@ -1221,11 +1281,20 @@ fn appendTestRunArgs(
     allocator: std.mem.Allocator,
     test_run_args: *std.ArrayListUnmanaged([]const u8),
     seed: ?[]const u8,
+    timings: bool,
+    slowest: ?[]const u8,
     forwarded_args: []const []const u8,
 ) !void {
     if (seed) |seed_value| {
         try test_run_args.append(allocator, "--seed");
         try test_run_args.append(allocator, seed_value);
+    }
+    if (timings) {
+        try test_run_args.append(allocator, "--timings");
+    }
+    if (slowest) |slowest_value| {
+        try test_run_args.append(allocator, "--slowest");
+        try test_run_args.append(allocator, slowest_value);
     }
     for (forwarded_args) |arg| {
         try test_run_args.append(allocator, arg);
@@ -1360,7 +1429,7 @@ fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Build run_args: forward --seed to the test binary if provided
     var test_run_args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer test_run_args.deinit(allocator);
-    try appendTestRunArgs(allocator, &test_run_args, parsed.seed, parsed.run_args);
+    try appendTestRunArgs(allocator, &test_run_args, parsed.seed, parsed.timings, parsed.slowest, parsed.run_args);
 
     if (parsed.watch) {
         watchAndRebuild(allocator, project_root, "test", parsed.build_opts, parsed.build_overrides, .tests, test_run_args.items, parsed.collect_arc_stats, parsed.zap_lib_dir);
@@ -1941,6 +2010,101 @@ const BuildArtifact = struct {
     }
 };
 
+fn startProgressNode(
+    progress: ?*zap.progress.Reporter,
+    parent: ?zap.progress.Node,
+    label: []const u8,
+) ?zap.progress.Node {
+    if (parent) |parent_node| {
+        return parent_node.start(label, .{}) catch {
+            if (progress) |reporter| reporter.stage("{s}", .{label});
+            return null;
+        };
+    }
+    const reporter = progress orelse return null;
+    return reporter.start(label, .{}) catch {
+        reporter.stage("{s}", .{label});
+        return null;
+    };
+}
+
+fn progressNodeParent(progress: ?*zap.progress.Reporter, parent: ?zap.progress.Node) ?zap.progress.Node {
+    if (parent) |node| return node;
+    if (progress) |reporter| return reporter.rootNode();
+    return null;
+}
+
+fn updateProgressNodeCurrentItem(
+    progress: ?*zap.progress.Reporter,
+    node: ?zap.progress.Node,
+    item: []const u8,
+    comptime fallback_format: []const u8,
+    fallback_args: anytype,
+) void {
+    if (node) |progress_node| {
+        progress_node.updateCurrentItem(item);
+    } else if (progress) |reporter| {
+        reporter.stage(fallback_format, fallback_args);
+    }
+}
+
+fn finishProgressNode(node: ?zap.progress.Node, result: zap.progress.NodeResult) void {
+    if (node) |progress_node| progress_node.finish(result);
+}
+
+const ScopedProgressNode = struct {
+    progress: ?*zap.progress.Reporter,
+    node: ?zap.progress.Node,
+    result: zap.progress.NodeResult = .failed,
+
+    fn start(
+        progress: ?*zap.progress.Reporter,
+        parent: ?zap.progress.Node,
+        label: []const u8,
+    ) ScopedProgressNode {
+        return .{
+            .progress = progress,
+            .node = startProgressNode(progress, parent, label),
+        };
+    }
+
+    fn updateCurrentItem(
+        self: *ScopedProgressNode,
+        item: []const u8,
+        comptime fallback_format: []const u8,
+        fallback_args: anytype,
+    ) void {
+        updateProgressNodeCurrentItem(self.progress, self.node, item, fallback_format, fallback_args);
+    }
+
+    fn cacheHit(self: *ScopedProgressNode, label: []const u8, item: []const u8) void {
+        if (self.node) |node| node.cacheHit(label, item);
+    }
+
+    fn cacheMiss(self: *ScopedProgressNode, label: []const u8, item: []const u8) void {
+        if (self.node) |node| node.cacheMiss(label, item);
+    }
+
+    fn succeed(self: *ScopedProgressNode) void {
+        self.result = .succeeded;
+        self.finish();
+    }
+
+    fn skip(self: *ScopedProgressNode) void {
+        self.result = .skipped;
+        self.finish();
+    }
+
+    fn finish(self: *ScopedProgressNode) void {
+        finishProgressNode(self.node, self.result);
+        self.node = null;
+    }
+
+    fn deinit(self: *ScopedProgressNode) void {
+        self.finish();
+    }
+};
+
 fn makeBuildArtifact(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -2213,9 +2377,9 @@ fn computeManifestInvocationIdentity(
     collect_arc_stats: bool,
     zap_lib_dir: ?[]const u8,
     zig_lib_dir: []const u8,
-    compiler_identity_hash: u64,
-    zig_lib_identity_hash: u64,
-) !u64 {
+    compiler_identity_digest: build_cache.ToolchainDigest,
+    zig_lib_identity_digest: build_cache.ToolchainDigest,
+) !build_cache.InvocationIdentity {
     const build_opt_identity_entries = buildOptIdentityEntries(alloc, build_opts) catch return error.OutOfMemory;
     defer alloc.free(build_opt_identity_entries);
     return build_cache.hashInvocationIdentity(alloc, .{
@@ -2227,8 +2391,8 @@ fn computeManifestInvocationIdentity(
         .collect_arc_stats = collect_arc_stats,
         .zap_lib_dir = zap_lib_dir,
         .zig_lib_dir = zig_lib_dir,
-        .zig_lib_identity_hash = zig_lib_identity_hash,
-        .compiler_identity_hash = compiler_identity_hash,
+        .zig_lib_identity_digest = zig_lib_identity_digest,
+        .compiler_identity_digest = compiler_identity_digest,
     });
 }
 
@@ -2318,21 +2482,57 @@ fn tryManifestSnapshotHit(
     artifact_allocator: std.mem.Allocator,
     scratch_allocator: std.mem.Allocator,
     snapshot_path: []const u8,
-    invocation_identity: u64,
+    invocation_identity: build_cache.InvocationIdentity,
     progress: ?*zap.progress.Reporter,
+    progress_node: ?zap.progress.Node,
 ) ?BuildArtifact {
-    var stable_snapshot = build_cache.readStableSnapshot(scratch_allocator, snapshot_path) catch return null;
+    var stable_snapshot = build_cache.readStableSnapshot(scratch_allocator, snapshot_path) catch {
+        if (progress_node) |node| node.cacheMiss("snapshot", "snapshot_unreadable");
+        incrementalTrace("manifest-snapshot result=miss reason=snapshot_unreadable path={s}", .{snapshot_path});
+        return null;
+    };
     defer stable_snapshot.deinit(scratch_allocator);
 
+    var validation_stats: build_cache.ValidationStats = .{};
     if (!build_cache.validateSnapshot(scratch_allocator, stable_snapshot.snapshot, .{
         .invocation_identity = invocation_identity,
         .snapshot_mtime_nanos = stable_snapshot.mtime_nanos,
+        .stats = &validation_stats,
     })) {
+        if (progress_node) |node| {
+            if (build_cache.validationMissDetailAlloc(scratch_allocator, validation_stats)) |miss_detail| {
+                defer scratch_allocator.free(miss_detail);
+                node.cacheMiss("snapshot", miss_detail);
+            } else |_| {
+                node.cacheMiss("snapshot", build_cache.validationMissReasonLabel(validation_stats.miss_reason));
+            }
+        }
+        if (build_cache.validationMissDetailAlloc(scratch_allocator, validation_stats)) |miss_detail| {
+            defer scratch_allocator.free(miss_detail);
+            incrementalTrace(
+                "manifest-snapshot result=miss reason={s} path={s}",
+                .{ miss_detail, snapshot_path },
+            );
+        } else |_| {
+            incrementalTrace(
+                "manifest-snapshot result=miss reason={s} path={s}",
+                .{ build_cache.validationMissReasonLabel(validation_stats.miss_reason), snapshot_path },
+            );
+        }
         return null;
     }
 
-    installCachedManifestArtifact(scratch_allocator, stable_snapshot.snapshot) catch return null;
+    installCachedManifestArtifact(scratch_allocator, stable_snapshot.snapshot) catch {
+        if (progress_node) |node| node.cacheMiss("snapshot", "install_failed");
+        incrementalTrace("manifest-snapshot result=miss reason=install_failed path={s}", .{snapshot_path});
+        return null;
+    };
 
+    if (progress_node) |node| node.cacheHit("snapshot", snapshot_path);
+    incrementalTrace(
+        "manifest-snapshot result=hit path={s} output={s}",
+        .{ snapshot_path, stable_snapshot.snapshot.output_path },
+    );
     if (progress) |reporter| {
         reporter.event("[cached] {s}\n", .{stable_snapshot.snapshot.output_path});
     } else {
@@ -2404,7 +2604,8 @@ const ManifestSources = struct {
     source_file_to_structs: std.StringHashMap([]const []const u8),
     source_file_imports: std.StringHashMap([]const []const u8),
     source_file_imported_by: std.StringHashMap([]const []const u8),
-    source_file_compile_after_globs: std.StringHashMap(void),
+    source_file_compile_after_globs: std.StringHashMap([]const []const u8),
+    source_file_compile_after_files: std.StringHashMap([]const []const u8),
     mapped_files: []compiler.MappedFile,
 
     fn deinit(self: *ManifestSources) void {
@@ -2424,10 +2625,371 @@ const ComputedIncrementalHashes = struct {
     }
 };
 
+fn emittedIncrementalGraphChanged(
+    previous_root_present: bool,
+    previous_root_hash: u64,
+    previous_modules: *const std.StringHashMap(u64),
+    current_hashes: *const ComputedIncrementalHashes,
+) bool {
+    if (previous_root_present != current_hashes.root_present) return true;
+    if (previous_root_present and previous_root_hash != current_hashes.root_hash) return true;
+    if (previous_modules.count() != current_hashes.modules.count()) return true;
+
+    var current_iter = current_hashes.modules.iterator();
+    while (current_iter.next()) |entry| {
+        const previous_hash = previous_modules.get(entry.key_ptr.*) orelse return true;
+        if (previous_hash != entry.value_ptr.*) return true;
+    }
+
+    return false;
+}
+
 const IncrementalModuleSelection = struct {
     struct_names: []const []const u8,
     include_root: bool,
 };
+
+const PreparedIncrementalBackendPlan = struct {
+    selection: IncrementalModuleSelection,
+    invalidation: zir_backend.SelectedUpdateInvalidationPolicy,
+};
+
+const OwnedIncrementalModuleSelection = struct {
+    struct_names: []const []const u8,
+    include_root: bool,
+
+    fn deinit(self: OwnedIncrementalModuleSelection, allocator: std.mem.Allocator) void {
+        for (self.struct_names) |struct_name| allocator.free(struct_name);
+        allocator.free(self.struct_names);
+    }
+};
+
+fn traceIncrementalModuleSelection(
+    comptime label: []const u8,
+    selection: IncrementalModuleSelection,
+) void {
+    if (!incrementalTraceEnabled()) return;
+    incrementalTrace(
+        "backend-selection label={s} modules={d} include_root={}",
+        .{ label, selection.struct_names.len, selection.include_root },
+    );
+    for (selection.struct_names) |struct_name| {
+        incrementalTrace("backend-selection-item label={s} module={s}", .{ label, struct_name });
+    }
+}
+
+fn traceOwnedIncrementalModuleSelection(
+    comptime label: []const u8,
+    selection: OwnedIncrementalModuleSelection,
+) void {
+    if (!incrementalTraceEnabled()) return;
+    incrementalTrace(
+        "backend-selection label={s} modules={d} include_root={}",
+        .{ label, selection.struct_names.len, selection.include_root },
+    );
+    for (selection.struct_names) |struct_name| {
+        incrementalTrace("backend-selection-item label={s} module={s}", .{ label, struct_name });
+    }
+}
+
+fn incrementalModuleNameByte(byte: u8) u8 {
+    return if (byte == '.') '_' else byte;
+}
+
+fn incrementalModuleNamesEqual(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_byte, right_byte| {
+        if (incrementalModuleNameByte(left_byte) != incrementalModuleNameByte(right_byte)) return false;
+    }
+    return true;
+}
+
+fn moduleMapContainsIncrementalName(module_names: *std.StringHashMap(void), struct_name: []const u8) bool {
+    if (module_names.contains(struct_name)) return true;
+    var iter = module_names.iterator();
+    while (iter.next()) |entry| {
+        if (incrementalModuleNamesEqual(entry.key_ptr.*, struct_name)) return true;
+    }
+    return false;
+}
+
+fn moduleHashesContainIncrementalName(module_hashes: *const std.StringHashMap(u64), struct_name: []const u8) bool {
+    if (module_hashes.contains(struct_name)) return true;
+    var iter = module_hashes.iterator();
+    while (iter.next()) |entry| {
+        if (incrementalModuleNamesEqual(entry.key_ptr.*, struct_name)) return true;
+    }
+    return false;
+}
+
+fn normalizeIncrementalModuleName(allocator: std.mem.Allocator, struct_name: []const u8) ![]const u8 {
+    const normalized = try allocator.dupe(u8, struct_name);
+    for (normalized) |*byte| {
+        byte.* = incrementalModuleNameByte(byte.*);
+    }
+    return normalized;
+}
+
+fn normalizeIncrementalSelectionForBackend(
+    allocator: std.mem.Allocator,
+    selection: IncrementalModuleSelection,
+) !OwnedIncrementalModuleSelection {
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    var normalized_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (normalized_names.items) |name| allocator.free(name);
+        normalized_names.deinit(allocator);
+    }
+
+    for (selection.struct_names) |struct_name| {
+        const normalized = try normalizeIncrementalModuleName(allocator, struct_name);
+        errdefer allocator.free(normalized);
+        if (seen.contains(normalized)) {
+            allocator.free(normalized);
+            continue;
+        }
+        try normalized_names.append(allocator, normalized);
+        try seen.put(normalized, {});
+    }
+
+    return .{
+        .struct_names = try normalized_names.toOwnedSlice(allocator),
+        .include_root = selection.include_root,
+    };
+}
+
+fn appendIncrementalSelectionStruct(
+    allocator: std.mem.Allocator,
+    selected_structs: *std.StringHashMap(void),
+    ordered_structs: *std.ArrayListUnmanaged([]const u8),
+    struct_name: []const u8,
+) !void {
+    if (moduleMapContainsIncrementalName(selected_structs, struct_name)) return;
+    try selected_structs.put(struct_name, {});
+    try ordered_structs.append(allocator, struct_name);
+}
+
+fn mergeIncrementalSelections(
+    allocator: std.mem.Allocator,
+    first: IncrementalModuleSelection,
+    second: IncrementalModuleSelection,
+) !IncrementalModuleSelection {
+    var selected_structs = std.StringHashMap(void).init(allocator);
+    defer selected_structs.deinit();
+    var ordered_structs: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer ordered_structs.deinit(allocator);
+
+    for (first.struct_names) |struct_name| {
+        try appendIncrementalSelectionStruct(allocator, &selected_structs, &ordered_structs, struct_name);
+    }
+    for (second.struct_names) |struct_name| {
+        try appendIncrementalSelectionStruct(allocator, &selected_structs, &ordered_structs, struct_name);
+    }
+
+    return .{
+        .struct_names = try ordered_structs.toOwnedSlice(allocator),
+        .include_root = first.include_root or second.include_root,
+    };
+}
+
+fn filterIncrementalSelectionToCurrentModules(
+    allocator: std.mem.Allocator,
+    selection: IncrementalModuleSelection,
+    current_hashes: *const ComputedIncrementalHashes,
+) !IncrementalModuleSelection {
+    var selected_structs = std.StringHashMap(void).init(allocator);
+    defer selected_structs.deinit();
+    var ordered_structs: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer ordered_structs.deinit(allocator);
+
+    for (selection.struct_names) |struct_name| {
+        if (!moduleHashesContainIncrementalName(&current_hashes.modules, struct_name)) continue;
+        try appendIncrementalSelectionStruct(allocator, &selected_structs, &ordered_structs, struct_name);
+    }
+
+    return .{
+        .struct_names = try ordered_structs.toOwnedSlice(allocator),
+        .include_root = selection.include_root and current_hashes.root_present,
+    };
+}
+
+fn validateIncrementalHashTopology(
+    previous_root_present: bool,
+    previous_modules: *const std.StringHashMap(u64),
+    current_hashes: *const ComputedIncrementalHashes,
+) !void {
+    if (previous_root_present and !current_hashes.root_present) {
+        return error.ContextInvalidated;
+    }
+
+    var old_iter = previous_modules.iterator();
+    while (old_iter.next()) |entry| {
+        if (!current_hashes.modules.contains(entry.key_ptr.*)) {
+            return error.ContextInvalidated;
+        }
+    }
+
+    var current_iter = current_hashes.modules.iterator();
+    while (current_iter.next()) |entry| {
+        if (!previous_modules.contains(entry.key_ptr.*)) {
+            return error.ContextInvalidated;
+        }
+    }
+}
+
+fn selectChangedIncrementalModulesFromHashes(
+    allocator: std.mem.Allocator,
+    previous_root_present: bool,
+    previous_root_hash: u64,
+    previous_modules: *const std.StringHashMap(u64),
+    current_hashes: *const ComputedIncrementalHashes,
+) !IncrementalModuleSelection {
+    var selected_structs: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer selected_structs.deinit(allocator);
+
+    try validateIncrementalHashTopology(previous_root_present, previous_modules, current_hashes);
+    const include_root = current_hashes.root_present and
+        (!previous_root_present or previous_root_hash != current_hashes.root_hash);
+
+    var current_iter = current_hashes.modules.iterator();
+    while (current_iter.next()) |entry| {
+        const old_hash = previous_modules.get(entry.key_ptr.*) orelse return error.ContextInvalidated;
+        if (old_hash != entry.value_ptr.*) {
+            try selected_structs.append(allocator, entry.key_ptr.*);
+        }
+    }
+
+    return IncrementalModuleSelection{
+        .struct_names = try selected_structs.toOwnedSlice(allocator),
+        .include_root = include_root,
+    };
+}
+
+fn selectAffectedIncrementalModulesFromFunctions(
+    allocator: std.mem.Allocator,
+    program: ir.Program,
+    affected_function_ids: []const ir.FunctionId,
+) !IncrementalModuleSelection {
+    var affected_functions = std.AutoHashMap(ir.FunctionId, void).init(allocator);
+    defer affected_functions.deinit();
+    for (affected_function_ids) |function_id| {
+        try affected_functions.put(function_id, {});
+    }
+
+    var selected_structs = std.StringHashMap(void).init(allocator);
+    defer selected_structs.deinit();
+    var ordered_structs: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer ordered_structs.deinit(allocator);
+
+    var include_root = false;
+    for (program.functions) |function| {
+        if (!affected_functions.contains(function.id)) continue;
+        const is_entry = if (program.entry) |entry_id| function.id == entry_id else false;
+        if (is_entry or function.struct_name == null) {
+            include_root = true;
+            continue;
+        }
+        try appendIncrementalSelectionStruct(
+            allocator,
+            &selected_structs,
+            &ordered_structs,
+            function.struct_name.?,
+        );
+    }
+
+    return .{
+        .struct_names = try ordered_structs.toOwnedSlice(allocator),
+        .include_root = include_root,
+    };
+}
+
+fn selectAllIncrementalModulesFromHashes(
+    allocator: std.mem.Allocator,
+    current_hashes: *const ComputedIncrementalHashes,
+) !IncrementalModuleSelection {
+    var ordered_structs: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer ordered_structs.deinit(allocator);
+
+    var iter = current_hashes.modules.iterator();
+    while (iter.next()) |entry| {
+        try ordered_structs.append(allocator, entry.key_ptr.*);
+    }
+
+    return .{
+        .struct_names = try ordered_structs.toOwnedSlice(allocator),
+        .include_root = current_hashes.root_present,
+    };
+}
+
+fn selectPreparedIncrementalBackendModules(
+    allocator: std.mem.Allocator,
+    result: *const compiler.CompileResult,
+    previous_root_present: bool,
+    previous_root_hash: u64,
+    previous_modules: *const std.StringHashMap(u64),
+    current_hashes: *const ComputedIncrementalHashes,
+) !IncrementalModuleSelection {
+    if (result.incremental_backend_force_full) {
+        try validateIncrementalHashTopology(previous_root_present, previous_modules, current_hashes);
+        return selectAllIncrementalModulesFromHashes(allocator, current_hashes);
+    }
+
+    const direct_backend_selection = try selectChangedIncrementalModulesFromHashes(
+        allocator,
+        previous_root_present,
+        previous_root_hash,
+        previous_modules,
+        current_hashes,
+    );
+    defer allocator.free(direct_backend_selection.struct_names);
+
+    const affected_function_backend_selection = try selectAffectedIncrementalModulesFromFunctions(
+        allocator,
+        result.ir_program,
+        result.incremental_backend_affected_function_ids,
+    );
+    defer allocator.free(affected_function_backend_selection.struct_names);
+
+    const merged_backend_selection = try mergeIncrementalSelections(
+        allocator,
+        direct_backend_selection,
+        affected_function_backend_selection,
+    );
+    defer allocator.free(merged_backend_selection.struct_names);
+
+    return filterIncrementalSelectionToCurrentModules(
+        allocator,
+        merged_backend_selection,
+        current_hashes,
+    );
+}
+
+fn selectPreparedIncrementalBackendPlan(
+    allocator: std.mem.Allocator,
+    result: *const compiler.CompileResult,
+    previous_root_present: bool,
+    previous_root_hash: u64,
+    previous_modules: *const std.StringHashMap(u64),
+    current_hashes: *const ComputedIncrementalHashes,
+) !PreparedIncrementalBackendPlan {
+    const selection = try selectPreparedIncrementalBackendModules(
+        allocator,
+        result,
+        previous_root_present,
+        previous_root_hash,
+        previous_modules,
+        current_hashes,
+    );
+
+    return .{
+        .selection = selection,
+        .invalidation = if (result.incremental_backend_force_full)
+            .force_all_source_hashes
+        else
+            .compare_source_hashes,
+    };
+}
 
 fn hashDeepValue(hasher: anytype, value: anytype) void {
     const T = @TypeOf(value);
@@ -2842,8 +3404,16 @@ fn computeSourceTopologyHash(manifest_sources: *const ManifestSources) u64 {
                 hash = mixIncrementalHashBytes(hash, "source-import", imported_struct);
             }
         }
-        if (manifest_sources.source_file_compile_after_globs.contains(source_unit.file_path)) {
+        if (manifest_sources.source_file_compile_after_globs.get(source_unit.file_path)) |patterns| {
             hash = mixIncrementalHashBytes(hash, "compile-after-globs", source_unit.file_path);
+            for (patterns) |pattern| {
+                hash = mixIncrementalHashBytes(hash, "compile-after-pattern", pattern);
+            }
+        }
+        if (manifest_sources.source_file_compile_after_files.get(source_unit.file_path)) |matched_files| {
+            for (matched_files) |matched_file| {
+                hash = mixIncrementalHashBytes(hash, "compile-after-match", matched_file);
+            }
         }
     }
     if (manifest_sources.struct_order) |struct_order| {
@@ -3173,7 +3743,8 @@ fn discoverManifestSources(
     var source_file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
     var source_file_imports = std.StringHashMap([]const []const u8).init(alloc);
     var source_file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
-    var source_file_compile_after_globs = std.StringHashMap(void).init(alloc);
+    var source_file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var source_file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
     var struct_order: std.ArrayListUnmanaged([]const u8) = .empty;
     var level_boundaries: std.ArrayListUnmanaged(u32) = .empty;
 
@@ -3241,12 +3812,8 @@ fn discoverManifestSources(
     try copyGraphListMap(alloc, &source_file_to_structs, &file_graph.file_to_structs);
     try copyGraphListMap(alloc, &source_file_imports, &file_graph.file_imports);
     try copyGraphListMap(alloc, &source_file_imported_by, &file_graph.file_imported_by);
-    {
-        var iter = file_graph.file_compile_after_globs.iterator();
-        while (iter.next()) |entry| {
-            try putPathVoidWithCanonical(alloc, &source_file_compile_after_globs, entry.key_ptr.*);
-        }
-    }
+    try copyGraphListMap(alloc, &source_file_compile_after_globs, &file_graph.file_compile_after_globs);
+    try copyGraphListMap(alloc, &source_file_compile_after_files, &file_graph.file_compile_after_files);
 
     for (file_graph.topo_order.items) |file_path| {
         try source_files.append(alloc, file_path);
@@ -3365,6 +3932,7 @@ fn discoverManifestSources(
         .source_file_imports = source_file_imports,
         .source_file_imported_by = source_file_imported_by,
         .source_file_compile_after_globs = source_file_compile_after_globs,
+        .source_file_compile_after_files = source_file_compile_after_files,
         .mapped_files = mapped_files.items,
     };
 }
@@ -3388,45 +3956,63 @@ fn buildTarget(
     var progress = zap.progress.Reporter.init("Compiling", stderrProgressEnabled());
     const progress_reporter: ?*zap.progress.Reporter = if (progress.enabled) &progress else null;
     defer progress.finish();
+    const progress_root = progressNodeParent(progress_reporter, null);
 
-    progress.stage("Planning target :{s}", .{target_name});
+    var plan_node = ScopedProgressNode.start(progress_reporter, progress_root, "Plan target");
+    defer plan_node.deinit();
+    plan_node.updateCurrentItem(target_name, "Planning target :{s}", .{target_name});
+    plan_node.succeed();
 
     // Read build.zap
-    progress.stage("Manifest: reading build.zap", .{});
+    var read_manifest_node = ScopedProgressNode.start(progress_reporter, progress_root, "Read manifest");
+    defer read_manifest_node.deinit();
     const build_file_path = try std.fs.path.join(alloc, &.{ project_root, "build.zap" });
+    read_manifest_node.updateCurrentItem(build_file_path, "Manifest: reading build.zap", .{});
     const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_file_path, alloc, .limited(10 * 1024 * 1024)) catch |err| {
         std.debug.print("Error reading build.zap: {}\n", .{err});
         std.process.exit(1);
     };
+    read_manifest_node.succeed();
 
     // Resolve zap lib dir for stdlib (flag > env > exe-relative > cwd).
-    progress.stage("Toolchain: resolving Zap stdlib", .{});
+    var toolchain_node = ScopedProgressNode.start(progress_reporter, progress_root, "Resolve toolchain");
+    defer toolchain_node.deinit();
+    var zap_stdlib_node = ScopedProgressNode.start(progress_reporter, toolchain_node.node, "Zap stdlib");
+    defer zap_stdlib_node.deinit();
     const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override, project_root) catch {
         std.debug.print("Error: could not resolve Zap stdlib directory\n", .{});
         std.process.exit(1);
     };
+    if (zap_lib_dir) |dir| zap_stdlib_node.updateCurrentItem(dir, "Toolchain: resolving Zap stdlib", .{});
+    zap_stdlib_node.succeed();
 
     // Detect zig lib dir before CTFE so the manifest artifact snapshot
     // can validate an early cache hit without constructing the full
     // build plan.
-    progress.stage("Toolchain: resolving Zig stdlib", .{});
+    var zig_stdlib_node = ScopedProgressNode.start(progress_reporter, toolchain_node.node, "Zig stdlib");
+    defer zig_stdlib_node.deinit();
     const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
         break :blk extractEmbeddedZigLib(alloc) catch {
             std.debug.print("Error: could not find or extract Zig lib\n", .{});
             std.process.exit(1);
         };
     };
+    zig_stdlib_node.updateCurrentItem(zig_lib_dir, "Toolchain: resolving Zig stdlib", .{});
+    zig_stdlib_node.succeed();
 
     const toolchain_cache_dir = ".zap-cache/toolchain";
-    progress.stage("Toolchain: checking compiler identity", .{});
-    const compiler_identity_hash = hashCompilerIdentity(alloc, toolchain_cache_dir) catch |err| {
+    var compiler_identity_node = ScopedProgressNode.start(progress_reporter, toolchain_node.node, "Compiler identity");
+    defer compiler_identity_node.deinit();
+    const compiler_identity_digest = hashCompilerIdentity(alloc, toolchain_cache_dir) catch |err| {
         std.debug.print("Error: could not hash compiler identity for the manifest cache key: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    const zig_lib_identity_hash = hashZigLibIdentity(alloc, toolchain_cache_dir, zig_lib_dir) catch |err| {
+    const zig_lib_identity_digest = hashZigLibIdentity(alloc, toolchain_cache_dir, zig_lib_dir) catch |err| {
         std.debug.print("Error: could not hash Zig lib identity for the manifest cache key: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
+    compiler_identity_node.succeed();
+    toolchain_node.succeed();
     const manifest_invocation_identity = computeManifestInvocationIdentity(
         alloc,
         build_source,
@@ -3437,14 +4023,17 @@ fn buildTarget(
         collect_arc_stats,
         zap_lib_dir,
         zig_lib_dir,
-        compiler_identity_hash,
-        zig_lib_identity_hash,
+        compiler_identity_digest,
+        zig_lib_identity_digest,
     ) catch return error.OutOfMemory;
 
     const backend_cache_dir = ".zap-cache";
     const manifest_snapshot_path = build_cache.snapshotPath(alloc, backend_cache_dir, target_name) catch return error.OutOfMemory;
-    progress.stage("Manifest: checking cache", .{});
-    if (tryManifestSnapshotHit(allocator, alloc, manifest_snapshot_path, manifest_invocation_identity, progress_reporter)) |artifact| {
+    var manifest_cache_node = ScopedProgressNode.start(progress_reporter, progress_root, "Check manifest cache");
+    defer manifest_cache_node.deinit();
+    manifest_cache_node.updateCurrentItem(manifest_snapshot_path, "Manifest: checking cache", .{});
+    if (tryManifestSnapshotHit(allocator, alloc, manifest_snapshot_path, manifest_invocation_identity, progress_reporter, manifest_cache_node.node)) |artifact| {
+        manifest_cache_node.succeed();
         warmManifestDaemon(
             alloc,
             manifest_invocation_identity,
@@ -3457,7 +4046,11 @@ fn buildTarget(
         );
         return artifact;
     }
+    manifest_cache_node.succeed();
 
+    var daemon_node = ScopedProgressNode.start(progress_reporter, progress_root, "Manifest daemon");
+    defer daemon_node.deinit();
+    daemon_node.updateCurrentItem("querying incremental daemon", "Manifest: querying incremental daemon", .{});
     if (tryManifestDaemonBuild(
         allocator,
         alloc,
@@ -3468,22 +4061,32 @@ fn buildTarget(
         build_overrides,
         collect_arc_stats,
         zap_lib_dir_override,
+        daemon_node.node,
     )) |artifact| {
-        if (tryManifestSnapshotHit(allocator, alloc, manifest_snapshot_path, manifest_invocation_identity, progress_reporter)) |validated_artifact| {
+        daemon_node.succeed();
+        if (tryManifestSnapshotHit(allocator, alloc, manifest_snapshot_path, manifest_invocation_identity, progress_reporter, null)) |validated_artifact| {
             artifact.deinit(allocator);
             return validated_artifact;
         }
 
         artifact.deinit(allocator);
-        progress.stage("Manifest: daemon result stale; rebuilding", .{});
+        var stale_node = ScopedProgressNode.start(progress_reporter, progress_root, "Manifest daemon");
+        defer stale_node.deinit();
+        stale_node.updateCurrentItem("daemon result stale; rebuilding", "Manifest: daemon result stale; rebuilding", .{});
+        stale_node.succeed();
+    } else {
+        daemon_node.skip();
     }
 
     // Extract manifest from build.zap via CTFE.
     // Compiles build.zap to IR and evaluates manifest/1 at compile time.
+    var manifest_eval_node = ScopedProgressNode.start(progress_reporter, progress_root, "Evaluate manifest");
+    defer manifest_eval_node.deinit();
     const manifest_eval = builder.ctfeManifestDetailedWithProgress(alloc, build_source, target_name, build_opts, zap_lib_dir, progress_reporter) catch |err| {
         std.debug.print("Error: failed to evaluate build.zap manifest via CTFE: {}\n", .{err});
         std.process.exit(1);
     };
+    manifest_eval_node.succeed();
     // The CLI is the ultimate per-field source of truth: overlay the
     // parsed `-D` build flags onto the manifest-produced config. This
     // is the SAME single override step the script path applies, so
@@ -3493,18 +4096,27 @@ fn buildTarget(
     var config = manifest_eval.config;
     applyBuildOverrides(&config, build_overrides);
 
-    progress.stage("Sources: resolving roots", .{});
-    progress.stage("Dependencies: resolving", .{});
+    var sources_node = ScopedProgressNode.start(progress_reporter, progress_root, "Resolve sources");
+    defer sources_node.deinit();
+    var source_roots_node = ScopedProgressNode.start(progress_reporter, sources_node.node, "Source roots");
+    defer source_roots_node.deinit();
     const source_roots = resolveManifestSourceRoots(alloc, project_root, config, zap_lib_dir, .{}) catch |err| {
         std.debug.print("Error: source-root resolution failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
+    source_roots_node.succeed();
+    var source_discovery_node = ScopedProgressNode.start(progress_reporter, sources_node.node, "Discover sources");
+    defer source_discovery_node.deinit();
     var manifest_sources = discoverManifestSources(alloc, project_root, config, source_roots, progress_reporter) catch |err| {
         std.debug.print("Error: source discovery failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
     defer manifest_sources.deinit();
+    source_discovery_node.succeed();
+    sources_node.succeed();
 
+    var compile_tail_node = ScopedProgressNode.start(progress_reporter, progress_root, "Compile/link");
+    defer compile_tail_node.deinit();
     const artifact = try compileAndLink(allocator, alloc, .{
         .config = config,
         .source_roots = manifest_sources.source_roots,
@@ -3517,12 +4129,13 @@ fn buildTarget(
         .build_opts = build_opts,
         .zap_lib_dir = zap_lib_dir,
         .zig_lib_dir = zig_lib_dir,
-        .compiler_identity_hash = compiler_identity_hash,
-        .zig_lib_identity_hash = zig_lib_identity_hash,
+        .compiler_identity_digest = compiler_identity_digest,
+        .zig_lib_identity_digest = zig_lib_identity_digest,
         .project_root = project_root,
         .collect_arc_stats = collect_arc_stats,
         .layout = .manifest,
         .progress = progress_reporter,
+        .progress_parent = compile_tail_node.node,
         .manifest_cache = .{
             .invocation_identity = manifest_invocation_identity,
             .snapshot_path = manifest_snapshot_path,
@@ -3530,6 +4143,7 @@ fn buildTarget(
             .dependencies = manifest_eval.dependencies,
         },
     });
+    compile_tail_node.succeed();
     warmManifestDaemon(
         alloc,
         manifest_invocation_identity,
@@ -3578,8 +4192,8 @@ const CompileAndLinkInputs = struct {
     build_opts: std.StringHashMapUnmanaged([]const u8),
     zap_lib_dir: ?[]const u8,
     zig_lib_dir: []const u8,
-    compiler_identity_hash: u64,
-    zig_lib_identity_hash: u64,
+    compiler_identity_digest: build_cache.ToolchainDigest,
+    zig_lib_identity_digest: build_cache.ToolchainDigest,
     project_root: []const u8,
     collect_arc_stats: bool,
     // Cross-compile target/cpu are NOT separate inputs: they live on
@@ -3588,11 +4202,12 @@ const CompileAndLinkInputs = struct {
     // / `config.cpu` directly so there is no second target channel.
     layout: OutputLayout,
     progress: ?*zap.progress.Reporter = null,
+    progress_parent: ?zap.progress.Node = null,
     manifest_cache: ?ManifestCacheInputs = null,
 };
 
 const ManifestCacheInputs = struct {
-    invocation_identity: u64,
+    invocation_identity: build_cache.InvocationIdentity,
     snapshot_path: []const u8,
     build_file_path: []const u8,
     dependencies: []const zap.ctfe.CtDependency,
@@ -3604,17 +4219,19 @@ fn computeManifestCacheKeyHex(
     config: zap.builder.BuildConfig,
     active_manager_source_path: []const u8,
 ) ![]const u8 {
-    const active_manager_source_hash = hashActiveManagerSource(alloc, active_manager_source_path) catch |err| {
+    const active_manager_source_digest = hashActiveManagerSource(alloc, active_manager_source_path) catch |err| {
         std.debug.print("Error: could not hash active memory manager source: {}\n", .{err});
         return err;
     };
-    const cache_digest = computeBuildCacheKey(inputs.cache_source, inputs.source_units, inputs.target_name, .{
+    const optimize_policy = optimizePolicyForBuildConfig(config.optimize);
+    const cache_digest = try computeBuildCacheKey(alloc, inputs.cache_source, inputs.source_units, inputs.target_name, .{
         .manifest_result_hash = inputs.manifest_result_hash,
-        .active_manager_source_hash = active_manager_source_hash,
-        .compiler_identity_hash = inputs.compiler_identity_hash,
-        .zig_lib_identity_hash = inputs.zig_lib_identity_hash,
+        .active_manager_source_digest = active_manager_source_digest,
+        .compiler_identity_digest = inputs.compiler_identity_digest,
+        .zig_lib_identity_digest = inputs.zig_lib_identity_digest,
         .collect_arc_stats = inputs.collect_arc_stats,
         .optimize = config.optimize,
+        .frontend_policy_tag = optimize_policy.frontend_policy_tag,
         .memory_manager_name = if (config.memory_manager) |m| m.type_name else "",
         .target = config.target orelse "",
         .cpu = config.cpu orelse "",
@@ -3668,8 +4285,20 @@ fn compileAndLink(
     // every object is built for the same machine.
     const compile_target = config.target;
     const compile_cpu = config.cpu;
+    const optimize_policy = optimizePolicyForBuildConfig(config.optimize);
 
-    if (progress) |reporter| reporter.stage("Memory: resolving manifest adapter", .{});
+    const external_progress_parent = inputs.progress_parent != null;
+    const compile_parent_node = if (inputs.progress_parent) |parent_node|
+        parent_node
+    else
+        startProgressNode(progress, progressNodeParent(progress, null), "Compile/link");
+    var compile_parent_succeeded = false;
+    defer if (!external_progress_parent) {
+        finishProgressNode(compile_parent_node, if (compile_parent_succeeded) .succeeded else .failed);
+    };
+
+    var memory_adapter_node = ScopedProgressNode.start(progress, compile_parent_node, "Memory adapter");
+    defer memory_adapter_node.deinit();
     const memory_adapter_eval = builder.evaluateMemoryManagerAdapterFromSources(
         alloc,
         inputs.source_roots,
@@ -3685,6 +4314,8 @@ fn compileAndLink(
         std.debug.print("Error: manifest did not select a Memory.Manager adapter\n", .{});
         std.process.exit(1);
     };
+    memory_adapter_node.updateCurrentItem(manifest_memory_manager.type_name, "Memory: resolving manifest adapter", .{});
+    memory_adapter_node.succeed();
     const effective_manifest_hash = builder.hashManifestWithMemoryAdapter(
         inputs.manifest_result_hash,
         memory_adapter_eval.result_hash,
@@ -3724,12 +4355,16 @@ fn compileAndLink(
     const ctfe_cache_dir = try std.fs.path.join(alloc, &.{ backend_cache_dir, "ctfe" });
     const memory_cache_dir = try std.fs.path.join(alloc, &.{ backend_cache_dir, "memory" });
 
-    if (progress) |reporter| reporter.stage("Cache: preparing output directories", .{});
+    var output_cache_node = ScopedProgressNode.start(progress, compile_parent_node, "Output/cache preparation");
+    defer output_cache_node.deinit();
+    output_cache_node.updateCurrentItem(out_dir, "Cache: preparing output directories", .{});
     std.Io.Dir.cwd().createDirPath(global_io, backend_cache_dir) catch {};
     std.Io.Dir.cwd().createDirPath(global_io, out_dir) catch {};
 
     const output_filename = try buildArtifactFilename(alloc, config);
     const output_path = try std.fs.path.join(alloc, &.{ out_dir, output_filename });
+    output_cache_node.updateCurrentItem(output_path, "Cache: preparing output directories", .{});
+    output_cache_node.succeed();
 
     // Determine lib_mode from manifest kind
     const lib_mode = config.kind == .lib;
@@ -3747,12 +4382,7 @@ fn compileAndLink(
     // Memory Manager ABI does not yet thread optimize through HIR/codegen,
     // so we match Zap's selection so debug/safe/fast produce a manager
     // built with the same optimization level as the rest of the binary.
-    const driver_optimize: zap.memory_driver.ZapForkOptimize = switch (config.optimize) {
-        .debug => .Debug,
-        .release_safe => .ReleaseSafe,
-        .release_fast => .ReleaseFast,
-        .release_small => .ReleaseSmall,
-    };
+    const driver_optimize = optimize_policy.memory_driver_optimize;
 
     var driver_diag_buf: [4096]u8 = undefined;
     var driver_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &driver_diag_buf };
@@ -3778,8 +4408,8 @@ fn compileAndLink(
         .zap_source_root = zap_source_tree_root,
         .cache_dir = memory_cache_dir,
         .zig_lib_dir = zig_lib_dir,
-        .compiler_identity_hash = inputs.compiler_identity_hash,
-        .zig_lib_identity_hash = inputs.zig_lib_identity_hash,
+        .compiler_identity_digest = inputs.compiler_identity_digest,
+        .zig_lib_identity_digest = inputs.zig_lib_identity_digest,
         .optimize = driver_optimize,
         // Thread the build's cross-compile target through so the
         // manager `.o` is built for the same target as the final
@@ -3793,7 +4423,8 @@ fn compileAndLink(
         .progress = progress,
     };
 
-    if (progress) |reporter| reporter.stage("Memory: locating manager backend", .{});
+    var manager_source_node = ScopedProgressNode.start(progress, compile_parent_node, "Manager source");
+    defer manager_source_node.deinit();
     var source_selection = zap.memory_driver.resolveManagerSource(
         alloc,
         memory_driver_options,
@@ -3806,31 +4437,38 @@ fn compileAndLink(
         std.process.exit(1);
     };
     defer zap.memory_driver.freeManagerSourceSelection(alloc, &source_selection);
+    manager_source_node.updateCurrentItem(source_selection.active_manager_source_path, "Memory: locating manager backend", .{});
+    manager_source_node.succeed();
 
     // Compilation caching: hash the cache source (build.zap or the
     // script source) + all Zap sources + target name, the selected
     // backend source, the running compiler identity, and EVERY build
     // control that changes the emitted artifact — including the
-    // (post-override) optimize mode, memory manager, cross target, and
-    // cpu. Folding all four controls means flipping any `-D` flag
-    // invalidates the cache (and is the exact key Phase 5's
+    // (post-override) optimize mode, frontend policy, memory manager,
+    // cross target, and cpu. Folding these controls means flipping any
+    // `-D` flag invalidates the cache (and is the exact key Phase 5's
     // content-addressed script skip-recompile attaches to: see
     // `cacheKeyControls`).
-    if (progress) |reporter| reporter.stage("Cache: hashing build inputs", .{});
+    var input_hash_node = ScopedProgressNode.start(progress, compile_parent_node, "Build input hashing");
+    defer input_hash_node.deinit();
     var cache_inputs = inputs;
     cache_inputs.manifest_result_hash = effective_manifest_hash;
     const cache_key_hex = computeManifestCacheKeyHex(alloc, cache_inputs, config, source_selection.active_manager_source_path) catch {
         std.process.exit(1);
     };
+    input_hash_node.updateCurrentItem(cache_key_hex, "Cache: hashing build inputs", .{});
+    input_hash_node.succeed();
     const cached_manifest_artifact_path: ?[]const u8 = if (inputs.manifest_cache != null)
         try build_cache.artifactPath(alloc, backend_cache_dir, cache_key_hex, output_filename)
     else
         null;
 
     if (inputs.manifest_cache != null) {
-        if (progress) |reporter| reporter.stage("Cache: checking artifact", .{});
+        var artifact_cache_node = ScopedProgressNode.start(progress, compile_parent_node, "Artifact cache check");
+        defer artifact_cache_node.deinit();
         const cache_valid = blk: {
             const cached_path = cached_manifest_artifact_path orelse break :blk false;
+            artifact_cache_node.updateCurrentItem(cached_path, "Cache: checking artifact", .{});
             std.Io.Dir.cwd().access(global_io, cached_path, .{}) catch break :blk false;
             const debug_symbols_ready = artifactHasRequiredDebugSymbols(alloc, config, cached_path) catch {
                 std.debug.print("Error: out of memory checking debug symbol cache state\n", .{});
@@ -3842,6 +4480,7 @@ fn compileAndLink(
 
         if (cache_valid) {
             const cached_path = cached_manifest_artifact_path.?;
+            artifact_cache_node.cacheHit("artifact", cached_path);
             const snapshot_for_install: build_cache.Snapshot = .{
                 .invocation_identity = inputs.manifest_cache.?.invocation_identity,
                 .cache_key_hex = cache_key_hex,
@@ -3856,23 +4495,35 @@ fn compileAndLink(
                 std.debug.print("Error: could not install cached artifact: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };
-            if (progress) |reporter| reporter.stage("Cache: refreshing manifest snapshot", .{});
+            artifact_cache_node.succeed();
+            var snapshot_node = ScopedProgressNode.start(progress, compile_parent_node, "Snapshot write");
+            defer snapshot_node.deinit();
+            snapshot_node.updateCurrentItem(inputs.manifest_cache.?.snapshot_path, "Cache: refreshing manifest snapshot", .{});
             refreshManifestSnapshot(alloc, inputs, config, output_path, cached_path, cache_key_hex, source_selection.active_manager_source_path) catch |err| {
                 std.debug.print("Error: could not refresh manifest artifact snapshot: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };
+            snapshot_node.succeed();
             if (progress) |reporter| {
                 reporter.event("[cached] {s}\n", .{output_path});
             } else {
                 std.debug.print("[cached] {s}\n", .{output_path});
             }
+            compile_parent_succeeded = true;
             return try makeBuildArtifact(allocator, output_path, config.kind, compile_target, config.pipeline);
         }
+        if (cached_manifest_artifact_path) |cached_path| {
+            artifact_cache_node.cacheMiss("artifact", cached_path);
+        } else {
+            artifact_cache_node.cacheMiss("artifact", output_filename);
+        }
+        artifact_cache_node.succeed();
     }
 
     driver_diag.written = 0;
     if (driver_diag.buffer.len > 0) driver_diag.buffer[0] = 0;
-    if (progress) |reporter| reporter.stage("Memory: building manager object", .{});
+    var manager_object_node = ScopedProgressNode.start(progress, compile_parent_node, "Manager object");
+    defer manager_object_node.deinit();
     var resolved_manager = zap.memory_driver.resolve(
         alloc,
         memory_driver_options,
@@ -3885,15 +4536,19 @@ fn compileAndLink(
         std.process.exit(1);
     };
     defer zap.memory_driver.freeResolved(alloc, &resolved_manager);
+    manager_object_node.updateCurrentItem(resolved_manager.active_manager_source_path, "Memory: building manager object", .{});
+    manager_object_node.succeed();
 
     // Compile through frontend
     // Use per-file pipeline for import-driven discovery, legacy pipeline for glob
-    if (progress) |reporter| reporter.stage("Frontend: compiling Zap sources", .{});
+    var frontend_node = ScopedProgressNode.start(progress, compile_parent_node, "Frontend compile");
+    defer frontend_node.deinit();
     var result = compileProjectFrontend(alloc, inputs.source_units, .{
         .show_progress = progress != null,
         .progress = progress,
         .progress_context = "Frontend",
         .lib_mode = lib_mode,
+        .frontend_optimize_mode = optimize_policy.frontend_optimize_mode,
         .struct_order = inputs.struct_order,
         .level_boundaries = inputs.level_boundaries,
         .cache_dir = ctfe_cache_dir,
@@ -3904,12 +4559,16 @@ fn compileAndLink(
     }) catch {
         std.process.exit(1);
     };
+    frontend_node.succeed();
 
     // Resolve the manifest root to an IR function ID.
     // so the ZIR backend knows which function is the entry point.
     // IR naming: struct parts joined by "_", then "__" before function name, then "__" arity.
     // For example, &Test.TestHelper.main/1 maps to Test_TestHelper__main__1.
+    var entry_node = ScopedProgressNode.start(progress, compile_parent_node, "Entry resolution");
+    defer entry_node.deinit();
     if (config.root) |root| {
+        entry_node.updateCurrentItem(root, "Entry: resolving {s}", .{root});
         // Extract the arity suffix from the canonical root name.
         const arity_str = if (std.mem.findScalarLast(u8, root, '/')) |slash|
             root[slash + 1 ..]
@@ -3949,14 +4608,10 @@ fn compileAndLink(
             }
         }
     }
+    entry_node.succeed();
 
     // Map optimize mode from manifest
-    const optimize_mode: u8 = switch (config.optimize) {
-        .debug => 0,
-        .release_safe => 1,
-        .release_fast => 2,
-        .release_small => 3,
-    };
+    const optimize_mode: u8 = optimize_policy.backend_optimize_mode;
 
     // Memory manager resolution happened above (Phase 6 needs the
     // resulting `declared_caps` before the front-end). The object path
@@ -3969,7 +4624,8 @@ fn compileAndLink(
         .obj => 2,
     };
     const has_generated_executable_startup_prologue = hasGeneratedExecutableStartupPrologue(config.kind);
-    if (progress) |reporter| reporter.stage("Backend: compiling ZIR and linking", .{});
+    var backend_node = ScopedProgressNode.start(progress, compile_parent_node, "ZIR/backend/link");
+    defer backend_node.deinit();
     zir_backend.compile(alloc, result.ir_program, .{
         .zig_lib_dir = zig_lib_dir,
         .cache_dir = backend_cache_dir,
@@ -4013,25 +4669,46 @@ fn compileAndLink(
         std.debug.print("Error: compilation failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    generateDarwinDebugSymbolsOrExit(alloc, config, output_path, progress);
+    backend_node.succeed();
+
+    if (needsDarwinDebugSymbols(config)) {
+        var debug_symbols_node = ScopedProgressNode.start(progress, compile_parent_node, "Debug symbols");
+        defer debug_symbols_node.deinit();
+        generateDarwinDebugSymbolsOrExit(alloc, config, output_path, progress);
+        debug_symbols_node.succeed();
+    }
     if (cached_manifest_artifact_path) |cached_path| {
-        if (progress) |reporter| reporter.stage("Cache: publishing content-addressed artifact", .{});
+        var publish_node = ScopedProgressNode.start(progress, compile_parent_node, "Artifact publish");
+        defer publish_node.deinit();
+        publish_node.updateCurrentItem(cached_path, "Cache: publishing content-addressed artifact", .{});
         publishManifestArtifactToCache(alloc, config, output_path, cached_path) catch |err| {
             std.debug.print("Error: could not publish manifest artifact cache entry: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
+        publish_node.succeed();
     }
 
     // Save the manifest artifact snapshot atomically for manifest
     // builds. Script builds pass no `manifest_cache`, so this shared
     // helper writes no cwd metadata for script mode.
+    var snapshot_node = if (inputs.manifest_cache != null)
+        ScopedProgressNode.start(progress, compile_parent_node, "Snapshot write")
+    else
+        ScopedProgressNode{ .progress = progress, .node = null };
+    defer snapshot_node.deinit();
+    if (inputs.manifest_cache) |manifest_cache| {
+        snapshot_node.updateCurrentItem(manifest_cache.snapshot_path, "Cache: refreshing manifest snapshot", .{});
+    }
     writeManifestCacheMetadata(alloc, inputs, config, output_path, cached_manifest_artifact_path orelse output_path, cache_key_hex, resolved_manager.active_manager_source_path) catch |err| {
         std.debug.print("Error: could not write manifest cache metadata: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
+    snapshot_node.succeed();
 
     // Return a durable copy of the output path
-    return try makeBuildArtifact(allocator, output_path, config.kind, compile_target, config.pipeline);
+    const artifact = try makeBuildArtifact(allocator, output_path, config.kind, compile_target, config.pipeline);
+    compile_parent_succeeded = true;
+    return artifact;
 }
 
 fn compileProjectFrontend(
@@ -4179,7 +4856,7 @@ fn appendAbsentFileFingerprint(
     try files.append(alloc, .{
         .path = try alloc.dupe(u8, path),
         .present = false,
-        .content_hash = 0,
+        .content_digest = [_]u8{0} ** @sizeOf(build_cache.FileDigest),
         .size = 0,
         .inode = 0,
         .mtime_nanos = 0,
@@ -4237,8 +4914,8 @@ fn collectMemoryAdapterSourceUnits(
     return try units.toOwnedSlice(alloc);
 }
 
-const BUILD_CACHE_DIGEST_LEN: usize = 32;
-const BuildCacheDigest = [BUILD_CACHE_DIGEST_LEN]u8;
+const BUILD_CACHE_DIGEST_LEN: usize = @sizeOf(build_cache.CacheDigest);
+const BuildCacheDigest = build_cache.CacheDigest;
 
 fn digestHexAlloc(alloc: std.mem.Allocator, digest: BuildCacheDigest) ![]const u8 {
     var hex_buf: [BUILD_CACHE_DIGEST_LEN * 2]u8 = undefined;
@@ -4249,19 +4926,27 @@ fn digestHexAlloc(alloc: std.mem.Allocator, digest: BuildCacheDigest) ![]const u
     return try alloc.dupe(u8, &hex_buf);
 }
 
+fn zeroBuildCacheDigest() BuildCacheDigest {
+    return [_]u8{0} ** @sizeOf(BuildCacheDigest);
+}
+
+fn testBuildCacheDigest(byte: u8) BuildCacheDigest {
+    return [_]u8{byte} ** @sizeOf(BuildCacheDigest);
+}
+
 /// Compute a build cache key using the full SHA-256 digest. Artifact
 /// directories are named with the 64-character lower-hex encoding of this
 /// digest, matching Zig's collision-resistant object-cache model.
 const BuildCacheOptions = struct {
     manifest_result_hash: u64,
-    active_manager_source_hash: u64 = 0,
-    /// Identity hash of the running compiler binary. Manifest artifact
+    active_manager_source_digest: BuildCacheDigest = zeroBuildCacheDigest(),
+    /// Identity digest of the running compiler binary. Manifest artifact
     /// cache hits can skip memory-manager validation, so compiler,
     /// runtime, ABI, and backend changes must force a rebuild.
-    compiler_identity_hash: u64 = 0,
-    /// Identity hash of the resolved Zig lib directory. The path alone
+    compiler_identity_digest: BuildCacheDigest = zeroBuildCacheDigest(),
+    /// Identity digest of the resolved Zig lib directory. The path alone
     /// is not enough: an override can mutate contents in place.
-    zig_lib_identity_hash: u64 = 0,
+    zig_lib_identity_digest: BuildCacheDigest = zeroBuildCacheDigest(),
     collect_arc_stats: bool = false,
     /// The post-override build controls. Folding all four into the key
     /// means flipping ANY `-D` flag (or a manifest change to one)
@@ -4269,6 +4954,10 @@ const BuildCacheOptions = struct {
     /// content-addressed script skip-recompile relies on. Defaults
     /// keep the key stable for a plain unflagged build.
     optimize: zap.builder.BuildConfig.Optimize = .debug,
+    /// Stable identity of the selected frontend pass policy. This is folded
+    /// separately from `optimize` so future policy changes under the same
+    /// backend optimize mode cannot reuse stale artifacts.
+    frontend_policy_tag: u64 = compiler.FrontendOptimizeMode.debug.cacheTag(),
     /// Selected memory manager type name ("" when none — never happens
     /// for a real build, but keeps the unit-testable struct total).
     memory_manager_name: []const u8 = "",
@@ -4289,7 +4978,9 @@ const BuildCacheOptions = struct {
     /// Magic + version for the build-control sub-section so a future
     /// change to what is folded in is self-describing in the stream.
     const CONTROL_MAGIC: u32 = 0x5a_42_43_31; // "ZBC1"
-    const CONTROL_VERSION: u16 = 1;
+    /// Increment when the artifact cache correctness contract changes. Version
+    /// 5 folds the explicit frontend policy tag into artifact identity.
+    const CONTROL_VERSION: u16 = 5;
 
     fn runtimeFlags(self: BuildCacheOptions) u16 {
         var flags: u16 = 0;
@@ -4299,19 +4990,20 @@ const BuildCacheOptions = struct {
 
     fn updateHasher(self: BuildCacheOptions, hasher: *std.crypto.hash.sha2.Sha256) void {
         hasher.update(std.mem.asBytes(&self.manifest_result_hash));
-        hasher.update(std.mem.asBytes(&self.active_manager_source_hash));
-        hasher.update(std.mem.asBytes(&self.compiler_identity_hash));
-        hasher.update(std.mem.asBytes(&self.zig_lib_identity_hash));
+        hasher.update(&self.active_manager_source_digest);
+        hasher.update(&self.compiler_identity_digest);
+        hasher.update(&self.zig_lib_identity_digest);
 
-        // Build-control sub-section — ALWAYS folded in so the
-        // optimize mode, memory manager, cross target, and cpu are
-        // part of every cache key (no early-out can skip these).
+        // Build-control sub-section — ALWAYS folded in so the optimize
+        // mode, frontend policy, memory manager, cross target, and cpu
+        // are part of every cache key (no early-out can skip these).
         const control_magic = CONTROL_MAGIC;
         const control_version = CONTROL_VERSION;
         hasher.update(std.mem.asBytes(&control_magic));
         hasher.update(std.mem.asBytes(&control_version));
         const optimize_tag: u8 = @intFromEnum(self.optimize);
         hasher.update(std.mem.asBytes(&optimize_tag));
+        hasher.update(std.mem.asBytes(&self.frontend_policy_tag));
         // Length-prefix each string so "ab"+"c" can't collide with
         // "a"+"bc".
         for ([_][]const u8{ self.memory_manager_name, self.target, self.cpu }) |s| {
@@ -4332,29 +5024,41 @@ const BuildCacheOptions = struct {
     }
 };
 
-fn hashActiveManagerSource(alloc: std.mem.Allocator, source_path: []const u8) !u64 {
+fn hashActiveManagerSource(alloc: std.mem.Allocator, source_path: []const u8) !BuildCacheDigest {
     const source = try std.Io.Dir.cwd().readFileAlloc(global_io, source_path, alloc, .limited(10 * 1024 * 1024));
     defer alloc.free(source);
-    var hasher = std.hash.Wyhash.init(0);
-    hasher.update(source_path);
-    hasher.update(source);
-    return hasher.final();
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashUpdateLenPrefixed(&hasher, source_path);
+    hashUpdateLenPrefixed(&hasher, source);
+    return hasher.finalResult();
 }
 
 fn computeBuildCacheKey(
+    alloc: std.mem.Allocator,
     build_source: []const u8,
     source_units: []const compiler.SourceUnit,
     target_name: []const u8,
     options: BuildCacheOptions,
-) BuildCacheDigest {
+) !BuildCacheDigest {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(build_source);
-    // Hash each source file individually — no concatenation needed
-    for (source_units) |unit| {
-        hasher.update(unit.file_path);
-        hasher.update(unit.source);
+    hashUpdateLenPrefixed(&hasher, build_source);
+    // Hash each source file individually. Every variable-width field is
+    // length-prefixed so adjacent path/source bytes cannot collide by
+    // shifting a boundary.
+    const sorted_units = try alloc.dupe(compiler.SourceUnit, source_units);
+    defer alloc.free(sorted_units);
+    std.mem.sort(compiler.SourceUnit, sorted_units, {}, struct {
+        fn lessThan(_: void, left: compiler.SourceUnit, right: compiler.SourceUnit) bool {
+            const path_order = std.mem.order(u8, left.file_path, right.file_path);
+            if (path_order != .eq) return path_order == .lt;
+            return std.mem.lessThan(u8, left.source, right.source);
+        }
+    }.lessThan);
+    for (sorted_units) |unit| {
+        hashUpdateLenPrefixed(&hasher, unit.file_path);
+        hashUpdateLenPrefixed(&hasher, unit.source);
     }
-    hasher.update(target_name);
+    hashUpdateLenPrefixed(&hasher, target_name);
     options.updateHasher(&hasher);
     return hasher.finalResult();
 }
@@ -4383,14 +5087,15 @@ fn computeBuildCacheKey(
 //     this is the content-addressed tool-identity approach used by
 //     hermetic build systems, robust without a hand-maintained
 //     version string),
-//   * the post-override optimize mode, memory-manager type name,
-//     cross target triple, and cpu string (read off the synthetic
-//     `BuildConfig` AFTER `applyBuildOverrides`, the single source of
-//     truth — exactly the controls `computeBuildCacheKey` folds in).
+//   * the post-override optimize mode, frontend policy tag,
+//     memory-manager type name, cross target triple, and cpu string
+//     (read off the synthetic `BuildConfig` AFTER `applyBuildOverrides`,
+//     the single source of truth — exactly the controls
+//     `computeBuildCacheKey` folds in).
 // ---------------------------------------------------------------------------
 
 const SCRIPT_CONTENT_KEY_MAGIC: u32 = 0x5a_53_43_31; // "ZSC1"
-const SCRIPT_CONTENT_KEY_VERSION: u16 = 1;
+const SCRIPT_CONTENT_KEY_VERSION: u16 = 2;
 
 fn hashUpdateLenPrefixed(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
     const len: u64 = bytes.len;
@@ -4407,7 +5112,7 @@ fn hashUpdateLenPrefixed(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8
 /// stdlib. Returns a hard error on any IO failure (a silent 0 would
 /// collapse distinct stdlibs into one key — a correctness hole, never
 /// acceptable here).
-fn hashStdlibIdentity(alloc: std.mem.Allocator, stdlib_dir: []const u8) !u64 {
+fn hashStdlibIdentity(alloc: std.mem.Allocator, stdlib_dir: []const u8) !BuildCacheDigest {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     const magic = SCRIPT_CONTENT_KEY_MAGIC;
     const version = SCRIPT_CONTENT_KEY_VERSION;
@@ -4458,8 +5163,7 @@ fn hashStdlibIdentity(alloc: std.mem.Allocator, stdlib_dir: []const u8) !u64 {
         hashUpdateLenPrefixed(&hasher, contents);
     }
 
-    const digest = hasher.finalResult();
-    return std.mem.readInt(u64, digest[0..8], .little);
+    return hasher.finalResult();
 }
 
 /// Stable IDENTITY hash of the resolved Zig lib directory. The first
@@ -4471,8 +5175,8 @@ fn hashZigLibIdentity(
     alloc: std.mem.Allocator,
     cache_dir: []const u8,
     zig_lib_dir: []const u8,
-) !u64 {
-    return build_cache.zigLibIdentityHash(alloc, cache_dir, zig_lib_dir, null);
+) !BuildCacheDigest {
+    return build_cache.zigLibIdentityDigest(alloc, cache_dir, zig_lib_dir, null);
 }
 
 /// Content-addressed IDENTITY hash of the running Zap compiler: a
@@ -4484,8 +5188,8 @@ fn hashZigLibIdentity(
 /// brittle hand-maintained version string). A hard error on failure —
 /// silently dropping compiler identity from the key would risk a
 /// stale-binary false hit across compiler versions.
-fn hashCompilerIdentity(alloc: std.mem.Allocator, cache_dir: []const u8) !u64 {
-    return build_cache.compilerIdentityHash(alloc, cache_dir, null);
+fn hashCompilerIdentity(alloc: std.mem.Allocator, cache_dir: []const u8) !BuildCacheDigest {
+    return build_cache.compilerIdentityDigest(alloc, cache_dir, null);
 }
 
 /// The post-override build controls folded into the script content
@@ -4496,6 +5200,7 @@ fn hashCompilerIdentity(alloc: std.mem.Allocator, cache_dir: []const u8) !u64 {
 /// cache semantics never drift.
 const ScriptContentKeyControls = struct {
     optimize: zap.builder.BuildConfig.Optimize,
+    frontend_policy_tag: u64 = compiler.FrontendOptimizeMode.debug.cacheTag(),
     memory_manager_name: []const u8,
     target: []const u8,
     cpu: []const u8,
@@ -4508,9 +5213,9 @@ const ScriptContentKeyControls = struct {
 fn computeScriptContentKey(
     alloc: std.mem.Allocator,
     script_source: []const u8,
-    stdlib_identity: u64,
-    compiler_identity: u64,
-    zig_lib_identity: u64,
+    stdlib_identity_digest: BuildCacheDigest,
+    compiler_identity_digest: BuildCacheDigest,
+    zig_lib_identity_digest: BuildCacheDigest,
     controls: ScriptContentKeyControls,
 ) ![]const u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -4520,12 +5225,13 @@ fn computeScriptContentKey(
     hasher.update(std.mem.asBytes(&version));
 
     hashUpdateLenPrefixed(&hasher, script_source);
-    hasher.update(std.mem.asBytes(&stdlib_identity));
-    hasher.update(std.mem.asBytes(&compiler_identity));
-    hasher.update(std.mem.asBytes(&zig_lib_identity));
+    hasher.update(&stdlib_identity_digest);
+    hasher.update(&compiler_identity_digest);
+    hasher.update(&zig_lib_identity_digest);
 
     const optimize_tag: u8 = @intFromEnum(controls.optimize);
     hasher.update(std.mem.asBytes(&optimize_tag));
+    hasher.update(std.mem.asBytes(&controls.frontend_policy_tag));
     hashUpdateLenPrefixed(&hasher, controls.memory_manager_name);
     hashUpdateLenPrefixed(&hasher, controls.target);
     hashUpdateLenPrefixed(&hasher, controls.cpu);
@@ -5007,14 +5713,15 @@ const IncrementalWatchState = struct {
     output_name: []const u8,
     output_mode: u8,
     optimize_mode: u8,
+    frontend_optimize_mode: compiler.FrontendOptimizeMode,
     kind: zap.builder.BuildConfig.Kind,
     target: ?[]const u8,
     lib_mode: bool,
     has_generated_executable_startup_prologue: bool,
     collect_arc_stats: bool,
     link_libc: bool,
-    compiler_identity_hash: u64,
-    zig_lib_identity_hash: u64,
+    compiler_identity_digest: BuildCacheDigest,
+    zig_lib_identity_digest: BuildCacheDigest,
     allocator: std.mem.Allocator,
     /// Pinned manifest/config data. `rebuildManifestDaemonState` tears this
     /// state down when `build.zap` changes, so ordinary source edits can reuse
@@ -5061,6 +5768,10 @@ const IncrementalWatchState = struct {
     /// Resolved active manager backend source path. Owned by `allocator`;
     /// freed in `deinit`.
     active_manager_source_path: []const u8,
+    /// Content identity of `active_manager_source_path` at context creation.
+    /// The manager object and generated runtime are pinned to this source; a
+    /// later content change requires rebuilding the persistent Zig context.
+    active_manager_source_digest: BuildCacheDigest,
 
     fn deinit(self: *IncrementalWatchState) void {
         zir_backend.destroyContext(self.zir_ctx);
@@ -5114,13 +5825,14 @@ const IncrementalWatchState = struct {
         applyBuildOverrides(&config, build_overrides);
         const compile_target: ?[]const u8 = config.target;
         const compile_cpu: ?[]const u8 = config.cpu;
+        const optimize_policy = optimizePolicyForBuildConfig(config.optimize);
 
         if (progress) |reporter| reporter.stage("Toolchain: resolving Zig stdlib", .{});
         const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse (extractEmbeddedZigLib(alloc) catch return null);
         const toolchain_cache_dir = ".zap-cache/toolchain";
         if (progress) |reporter| reporter.stage("Toolchain: checking compiler identity", .{});
-        const compiler_identity_hash = hashCompilerIdentity(alloc, toolchain_cache_dir) catch return null;
-        const zig_lib_identity_hash = hashZigLibIdentity(alloc, toolchain_cache_dir, zig_lib_dir) catch return null;
+        const compiler_identity_digest = hashCompilerIdentity(alloc, toolchain_cache_dir) catch return null;
+        const zig_lib_identity_digest = hashZigLibIdentity(alloc, toolchain_cache_dir, zig_lib_dir) catch return null;
 
         if (progress) |reporter| reporter.stage("Sources: resolving roots", .{});
         const watch_source_roots = resolveManifestSourceRoots(alloc, project_root, config, zap_lib_dir, .{
@@ -5148,12 +5860,7 @@ const IncrementalWatchState = struct {
         // validation object, and capability bitmask that a non-watch
         // build would. The driver_optimize/driver target arguments mirror
         // `buildTarget` to keep validation identical across build modes.
-        const driver_optimize: zap.memory_driver.ZapForkOptimize = switch (config.optimize) {
-            .debug => .Debug,
-            .release_safe => .ReleaseSafe,
-            .release_fast => .ReleaseFast,
-            .release_small => .ReleaseSmall,
-        };
+        const driver_optimize = optimize_policy.memory_driver_optimize;
         const zap_source_tree_root: []const u8 = if (zap_lib_dir) |lib_dir|
             (std.fs.path.dirname(lib_dir) orelse project_root)
         else
@@ -5172,8 +5879,8 @@ const IncrementalWatchState = struct {
                 .zap_source_root = zap_source_tree_root,
                 .cache_dir = ".zap-cache/memory",
                 .zig_lib_dir = zig_lib_dir,
-                .compiler_identity_hash = compiler_identity_hash,
-                .zig_lib_identity_hash = zig_lib_identity_hash,
+                .compiler_identity_digest = compiler_identity_digest,
+                .zig_lib_identity_digest = zig_lib_identity_digest,
                 .optimize = driver_optimize,
                 .target = compile_target,
                 .cpu = compile_cpu,
@@ -5191,6 +5898,7 @@ const IncrementalWatchState = struct {
             return null;
         };
         defer zap.memory_driver.freeResolved(alloc, &resolved_manager);
+        const active_manager_source_digest = hashActiveManagerSource(alloc, resolved_manager.active_manager_source_path) catch return null;
 
         // Watch mode supports every manager that produces a valid
         // `.zapmem` section:
@@ -5226,12 +5934,7 @@ const IncrementalWatchState = struct {
             .obj => 2,
         };
         const has_generated_executable_startup_prologue = hasGeneratedExecutableStartupPrologue(config.kind);
-        const optimize_mode_val: u8 = switch (config.optimize) {
-            .debug => 0,
-            .release_safe => 1,
-            .release_fast => 2,
-            .release_small => 3,
-        };
+        const optimize_mode_val: u8 = optimize_policy.backend_optimize_mode;
 
         // Dupe strings into the persistent allocator
         const zig_lib_duped = allocator.dupe(u8, zig_lib_dir) catch {
@@ -5321,14 +6024,15 @@ const IncrementalWatchState = struct {
             .output_name = output_name_duped,
             .output_mode = output_mode_val,
             .optimize_mode = optimize_mode_val,
+            .frontend_optimize_mode = optimize_policy.frontend_optimize_mode,
             .kind = config.kind,
             .target = target_duped,
             .lib_mode = config.kind == .lib,
             .has_generated_executable_startup_prologue = has_generated_executable_startup_prologue,
             .collect_arc_stats = collect_arc_stats,
             .link_libc = true,
-            .compiler_identity_hash = compiler_identity_hash,
-            .zig_lib_identity_hash = zig_lib_identity_hash,
+            .compiler_identity_digest = compiler_identity_digest,
+            .zig_lib_identity_digest = zig_lib_identity_digest,
             .allocator = allocator,
             .manifest_arena = pinned_manifest.arena,
             .manifest_config = pinned_manifest.config,
@@ -5343,6 +6047,7 @@ const IncrementalWatchState = struct {
             .declared_caps = declared_caps,
             .refcount_sized_extension = refcount_sized_extension,
             .active_manager_source_path = active_manager_source_path_owned,
+            .active_manager_source_digest = active_manager_source_digest,
         };
     }
 
@@ -5372,40 +6077,6 @@ const IncrementalWatchState = struct {
         self.root_module_hash_present = current_hashes.root_present;
         self.root_module_hash = current_hashes.root_hash;
         self.source_topology_hash = source_topology_hash;
-    }
-
-    fn selectChangedIncrementalModules(
-        self: *IncrementalWatchState,
-        allocator: std.mem.Allocator,
-        current_hashes: *const ComputedIncrementalHashes,
-    ) !IncrementalModuleSelection {
-        var selected_structs: std.ArrayListUnmanaged([]const u8) = .empty;
-
-        if (self.root_module_hash_present and !current_hashes.root_present) {
-            return error.ContextInvalidated;
-        }
-        const include_root = current_hashes.root_present and
-            (!self.root_module_hash_present or self.root_module_hash != current_hashes.root_hash);
-
-        var old_iter = self.module_hashes.iterator();
-        while (old_iter.next()) |entry| {
-            if (!current_hashes.modules.contains(entry.key_ptr.*)) {
-                return error.ContextInvalidated;
-            }
-        }
-
-        var current_iter = current_hashes.modules.iterator();
-        while (current_iter.next()) |entry| {
-            const old_hash = self.module_hashes.get(entry.key_ptr.*) orelse return error.ContextInvalidated;
-            if (old_hash != entry.value_ptr.*) {
-                try selected_structs.append(allocator, entry.key_ptr.*);
-            }
-        }
-
-        return IncrementalModuleSelection{
-            .struct_names = try selected_structs.toOwnedSlice(allocator),
-            .include_root = include_root,
-        };
     }
 
     fn backendOptions(
@@ -5441,9 +6112,10 @@ const IncrementalWatchState = struct {
         };
     }
 
-    /// Run an incremental rebuild: full frontend re-compile, then
-    /// prepareUpdate -> invalidateFile -> injectPreparedAndUpdate on the
-    /// persistent context.
+    /// Run an incremental rebuild: full frontend re-compile, then a selected
+    /// injected-ZIR update on the persistent Zig context. Normal selected
+    /// updates preserve Zig's compare-hash invalidation; only frontend
+    /// force-full/structural updates request full source-hash invalidation.
     fn rebuild(
         self: *IncrementalWatchState,
         allocator: std.mem.Allocator,
@@ -5497,6 +6169,10 @@ const IncrementalWatchState = struct {
         if (memory_adapter_eval.result_hash != self.memory_adapter_result_hash) {
             return error.ContextInvalidated;
         }
+        const current_active_manager_source_digest = hashActiveManagerSource(alloc, self.active_manager_source_path) catch return error.ContextInvalidated;
+        if (!std.mem.eql(u8, current_active_manager_source_digest[0..], self.active_manager_source_digest[0..])) {
+            return error.ContextInvalidated;
+        }
         profileLap(&profile_timer, "memory validation", .{});
 
         if (progress) |reporter| reporter.stage("Frontend: compiling Zap sources", .{});
@@ -5504,11 +6180,13 @@ const IncrementalWatchState = struct {
             .file_to_structs = &manifest_sources.source_file_to_structs,
             .file_imported_by = &manifest_sources.source_file_imported_by,
             .file_compile_after_globs = &manifest_sources.source_file_compile_after_globs,
+            .file_compile_after_files = &manifest_sources.source_file_compile_after_files,
         }, .{
             .show_progress = progress != null,
             .progress = progress,
             .progress_context = "Frontend",
             .lib_mode = self.lib_mode,
+            .frontend_optimize_mode = self.frontend_optimize_mode,
             .struct_order = manifest_sources.struct_order,
             .level_boundaries = manifest_sources.level_boundaries,
             .cache_dir = ".zap-cache/ctfe",
@@ -5566,31 +6244,73 @@ const IncrementalWatchState = struct {
             }
         }
 
-        const selection = if (self.baseline_established)
-            try self.selectChangedIncrementalModules(alloc, &current_hashes)
-        else
-            IncrementalModuleSelection{ .struct_names = &.{}, .include_root = false };
-        profileLap(&profile_timer, "select modules count={d} root={}", .{ selection.struct_names.len, selection.include_root });
-
-        // Incremental backend: prepare only modules whose emitted IR changed,
-        // then inject only those replacements. Unchanged modules never enter
-        // Zig's prev_zir set.
         const prepared_update = self.baseline_established;
-        const needs_backend_update = !prepared_update or selection.include_root or selection.struct_names.len > 0;
-        // A source mutation that maps to no backend work is only safe if
-        // every invalidation layer proves a semantic no-op. Today the daemon
-        // publishes content-addressed artifacts keyed by source bytes, so a
-        // missed invalidation would poison the cache with an old binary under
-        // a new key. Re-establishing the context makes that case a full,
-        // source-truth rebuild instead of trusting the stale baseline.
-        if (prepared_update and changed_paths.len > 0 and !needs_backend_update) {
-            return error.ContextInvalidated;
+        const backend_plan = if (prepared_update)
+            selectPreparedIncrementalBackendPlan(
+                alloc,
+                &result,
+                self.root_module_hash_present,
+                self.root_module_hash,
+                &self.module_hashes,
+                &current_hashes,
+            ) catch return error.ContextInvalidated
+        else
+            PreparedIncrementalBackendPlan{
+                .selection = .{ .struct_names = &.{}, .include_root = false },
+                .invalidation = .compare_source_hashes,
+            };
+        const backend_selection = backend_plan.selection;
+        const backend_module_selection = normalizeIncrementalSelectionForBackend(alloc, backend_selection) catch return error.ContextInvalidated;
+        defer backend_module_selection.deinit(alloc);
+        if (incrementalTraceEnabled()) {
+            incrementalTrace(
+                "backend-selection prepared={} force_full={} invalidation={s} affected_functions={d}",
+                .{
+                    prepared_update,
+                    result.incremental_backend_force_full,
+                    @tagName(backend_plan.invalidation),
+                    result.incremental_backend_affected_function_ids.len,
+                },
+            );
+            traceIncrementalModuleSelection("final-filtered", backend_selection);
+            traceOwnedIncrementalModuleSelection("normalized-backend", backend_module_selection);
         }
+        if (profileEnabled()) {
+            std.debug.print(
+                "\n[incremental backend] prepared={} force_full={} invalidation={s} affected_functions={d} selected_modules={d} include_root={}\n",
+                .{
+                    prepared_update,
+                    result.incremental_backend_force_full,
+                    @tagName(backend_plan.invalidation),
+                    result.incremental_backend_affected_function_ids.len,
+                    backend_module_selection.struct_names.len,
+                    backend_module_selection.include_root,
+                },
+            );
+            for (backend_module_selection.struct_names) |struct_name| {
+                std.debug.print("[incremental backend] selected {s}\n", .{struct_name});
+            }
+        }
+        const needs_backend_update = !prepared_update or
+            backend_module_selection.include_root or
+            backend_module_selection.struct_names.len > 0;
 
+        // Source edits must publish artifacts from the current affected ZIR
+        // modules. Zap keeps the persistent Zig compilation context and prepares
+        // only the modules whose stable emitted IR changed. The invalidation
+        // policy is explicit: ordinary selected updates preserve Zig's
+        // old-ZIR/new-ZIR compare-hash path, while structural force-full updates
+        // ask the fork to mark every source hash in the prepared files stale.
         if (prepared_update and needs_backend_update) {
             if (progress) |reporter| reporter.stage("Backend: preparing incremental update", .{});
             var update_prepared = false;
-            zir_backend.prepareSelectedUpdate(alloc, self.zir_ctx, selection.struct_names, selection.include_root) catch {
+            zir_backend.prepareSelectedUpdate(
+                alloc,
+                self.zir_ctx,
+                backend_module_selection.struct_names,
+                backend_module_selection.include_root,
+                backend_plan.invalidation,
+            ) catch {
                 zir_backend.abortUpdate(self.zir_ctx) catch {};
                 return error.ContextInvalidated;
             };
@@ -5598,23 +6318,18 @@ const IncrementalWatchState = struct {
             errdefer if (update_prepared) zir_backend.abortUpdate(self.zir_ctx) catch {};
             profileLap(&profile_timer, "backend prepare", .{});
 
-            for (selection.struct_names) |struct_name| {
-                zir_backend.invalidateFile(self.zir_ctx, struct_name, alloc) catch return error.ContextInvalidated;
-            }
-            profileLap(&profile_timer, "backend invalidate", .{});
-
             const backend_options = self.backendOptions(alloc, &result, progress);
-            if (progress) |reporter| reporter.stage("Backend: compiling selected ZIR and linking", .{});
+            if (progress) |reporter| reporter.stage("Backend: compiling ZIR and linking", .{});
             zir_backend.injectPreparedSelectedAndUpdate(
                 alloc,
                 result.ir_program,
                 self.zir_ctx,
                 backend_options,
-                selection.struct_names,
-                selection.include_root,
+                backend_module_selection.struct_names,
+                backend_module_selection.include_root,
             ) catch return error.ContextInvalidated;
             update_prepared = false;
-            profileLap(&profile_timer, "backend selected update", .{});
+            profileLap(&profile_timer, "backend incremental update", .{});
         } else if (!prepared_update) {
             const backend_options = self.backendOptions(alloc, &result, progress);
             if (progress) |reporter| reporter.stage("Backend: compiling ZIR and linking", .{});
@@ -5641,8 +6356,8 @@ const IncrementalWatchState = struct {
             self.collect_arc_stats,
             zap_lib_dir,
             self.zig_lib_dir,
-            self.compiler_identity_hash,
-            self.zig_lib_identity_hash,
+            self.compiler_identity_digest,
+            self.zig_lib_identity_digest,
         ) catch return error.CacheMetadataError;
         const manifest_snapshot_path = build_cache.snapshotPath(alloc, ".zap-cache", target_name) catch return error.CacheMetadataError;
         const metadata_inputs = CompileAndLinkInputs{
@@ -5660,8 +6375,8 @@ const IncrementalWatchState = struct {
             .build_opts = build_opts,
             .zap_lib_dir = zap_lib_dir,
             .zig_lib_dir = self.zig_lib_dir,
-            .compiler_identity_hash = self.compiler_identity_hash,
-            .zig_lib_identity_hash = self.zig_lib_identity_hash,
+            .compiler_identity_digest = self.compiler_identity_digest,
+            .zig_lib_identity_digest = self.zig_lib_identity_digest,
             .project_root = project_root,
             .collect_arc_stats = self.collect_arc_stats,
             .layout = .manifest,
@@ -5826,9 +6541,108 @@ fn runWatchArtifact(
     );
 }
 
+const WatchPathKind = enum {
+    missing,
+    file,
+    directory,
+    other,
+};
+
+const WatchPathFingerprint = struct {
+    kind: WatchPathKind,
+    size: u64 = 0,
+    inode: u64 = 0,
+    mtime_nanos: i128 = 0,
+    ctime_nanos: i128 = 0,
+    content_digest: build_cache.FileDigest = [_]u8{0} ** @sizeOf(build_cache.FileDigest),
+    listing_hash: u64 = 0,
+};
+
+fn watchPathFingerprint(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    previous: ?WatchPathFingerprint,
+) !WatchPathFingerprint {
+    const stat = std.Io.Dir.cwd().statFile(global_io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .{ .kind = .missing },
+        else => return err,
+    };
+
+    return switch (stat.kind) {
+        .file => blk: {
+            if (previous) |previous_fingerprint| {
+                if (previous_fingerprint.kind == .file and
+                    previous_fingerprint.size == stat.size and
+                    previous_fingerprint.inode == @as(u64, @intCast(stat.inode)) and
+                    previous_fingerprint.mtime_nanos == stat.mtime.nanoseconds and
+                    previous_fingerprint.ctime_nanos == stat.ctime.nanoseconds)
+                {
+                    break :blk previous_fingerprint;
+                }
+            }
+            const fingerprint = try build_cache.fileFingerprint(allocator, path);
+            defer allocator.free(fingerprint.path);
+            break :blk .{
+                .kind = .file,
+                .size = fingerprint.size,
+                .inode = fingerprint.inode,
+                .mtime_nanos = fingerprint.mtime_nanos,
+                .ctime_nanos = fingerprint.ctime_nanos,
+                .content_digest = fingerprint.content_digest,
+            };
+        },
+        .directory => blk: {
+            const fingerprint = try build_cache.directoryFingerprint(allocator, path, false);
+            defer allocator.free(fingerprint.path);
+            break :blk .{
+                .kind = .directory,
+                .size = stat.size,
+                .inode = @intCast(stat.inode),
+                .mtime_nanos = stat.mtime.nanoseconds,
+                .ctime_nanos = stat.ctime.nanoseconds,
+                .listing_hash = fingerprint.listing_hash,
+            };
+        },
+        else => .{
+            .kind = .other,
+            .size = stat.size,
+            .inode = @intCast(stat.inode),
+            .mtime_nanos = stat.mtime.nanoseconds,
+            .ctime_nanos = stat.ctime.nanoseconds,
+        },
+    };
+}
+
+fn watchPathFingerprintsEqual(
+    previous: WatchPathFingerprint,
+    current: WatchPathFingerprint,
+) bool {
+    return watchPathFingerprintContentEqual(previous, current) and
+        previous.size == current.size and
+        previous.inode == current.inode and
+        previous.mtime_nanos == current.mtime_nanos and
+        previous.ctime_nanos == current.ctime_nanos;
+}
+
+fn watchPathFingerprintContentEqual(
+    previous: WatchPathFingerprint,
+    current: WatchPathFingerprint,
+) bool {
+    if (previous.kind != current.kind) return false;
+    return switch (previous.kind) {
+        .missing => true,
+        .file => std.mem.eql(u8, previous.content_digest[0..], current.content_digest[0..]),
+        .directory => previous.listing_hash == current.listing_hash,
+        .other => previous.size == current.size and
+            previous.inode == current.inode and
+            previous.mtime_nanos == current.mtime_nanos and
+            previous.ctime_nanos == current.ctime_nanos,
+    };
+}
+
 const WatchSnapshot = struct {
     paths: []const []const u8,
-    mtimes: []std.Io.Timestamp,
+    fingerprints: []WatchPathFingerprint,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -5842,12 +6656,12 @@ const WatchSnapshot = struct {
         const paths = try collectWatchPaths(allocator, project_root, target_name, build_opts, build_overrides, zap_lib_dir_override, extra_watch_path);
         errdefer freeOwnedPathSlice(allocator, paths);
 
-        const mtimes = try allocator.alloc(std.Io.Timestamp, paths.len);
-        errdefer allocator.free(mtimes);
+        const fingerprints = try allocator.alloc(WatchPathFingerprint, paths.len);
+        errdefer allocator.free(fingerprints);
         for (paths, 0..) |path, index| {
-            mtimes[index] = getFileMtime(path) orelse std.Io.Timestamp.zero;
+            fingerprints[index] = try watchPathFingerprint(allocator, path, null);
         }
-        return .{ .paths = paths, .mtimes = mtimes };
+        return .{ .paths = paths, .fingerprints = fingerprints };
     }
 
     fn initProjectOnly(
@@ -5857,12 +6671,12 @@ const WatchSnapshot = struct {
         const paths = try collectProjectWatchPathsWithoutManifest(allocator, project_root);
         errdefer freeOwnedPathSlice(allocator, paths);
 
-        const mtimes = try allocator.alloc(std.Io.Timestamp, paths.len);
-        errdefer allocator.free(mtimes);
+        const fingerprints = try allocator.alloc(WatchPathFingerprint, paths.len);
+        errdefer allocator.free(fingerprints);
         for (paths, 0..) |path, index| {
-            mtimes[index] = getFileMtime(path) orelse std.Io.Timestamp.zero;
+            fingerprints[index] = try watchPathFingerprint(allocator, path, null);
         }
-        return .{ .paths = paths, .mtimes = mtimes };
+        return .{ .paths = paths, .fingerprints = fingerprints };
     }
 
     fn initFromSourceRoots(
@@ -5874,32 +6688,69 @@ const WatchSnapshot = struct {
         const paths = try collectWatchPathsFromSourceRoots(allocator, project_root, source_roots, extra_watch_path);
         errdefer freeOwnedPathSlice(allocator, paths);
 
-        const mtimes = try allocator.alloc(std.Io.Timestamp, paths.len);
-        errdefer allocator.free(mtimes);
+        const fingerprints = try allocator.alloc(WatchPathFingerprint, paths.len);
+        errdefer allocator.free(fingerprints);
         for (paths, 0..) |path, index| {
-            mtimes[index] = getFileMtime(path) orelse std.Io.Timestamp.zero;
+            fingerprints[index] = try watchPathFingerprint(allocator, path, null);
         }
-        return .{ .paths = paths, .mtimes = mtimes };
+        return .{ .paths = paths, .fingerprints = fingerprints };
     }
 
     fn deinit(self: *WatchSnapshot, allocator: std.mem.Allocator) void {
         freeOwnedPathSlice(allocator, self.paths);
-        allocator.free(self.mtimes);
-        self.* = .{ .paths = &.{}, .mtimes = &.{} };
+        allocator.free(self.fingerprints);
+        self.* = .{ .paths = &.{}, .fingerprints = &.{} };
     }
 
     fn changedPaths(self: *WatchSnapshot, allocator: std.mem.Allocator) ![]const []const u8 {
         var changed_paths: std.ArrayListUnmanaged([]const u8) = .empty;
         for (self.paths, 0..) |path, index| {
-            const current_mtime = getFileMtime(path) orelse std.Io.Timestamp.zero;
-            if (current_mtime.nanoseconds != self.mtimes[index].nanoseconds) {
-                self.mtimes[index] = current_mtime;
+            const current_fingerprint = try watchPathFingerprint(allocator, path, self.fingerprints[index]);
+            if (!watchPathFingerprintContentEqual(self.fingerprints[index], current_fingerprint)) {
+                self.fingerprints[index] = current_fingerprint;
                 try changed_paths.append(allocator, path);
+            } else if (!watchPathFingerprintsEqual(self.fingerprints[index], current_fingerprint)) {
+                self.fingerprints[index] = current_fingerprint;
             }
         }
         return try changed_paths.toOwnedSlice(allocator);
     }
 };
+
+test "watch snapshot detects same-size file content edits" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "bool.zap", .data = "aaaa" });
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+    const file_path = try std.fs.path.join(allocator, &.{ tmp_path, "bool.zap" });
+    defer allocator.free(file_path);
+
+    const paths = try allocator.alloc([]const u8, 1);
+    paths[0] = try allocator.dupe(u8, file_path);
+    errdefer freeOwnedPathSlice(allocator, paths);
+
+    const fingerprints = try allocator.alloc(WatchPathFingerprint, 1);
+    errdefer allocator.free(fingerprints);
+    fingerprints[0] = try watchPathFingerprint(allocator, file_path, null);
+
+    var snapshot: WatchSnapshot = .{
+        .paths = paths,
+        .fingerprints = fingerprints,
+    };
+    defer snapshot.deinit(allocator);
+
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "bool.zap", .data = "bbbb" });
+
+    const changed_paths = try snapshot.changedPaths(allocator);
+    defer allocator.free(changed_paths);
+
+    try std.testing.expectEqual(@as(usize, 1), changed_paths.len);
+    try std.testing.expectEqualStrings(file_path, changed_paths[0]);
+}
 
 fn refreshWatchSnapshot(
     snapshot: *WatchSnapshot,
@@ -5937,23 +6788,41 @@ fn refreshWatchSnapshotFromSourceRoots(
 const MANIFEST_DAEMON_DIR = ".zap-cache/daemon";
 const MANIFEST_DAEMON_REQUEST_MAGIC: u32 = 0x5a_44_52_31; // "ZDR1"
 const MANIFEST_DAEMON_RESPONSE_MAGIC: u32 = 0x5a_44_53_31; // "ZDS1"
-const MANIFEST_DAEMON_PROTOCOL_VERSION: u16 = 2;
+const MANIFEST_DAEMON_PROTOCOL_VERSION: u16 = 5;
 const MANIFEST_DAEMON_IDLE_TIMEOUT_MS: i32 = 5 * 60 * 1000;
+const MANIFEST_DAEMON_REQUEST_HEADER_LEN: usize = 7;
 
 const ManifestDaemonRequestMode = enum(u8) {
     warm = 1,
     build = 2,
+    shutdown = 3,
 };
+
+fn manifestDaemonRequestRequiresSourceRecheck(
+    mode: ManifestDaemonRequestMode,
+    had_incremental_state: bool,
+    changed_path_count: usize,
+) bool {
+    // A freshly-created daemon state only owns a Zig compilation context.
+    // It has not injected Zap ZIR, linked an artifact, or published metadata
+    // yet. The first request must therefore run the normal rebuild path so the
+    // daemon's backend state and manifest snapshot are tied to the same source
+    // bytes before either warm or build requests can reuse it.
+    if (!had_incremental_state) return true;
+    return mode == .build or changed_path_count > 0;
+}
 
 const ManifestDaemonRequest = struct {
     mode: ManifestDaemonRequestMode,
-    invocation_identity: u64,
+    invocation_identity: build_cache.InvocationIdentity,
     response_path: ?[]const u8,
+    progress_path: ?[]const u8,
     project_root: []const u8,
     target_name: []const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
     build_overrides: BuildOverrides,
     collect_arc_stats: bool,
+    trace_enabled: bool,
     zap_lib_dir_override: ?[]const u8,
 };
 
@@ -5968,7 +6837,7 @@ const ManifestDaemonResponse = union(enum) {
 };
 
 const ManifestDaemonState = struct {
-    invocation_identity: ?u64 = null,
+    invocation_identity: ?build_cache.InvocationIdentity = null,
     incremental_state: ?IncrementalWatchState = null,
     watch_snapshot: ?WatchSnapshot = null,
 
@@ -5979,37 +6848,757 @@ const ManifestDaemonState = struct {
     }
 };
 
-fn manifestDaemonEndpointPath(alloc: std.mem.Allocator, invocation_identity: u64) ![]const u8 {
-    return std.fmt.allocPrint(alloc, "{s}/{x:0>16}.fifo", .{ MANIFEST_DAEMON_DIR, invocation_identity });
+fn manifestDaemonIdentityHexAlloc(alloc: std.mem.Allocator, invocation_identity: build_cache.InvocationIdentity) ![]const u8 {
+    return digestHexAlloc(alloc, invocation_identity);
 }
 
-fn manifestDaemonLogPath(alloc: std.mem.Allocator, invocation_identity: u64) ![]const u8 {
-    return std.fmt.allocPrint(alloc, "{s}/{x:0>16}.log", .{ MANIFEST_DAEMON_DIR, invocation_identity });
+fn manifestDaemonEndpointPath(alloc: std.mem.Allocator, invocation_identity: build_cache.InvocationIdentity) ![]const u8 {
+    const identity_hex = try manifestDaemonIdentityHexAlloc(alloc, invocation_identity);
+    defer alloc.free(identity_hex);
+    return std.fmt.allocPrint(alloc, "{s}/{s}.fifo", .{ MANIFEST_DAEMON_DIR, identity_hex });
 }
 
-fn manifestDaemonStartLockPath(alloc: std.mem.Allocator, invocation_identity: u64) ![]const u8 {
-    return std.fmt.allocPrint(alloc, "{s}/{x:0>16}.start-lock", .{ MANIFEST_DAEMON_DIR, invocation_identity });
+fn manifestDaemonLogPath(alloc: std.mem.Allocator, invocation_identity: build_cache.InvocationIdentity) ![]const u8 {
+    const identity_hex = try manifestDaemonIdentityHexAlloc(alloc, invocation_identity);
+    defer alloc.free(identity_hex);
+    return std.fmt.allocPrint(alloc, "{s}/{s}.log", .{ MANIFEST_DAEMON_DIR, identity_hex });
 }
 
-fn manifestDaemonRequestPath(alloc: std.mem.Allocator, invocation_identity: u64, request_id: u64) ![]const u8 {
-    return std.fmt.allocPrint(alloc, "{s}/{x:0>16}.{x:0>16}.req", .{ MANIFEST_DAEMON_DIR, invocation_identity, request_id });
+fn manifestDaemonPidPath(alloc: std.mem.Allocator, invocation_identity: build_cache.InvocationIdentity) ![]const u8 {
+    const identity_hex = try manifestDaemonIdentityHexAlloc(alloc, invocation_identity);
+    defer alloc.free(identity_hex);
+    return std.fmt.allocPrint(alloc, "{s}/{s}.pid", .{ MANIFEST_DAEMON_DIR, identity_hex });
 }
 
-fn manifestDaemonResponsePath(alloc: std.mem.Allocator, invocation_identity: u64, request_id: u64) ![]const u8 {
-    return std.fmt.allocPrint(alloc, "{s}/{x:0>16}.{x:0>16}.resp", .{ MANIFEST_DAEMON_DIR, invocation_identity, request_id });
+fn manifestDaemonPidPathFromEndpointPath(alloc: std.mem.Allocator, endpoint_path: []const u8) ![]const u8 {
+    if (std.mem.endsWith(u8, endpoint_path, ".fifo")) {
+        return std.fmt.allocPrint(alloc, "{s}.pid", .{endpoint_path[0 .. endpoint_path.len - ".fifo".len]});
+    }
+    return std.fmt.allocPrint(alloc, "{s}.pid", .{endpoint_path});
+}
+
+fn manifestDaemonStartLockPath(alloc: std.mem.Allocator, invocation_identity: build_cache.InvocationIdentity) ![]const u8 {
+    const identity_hex = try manifestDaemonIdentityHexAlloc(alloc, invocation_identity);
+    defer alloc.free(identity_hex);
+    return std.fmt.allocPrint(alloc, "{s}/{s}.start-lock", .{ MANIFEST_DAEMON_DIR, identity_hex });
+}
+
+fn manifestDaemonRequestPath(alloc: std.mem.Allocator, invocation_identity: build_cache.InvocationIdentity, request_id: u64) ![]const u8 {
+    const identity_hex = try manifestDaemonIdentityHexAlloc(alloc, invocation_identity);
+    defer alloc.free(identity_hex);
+    return std.fmt.allocPrint(alloc, "{s}/{s}.{x:0>16}.req", .{ MANIFEST_DAEMON_DIR, identity_hex, request_id });
+}
+
+fn manifestDaemonResponsePath(alloc: std.mem.Allocator, invocation_identity: build_cache.InvocationIdentity, request_id: u64) ![]const u8 {
+    const identity_hex = try manifestDaemonIdentityHexAlloc(alloc, invocation_identity);
+    defer alloc.free(identity_hex);
+    return std.fmt.allocPrint(alloc, "{s}/{s}.{x:0>16}.resp", .{ MANIFEST_DAEMON_DIR, identity_hex, request_id });
+}
+
+fn manifestDaemonProgressPath(alloc: std.mem.Allocator, invocation_identity: build_cache.InvocationIdentity, request_id: u64) ![]const u8 {
+    const identity_hex = try manifestDaemonIdentityHexAlloc(alloc, invocation_identity);
+    defer alloc.free(identity_hex);
+    return std.fmt.allocPrint(alloc, "{s}/{s}.{x:0>16}.progress", .{ MANIFEST_DAEMON_DIR, identity_hex, request_id });
+}
+
+const MANIFEST_DAEMON_PROGRESS_MAGIC: u32 = 0x5a_44_50_31; // "ZDP1"
+const MANIFEST_DAEMON_PROGRESS_VERSION: u16 = 1;
+const MANIFEST_DAEMON_PROGRESS_HEADER_LEN: usize = 11;
+
+const ManifestDaemonProgressTag = enum(u8) {
+    stage = 1,
+    begin = 2,
+    update_label = 3,
+    update_current_item = 4,
+    set_completed_count = 5,
+    complete_one = 6,
+    finish = 7,
+    cache_event = 8,
+    output = 9,
+};
+
+const ManifestDaemonProgressEvent = union(ManifestDaemonProgressTag) {
+    stage: []const u8,
+    begin: struct {
+        parent_id: zap.progress.NodeId,
+        node_id: zap.progress.NodeId,
+        label: []const u8,
+        options: zap.progress.NodeOptions,
+    },
+    update_label: struct {
+        node_id: zap.progress.NodeId,
+        label: []const u8,
+    },
+    update_current_item: struct {
+        node_id: zap.progress.NodeId,
+        current_item: []const u8,
+    },
+    set_completed_count: struct {
+        node_id: zap.progress.NodeId,
+        completed_count: usize,
+    },
+    complete_one: zap.progress.NodeId,
+    finish: struct {
+        node_id: zap.progress.NodeId,
+        result: zap.progress.NodeResult,
+    },
+    cache_event: struct {
+        node_id: zap.progress.NodeId,
+        kind: zap.progress.CacheEventKind,
+        label: []const u8,
+        item: []const u8,
+    },
+    output: []const u8,
+};
+
+const ProgressPayloadReader = struct {
+    bytes: []const u8,
+    index: usize = 0,
+
+    fn take(self: *ProgressPayloadReader, len: usize) ![]const u8 {
+        if (self.index > self.bytes.len) return error.InvalidDaemonProgress;
+        if (len > self.bytes.len - self.index) return error.InvalidDaemonProgress;
+        const out = self.bytes[self.index..][0..len];
+        self.index += len;
+        return out;
+    }
+
+    fn takeU8(self: *ProgressPayloadReader) !u8 {
+        return (try self.take(1))[0];
+    }
+
+    fn takeU32(self: *ProgressPayloadReader) !u32 {
+        const bytes = try self.take(4);
+        return std.mem.readInt(u32, bytes[0..4], .little);
+    }
+
+    fn takeU64(self: *ProgressPayloadReader) !u64 {
+        const bytes = try self.take(8);
+        return std.mem.readInt(u64, bytes[0..8], .little);
+    }
+
+    fn takeString(self: *ProgressPayloadReader) ![]const u8 {
+        const len = try self.takeU32();
+        return try self.take(len);
+    }
+
+    fn takeNodeId(self: *ProgressPayloadReader) !zap.progress.NodeId {
+        return .{
+            .index = try self.takeU8(),
+            .generation = try self.takeU32(),
+        };
+    }
+
+    fn takeNodeOptions(self: *ProgressPayloadReader) !zap.progress.NodeOptions {
+        const has_estimated_total = try self.takeU8();
+        const estimated_total: ?usize = switch (has_estimated_total) {
+            0 => null,
+            1 => std.math.cast(usize, try self.takeU64()) orelse return error.InvalidDaemonProgress,
+            else => return error.InvalidDaemonProgress,
+        };
+        return .{ .estimated_total = estimated_total };
+    }
+
+    fn finish(self: *ProgressPayloadReader) !void {
+        if (self.index != self.bytes.len) return error.InvalidDaemonProgress;
+    }
+};
+
+fn writeManifestDaemonProgressString(writer: *std.Io.Writer, value: []const u8) !void {
+    const len = std.math.cast(u32, value.len) orelse return error.ManifestDaemonProgressRecordTooLarge;
+    try writer.writeInt(u32, len, .little);
+    try writer.writeAll(value);
+}
+
+fn writeManifestDaemonProgressNodeId(writer: *std.Io.Writer, node_id: zap.progress.NodeId) !void {
+    try writer.writeByte(node_id.index);
+    try writer.writeInt(u32, node_id.generation, .little);
+}
+
+fn writeManifestDaemonProgressNodeOptions(writer: *std.Io.Writer, options: zap.progress.NodeOptions) !void {
+    try writer.writeByte(if (options.estimated_total != null) 1 else 0);
+    if (options.estimated_total) |estimated_total| {
+        try writer.writeInt(u64, @intCast(estimated_total), .little);
+    }
+}
+
+fn writeManifestDaemonProgressResult(writer: *std.Io.Writer, result: zap.progress.NodeResult) !void {
+    try writer.writeByte(switch (result) {
+        .succeeded => 0,
+        .failed => 1,
+        .skipped => 2,
+        .cancelled => 3,
+    });
+}
+
+fn readManifestDaemonProgressResult(reader: *ProgressPayloadReader) !zap.progress.NodeResult {
+    return switch (try reader.takeU8()) {
+        0 => .succeeded,
+        1 => .failed,
+        2 => .skipped,
+        3 => .cancelled,
+        else => error.InvalidDaemonProgress,
+    };
+}
+
+fn writeManifestDaemonProgressCacheKind(writer: *std.Io.Writer, kind: zap.progress.CacheEventKind) !void {
+    try writer.writeByte(switch (kind) {
+        .hit => 0,
+        .miss => 1,
+    });
+}
+
+fn readManifestDaemonProgressCacheKind(reader: *ProgressPayloadReader) !zap.progress.CacheEventKind {
+    return switch (try reader.takeU8()) {
+        0 => .hit,
+        1 => .miss,
+        else => error.InvalidDaemonProgress,
+    };
+}
+
+fn writeManifestDaemonProgressPayload(writer: *std.Io.Writer, event: ManifestDaemonProgressEvent) !void {
+    switch (event) {
+        .stage => |message| try writeManifestDaemonProgressString(writer, message),
+        .output => |message| try writeManifestDaemonProgressString(writer, message),
+        .begin => |begin| {
+            try writeManifestDaemonProgressNodeId(writer, begin.parent_id);
+            try writeManifestDaemonProgressNodeId(writer, begin.node_id);
+            try writeManifestDaemonProgressString(writer, begin.label);
+            try writeManifestDaemonProgressNodeOptions(writer, begin.options);
+        },
+        .update_label => |update| {
+            try writeManifestDaemonProgressNodeId(writer, update.node_id);
+            try writeManifestDaemonProgressString(writer, update.label);
+        },
+        .update_current_item => |update| {
+            try writeManifestDaemonProgressNodeId(writer, update.node_id);
+            try writeManifestDaemonProgressString(writer, update.current_item);
+        },
+        .set_completed_count => |update| {
+            try writeManifestDaemonProgressNodeId(writer, update.node_id);
+            try writer.writeInt(u64, @intCast(update.completed_count), .little);
+        },
+        .complete_one => |node_id| try writeManifestDaemonProgressNodeId(writer, node_id),
+        .finish => |finish| {
+            try writeManifestDaemonProgressNodeId(writer, finish.node_id);
+            try writeManifestDaemonProgressResult(writer, finish.result);
+        },
+        .cache_event => |cache_event| {
+            try writeManifestDaemonProgressNodeId(writer, cache_event.node_id);
+            try writeManifestDaemonProgressCacheKind(writer, cache_event.kind);
+            try writeManifestDaemonProgressString(writer, cache_event.label);
+            try writeManifestDaemonProgressString(writer, cache_event.item);
+        },
+    }
+}
+
+fn manifestDaemonProgressTag(event: ManifestDaemonProgressEvent) ManifestDaemonProgressTag {
+    return switch (event) {
+        .stage => .stage,
+        .output => .output,
+        .begin => .begin,
+        .update_label => .update_label,
+        .update_current_item => .update_current_item,
+        .set_completed_count => .set_completed_count,
+        .complete_one => .complete_one,
+        .finish => .finish,
+        .cache_event => .cache_event,
+    };
+}
+
+fn writeManifestDaemonProgressRecord(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    event: ManifestDaemonProgressEvent,
+) !void {
+    var payload: std.Io.Writer.Allocating = .init(allocator);
+    defer payload.deinit();
+    try writeManifestDaemonProgressPayload(&payload.writer, event);
+
+    try writer.writeInt(u32, MANIFEST_DAEMON_PROGRESS_MAGIC, .little);
+    try writer.writeInt(u16, MANIFEST_DAEMON_PROGRESS_VERSION, .little);
+    try writer.writeByte(@intFromEnum(manifestDaemonProgressTag(event)));
+    const payload_len = std.math.cast(u32, payload.written().len) orelse return error.ManifestDaemonProgressRecordTooLarge;
+    try writer.writeInt(u32, payload_len, .little);
+    try writer.writeAll(payload.written());
+}
+
+fn serializeManifestDaemonProgressRecord(allocator: std.mem.Allocator, event: ManifestDaemonProgressEvent) ![]const u8 {
+    var record: std.Io.Writer.Allocating = .init(allocator);
+    errdefer record.deinit();
+    try writeManifestDaemonProgressRecord(allocator, &record.writer, event);
+    return try record.toOwnedSlice();
+}
+
+fn readManifestDaemonProgressPayload(tag: ManifestDaemonProgressTag, payload: []const u8) !ManifestDaemonProgressEvent {
+    var reader: ProgressPayloadReader = .{ .bytes = payload };
+    const event: ManifestDaemonProgressEvent = switch (tag) {
+        .stage => .{ .stage = try reader.takeString() },
+        .output => .{ .output = try reader.takeString() },
+        .begin => .{ .begin = .{
+            .parent_id = try reader.takeNodeId(),
+            .node_id = try reader.takeNodeId(),
+            .label = try reader.takeString(),
+            .options = try reader.takeNodeOptions(),
+        } },
+        .update_label => .{ .update_label = .{
+            .node_id = try reader.takeNodeId(),
+            .label = try reader.takeString(),
+        } },
+        .update_current_item => .{ .update_current_item = .{
+            .node_id = try reader.takeNodeId(),
+            .current_item = try reader.takeString(),
+        } },
+        .set_completed_count => .{ .set_completed_count = .{
+            .node_id = try reader.takeNodeId(),
+            .completed_count = std.math.cast(usize, try reader.takeU64()) orelse return error.InvalidDaemonProgress,
+        } },
+        .complete_one => .{ .complete_one = try reader.takeNodeId() },
+        .finish => .{ .finish = .{
+            .node_id = try reader.takeNodeId(),
+            .result = try readManifestDaemonProgressResult(&reader),
+        } },
+        .cache_event => .{ .cache_event = .{
+            .node_id = try reader.takeNodeId(),
+            .kind = try readManifestDaemonProgressCacheKind(&reader),
+            .label = try reader.takeString(),
+            .item = try reader.takeString(),
+        } },
+    };
+    try reader.finish();
+    return event;
+}
+
+fn readManifestDaemonProgressRecord(bytes: []const u8, consumed_len: *usize) !?ManifestDaemonProgressEvent {
+    consumed_len.* = 0;
+    if (bytes.len < MANIFEST_DAEMON_PROGRESS_HEADER_LEN) return null;
+
+    const magic = std.mem.readInt(u32, bytes[0..4], .little);
+    if (magic != MANIFEST_DAEMON_PROGRESS_MAGIC) return error.InvalidDaemonProgress;
+    const version = std.mem.readInt(u16, bytes[4..6], .little);
+    if (version != MANIFEST_DAEMON_PROGRESS_VERSION) return error.InvalidDaemonProgress;
+    const tag: ManifestDaemonProgressTag = switch (bytes[6]) {
+        1 => .stage,
+        2 => .begin,
+        3 => .update_label,
+        4 => .update_current_item,
+        5 => .set_completed_count,
+        6 => .complete_one,
+        7 => .finish,
+        8 => .cache_event,
+        9 => .output,
+        else => return error.InvalidDaemonProgress,
+    };
+    const payload_len = std.mem.readInt(u32, bytes[7..11], .little);
+    const payload_len_usize = std.math.cast(usize, payload_len) orelse return error.InvalidDaemonProgress;
+    const record_len = std.math.add(usize, MANIFEST_DAEMON_PROGRESS_HEADER_LEN, payload_len_usize) catch return error.InvalidDaemonProgress;
+    if (bytes.len < record_len) return null;
+
+    consumed_len.* = record_len;
+    return try readManifestDaemonProgressPayload(tag, bytes[MANIFEST_DAEMON_PROGRESS_HEADER_LEN..record_len]);
+}
+
+fn manifestDaemonProgressNodeKey(node_id: zap.progress.NodeId) u64 {
+    return (@as(u64, node_id.generation) << 8) | node_id.index;
+}
+
+const ManifestDaemonProgressWriter = struct {
+    allocator: std.mem.Allocator,
+    file: ?std.Io.File,
+    disabled: bool = false,
+
+    fn init(allocator: std.mem.Allocator, progress_path: []const u8) !ManifestDaemonProgressWriter {
+        if (std.fs.path.dirname(progress_path)) |dir| {
+            try std.Io.Dir.cwd().createDirPath(global_io, dir);
+        }
+        const file = try std.Io.Dir.cwd().createFile(global_io, progress_path, .{ .truncate = false });
+        return .{
+            .allocator = allocator,
+            .file = file,
+        };
+    }
+
+    fn deinit(self: *ManifestDaemonProgressWriter) void {
+        if (self.file) |file| file.close(global_io);
+        self.file = null;
+    }
+
+    fn sink(self: *ManifestDaemonProgressWriter) zap.progress.EventSink {
+        return .{
+            .context = self,
+            .stageFn = stage,
+            .outputFn = output,
+            .beginFn = begin,
+            .updateLabelFn = updateLabel,
+            .updateCurrentItemFn = updateCurrentItem,
+            .setCompletedCountFn = setCompletedCount,
+            .completeOneFn = completeOne,
+            .finishFn = finish,
+            .cacheEventFn = cacheEvent,
+        };
+    }
+
+    fn write(self: *ManifestDaemonProgressWriter, event: ManifestDaemonProgressEvent) void {
+        if (self.disabled) return;
+        const file = self.file orelse return;
+        const record = serializeManifestDaemonProgressRecord(self.allocator, event) catch {
+            self.disabled = true;
+            return;
+        };
+        defer self.allocator.free(record);
+        file.writeStreamingAll(global_io, record) catch {
+            self.disabled = true;
+        };
+    }
+
+    fn fromContext(context: *anyopaque) *ManifestDaemonProgressWriter {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn stage(context: *anyopaque, message: []const u8) void {
+        fromContext(context).write(.{ .stage = message });
+    }
+
+    fn output(context: *anyopaque, message: []const u8) void {
+        fromContext(context).write(.{ .output = message });
+    }
+
+    fn begin(
+        context: *anyopaque,
+        parent_id: zap.progress.NodeId,
+        node_id: zap.progress.NodeId,
+        label: []const u8,
+        options: zap.progress.NodeOptions,
+    ) void {
+        fromContext(context).write(.{ .begin = .{
+            .parent_id = parent_id,
+            .node_id = node_id,
+            .label = label,
+            .options = options,
+        } });
+    }
+
+    fn updateLabel(context: *anyopaque, node_id: zap.progress.NodeId, label: []const u8) void {
+        fromContext(context).write(.{ .update_label = .{
+            .node_id = node_id,
+            .label = label,
+        } });
+    }
+
+    fn updateCurrentItem(context: *anyopaque, node_id: zap.progress.NodeId, current_item: []const u8) void {
+        fromContext(context).write(.{ .update_current_item = .{
+            .node_id = node_id,
+            .current_item = current_item,
+        } });
+    }
+
+    fn setCompletedCount(context: *anyopaque, node_id: zap.progress.NodeId, completed_count: usize) void {
+        fromContext(context).write(.{ .set_completed_count = .{
+            .node_id = node_id,
+            .completed_count = completed_count,
+        } });
+    }
+
+    fn completeOne(context: *anyopaque, node_id: zap.progress.NodeId) void {
+        fromContext(context).write(.{ .complete_one = node_id });
+    }
+
+    fn finish(context: *anyopaque, node_id: zap.progress.NodeId, result: zap.progress.NodeResult) void {
+        fromContext(context).write(.{ .finish = .{
+            .node_id = node_id,
+            .result = result,
+        } });
+    }
+
+    fn cacheEvent(
+        context: *anyopaque,
+        node_id: zap.progress.NodeId,
+        kind: zap.progress.CacheEventKind,
+        label: []const u8,
+        item: []const u8,
+    ) void {
+        fromContext(context).write(.{ .cache_event = .{
+            .node_id = node_id,
+            .kind = kind,
+            .label = label,
+            .item = item,
+        } });
+    }
+};
+
+const ManifestDaemonProgressPoller = struct {
+    allocator: std.mem.Allocator,
+    string_arena: std.heap.ArenaAllocator,
+    fd: std.posix.fd_t,
+    parent_node: ?zap.progress.Node,
+    read_offset: usize = 0,
+    pending_bytes: std.ArrayListUnmanaged(u8) = .empty,
+    nodes: std.AutoHashMap(u64, zap.progress.Node),
+    node_order: std.ArrayListUnmanaged(u64) = .empty,
+    disabled: bool = false,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        progress_path: []const u8,
+        parent_node: ?zap.progress.Node,
+    ) !ManifestDaemonProgressPoller {
+        const fd = try std.posix.openat(std.posix.AT.FDCWD, progress_path, .{
+            .ACCMODE = .RDONLY,
+            .CLOEXEC = true,
+        }, 0);
+        return .{
+            .allocator = allocator,
+            .string_arena = std.heap.ArenaAllocator.init(allocator),
+            .fd = fd,
+            .parent_node = parent_node,
+            .nodes = std.AutoHashMap(u64, zap.progress.Node).init(allocator),
+        };
+    }
+
+    fn deinit(self: *ManifestDaemonProgressPoller) void {
+        closeFd(self.fd, false);
+        self.finishRemaining(.cancelled);
+        self.node_order.deinit(self.allocator);
+        self.pending_bytes.deinit(self.allocator);
+        self.nodes.deinit();
+        self.string_arena.deinit();
+    }
+
+    fn poll(self: *ManifestDaemonProgressPoller) void {
+        if (self.disabled) return;
+        self.readAvailable() catch {
+            self.disabled = true;
+            return;
+        };
+        self.consumePending() catch {
+            self.disabled = true;
+        };
+    }
+
+    fn readAvailable(self: *ManifestDaemonProgressPoller) !void {
+        var buffer: [8192]u8 = undefined;
+        while (true) {
+            const bytes_read = try preadManifestDaemonProgress(self.fd, &buffer, self.read_offset);
+            if (bytes_read == 0) return;
+            try self.pending_bytes.appendSlice(self.allocator, buffer[0..bytes_read]);
+            self.read_offset += bytes_read;
+            if (bytes_read < buffer.len) return;
+        }
+    }
+
+    fn consumePending(self: *ManifestDaemonProgressPoller) !void {
+        var consumed_total: usize = 0;
+        while (consumed_total < self.pending_bytes.items.len) {
+            var consumed_len: usize = 0;
+            const event = try readManifestDaemonProgressRecord(self.pending_bytes.items[consumed_total..], &consumed_len) orelse break;
+            self.apply(event);
+            consumed_total += consumed_len;
+        }
+
+        if (consumed_total == 0) return;
+        if (consumed_total == self.pending_bytes.items.len) {
+            self.pending_bytes.clearRetainingCapacity();
+            return;
+        }
+
+        const remaining_len = self.pending_bytes.items.len - consumed_total;
+        std.mem.copyForwards(u8, self.pending_bytes.items[0..remaining_len], self.pending_bytes.items[consumed_total..]);
+        self.pending_bytes.shrinkRetainingCapacity(remaining_len);
+    }
+
+    fn apply(self: *ManifestDaemonProgressPoller, event: ManifestDaemonProgressEvent) void {
+        switch (event) {
+            .stage => |message| {
+                const owned_message = self.dupeString(message) catch return;
+                if (self.parent_node) |node| node.updateCurrentItem(owned_message);
+            },
+            .output => |message| {
+                const owned_message = self.dupeString(message) catch return;
+                if (self.parent_node) |node| node.output(owned_message);
+            },
+            .begin => |begin| {
+                const maybe_parent = if (begin.parent_id.index == 0)
+                    self.parent_node
+                else
+                    self.nodes.get(manifestDaemonProgressNodeKey(begin.parent_id));
+                const parent = maybe_parent orelse return;
+                const owned_label = self.dupeString(begin.label) catch return;
+                const local_node = parent.start(owned_label, begin.options) catch return;
+                const key = manifestDaemonProgressNodeKey(begin.node_id);
+                self.nodes.put(key, local_node) catch {
+                    local_node.finish(.cancelled);
+                    return;
+                };
+                self.node_order.append(self.allocator, key) catch {
+                    if (self.nodes.fetchRemove(key)) |entry| entry.value.finish(.cancelled);
+                    return;
+                };
+            },
+            .update_label => |update| {
+                const owned_label = self.dupeString(update.label) catch return;
+                if (self.nodes.get(manifestDaemonProgressNodeKey(update.node_id))) |node| node.updateLabel(owned_label);
+            },
+            .update_current_item => |update| {
+                const owned_current_item = self.dupeString(update.current_item) catch return;
+                if (self.nodes.get(manifestDaemonProgressNodeKey(update.node_id))) |node| node.updateCurrentItem(owned_current_item);
+            },
+            .set_completed_count => |update| {
+                if (self.nodes.get(manifestDaemonProgressNodeKey(update.node_id))) |node| node.setCompletedCount(update.completed_count);
+            },
+            .complete_one => |node_id| {
+                if (self.nodes.get(manifestDaemonProgressNodeKey(node_id))) |node| node.completeOne();
+            },
+            .finish => |finish| {
+                const key = manifestDaemonProgressNodeKey(finish.node_id);
+                if (self.nodes.fetchRemove(key)) |entry| entry.value.finish(finish.result);
+            },
+            .cache_event => |cache_event| {
+                if (self.nodes.get(manifestDaemonProgressNodeKey(cache_event.node_id))) |node| {
+                    const owned_label = self.dupeString(cache_event.label) catch return;
+                    const owned_item = self.dupeString(cache_event.item) catch return;
+                    switch (cache_event.kind) {
+                        .hit => node.cacheHit(owned_label, owned_item),
+                        .miss => node.cacheMiss(owned_label, owned_item),
+                    }
+                }
+            },
+        }
+    }
+
+    fn dupeString(self: *ManifestDaemonProgressPoller, value: []const u8) ![]const u8 {
+        return try self.string_arena.allocator().dupe(u8, value);
+    }
+
+    fn finishRemaining(self: *ManifestDaemonProgressPoller, result: zap.progress.NodeResult) void {
+        var remaining = self.node_order.items.len;
+        while (remaining > 0) {
+            remaining -= 1;
+            const key = self.node_order.items[remaining];
+            if (self.nodes.fetchRemove(key)) |entry| entry.value.finish(result);
+        }
+        self.node_order.clearRetainingCapacity();
+    }
+};
+
+fn preadManifestDaemonProgress(fd: std.posix.fd_t, buffer: []u8, offset: usize) !usize {
+    while (true) {
+        const rc = std.posix.system.pread(fd, buffer.ptr, buffer.len, @intCast(offset));
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return error.ManifestDaemonProgressReadFailed,
+        }
+    }
+}
+
+test "manifest daemon progress records round trip structured events" {
+    const allocator = std.testing.allocator;
+    const remote_parent: zap.progress.NodeId = .{ .index = 0, .generation = 1 };
+    const remote_node: zap.progress.NodeId = .{ .index = 7, .generation = 42 };
+    const bytes = try serializeManifestDaemonProgressRecord(allocator, .{ .begin = .{
+        .parent_id = remote_parent,
+        .node_id = remote_node,
+        .label = "Frontend compile",
+        .options = .{ .estimated_total = 12 },
+    } });
+    defer allocator.free(bytes);
+
+    var consumed_len: usize = 0;
+    const event = (try readManifestDaemonProgressRecord(bytes, &consumed_len)).?;
+    try std.testing.expectEqual(bytes.len, consumed_len);
+    switch (event) {
+        .begin => |begin| {
+            try std.testing.expectEqual(remote_parent, begin.parent_id);
+            try std.testing.expectEqual(remote_node, begin.node_id);
+            try std.testing.expectEqualStrings("Frontend compile", begin.label);
+            try std.testing.expectEqual(@as(?usize, 12), begin.options.estimated_total);
+        },
+        else => return error.UnexpectedProgressEvent,
+    }
+}
+
+test "manifest daemon progress parser waits for complete records" {
+    const allocator = std.testing.allocator;
+    const bytes = try serializeManifestDaemonProgressRecord(allocator, .{ .stage = "Backend: compiling ZIR and linking" });
+    defer allocator.free(bytes);
+
+    var consumed_len: usize = 123;
+    try std.testing.expect((try readManifestDaemonProgressRecord(bytes[0 .. bytes.len - 1], &consumed_len)) == null);
+    try std.testing.expectEqual(@as(usize, 0), consumed_len);
+
+    const event = (try readManifestDaemonProgressRecord(bytes, &consumed_len)).?;
+    try std.testing.expectEqual(bytes.len, consumed_len);
+    switch (event) {
+        .stage => |message| try std.testing.expectEqualStrings("Backend: compiling ZIR and linking", message),
+        else => return error.UnexpectedProgressEvent,
+    }
+}
+
+test "manifest daemon progress records round trip direct output events" {
+    const allocator = std.testing.allocator;
+    const bytes = try serializeManifestDaemonProgressRecord(allocator, .{ .output = "Zig: semantic analysis, codegen, link\n" });
+    defer allocator.free(bytes);
+
+    var consumed_len: usize = 0;
+    const event = (try readManifestDaemonProgressRecord(bytes, &consumed_len)).?;
+    try std.testing.expectEqual(bytes.len, consumed_len);
+    switch (event) {
+        .output => |message| try std.testing.expectEqualStrings("Zig: semantic analysis, codegen, link\n", message),
+        else => return error.UnexpectedProgressEvent,
+    }
+}
+
+test "manifest daemon request names are tied to full invocation identities" {
+    var identity: build_cache.InvocationIdentity = undefined;
+    @memset(&identity, 0xab);
+
+    const identity_hex = try manifestDaemonIdentityHexAlloc(std.testing.allocator, identity);
+    defer std.testing.allocator.free(identity_hex);
+
+    const matching_name = try std.fmt.allocPrint(std.testing.allocator, "{s}.1234567890abcdef.req", .{identity_hex});
+    defer std.testing.allocator.free(matching_name);
+    try std.testing.expect(manifestDaemonRequestNameMatchesIdentity(matching_name, identity));
+    const request_identity = parseManifestDaemonInvocationIdentityFromRequestName(matching_name).?;
+    try std.testing.expectEqualSlices(u8, &identity, &request_identity);
+
+    const endpoint_name = try std.fmt.allocPrint(std.testing.allocator, "{s}.fifo", .{identity_hex});
+    defer std.testing.allocator.free(endpoint_name);
+    try std.testing.expect(!manifestDaemonRequestNameMatchesIdentity(endpoint_name, identity));
+    const endpoint_identity = parseManifestDaemonInvocationIdentityFromEndpointName(endpoint_name).?;
+    try std.testing.expectEqualSlices(u8, &identity, &endpoint_identity);
+
+    var other_identity = identity;
+    other_identity[0] = 0xac;
+    try std.testing.expect(!manifestDaemonRequestNameMatchesIdentity(matching_name, other_identity));
+}
+
+test "manifest daemon request header parser identifies warm build and shutdown modes" {
+    inline for (.{
+        .{ @as(u8, 1), ManifestDaemonRequestMode.warm },
+        .{ @as(u8, 2), ManifestDaemonRequestMode.build },
+        .{ @as(u8, 3), ManifestDaemonRequestMode.shutdown },
+    }) |case| {
+        var bytes: [MANIFEST_DAEMON_REQUEST_HEADER_LEN]u8 = undefined;
+        std.mem.writeInt(u32, bytes[0..4], MANIFEST_DAEMON_REQUEST_MAGIC, .little);
+        std.mem.writeInt(u16, bytes[4..6], MANIFEST_DAEMON_PROTOCOL_VERSION, .little);
+        bytes[6] = case[0];
+        try std.testing.expectEqual(case[1], try readManifestDaemonRequestModeHeader(&bytes));
+    }
 }
 
 fn manifestDaemonNowMs() i64 {
     return Io.Timestamp.now(global_io, .awake).toMilliseconds();
 }
 
-fn nextManifestDaemonRequestId(invocation_identity: u64) u64 {
+fn nextManifestDaemonRequestId(invocation_identity: build_cache.InvocationIdentity) u64 {
     const counter = manifest_daemon_request_counter;
     manifest_daemon_request_counter +%= 1;
 
     const pid = std.posix.system.getpid();
     const now_ns = Io.Timestamp.now(global_io, .real).toNanoseconds();
-    var hasher = std.hash.Wyhash.init(invocation_identity);
+    const seed = std.mem.readInt(u64, invocation_identity[0..8], .little);
+    var hasher = std.hash.Wyhash.init(seed);
+    hasher.update(&invocation_identity);
     hasher.update(std.mem.asBytes(&counter));
     hasher.update(std.mem.asBytes(&pid));
     hasher.update(std.mem.asBytes(&now_ns));
@@ -6169,21 +7758,25 @@ fn readDaemonBuildOverrides(allocator: std.mem.Allocator, reader: *std.Io.Reader
 fn writeManifestDaemonRequest(
     writer: *std.Io.Writer,
     mode: ManifestDaemonRequestMode,
-    invocation_identity: u64,
+    invocation_identity: build_cache.InvocationIdentity,
     response_path: ?[]const u8,
+    progress_path: ?[]const u8,
     project_root: []const u8,
     target_name: []const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
     build_overrides: BuildOverrides,
     collect_arc_stats: bool,
+    trace_enabled: bool,
     zap_lib_dir_override: ?[]const u8,
 ) !void {
     try writer.writeInt(u32, MANIFEST_DAEMON_REQUEST_MAGIC, .little);
     try writer.writeInt(u16, MANIFEST_DAEMON_PROTOCOL_VERSION, .little);
     try writer.writeByte(@intFromEnum(mode));
-    try writer.writeInt(u64, invocation_identity, .little);
+    try writer.writeAll(&invocation_identity);
     try writer.writeByte(if (collect_arc_stats) 1 else 0);
+    try writer.writeByte(if (trace_enabled) 1 else 0);
     try writeDaemonOptionalString(writer, response_path);
+    try writeDaemonOptionalString(writer, progress_path);
     try writeDaemonString(writer, project_root);
     try writeDaemonString(writer, target_name);
     try writeDaemonOptionalString(writer, zap_lib_dir_override);
@@ -6204,16 +7797,25 @@ fn readManifestDaemonRequest(allocator: std.mem.Allocator, reader: *std.Io.Reade
     const mode: ManifestDaemonRequestMode = switch (mode_tag) {
         1 => .warm,
         2 => .build,
+        3 => .shutdown,
         else => return error.InvalidDaemonProtocol,
     };
-    const invocation_identity = try reader.takeInt(u64, .little);
+    var invocation_identity: build_cache.InvocationIdentity = undefined;
+    try reader.readSliceAll(&invocation_identity);
     const collect_arc_stats_tag = try reader.takeInt(u8, .little);
     const collect_arc_stats = switch (collect_arc_stats_tag) {
         0 => false,
         1 => true,
         else => return error.InvalidDaemonProtocol,
     };
+    const trace_enabled_tag = try reader.takeInt(u8, .little);
+    const trace_enabled = switch (trace_enabled_tag) {
+        0 => false,
+        1 => true,
+        else => return error.InvalidDaemonProtocol,
+    };
     const response_path = try readDaemonOptionalString(allocator, reader);
+    const progress_path = try readDaemonOptionalString(allocator, reader);
     const project_root = try readDaemonString(allocator, reader);
     const target_name = try readDaemonString(allocator, reader);
     const zap_lib_dir_override = try readDaemonOptionalString(allocator, reader);
@@ -6232,11 +7834,13 @@ fn readManifestDaemonRequest(allocator: std.mem.Allocator, reader: *std.Io.Reade
         .mode = mode,
         .invocation_identity = invocation_identity,
         .response_path = response_path,
+        .progress_path = progress_path,
         .project_root = project_root,
         .target_name = target_name,
         .build_opts = build_opts,
         .build_overrides = build_overrides,
         .collect_arc_stats = collect_arc_stats,
+        .trace_enabled = trace_enabled,
         .zap_lib_dir_override = zap_lib_dir_override,
     };
 }
@@ -6394,22 +7998,297 @@ fn notifyManifestDaemon(endpoint_path: []const u8, request_path: []const u8) !vo
     try writeAllFd(write_fd, "\n");
 }
 
-fn waitForManifestDaemon(endpoint_path: []const u8) bool {
+fn waitForManifestDaemon(allocator: std.mem.Allocator, endpoint_path: []const u8) bool {
     var attempts: usize = 0;
     while (attempts < 80) : (attempts += 1) {
-        if (openManifestDaemonEndpointForWrite(endpoint_path)) |write_fd| {
-            closeFd(write_fd, true);
-            return true;
-        } else |_| {}
+        if (manifestDaemonEndpointIsLive(allocator, endpoint_path)) return true;
         global_io.sleep(std.Io.Duration.fromMilliseconds(25), .awake) catch {};
     }
     return false;
+}
+
+fn waitForManifestDaemonEndpointRemoval(endpoint_path: []const u8) bool {
+    var attempts: usize = 0;
+    while (attempts < 80) : (attempts += 1) {
+        if (!cwdPathExists(endpoint_path)) return true;
+        global_io.sleep(std.Io.Duration.fromMilliseconds(25), .awake) catch {};
+    }
+    return !cwdPathExists(endpoint_path);
+}
+
+fn hexValue(byte: u8) ?u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
+        else => null,
+    };
+}
+
+fn parseManifestDaemonInvocationIdentityHex(hex: []const u8) ?build_cache.InvocationIdentity {
+    if (hex.len != @sizeOf(build_cache.InvocationIdentity) * 2) return null;
+
+    var identity: build_cache.InvocationIdentity = undefined;
+    for (&identity, 0..) |*byte, index| {
+        const high = hexValue(hex[index * 2]) orelse return null;
+        const low = hexValue(hex[index * 2 + 1]) orelse return null;
+        byte.* = (high << 4) | low;
+    }
+    return identity;
+}
+
+fn parseManifestDaemonInvocationIdentityFromEndpointName(name: []const u8) ?build_cache.InvocationIdentity {
+    const suffix = ".fifo";
+    if (!std.mem.endsWith(u8, name, suffix)) return null;
+    return parseManifestDaemonInvocationIdentityHex(name[0 .. name.len - suffix.len]);
+}
+
+fn parseManifestDaemonInvocationIdentityFromRequestName(name: []const u8) ?build_cache.InvocationIdentity {
+    if (!std.mem.endsWith(u8, name, ".req")) return null;
+    const dot_index = std.mem.indexOfScalar(u8, name, '.') orelse return null;
+    return parseManifestDaemonInvocationIdentityHex(name[0..dot_index]);
+}
+
+fn manifestDaemonRequestNameMatchesIdentity(name: []const u8, invocation_identity: build_cache.InvocationIdentity) bool {
+    if (!std.mem.endsWith(u8, name, ".req")) return false;
+
+    var identity_hex_buffer: [@sizeOf(build_cache.InvocationIdentity) * 2]u8 = undefined;
+    for (invocation_identity, 0..) |byte, index| {
+        identity_hex_buffer[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        identity_hex_buffer[index * 2 + 1] = std.fmt.digitToChar(byte & 0xf, .lower);
+    }
+    if (!std.mem.startsWith(u8, name, &identity_hex_buffer)) return false;
+    if (name.len <= identity_hex_buffer.len + ".req".len) return false;
+    return name[identity_hex_buffer.len] == '.';
+}
+
+fn readManifestDaemonRequestModeHeader(bytes: []const u8) !ManifestDaemonRequestMode {
+    if (bytes.len < MANIFEST_DAEMON_REQUEST_HEADER_LEN) return error.InvalidDaemonProtocol;
+
+    var reader: std.Io.Reader = .fixed(bytes[0..MANIFEST_DAEMON_REQUEST_HEADER_LEN]);
+    if (try reader.takeInt(u32, .little) != MANIFEST_DAEMON_REQUEST_MAGIC) return error.InvalidDaemonProtocol;
+    if (try reader.takeInt(u16, .little) != MANIFEST_DAEMON_PROTOCOL_VERSION) return error.InvalidDaemonProtocol;
+    return switch (try reader.takeInt(u8, .little)) {
+        1 => .warm,
+        2 => .build,
+        3 => .shutdown,
+        else => error.InvalidDaemonProtocol,
+    };
+}
+
+fn readManifestDaemonRequestModeFromFile(path: []const u8) !ManifestDaemonRequestMode {
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+    }, 0);
+    defer closeFd(fd, false);
+
+    var header: [MANIFEST_DAEMON_REQUEST_HEADER_LEN]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < header.len) {
+        const bytes_read = try std.posix.read(fd, header[offset..]);
+        if (bytes_read == 0) return error.InvalidDaemonProtocol;
+        offset += bytes_read;
+    }
+    return readManifestDaemonRequestModeHeader(&header);
+}
+
+fn manifestDaemonHasPendingRequest(
+    allocator: std.mem.Allocator,
+    invocation_identity: build_cache.InvocationIdentity,
+    mode_filter: ?ManifestDaemonRequestMode,
+) bool {
+    var dir = std.Io.Dir.cwd().openDir(global_io, MANIFEST_DAEMON_DIR, .{ .iterate = true }) catch return false;
+    defer dir.close(global_io);
+
+    var iterator = dir.iterate();
+    while (iterator.next(global_io) catch null) |entry| {
+        if (!manifestDaemonRequestNameMatchesIdentity(entry.name, invocation_identity)) continue;
+        if (mode_filter == null) return true;
+
+        const request_path = std.fs.path.join(allocator, &.{ MANIFEST_DAEMON_DIR, entry.name }) catch return true;
+        defer allocator.free(request_path);
+        const request_mode = readManifestDaemonRequestModeFromFile(request_path) catch return true;
+        if (request_mode == mode_filter.?) return true;
+    }
+    return false;
+}
+
+fn deleteManifestDaemonPendingRequests(
+    allocator: std.mem.Allocator,
+    invocation_identity: build_cache.InvocationIdentity,
+) void {
+    var dir = std.Io.Dir.cwd().openDir(global_io, MANIFEST_DAEMON_DIR, .{ .iterate = true }) catch return;
+    defer dir.close(global_io);
+
+    var iterator = dir.iterate();
+    while (iterator.next(global_io) catch null) |entry| {
+        if (!manifestDaemonRequestNameMatchesIdentity(entry.name, invocation_identity)) continue;
+        const request_path = std.fs.path.join(allocator, &.{ MANIFEST_DAEMON_DIR, entry.name }) catch continue;
+        defer allocator.free(request_path);
+        std.Io.Dir.cwd().deleteFile(global_io, request_path) catch {};
+    }
+}
+
+fn cleanupManifestDaemonOrphanRequests(allocator: std.mem.Allocator) void {
+    var dir = std.Io.Dir.cwd().openDir(global_io, MANIFEST_DAEMON_DIR, .{ .iterate = true }) catch return;
+    defer dir.close(global_io);
+
+    var iterator = dir.iterate();
+    while (iterator.next(global_io) catch null) |entry| {
+        const invocation_identity = parseManifestDaemonInvocationIdentityFromRequestName(entry.name) orelse continue;
+        const endpoint_path = manifestDaemonEndpointPath(allocator, invocation_identity) catch continue;
+        defer allocator.free(endpoint_path);
+        if (cwdPathExists(endpoint_path)) continue;
+
+        const request_path = std.fs.path.join(allocator, &.{ MANIFEST_DAEMON_DIR, entry.name }) catch continue;
+        defer allocator.free(request_path);
+        std.Io.Dir.cwd().deleteFile(global_io, request_path) catch {};
+    }
+}
+
+fn writeManifestDaemonPidFile(
+    allocator: std.mem.Allocator,
+    pid_path: []const u8,
+    pid: std.posix.pid_t,
+) !void {
+    const pid_text = try std.fmt.allocPrint(allocator, "{d}\n", .{pid});
+    defer allocator.free(pid_text);
+    try build_cache.writeFileAtomic(allocator, pid_path, pid_text);
+}
+
+fn readManifestDaemonPid(allocator: std.mem.Allocator, pid_path: []const u8) !std.posix.pid_t {
+    const pid_text = try std.Io.Dir.cwd().readFileAlloc(global_io, pid_path, allocator, .limited(128));
+    defer allocator.free(pid_text);
+    const trimmed = std.mem.trim(u8, pid_text, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidDaemonPid;
+    return std.fmt.parseInt(std.posix.pid_t, trimmed, 10) catch error.InvalidDaemonPid;
+}
+
+fn manifestDaemonProcessIsAlive(pid: std.posix.pid_t) bool {
+    if (pid <= 0) return false;
+    const no_signal: std.posix.SIG = @enumFromInt(0);
+    switch (std.posix.errno(std.posix.system.kill(pid, no_signal))) {
+        .SUCCESS, .PERM => return true,
+        .SRCH => return false,
+        else => return false,
+    }
+}
+
+fn manifestDaemonEndpointIsLive(allocator: std.mem.Allocator, endpoint_path: []const u8) bool {
+    const pid_path = manifestDaemonPidPathFromEndpointPath(allocator, endpoint_path) catch return false;
+    defer allocator.free(pid_path);
+
+    const pid = readManifestDaemonPid(allocator, pid_path) catch return false;
+    if (!manifestDaemonProcessIsAlive(pid)) return false;
+
+    if (openManifestDaemonEndpointForWrite(endpoint_path)) |write_fd| {
+        closeFd(write_fd, true);
+        return true;
+    } else |_| {
+        return false;
+    }
+}
+
+fn cleanupManifestDaemonEndpointFiles(
+    allocator: std.mem.Allocator,
+    invocation_identity: build_cache.InvocationIdentity,
+    endpoint_path: []const u8,
+) void {
+    std.Io.Dir.cwd().deleteFile(global_io, endpoint_path) catch {};
+    const pid_path = manifestDaemonPidPath(allocator, invocation_identity) catch return;
+    defer allocator.free(pid_path);
+    std.Io.Dir.cwd().deleteFile(global_io, pid_path) catch {};
+    deleteManifestDaemonPendingRequests(allocator, invocation_identity);
+}
+
+fn terminateManifestDaemonEndpoint(
+    allocator: std.mem.Allocator,
+    invocation_identity: build_cache.InvocationIdentity,
+    endpoint_path: []const u8,
+) void {
+    const pid_path = manifestDaemonPidPath(allocator, invocation_identity) catch return;
+    defer allocator.free(pid_path);
+    const pid = readManifestDaemonPid(allocator, pid_path) catch {
+        cleanupManifestDaemonEndpointFiles(allocator, invocation_identity, endpoint_path);
+        return;
+    };
+
+    if (manifestDaemonProcessIsAlive(pid)) {
+        std.posix.kill(pid, .TERM) catch {};
+        var attempts: usize = 0;
+        while (attempts < 80 and manifestDaemonProcessIsAlive(pid)) : (attempts += 1) {
+            global_io.sleep(std.Io.Duration.fromMilliseconds(25), .awake) catch {};
+        }
+        if (manifestDaemonProcessIsAlive(pid)) {
+            std.posix.kill(pid, .KILL) catch {};
+        }
+    }
+
+    cleanupManifestDaemonEndpointFiles(allocator, invocation_identity, endpoint_path);
+}
+
+fn shutdownManifestDaemonEndpoint(
+    allocator: std.mem.Allocator,
+    invocation_identity: build_cache.InvocationIdentity,
+    endpoint_path: []const u8,
+) !void {
+    if (!manifestDaemonEndpointIsLive(allocator, endpoint_path)) {
+        cleanupManifestDaemonEndpointFiles(allocator, invocation_identity, endpoint_path);
+        return;
+    }
+
+    const build_opts: std.StringHashMapUnmanaged([]const u8) = .empty;
+    const request_path = sendManifestDaemonRequest(
+        allocator,
+        endpoint_path,
+        .shutdown,
+        invocation_identity,
+        null,
+        null,
+        ".",
+        "",
+        build_opts,
+        .{},
+        false,
+        false,
+        null,
+    ) catch return;
+    defer allocator.free(request_path);
+
+    if (!waitForManifestDaemonEndpointRemoval(endpoint_path)) {
+        terminateManifestDaemonEndpoint(allocator, invocation_identity, endpoint_path);
+    }
+}
+
+fn shutdownManifestDaemonsInCwd(allocator: std.mem.Allocator) !void {
+    var dir = std.Io.Dir.cwd().openDir(global_io, MANIFEST_DAEMON_DIR, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(global_io);
+
+    var iterator = dir.iterate();
+    while (try iterator.next(global_io)) |entry| {
+        const invocation_identity = parseManifestDaemonInvocationIdentityFromEndpointName(entry.name) orelse continue;
+        const endpoint_path = try std.fs.path.join(allocator, &.{ MANIFEST_DAEMON_DIR, entry.name });
+        defer allocator.free(endpoint_path);
+        try shutdownManifestDaemonEndpoint(allocator, invocation_identity, endpoint_path);
+    }
+
+    cleanupManifestDaemonOrphanRequests(allocator);
 }
 
 fn truncateManifestDaemonLog(log_path: []const u8) void {
     std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR) catch return;
     var log_file = std.Io.Dir.cwd().createFile(global_io, log_path, .{ .truncate = true }) catch return;
     log_file.close(global_io);
+}
+
+fn truncateManifestDaemonProgress(progress_path: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
+    var progress_file = try std.Io.Dir.cwd().createFile(global_io, progress_path, .{ .truncate = true });
+    progress_file.close(global_io);
 }
 
 fn printManifestDaemonLog(allocator: std.mem.Allocator, log_path: []const u8) void {
@@ -6440,16 +8319,16 @@ fn spawnDetachedManifestDaemon(
     endpoint_path: [:0]const u8,
     stderr_fd: std.posix.fd_t,
     dev_null_fd: std.posix.fd_t,
-) bool {
+) ?std.posix.pid_t {
     const pid_result = std.posix.system.fork();
     switch (std.posix.errno(pid_result)) {
         .SUCCESS => {},
-        .AGAIN, .NOMEM, .NOSYS => return false,
-        else => return false,
+        .AGAIN, .NOMEM, .NOSYS => return null,
+        else => return null,
     }
 
     const pid: std.posix.pid_t = @intCast(pid_result);
-    if (pid != 0) return true;
+    if (pid != 0) return pid;
 
     defer comptime unreachable;
 
@@ -6494,21 +8373,32 @@ fn spawnManifestDaemon(
     }, 0) catch return false;
     defer closeFd(dev_null_fd, false);
 
-    if (!spawnDetachedManifestDaemon(exe_path, endpoint_path_z, log_file.handle, dev_null_fd)) return false;
+    const child_pid = spawnDetachedManifestDaemon(exe_path, endpoint_path_z, log_file.handle, dev_null_fd) orelse return false;
 
-    return waitForManifestDaemon(endpoint_path);
+    const pid_path = manifestDaemonPidPathFromEndpointPath(allocator, endpoint_path) catch {
+        std.posix.kill(child_pid, .TERM) catch {};
+        return false;
+    };
+    defer allocator.free(pid_path);
+    writeManifestDaemonPidFile(allocator, pid_path, child_pid) catch {
+        std.posix.kill(child_pid, .TERM) catch {};
+        return false;
+    };
+
+    return waitForManifestDaemon(allocator, endpoint_path);
 }
 
 fn startManifestDaemon(
     allocator: std.mem.Allocator,
-    invocation_identity: u64,
+    invocation_identity: build_cache.InvocationIdentity,
     endpoint_path: []const u8,
     log_path: []const u8,
 ) bool {
-    if (openManifestDaemonEndpointForWrite(endpoint_path)) |write_fd| {
-        closeFd(write_fd, true);
+    if (manifestDaemonEndpointIsLive(allocator, endpoint_path)) {
         return true;
-    } else |_| {}
+    } else {
+        cleanupManifestDaemonEndpointFiles(allocator, invocation_identity, endpoint_path);
+    }
 
     std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR) catch return false;
 
@@ -6519,13 +8409,13 @@ fn startManifestDaemon(
         defer std.Io.Dir.cwd().deleteTree(global_io, lock_path) catch {};
         return spawnManifestDaemon(allocator, endpoint_path, log_path);
     } else |_| {
-        if (waitForManifestDaemon(endpoint_path)) return true;
+        if (waitForManifestDaemon(allocator, endpoint_path)) return true;
         std.Io.Dir.cwd().deleteTree(global_io, lock_path) catch {};
         if (std.Io.Dir.cwd().createDir(global_io, lock_path, .default_dir)) |_| {
             defer std.Io.Dir.cwd().deleteTree(global_io, lock_path) catch {};
             return spawnManifestDaemon(allocator, endpoint_path, log_path);
         } else |_| {
-            return waitForManifestDaemon(endpoint_path);
+            return waitForManifestDaemon(allocator, endpoint_path);
         }
     }
 }
@@ -6534,13 +8424,15 @@ fn writeManifestDaemonRequestFile(
     allocator: std.mem.Allocator,
     request_path: []const u8,
     mode: ManifestDaemonRequestMode,
-    invocation_identity: u64,
+    invocation_identity: build_cache.InvocationIdentity,
     response_path: ?[]const u8,
+    progress_path: ?[]const u8,
     project_root: []const u8,
     target_name: []const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
     build_overrides: BuildOverrides,
     collect_arc_stats: bool,
+    trace_enabled: bool,
     zap_lib_dir_override: ?[]const u8,
 ) !void {
     var serialized: std.Io.Writer.Allocating = .init(allocator);
@@ -6550,11 +8442,13 @@ fn writeManifestDaemonRequestFile(
         mode,
         invocation_identity,
         response_path,
+        progress_path,
         project_root,
         target_name,
         build_opts,
         build_overrides,
         collect_arc_stats,
+        trace_enabled,
         zap_lib_dir_override,
     );
     try build_cache.writeFileAtomic(allocator, request_path, serialized.written());
@@ -6564,13 +8458,15 @@ fn sendManifestDaemonRequest(
     allocator: std.mem.Allocator,
     endpoint_path: []const u8,
     mode: ManifestDaemonRequestMode,
-    invocation_identity: u64,
+    invocation_identity: build_cache.InvocationIdentity,
     response_path: ?[]const u8,
+    progress_path: ?[]const u8,
     project_root: []const u8,
     target_name: []const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
     build_overrides: BuildOverrides,
     collect_arc_stats: bool,
+    trace_enabled: bool,
     zap_lib_dir_override: ?[]const u8,
 ) ![]const u8 {
     const request_id = nextManifestDaemonRequestId(invocation_identity);
@@ -6584,11 +8480,13 @@ fn sendManifestDaemonRequest(
         mode,
         invocation_identity,
         response_path,
+        progress_path,
         project_root,
         target_name,
         build_opts,
         build_overrides,
         collect_arc_stats,
+        trace_enabled,
         zap_lib_dir_override,
     );
     try notifyManifestDaemon(endpoint_path, request_path);
@@ -6611,15 +8509,17 @@ fn waitForManifestDaemonResponse(
     scratch_allocator: std.mem.Allocator,
     endpoint_path: []const u8,
     response_path: []const u8,
+    progress_poller: ?*ManifestDaemonProgressPoller,
 ) !ManifestDaemonResponse {
     while (true) {
+        if (progress_poller) |poller| poller.poll();
+
         if (cwdPathExists(response_path)) {
+            if (progress_poller) |poller| poller.poll();
             return readManifestDaemonResponseFile(artifact_allocator, scratch_allocator, response_path);
         }
 
-        if (openManifestDaemonEndpointForWrite(endpoint_path)) |write_fd| {
-            closeFd(write_fd, true);
-        } else |_| {
+        if (!manifestDaemonEndpointIsLive(scratch_allocator, endpoint_path)) {
             return error.DaemonEndpointUnavailable;
         }
 
@@ -6629,7 +8529,7 @@ fn waitForManifestDaemonResponse(
 
 fn warmManifestDaemon(
     allocator: std.mem.Allocator,
-    invocation_identity: u64,
+    invocation_identity: build_cache.InvocationIdentity,
     project_root: []const u8,
     target_name: []const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
@@ -6643,17 +8543,20 @@ fn warmManifestDaemon(
     defer allocator.free(log_path);
 
     if (!startManifestDaemon(allocator, invocation_identity, endpoint_path, log_path)) return;
+    if (manifestDaemonHasPendingRequest(allocator, invocation_identity, null)) return;
     const request_path = sendManifestDaemonRequest(
         allocator,
         endpoint_path,
         .warm,
         invocation_identity,
         null,
+        null,
         project_root,
         target_name,
         build_opts,
         build_overrides,
         collect_arc_stats,
+        false,
         zap_lib_dir_override,
     ) catch return;
     allocator.free(request_path);
@@ -6662,13 +8565,14 @@ fn warmManifestDaemon(
 fn tryManifestDaemonBuild(
     artifact_allocator: std.mem.Allocator,
     scratch_allocator: std.mem.Allocator,
-    invocation_identity: u64,
+    invocation_identity: build_cache.InvocationIdentity,
     project_root: []const u8,
     target_name: []const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
     build_overrides: BuildOverrides,
     collect_arc_stats: bool,
     zap_lib_dir_override: ?[]const u8,
+    progress_node: ?zap.progress.Node,
 ) ?BuildArtifact {
     const endpoint_path = manifestDaemonEndpointPath(scratch_allocator, invocation_identity) catch return null;
     defer scratch_allocator.free(endpoint_path);
@@ -6680,29 +8584,65 @@ fn tryManifestDaemonBuild(
         std.Io.Dir.cwd().deleteFile(global_io, response_path) catch {};
         scratch_allocator.free(response_path);
     }
+    const progress_path: ?[]const u8 = if (progress_node != null)
+        (manifestDaemonProgressPath(scratch_allocator, invocation_identity, request_id) catch return null)
+    else
+        null;
+    defer if (progress_path) |path| {
+        std.Io.Dir.cwd().deleteFile(global_io, path) catch {};
+        scratch_allocator.free(path);
+    };
 
     truncateManifestDaemonLog(log_path);
+    switch (manifestDaemonBuildQueuePolicy(manifestDaemonHasPendingRequest(scratch_allocator, invocation_identity, .warm))) {
+        .send_immediately => {},
+        .queue_after_pending_warm => {
+            if (progress_node) |node| node.updateCurrentItem("waiting for background warm daemon");
+        },
+    }
     if (!startManifestDaemon(scratch_allocator, invocation_identity, endpoint_path, log_path)) return null;
+    if (progress_path) |path| {
+        truncateManifestDaemonProgress(path) catch return null;
+    }
 
+    var progress_poller: ?ManifestDaemonProgressPoller = if (progress_path) |path|
+        (ManifestDaemonProgressPoller.init(scratch_allocator, path, progress_node) catch null)
+    else
+        null;
+    defer if (progress_poller) |*poller| poller.deinit();
+
+    if (progress_node) |node| node.updateCurrentItem("querying incremental daemon");
     const request_path = sendManifestDaemonRequest(
         scratch_allocator,
         endpoint_path,
         .build,
         invocation_identity,
         response_path,
+        progress_path,
         project_root,
         target_name,
         build_opts,
         build_overrides,
         collect_arc_stats,
+        incrementalTraceEnabled(),
         zap_lib_dir_override,
     ) catch return null;
     defer scratch_allocator.free(request_path);
 
-    const response = waitForManifestDaemonResponse(artifact_allocator, scratch_allocator, endpoint_path, response_path) catch return null;
+    if (progress_node) |node| node.updateCurrentItem("waiting for daemon build");
+    const response = waitForManifestDaemonResponse(artifact_allocator, scratch_allocator, endpoint_path, response_path, if (progress_poller) |*poller| poller else null) catch return null;
     switch (response) {
-        .ok => |artifact| return artifact,
+        .ok => |artifact| {
+            if (progress_poller) |*poller| poller.poll();
+            if (incrementalTraceEnabled()) printManifestDaemonLog(scratch_allocator, log_path);
+            return artifact;
+        },
         .failed => |message| {
+            if (progress_poller) |*poller| {
+                poller.poll();
+                poller.finishRemaining(.failed);
+            }
+            if (progress_node) |node| node.handoffExternalOutput(.clear);
             printManifestDaemonLog(scratch_allocator, log_path);
             std.debug.print("Error: incremental daemon build failed: {s}\n", .{message});
             std.process.exit(1);
@@ -6714,9 +8654,10 @@ fn ensureManifestDaemonState(
     daemon_state: *ManifestDaemonState,
     allocator: std.mem.Allocator,
     request: ManifestDaemonRequest,
+    progress_reporter: ?*zap.progress.Reporter,
 ) !*IncrementalWatchState {
     if (daemon_state.invocation_identity) |identity| {
-        if (identity != request.invocation_identity) return error.InvalidDaemonRequest;
+        if (!std.mem.eql(u8, &identity, &request.invocation_identity)) return error.InvalidDaemonRequest;
     } else {
         daemon_state.invocation_identity = request.invocation_identity;
     }
@@ -6730,6 +8671,7 @@ fn ensureManifestDaemonState(
             request.build_overrides,
             request.collect_arc_stats,
             request.zap_lib_dir_override,
+            progress_reporter,
         ) orelse return error.InitialBuildFailed;
         const extra_watch_path = daemon_state.incremental_state.?.active_manager_source_path;
         daemon_state.watch_snapshot = WatchSnapshot.initFromSourceRoots(
@@ -6751,8 +8693,10 @@ fn rebuildManifestDaemonState(
     daemon_state: *ManifestDaemonState,
     allocator: std.mem.Allocator,
     request: ManifestDaemonRequest,
+    progress_reporter: ?*zap.progress.Reporter,
 ) !*IncrementalWatchState {
-    var state = try ensureManifestDaemonState(daemon_state, allocator, request);
+    const had_incremental_state = daemon_state.incremental_state != null;
+    var state = try ensureManifestDaemonState(daemon_state, allocator, request, progress_reporter);
 
     var changed_paths: []const []const u8 = &.{};
     if (daemon_state.watch_snapshot) |*snapshot| {
@@ -6773,8 +8717,8 @@ fn rebuildManifestDaemonState(
         daemon_state.watch_snapshot = null;
         state.deinit();
         daemon_state.incremental_state = null;
-        state = try ensureManifestDaemonState(daemon_state, allocator, request);
-    } else if (changed_paths.len > 0) {
+        state = try ensureManifestDaemonState(daemon_state, allocator, request, progress_reporter);
+    } else if (manifestDaemonRequestRequiresSourceRecheck(request.mode, had_incremental_state, changed_paths.len)) {
         state.rebuild(
             allocator,
             request.project_root,
@@ -6783,14 +8727,14 @@ fn rebuildManifestDaemonState(
             request.build_overrides,
             changed_paths,
             request.zap_lib_dir_override,
-            null,
+            progress_reporter,
         ) catch |err| switch (err) {
             error.ContextInvalidated => {
                 if (daemon_state.watch_snapshot) |*snapshot| snapshot.deinit(allocator);
                 daemon_state.watch_snapshot = null;
                 state.deinit();
                 daemon_state.incremental_state = null;
-                state = try ensureManifestDaemonState(daemon_state, allocator, request);
+                state = try ensureManifestDaemonState(daemon_state, allocator, request, progress_reporter);
             },
             else => return err,
         };
@@ -6835,7 +8779,7 @@ fn handleManifestDaemonRequestFile(
     allocator: std.mem.Allocator,
     request_path: []const u8,
     daemon_state: *ManifestDaemonState,
-) !void {
+) !bool {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const request_allocator = arena.allocator();
@@ -6845,21 +8789,62 @@ fn handleManifestDaemonRequestFile(
 
     var reader: std.Io.Reader = .fixed(request_bytes);
     const request = try readManifestDaemonRequest(request_allocator, &reader);
+    if (request.mode == .shutdown) return true;
 
-    const state = rebuildManifestDaemonState(daemon_state, allocator, request) catch |err| {
+    setIncrementalTraceEnabledOverride(request.trace_enabled);
+    compiler.setIncrementalTraceEnabledOverride(request.trace_enabled);
+    defer {
+        compiler.setIncrementalTraceEnabledOverride(null);
+        setIncrementalTraceEnabledOverride(null);
+    }
+
+    var progress_writer: ?ManifestDaemonProgressWriter = if (request.progress_path) |progress_path|
+        (ManifestDaemonProgressWriter.init(allocator, progress_path) catch null)
+    else
+        null;
+    defer if (progress_writer) |*writer| writer.deinit();
+
+    var progress_reporter: ?zap.progress.Reporter = if (progress_writer) |*writer|
+        zap.progress.Reporter.initWithEventSink("Compiling", false, 100, writer.sink())
+    else
+        null;
+
+    const state = rebuildManifestDaemonState(
+        daemon_state,
+        allocator,
+        request,
+        if (progress_reporter) |*reporter| reporter else null,
+    ) catch |err| {
         if (request.mode == .build and request.response_path != null) {
             const message = std.fmt.allocPrint(request_allocator, "{s}", .{@errorName(err)}) catch @errorName(err);
             try writeManifestDaemonErrorFile(allocator, request.response_path.?, message);
         } else {
             std.debug.print("Error: manifest incremental daemon warm failed: {s}\n", .{@errorName(err)});
         }
-        return;
+        return false;
     };
 
     if (request.mode == .build) {
         const response_path = request.response_path orelse return error.InvalidDaemonProtocol;
         try writeManifestDaemonResponseFile(allocator, response_path, state);
     }
+
+    return false;
+}
+
+const ManifestDaemonEndpointProcessResult = struct {
+    read_any: bool,
+    shutdown_requested: bool,
+};
+
+const ManifestDaemonBuildQueuePolicy = enum {
+    send_immediately,
+    queue_after_pending_warm,
+};
+
+fn manifestDaemonBuildQueuePolicy(has_pending_warm_request: bool) ManifestDaemonBuildQueuePolicy {
+    if (has_pending_warm_request) return .queue_after_pending_warm;
+    return .send_immediately;
 }
 
 fn processManifestDaemonEndpoint(
@@ -6867,7 +8852,7 @@ fn processManifestDaemonEndpoint(
     endpoint: ManifestDaemonEndpoint,
     daemon_state: *ManifestDaemonState,
     pending_line: *std.ArrayListUnmanaged(u8),
-) !bool {
+) !ManifestDaemonEndpointProcessResult {
     var read_buffer: [4096]u8 = undefined;
     var read_any = false;
 
@@ -6885,8 +8870,13 @@ fn processManifestDaemonEndpoint(
                     const request_path = try allocator.dupe(u8, pending_line.items);
                     defer allocator.free(request_path);
                     pending_line.clearRetainingCapacity();
-                    handleManifestDaemonRequestFile(allocator, request_path, daemon_state) catch |err| {
+                    const shutdown_requested = handleManifestDaemonRequestFile(allocator, request_path, daemon_state) catch |err| blk: {
                         std.debug.print("Error: manifest incremental daemon request failed: {s}\n", .{@errorName(err)});
+                        break :blk false;
+                    };
+                    if (shutdown_requested) return .{
+                        .read_any = true,
+                        .shutdown_requested = true,
                     };
                 }
             } else {
@@ -6896,13 +8886,19 @@ fn processManifestDaemonEndpoint(
         }
     }
 
-    return read_any;
+    return .{
+        .read_any = read_any,
+        .shutdown_requested = false,
+    };
 }
 
 fn runManifestIncrementalDaemon(allocator: std.mem.Allocator, endpoint_path: []const u8) !void {
     const endpoint = try openManifestDaemonEndpointForRead(allocator, endpoint_path);
     defer endpoint.deinit();
     defer std.Io.Dir.cwd().deleteFile(global_io, endpoint_path) catch {};
+    const pid_path = try manifestDaemonPidPathFromEndpointPath(allocator, endpoint_path);
+    defer allocator.free(pid_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, pid_path) catch {};
 
     var daemon_state: ManifestDaemonState = .{};
     defer daemon_state.deinit(allocator);
@@ -6918,9 +8914,11 @@ fn runManifestIncrementalDaemon(allocator: std.mem.Allocator, endpoint_path: []c
         }};
         const ready = std.posix.poll(&poll_fds, 250) catch 0;
         if (ready > 0) {
-            if (try processManifestDaemonEndpoint(allocator, endpoint, &daemon_state, &pending_line)) {
+            const result = try processManifestDaemonEndpoint(allocator, endpoint, &daemon_state, &pending_line);
+            if (result.read_any) {
                 last_activity_ms = manifestDaemonNowMs();
             }
+            if (result.shutdown_requested) break;
         }
 
         const idle_ms = manifestDaemonNowMs() - last_activity_ms;
@@ -6938,11 +8936,8 @@ fn establishIncrementalWatchState(
     build_overrides: BuildOverrides,
     collect_arc_stats: bool,
     zap_lib_dir_override: ?[]const u8,
+    progress_reporter: ?*zap.progress.Reporter,
 ) ?IncrementalWatchState {
-    var progress = zap.progress.Reporter.init("Compiling", stderrProgressEnabled());
-    const progress_reporter: ?*zap.progress.Reporter = if (progress.enabled) &progress else null;
-    defer progress.finish();
-
     var state = IncrementalWatchState.init(allocator, project_root, target_name, build_opts, build_overrides, collect_arc_stats, zap_lib_dir_override, progress_reporter) orelse return null;
     state.rebuild(allocator, project_root, target_name, build_opts, build_overrides, &.{}, zap_lib_dir_override, progress_reporter) catch |err| {
         std.debug.print("Initial incremental build failed ({s})\n", .{@errorName(err)});
@@ -6977,7 +8972,10 @@ fn watchAndRebuild(
     };
     defer watch_snapshot.deinit(allocator);
 
-    var incr_state = establishIncrementalWatchState(allocator, project_root, target_name, build_opts, build_overrides, collect_arc_stats, zap_lib_dir_override);
+    var initial_progress = zap.progress.Reporter.init("Compiling", stderrProgressEnabled());
+    const initial_progress_reporter: ?*zap.progress.Reporter = if (initial_progress.enabled) &initial_progress else null;
+    var incr_state = establishIncrementalWatchState(allocator, project_root, target_name, build_opts, build_overrides, collect_arc_stats, zap_lib_dir_override, initial_progress_reporter);
+    initial_progress.finish();
     defer if (incr_state) |*s| s.deinit();
 
     if (incr_state) |*state| {
@@ -7045,7 +9043,10 @@ fn watchAndRebuild(
             }
 
             if (incr_state == null) {
-                incr_state = establishIncrementalWatchState(allocator, project_root, target_name, build_opts, build_overrides, collect_arc_stats, zap_lib_dir_override);
+                var progress = zap.progress.Reporter.init("Compiling", stderrProgressEnabled());
+                const progress_reporter: ?*zap.progress.Reporter = if (progress.enabled) &progress else null;
+                incr_state = establishIncrementalWatchState(allocator, project_root, target_name, build_opts, build_overrides, collect_arc_stats, zap_lib_dir_override, progress_reporter);
+                progress.finish();
                 rebuild_succeeded = incr_state != null;
             }
 
@@ -7110,6 +9111,8 @@ const ParsedArgs = struct {
     build_overrides: BuildOverrides = .{},
     run_args: []const []const u8,
     seed: ?[]const u8 = null,
+    timings: bool = false,
+    slowest: ?[]const u8 = null,
     watch: bool = false,
     collect_arc_stats: bool = false,
     no_deps: bool = false,
@@ -7170,6 +9173,16 @@ fn parseTargetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Pars
                 result.seed = args[i];
             } else {
                 std.debug.print("Error: --seed requires a value\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--timings")) {
+            result.timings = true;
+        } else if (std.mem.eql(u8, arg, "--slowest")) {
+            i += 1;
+            if (i < args.len) {
+                result.slowest = args[i];
+            } else {
+                std.debug.print("Error: --slowest requires a value\n", .{});
                 std.process.exit(1);
             }
         } else if (std.mem.startsWith(u8, arg, "-D")) {
@@ -7239,7 +9252,7 @@ fn parseTargetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Pars
 /// possible failure mode. The positional target itself is harmlessly
 /// ignored by `parseBuildOverrides` (its `!startsWith("-D") continue`),
 /// so the region only needs to exclude post-`--` program args. Value-
-/// consuming flags (`--build-file`, `--zap-lib-dir`, `--seed`) still
+/// consuming flags (`--build-file`, `--zap-lib-dir`, `--seed`, `--slowest`) still
 /// skip their value so a `--seed --` value cannot be misread as the
 /// program-args boundary; `parseBuildOverrides` independently skips the
 /// same flag/value pairs so a value like `--seed -Dx=1` is never
@@ -7251,7 +9264,8 @@ fn manifestLeadingFlagEnd(args: []const []const u8) usize {
         if (std.mem.eql(u8, arg, "--")) return i;
         if (std.mem.eql(u8, arg, "--build-file") or
             std.mem.eql(u8, arg, "--zap-lib-dir") or
-            std.mem.eql(u8, arg, "--seed"))
+            std.mem.eql(u8, arg, "--seed") or
+            std.mem.eql(u8, arg, "--slowest"))
         {
             i += 1; // value-consuming: skip the value too
             continue;
@@ -7318,6 +9332,313 @@ test "incremental module hashes own module-name keys" {
     const entry = iter.next().?;
     try testing.expect(entry.key_ptr.*.ptr != borrowed_name.ptr);
     try testing.expectEqual(@as(u64, 123), hashes.modules.get("Example").?);
+}
+
+test "incremental backend update decision follows emitted graph hashes" {
+    var previous_modules = std.StringHashMap(u64).init(testing.allocator);
+    defer previous_modules.deinit();
+    try previous_modules.put("Bool", 100);
+    try previous_modules.put("TestRunner", 200);
+
+    var current_hashes: ComputedIncrementalHashes = .{
+        .allocator = testing.allocator,
+        .modules = std.StringHashMap(u64).init(testing.allocator),
+        .root_present = true,
+        .root_hash = 300,
+    };
+    defer current_hashes.modules.deinit();
+    try current_hashes.modules.put("Bool", 100);
+    try current_hashes.modules.put("TestRunner", 200);
+
+    try testing.expect(!emittedIncrementalGraphChanged(true, 300, &previous_modules, &current_hashes));
+
+    try current_hashes.modules.put("Bool", 101);
+    try testing.expect(emittedIncrementalGraphChanged(true, 300, &previous_modules, &current_hashes));
+}
+
+test "incremental backend selection identifies changed modules and root" {
+    var previous_modules = std.StringHashMap(u64).init(testing.allocator);
+    defer previous_modules.deinit();
+    try previous_modules.put("Bool", 100);
+    try previous_modules.put("TestRunner", 200);
+
+    var current_hashes: ComputedIncrementalHashes = .{
+        .allocator = testing.allocator,
+        .modules = std.StringHashMap(u64).init(testing.allocator),
+        .root_present = true,
+        .root_hash = 300,
+    };
+    defer current_hashes.modules.deinit();
+    try current_hashes.modules.put("Bool", 101);
+    try current_hashes.modules.put("TestRunner", 200);
+
+    const changed_bool = try selectChangedIncrementalModulesFromHashes(
+        testing.allocator,
+        true,
+        300,
+        &previous_modules,
+        &current_hashes,
+    );
+    defer testing.allocator.free(changed_bool.struct_names);
+    try testing.expect(!changed_bool.include_root);
+    try testing.expectEqual(@as(usize, 1), changed_bool.struct_names.len);
+    try testing.expectEqualStrings("Bool", changed_bool.struct_names[0]);
+
+    current_hashes.root_hash = 301;
+    current_hashes.modules.getPtr("Bool").?.* = 100;
+    const changed_root = try selectChangedIncrementalModulesFromHashes(
+        testing.allocator,
+        true,
+        300,
+        &previous_modules,
+        &current_hashes,
+    );
+    defer testing.allocator.free(changed_root.struct_names);
+    try testing.expect(changed_root.include_root);
+    try testing.expectEqual(@as(usize, 0), changed_root.struct_names.len);
+}
+
+fn testIncrementalFunction(
+    function_id: ir.FunctionId,
+    name: []const u8,
+    struct_name: ?[]const u8,
+) ir.Function {
+    return .{
+        .id = function_id,
+        .name = name,
+        .struct_name = struct_name,
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = &.{},
+        .is_closure = false,
+        .captures = &.{},
+    };
+}
+
+fn selectionContainsModuleName(module_names: []const []const u8, expected_name: []const u8) bool {
+    for (module_names) |module_name| {
+        if (std.mem.eql(u8, module_name, expected_name)) return true;
+    }
+    return false;
+}
+
+fn expectIncrementalModulesExactly(
+    actual_names: []const []const u8,
+    expected_names: []const []const u8,
+) !void {
+    try testing.expectEqual(expected_names.len, actual_names.len);
+    for (expected_names) |expected_name| {
+        try testing.expect(selectionContainsModuleName(actual_names, expected_name));
+    }
+    for (actual_names) |actual_name| {
+        try testing.expect(selectionContainsModuleName(expected_names, actual_name));
+    }
+}
+
+const OwnedPreparedIncrementalBackendPlan = struct {
+    selection: OwnedIncrementalModuleSelection,
+    invalidation: zir_backend.SelectedUpdateInvalidationPolicy,
+
+    fn deinit(self: OwnedPreparedIncrementalBackendPlan, allocator: std.mem.Allocator) void {
+        self.selection.deinit(allocator);
+    }
+};
+
+fn preparedBackendPlanForTest(
+    result: *const compiler.CompileResult,
+    previous_root_present: bool,
+    previous_root_hash: u64,
+    previous_modules: *const std.StringHashMap(u64),
+    current_hashes: *const ComputedIncrementalHashes,
+) !OwnedPreparedIncrementalBackendPlan {
+    const plan = try selectPreparedIncrementalBackendPlan(
+        testing.allocator,
+        result,
+        previous_root_present,
+        previous_root_hash,
+        previous_modules,
+        current_hashes,
+    );
+    defer testing.allocator.free(plan.selection.struct_names);
+    return .{
+        .selection = try normalizeIncrementalSelectionForBackend(testing.allocator, plan.selection),
+        .invalidation = plan.invalidation,
+    };
+}
+
+test "prepared incremental backend selection keeps Bool body changes precise" {
+    var previous_modules = std.StringHashMap(u64).init(testing.allocator);
+    defer previous_modules.deinit();
+    try previous_modules.put("Bool", 100);
+    try previous_modules.put("Zap_BoolTest", 200);
+    try previous_modules.put("CompileAfterRunner", 300);
+
+    var current_hashes: ComputedIncrementalHashes = .{
+        .allocator = testing.allocator,
+        .modules = std.StringHashMap(u64).init(testing.allocator),
+    };
+    defer current_hashes.modules.deinit();
+    try current_hashes.modules.put("Bool", 101);
+    try current_hashes.modules.put("Zap_BoolTest", 200);
+    try current_hashes.modules.put("CompileAfterRunner", 300);
+
+    const functions = [_]ir.Function{
+        testIncrementalFunction(1, "Bool__negate__1", "Bool"),
+        testIncrementalFunction(2, "Zap_BoolTest__test_negate__0", "Zap.BoolTest"),
+        testIncrementalFunction(3, "CompileAfterRunner__run__0", "CompileAfterRunner"),
+    };
+    const affected_functions = [_]ir.FunctionId{1};
+    const result: compiler.CompileResult = .{
+        .ir_program = .{ .functions = &functions, .type_defs = &.{}, .entry = null },
+        .incremental_backend_affected_function_ids = &affected_functions,
+    };
+
+    const backend_plan = try preparedBackendPlanForTest(&result, false, 0, &previous_modules, &current_hashes);
+    defer backend_plan.deinit(testing.allocator);
+
+    try testing.expectEqual(zir_backend.SelectedUpdateInvalidationPolicy.compare_source_hashes, backend_plan.invalidation);
+    try testing.expect(!backend_plan.selection.include_root);
+    try expectIncrementalModulesExactly(backend_plan.selection.struct_names, &.{"Bool"});
+}
+
+test "prepared incremental backend selection keeps caller modules precise" {
+    var previous_modules = std.StringHashMap(u64).init(testing.allocator);
+    defer previous_modules.deinit();
+    try previous_modules.put("Bool", 100);
+    try previous_modules.put("Zap_BoolTest", 200);
+
+    var current_hashes: ComputedIncrementalHashes = .{
+        .allocator = testing.allocator,
+        .modules = std.StringHashMap(u64).init(testing.allocator),
+    };
+    defer current_hashes.modules.deinit();
+    try current_hashes.modules.put("Bool", 100);
+    try current_hashes.modules.put("Zap_BoolTest", 200);
+
+    const functions = [_]ir.Function{
+        testIncrementalFunction(1, "Bool__negate__1", "Bool"),
+        testIncrementalFunction(2, "Zap_BoolTest__test_negate__0", "Zap.BoolTest"),
+    };
+    const affected_functions = [_]ir.FunctionId{2};
+    const result: compiler.CompileResult = .{
+        .ir_program = .{ .functions = &functions, .type_defs = &.{}, .entry = null },
+        .incremental_backend_affected_function_ids = &affected_functions,
+    };
+
+    const backend_plan = try preparedBackendPlanForTest(&result, false, 0, &previous_modules, &current_hashes);
+    defer backend_plan.deinit(testing.allocator);
+
+    try testing.expectEqual(zir_backend.SelectedUpdateInvalidationPolicy.compare_source_hashes, backend_plan.invalidation);
+    try testing.expect(!backend_plan.selection.include_root);
+    try expectIncrementalModulesExactly(backend_plan.selection.struct_names, &.{"Zap_BoolTest"});
+}
+
+test "prepared incremental backend force full selects all current modules and root" {
+    var previous_modules = std.StringHashMap(u64).init(testing.allocator);
+    defer previous_modules.deinit();
+    try previous_modules.put("Bool", 100);
+    try previous_modules.put("Zap_BoolTest", 200);
+
+    var current_hashes: ComputedIncrementalHashes = .{
+        .allocator = testing.allocator,
+        .modules = std.StringHashMap(u64).init(testing.allocator),
+        .root_present = true,
+        .root_hash = 300,
+    };
+    defer current_hashes.modules.deinit();
+    try current_hashes.modules.put("Bool", 101);
+    try current_hashes.modules.put("Zap_BoolTest", 201);
+
+    const functions = [_]ir.Function{
+        testIncrementalFunction(1, "Bool__negate__1", "Bool"),
+        testIncrementalFunction(2, "Zap_BoolTest__test_negate__0", "Zap.BoolTest"),
+    };
+    const result: compiler.CompileResult = .{
+        .ir_program = .{ .functions = &functions, .type_defs = &.{}, .entry = null },
+        .incremental_backend_force_full = true,
+    };
+
+    const backend_plan = try preparedBackendPlanForTest(&result, true, 299, &previous_modules, &current_hashes);
+    defer backend_plan.deinit(testing.allocator);
+
+    try testing.expectEqual(zir_backend.SelectedUpdateInvalidationPolicy.force_all_source_hashes, backend_plan.invalidation);
+    try testing.expect(backend_plan.selection.include_root);
+    try expectIncrementalModulesExactly(backend_plan.selection.struct_names, &.{ "Bool", "Zap_BoolTest" });
+}
+
+test "prepared incremental backend entry functions include root" {
+    var previous_modules = std.StringHashMap(u64).init(testing.allocator);
+    defer previous_modules.deinit();
+    try previous_modules.put("App", 100);
+
+    var current_hashes: ComputedIncrementalHashes = .{
+        .allocator = testing.allocator,
+        .modules = std.StringHashMap(u64).init(testing.allocator),
+        .root_present = true,
+        .root_hash = 200,
+    };
+    defer current_hashes.modules.deinit();
+    try current_hashes.modules.put("App", 100);
+
+    const functions = [_]ir.Function{
+        testIncrementalFunction(1, "App__main__0", "App"),
+    };
+    const affected_functions = [_]ir.FunctionId{1};
+    const result: compiler.CompileResult = .{
+        .ir_program = .{ .functions = &functions, .type_defs = &.{}, .entry = 1 },
+        .incremental_backend_affected_function_ids = &affected_functions,
+    };
+
+    const backend_plan = try preparedBackendPlanForTest(&result, true, 200, &previous_modules, &current_hashes);
+    defer backend_plan.deinit(testing.allocator);
+
+    try testing.expectEqual(zir_backend.SelectedUpdateInvalidationPolicy.compare_source_hashes, backend_plan.invalidation);
+    try testing.expect(backend_plan.selection.include_root);
+    try expectIncrementalModulesExactly(backend_plan.selection.struct_names, &.{});
+}
+
+test "prepared incremental backend direct root hash changes use compare-hash invalidation" {
+    var previous_modules = std.StringHashMap(u64).init(testing.allocator);
+    defer previous_modules.deinit();
+    try previous_modules.put("App", 100);
+
+    var current_hashes: ComputedIncrementalHashes = .{
+        .allocator = testing.allocator,
+        .modules = std.StringHashMap(u64).init(testing.allocator),
+        .root_present = true,
+        .root_hash = 301,
+    };
+    defer current_hashes.modules.deinit();
+    try current_hashes.modules.put("App", 100);
+
+    const functions = [_]ir.Function{
+        testIncrementalFunction(1, "App__main__0", "App"),
+    };
+    const result: compiler.CompileResult = .{
+        .ir_program = .{ .functions = &functions, .type_defs = &.{}, .entry = null },
+    };
+
+    const backend_plan = try preparedBackendPlanForTest(&result, true, 300, &previous_modules, &current_hashes);
+    defer backend_plan.deinit(testing.allocator);
+
+    try testing.expectEqual(zir_backend.SelectedUpdateInvalidationPolicy.compare_source_hashes, backend_plan.invalidation);
+    try testing.expect(backend_plan.selection.include_root);
+    try expectIncrementalModulesExactly(backend_plan.selection.struct_names, &.{});
+}
+
+test "manifest daemon build requests recheck sources even without watcher hits" {
+    try testing.expect(manifestDaemonRequestRequiresSourceRecheck(.build, false, 0));
+    try testing.expect(manifestDaemonRequestRequiresSourceRecheck(.warm, false, 0));
+    try testing.expect(manifestDaemonRequestRequiresSourceRecheck(.build, true, 0));
+    try testing.expect(manifestDaemonRequestRequiresSourceRecheck(.warm, true, 1));
+    try testing.expect(!manifestDaemonRequestRequiresSourceRecheck(.warm, true, 0));
+}
+
+test "manifest daemon build requests queue behind pending warm baselines" {
+    try testing.expectEqual(ManifestDaemonBuildQueuePolicy.send_immediately, manifestDaemonBuildQueuePolicy(false));
+    try testing.expectEqual(ManifestDaemonBuildQueuePolicy.queue_after_pending_warm, manifestDaemonBuildQueuePolicy(true));
 }
 
 // ---------------------------------------------------------------------------
@@ -7570,7 +9891,7 @@ test "appendTestRunArgs forwards seed before explicit test args" {
     var args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer args.deinit(testing.allocator);
 
-    try appendTestRunArgs(testing.allocator, &args, "12345", &.{ "--only", "math" });
+    try appendTestRunArgs(testing.allocator, &args, "12345", false, null, &.{ "--only", "math" });
 
     try testing.expectEqual(@as(usize, 4), args.items.len);
     try testing.expectEqualStrings("--seed", args.items[0]);
@@ -7583,11 +9904,33 @@ test "appendTestRunArgs preserves forwarded test args without a seed" {
     var args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer args.deinit(testing.allocator);
 
-    try appendTestRunArgs(testing.allocator, &args, null, &.{ "--list", "--verbose" });
+    try appendTestRunArgs(testing.allocator, &args, null, false, null, &.{ "--list", "--verbose" });
 
     try testing.expectEqual(@as(usize, 2), args.items.len);
     try testing.expectEqualStrings("--list", args.items[0]);
     try testing.expectEqualStrings("--verbose", args.items[1]);
+}
+
+test "appendTestRunArgs forwards timing options before explicit test args" {
+    var args: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer args.deinit(testing.allocator);
+
+    try appendTestRunArgs(testing.allocator, &args, null, true, "7", &.{"--list"});
+
+    try testing.expectEqual(@as(usize, 4), args.items.len);
+    try testing.expectEqualStrings("--timings", args.items[0]);
+    try testing.expectEqualStrings("--slowest", args.items[1]);
+    try testing.expectEqualStrings("7", args.items[2]);
+    try testing.expectEqualStrings("--list", args.items[3]);
+}
+
+test "parseTargetArgs captures Zest timing flags" {
+    var parsed = try parseTargetArgs(testing.allocator, &.{ "--timings", "--slowest", "12" });
+    defer parsed.deinit(testing.allocator);
+
+    try testing.expect(parsed.timings);
+    try testing.expectEqualStrings("12", parsed.slowest.?);
+    try testing.expect(parsed.target == null);
 }
 
 test "buildPipelineRunArgs appends forwarded runtime args when requested" {
@@ -7643,6 +9986,28 @@ test "parseScriptOptimizeMode: unknown mode names return null (no silent fallbac
     try testing.expect(parseScriptOptimizeMode("ReleaseTurbo") == null);
 }
 
+test "optimizePolicyForBuildConfig maps frontend backend and memory optimize modes" {
+    const cases = [_]struct {
+        build: zap.builder.BuildConfig.Optimize,
+        frontend: compiler.FrontendOptimizeMode,
+        backend: u8,
+        memory: zap.memory_driver.ZapForkOptimize,
+    }{
+        .{ .build = .debug, .frontend = .debug, .backend = 0, .memory = .Debug },
+        .{ .build = .release_safe, .frontend = .release_safe, .backend = 1, .memory = .ReleaseSafe },
+        .{ .build = .release_fast, .frontend = .release_fast, .backend = 2, .memory = .ReleaseFast },
+        .{ .build = .release_small, .frontend = .release_small, .backend = 3, .memory = .ReleaseSmall },
+    };
+
+    for (cases) |case| {
+        const policy = optimizePolicyForBuildConfig(case.build);
+        try testing.expectEqual(case.frontend, policy.frontend_optimize_mode);
+        try testing.expectEqual(case.frontend.cacheTag(), policy.frontend_policy_tag);
+        try testing.expectEqual(case.backend, policy.backend_optimize_mode);
+        try testing.expectEqual(case.memory, policy.memory_driver_optimize);
+    }
+}
+
 test "validateScriptMemoryManager: accepts exactly the five stdlib managers" {
     try testing.expect(validateScriptMemoryManager("Memory.ARC"));
     try testing.expect(validateScriptMemoryManager("Memory.Arena"));
@@ -7669,10 +10034,72 @@ test "computeBuildCacheKey includes manifest result hash" {
     };
     const target_name = "default";
 
-    const first = computeBuildCacheKey(build_source, &units, target_name, .{ .manifest_result_hash = 111 });
-    const second = computeBuildCacheKey(build_source, &units, target_name, .{ .manifest_result_hash = 222 });
+    const first = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, .{ .manifest_result_hash = 111 });
+    const second = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, .{ .manifest_result_hash = 222 });
 
     try testing.expect(!std.mem.eql(u8, first[0..], second[0..]));
+}
+
+test "computeBuildCacheKey includes source contents" {
+    const build_source = "pub struct App.Builder {}";
+    const first_units = [_]compiler.SourceUnit{
+        .{ .file_path = "lib/bool.zap", .source = "pub fn negate(true) -> Bool { false }" },
+    };
+    const second_units = [_]compiler.SourceUnit{
+        .{ .file_path = "lib/bool.zap", .source = "pub fn negate(true) -> Bool { true }" },
+    };
+    const target_name = "test";
+    const manifest_hash: u64 = 111;
+
+    const first_key = try computeBuildCacheKey(testing.allocator, build_source, &first_units, target_name, .{
+        .manifest_result_hash = manifest_hash,
+    });
+    const second_key = try computeBuildCacheKey(testing.allocator, build_source, &second_units, target_name, .{
+        .manifest_result_hash = manifest_hash,
+    });
+
+    try testing.expect(!std.mem.eql(u8, first_key[0..], second_key[0..]));
+}
+
+test "computeBuildCacheKey length-prefixes source unit fields" {
+    const first_units = [_]compiler.SourceUnit{
+        .{ .file_path = "ab", .source = "c" },
+    };
+    const second_units = [_]compiler.SourceUnit{
+        .{ .file_path = "a", .source = "bc" },
+    };
+    const target_name = "test";
+    const manifest_hash: u64 = 111;
+
+    const first_key = try computeBuildCacheKey(testing.allocator, "", &first_units, target_name, .{
+        .manifest_result_hash = manifest_hash,
+    });
+    const second_key = try computeBuildCacheKey(testing.allocator, "", &second_units, target_name, .{
+        .manifest_result_hash = manifest_hash,
+    });
+
+    try testing.expect(!std.mem.eql(u8, first_key[0..], second_key[0..]));
+}
+
+test "computeBuildCacheKey is stable across source discovery order" {
+    const build_source = "pub struct App.Builder {}";
+    const first_units = [_]compiler.SourceUnit{
+        .{ .file_path = "lib/b.zap", .source = "pub struct B {}" },
+        .{ .file_path = "lib/a.zap", .source = "pub struct A {}" },
+    };
+    const second_units = [_]compiler.SourceUnit{
+        .{ .file_path = "lib/a.zap", .source = "pub struct A {}" },
+        .{ .file_path = "lib/b.zap", .source = "pub struct B {}" },
+    };
+
+    const first_key = try computeBuildCacheKey(testing.allocator, build_source, &first_units, "test", .{
+        .manifest_result_hash = 111,
+    });
+    const second_key = try computeBuildCacheKey(testing.allocator, build_source, &second_units, "test", .{
+        .manifest_result_hash = 111,
+    });
+
+    try testing.expectEqual(first_key, second_key);
 }
 
 test "Phase 2 ARC stats: build cache key separates runtime collection shape" {
@@ -7683,11 +10110,11 @@ test "Phase 2 ARC stats: build cache key separates runtime collection shape" {
     const target_name = "default";
     const manifest_hash: u64 = 111;
 
-    const default_key = computeBuildCacheKey(build_source, &units, target_name, .{
+    const default_key = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, .{
         .manifest_result_hash = manifest_hash,
         .collect_arc_stats = false,
     });
-    const stats_key = computeBuildCacheKey(build_source, &units, target_name, .{
+    const stats_key = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, .{
         .manifest_result_hash = manifest_hash,
         .collect_arc_stats = true,
     });
@@ -7703,13 +10130,13 @@ test "computeBuildCacheKey includes active manager source hash" {
     const target_name = "default";
     const manifest_hash: u64 = 111;
 
-    const first_key = computeBuildCacheKey(build_source, &units, target_name, .{
+    const first_key = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, .{
         .manifest_result_hash = manifest_hash,
-        .active_manager_source_hash = 1,
+        .active_manager_source_digest = testBuildCacheDigest(1),
     });
-    const second_key = computeBuildCacheKey(build_source, &units, target_name, .{
+    const second_key = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, .{
         .manifest_result_hash = manifest_hash,
-        .active_manager_source_hash = 2,
+        .active_manager_source_digest = testBuildCacheDigest(2),
     });
 
     try testing.expect(!std.mem.eql(u8, first_key[0..], second_key[0..]));
@@ -7723,13 +10150,13 @@ test "computeBuildCacheKey includes compiler identity hash" {
     const target_name = "default";
     const manifest_hash: u64 = 111;
 
-    const first_key = computeBuildCacheKey(build_source, &units, target_name, .{
+    const first_key = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, .{
         .manifest_result_hash = manifest_hash,
-        .compiler_identity_hash = 1,
+        .compiler_identity_digest = testBuildCacheDigest(1),
     });
-    const second_key = computeBuildCacheKey(build_source, &units, target_name, .{
+    const second_key = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, .{
         .manifest_result_hash = manifest_hash,
-        .compiler_identity_hash = 2,
+        .compiler_identity_digest = testBuildCacheDigest(2),
     });
 
     try testing.expect(!std.mem.eql(u8, first_key[0..], second_key[0..]));
@@ -7743,13 +10170,35 @@ test "computeBuildCacheKey includes Zig lib identity hash" {
     const target_name = "default";
     const manifest_hash: u64 = 111;
 
-    const first_key = computeBuildCacheKey(build_source, &units, target_name, .{
+    const first_key = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, .{
         .manifest_result_hash = manifest_hash,
-        .zig_lib_identity_hash = 1,
+        .zig_lib_identity_digest = testBuildCacheDigest(1),
     });
-    const second_key = computeBuildCacheKey(build_source, &units, target_name, .{
+    const second_key = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, .{
         .manifest_result_hash = manifest_hash,
-        .zig_lib_identity_hash = 2,
+        .zig_lib_identity_digest = testBuildCacheDigest(2),
+    });
+
+    try testing.expect(!std.mem.eql(u8, first_key[0..], second_key[0..]));
+}
+
+test "computeBuildCacheKey includes frontend policy tag separately from optimize" {
+    const build_source = "pub struct App.Builder {}";
+    const units = [_]compiler.SourceUnit{
+        .{ .file_path = "lib/app.zap", .source = "pub struct App {}" },
+    };
+    const target_name = "default";
+    const manifest_hash: u64 = 111;
+
+    const first_key = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, .{
+        .manifest_result_hash = manifest_hash,
+        .optimize = .debug,
+        .frontend_policy_tag = compiler.FrontendOptimizeMode.debug.cacheTag(),
+    });
+    const second_key = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, .{
+        .manifest_result_hash = manifest_hash,
+        .optimize = .debug,
+        .frontend_policy_tag = compiler.FrontendOptimizeMode.release_fast.cacheTag(),
     });
 
     try testing.expect(!std.mem.eql(u8, first_key[0..], second_key[0..]));
@@ -7759,40 +10208,42 @@ test "Phase5 content key: every input flips the key (no silent collision)" {
     const a = testing.allocator;
     const base_controls: ScriptContentKeyControls = .{
         .optimize = .debug,
+        .frontend_policy_tag = compiler.FrontendOptimizeMode.debug.cacheTag(),
         .memory_manager_name = "Memory.ARC",
         .target = "",
         .cpu = "",
     };
 
-    const k_base = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", 0xAA, 0xBB, 0xCC, base_controls);
+    const k_base = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", testBuildCacheDigest(0xAA), testBuildCacheDigest(0xBB), testBuildCacheDigest(0xCC), base_controls);
     defer a.free(k_base);
 
     // Script source change ⇒ different key.
-    const k_src = try computeScriptContentKey(a, "fn main(_ :: [String]) { IO.puts(\"x\") }", 0xAA, 0xBB, 0xCC, base_controls);
+    const k_src = try computeScriptContentKey(a, "fn main(_ :: [String]) { IO.puts(\"x\") }", testBuildCacheDigest(0xAA), testBuildCacheDigest(0xBB), testBuildCacheDigest(0xCC), base_controls);
     defer a.free(k_src);
     try testing.expect(!std.mem.eql(u8, k_base, k_src));
 
     // Stdlib identity change ⇒ different key (no false hit across
     // stdlibs).
-    const k_lib = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", 0xAC, 0xBB, 0xCC, base_controls);
+    const k_lib = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", testBuildCacheDigest(0xAC), testBuildCacheDigest(0xBB), testBuildCacheDigest(0xCC), base_controls);
     defer a.free(k_lib);
     try testing.expect(!std.mem.eql(u8, k_base, k_lib));
 
     // Compiler identity change ⇒ different key (rebuilt compiler must
     // not reuse a stale binary).
-    const k_cc = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", 0xAA, 0xBC, 0xCC, base_controls);
+    const k_cc = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", testBuildCacheDigest(0xAA), testBuildCacheDigest(0xBC), testBuildCacheDigest(0xCC), base_controls);
     defer a.free(k_cc);
     try testing.expect(!std.mem.eql(u8, k_base, k_cc));
 
     // Zig lib identity change ⇒ different key (mutating the toolchain
     // support library in place must invalidate script artifacts).
-    const k_zig_lib = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", 0xAA, 0xBB, 0xCD, base_controls);
+    const k_zig_lib = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", testBuildCacheDigest(0xAA), testBuildCacheDigest(0xBB), testBuildCacheDigest(0xCD), base_controls);
     defer a.free(k_zig_lib);
     try testing.expect(!std.mem.eql(u8, k_base, k_zig_lib));
 
     // Each post-override build control flips the key independently.
-    const k_opt = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", 0xAA, 0xBB, 0xCC, .{
+    const k_opt = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", testBuildCacheDigest(0xAA), testBuildCacheDigest(0xBB), testBuildCacheDigest(0xCC), .{
         .optimize = .release_fast,
+        .frontend_policy_tag = compiler.FrontendOptimizeMode.release_fast.cacheTag(),
         .memory_manager_name = "Memory.ARC",
         .target = "",
         .cpu = "",
@@ -7800,8 +10251,19 @@ test "Phase5 content key: every input flips the key (no silent collision)" {
     defer a.free(k_opt);
     try testing.expect(!std.mem.eql(u8, k_base, k_opt));
 
-    const k_mem = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", 0xAA, 0xBB, 0xCC, .{
+    const k_policy = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", testBuildCacheDigest(0xAA), testBuildCacheDigest(0xBB), testBuildCacheDigest(0xCC), .{
         .optimize = .debug,
+        .frontend_policy_tag = compiler.FrontendOptimizeMode.release_fast.cacheTag(),
+        .memory_manager_name = "Memory.ARC",
+        .target = "",
+        .cpu = "",
+    });
+    defer a.free(k_policy);
+    try testing.expect(!std.mem.eql(u8, k_base, k_policy));
+
+    const k_mem = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", testBuildCacheDigest(0xAA), testBuildCacheDigest(0xBB), testBuildCacheDigest(0xCC), .{
+        .optimize = .debug,
+        .frontend_policy_tag = compiler.FrontendOptimizeMode.debug.cacheTag(),
         .memory_manager_name = "Memory.Arena",
         .target = "",
         .cpu = "",
@@ -7809,8 +10271,9 @@ test "Phase5 content key: every input flips the key (no silent collision)" {
     defer a.free(k_mem);
     try testing.expect(!std.mem.eql(u8, k_base, k_mem));
 
-    const k_tgt = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", 0xAA, 0xBB, 0xCC, .{
+    const k_tgt = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", testBuildCacheDigest(0xAA), testBuildCacheDigest(0xBB), testBuildCacheDigest(0xCC), .{
         .optimize = .debug,
+        .frontend_policy_tag = compiler.FrontendOptimizeMode.debug.cacheTag(),
         .memory_manager_name = "Memory.ARC",
         .target = "x86_64-linux-musl",
         .cpu = "",
@@ -7818,8 +10281,9 @@ test "Phase5 content key: every input flips the key (no silent collision)" {
     defer a.free(k_tgt);
     try testing.expect(!std.mem.eql(u8, k_base, k_tgt));
 
-    const k_cpu = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", 0xAA, 0xBB, 0xCC, .{
+    const k_cpu = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", testBuildCacheDigest(0xAA), testBuildCacheDigest(0xBB), testBuildCacheDigest(0xCC), .{
         .optimize = .debug,
+        .frontend_policy_tag = compiler.FrontendOptimizeMode.debug.cacheTag(),
         .memory_manager_name = "Memory.ARC",
         .target = "",
         .cpu = "baseline",
@@ -7832,13 +10296,14 @@ test "Phase5 content key: identical inputs are stable (cache HIT is possible)" {
     const a = testing.allocator;
     const controls: ScriptContentKeyControls = .{
         .optimize = .release_safe,
+        .frontend_policy_tag = compiler.FrontendOptimizeMode.release_safe.cacheTag(),
         .memory_manager_name = "Memory.Tracking",
         .target = "aarch64-linux-musl",
         .cpu = "baseline",
     };
-    const k1 = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", 0x1234, 0x5678, 0x9ABC, controls);
+    const k1 = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", testBuildCacheDigest(0x12), testBuildCacheDigest(0x56), testBuildCacheDigest(0x9A), controls);
     defer a.free(k1);
-    const k2 = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", 0x1234, 0x5678, 0x9ABC, controls);
+    const k2 = try computeScriptContentKey(a, "fn main(_ :: [String]) { }", testBuildCacheDigest(0x12), testBuildCacheDigest(0x56), testBuildCacheDigest(0x9A), controls);
     defer a.free(k2);
     // Determinism is the whole point: same inputs ⇒ same key ⇒ the
     // skip-recompile fast path can find the prior artifact.
@@ -7850,14 +10315,14 @@ test "Phase5 content key: control length-prefixing prevents boundary collisions"
     const a = testing.allocator;
     // ("ab","") must NOT collide with ("a","b") for adjacent string
     // controls — length-prefixing guarantees this.
-    const k_ab = try computeScriptContentKey(a, "s", 1, 2, 3, .{
+    const k_ab = try computeScriptContentKey(a, "s", testBuildCacheDigest(1), testBuildCacheDigest(2), testBuildCacheDigest(3), .{
         .optimize = .debug,
         .memory_manager_name = "ab",
         .target = "",
         .cpu = "",
     });
     defer a.free(k_ab);
-    const k_a_b = try computeScriptContentKey(a, "s", 1, 2, 3, .{
+    const k_a_b = try computeScriptContentKey(a, "s", testBuildCacheDigest(1), testBuildCacheDigest(2), testBuildCacheDigest(3), .{
         .optimize = .debug,
         .memory_manager_name = "a",
         .target = "b",
@@ -7888,7 +10353,7 @@ test "Phase5 stdlib identity: content AND path sensitive, deterministic (no fals
     const h_b = try hashStdlibIdentity(a, path_b);
     // Different contents ⇒ different identity (no false hit across
     // distinct stdlibs).
-    try testing.expect(h_a != h_b);
+    try testing.expect(!std.mem.eql(u8, h_a[0..], h_b[0..]));
     // Deterministic: same dir hashed twice ⇒ identical (so an
     // unchanged stdlib keeps the same key ⇒ cache HIT possible).
     try testing.expectEqual(h_a, try hashStdlibIdentity(a, path_a));
@@ -7901,7 +10366,7 @@ test "Phase5 stdlib identity: content AND path sensitive, deterministic (no fals
     const path_c = tmp.dir.realPathFileAlloc(global_io, "libC", a) catch return error.Unexpected;
     defer a.free(path_c);
     const h_c = try hashStdlibIdentity(a, path_c);
-    try testing.expect(h_a != h_c);
+    try testing.expect(!std.mem.eql(u8, h_a[0..], h_c[0..]));
 }
 
 test "Zig lib identity: content AND path sensitive, deterministic" {
@@ -7927,11 +10392,11 @@ test "Zig lib identity: content AND path sensitive, deterministic" {
     const h_a = try hashZigLibIdentity(a, cache_dir, path_a);
     try testing.expectEqual(h_a, try hashZigLibIdentity(a, cache_dir, path_a));
     const h_b = try hashZigLibIdentity(a, cache_dir, path_b);
-    try testing.expect(h_a != h_b);
+    try testing.expect(!std.mem.eql(u8, h_a[0..], h_b[0..]));
 
     tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig_a/std/start.zig", .data = "pub const a = 2;" }) catch return error.Unexpected;
     const h_changed = try hashZigLibIdentity(a, cache_dir, path_a);
-    try testing.expect(h_a != h_changed);
+    try testing.expect(!std.mem.eql(u8, h_a[0..], h_changed[0..]));
 }
 
 test "Phase 7e: object manifest kind does not guarantee executable startup prologue" {
@@ -8104,13 +10569,15 @@ test "manifest source-root recursive scan policy covers protocol and impl roots"
 // `zap run` dispatch + foreign-target run-vs-report — pure helper unit
 // tests. `firstPositionalIndex` locates the script/target positional and
 // MUST mirror exactly the value-consuming flags `parseTargetArgs`
-// recognizes (`--build-file`/`--zap-lib-dir`/`--seed`); a regression
+// recognizes (`--build-file`/`--zap-lib-dir`/`--seed`/`--slowest`);
+// a regression
 // that re-adds a removed two-token flag (`-O`/`--memory`/`--target`)
 // would swallow the script path and mis-dispatch (the locked position
-// contract: only `-D…` and `--zap-lib-dir` are recognized leading
-// flags). `targetIsHostRunnable` decides the run-vs-report split for a
-// cross-built artifact. Both are filesystem-free and exercised by
-// `zig build test` without spawning a process.
+// contract: only `-D…`, `--zap-lib-dir`, and explicit test-runner
+// options are recognized leading flags). `targetIsHostRunnable`
+// decides the run-vs-report split for a cross-built artifact. Both are
+// filesystem-free and exercised by `zig build test` without spawning a
+// process.
 // ---------------------------------------------------------------------------
 
 test "firstPositionalIndex: bare script path is the first positional" {
@@ -8140,6 +10607,10 @@ test "firstPositionalIndex: recognized two-token flags skip their value" {
     try testing.expectEqual(
         @as(?usize, 4),
         firstPositionalIndex(&.{ "--build-file", "b.zap", "--seed", "7", "s.zap" }),
+    );
+    try testing.expectEqual(
+        @as(?usize, 3),
+        firstPositionalIndex(&.{ "--slowest", "10", "--timings", "s.zap" }),
     );
 }
 

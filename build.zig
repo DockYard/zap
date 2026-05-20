@@ -5,7 +5,9 @@ const builtin = @import("builtin");
 const zap_deps_version = "v0.16.0-zap.1";
 const zap_deps_base_url = "https://github.com/DockYard/zig/releases/download/" ++ zap_deps_version;
 const host_triple = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ "-" ++ @tagName(builtin.abi);
-const default_deps_dir = "zap-deps/" ++ host_triple;
+const default_deps_dir_relative = "zap-deps/" ++ host_triple;
+const default_zig_fork_root_relative = "../zig";
+const default_zig_bootstrap_llvm_lib_path_relative = "../zig-bootstrap/out/host/lib";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -63,7 +65,7 @@ pub fn build(b: *std.Build) void {
     // -----------------------------------------------------------------------
     // Setup step: download pre-built deps
     // -----------------------------------------------------------------------
-    const setup_step = b.step("setup", "Download pre-built zap dependencies for " ++ host_triple);
+    const setup_step = b.step("setup", "Download pre-built LLVM dependencies for " ++ host_triple);
     const setup_cmd = b.addSystemCommand(&.{
         "sh", "-c",
         "set -e && " ++
@@ -73,7 +75,7 @@ pub fn build(b: *std.Build) void {
             "mkdir -p zap-deps && " ++
             "tar xJf zap-deps-" ++ host_triple ++ ".tar.xz -C zap-deps && " ++
             "rm zap-deps-" ++ host_triple ++ ".tar.xz && " ++
-            "echo 'Done! You can now run: zig build'",
+            "echo 'Done! Build the sibling Zig fork, then run: zig build'",
     });
     setup_step.dependOn(&setup_cmd.step);
 
@@ -119,31 +121,74 @@ pub fn build(b: *std.Build) void {
     // -----------------------------------------------------------------------
     const user_lib = b.option([]const u8, "zap-compiler-lib", "Path to libzap_compiler.a");
     const user_llvm = b.option([]const u8, "llvm-lib-path", "Path to LLVM library directory with native .a files");
+    const default_zig_fork_root = b.pathFromRoot(default_zig_fork_root_relative);
+    const default_zig_bootstrap_llvm_lib_path = b.pathFromRoot(default_zig_bootstrap_llvm_lib_path_relative);
+    const default_deps_dir = b.pathFromRoot(default_deps_dir_relative);
+    const default_deps_llvm_lib_path = b.pathJoin(&.{ default_deps_dir, "llvm-libs" });
+    const zig_fork_root = b.option([]const u8, "zig-fork-root", "Path to Zap's Zig fork root") orelse default_zig_fork_root;
 
-    const zig_compiler_lib_path = user_lib orelse default_deps_dir ++ "/libzap_compiler.a";
-    const llvm_lib_path: ?[]const u8 = user_llvm orelse default_deps_dir ++ "/llvm-libs";
+    const local_zig_compiler_lib_path = b.fmt("{s}/zig-out/lib/libzap_compiler.a", .{zig_fork_root});
+    const zig_compiler_lib_path = user_lib orelse local_zig_compiler_lib_path;
+    const llvm_lib_path: ?[]const u8 = user_llvm orelse blk: {
+        if (pathExists(b, default_zig_bootstrap_llvm_lib_path)) {
+            break :blk default_zig_bootstrap_llvm_lib_path;
+        }
+        break :blk default_deps_llvm_lib_path;
+    };
 
-    // If using defaults and deps don't exist, fail with a helpful message
-    if (user_lib == null) {
-        std.Io.Dir.cwd().access(b.graph.io, zig_compiler_lib_path, .{}) catch {
+    if (!pathExists(b, zig_compiler_lib_path)) {
+        const fail = b.addSystemCommand(&.{
+            "sh", "-c",
+            b.fmt(
+                "printf '\\n" ++
+                    "Error: Zap requires libzap_compiler.a from the local Zig fork.\\n" ++
+                    "\\n" ++
+                    "Expected:\\n" ++
+                    "  {s}\\n" ++
+                    "\\n" ++
+                    "Build it with:\\n" ++
+                    "  cd {s} && zig build lib --search-prefix ../zig-bootstrap/out/host --search-prefix /opt/homebrew -Dstatic-llvm -Doptimize=ReleaseSafe -Dversion-string=0.16.0\\n" ++
+                    "\\n" ++
+                    "Or pass an explicit archive with:\\n" ++
+                    "  zig build -Dzap-compiler-lib=/path/to/libzap_compiler.a\\n" ++
+                    "\\n' >&2 && exit 1",
+                .{ zig_compiler_lib_path, zig_fork_root },
+            ),
+        });
+        b.getInstallStep().dependOn(&fail.step);
+        test_step.dependOn(&fail.step);
+        const run_step = b.step("run", "Run the app");
+        run_step.dependOn(&fail.step);
+        const zir_test_step = b.step("zir-test", "Run ZIR integration tests");
+        zir_test_step.dependOn(&fail.step);
+        return;
+    }
+
+    if (llvm_lib_path) |selected_llvm_lib_path| {
+        if (!pathExists(b, selected_llvm_lib_path)) {
             const fail = b.addSystemCommand(&.{
                 "sh", "-c",
-                "printf '\\n" ++
-                    "Error: zap-deps not found.\\n" ++
-                    "\\n" ++
-                    "Run:\\n" ++
-                    "  zig build setup\\n" ++
-                    "\\n" ++
-                    "This downloads the pre-built dependencies for " ++ host_triple ++ ".\\n" ++
-                    "\\n' >&2 && exit 1",
+                b.fmt(
+                    "printf '\\n" ++
+                        "Error: LLVM static library directory not found.\\n" ++
+                        "\\n" ++
+                        "Expected:\\n" ++
+                        "  {s}\\n" ++
+                        "\\n" ++
+                        "Run `zig build setup` to install vendored LLVM libraries or pass:\\n" ++
+                        "  -Dllvm-lib-path=/path/to/llvm/lib\\n" ++
+                        "\\n' >&2 && exit 1",
+                    .{selected_llvm_lib_path},
+                ),
             });
             b.getInstallStep().dependOn(&fail.step);
+            test_step.dependOn(&fail.step);
             const run_step = b.step("run", "Run the app");
             run_step.dependOn(&fail.step);
             const zir_test_step = b.step("zir-test", "Run ZIR integration tests");
             zir_test_step.dependOn(&fail.step);
             return;
-        };
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -231,6 +276,18 @@ pub fn build(b: *std.Build) void {
         .install_dir = .prefix,
         .install_subdir = "src/memory",
     });
+
+    const cache_correctness_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/cache_correctness_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_cache_correctness_tests = b.addRunArtifact(cache_correctness_tests);
+    run_cache_correctness_tests.setEnvironmentVariable("ZAP_BINARY", b.getInstallPath(.bin, "zap"));
+    run_cache_correctness_tests.step.dependOn(b.getInstallStep());
+    test_step.dependOn(&run_cache_correctness_tests.step);
 
     // -----------------------------------------------------------------------
     // Run step
@@ -399,6 +456,11 @@ fn applyNativeCompilerLinkage(
     root_module.linkSystemLibrary("zstd", .{});
     root_module.linkSystemLibrary("xml2", .{});
     root_module.linkSystemLibrary("c++", .{ .use_pkg_config = .no });
+}
+
+fn pathExists(b: *std.Build, path: []const u8) bool {
+    std.Io.Dir.cwd().access(b.graph.io, path, .{}) catch return false;
+    return true;
 }
 
 fn detectBuildZigLibDir(b: *std.Build) []const u8 {

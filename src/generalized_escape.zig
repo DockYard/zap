@@ -130,7 +130,7 @@ pub const GeneralizedEscapeAnalyzer = struct {
     pub fn setFunctionSummaries(self: *GeneralizedEscapeAnalyzer, summaries: *const std.AutoHashMap(ir.FunctionId, lattice.FunctionSummary)) !void {
         var it = summaries.iterator();
         while (it.next()) |entry| {
-            try self.ctx.function_summaries.put(entry.key_ptr.*, entry.value_ptr.*);
+            try self.ctx.putFunctionSummaryClone(entry.key_ptr.*, entry.value_ptr.*);
         }
     }
 

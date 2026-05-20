@@ -33,10 +33,10 @@ pub struct Bool {
     """
 
   pub fn negate(true) -> Bool {
-    true
+    false
   }
 
   pub fn negate(false) -> Bool {
-    false
+    true
   }
 }

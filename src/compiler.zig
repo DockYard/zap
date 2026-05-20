@@ -14,6 +14,7 @@ const ast = zap.ast;
 const runtime_source = @embedFile("runtime.zig");
 const lexer = @import("lexer.zig");
 const progress_mod = @import("progress.zig");
+const frontend_policy = @import("frontend_policy.zig");
 
 /// Per-stage timing diagnostic. Gated by `ZAP_PROFILE`: production builds
 /// stay quiet, but `ZAP_PROFILE=1 zap test` (or any compile-driving
@@ -66,6 +67,164 @@ fn profilingEnabled() bool {
     return Cache.enabled;
 }
 
+/// True when verbose incremental-cache tracing is enabled. This is separate
+/// from `ZAP_PROFILE`: profiling answers "how long?", while this trace answers
+/// "why was this node rebuilt?" The alternate spelling keeps older local
+/// scripts usable while standardizing new docs on `ZAP_INCREMENTAL_TRACE`.
+var incremental_trace_enabled_override: ?bool = null;
+
+pub fn setIncrementalTraceEnabledOverride(enabled: ?bool) void {
+    incremental_trace_enabled_override = enabled;
+}
+
+fn incrementalTraceEnabled() bool {
+    const Cache = struct {
+        var inited: bool = false;
+        var enabled: bool = false;
+    };
+    if (incremental_trace_enabled_override) |enabled| return enabled;
+    if (Cache.inited) return Cache.enabled;
+    Cache.enabled = std.c.getenv("ZAP_INCREMENTAL_TRACE") != null or
+        std.c.getenv("ZAP_TRACE_INCREMENTAL") != null;
+    Cache.inited = true;
+    return Cache.enabled;
+}
+
+fn incrementalTrace(comptime format: []const u8, args: anytype) void {
+    if (!incrementalTraceEnabled()) return;
+    std.debug.print("\n[incremental trace] " ++ format ++ "\n", args);
+}
+
+fn tracePackageKey(key: zap.incremental_graph.PackageKey) void {
+    std.debug.print("package={s} root={s}", .{ key.name, key.root_identity });
+    if (key.version) |version| std.debug.print(" version={s}", .{version});
+}
+
+fn traceDeclarationOwnerKey(key: zap.incremental_graph.DeclarationOwnerKey) void {
+    std.debug.print("owner_kind={s} ", .{@tagName(key.kind)});
+    tracePackageKey(key.package);
+    std.debug.print(" owner={s}", .{key.qualified_name});
+}
+
+fn traceIncrementalNodeKeyFields(key: zap.incremental_graph.NodeKey) void {
+    switch (key) {
+        .source_file => |value| {
+            tracePackageKey(value.package);
+            std.debug.print(" path={s}", .{value.path});
+        },
+        .package_surface => |value| tracePackageKey(value),
+        .struct_surface => |value| {
+            tracePackageKey(value.package);
+            std.debug.print(" struct={s}", .{value.qualified_name});
+        },
+        .macro_provider => |value| {
+            traceDeclarationOwnerKey(value.owner);
+            std.debug.print(" macro={s}/{d}", .{ value.local_name, value.arity });
+        },
+        .function_signature, .function_body => |value| {
+            traceDeclarationOwnerKey(value.owner);
+            std.debug.print(
+                " function={s}/{d} clause={d} declaration_kind={s}",
+                .{ value.local_name, value.arity, value.clause_index, @tagName(value.declaration_kind) },
+            );
+        },
+        .type_layout => |value| {
+            tracePackageKey(value.package);
+            std.debug.print(" type={s}", .{value.qualified_name});
+        },
+        .protocol => |value| {
+            tracePackageKey(value.package);
+            std.debug.print(" protocol={s}", .{value.qualified_name});
+        },
+        .impl => |value| {
+            tracePackageKey(value.package);
+            std.debug.print(
+                " module={s} protocol={s} target={s}",
+                .{ value.module_path, value.protocol_qualified_name, value.target_type_identity },
+            );
+        },
+        .ctfe_file => |value| {
+            tracePackageKey(value.package);
+            std.debug.print(" path={s}", .{value.path});
+        },
+        .ctfe_env => |value| {
+            tracePackageKey(value.package);
+            std.debug.print(" env={s}", .{value.name});
+        },
+        .ctfe_glob => |value| {
+            tracePackageKey(value.package);
+            std.debug.print(" pattern={s} recursive={}", .{ value.pattern, value.recursive });
+        },
+        .ctfe_reflection => |value| {
+            tracePackageKey(value.package);
+            std.debug.print(" query={s}", .{value.query_identity});
+        },
+        .backend_artifact => |value| {
+            tracePackageKey(value.package);
+            std.debug.print(" target={s} artifact={s}", .{ value.target_identity, value.artifact_identity });
+        },
+        .backend_module => |value| {
+            tracePackageKey(value.package);
+            std.debug.print(" module={s}", .{value.module_identity});
+        },
+    }
+}
+
+fn traceIncrementalGraphNode(
+    comptime label: []const u8,
+    graph: *const zap.incremental_graph.Graph,
+    node_id: zap.incremental_graph.NodeId,
+) void {
+    if (!incrementalTraceEnabled()) return;
+    const node_key = graph.nodeKey(node_id) orelse {
+        std.debug.print(
+            "\n[incremental trace] {s} id={d} kind=unknown reason=missing-node-record\n",
+            .{ label, @intFromEnum(node_id) },
+        );
+        return;
+    };
+    std.debug.print(
+        "\n[incremental trace] {s} id={d} kind={s} ",
+        .{ label, @intFromEnum(node_id), @tagName(node_key.kind()) },
+    );
+    traceIncrementalNodeKeyFields(node_key.*);
+    std.debug.print("\n", .{});
+}
+
+fn traceIncrementalGraphStep(
+    comptime label: []const u8,
+    graph: *const zap.incremental_graph.Graph,
+    step: zap.incremental_graph.AffectedStep,
+) void {
+    if (!incrementalTraceEnabled()) return;
+    const depender_key = graph.nodeKey(step.depender) orelse {
+        incrementalTrace(
+            "{s} reason={s} depender_id={d} dependee_id={d} error=missing-depender",
+            .{ label, @tagName(step.reason), @intFromEnum(step.depender), @intFromEnum(step.dependee) },
+        );
+        return;
+    };
+    const dependee_key = graph.nodeKey(step.dependee) orelse {
+        incrementalTrace(
+            "{s} reason={s} depender_id={d} dependee_id={d} error=missing-dependee",
+            .{ label, @tagName(step.reason), @intFromEnum(step.depender), @intFromEnum(step.dependee) },
+        );
+        return;
+    };
+
+    std.debug.print(
+        "\n[incremental trace] {s} reason={s} depender_id={d} depender_kind={s} ",
+        .{ label, @tagName(step.reason), @intFromEnum(step.depender), @tagName(depender_key.kind()) },
+    );
+    traceIncrementalNodeKeyFields(depender_key.*);
+    std.debug.print(
+        " dependee_id={d} dependee_kind={s} ",
+        .{ @intFromEnum(step.dependee), @tagName(dependee_key.kind()) },
+    );
+    traceIncrementalNodeKeyFields(dependee_key.*);
+    std.debug.print("\n", .{});
+}
+
 pub const CompileResult = struct {
     ir_program: ir.Program,
     analysis_context: ?zap.escape_lattice.AnalysisContext = null,
@@ -76,6 +235,16 @@ pub const CompileResult = struct {
     /// `return_source_locals` set without re-running the analysis.
     /// Empty when the IR program contains no ARC-managed locals.
     arc_ownership: ?zap.arc_liveness.ProgramArcOwnership = null,
+    /// Function ids whose current emitted ZIR should be considered dirty by
+    /// the persistent Zig backend. The frontend still uses its broader
+    /// invalidation set to keep Zap-level macro/type effects correct; this
+    /// narrower caller closure tells the backend which modules need Zig Sema
+    /// invalidation for a source edit.
+    incremental_backend_affected_function_ids: []const ir.FunctionId = &.{},
+    /// True when the incremental frontend could not prove final IR layout
+    /// stability. The caller must refresh every emitted backend module rather
+    /// than attempting a selected update.
+    incremental_backend_force_full: bool = false,
 };
 
 pub const CompileError = error{
@@ -88,7 +257,13 @@ pub const CompileError = error{
     IrFailed,
     OutOfMemory,
     ReadError,
+    IncrementalGraphDigestCollision,
+    UnknownIncrementalGraphNode,
 };
+
+pub const FrontendVerifierMode = frontend_policy.FrontendVerifierMode;
+pub const FrontendPassPolicy = frontend_policy.FrontendPassPolicy;
+pub const FrontendOptimizeMode = frontend_policy.FrontendOptimizeMode;
 
 pub const CompileOptions = struct {
     /// Show progress output to stderr.
@@ -100,6 +275,9 @@ pub const CompileOptions = struct {
     progress_context: []const u8 = "",
     /// lib mode — skip main function emission in ZIR.
     lib_mode: bool = false,
+    /// Selected frontend optimization policy. Debug skips optimization-only
+    /// frontend passes; release modes preserve the full pass set.
+    frontend_optimize_mode: FrontendOptimizeMode = .debug,
     /// Struct names in dependency order for CTFE evaluation.
     /// When set, computed attributes are evaluated per-struct in this order.
     struct_order: ?[]const []const u8 = null,
@@ -134,10 +312,12 @@ pub const CompileOptions = struct {
 };
 
 fn ctfeCompileOptionsHash(options: CompileOptions) u64 {
-    return if (options.ctfe_target != null or options.ctfe_optimize != null)
-        zap.ctfe.hashCompileOptions(options.ctfe_target orelse "", options.ctfe_optimize orelse "")
-    else
-        0;
+    var hasher = std.hash.Wyhash.init(0);
+    const base_hash = zap.ctfe.hashCompileOptions(options.ctfe_target orelse "", options.ctfe_optimize orelse "");
+    const frontend_policy_tag = options.frontend_optimize_mode.cacheTag();
+    hasher.update(std.mem.asBytes(&base_hash));
+    hasher.update(std.mem.asBytes(&frontend_policy_tag));
+    return hasher.final();
 }
 
 fn progressHeader(options: CompileOptions) void {
@@ -292,7 +472,8 @@ pub const SourceUnit = struct {
 pub const FrontendDependencyGraph = struct {
     file_to_structs: *const std.StringHashMap([]const []const u8),
     file_imported_by: *const std.StringHashMap([]const []const u8),
-    file_compile_after_globs: *const std.StringHashMap(void),
+    file_compile_after_globs: *const std.StringHashMap([]const []const u8),
+    file_compile_after_files: *const std.StringHashMap([]const []const u8),
 };
 
 pub const FrontendIncrementalState = struct {
@@ -303,6 +484,10 @@ pub const FrontendIncrementalState = struct {
     expanded_top_level: ?*CachedExpandedTopLevel = null,
     final_arena: ?std.heap.ArenaAllocator = null,
     final_program: ?ir.Program = null,
+    dependency_graph: zap.incremental_graph.Graph,
+    inventory_fingerprints_arena: std.heap.ArenaAllocator,
+    compile_after_inventory_fingerprints: std.StringHashMap(zap.incremental_graph.DeclarationFingerprintSet),
+    policy_cache_tag: ?u64 = null,
     initialized: bool = false,
 
     const CachedParsedFile = struct {
@@ -312,6 +497,8 @@ pub const FrontendIncrementalState = struct {
         script_mode: bool,
         primary_struct_name: ?[]const u8,
         program: ast.Program,
+        declaration_fingerprints: ?zap.incremental_graph.DeclarationFingerprintSet = null,
+        reflection_fingerprints: ?zap.incremental_graph.DeclarationFingerprintSet = null,
 
         fn destroy(self: *CachedParsedFile, allocator: std.mem.Allocator) void {
             self.arena.deinit();
@@ -348,6 +535,9 @@ pub const FrontendIncrementalState = struct {
             .interner = ast.StringInterner.init(allocator),
             .parsed_files = std.StringHashMap(*CachedParsedFile).init(allocator),
             .expanded_structs = std.StringHashMap(*CachedExpandedStruct).init(allocator),
+            .dependency_graph = zap.incremental_graph.Graph.init(allocator),
+            .inventory_fingerprints_arena = std.heap.ArenaAllocator.init(allocator),
+            .compile_after_inventory_fingerprints = std.StringHashMap(zap.incremental_graph.DeclarationFingerprintSet).init(allocator),
         };
     }
 
@@ -366,7 +556,44 @@ pub const FrontendIncrementalState = struct {
         self.final_arena = null;
         self.final_program = null;
 
+        self.dependency_graph.deinit();
+        self.compile_after_inventory_fingerprints.deinit();
+        self.inventory_fingerprints_arena.deinit();
         self.interner.deinit();
+    }
+
+    fn clearCachedFrontendState(self: *FrontendIncrementalState) void {
+        var parsed_iter = self.parsed_files.iterator();
+        while (parsed_iter.next()) |entry| entry.value_ptr.*.destroy(self.allocator);
+        self.parsed_files.clearRetainingCapacity();
+
+        var expanded_iter = self.expanded_structs.iterator();
+        while (expanded_iter.next()) |entry| entry.value_ptr.*.destroy(self.allocator);
+        self.expanded_structs.clearRetainingCapacity();
+
+        if (self.expanded_top_level) |artifact| artifact.destroy(self.allocator);
+        self.expanded_top_level = null;
+
+        if (self.final_arena) |*arena| arena.deinit();
+        self.final_arena = null;
+        self.final_program = null;
+
+        self.dependency_graph.deinit();
+        self.dependency_graph = zap.incremental_graph.Graph.init(self.allocator);
+        self.compile_after_inventory_fingerprints.clearRetainingCapacity();
+        self.inventory_fingerprints_arena.deinit();
+        self.inventory_fingerprints_arena = std.heap.ArenaAllocator.init(self.allocator);
+        self.interner.deinit();
+        self.interner = ast.StringInterner.init(self.allocator);
+        self.initialized = false;
+    }
+
+    fn ensurePolicyCacheTag(self: *FrontendIncrementalState, policy_cache_tag: u64) void {
+        if (self.policy_cache_tag) |current_tag| {
+            if (current_tag == policy_cache_tag) return;
+            self.clearCachedFrontendState();
+        }
+        self.policy_cache_tag = policy_cache_tag;
     }
 
     pub fn prepare(
@@ -376,6 +603,8 @@ pub const FrontendIncrementalState = struct {
         graph: FrontendDependencyGraph,
         options: CompileOptions,
     ) CompileError!FrontendIncrementalPrepared {
+        self.ensurePolicyCacheTag(options.frontend_optimize_mode.cacheTag());
+
         var diag_engine = zap.DiagnosticEngine.init(alloc);
         diag_engine.use_color = zap.diagnostics.detectColor();
         setDiagnosticSources(&diag_engine, source_units);
@@ -389,6 +618,9 @@ pub const FrontendIncrementalState = struct {
         errdefer destroyCachedParsedFiles(self.allocator, new_parsed_files.items);
 
         const parsed_programs = try alloc.alloc(ast.Program, source_units.len);
+        const parsed_fingerprint_sets = try alloc.alloc(?zap.incremental_graph.DeclarationFingerprintSet, source_units.len);
+        const reflection_fingerprint_sets = try alloc.alloc(?zap.incremental_graph.DeclarationFingerprintSet, source_units.len);
+        var changed_declaration_fingerprints: std.ArrayListUnmanaged(FrontendChangedFileFingerprints) = .empty;
         for (source_units, 0..) |unit, source_index| {
             const current_hash = hashSourceBytes(unit.source);
             const cached = self.parsed_files.get(unit.file_path);
@@ -398,14 +630,28 @@ pub const FrontendIncrementalState = struct {
                     optionalStringEql(entry.primary_struct_name, unit.primary_struct_name))
                 {
                     parsed_programs[source_index] = entry.program;
+                    parsed_fingerprint_sets[source_index] = entry.declaration_fingerprints;
+                    reflection_fingerprint_sets[source_index] = entry.reflection_fingerprints;
                     continue;
                 }
             }
 
-            try changed_files.append(alloc, unit.file_path);
+            try appendUniqueFilePath(alloc, &changed_files, unit.file_path);
             const parsed = try self.parseSourceUnit(unit, source_units, source_index, current_hash, alloc, &diag_engine);
             try new_parsed_files.append(alloc, parsed);
             parsed_programs[source_index] = parsed.program;
+            parsed_fingerprint_sets[source_index] = parsed.declaration_fingerprints;
+            reflection_fingerprint_sets[source_index] = parsed.reflection_fingerprints;
+            try changed_declaration_fingerprints.append(alloc, .{
+                .file_path = unit.file_path,
+                .previous = if (cached) |entry| entry.declaration_fingerprints else null,
+                .current = parsed.declaration_fingerprints,
+            });
+            try changed_declaration_fingerprints.append(alloc, .{
+                .file_path = unit.file_path,
+                .previous = if (cached) |entry| entry.reflection_fingerprints else null,
+                .current = parsed.reflection_fingerprints,
+            });
         }
 
         if (diag_engine.hasErrors()) {
@@ -414,14 +660,66 @@ pub const FrontendIncrementalState = struct {
             return error.ParseFailed;
         }
 
+        var new_dependency_graph = try buildFrontendIncrementalGraph(self.allocator, source_units, graph);
+        errdefer new_dependency_graph.deinit();
+        try augmentFrontendGraphWithDeclarationFingerprints(&new_dependency_graph, parsed_fingerprint_sets);
+        try augmentFrontendGraphWithDeclarationFingerprints(&new_dependency_graph, reflection_fingerprint_sets);
+
+        var new_inventory_arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer new_inventory_arena.deinit();
+        var new_compile_after_inventory_fingerprints = std.StringHashMap(zap.incremental_graph.DeclarationFingerprintSet).init(self.allocator);
+        errdefer new_compile_after_inventory_fingerprints.deinit();
+        try buildCompileAfterInventoryFingerprints(
+            new_inventory_arena.allocator(),
+            graph,
+            &new_compile_after_inventory_fingerprints,
+        );
+        try appendCompileAfterInventoryFingerprintChanges(
+            alloc,
+            graph,
+            &self.compile_after_inventory_fingerprints,
+            &new_compile_after_inventory_fingerprints,
+            &changed_files,
+            &changed_declaration_fingerprints,
+        );
+        try augmentFrontendGraphWithInventoryFingerprints(&new_dependency_graph, &new_compile_after_inventory_fingerprints);
+
         var invalidated_structs = std.StringHashMap(void).init(alloc);
+        var changed_declaration_structs = std.StringHashMap(void).init(alloc);
+        var changed_graph_roots: std.ArrayListUnmanaged(zap.incremental_graph.NodeId) = .empty;
         try self.computeInvalidatedStructs(
             alloc,
             source_units,
             graph,
+            &new_dependency_graph,
             changed_files.items,
+            changed_declaration_fingerprints.items,
+            &invalidated_structs,
+            &changed_declaration_structs,
+            &changed_graph_roots,
+        );
+        const invalidated_struct_names = try invalidatedStructNamesInSourceOrder(
+            alloc,
+            source_units,
+            graph,
             &invalidated_structs,
         );
+        const changed_struct_names = try structNamesForFilesInSourceOrder(
+            alloc,
+            source_units,
+            graph,
+            changed_files.items,
+        );
+        incrementalTrace(
+            "frontend-invalidated changed_structs={d} invalidated_structs={d}",
+            .{ changed_struct_names.len, invalidated_struct_names.len },
+        );
+        for (changed_struct_names) |struct_name| {
+            incrementalTrace("changed-struct struct={s}", .{struct_name});
+        }
+        for (invalidated_struct_names) |struct_name| {
+            incrementalTrace("invalidated-struct-order struct={s}", .{struct_name});
+        }
 
         var new_expanded_structs: std.ArrayListUnmanaged(*CachedExpandedStruct) = .empty;
         errdefer destroyCachedExpandedStructs(self.allocator, new_expanded_structs.items);
@@ -431,6 +729,7 @@ pub const FrontendIncrementalState = struct {
         var expansion_cache = ExpansionCacheWork{
             .state = self,
             .invalidated_structs = &invalidated_structs,
+            .changed_declaration_structs = &changed_declaration_structs,
             .new_expanded_structs = &new_expanded_structs,
             .new_expanded_top_level = &new_expanded_top_level,
         };
@@ -463,6 +762,10 @@ pub const FrontendIncrementalState = struct {
             options,
             self.final_program,
             &invalidated_structs,
+            &changed_declaration_structs,
+            changed_graph_roots.items,
+            changed_struct_names,
+            &new_dependency_graph,
         );
 
         var final_arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -472,13 +775,36 @@ pub const FrontendIncrementalState = struct {
         return .{
             .state = self,
             .result = result,
+            .invalidated_struct_names = invalidated_struct_names,
+            .changed_struct_names = changed_struct_names,
+            .changed_graph_roots = try changed_graph_roots.toOwnedSlice(alloc),
             .new_parsed_files = try new_parsed_files.toOwnedSlice(alloc),
             .new_expanded_structs = try new_expanded_structs.toOwnedSlice(alloc),
             .new_expanded_top_level = new_expanded_top_level,
             .clear_expanded_top_level = !expansion_cache.has_unassigned_top_level_items,
             .new_final_arena = final_arena,
             .new_final_program = final_program,
+            .new_dependency_graph = new_dependency_graph,
+            .new_inventory_arena = new_inventory_arena,
+            .new_compile_after_inventory_fingerprints = new_compile_after_inventory_fingerprints,
         };
+    }
+
+    pub fn dependencyGraphNodeCount(self: *const FrontendIncrementalState) usize {
+        return self.dependency_graph.nodeCount();
+    }
+
+    pub fn dependencyGraphSourceFileNode(self: *const FrontendIncrementalState, file_path: []const u8) !?zap.incremental_graph.NodeId {
+        return self.dependency_graph.getNode(frontendSourceFileNodeKey(file_path));
+    }
+
+    pub fn dependencyGraphStructSurfaceNode(self: *const FrontendIncrementalState, struct_name: []const u8) !?zap.incremental_graph.NodeId {
+        return self.dependency_graph.getNode(frontendStructSurfaceNodeKey(struct_name));
+    }
+
+    pub fn dependencyGraphAffectedFromSourceFile(self: *const FrontendIncrementalState, allocator: std.mem.Allocator, file_path: []const u8) ![]zap.incremental_graph.NodeId {
+        const source_id = (try self.dependencyGraphSourceFileNode(file_path)) orelse return error.UnknownIncrementalGraphNode;
+        return self.dependency_graph.affectedFrom(allocator, &.{source_id});
     }
 
     fn parseSourceUnit(
@@ -498,6 +824,8 @@ pub const FrontendIncrementalState = struct {
             .script_mode = unit.script_mode,
             .primary_struct_name = null,
             .program = .{ .structs = &.{}, .top_items = &.{} },
+            .declaration_fingerprints = null,
+            .reflection_fingerprints = null,
         };
         errdefer artifact.destroy(self.allocator);
 
@@ -532,6 +860,28 @@ pub const FrontendIncrementalState = struct {
             }) catch {};
         }
 
+        artifact.declaration_fingerprints = computeFrontendDeclarationFingerprints(
+            artifact_alloc,
+            artifact.program,
+            unit.source,
+            @intCast(source_index),
+            &self.interner,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedDeclarationFingerprint => null,
+        };
+        artifact.reflection_fingerprints = computeFrontendReflectionFingerprints(
+            artifact_alloc,
+            artifact.program,
+            unit.source,
+            @intCast(source_index),
+            unit.file_path,
+            &self.interner,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedDeclarationFingerprint => null,
+        };
+
         return artifact;
     }
 
@@ -540,55 +890,218 @@ pub const FrontendIncrementalState = struct {
         alloc: std.mem.Allocator,
         source_units: []const SourceUnit,
         graph: FrontendDependencyGraph,
+        dependency_graph: *const zap.incremental_graph.Graph,
         changed_files: []const []const u8,
+        changed_declaration_fingerprints: []const FrontendChangedFileFingerprints,
         invalidated_structs: *std.StringHashMap(void),
+        changed_declaration_structs: *std.StringHashMap(void),
+        changed_graph_roots: *std.ArrayListUnmanaged(zap.incremental_graph.NodeId),
     ) CompileError!void {
+        incrementalTrace(
+            "frontend-prepare initialized={} changed_files={d} graph_nodes={d} graph_edges={d}",
+            .{ self.initialized, changed_files.len, dependency_graph.nodeCount(), dependency_graph.edgeCount() },
+        );
+        for (changed_files) |file_path| {
+            incrementalTrace("changed-file path={s}", .{file_path});
+        }
+
         if (!self.initialized) {
+            incrementalTrace("struct-invalidation scope=all reason=initial-build", .{});
             try addAllSourceStructs(alloc, source_units, graph, invalidated_structs);
             return;
         }
 
-        if (changed_files.len == 0) return;
+        if (changed_files.len == 0) {
+            incrementalTrace("struct-invalidation scope=none reason=no-source-changes", .{});
+            return;
+        }
 
-        var affected_files = std.StringHashMap(void).init(alloc);
-        var queue: std.ArrayListUnmanaged([]const u8) = .empty;
         for (changed_files) |file_path| {
-            if (mustInvalidateWholeFrontend(file_path, graph, true)) {
+            if (wholeFrontendInvalidationReason(file_path, graph, true)) |reason| {
+                incrementalTrace(
+                    "struct-invalidation scope=all reason={s} file={s}",
+                    .{ @tagName(reason), file_path },
+                );
                 try addAllSourceStructs(alloc, source_units, graph, invalidated_structs);
                 return;
             }
-            try queue.append(alloc, file_path);
-            try affected_files.put(file_path, {});
         }
 
-        var cursor: usize = 0;
-        while (cursor < queue.items.len) : (cursor += 1) {
-            const file_path = queue.items[cursor];
-            if (graph.file_imported_by.get(file_path)) |dependents| {
-                for (dependents) |dependent_file| {
-                    if (affected_files.contains(dependent_file)) continue;
-                    if (mustInvalidateWholeFrontend(dependent_file, graph, false)) {
-                        try addAllSourceStructs(alloc, source_units, graph, invalidated_structs);
-                        return;
+        if (try transitiveDependentWholeFrontendInvalidation(alloc, graph, changed_files)) |hit| {
+            incrementalTrace(
+                "struct-invalidation scope=all reason=transitive-dependent-{s} file={s}",
+                .{ @tagName(hit.reason), hit.file_path },
+            );
+            try addAllSourceStructs(alloc, source_units, graph, invalidated_structs);
+            return;
+        }
+
+        if (allChangedFilesHaveFingerprintBatch(changed_files, changed_declaration_fingerprints)) {
+            var precise_roots: std.ArrayListUnmanaged(zap.incremental_graph.NodeId) = .empty;
+            defer precise_roots.deinit(alloc);
+            var precise_rebuild_structs = std.StringHashMap(void).init(alloc);
+            defer precise_rebuild_structs.deinit();
+            var precise_struct_surfaces = std.StringHashMap(void).init(alloc);
+            defer precise_struct_surfaces.deinit();
+            var fallback_source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer fallback_source_files.deinit(alloc);
+
+            for (changed_declaration_fingerprints) |file_fingerprints| {
+                var selection = try zap.incremental_graph.selectChangedDeclarationRoots(
+                    alloc,
+                    dependency_graph,
+                    file_fingerprints.previous,
+                    file_fingerprints.current,
+                );
+                defer selection.deinit(alloc);
+
+                if (selection.fallback_reason) |reason| {
+                    incrementalTrace(
+                        "declaration-invalidation fallback reason={s} file={s}",
+                        .{ @tagName(reason), file_fingerprints.file_path },
+                    );
+                    try appendUniqueFilePath(alloc, &fallback_source_files, file_fingerprints.file_path);
+                    continue;
+                }
+
+                for (selection.roots) |root_id| {
+                    try appendUniqueNodeId(alloc, &precise_roots, root_id);
+                    const root_key = dependency_graph.nodeKey(root_id) orelse {
+                        incrementalTrace(
+                            "declaration-invalidation fallback reason=missing-root-node id={d}",
+                            .{@intFromEnum(root_id)},
+                        );
+                        try appendUniqueFilePath(alloc, &fallback_source_files, file_fingerprints.file_path);
+                        break;
+                    };
+                    try addChangedDeclarationStructForNode(alloc, root_key.*, &precise_rebuild_structs);
+                    if (root_key.kind() == .struct_surface) {
+                        try precise_struct_surfaces.put(root_key.struct_surface.qualified_name, {});
                     }
-                    try affected_files.put(dependent_file, {});
-                    try queue.append(alloc, dependent_file);
+                    traceIncrementalGraphNode("changed-declaration-root", dependency_graph, root_id);
                 }
             }
+
+            if (precise_roots.items.len > 0 or fallback_source_files.items.len > 0) {
+                try copyStringSet(&precise_rebuild_structs, changed_declaration_structs);
+                var surface_iter = precise_struct_surfaces.iterator();
+                while (surface_iter.next()) |entry| {
+                    try invalidated_structs.put(entry.key_ptr.*, {});
+                    incrementalTrace(
+                        "invalidated-struct source=changed-root struct={s}",
+                        .{entry.key_ptr.*},
+                    );
+                }
+
+                if (precise_roots.items.len > 0) {
+                    const affected_nodes = try dependency_graph.affectedFrom(alloc, precise_roots.items);
+                    defer alloc.free(affected_nodes);
+                    if (incrementalTraceEnabled()) {
+                        const affected_steps = try dependency_graph.affectedTraceFrom(alloc, precise_roots.items);
+                        defer alloc.free(affected_steps);
+                        for (affected_steps) |step| {
+                            traceIncrementalGraphStep("affected-edge", dependency_graph, step);
+                        }
+                    }
+                    incrementalTrace(
+                        "graph-reachability declaration_roots={d} affected_nodes={d}",
+                        .{ precise_roots.items.len, affected_nodes.len },
+                    );
+
+                    for (affected_nodes) |node_id| {
+                        traceIncrementalGraphNode("affected-node", dependency_graph, node_id);
+                        const node_key = dependency_graph.nodeKey(node_id) orelse {
+                            incrementalTrace(
+                                "struct-invalidation scope=all reason=missing-affected-node id={d}",
+                                .{@intFromEnum(node_id)},
+                            );
+                            try addAllSourceStructs(alloc, source_units, graph, invalidated_structs);
+                            return;
+                        };
+                        switch (node_key.*) {
+                            .struct_surface => |struct_key| {
+                                try invalidated_structs.put(struct_key.qualified_name, {});
+                                incrementalTrace(
+                                    "invalidated-struct source=graph struct={s}",
+                                    .{struct_key.qualified_name},
+                                );
+                            },
+                            else => {},
+                        }
+                    }
+                }
+
+                if (fallback_source_files.items.len > 0) {
+                    try addSourceGraphInvalidations(
+                        alloc,
+                        source_units,
+                        graph,
+                        dependency_graph,
+                        fallback_source_files.items,
+                        invalidated_structs,
+                    );
+                }
+
+                for (precise_roots.items) |root_id| {
+                    try changed_graph_roots.append(alloc, root_id);
+                }
+                return;
+            }
+        } else {
+            incrementalTrace(
+                "declaration-invalidation fallback reason=missing-changed-fingerprint-batch changed_files={d} fingerprints={d}",
+                .{ changed_files.len, changed_declaration_fingerprints.len },
+            );
         }
 
-        var affected_iter = affected_files.iterator();
-        while (affected_iter.next()) |entry| {
-            const structs = graph.file_to_structs.get(entry.key_ptr.*) orelse {
+        var changed_source_ids: std.ArrayListUnmanaged(zap.incremental_graph.NodeId) = .empty;
+        defer changed_source_ids.deinit(alloc);
+        for (changed_files) |file_path| {
+            const source_id = (try dependency_graph.getNode(frontendSourceFileNodeKey(file_path))) orelse {
+                incrementalTrace(
+                    "struct-invalidation scope=all reason=missing-source-node file={s}",
+                    .{file_path},
+                );
                 try addAllSourceStructs(alloc, source_units, graph, invalidated_structs);
                 return;
             };
-            if (structs.len == 0) {
+            try changed_source_ids.append(alloc, source_id);
+            traceIncrementalGraphNode("changed-source-node", dependency_graph, source_id);
+        }
+
+        const affected_nodes = try dependency_graph.affectedFrom(alloc, changed_source_ids.items);
+        defer alloc.free(affected_nodes);
+        if (incrementalTraceEnabled()) {
+            const affected_steps = try dependency_graph.affectedTraceFrom(alloc, changed_source_ids.items);
+            defer alloc.free(affected_steps);
+            for (affected_steps) |step| {
+                traceIncrementalGraphStep("affected-edge", dependency_graph, step);
+            }
+        }
+        incrementalTrace(
+            "graph-reachability source_nodes={d} affected_nodes={d}",
+            .{ changed_source_ids.items.len, affected_nodes.len },
+        );
+
+        for (affected_nodes) |node_id| {
+            traceIncrementalGraphNode("affected-node", dependency_graph, node_id);
+            const node_key = dependency_graph.nodeKey(node_id) orelse {
+                incrementalTrace(
+                    "struct-invalidation scope=all reason=missing-affected-node id={d}",
+                    .{@intFromEnum(node_id)},
+                );
                 try addAllSourceStructs(alloc, source_units, graph, invalidated_structs);
                 return;
-            }
-            for (structs) |struct_name| {
-                try invalidated_structs.put(struct_name, {});
+            };
+            switch (node_key.*) {
+                .struct_surface => |struct_key| {
+                    try invalidated_structs.put(struct_key.qualified_name, {});
+                    incrementalTrace(
+                        "invalidated-struct source=graph struct={s}",
+                        .{struct_key.qualified_name},
+                    );
+                },
+                else => {},
             }
         }
     }
@@ -597,12 +1110,18 @@ pub const FrontendIncrementalState = struct {
 pub const FrontendIncrementalPrepared = struct {
     state: *FrontendIncrementalState,
     result: CompileResult,
+    invalidated_struct_names: []const []const u8,
+    changed_struct_names: []const []const u8,
+    changed_graph_roots: []const zap.incremental_graph.NodeId,
     new_parsed_files: []const *FrontendIncrementalState.CachedParsedFile,
     new_expanded_structs: []const *FrontendIncrementalState.CachedExpandedStruct,
     new_expanded_top_level: ?*FrontendIncrementalState.CachedExpandedTopLevel,
     clear_expanded_top_level: bool,
     new_final_arena: std.heap.ArenaAllocator,
     new_final_program: ir.Program,
+    new_dependency_graph: zap.incremental_graph.Graph,
+    new_inventory_arena: std.heap.ArenaAllocator,
+    new_compile_after_inventory_fingerprints: std.StringHashMap(zap.incremental_graph.DeclarationFingerprintSet),
     committed: bool = false,
 
     pub fn commit(self: *FrontendIncrementalPrepared) !void {
@@ -635,6 +1154,12 @@ pub const FrontendIncrementalPrepared = struct {
         self.state.final_arena = self.new_final_arena;
         self.state.final_program = self.new_final_program;
 
+        self.state.dependency_graph.deinit();
+        self.state.dependency_graph = self.new_dependency_graph;
+        self.state.compile_after_inventory_fingerprints.deinit();
+        self.state.inventory_fingerprints_arena.deinit();
+        self.state.inventory_fingerprints_arena = self.new_inventory_arena;
+        self.state.compile_after_inventory_fingerprints = self.new_compile_after_inventory_fingerprints;
         self.state.initialized = true;
         self.committed = true;
     }
@@ -645,12 +1170,22 @@ pub const FrontendIncrementalPrepared = struct {
         destroyCachedExpandedStructs(self.state.allocator, self.new_expanded_structs);
         if (self.new_expanded_top_level) |expanded_top_level| expanded_top_level.destroy(self.state.allocator);
         self.new_final_arena.deinit();
+        self.new_dependency_graph.deinit();
+        self.new_compile_after_inventory_fingerprints.deinit();
+        self.new_inventory_arena.deinit();
     }
+};
+
+const FrontendChangedFileFingerprints = struct {
+    file_path: []const u8,
+    previous: ?zap.incremental_graph.DeclarationFingerprintSet,
+    current: ?zap.incremental_graph.DeclarationFingerprintSet,
 };
 
 const ExpansionCacheWork = struct {
     state: *FrontendIncrementalState,
     invalidated_structs: *const std.StringHashMap(void),
+    changed_declaration_structs: *const std.StringHashMap(void),
     new_expanded_structs: *std.ArrayListUnmanaged(*FrontendIncrementalState.CachedExpandedStruct),
     new_expanded_top_level: *?*FrontendIncrementalState.CachedExpandedTopLevel,
     has_unassigned_top_level_items: bool = false,
@@ -681,26 +1216,1277 @@ fn hashSourceBytes(source: []const u8) u64 {
     return hasher.final();
 }
 
+const FrontendFingerprintBuildError = std.mem.Allocator.Error || error{
+    UnsupportedDeclarationFingerprint,
+};
+
+fn computeFrontendDeclarationFingerprints(
+    alloc: std.mem.Allocator,
+    program: ast.Program,
+    source: []const u8,
+    source_id: u32,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!zap.incremental_graph.DeclarationFingerprintSet {
+    var records: std.ArrayListUnmanaged(zap.incremental_graph.DeclarationFingerprint) = .empty;
+    errdefer records.deinit(alloc);
+
+    for (program.structs) |*struct_decl| {
+        const struct_name = try structNameToOwnedString(alloc, struct_decl.name, interner);
+        const struct_key = zap.incremental_graph.NodeKey{ .struct_surface = .{
+            .package = frontendPackageKey(),
+            .qualified_name = struct_name,
+        } };
+        try records.append(alloc, .{
+            .key = struct_key,
+            .kind = .struct_surface,
+            .digest = try fingerprintStructSurface(struct_decl, source, source_id, interner),
+        });
+
+        const owner = zap.incremental_graph.DeclarationOwnerKey{
+            .package = frontendPackageKey(),
+            .kind = .@"struct",
+            .qualified_name = struct_name,
+        };
+        try appendStructFunctionDeclarationFingerprints(alloc, &records, struct_decl, owner, source, source_id, interner);
+    }
+
+    var top_function_groups: FunctionFingerprintGroups = .{};
+    defer top_function_groups.deinit(alloc);
+
+    for (program.top_items) |item| {
+        switch (item) {
+            .function => |function_decl| try top_function_groups.append(
+                alloc,
+                function_decl,
+                frontendPackageOwnerKey(),
+                .free,
+                source,
+                source_id,
+                interner,
+            ),
+            .priv_function => |function_decl| try top_function_groups.append(
+                alloc,
+                function_decl,
+                frontendPackageOwnerKey(),
+                .free,
+                source,
+                source_id,
+                interner,
+            ),
+            .impl_decl => |impl_decl| try appendImplFunctionDeclarationFingerprints(
+                alloc,
+                &records,
+                impl_decl,
+                source,
+                source_id,
+                interner,
+            ),
+            .priv_impl_decl => |impl_decl| try appendImplFunctionDeclarationFingerprints(
+                alloc,
+                &records,
+                impl_decl,
+                source,
+                source_id,
+                interner,
+            ),
+            else => {},
+        }
+    }
+    try top_function_groups.appendRecords(alloc, &records);
+
+    return .{
+        .root_glue = null,
+        .records = try records.toOwnedSlice(alloc),
+    };
+}
+
+fn computeFrontendReflectionFingerprints(
+    alloc: std.mem.Allocator,
+    program: ast.Program,
+    source: []const u8,
+    source_id: u32,
+    file_path: []const u8,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!zap.incremental_graph.DeclarationFingerprintSet {
+    var records: std.ArrayListUnmanaged(zap.incremental_graph.DeclarationFingerprint) = .empty;
+    errdefer records.deinit(alloc);
+
+    for (program.structs) |*struct_decl| {
+        const struct_name = try structNameToOwnedString(alloc, struct_decl.name, interner);
+        try records.append(alloc, .{
+            .key = frontendStructReflectionNodeKey(struct_name),
+            .kind = .ctfe_reflection,
+            .digest = try fingerprintReflectedMetadata(alloc, program, struct_decl, source, source_id, file_path, interner),
+        });
+    }
+
+    return .{
+        .root_glue = null,
+        .records = try records.toOwnedSlice(alloc),
+    };
+}
+
+fn appendStructFunctionDeclarationFingerprints(
+    alloc: std.mem.Allocator,
+    records: *std.ArrayListUnmanaged(zap.incremental_graph.DeclarationFingerprint),
+    struct_decl: *const ast.StructDecl,
+    owner: zap.incremental_graph.DeclarationOwnerKey,
+    source: []const u8,
+    source_id: u32,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!void {
+    var groups: FunctionFingerprintGroups = .{};
+    defer groups.deinit(alloc);
+
+    for (struct_decl.items) |item| {
+        switch (item) {
+            .function => |function_decl| try groups.append(
+                alloc,
+                function_decl,
+                owner,
+                .struct_method,
+                source,
+                source_id,
+                interner,
+            ),
+            .priv_function => |function_decl| try groups.append(
+                alloc,
+                function_decl,
+                owner,
+                .struct_method,
+                source,
+                source_id,
+                interner,
+            ),
+            else => {},
+        }
+    }
+
+    try groups.appendRecords(alloc, records);
+}
+
+fn appendImplFunctionDeclarationFingerprints(
+    alloc: std.mem.Allocator,
+    records: *std.ArrayListUnmanaged(zap.incremental_graph.DeclarationFingerprint),
+    impl_decl: *const ast.ImplDecl,
+    source: []const u8,
+    source_id: u32,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!void {
+    const target_name = try structNameToOwnedString(alloc, impl_decl.target_type, interner);
+    const owner = zap.incremental_graph.DeclarationOwnerKey{
+        .package = frontendPackageKey(),
+        .kind = .@"struct",
+        .qualified_name = target_name,
+    };
+
+    var groups: FunctionFingerprintGroups = .{};
+    defer groups.deinit(alloc);
+
+    for (impl_decl.functions) |function_decl| {
+        try groups.append(
+            alloc,
+            function_decl,
+            owner,
+            .struct_method,
+            source,
+            source_id,
+            interner,
+        );
+    }
+
+    try groups.appendRecords(alloc, records);
+}
+
+const FunctionFingerprintGroup = struct {
+    key: zap.incremental_graph.FunctionKey,
+    signature_hasher: zap.incremental_graph.StableHasher,
+    body_hasher: zap.incremental_graph.StableHasher,
+    declaration_count: u64 = 0,
+    clause_count: u64 = 0,
+
+    fn init(key: zap.incremental_graph.FunctionKey) FunctionFingerprintGroup {
+        var signature_hasher = zap.incremental_graph.StableHasher.init(.function_signature_fingerprint);
+        appendFunctionFingerprintGroupKey(&signature_hasher, key);
+        var body_hasher = zap.incremental_graph.StableHasher.init(.function_body_fingerprint);
+        appendFunctionFingerprintGroupKey(&body_hasher, key);
+        return .{
+            .key = key,
+            .signature_hasher = signature_hasher,
+            .body_hasher = body_hasher,
+        };
+    }
+
+    fn appendDeclaration(
+        self: *FunctionFingerprintGroup,
+        function_decl: *const ast.FunctionDecl,
+        source: []const u8,
+        source_id: u32,
+        interner: *const ast.StringInterner,
+    ) FrontendFingerprintBuildError!void {
+        self.declaration_count += 1;
+        self.signature_hasher.appendEnum(function_decl.visibility);
+        self.signature_hasher.appendBytes(interner.get(function_decl.name));
+        try appendOptionalExprSpan(&self.signature_hasher, function_decl.name_expr, source, source_id);
+        self.signature_hasher.appendInt(u64, function_decl.clauses.len);
+
+        self.body_hasher.appendInt(u64, function_decl.clauses.len);
+        for (function_decl.clauses) |clause| {
+            self.clause_count += 1;
+            self.signature_hasher.appendInt(u64, clause.params.len);
+            for (clause.params) |param| {
+                self.signature_hasher.appendEnum(param.ownership);
+                self.signature_hasher.appendBool(param.ownership_explicit);
+                try appendPatternSpan(&self.signature_hasher, param.pattern, source, source_id);
+                try appendOptionalTypeExprSpan(&self.signature_hasher, param.type_annotation, source, source_id);
+                try appendOptionalExprSpan(&self.signature_hasher, param.default, source, source_id);
+            }
+            try appendOptionalTypeExprSpan(&self.signature_hasher, clause.return_type, source, source_id);
+
+            try appendOptionalExprSpan(&self.body_hasher, clause.refinement, source, source_id);
+            if (clause.body) |statements| {
+                self.body_hasher.appendBool(true);
+                self.body_hasher.appendInt(u64, statements.len);
+                for (statements) |statement| {
+                    self.body_hasher.appendEnum(std.meta.activeTag(statement));
+                    try appendSourceSpan(&self.body_hasher, stmtSourceSpan(statement), source, source_id);
+                }
+            } else {
+                self.body_hasher.appendBool(false);
+            }
+        }
+    }
+
+    fn signatureDigest(self: *FunctionFingerprintGroup) zap.incremental_graph.StableDigest {
+        self.signature_hasher.appendInt(u64, self.declaration_count);
+        self.signature_hasher.appendInt(u64, self.clause_count);
+        return self.signature_hasher.final();
+    }
+
+    fn bodyDigest(self: *FunctionFingerprintGroup) zap.incremental_graph.StableDigest {
+        self.body_hasher.appendInt(u64, self.declaration_count);
+        self.body_hasher.appendInt(u64, self.clause_count);
+        return self.body_hasher.final();
+    }
+};
+
+const FunctionFingerprintGroups = struct {
+    items: std.ArrayListUnmanaged(FunctionFingerprintGroup) = .empty,
+
+    fn deinit(self: *FunctionFingerprintGroups, alloc: std.mem.Allocator) void {
+        self.items.deinit(alloc);
+    }
+
+    fn append(
+        self: *FunctionFingerprintGroups,
+        alloc: std.mem.Allocator,
+        function_decl: *const ast.FunctionDecl,
+        owner: zap.incremental_graph.DeclarationOwnerKey,
+        declaration_kind: zap.incremental_graph.FunctionDeclarationKind,
+        source: []const u8,
+        source_id: u32,
+        interner: *const ast.StringInterner,
+    ) FrontendFingerprintBuildError!void {
+        const function_key = try frontendAstFunctionKey(alloc, function_decl, owner, declaration_kind, interner);
+        const group = try self.getOrAppend(alloc, function_key);
+        try group.appendDeclaration(function_decl, source, source_id, interner);
+    }
+
+    fn appendRecords(
+        self: *FunctionFingerprintGroups,
+        alloc: std.mem.Allocator,
+        records: *std.ArrayListUnmanaged(zap.incremental_graph.DeclarationFingerprint),
+    ) !void {
+        for (self.items.items) |*group| {
+            try records.append(alloc, .{
+                .key = .{ .function_signature = group.key },
+                .kind = .function_signature,
+                .digest = group.signatureDigest(),
+            });
+            try records.append(alloc, .{
+                .key = .{ .function_body = group.key },
+                .kind = .function_body,
+                .digest = group.bodyDigest(),
+            });
+        }
+    }
+
+    fn getOrAppend(
+        self: *FunctionFingerprintGroups,
+        alloc: std.mem.Allocator,
+        function_key: zap.incremental_graph.FunctionKey,
+    ) !*FunctionFingerprintGroup {
+        for (self.items.items) |*group| {
+            if (zap.incremental_graph.FunctionKey.eql(group.key, function_key)) return group;
+        }
+        try self.items.append(alloc, FunctionFingerprintGroup.init(function_key));
+        return &self.items.items[self.items.items.len - 1];
+    }
+};
+
+fn appendFunctionFingerprintGroupKey(
+    hasher: *zap.incremental_graph.StableHasher,
+    key: zap.incremental_graph.FunctionKey,
+) void {
+    key.appendStableHash(hasher);
+}
+
+fn frontendPackageOwnerKey() zap.incremental_graph.DeclarationOwnerKey {
+    return .{
+        .package = frontendPackageKey(),
+        .kind = .package,
+        .qualified_name = "",
+    };
+}
+
+fn frontendAstFunctionKey(
+    alloc: std.mem.Allocator,
+    function_decl: *const ast.FunctionDecl,
+    owner: zap.incremental_graph.DeclarationOwnerKey,
+    declaration_kind: zap.incremental_graph.FunctionDeclarationKind,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!zap.incremental_graph.FunctionKey {
+    const arity = try functionDeclArity(function_decl);
+    const raw_name = interner.get(function_decl.name);
+    const mangled_name = try ir.mangleSymbolForZig(alloc, raw_name);
+    const local_name = try std.fmt.allocPrint(alloc, "{s}__{d}", .{ mangled_name, arity });
+    return .{
+        .owner = owner,
+        .declaration_kind = declaration_kind,
+        .local_name = local_name,
+        .arity = arity,
+        .clause_index = 0,
+        .specialization = null,
+    };
+}
+
+fn functionDeclArity(function_decl: *const ast.FunctionDecl) error{UnsupportedDeclarationFingerprint}!u16 {
+    if (function_decl.clauses.len == 0) return 0;
+    return std.math.cast(u16, function_decl.clauses[0].params.len) orelse error.UnsupportedDeclarationFingerprint;
+}
+
+fn fingerprintStructSurface(
+    struct_decl: *const ast.StructDecl,
+    source: []const u8,
+    source_id: u32,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!zap.incremental_graph.StableDigest {
+    var hasher = zap.incremental_graph.StableHasher.init(.struct_surface_fingerprint);
+    hasher.appendBool(struct_decl.is_private);
+    appendStructName(&hasher, struct_decl.name, interner);
+    hasher.appendBool(struct_decl.parent != null);
+    if (struct_decl.parent) |parent| hasher.appendBytes(interner.get(parent));
+
+    hasher.appendInt(u64, struct_decl.fields.len);
+    for (struct_decl.fields) |field| {
+        hasher.appendBytes(interner.get(field.name));
+        try appendTypeExprSpan(&hasher, field.type_expr, source, source_id);
+        try appendOptionalExprSpan(&hasher, field.default, source, source_id);
+    }
+
+    hasher.appendInt(u64, struct_decl.items.len);
+    for (struct_decl.items) |item| {
+        hasher.appendEnum(std.meta.activeTag(item));
+        switch (item) {
+            .function, .priv_function => |function_decl| try appendFunctionSurface(&hasher, function_decl, interner),
+            else => try appendSourceSpan(&hasher, structItemSourceSpan(item), source, source_id),
+        }
+    }
+
+    return hasher.final();
+}
+
+fn fingerprintFunctionSignature(
+    function_decl: *const ast.FunctionDecl,
+    source: []const u8,
+    source_id: u32,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!zap.incremental_graph.StableDigest {
+    var hasher = zap.incremental_graph.StableHasher.init(.function_signature_fingerprint);
+    hasher.appendEnum(function_decl.visibility);
+    hasher.appendBytes(interner.get(function_decl.name));
+    try appendOptionalExprSpan(&hasher, function_decl.name_expr, source, source_id);
+    hasher.appendInt(u64, function_decl.clauses.len);
+    for (function_decl.clauses) |clause| {
+        hasher.appendInt(u64, clause.params.len);
+        for (clause.params) |param| {
+            hasher.appendEnum(param.ownership);
+            hasher.appendBool(param.ownership_explicit);
+            try appendPatternSpan(&hasher, param.pattern, source, source_id);
+            try appendOptionalTypeExprSpan(&hasher, param.type_annotation, source, source_id);
+            try appendOptionalExprSpan(&hasher, param.default, source, source_id);
+        }
+        try appendOptionalTypeExprSpan(&hasher, clause.return_type, source, source_id);
+    }
+    return hasher.final();
+}
+
+fn fingerprintFunctionBody(
+    function_decl: *const ast.FunctionDecl,
+    source: []const u8,
+    source_id: u32,
+) FrontendFingerprintBuildError!zap.incremental_graph.StableDigest {
+    var hasher = zap.incremental_graph.StableHasher.init(.function_body_fingerprint);
+    hasher.appendInt(u64, function_decl.clauses.len);
+    for (function_decl.clauses) |clause| {
+        try appendOptionalExprSpan(&hasher, clause.refinement, source, source_id);
+        if (clause.body) |statements| {
+            hasher.appendBool(true);
+            hasher.appendInt(u64, statements.len);
+            for (statements) |statement| {
+                hasher.appendEnum(std.meta.activeTag(statement));
+                try appendSourceSpan(&hasher, stmtSourceSpan(statement), source, source_id);
+            }
+        } else {
+            hasher.appendBool(false);
+        }
+    }
+    return hasher.final();
+}
+
+fn fingerprintReflectedMetadata(
+    alloc: std.mem.Allocator,
+    program: ast.Program,
+    struct_decl: *const ast.StructDecl,
+    source: []const u8,
+    source_id: u32,
+    file_path: []const u8,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!zap.incremental_graph.StableDigest {
+    var hasher = zap.incremental_graph.StableHasher.init(.ctfe_reflection_fingerprint);
+    hasher.appendBytes("struct_surface");
+    hasher.appendDigest(try fingerprintStructSurface(struct_decl, source, source_id, interner));
+    try appendReflectedStructInfo(alloc, &hasher, program.top_items, struct_decl, source, source_id, file_path, interner);
+    try appendReflectedStructFunctions(alloc, &hasher, struct_decl, source, source_id, file_path, interner);
+    try appendReflectedStructMacros(alloc, &hasher, struct_decl, source, source_id, file_path, interner);
+    try appendReflectedNestedUnions(alloc, &hasher, struct_decl, file_path, interner);
+    try appendReflectedFileInventory(alloc, &hasher, program, file_path, interner);
+    return hasher.final();
+}
+
+fn appendReflectedStructInfo(
+    alloc: std.mem.Allocator,
+    hasher: *zap.incremental_graph.StableHasher,
+    top_items: []const ast.TopItem,
+    struct_decl: *const ast.StructDecl,
+    source: []const u8,
+    source_id: u32,
+    file_path: []const u8,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!void {
+    hasher.appendBytes("struct_info");
+    appendStructName(hasher, struct_decl.name, interner);
+    hasher.appendBytes(file_path);
+    hasher.appendBool(struct_decl.is_private);
+    _ = source;
+    _ = source_id;
+    try appendDocAttributeText(alloc, hasher, topLevelStructDocAttribute(top_items, struct_decl, interner), interner);
+    try appendDocAttributeText(alloc, hasher, trailingStructDocAttribute(struct_decl, interner), interner);
+}
+
+fn appendReflectedStructFunctions(
+    alloc: std.mem.Allocator,
+    hasher: *zap.incremental_graph.StableHasher,
+    struct_decl: *const ast.StructDecl,
+    source: []const u8,
+    source_id: u32,
+    file_path: []const u8,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!void {
+    hasher.appendBytes("struct_functions");
+    hasher.appendInt(u64, reflectedPublicFunctionCount(struct_decl));
+
+    var pending_doc: ?*const ast.AttributeDecl = null;
+    for (struct_decl.items) |item| {
+        switch (item) {
+            .attribute => |attribute| updatePendingDocAttribute(&pending_doc, attribute, interner),
+            .function => |function_decl| {
+                try appendReflectedCallable(alloc, hasher, "function", function_decl, pending_doc, source, source_id, file_path, interner);
+                pending_doc = null;
+            },
+            .priv_function => {
+                pending_doc = null;
+            },
+            .macro, .priv_macro => {
+                pending_doc = null;
+            },
+            else => {},
+        }
+    }
+}
+
+fn appendReflectedStructMacros(
+    alloc: std.mem.Allocator,
+    hasher: *zap.incremental_graph.StableHasher,
+    struct_decl: *const ast.StructDecl,
+    source: []const u8,
+    source_id: u32,
+    file_path: []const u8,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!void {
+    hasher.appendBytes("struct_macros");
+    hasher.appendInt(u64, reflectedPublicMacroCount(struct_decl, interner));
+
+    var pending_doc: ?*const ast.AttributeDecl = null;
+    for (struct_decl.items) |item| {
+        switch (item) {
+            .attribute => |attribute| updatePendingDocAttribute(&pending_doc, attribute, interner),
+            .macro => |macro_decl| {
+                const macro_name = interner.get(macro_decl.name);
+                if (!std.mem.startsWith(u8, macro_name, "__")) {
+                    try appendReflectedCallable(alloc, hasher, "macro", macro_decl, pending_doc, source, source_id, file_path, interner);
+                }
+                pending_doc = null;
+            },
+            .priv_macro => {
+                pending_doc = null;
+            },
+            .function, .priv_function => {
+                pending_doc = null;
+            },
+            else => {},
+        }
+    }
+}
+
+fn appendReflectedCallable(
+    alloc: std.mem.Allocator,
+    hasher: *zap.incremental_graph.StableHasher,
+    kind: []const u8,
+    function_decl: *const ast.FunctionDecl,
+    doc_attribute: ?*const ast.AttributeDecl,
+    source: []const u8,
+    source_id: u32,
+    file_path: []const u8,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!void {
+    hasher.appendBytes(kind);
+    hasher.appendBytes(interner.get(function_decl.name));
+    hasher.appendInt(u16, try functionDeclArity(function_decl));
+    hasher.appendEnum(function_decl.visibility);
+    try appendDocAttributeText(alloc, hasher, doc_attribute, interner);
+    hasher.appendBytes(file_path);
+    try appendSourceSpanLineNumber(hasher, function_decl.meta.span, source, source_id);
+    const signature_digest = try fingerprintFunctionSignature(function_decl, source, source_id, interner);
+    hasher.appendDigest(signature_digest);
+}
+
+fn appendReflectedNestedUnions(
+    alloc: std.mem.Allocator,
+    hasher: *zap.incremental_graph.StableHasher,
+    struct_decl: *const ast.StructDecl,
+    file_path: []const u8,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!void {
+    hasher.appendBytes("nested_unions");
+    hasher.appendInt(u64, reflectedNestedUnionCount(struct_decl));
+    for (struct_decl.items) |item| {
+        switch (item) {
+            .union_decl => |union_decl| try appendReflectedUnion(alloc, hasher, union_decl, null, file_path, interner),
+            else => {},
+        }
+    }
+}
+
+fn appendReflectedFileInventory(
+    alloc: std.mem.Allocator,
+    hasher: *zap.incremental_graph.StableHasher,
+    program: ast.Program,
+    file_path: []const u8,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!void {
+    hasher.appendBytes("source_graph_inventory");
+    hasher.appendBytes(file_path);
+    hasher.appendInt(u64, reflectedTopItemCount(program.top_items));
+
+    var pending_doc: ?*const ast.AttributeDecl = null;
+    for (program.top_items) |item| {
+        switch (item) {
+            .attribute => |attribute| updatePendingDocAttribute(&pending_doc, attribute, interner),
+            .struct_decl, .priv_struct_decl => |decl| {
+                hasher.appendBytes("source_graph_struct");
+                appendStructName(hasher, decl.name, interner);
+                hasher.appendBool(decl.is_private);
+                pending_doc = null;
+            },
+            .protocol, .priv_protocol => |decl| {
+                try appendReflectedProtocol(alloc, hasher, decl, pending_doc, file_path, interner);
+                pending_doc = null;
+            },
+            .union_decl => |decl| {
+                try appendReflectedUnion(alloc, hasher, decl, pending_doc, file_path, interner);
+                pending_doc = null;
+            },
+            .impl_decl, .priv_impl_decl => |decl| {
+                try appendReflectedImpl(alloc, hasher, decl, file_path, interner);
+                pending_doc = null;
+            },
+            .function, .priv_function, .macro, .priv_macro, .type_decl, .opaque_decl => {
+                pending_doc = null;
+            },
+        }
+    }
+}
+
+fn appendReflectedProtocol(
+    alloc: std.mem.Allocator,
+    hasher: *zap.incremental_graph.StableHasher,
+    protocol_decl: *const ast.ProtocolDecl,
+    doc_attribute: ?*const ast.AttributeDecl,
+    file_path: []const u8,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!void {
+    hasher.appendBytes("protocol");
+    appendStructName(hasher, protocol_decl.name, interner);
+    hasher.appendBytes(file_path);
+    hasher.appendBool(protocol_decl.is_private);
+    try appendDocAttributeText(alloc, hasher, doc_attribute, interner);
+    hasher.appendInt(u64, protocol_decl.type_params.len);
+    for (protocol_decl.type_params) |type_param| hasher.appendBytes(interner.get(type_param));
+    hasher.appendInt(u64, protocol_decl.functions.len);
+    for (protocol_decl.functions) |function_sig| {
+        hasher.appendBytes(interner.get(function_sig.name));
+        hasher.appendBytes(zap.signature.buildProtocolFunctionSignature(alloc, function_sig, interner));
+    }
+}
+
+fn appendReflectedUnion(
+    alloc: std.mem.Allocator,
+    hasher: *zap.incremental_graph.StableHasher,
+    union_decl: *const ast.UnionDecl,
+    doc_attribute: ?*const ast.AttributeDecl,
+    file_path: []const u8,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!void {
+    hasher.appendBytes("union");
+    hasher.appendBytes(interner.get(union_decl.name));
+    hasher.appendBytes(file_path);
+    hasher.appendBool(union_decl.is_private);
+    try appendDocAttributeText(alloc, hasher, doc_attribute, interner);
+    hasher.appendInt(u64, union_decl.variants.len);
+    for (union_decl.variants) |variant| {
+        hasher.appendBytes(interner.get(variant.name));
+        hasher.appendBytes(zap.signature.buildUnionVariantSignature(alloc, variant, interner));
+    }
+}
+
+fn appendReflectedImpl(
+    alloc: std.mem.Allocator,
+    hasher: *zap.incremental_graph.StableHasher,
+    impl_decl: *const ast.ImplDecl,
+    file_path: []const u8,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!void {
+    hasher.appendBytes("impl");
+    appendStructName(hasher, impl_decl.protocol_name, interner);
+    appendStructName(hasher, impl_decl.target_type, interner);
+    hasher.appendBytes(file_path);
+    hasher.appendBool(impl_decl.is_private);
+    hasher.appendInt(u64, impl_decl.type_params.len);
+    for (impl_decl.type_params) |type_param| hasher.appendBytes(interner.get(type_param));
+    hasher.appendInt(u64, impl_decl.protocol_type_args.len);
+    for (impl_decl.protocol_type_args) |type_arg| {
+        var buffer = zap.signature.Buffer.init(alloc);
+        zap.signature.appendTypeExpr(&buffer, type_arg, interner);
+        hasher.appendBytes(buffer.toSlice());
+    }
+}
+
+fn reflectedPublicFunctionCount(struct_decl: *const ast.StructDecl) u64 {
+    var count: u64 = 0;
+    for (struct_decl.items) |item| {
+        switch (item) {
+            .function => count += 1,
+            else => {},
+        }
+    }
+    return count;
+}
+
+fn reflectedPublicMacroCount(struct_decl: *const ast.StructDecl, interner: *const ast.StringInterner) u64 {
+    var count: u64 = 0;
+    for (struct_decl.items) |item| {
+        switch (item) {
+            .macro => |macro_decl| {
+                if (!std.mem.startsWith(u8, interner.get(macro_decl.name), "__")) count += 1;
+            },
+            else => {},
+        }
+    }
+    return count;
+}
+
+fn reflectedNestedUnionCount(struct_decl: *const ast.StructDecl) u64 {
+    var count: u64 = 0;
+    for (struct_decl.items) |item| {
+        switch (item) {
+            .union_decl => count += 1,
+            else => {},
+        }
+    }
+    return count;
+}
+
+fn reflectedTopItemCount(top_items: []const ast.TopItem) u64 {
+    var count: u64 = 0;
+    for (top_items) |item| {
+        switch (item) {
+            .struct_decl,
+            .priv_struct_decl,
+            .protocol,
+            .priv_protocol,
+            .union_decl,
+            .impl_decl,
+            .priv_impl_decl,
+            => count += 1,
+            else => {},
+        }
+    }
+    return count;
+}
+
+fn updatePendingDocAttribute(
+    pending_doc: *?*const ast.AttributeDecl,
+    attribute: *const ast.AttributeDecl,
+    interner: *const ast.StringInterner,
+) void {
+    if (pending_doc.* != null) return;
+    if (std.mem.eql(u8, interner.get(attribute.name), "doc")) {
+        pending_doc.* = attribute;
+    }
+}
+
+fn topLevelStructDocAttribute(
+    top_items: []const ast.TopItem,
+    struct_decl: *const ast.StructDecl,
+    interner: *const ast.StringInterner,
+) ?*const ast.AttributeDecl {
+    var pending_doc: ?*const ast.AttributeDecl = null;
+    for (top_items) |item| {
+        switch (item) {
+            .attribute => |attribute| updatePendingDocAttribute(&pending_doc, attribute, interner),
+            .struct_decl, .priv_struct_decl => |decl| {
+                if (sameStructDeclIdentity(decl, struct_decl)) return pending_doc;
+                pending_doc = null;
+            },
+            .protocol,
+            .priv_protocol,
+            .union_decl,
+            .impl_decl,
+            .priv_impl_decl,
+            .function,
+            .priv_function,
+            .macro,
+            .priv_macro,
+            .type_decl,
+            .opaque_decl,
+            => pending_doc = null,
+        }
+    }
+    return null;
+}
+
+fn trailingStructDocAttribute(
+    struct_decl: *const ast.StructDecl,
+    interner: *const ast.StringInterner,
+) ?*const ast.AttributeDecl {
+    var pending_doc: ?*const ast.AttributeDecl = null;
+    var saw_pending_after_callable = false;
+    for (struct_decl.items) |item| {
+        switch (item) {
+            .attribute => |attribute| {
+                updatePendingDocAttribute(&pending_doc, attribute, interner);
+                saw_pending_after_callable = true;
+            },
+            .function, .priv_function, .macro, .priv_macro => {
+                pending_doc = null;
+                saw_pending_after_callable = false;
+            },
+            else => {},
+        }
+    }
+    return if (saw_pending_after_callable) pending_doc else null;
+}
+
+fn sameStructDeclIdentity(left: *const ast.StructDecl, right: *const ast.StructDecl) bool {
+    return structNameIdsEqual(left.name, right.name) and
+        left.meta.span.start == right.meta.span.start and
+        left.meta.span.end == right.meta.span.end and
+        left.meta.span.source_id == right.meta.span.source_id;
+}
+
+fn structNameIdsEqual(left: ast.StructName, right: ast.StructName) bool {
+    if (left.parts.len != right.parts.len) return false;
+    for (left.parts, right.parts) |left_part, right_part| {
+        if (left_part != right_part) return false;
+    }
+    return true;
+}
+
+fn appendDocAttributeText(
+    alloc: std.mem.Allocator,
+    hasher: *zap.incremental_graph.StableHasher,
+    attribute: ?*const ast.AttributeDecl,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!void {
+    const doc_text = try docAttributeText(alloc, attribute, interner);
+    hasher.appendBytes(doc_text);
+}
+
+fn docAttributeText(
+    alloc: std.mem.Allocator,
+    attribute: ?*const ast.AttributeDecl,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError![]const u8 {
+    const attr = attribute orelse return "";
+    const expr = attr.value orelse return "";
+    if (expr.* != .string_literal) return "";
+    return try stripHeredocCommonIndentForFingerprint(alloc, interner.get(expr.string_literal.value));
+}
+
+fn stripHeredocCommonIndentForFingerprint(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+) std.mem.Allocator.Error![]const u8 {
+    var min_indent: usize = std.math.maxInt(usize);
+    var line_iter = std.mem.splitSequence(u8, text, "\n");
+    while (line_iter.next()) |line| {
+        if (std.mem.trim(u8, line, " \t").len == 0) continue;
+        var indent: usize = 0;
+        for (line) |char| {
+            if (char == ' ') {
+                indent += 1;
+            } else if (char == '\t') {
+                indent += 4;
+            } else break;
+        }
+        if (indent < min_indent) min_indent = indent;
+    }
+
+    if (min_indent == 0 or min_indent == std.math.maxInt(usize)) {
+        return try alloc.dupe(u8, text);
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var lines = std.mem.splitSequence(u8, text, "\n");
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try out.append(alloc, '\n');
+        first = false;
+        if (std.mem.trim(u8, line, " \t").len == 0) continue;
+        var to_strip = min_indent;
+        var start: usize = 0;
+        while (start < line.len and to_strip > 0) {
+            if (line[start] == ' ') {
+                to_strip -= 1;
+                start += 1;
+            } else if (line[start] == '\t') {
+                if (to_strip >= 4) {
+                    to_strip -= 4;
+                } else {
+                    to_strip = 0;
+                }
+                start += 1;
+            } else break;
+        }
+        try out.appendSlice(alloc, line[start..]);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendSourceSpanLineNumber(
+    hasher: *zap.incremental_graph.StableHasher,
+    span: ast.SourceSpan,
+    source: []const u8,
+    source_id: u32,
+) FrontendFingerprintBuildError!void {
+    if (span.source_id == null or span.source_id.? != source_id) return error.UnsupportedDeclarationFingerprint;
+    if (span.start > source.len) return error.UnsupportedDeclarationFingerprint;
+    hasher.appendInt(u32, lineNumberFromSourceOffset(source, span.start));
+}
+
+fn lineNumberFromSourceOffset(source: []const u8, offset: u32) u32 {
+    if (offset > source.len) return 0;
+    var line: u32 = 1;
+    var index: usize = 0;
+    while (index < offset) : (index += 1) {
+        if (source[index] == '\n') line += 1;
+    }
+    return line;
+}
+
+fn buildCompileAfterInventoryFingerprints(
+    alloc: std.mem.Allocator,
+    graph: FrontendDependencyGraph,
+    out: *std.StringHashMap(zap.incremental_graph.DeclarationFingerprintSet),
+) CompileError!void {
+    var iter = graph.file_compile_after_globs.iterator();
+    while (iter.next()) |entry| {
+        const file_path = entry.key_ptr.*;
+        const owned_file_path = try alloc.dupe(u8, file_path);
+        const records = try alloc.alloc(zap.incremental_graph.DeclarationFingerprint, 1);
+        records[0] = .{
+            .key = frontendCompileAfterGlobNodeKey(owned_file_path),
+            .kind = .ctfe_glob,
+            .digest = try fingerprintCompileAfterInventory(
+                graph,
+                file_path,
+                entry.value_ptr.*,
+                graph.file_compile_after_files.get(file_path) orelse &.{},
+            ),
+        };
+        try out.put(owned_file_path, .{
+            .root_glue = null,
+            .records = records,
+        });
+    }
+}
+
+fn fingerprintCompileAfterInventory(
+    graph: FrontendDependencyGraph,
+    file_path: []const u8,
+    patterns: []const []const u8,
+    matched_files: []const []const u8,
+) CompileError!zap.incremental_graph.StableDigest {
+    var hasher = zap.incremental_graph.StableHasher.init(.ctfe_glob_fingerprint);
+    hasher.appendBytes(file_path);
+    hasher.appendInt(u64, patterns.len);
+    for (patterns) |pattern| hasher.appendBytes(pattern);
+
+    hasher.appendInt(u64, matched_files.len);
+    for (matched_files) |matched_file| {
+        hasher.appendBytes(matched_file);
+        const structs = graph.file_to_structs.get(matched_file) orelse &.{};
+        hasher.appendInt(u64, structs.len);
+        for (structs) |struct_name| hasher.appendBytes(struct_name);
+    }
+    return hasher.final();
+}
+
+fn appendCompileAfterInventoryFingerprintChanges(
+    alloc: std.mem.Allocator,
+    graph: FrontendDependencyGraph,
+    previous: *const std.StringHashMap(zap.incremental_graph.DeclarationFingerprintSet),
+    current: *const std.StringHashMap(zap.incremental_graph.DeclarationFingerprintSet),
+    changed_files: *std.ArrayListUnmanaged([]const u8),
+    changed_declaration_fingerprints: *std.ArrayListUnmanaged(FrontendChangedFileFingerprints),
+) CompileError!void {
+    _ = graph;
+    var current_iter = current.iterator();
+    while (current_iter.next()) |entry| {
+        const file_path = entry.key_ptr.*;
+        const previous_set = previous.get(file_path);
+        if (previous_set) |some_previous| {
+            if (declarationFingerprintSetsEqual(some_previous, entry.value_ptr.*)) continue;
+        }
+        try appendUniqueFilePath(alloc, changed_files, file_path);
+        try changed_declaration_fingerprints.append(alloc, .{
+            .file_path = file_path,
+            .previous = previous_set,
+            .current = entry.value_ptr.*,
+        });
+    }
+
+    var previous_iter = previous.iterator();
+    while (previous_iter.next()) |entry| {
+        const file_path = entry.key_ptr.*;
+        if (current.contains(file_path)) continue;
+        try appendUniqueFilePath(alloc, changed_files, file_path);
+        try changed_declaration_fingerprints.append(alloc, .{
+            .file_path = file_path,
+            .previous = entry.value_ptr.*,
+            .current = null,
+        });
+    }
+}
+
+fn augmentFrontendGraphWithInventoryFingerprints(
+    dependency_graph: *zap.incremental_graph.Graph,
+    inventory_fingerprints: *const std.StringHashMap(zap.incremental_graph.DeclarationFingerprintSet),
+) CompileError!void {
+    var iter = inventory_fingerprints.iterator();
+    while (iter.next()) |entry| {
+        const sets = [_]?zap.incremental_graph.DeclarationFingerprintSet{entry.value_ptr.*};
+        try augmentFrontendGraphWithDeclarationFingerprints(dependency_graph, &sets);
+    }
+}
+
+fn declarationFingerprintSetsEqual(
+    left: zap.incremental_graph.DeclarationFingerprintSet,
+    right: zap.incremental_graph.DeclarationFingerprintSet,
+) bool {
+    if (!optionalDigestEqual(left.root_glue, right.root_glue)) return false;
+    if (left.records.len != right.records.len) return false;
+    for (left.records, right.records) |left_record, right_record| {
+        if (left_record.kind != right_record.kind) return false;
+        if (!zap.incremental_graph.NodeKey.eql(left_record.key, right_record.key)) return false;
+        if (!std.mem.eql(u8, left_record.digest[0..], right_record.digest[0..])) return false;
+    }
+    return true;
+}
+
+fn optionalDigestEqual(
+    left: ?zap.incremental_graph.StableDigest,
+    right: ?zap.incremental_graph.StableDigest,
+) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?[0..], right.?[0..]);
+}
+
+fn appendFunctionSurface(
+    hasher: *zap.incremental_graph.StableHasher,
+    function_decl: *const ast.FunctionDecl,
+    interner: *const ast.StringInterner,
+) error{UnsupportedDeclarationFingerprint}!void {
+    hasher.appendEnum(function_decl.visibility);
+    hasher.appendBytes(interner.get(function_decl.name));
+    const arity = try functionDeclArity(function_decl);
+    hasher.appendInt(u16, arity);
+    hasher.appendInt(u64, function_decl.clauses.len);
+}
+
+fn appendStructName(
+    hasher: *zap.incremental_graph.StableHasher,
+    name: ast.StructName,
+    interner: *const ast.StringInterner,
+) void {
+    hasher.appendInt(u64, name.parts.len);
+    for (name.parts) |part| hasher.appendBytes(interner.get(part));
+}
+
+fn appendPatternSpan(
+    hasher: *zap.incremental_graph.StableHasher,
+    pattern: *const ast.Pattern,
+    source: []const u8,
+    source_id: u32,
+) FrontendFingerprintBuildError!void {
+    try appendSourceSpan(hasher, pattern.getMeta().span, source, source_id);
+}
+
+fn appendTypeExprSpan(
+    hasher: *zap.incremental_graph.StableHasher,
+    type_expr: *const ast.TypeExpr,
+    source: []const u8,
+    source_id: u32,
+) FrontendFingerprintBuildError!void {
+    try appendSourceSpan(hasher, type_expr.getMeta().span, source, source_id);
+}
+
+fn appendOptionalTypeExprSpan(
+    hasher: *zap.incremental_graph.StableHasher,
+    type_expr: ?*const ast.TypeExpr,
+    source: []const u8,
+    source_id: u32,
+) FrontendFingerprintBuildError!void {
+    if (type_expr) |some| {
+        hasher.appendBool(true);
+        try appendTypeExprSpan(hasher, some, source, source_id);
+    } else {
+        hasher.appendBool(false);
+    }
+}
+
+fn appendOptionalExprSpan(
+    hasher: *zap.incremental_graph.StableHasher,
+    expr: ?*const ast.Expr,
+    source: []const u8,
+    source_id: u32,
+) FrontendFingerprintBuildError!void {
+    if (expr) |some| {
+        hasher.appendBool(true);
+        try appendSourceSpan(hasher, some.getMeta().span, source, source_id);
+    } else {
+        hasher.appendBool(false);
+    }
+}
+
+fn appendSourceSpan(
+    hasher: *zap.incremental_graph.StableHasher,
+    span: ast.SourceSpan,
+    source: []const u8,
+    source_id: u32,
+) FrontendFingerprintBuildError!void {
+    if (span.source_id == null or span.source_id.? != source_id) return error.UnsupportedDeclarationFingerprint;
+    if (span.start > span.end) return error.UnsupportedDeclarationFingerprint;
+    const start: usize = @intCast(span.start);
+    const end: usize = @intCast(span.end);
+    if (end > source.len) return error.UnsupportedDeclarationFingerprint;
+    hasher.appendBytes(source[start..end]);
+}
+
+fn structItemSourceSpan(item: ast.StructItem) ast.SourceSpan {
+    return switch (item) {
+        .type_decl => |decl| decl.meta.span,
+        .opaque_decl => |decl| decl.meta.span,
+        .struct_decl => |decl| decl.meta.span,
+        .union_decl => |decl| decl.meta.span,
+        .function => |decl| decl.meta.span,
+        .priv_function => |decl| decl.meta.span,
+        .macro => |decl| decl.meta.span,
+        .priv_macro => |decl| decl.meta.span,
+        .alias_decl => |decl| decl.meta.span,
+        .import_decl => |decl| decl.meta.span,
+        .use_decl => |decl| decl.meta.span,
+        .attribute => |decl| decl.meta.span,
+        .struct_level_expr => |expr| expr.getMeta().span,
+    };
+}
+
+fn stmtSourceSpan(statement: ast.Stmt) ast.SourceSpan {
+    return switch (statement) {
+        .expr => |expr| expr.getMeta().span,
+        .assignment => |assignment| assignment.meta.span,
+        .function_decl => |decl| decl.meta.span,
+        .macro_decl => |decl| decl.meta.span,
+        .import_decl => |decl| decl.meta.span,
+        .attribute => |decl| decl.meta.span,
+    };
+}
+
 fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
     if (left == null and right == null) return true;
     if (left == null or right == null) return false;
     return std.mem.eql(u8, left.?, right.?);
 }
 
-fn mustInvalidateWholeFrontend(file_path: []const u8, graph: FrontendDependencyGraph, file_is_direct_change: bool) bool {
-    // Editing a compile-after/reflection provider must invalidate the
-    // compile-after consumer, but it does not by itself make every sibling
-    // provider stale. Editing the compile-after declaration file itself is
-    // different: the glob/pattern/provider contract may have changed, so the
-    // whole frontend is invalidated unless a narrower reflection dependency
-    // signature is available.
-    if (file_is_direct_change and graph.file_compile_after_globs.contains(file_path)) return true;
-    const structs = graph.file_to_structs.get(file_path) orelse return true;
-    if (structs.len == 0) return true;
+const WholeFrontendInvalidationReason = enum {
+    missing_file_struct_mapping,
+    empty_file_struct_mapping,
+    kernel_struct,
+};
+
+const WholeFrontendInvalidationHit = struct {
+    file_path: []const u8,
+    reason: WholeFrontendInvalidationReason,
+};
+
+fn wholeFrontendInvalidationReason(
+    file_path: []const u8,
+    graph: FrontendDependencyGraph,
+    file_is_direct_change: bool,
+) ?WholeFrontendInvalidationReason {
+    _ = file_is_direct_change;
+    const structs = graph.file_to_structs.get(file_path) orelse return .missing_file_struct_mapping;
+    if (structs.len == 0) return .empty_file_struct_mapping;
     for (structs) |struct_name| {
-        if (std.mem.eql(u8, struct_name, zap.discovery.kernel_struct_name)) return true;
+        if (std.mem.eql(u8, struct_name, zap.discovery.kernel_struct_name)) return .kernel_struct;
     }
-    return false;
+    return null;
+}
+
+fn mustInvalidateWholeFrontend(file_path: []const u8, graph: FrontendDependencyGraph, file_is_direct_change: bool) bool {
+    return wholeFrontendInvalidationReason(file_path, graph, file_is_direct_change) != null;
+}
+
+fn transitiveDependentWholeFrontendInvalidation(
+    alloc: std.mem.Allocator,
+    graph: FrontendDependencyGraph,
+    changed_files: []const []const u8,
+) CompileError!?WholeFrontendInvalidationHit {
+    var seen_files = std.StringHashMap(void).init(alloc);
+    defer seen_files.deinit();
+
+    var queue: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer queue.deinit(alloc);
+
+    for (changed_files) |file_path| {
+        const seen_entry = try seen_files.getOrPut(file_path);
+        if (!seen_entry.found_existing) try queue.append(alloc, file_path);
+    }
+
+    var cursor: usize = 0;
+    while (cursor < queue.items.len) : (cursor += 1) {
+        const current_file = queue.items[cursor];
+        const dependents = graph.file_imported_by.get(current_file) orelse continue;
+        for (dependents) |dependent_file| {
+            const seen_entry = try seen_files.getOrPut(dependent_file);
+            if (seen_entry.found_existing) continue;
+            if (wholeFrontendInvalidationReason(dependent_file, graph, false)) |reason| {
+                return .{ .file_path = dependent_file, .reason = reason };
+            }
+            try queue.append(alloc, dependent_file);
+        }
+    }
+
+    return null;
+}
+
+fn allChangedFilesHaveFingerprintBatch(
+    changed_files: []const []const u8,
+    changed_declaration_fingerprints: []const FrontendChangedFileFingerprints,
+) bool {
+    for (changed_files) |file_path| {
+        var found = false;
+        for (changed_declaration_fingerprints) |file_fingerprints| {
+            if (std.mem.eql(u8, file_fingerprints.file_path, file_path)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn addSourceGraphInvalidations(
+    alloc: std.mem.Allocator,
+    source_units: []const SourceUnit,
+    graph: FrontendDependencyGraph,
+    dependency_graph: *const zap.incremental_graph.Graph,
+    changed_files: []const []const u8,
+    invalidated_structs: *std.StringHashMap(void),
+) CompileError!void {
+    var changed_source_ids: std.ArrayListUnmanaged(zap.incremental_graph.NodeId) = .empty;
+    defer changed_source_ids.deinit(alloc);
+    for (changed_files) |file_path| {
+        const source_id = (try dependency_graph.getNode(frontendSourceFileNodeKey(file_path))) orelse {
+            incrementalTrace(
+                "struct-invalidation scope=all reason=missing-source-node file={s}",
+                .{file_path},
+            );
+            try addAllSourceStructs(alloc, source_units, graph, invalidated_structs);
+            return;
+        };
+        try changed_source_ids.append(alloc, source_id);
+        traceIncrementalGraphNode("changed-source-node", dependency_graph, source_id);
+    }
+
+    const affected_nodes = try dependency_graph.affectedFrom(alloc, changed_source_ids.items);
+    defer alloc.free(affected_nodes);
+    if (incrementalTraceEnabled()) {
+        const affected_steps = try dependency_graph.affectedTraceFrom(alloc, changed_source_ids.items);
+        defer alloc.free(affected_steps);
+        for (affected_steps) |step| {
+            traceIncrementalGraphStep("affected-edge", dependency_graph, step);
+        }
+    }
+    incrementalTrace(
+        "graph-reachability source_nodes={d} affected_nodes={d}",
+        .{ changed_source_ids.items.len, affected_nodes.len },
+    );
+
+    for (affected_nodes) |node_id| {
+        traceIncrementalGraphNode("affected-node", dependency_graph, node_id);
+        const node_key = dependency_graph.nodeKey(node_id) orelse {
+            incrementalTrace(
+                "struct-invalidation scope=all reason=missing-affected-node id={d}",
+                .{@intFromEnum(node_id)},
+            );
+            try addAllSourceStructs(alloc, source_units, graph, invalidated_structs);
+            return;
+        };
+        switch (node_key.*) {
+            .struct_surface => |struct_key| {
+                try invalidated_structs.put(struct_key.qualified_name, {});
+                incrementalTrace(
+                    "invalidated-struct source=graph struct={s}",
+                    .{struct_key.qualified_name},
+                );
+            },
+            else => {},
+        }
+    }
 }
 
 fn addAllSourceStructs(
@@ -717,6 +2503,480 @@ fn addAllSourceStructs(
         }
     }
     _ = alloc;
+}
+
+fn appendUniqueNodeId(
+    alloc: std.mem.Allocator,
+    node_ids: *std.ArrayListUnmanaged(zap.incremental_graph.NodeId),
+    node_id: zap.incremental_graph.NodeId,
+) CompileError!void {
+    for (node_ids.items) |existing| {
+        if (existing == node_id) return;
+    }
+    try node_ids.append(alloc, node_id);
+}
+
+fn appendUniqueFilePath(
+    alloc: std.mem.Allocator,
+    file_paths: *std.ArrayListUnmanaged([]const u8),
+    file_path: []const u8,
+) CompileError!void {
+    for (file_paths.items) |existing| {
+        if (std.mem.eql(u8, existing, file_path)) return;
+    }
+    try file_paths.append(alloc, file_path);
+}
+
+fn copyStringSet(source: *const std.StringHashMap(void), dest: *std.StringHashMap(void)) CompileError!void {
+    var iter = source.iterator();
+    while (iter.next()) |entry| {
+        try dest.put(entry.key_ptr.*, {});
+    }
+}
+
+fn addChangedDeclarationStructForNode(
+    alloc: std.mem.Allocator,
+    node_key: zap.incremental_graph.NodeKey,
+    changed_declaration_structs: *std.StringHashMap(void),
+) CompileError!void {
+    _ = alloc;
+    switch (node_key) {
+        .struct_surface => |struct_key| try changed_declaration_structs.put(struct_key.qualified_name, {}),
+        .function_signature, .function_body => |function_key| {
+            if (function_key.owner.kind == .@"struct") {
+                try changed_declaration_structs.put(function_key.owner.qualified_name, {});
+            } else if (function_key.owner.kind == .package) {
+                try changed_declaration_structs.put("", {});
+            }
+        },
+        .package_surface => try changed_declaration_structs.put("", {}),
+        else => {},
+    }
+}
+
+fn frontendPackageKey() zap.incremental_graph.PackageKey {
+    return .{
+        .kind = .project_root,
+        .name = "frontend",
+        .root_identity = "zap-frontend-incremental-v1",
+        .version = null,
+    };
+}
+
+fn frontendSourceFileNodeKey(file_path: []const u8) zap.incremental_graph.NodeKey {
+    return .{ .source_file = .{
+        .package = frontendPackageKey(),
+        .path = file_path,
+    } };
+}
+
+fn frontendPackageSurfaceNodeKey() zap.incremental_graph.NodeKey {
+    return .{ .package_surface = frontendPackageKey() };
+}
+
+fn frontendStructSurfaceNodeKey(struct_name: []const u8) zap.incremental_graph.NodeKey {
+    return .{ .struct_surface = .{
+        .package = frontendPackageKey(),
+        .qualified_name = struct_name,
+    } };
+}
+
+fn frontendCompileAfterGlobNodeKey(file_path: []const u8) zap.incremental_graph.NodeKey {
+    return .{ .ctfe_glob = .{
+        .package = frontendPackageKey(),
+        .pattern = file_path,
+        .recursive = false,
+    } };
+}
+
+fn frontendStructReflectionNodeKey(struct_name: []const u8) zap.incremental_graph.NodeKey {
+    return .{ .ctfe_reflection = .{
+        .package = frontendPackageKey(),
+        .query_identity = struct_name,
+    } };
+}
+
+fn frontendFunctionOwnerKey(function: ir.Function) zap.incremental_graph.DeclarationOwnerKey {
+    if (function.struct_name) |struct_name| {
+        return .{
+            .package = frontendPackageKey(),
+            .kind = .@"struct",
+            .qualified_name = struct_name,
+        };
+    }
+
+    return .{
+        .package = frontendPackageKey(),
+        .kind = .package,
+        .qualified_name = "",
+    };
+}
+
+fn frontendFunctionKey(function: ir.Function) CompileError!zap.incremental_graph.FunctionKey {
+    return .{
+        .owner = frontendFunctionOwnerKey(function),
+        .declaration_kind = if (function.struct_name != null) .struct_method else .free,
+        .local_name = if (function.local_name.len > 0) function.local_name else function.name,
+        .arity = std.math.cast(u16, function.arity) orelse return error.IrFailed,
+        .clause_index = function.source_clause_index orelse 0,
+        .specialization = null,
+    };
+}
+
+fn frontendFunctionBodyNodeKey(function: ir.Function) CompileError!zap.incremental_graph.NodeKey {
+    return .{ .function_body = try frontendFunctionKey(function) };
+}
+
+fn frontendFunctionSignatureNodeKey(function: ir.Function) CompileError!zap.incremental_graph.NodeKey {
+    return .{ .function_signature = try frontendFunctionKey(function) };
+}
+
+fn buildFrontendIncrementalGraph(
+    allocator: std.mem.Allocator,
+    source_units: []const SourceUnit,
+    frontend_graph: FrontendDependencyGraph,
+) CompileError!zap.incremental_graph.Graph {
+    var dependency_graph = zap.incremental_graph.Graph.init(allocator);
+    errdefer dependency_graph.deinit();
+
+    _ = try dependency_graph.getOrPutNode(frontendPackageSurfaceNodeKey());
+
+    for (source_units) |unit| {
+        const source_id = try dependency_graph.getOrPutNode(frontendSourceFileNodeKey(unit.file_path));
+        const structs = frontend_graph.file_to_structs.get(unit.file_path) orelse continue;
+        for (structs) |struct_name| {
+            const struct_id = try dependency_graph.getOrPutNode(frontendStructSurfaceNodeKey(struct_name));
+            try dependency_graph.addEdge(struct_id, source_id, .surface);
+        }
+    }
+
+    var imported_iter = frontend_graph.file_imported_by.iterator();
+    while (imported_iter.next()) |entry| {
+        const imported_structs = frontend_graph.file_to_structs.get(entry.key_ptr.*) orelse continue;
+        for (entry.value_ptr.*) |dependent_file| {
+            const dependent_structs = frontend_graph.file_to_structs.get(dependent_file) orelse continue;
+            for (dependent_structs) |dependent_struct_name| {
+                const dependent_struct_id = try dependency_graph.getOrPutNode(frontendStructSurfaceNodeKey(dependent_struct_name));
+                for (imported_structs) |imported_struct_name| {
+                    const imported_struct_id = try dependency_graph.getOrPutNode(frontendStructSurfaceNodeKey(imported_struct_name));
+                    try dependency_graph.addEdge(dependent_struct_id, imported_struct_id, .import);
+                }
+            }
+        }
+    }
+
+    var compile_after_iter = frontend_graph.file_compile_after_globs.iterator();
+    while (compile_after_iter.next()) |entry| {
+        const file_path = entry.key_ptr.*;
+        const glob_id = try dependency_graph.getOrPutNode(frontendCompileAfterGlobNodeKey(file_path));
+        const structs = frontend_graph.file_to_structs.get(file_path) orelse continue;
+        for (structs) |struct_name| {
+            const struct_id = try dependency_graph.getOrPutNode(frontendStructSurfaceNodeKey(struct_name));
+            try dependency_graph.addEdge(struct_id, glob_id, .ctfe_glob);
+        }
+        const matched_files = frontend_graph.file_compile_after_files.get(file_path) orelse continue;
+        for (matched_files) |matched_file| {
+            const matched_structs = frontend_graph.file_to_structs.get(matched_file) orelse continue;
+            for (matched_structs) |matched_struct_name| {
+                const reflection_id = try dependency_graph.getOrPutNode(frontendStructReflectionNodeKey(matched_struct_name));
+                try dependency_graph.addEdge(glob_id, reflection_id, .ctfe_reflection);
+            }
+        }
+    }
+
+    return dependency_graph;
+}
+
+fn augmentFrontendGraphWithDeclarationFingerprints(
+    dependency_graph: *zap.incremental_graph.Graph,
+    fingerprint_sets: []const ?zap.incremental_graph.DeclarationFingerprintSet,
+) CompileError!void {
+    for (fingerprint_sets) |maybe_set| {
+        const fingerprint_set = maybe_set orelse continue;
+        for (fingerprint_set.records) |record| {
+            const node_id = try dependency_graph.getOrPutNode(record.key);
+            switch (record.key) {
+                .function_body => |function_key| {
+                    const signature_id = try dependency_graph.getOrPutNode(.{ .function_signature = function_key });
+                    try dependency_graph.addEdge(node_id, signature_id, .surface);
+                    const owner_surface_id = try dependency_graph.getOrPutNode(frontendOwnerSurfaceNodeKey(function_key.owner));
+                    try dependency_graph.addEdge(node_id, owner_surface_id, .surface);
+                },
+                .function_signature => |function_key| {
+                    const owner_surface_id = try dependency_graph.getOrPutNode(frontendOwnerSurfaceNodeKey(function_key.owner));
+                    try dependency_graph.addEdge(node_id, owner_surface_id, .surface);
+                },
+                else => {},
+            }
+        }
+    }
+}
+
+fn frontendOwnerSurfaceNodeKey(owner: zap.incremental_graph.DeclarationOwnerKey) zap.incremental_graph.NodeKey {
+    if (owner.kind == .@"struct") {
+        return .{ .struct_surface = .{
+            .package = owner.package,
+            .qualified_name = owner.qualified_name,
+        } };
+    }
+    return .{ .package_surface = owner.package };
+}
+
+fn augmentFrontendGraphWithFunctions(
+    alloc: std.mem.Allocator,
+    dependency_graph: *zap.incremental_graph.Graph,
+    program: ir.Program,
+) CompileError!void {
+    for (program.functions) |function| {
+        const body_id = try dependency_graph.getOrPutNode(try frontendFunctionBodyNodeKey(function));
+        const signature_id = try dependency_graph.getOrPutNode(try frontendFunctionSignatureNodeKey(function));
+        try dependency_graph.addEdge(body_id, signature_id, .surface);
+
+        if (function.struct_name) |struct_name| {
+            const struct_id = try dependency_graph.getOrPutNode(frontendStructSurfaceNodeKey(struct_name));
+            try dependency_graph.addEdge(body_id, struct_id, .surface);
+            try dependency_graph.addEdge(signature_id, struct_id, .surface);
+        } else {
+            const package_id = try dependency_graph.getOrPutNode(frontendPackageSurfaceNodeKey());
+            try dependency_graph.addEdge(body_id, package_id, .surface);
+            try dependency_graph.addEdge(signature_id, package_id, .surface);
+        }
+    }
+
+    var callers_by_callee = std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)).init(alloc);
+    defer {
+        var lists = callers_by_callee.valueIterator();
+        while (lists.next()) |list| list.deinit(alloc);
+        callers_by_callee.deinit();
+    }
+
+    for (program.functions) |function| {
+        for (function.body) |block| {
+            try addCallEdgesFromInstructions(alloc, program, function.id, block.instructions, &callers_by_callee);
+        }
+    }
+
+    var callee_iter = callers_by_callee.iterator();
+    while (callee_iter.next()) |entry| {
+        const callee = functionById(program, entry.key_ptr.*) orelse continue;
+        const callee_signature_id = try dependency_graph.getOrPutNode(try frontendFunctionSignatureNodeKey(callee.*));
+        for (entry.value_ptr.items) |caller_id| {
+            const caller = functionById(program, caller_id) orelse continue;
+            const caller_body_id = try dependency_graph.getOrPutNode(try frontendFunctionBodyNodeKey(caller.*));
+            // Normal calls depend on the callee signature. Callee-body semantic summaries
+            // must be represented by a separate .analysis_summary edge.
+            try dependency_graph.addEdge(caller_body_id, callee_signature_id, .call_edge);
+        }
+    }
+}
+
+fn augmentFrontendGraphWithAnalysisSummaryEdges(
+    alloc: std.mem.Allocator,
+    dependency_graph: *zap.incremental_graph.Graph,
+    program: ir.Program,
+    policy: FrontendPassPolicy,
+) CompileError!void {
+    var callers_by_callee = std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)).init(alloc);
+    defer {
+        var lists = callers_by_callee.valueIterator();
+        while (lists.next()) |list| list.deinit(alloc);
+        callers_by_callee.deinit();
+    }
+
+    for (program.functions) |function| {
+        for (function.body) |block| {
+            try addAnalysisSummaryEdgesFromInstructions(
+                alloc,
+                program,
+                function.id,
+                block.instructions,
+                policy,
+                &callers_by_callee,
+            );
+        }
+    }
+
+    var callee_iter = callers_by_callee.iterator();
+    while (callee_iter.next()) |entry| {
+        const callee = functionById(program, entry.key_ptr.*) orelse continue;
+        if (!calleeBodyMayAffectCallerFinalIr(callee.*, policy)) continue;
+
+        const callee_body_id = try dependency_graph.getOrPutNode(try frontendFunctionBodyNodeKey(callee.*));
+        for (entry.value_ptr.items) |caller_id| {
+            const caller = functionById(program, caller_id) orelse continue;
+            const caller_body_id = try dependency_graph.getOrPutNode(try frontendFunctionBodyNodeKey(caller.*));
+            // These edges are deliberately separate from `.call_edge`: normal
+            // calls depend on signatures, while body-derived analysis summaries
+            // only flow to callers for passes whose summaries can change caller IR.
+            try dependency_graph.addEdge(caller_body_id, callee_body_id, .analysis_summary);
+        }
+    }
+}
+
+fn addAnalysisSummaryEdgesFromInstructions(
+    alloc: std.mem.Allocator,
+    program: ir.Program,
+    caller_id: ir.FunctionId,
+    instructions: []const ir.Instruction,
+    policy: FrontendPassPolicy,
+    callers_by_callee: *std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
+) CompileError!void {
+    for (instructions) |instruction| {
+        switch (instruction) {
+            .call_direct => |call| try addReverseCallEdgeTarget(alloc, program, caller_id, call.function, callers_by_callee),
+            .call_named => |call| {
+                if (functionIdByName(program, call.name)) |target_id| {
+                    try addReverseCallEdgeTarget(alloc, program, caller_id, target_id, callers_by_callee);
+                }
+            },
+            .tail_call => |call| {
+                if (functionIdByName(program, call.name)) |target_id| {
+                    try addReverseCallEdgeTarget(alloc, program, caller_id, target_id, callers_by_callee);
+                }
+            },
+            .try_call_named => |call| {
+                if (functionIdByName(program, call.name)) |target_id| {
+                    try addReverseCallEdgeTarget(alloc, program, caller_id, target_id, callers_by_callee);
+                }
+                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, call.handler_instrs, policy, callers_by_callee);
+                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, call.success_instrs, policy, callers_by_callee);
+            },
+            .make_closure => |closure| {
+                if (policy.run_contification) {
+                    try addReverseCallEdgeTarget(alloc, program, caller_id, closure.function, callers_by_callee);
+                }
+            },
+            .if_expr => |value| {
+                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.then_instrs, policy, callers_by_callee);
+                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.else_instrs, policy, callers_by_callee);
+            },
+            .guard_block => |value| try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.body, policy, callers_by_callee),
+            .case_block => |value| {
+                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.pre_instrs, policy, callers_by_callee);
+                for (value.arms) |arm| {
+                    try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, arm.cond_instrs, policy, callers_by_callee);
+                    try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, arm.body_instrs, policy, callers_by_callee);
+                }
+                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.default_instrs, policy, callers_by_callee);
+            },
+            .switch_literal => |value| {
+                for (value.cases) |case| {
+                    try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, policy, callers_by_callee);
+                }
+                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.default_instrs, policy, callers_by_callee);
+            },
+            .switch_return => |value| {
+                for (value.cases) |case| {
+                    try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, policy, callers_by_callee);
+                }
+                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.default_instrs, policy, callers_by_callee);
+            },
+            .union_switch => |value| {
+                for (value.cases) |case| {
+                    try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, policy, callers_by_callee);
+                }
+            },
+            .union_switch_return => |value| {
+                for (value.cases) |case| {
+                    try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, policy, callers_by_callee);
+                }
+            },
+            .optional_dispatch => |value| {
+                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.nil_instrs, policy, callers_by_callee);
+                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.struct_instrs, policy, callers_by_callee);
+            },
+            else => {},
+        }
+    }
+}
+
+fn calleeBodyMayAffectCallerFinalIr(function: ir.Function, policy: FrontendPassPolicy) bool {
+    // ARC parameter-convention inference is semantic in every mode: a callee
+    // body can prove a borrowed parameter is actually consumed, and the caller
+    // final IR then rewrites the matching share/release pair into a move.
+    if (functionHasBorrowedParamConvention(function)) return true;
+
+    // Release policies enable optimization summaries whose callee-body facts
+    // are materialized into caller IR: escape/Perceus ARC records,
+    // contification, and unchecked uniqueness rewrites. Until each summary has
+    // a narrower digest node, model the dependency explicitly at body level.
+    return policyUsesCalleeBodySummariesInCallerFinalIr(policy);
+}
+
+fn functionHasBorrowedParamConvention(function: ir.Function) bool {
+    for (function.param_conventions) |convention| {
+        if (convention == .borrowed) return true;
+    }
+    return false;
+}
+
+fn policyUsesCalleeBodySummariesInCallerFinalIr(policy: FrontendPassPolicy) bool {
+    return policy.run_region_solver or
+        policy.run_lambda_specialization or
+        policy.run_perceus_reuse or
+        policy.run_arc_optimizer or
+        policy.run_contification or
+        policy.rewrite_unchecked_uniqueness;
+}
+
+fn invalidatedStructNamesInSourceOrder(
+    alloc: std.mem.Allocator,
+    source_units: []const SourceUnit,
+    graph: FrontendDependencyGraph,
+    invalidated_structs: *const std.StringHashMap(void),
+) CompileError![]const []const u8 {
+    var ordered: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer ordered.deinit(alloc);
+    var emitted = std.StringHashMap(void).init(alloc);
+    defer emitted.deinit();
+
+    for (source_units) |unit| {
+        const structs = graph.file_to_structs.get(unit.file_path) orelse continue;
+        for (structs) |struct_name| {
+            if (!invalidated_structs.contains(struct_name) or emitted.contains(struct_name)) continue;
+            try emitted.put(struct_name, {});
+            try ordered.append(alloc, struct_name);
+        }
+    }
+
+    var iter = invalidated_structs.iterator();
+    while (iter.next()) |entry| {
+        if (emitted.contains(entry.key_ptr.*)) continue;
+        try emitted.put(entry.key_ptr.*, {});
+        try ordered.append(alloc, entry.key_ptr.*);
+    }
+
+    return ordered.toOwnedSlice(alloc) catch return error.OutOfMemory;
+}
+
+fn structNamesForFilesInSourceOrder(
+    alloc: std.mem.Allocator,
+    source_units: []const SourceUnit,
+    graph: FrontendDependencyGraph,
+    file_paths: []const []const u8,
+) CompileError![]const []const u8 {
+    var changed_files = std.StringHashMap(void).init(alloc);
+    defer changed_files.deinit();
+    for (file_paths) |file_path| {
+        try changed_files.put(file_path, {});
+    }
+
+    var ordered: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer ordered.deinit(alloc);
+    var emitted = std.StringHashMap(void).init(alloc);
+    defer emitted.deinit();
+
+    for (source_units) |unit| {
+        if (!changed_files.contains(unit.file_path)) continue;
+        const structs = graph.file_to_structs.get(unit.file_path) orelse continue;
+        for (structs) |struct_name| {
+            if (emitted.contains(struct_name)) continue;
+            try emitted.put(struct_name, {});
+            try ordered.append(alloc, struct_name);
+        }
+    }
+
+    return ordered.toOwnedSlice(alloc) catch return error.OutOfMemory;
 }
 
 fn registerSourceUnits(graph: *zap.scope.ScopeGraph, source_units: []const SourceUnit) !void {
@@ -1335,7 +3595,7 @@ pub fn compileForCtfe(
 
     pipeline.runCtfeAttributes(&ir_program, options.struct_order);
 
-    var analysis_result = try pipeline.runAnalysisAndContify(&ir_program);
+    var analysis_result = try pipeline.runAnalysisAndOptimization(&ir_program);
 
     // Materialize the analysis-context records into first-class
     // `.retain { kind }` / `.release { kind }` IR instructions so
@@ -1845,17 +4105,40 @@ const Pipeline = struct {
         }
     }
 
-    fn runAnalysisAndContify(
+    fn runAnalysisPipelineOnly(
         self: *Pipeline,
         ir_program: *ir.Program,
     ) CompileError!zap.analysis_pipeline.PipelineResult {
         self.progress("Escape analysis");
-        var pipeline_result = zap.analysis_pipeline.runAnalysisPipeline(self.alloc, ir_program) catch
+        const policy = self.options.frontend_optimize_mode.passPolicy();
+        return zap.analysis_pipeline.runAnalysisPipelineWithPolicy(self.alloc, ir_program, policy) catch
             return self.failWith("Error during escape analysis", error.IrFailed);
+    }
+
+    fn runContificationRewrite(
+        self: *Pipeline,
+        ir_program: *ir.Program,
+        pipeline_result: *zap.analysis_pipeline.PipelineResult,
+    ) CompileError!void {
+        // Optional contification rewrite: an optimization-only IR rewrite fed
+        // by analysis metadata. Debug policy skips it; release policies keep
+        // it enabled.
         zap.contification_rewrite.rewriteContifiedContinuations(self.alloc, ir_program, &pipeline_result.context) catch |err| switch (err) {
             error.UnsupportedContifiedRewrite => {},
             else => return error.IrFailed,
         };
+    }
+
+    fn runAnalysisAndOptimization(
+        self: *Pipeline,
+        ir_program: *ir.Program,
+    ) CompileError!zap.analysis_pipeline.PipelineResult {
+        const policy = self.options.frontend_optimize_mode.passPolicy();
+        var pipeline_result = try self.runAnalysisPipelineOnly(ir_program);
+        errdefer pipeline_result.deinit();
+        if (policy.run_contification) {
+            try self.runContificationRewrite(ir_program, &pipeline_result);
+        }
         return pipeline_result;
     }
 };
@@ -2089,6 +4372,7 @@ fn stagedMacroExpandAndDesugarCached(
     const expansion_required = try alloc.alloc(bool, ordered_structs.items.len);
     for (ordered_structs.items, 0..) |original, index| {
         expansion_required[index] = cache.invalidated_structs.contains(original.name) or
+            cache.changed_declaration_structs.contains(original.name) or
             cache.state.expanded_structs.get(original.name) == null;
     }
     const later_expansion_required = try alloc.alloc(bool, ordered_structs.items.len);
@@ -2218,6 +4502,7 @@ fn topLevelExpansionRequired(
     original_structs: []const StructProgram,
 ) bool {
     if (top_level_items.len == 0) return false;
+    if (cache.changed_declaration_structs.contains("")) return true;
     const signature = top_level_signature orelse return true;
     if (invalidatedStructsMayAffectTopLevelMacros(original_structs, cache)) return true;
     const cached = cache.state.expanded_top_level orelse return true;
@@ -2228,8 +4513,17 @@ fn invalidatedStructsMayAffectTopLevelMacros(
     original_structs: []const StructProgram,
     cache: *ExpansionCacheWork,
 ) bool {
-    var invalidated_iter = cache.invalidated_structs.keyIterator();
-    while (invalidated_iter.next()) |struct_name| {
+    if (structSetMayAffectTopLevelMacros(original_structs, cache, cache.invalidated_structs)) return true;
+    return structSetMayAffectTopLevelMacros(original_structs, cache, cache.changed_declaration_structs);
+}
+
+fn structSetMayAffectTopLevelMacros(
+    original_structs: []const StructProgram,
+    cache: *ExpansionCacheWork,
+    struct_names: *const std.StringHashMap(void),
+) bool {
+    var iter = struct_names.keyIterator();
+    while (iter.next()) |struct_name| {
         if (lookupStructProgramInSlice(original_structs, struct_name.*)) |current| {
             if (structProgramDeclaresMacro(current.program)) return true;
         }
@@ -2376,7 +4670,9 @@ fn cachedOrExpandStagedStruct(
     cache: *ExpansionCacheWork,
 ) CompileError!StagedExpansionResult {
     const cached = cache.state.expanded_structs.get(original.name);
-    if (!cache.invalidated_structs.contains(original.name)) {
+    if (!cache.invalidated_structs.contains(original.name) and
+        !cache.changed_declaration_structs.contains(original.name))
+    {
         if (cached) |entry| {
             try reCollectFunctionsInProgram(collector, &entry.program);
             try updateImplDeclsInProgram(collector, &entry.program);
@@ -3090,7 +5386,7 @@ fn finishMergedIr(
 
     progressStage(options, "Analysis: escape and contification", .{});
     var merged_ir = pre_final_program;
-    var analysis_result = try pipeline.runAnalysisAndContify(&merged_ir);
+    var analysis_result = try pipeline.runAnalysisAndOptimization(&merged_ir);
     if (profilingEnabled()) {
         std.debug.print("\n[stage Phase5-AnalysisAndContify] ms={d}\n", .{phase_timer.lapMs()});
     } else {
@@ -3162,35 +5458,105 @@ fn compileStructByStructIncrementalFinal(
     options: CompileOptions,
     cached_final_program: ?ir.Program,
     invalidated_structs: *const std.StringHashMap(void),
+    changed_declaration_structs: *const std.StringHashMap(void),
+    changed_graph_roots: []const zap.incremental_graph.NodeId,
+    changed_struct_names: []const []const u8,
+    dependency_graph: *zap.incremental_graph.Graph,
 ) CompileError!CompileResult {
     var pre_final = try compileStructsToPreFinalIr(alloc, ctx, struct_order, options);
+    try augmentFrontendGraphWithFunctions(alloc, dependency_graph, pre_final.program);
+    try augmentFrontendGraphWithAnalysisSummaryEdges(
+        alloc,
+        dependency_graph,
+        pre_final.program,
+        options.frontend_optimize_mode.passPolicy(),
+    );
     const cached_program = cached_final_program orelse {
+        incrementalTrace("function-selection skipped reason=no-cached-final-program", .{});
         return finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
     };
 
     var affected_functions = std.AutoHashMap(ir.FunctionId, void).init(alloc);
-    try seedAffectedFunctionsFromStructs(alloc, pre_final.program, invalidated_structs, &affected_functions);
+    defer affected_functions.deinit();
+    const graph_selection = try selectAffectedFunctionsFromGraph(
+        alloc,
+        dependency_graph,
+        pre_final.program,
+        invalidated_structs,
+        changed_graph_roots,
+        &affected_functions,
+    );
+    if (!graph_selection.usedGraph()) {
+        incrementalTrace("function-selection fallback reason={s}", .{@tagName(graph_selection)});
+        try seedAffectedFunctionsFromStructs(alloc, pre_final.program, invalidated_structs, &affected_functions);
+        try seedAffectedFunctionsFromStructs(alloc, pre_final.program, changed_declaration_structs, &affected_functions);
+        try expandAffectedFunctionsToCallers(alloc, pre_final.program, &affected_functions);
+    }
+    incrementalTrace(
+        "function-selection mode={s} invalidated_structs={d} changed_declaration_structs={d} changed_roots={d} affected_functions={d}",
+        .{
+            if (graph_selection.usedGraph()) "graph" else "fallback",
+            invalidated_structs.count(),
+            changed_declaration_structs.count(),
+            changed_graph_roots.len,
+            affected_functions.count(),
+        },
+    );
+    if (profilingEnabled()) {
+        std.debug.print(
+            "\n[incremental frontend] changed_structs={d} affected_function_selection={s} affected_functions={d}\n",
+            .{
+                changed_struct_names.len,
+                if (graph_selection.usedGraph()) "graph" else "fallback",
+                affected_functions.count(),
+            },
+        );
+    }
     if (affected_functions.count() == 0) {
         pre_final.arc_ownership.deinit();
         return .{
             .ir_program = cached_program,
             .analysis_context = null,
             .arc_ownership = null,
+            .incremental_backend_affected_function_ids = &.{},
         };
     }
 
-    try expandAffectedFunctionsToCallers(alloc, pre_final.program, &affected_functions);
+    const backend_affected_function_ids = try affectedFunctionIdsInProgramOrder(
+        alloc,
+        pre_final.program,
+        &affected_functions,
+    );
+    traceAffectedFunctionIds(pre_final.program, backend_affected_function_ids);
+    if (profilingEnabled()) {
+        std.debug.print(
+            "[incremental frontend] backend_affected_functions={d} total_functions={d}\n",
+            .{ backend_affected_function_ids.len, pre_final.program.functions.len },
+        );
+    }
     if (affected_functions.count() == pre_final.program.functions.len) {
-        return finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
+        incrementalTrace(
+            "frontend-final scope=all reason=all-functions-affected affected_functions={d} total_functions={d}",
+            .{ affected_functions.count(), pre_final.program.functions.len },
+        );
+        var result = try finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
+        result.incremental_backend_force_full = true;
+        return result;
     }
 
     if (!finalFunctionLayoutStable(pre_final.program, cached_program) or
         !unaffectedFunctionIdentitiesStable(pre_final.program, cached_program, &affected_functions))
     {
-        return finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
+        incrementalTrace("frontend-final scope=all reason=function-layout-or-identity-change", .{});
+        var result = try finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
+        result.incremental_backend_force_full = true;
+        return result;
     }
     if (!typeDefinitionsStable(pre_final.program.type_defs, cached_program.type_defs)) {
-        return finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
+        incrementalTrace("frontend-final scope=all reason=type-definitions-changed", .{});
+        var result = try finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
+        result.incremental_backend_force_full = true;
+        return result;
     }
 
     const component_program = try buildAffectedPreFinalProgram(alloc, pre_final.program, &affected_functions);
@@ -3217,6 +5583,7 @@ fn compileStructByStructIncrementalFinal(
         .ir_program = merged_program,
         .analysis_context = component_result.analysis_context,
         .arc_ownership = component_result.arc_ownership,
+        .incremental_backend_affected_function_ids = backend_affected_function_ids,
     };
 }
 
@@ -3328,10 +5695,189 @@ fn seedAffectedFunctionsFromStructs(
             if (invalidated_structs.contains("")) try affected_functions.put(function.id, {});
             continue;
         };
-        if (invalidated_structs.contains(struct_name)) {
+        if (structSetContainsIncrementalName(invalidated_structs, struct_name)) {
             try affected_functions.put(function.id, {});
         }
     }
+}
+
+fn selectAffectedFunctionsFromGraph(
+    alloc: std.mem.Allocator,
+    dependency_graph: *const zap.incremental_graph.Graph,
+    program: ir.Program,
+    invalidated_structs: *const std.StringHashMap(void),
+    changed_graph_roots: []const zap.incremental_graph.NodeId,
+    affected_functions: *std.AutoHashMap(ir.FunctionId, void),
+) CompileError!GraphFunctionSelection {
+    var body_node_to_function = std.AutoHashMap(zap.incremental_graph.NodeId, ir.FunctionId).init(alloc);
+    defer body_node_to_function.deinit();
+
+    for (program.functions) |function| {
+        const body_id = (try dependency_graph.getNode(try frontendFunctionBodyNodeKey(function))) orelse {
+            incrementalTrace(
+                "function-selection missing-node kind=function_body function={s}",
+                .{function.name},
+            );
+            return .missing_function_body_node;
+        };
+        try body_node_to_function.put(body_id, function.id);
+    }
+
+    var invalidated_root_nodes: std.ArrayListUnmanaged(zap.incremental_graph.NodeId) = .empty;
+    defer invalidated_root_nodes.deinit(alloc);
+
+    if (changed_graph_roots.len > 0) {
+        for (changed_graph_roots) |root_id| {
+            if (dependency_graph.nodeKey(root_id) == null) {
+                incrementalTrace(
+                    "function-selection missing-node kind=changed-root id={d}",
+                    .{@intFromEnum(root_id)},
+                );
+                return .missing_changed_root_node;
+            }
+            try invalidated_root_nodes.append(alloc, root_id);
+            traceIncrementalGraphNode("invalidated-changed-root-node", dependency_graph, root_id);
+        }
+    } else {
+        var invalidated_iter = invalidated_structs.iterator();
+        while (invalidated_iter.next()) |entry| {
+            const surface_id = if (entry.key_ptr.*.len == 0)
+                (try dependency_graph.getNode(frontendPackageSurfaceNodeKey())) orelse {
+                    incrementalTrace("function-selection missing-node kind=package_surface", .{});
+                    return .missing_invalidated_surface_node;
+                }
+            else
+                (try dependency_graph.getNode(frontendStructSurfaceNodeKey(entry.key_ptr.*))) orelse {
+                    incrementalTrace(
+                        "function-selection missing-node kind=struct_surface struct={s}",
+                        .{entry.key_ptr.*},
+                    );
+                    return .missing_invalidated_surface_node;
+                };
+            try invalidated_root_nodes.append(alloc, surface_id);
+            traceIncrementalGraphNode("invalidated-surface-node", dependency_graph, surface_id);
+        }
+    }
+
+    const affected_nodes = try dependency_graph.affectedFrom(alloc, invalidated_root_nodes.items);
+    defer alloc.free(affected_nodes);
+    if (incrementalTraceEnabled()) {
+        const affected_steps = try dependency_graph.affectedTraceFrom(alloc, invalidated_root_nodes.items);
+        defer alloc.free(affected_steps);
+        for (affected_steps) |step| {
+            traceIncrementalGraphStep("function-affected-edge", dependency_graph, step);
+        }
+    }
+    incrementalTrace(
+        "function-graph-reachability root_nodes={d} affected_nodes={d}",
+        .{ invalidated_root_nodes.items.len, affected_nodes.len },
+    );
+
+    var selected_functions = std.AutoHashMap(ir.FunctionId, void).init(alloc);
+    defer selected_functions.deinit();
+
+    for (invalidated_root_nodes.items) |node_id| {
+        const node_key = dependency_graph.nodeKey(node_id) orelse {
+            incrementalTrace(
+                "function-selection missing-node kind=root id={d}",
+                .{@intFromEnum(node_id)},
+            );
+            return .missing_changed_root_node;
+        };
+        switch (node_key.*) {
+            .function_body => {
+                const function_id = body_node_to_function.get(node_id) orelse {
+                    incrementalTrace(
+                        "function-selection unmapped-function-body-node id={d}",
+                        .{@intFromEnum(node_id)},
+                    );
+                    return .unmapped_function_body_node;
+                };
+                try selected_functions.put(function_id, {});
+            },
+            else => {},
+        }
+    }
+
+    for (affected_nodes) |node_id| {
+        traceIncrementalGraphNode("function-affected-node", dependency_graph, node_id);
+        const node_key = dependency_graph.nodeKey(node_id) orelse {
+            incrementalTrace(
+                "function-selection missing-node kind=affected id={d}",
+                .{@intFromEnum(node_id)},
+            );
+            return .missing_affected_node;
+        };
+        switch (node_key.*) {
+            .function_body => {
+                const function_id = body_node_to_function.get(node_id) orelse {
+                    incrementalTrace(
+                        "function-selection unmapped-function-body-node id={d}",
+                        .{@intFromEnum(node_id)},
+                    );
+                    return .unmapped_function_body_node;
+                };
+                try selected_functions.put(function_id, {});
+            },
+            else => {},
+        }
+    }
+
+    var selected_iter = selected_functions.keyIterator();
+    while (selected_iter.next()) |function_id| {
+        try affected_functions.put(function_id.*, {});
+    }
+    return .graph;
+}
+
+fn incrementalStructNameByte(byte: u8) u8 {
+    return if (byte == '.') '_' else byte;
+}
+
+fn incrementalStructNamesEqual(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_byte, right_byte| {
+        if (incrementalStructNameByte(left_byte) != incrementalStructNameByte(right_byte)) return false;
+    }
+    return true;
+}
+
+fn structSetContainsIncrementalName(struct_names: *const std.StringHashMap(void), struct_name: []const u8) bool {
+    if (struct_names.contains(struct_name)) return true;
+    var iter = struct_names.iterator();
+    while (iter.next()) |entry| {
+        if (incrementalStructNamesEqual(entry.key_ptr.*, struct_name)) return true;
+    }
+    return false;
+}
+
+fn seedAffectedFunctionsFromStructNames(
+    alloc: std.mem.Allocator,
+    program: ir.Program,
+    struct_names: []const []const u8,
+    affected_functions: *std.AutoHashMap(ir.FunctionId, void),
+) CompileError!void {
+    var changed_structs = std.StringHashMap(void).init(alloc);
+    defer changed_structs.deinit();
+    for (struct_names) |struct_name| {
+        try changed_structs.put(struct_name, {});
+    }
+    try seedAffectedFunctionsFromStructs(alloc, program, &changed_structs, affected_functions);
+}
+
+fn affectedFunctionIdsInProgramOrder(
+    alloc: std.mem.Allocator,
+    program: ir.Program,
+    affected_functions: *const std.AutoHashMap(ir.FunctionId, void),
+) CompileError![]const ir.FunctionId {
+    var ordered: std.ArrayListUnmanaged(ir.FunctionId) = .empty;
+    errdefer ordered.deinit(alloc);
+    for (program.functions) |function| {
+        if (affected_functions.contains(function.id)) {
+            try ordered.append(alloc, function.id);
+        }
+    }
+    return ordered.toOwnedSlice(alloc) catch return error.OutOfMemory;
 }
 
 fn functionById(program: ir.Program, function_id: ir.FunctionId) ?*const ir.Function {
@@ -3339,6 +5885,33 @@ fn functionById(program: ir.Program, function_id: ir.FunctionId) ?*const ir.Func
         if (function.id == function_id) return function;
     }
     return null;
+}
+
+const GraphFunctionSelection = enum {
+    graph,
+    missing_changed_root_node,
+    missing_function_body_node,
+    missing_invalidated_surface_node,
+    missing_affected_node,
+    unmapped_function_body_node,
+
+    fn usedGraph(self: GraphFunctionSelection) bool {
+        return self == .graph;
+    }
+};
+
+fn traceAffectedFunctionIds(program: ir.Program, function_ids: []const ir.FunctionId) void {
+    if (!incrementalTraceEnabled()) return;
+    for (function_ids) |function_id| {
+        const function = functionById(program, function_id) orelse {
+            incrementalTrace("affected-function id={d} name=<missing>", .{function_id});
+            continue;
+        };
+        incrementalTrace(
+            "affected-function id={d} name={s} struct={s}",
+            .{ function.id, function.name, function.struct_name orelse "<top-level>" },
+        );
+    }
 }
 
 fn functionIdByName(program: ir.Program, name: []const u8) ?ir.FunctionId {
@@ -3361,6 +5934,22 @@ fn addReverseCallEdgeTarget(
     try gop.value_ptr.append(alloc, caller_id);
 }
 
+fn addReverseDispatchCallEdges(
+    alloc: std.mem.Allocator,
+    program: ir.Program,
+    caller_id: ir.FunctionId,
+    group_id: ir.FunctionId,
+    callers_by_callee: *std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
+) CompileError!void {
+    try addReverseCallEdgeTarget(alloc, program, caller_id, group_id, callers_by_callee);
+
+    for (program.functions) |function| {
+        if (function.source_group_id == group_id) {
+            try addReverseCallEdgeTarget(alloc, program, caller_id, function.id, callers_by_callee);
+        }
+    }
+}
+
 fn addCallEdgesFromInstructions(
     alloc: std.mem.Allocator,
     program: ir.Program,
@@ -3371,6 +5960,7 @@ fn addCallEdgesFromInstructions(
     for (instructions) |instruction| {
         switch (instruction) {
             .call_direct => |call| try addReverseCallEdgeTarget(alloc, program, caller_id, call.function, callers_by_callee),
+            .call_dispatch => |call| try addReverseDispatchCallEdges(alloc, program, caller_id, call.group_id, callers_by_callee),
             .make_closure => |closure| try addReverseCallEdgeTarget(alloc, program, caller_id, closure.function, callers_by_callee),
             .call_named => |call| {
                 if (functionIdByName(program, call.name)) |target_id| {
@@ -3452,6 +6042,7 @@ fn expandAffectedFunctionsToCallers(
     }
 
     var queue: std.ArrayListUnmanaged(ir.FunctionId) = .empty;
+    defer queue.deinit(alloc);
     var affected_iter = affected_functions.keyIterator();
     while (affected_iter.next()) |function_id| try queue.append(alloc, function_id.*);
 
@@ -3511,35 +6102,2364 @@ fn mergeCachedAndAffectedFinalProgram(
     };
 }
 
-/// Phase 6 of the ARC ownership initiative: walk every function in
-/// `program` and, for each function that has a per-function entry in
-/// `ownership`, insert scope-exit `release` IR instructions before
-/// every ret-equivalent terminator (sourced from
-/// `ArcOwnership.live_before_ret`). The pass is generic, type-blind,
-/// and runs uniformly on every function regardless of whether any
-/// ARC-managed locals are present — but the actual mutation only
-/// fires when the analyzer recorded a non-empty live-before-ret set
-/// for at least one terminator in the function.
-///
-/// `program.functions` is exposed as `[]const Function` so the
-/// `@constCast` here is the seam where the drop-insertion pass
-/// reaches through to mutate body slices in place. This is the same
-/// pattern `arc_liveness.writeBackConsumeModes` uses to update
-/// `share_value.mode` fields.
-/// Phase A of the Phase 6 redux plan: run the new
-/// `arc_ownership.classifyAndNormalize` pass followed by
-/// `arc_verifier.verify` on every function in `program`. Both passes
-/// are scaffolds at Phase A (no IR mutation, no rejected programs);
-/// the wiring exists so subsequent phases (C populates the
-/// classifier, E activates the verifier rules) can light up without
-/// further plumbing changes.
-///
-/// Functions absent from `ownership` (no last-use data recorded)
-/// still go through both passes — `arc_ownership` will be expected
-/// to handle that edge case in Phase C, and even today the verifier
-/// must run on every function regardless of whether the liveness
-/// analyzer recorded any ARC locals.
+test "incremental caller expansion follows dispatch group changes" {
+    const dispatch_instructions = [_]ir.Instruction{
+        .{ .call_dispatch = .{
+            .dest = 0,
+            .group_id = 1,
+            .args = &.{},
+            .arg_modes = &.{},
+        } },
+    };
+    const caller_blocks = [_]ir.Block{.{
+        .label = 0,
+        .instructions = &dispatch_instructions,
+    }};
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "Caller__uses_dispatch__0",
+            .struct_name = "Caller",
+            .local_name = "uses_dispatch__0",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &caller_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 1,
+            .name = "Bool__negate__1",
+            .struct_name = "Bool",
+            .local_name = "negate__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = null };
+
+    var affected_functions = std.AutoHashMap(ir.FunctionId, void).init(std.testing.allocator);
+    defer affected_functions.deinit();
+    try affected_functions.put(1, {});
+
+    try expandAffectedFunctionsToCallers(std.testing.allocator, program, &affected_functions);
+
+    try std.testing.expect(affected_functions.contains(0));
+}
+
+test "incremental caller expansion follows dispatch source clause changes" {
+    const dispatch_instructions = [_]ir.Instruction{
+        .{ .call_dispatch = .{
+            .dest = 0,
+            .group_id = 1,
+            .args = &.{},
+            .arg_modes = &.{},
+        } },
+    };
+    const caller_blocks = [_]ir.Block{.{
+        .label = 0,
+        .instructions = &dispatch_instructions,
+    }};
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "Caller__uses_dispatch__0",
+            .struct_name = "Caller",
+            .local_name = "uses_dispatch__0",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &caller_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 1,
+            .name = "Bool__negate__1",
+            .struct_name = "Bool",
+            .local_name = "negate__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 2,
+            .name = "Bool__negate__1_clause_0",
+            .source_group_id = 1,
+            .source_clause_index = 0,
+            .struct_name = "Bool",
+            .local_name = "negate__1_clause_0",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = null };
+
+    var affected_functions = std.AutoHashMap(ir.FunctionId, void).init(std.testing.allocator);
+    defer affected_functions.deinit();
+    try affected_functions.put(2, {});
+
+    try expandAffectedFunctionsToCallers(std.testing.allocator, program, &affected_functions);
+
+    try std.testing.expect(affected_functions.contains(0));
+}
+
+test "incremental frontend function graph follows dispatch source clause call signatures" {
+    const dispatch_instructions = [_]ir.Instruction{
+        .{ .call_dispatch = .{
+            .dest = 0,
+            .group_id = 1,
+            .args = &.{},
+            .arg_modes = &.{},
+        } },
+    };
+    const caller_blocks = [_]ir.Block{.{
+        .label = 0,
+        .instructions = &dispatch_instructions,
+    }};
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "Caller__uses_dispatch__0",
+            .struct_name = "Caller",
+            .local_name = "uses_dispatch__0",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &caller_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 1,
+            .name = "Bool__negate__1",
+            .struct_name = "Bool",
+            .local_name = "negate__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 2,
+            .name = "Bool__negate__1_clause_0",
+            .source_group_id = 1,
+            .source_clause_index = 0,
+            .struct_name = "Bool",
+            .local_name = "negate__1_clause_0",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = null };
+
+    var dependency_graph = zap.incremental_graph.Graph.init(std.testing.allocator);
+    defer dependency_graph.deinit();
+    try augmentFrontendGraphWithFunctions(std.testing.allocator, &dependency_graph, program);
+
+    const caller_id = (try dependency_graph.getNode(try frontendFunctionBodyNodeKey(functions[0]))).?;
+    const clause_signature_id = (try dependency_graph.getNode(try frontendFunctionSignatureNodeKey(functions[2]))).?;
+    const affected = try dependency_graph.affectedFrom(std.testing.allocator, &.{clause_signature_id});
+    defer std.testing.allocator.free(affected);
+
+    try std.testing.expect(nodeIdSliceContains(affected, caller_id));
+
+    const clause_body_id = (try dependency_graph.getNode(try frontendFunctionBodyNodeKey(functions[2]))).?;
+    const body_affected = try dependency_graph.affectedFrom(std.testing.allocator, &.{clause_body_id});
+    defer std.testing.allocator.free(body_affected);
+
+    try std.testing.expect(!nodeIdSliceContains(body_affected, caller_id));
+}
+
+test "incremental graph affected function selection includes direct caller closure" {
+    const call_instructions = [_]ir.Instruction{
+        .{ .call_direct = .{
+            .dest = 0,
+            .function = 1,
+            .args = &.{},
+            .arg_modes = &.{},
+        } },
+    };
+    const caller_blocks = [_]ir.Block{.{
+        .label = 0,
+        .instructions = &call_instructions,
+    }};
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "Beta__value__0",
+            .struct_name = "Beta",
+            .local_name = "value__0",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .i64,
+            .body = &caller_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 1,
+            .name = "Alpha__value__0",
+            .struct_name = "Alpha",
+            .local_name = "value__0",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .i64,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = null };
+
+    var dependency_graph = zap.incremental_graph.Graph.init(std.testing.allocator);
+    defer dependency_graph.deinit();
+    try augmentFrontendGraphWithFunctions(std.testing.allocator, &dependency_graph, program);
+
+    var invalidated_structs = std.StringHashMap(void).init(std.testing.allocator);
+    defer invalidated_structs.deinit();
+    try invalidated_structs.put("Alpha", {});
+
+    var affected_functions = std.AutoHashMap(ir.FunctionId, void).init(std.testing.allocator);
+    defer affected_functions.deinit();
+
+    try std.testing.expectEqual(GraphFunctionSelection.graph, try selectAffectedFunctionsFromGraph(
+        std.testing.allocator,
+        &dependency_graph,
+        program,
+        &invalidated_structs,
+        &.{},
+        &affected_functions,
+    ));
+    try std.testing.expect(affected_functions.contains(0));
+    try std.testing.expect(affected_functions.contains(1));
+}
+
+test "incremental graph affected function selection keeps body-only roots function-scoped" {
+    const call_instructions = [_]ir.Instruction{
+        .{ .call_direct = .{
+            .dest = 0,
+            .function = 1,
+            .args = &.{},
+            .arg_modes = &.{},
+        } },
+    };
+    const caller_blocks = [_]ir.Block{.{
+        .label = 0,
+        .instructions = &call_instructions,
+    }};
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "Caller__check__0",
+            .struct_name = "Caller",
+            .local_name = "check__0",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &caller_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 1,
+            .name = "Bool__negate__1",
+            .struct_name = "Bool",
+            .local_name = "negate__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 2,
+            .name = "Bool__to_string__1",
+            .struct_name = "Bool",
+            .local_name = "to_string__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .string,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = null };
+
+    var dependency_graph = zap.incremental_graph.Graph.init(std.testing.allocator);
+    defer dependency_graph.deinit();
+    try augmentFrontendGraphWithFunctions(std.testing.allocator, &dependency_graph, program);
+
+    var invalidated_structs = std.StringHashMap(void).init(std.testing.allocator);
+    defer invalidated_structs.deinit();
+
+    const body_root = (try dependency_graph.getNode(try frontendFunctionBodyNodeKey(functions[1]))).?;
+    var affected_functions = std.AutoHashMap(ir.FunctionId, void).init(std.testing.allocator);
+    defer affected_functions.deinit();
+
+    try std.testing.expectEqual(GraphFunctionSelection.graph, try selectAffectedFunctionsFromGraph(
+        std.testing.allocator,
+        &dependency_graph,
+        program,
+        &invalidated_structs,
+        &.{body_root},
+        &affected_functions,
+    ));
+    try std.testing.expect(affected_functions.contains(1));
+    try std.testing.expect(!affected_functions.contains(0));
+    try std.testing.expect(!affected_functions.contains(2));
+    try std.testing.expectEqual(@as(u32, 1), affected_functions.count());
+}
+
+test "incremental graph affected function selection reaches callers from signature roots" {
+    const call_instructions = [_]ir.Instruction{
+        .{ .call_direct = .{
+            .dest = 0,
+            .function = 1,
+            .args = &.{},
+            .arg_modes = &.{},
+        } },
+    };
+    const caller_blocks = [_]ir.Block{.{
+        .label = 0,
+        .instructions = &call_instructions,
+    }};
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "Caller__check__0",
+            .struct_name = "Caller",
+            .local_name = "check__0",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &caller_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 1,
+            .name = "Bool__negate__1",
+            .struct_name = "Bool",
+            .local_name = "negate__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 2,
+            .name = "Bool__to_string__1",
+            .struct_name = "Bool",
+            .local_name = "to_string__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .string,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = null };
+
+    var dependency_graph = zap.incremental_graph.Graph.init(std.testing.allocator);
+    defer dependency_graph.deinit();
+    try augmentFrontendGraphWithFunctions(std.testing.allocator, &dependency_graph, program);
+
+    var invalidated_structs = std.StringHashMap(void).init(std.testing.allocator);
+    defer invalidated_structs.deinit();
+
+    const signature_root = (try dependency_graph.getNode(try frontendFunctionSignatureNodeKey(functions[1]))).?;
+    var affected_functions = std.AutoHashMap(ir.FunctionId, void).init(std.testing.allocator);
+    defer affected_functions.deinit();
+
+    try std.testing.expectEqual(GraphFunctionSelection.graph, try selectAffectedFunctionsFromGraph(
+        std.testing.allocator,
+        &dependency_graph,
+        program,
+        &invalidated_structs,
+        &.{signature_root},
+        &affected_functions,
+    ));
+    try std.testing.expect(affected_functions.contains(0));
+    try std.testing.expect(affected_functions.contains(1));
+    try std.testing.expect(!affected_functions.contains(2));
+    try std.testing.expectEqual(@as(u32, 2), affected_functions.count());
+}
+
+test "incremental graph analysis summary edges select callers for callee body-derived ARC conventions" {
+    const call_instructions = [_]ir.Instruction{
+        .{ .call_direct = .{
+            .dest = 1,
+            .function = 1,
+            .args = &[_]ir.LocalId{0},
+            .arg_modes = &.{},
+        } },
+    };
+    const caller_blocks = [_]ir.Block{.{
+        .label = 0,
+        .instructions = &call_instructions,
+    }};
+    const callee_params = [_]ir.Param{.{
+        .name = "value",
+        .type_expr = .string,
+    }};
+    const callee_param_conventions = [_]ir.ParamConvention{.borrowed};
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "Caller__check__1",
+            .struct_name = "Caller",
+            .local_name = "check__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &callee_params,
+            .return_type = .string,
+            .body = &caller_blocks,
+            .is_closure = false,
+            .captures = &.{},
+            .param_conventions = &callee_param_conventions,
+        },
+        .{
+            .id = 1,
+            .name = "Value__normalize__1",
+            .struct_name = "Value",
+            .local_name = "normalize__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &callee_params,
+            .return_type = .string,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+            .param_conventions = &callee_param_conventions,
+        },
+        .{
+            .id = 2,
+            .name = "Value__unrelated__0",
+            .struct_name = "Value",
+            .local_name = "unrelated__0",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .string,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = null };
+
+    var dependency_graph = zap.incremental_graph.Graph.init(std.testing.allocator);
+    defer dependency_graph.deinit();
+    try augmentFrontendGraphWithFunctions(std.testing.allocator, &dependency_graph, program);
+    try augmentFrontendGraphWithAnalysisSummaryEdges(
+        std.testing.allocator,
+        &dependency_graph,
+        program,
+        FrontendOptimizeMode.debug.passPolicy(),
+    );
+
+    const callee_body_id = (try dependency_graph.getNode(try frontendFunctionBodyNodeKey(functions[1]))).?;
+    const caller_body_id = (try dependency_graph.getNode(try frontendFunctionBodyNodeKey(functions[0]))).?;
+    const affected_trace = try dependency_graph.affectedTraceFrom(std.testing.allocator, &.{callee_body_id});
+    defer std.testing.allocator.free(affected_trace);
+    try std.testing.expectEqual(@as(usize, 1), affected_trace.len);
+    try std.testing.expectEqual(caller_body_id, affected_trace[0].depender);
+    try std.testing.expectEqual(callee_body_id, affected_trace[0].dependee);
+    try std.testing.expectEqual(zap.incremental_graph.DependencyReason.analysis_summary, affected_trace[0].reason);
+
+    var invalidated_structs = std.StringHashMap(void).init(std.testing.allocator);
+    defer invalidated_structs.deinit();
+    var affected_functions = std.AutoHashMap(ir.FunctionId, void).init(std.testing.allocator);
+    defer affected_functions.deinit();
+    try std.testing.expectEqual(GraphFunctionSelection.graph, try selectAffectedFunctionsFromGraph(
+        std.testing.allocator,
+        &dependency_graph,
+        program,
+        &invalidated_structs,
+        &.{callee_body_id},
+        &affected_functions,
+    ));
+    try std.testing.expect(affected_functions.contains(0));
+    try std.testing.expect(affected_functions.contains(1));
+    try std.testing.expect(!affected_functions.contains(2));
+    try std.testing.expectEqual(@as(u32, 2), affected_functions.count());
+}
+
+test "incremental graph affected function selection reaches owned functions from struct surface roots" {
+    const call_instructions = [_]ir.Instruction{
+        .{ .call_direct = .{
+            .dest = 0,
+            .function = 1,
+            .args = &.{},
+            .arg_modes = &.{},
+        } },
+    };
+    const caller_blocks = [_]ir.Block{.{
+        .label = 0,
+        .instructions = &call_instructions,
+    }};
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "Caller__check__0",
+            .struct_name = "Caller",
+            .local_name = "check__0",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &caller_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 1,
+            .name = "Bool__negate__1",
+            .struct_name = "Bool",
+            .local_name = "negate__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 2,
+            .name = "Bool__to_string__1",
+            .struct_name = "Bool",
+            .local_name = "to_string__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .string,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = null };
+
+    var dependency_graph = zap.incremental_graph.Graph.init(std.testing.allocator);
+    defer dependency_graph.deinit();
+    try augmentFrontendGraphWithFunctions(std.testing.allocator, &dependency_graph, program);
+
+    var invalidated_structs = std.StringHashMap(void).init(std.testing.allocator);
+    defer invalidated_structs.deinit();
+
+    const struct_root = (try dependency_graph.getNode(frontendStructSurfaceNodeKey("Bool"))).?;
+    var affected_functions = std.AutoHashMap(ir.FunctionId, void).init(std.testing.allocator);
+    defer affected_functions.deinit();
+
+    try std.testing.expectEqual(GraphFunctionSelection.graph, try selectAffectedFunctionsFromGraph(
+        std.testing.allocator,
+        &dependency_graph,
+        program,
+        &invalidated_structs,
+        &.{struct_root},
+        &affected_functions,
+    ));
+    try std.testing.expect(affected_functions.contains(0));
+    try std.testing.expect(affected_functions.contains(1));
+    try std.testing.expect(affected_functions.contains(2));
+    try std.testing.expectEqual(@as(u32, 3), affected_functions.count());
+}
+
+test "incremental graph affected function selection includes dispatch source-clause callers" {
+    const dispatch_instructions = [_]ir.Instruction{
+        .{ .call_dispatch = .{
+            .dest = 0,
+            .group_id = 1,
+            .args = &.{},
+            .arg_modes = &.{},
+        } },
+    };
+    const caller_blocks = [_]ir.Block{.{
+        .label = 0,
+        .instructions = &dispatch_instructions,
+    }};
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "Caller__uses_dispatch__0",
+            .struct_name = "Caller",
+            .local_name = "uses_dispatch__0",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &caller_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 1,
+            .name = "Bool__negate__1",
+            .struct_name = "Bool",
+            .local_name = "negate__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 2,
+            .name = "Bool__negate__1_clause_0",
+            .source_group_id = 1,
+            .source_clause_index = 0,
+            .struct_name = "Bool",
+            .local_name = "negate__1_clause_0",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = null };
+
+    var dependency_graph = zap.incremental_graph.Graph.init(std.testing.allocator);
+    defer dependency_graph.deinit();
+    try augmentFrontendGraphWithFunctions(std.testing.allocator, &dependency_graph, program);
+
+    var invalidated_structs = std.StringHashMap(void).init(std.testing.allocator);
+    defer invalidated_structs.deinit();
+    try invalidated_structs.put("Bool", {});
+
+    var affected_functions = std.AutoHashMap(ir.FunctionId, void).init(std.testing.allocator);
+    defer affected_functions.deinit();
+
+    try std.testing.expectEqual(GraphFunctionSelection.graph, try selectAffectedFunctionsFromGraph(
+        std.testing.allocator,
+        &dependency_graph,
+        program,
+        &invalidated_structs,
+        &.{},
+        &affected_functions,
+    ));
+    try std.testing.expect(affected_functions.contains(0));
+    try std.testing.expect(affected_functions.contains(1));
+    try std.testing.expect(affected_functions.contains(2));
+}
+
+test "incremental graph affected function selection handles top-level invalidation" {
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "main__0",
+            .struct_name = null,
+            .local_name = "main__0",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .i64,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var dependency_graph = zap.incremental_graph.Graph.init(std.testing.allocator);
+    defer dependency_graph.deinit();
+    try augmentFrontendGraphWithFunctions(std.testing.allocator, &dependency_graph, program);
+
+    var invalidated_structs = std.StringHashMap(void).init(std.testing.allocator);
+    defer invalidated_structs.deinit();
+    try invalidated_structs.put("", {});
+
+    var affected_functions = std.AutoHashMap(ir.FunctionId, void).init(std.testing.allocator);
+    defer affected_functions.deinit();
+
+    try std.testing.expectEqual(GraphFunctionSelection.graph, try selectAffectedFunctionsFromGraph(
+        std.testing.allocator,
+        &dependency_graph,
+        program,
+        &invalidated_structs,
+        &.{},
+        &affected_functions,
+    ));
+    try std.testing.expect(affected_functions.contains(0));
+    try std.testing.expectEqual(@as(u32, 1), affected_functions.count());
+}
+
+test "incremental backend affected ids use changed structs and caller closure" {
+    const call_instructions = [_]ir.Instruction{
+        .{ .call_direct = .{
+            .dest = 0,
+            .function = 1,
+            .args = &.{},
+            .arg_modes = &.{},
+        } },
+    };
+    const caller_blocks = [_]ir.Block{.{
+        .label = 0,
+        .instructions = &call_instructions,
+    }};
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "Caller__check__0",
+            .struct_name = "Caller",
+            .local_name = "check__0",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &caller_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 1,
+            .name = "Bool__negate__1",
+            .struct_name = "Bool",
+            .local_name = "negate__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .bool_type,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = null };
+
+    var affected_functions = std.AutoHashMap(ir.FunctionId, void).init(std.testing.allocator);
+    defer affected_functions.deinit();
+    try seedAffectedFunctionsFromStructNames(std.testing.allocator, program, &[_][]const u8{"Bool"}, &affected_functions);
+    try expandAffectedFunctionsToCallers(std.testing.allocator, program, &affected_functions);
+    const affected_ids = try affectedFunctionIdsInProgramOrder(std.testing.allocator, program, &affected_functions);
+    defer std.testing.allocator.free(affected_ids);
+
+    try std.testing.expectEqual(@as(usize, 2), affected_ids.len);
+    try std.testing.expectEqual(@as(ir.FunctionId, 0), affected_ids[0]);
+    try std.testing.expectEqual(@as(ir.FunctionId, 1), affected_ids[1]);
+}
+
+test "incremental frontend invalidates dispatch callers when callee clauses change" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const bool_structs = [_][]const u8{"Bool"};
+    const caller_structs = [_][]const u8{"Caller"};
+    try file_to_structs.put("lib/bool.zap", &bool_structs);
+    try file_to_structs.put("lib/caller.zap", &caller_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    const bool_dependents = [_][]const u8{"lib/caller.zap"};
+    try file_imported_by.put("lib/bool.zap", &bool_dependents);
+
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const struct_order = [_][]const u8{ "Bool", "Caller" };
+
+    const bool_correct_source =
+        "pub struct Bool {\n" ++
+        "  pub fn negate(true) -> Bool { false }\n" ++
+        "  pub fn negate(false) -> Bool { true }\n" ++
+        "}\n";
+    const bool_broken_source =
+        "pub struct Bool {\n" ++
+        "  pub fn negate(true) -> Bool { true }\n" ++
+        "  pub fn negate(false) -> Bool { false }\n" ++
+        "}\n";
+    const caller_source =
+        "pub struct Caller {\n" ++
+        "  pub fn check() -> Bool { Bool.negate(false) }\n" ++
+        "}\n";
+
+    var correct_units = [_]SourceUnit{
+        .{ .file_path = "lib/bool.zap", .source = bool_correct_source, .primary_struct_name = "Bool" },
+        .{ .file_path = "lib/caller.zap", .source = caller_source, .primary_struct_name = "Caller" },
+    };
+    var initial = try state.prepare(alloc, &correct_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    try expectCtfeBool(alloc, initial.result.ir_program, "Caller__check__0", true);
+    try initial.commit();
+    initial.deinit();
+
+    var broken_units = [_]SourceUnit{
+        .{ .file_path = "lib/bool.zap", .source = bool_broken_source, .primary_struct_name = "Bool" },
+        .{ .file_path = "lib/caller.zap", .source = caller_source, .primary_struct_name = "Caller" },
+    };
+    var broken = try state.prepare(alloc, &broken_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    try expectCtfeBool(alloc, broken.result.ir_program, "Caller__check__0", false);
+    try broken.commit();
+    broken.deinit();
+
+    var restored = try state.prepare(alloc, &correct_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    try expectCtfeBool(alloc, restored.result.ir_program, "Caller__check__0", true);
+    try restored.commit();
+    restored.deinit();
+}
+
+test "incremental frontend propagates changed callee behavior through indirect callers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const bool_structs = [_][]const u8{"Bool"};
+    const middle_structs = [_][]const u8{"Middle"};
+    const top_structs = [_][]const u8{"Top"};
+    try file_to_structs.put("lib/bool.zap", &bool_structs);
+    try file_to_structs.put("lib/middle.zap", &middle_structs);
+    try file_to_structs.put("lib/top.zap", &top_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    const bool_dependents = [_][]const u8{"lib/middle.zap"};
+    const middle_dependents = [_][]const u8{"lib/top.zap"};
+    try file_imported_by.put("lib/bool.zap", &bool_dependents);
+    try file_imported_by.put("lib/middle.zap", &middle_dependents);
+
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const struct_order = [_][]const u8{ "Bool", "Middle", "Top" };
+
+    const bool_correct_source =
+        "pub struct Bool {\n" ++
+        "  pub fn negate(true) -> Bool { false }\n" ++
+        "  pub fn negate(false) -> Bool { true }\n" ++
+        "}\n";
+    const bool_broken_source =
+        "pub struct Bool {\n" ++
+        "  pub fn negate(true) -> Bool { true }\n" ++
+        "  pub fn negate(false) -> Bool { false }\n" ++
+        "}\n";
+    const middle_source =
+        "pub struct Middle {\n" ++
+        "  pub fn check() -> Bool { Bool.negate(false) }\n" ++
+        "}\n";
+    const top_source =
+        "pub struct Top {\n" ++
+        "  pub fn check() -> Bool { Middle.check() }\n" ++
+        "}\n";
+
+    var correct_units = [_]SourceUnit{
+        .{ .file_path = "lib/bool.zap", .source = bool_correct_source, .primary_struct_name = "Bool" },
+        .{ .file_path = "lib/middle.zap", .source = middle_source, .primary_struct_name = "Middle" },
+        .{ .file_path = "lib/top.zap", .source = top_source, .primary_struct_name = "Top" },
+    };
+    var initial = try state.prepare(alloc, &correct_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    try expectCtfeBool(alloc, initial.result.ir_program, "Top__check__0", true);
+    try initial.commit();
+    initial.deinit();
+
+    var broken_units = [_]SourceUnit{
+        .{ .file_path = "lib/bool.zap", .source = bool_broken_source, .primary_struct_name = "Bool" },
+        .{ .file_path = "lib/middle.zap", .source = middle_source, .primary_struct_name = "Middle" },
+        .{ .file_path = "lib/top.zap", .source = top_source, .primary_struct_name = "Top" },
+    };
+    var broken = try state.prepare(alloc, &broken_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    try expectCtfeBool(alloc, broken.result.ir_program, "Top__check__0", false);
+    try broken.commit();
+    broken.deinit();
+}
+
+test "incremental frontend commit stores durable source and struct graph nodes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const alpha_structs = [_][]const u8{"Alpha"};
+    try file_to_structs.put("lib/alpha.zap", &alpha_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+
+    const alpha_source =
+        "pub struct Alpha {\n" ++
+        "  pub fn value() -> i64 { 1 }\n" ++
+        "}\n";
+    var units = [_]SourceUnit{
+        .{ .file_path = "lib/alpha.zap", .source = alpha_source, .primary_struct_name = "Alpha" },
+    };
+
+    var prepared = try state.prepare(alloc, &units, graph, .{ .show_progress = false });
+    try prepared.commit();
+    prepared.deinit();
+
+    try std.testing.expect(state.dependencyGraphNodeCount() >= 2);
+    try std.testing.expect((try state.dependencyGraphSourceFileNode("lib/alpha.zap")) != null);
+    try std.testing.expect((try state.dependencyGraphStructSurfaceNode("Alpha")) != null);
+}
+
+test "incremental frontend graph represents import dependents without changing invalidation behavior" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const alpha_structs = [_][]const u8{"Alpha"};
+    const beta_structs = [_][]const u8{"Beta"};
+    try file_to_structs.put("lib/alpha.zap", &alpha_structs);
+    try file_to_structs.put("lib/beta.zap", &beta_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    const alpha_dependents = [_][]const u8{"lib/beta.zap"};
+    try file_imported_by.put("lib/alpha.zap", &alpha_dependents);
+
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const struct_order = [_][]const u8{ "Alpha", "Beta" };
+
+    const alpha_source =
+        "pub struct Alpha {\n" ++
+        "  pub fn value() -> i64 { 1 }\n" ++
+        "}\n";
+    const beta_source =
+        "pub struct Beta {\n" ++
+        "  pub fn value() -> i64 { Alpha.value() }\n" ++
+        "}\n";
+    var units = [_]SourceUnit{
+        .{ .file_path = "lib/alpha.zap", .source = alpha_source, .primary_struct_name = "Alpha" },
+        .{ .file_path = "lib/beta.zap", .source = beta_source, .primary_struct_name = "Beta" },
+    };
+
+    var prepared = try state.prepare(alloc, &units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    try prepared.commit();
+    prepared.deinit();
+
+    const alpha_id = (try state.dependencyGraphStructSurfaceNode("Alpha")).?;
+    const beta_id = (try state.dependencyGraphStructSurfaceNode("Beta")).?;
+    const affected = try state.dependencyGraphAffectedFromSourceFile(std.testing.allocator, "lib/alpha.zap");
+    defer std.testing.allocator.free(affected);
+
+    try std.testing.expect(nodeIdSliceContains(affected, alpha_id));
+    try std.testing.expect(nodeIdSliceContains(affected, beta_id));
+}
+
+test "incremental frontend graph-backed invalidation follows transitive import struct surfaces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+    state.initialized = true;
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const alpha_structs = [_][]const u8{"Alpha"};
+    const middle_structs = [_][]const u8{"Middle"};
+    const top_structs = [_][]const u8{"Top"};
+    try file_to_structs.put("lib/alpha.zap", &alpha_structs);
+    try file_to_structs.put("lib/middle.zap", &middle_structs);
+    try file_to_structs.put("lib/top.zap", &top_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    const alpha_dependents = [_][]const u8{"lib/middle.zap"};
+    const middle_dependents = [_][]const u8{"lib/top.zap"};
+    try file_imported_by.put("lib/alpha.zap", &alpha_dependents);
+    try file_imported_by.put("lib/middle.zap", &middle_dependents);
+
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const frontend_graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const source_units = [_]SourceUnit{
+        .{ .file_path = "lib/alpha.zap", .source = "", .primary_struct_name = "Alpha" },
+        .{ .file_path = "lib/middle.zap", .source = "", .primary_struct_name = "Middle" },
+        .{ .file_path = "lib/top.zap", .source = "", .primary_struct_name = "Top" },
+    };
+
+    var dependency_graph = try buildFrontendIncrementalGraph(std.testing.allocator, &source_units, frontend_graph);
+    defer dependency_graph.deinit();
+
+    var invalidated_structs = std.StringHashMap(void).init(alloc);
+    var changed_declaration_structs = std.StringHashMap(void).init(alloc);
+    var changed_graph_roots: std.ArrayListUnmanaged(zap.incremental_graph.NodeId) = .empty;
+    const changed_files = [_][]const u8{"lib/alpha.zap"};
+    try state.computeInvalidatedStructs(
+        alloc,
+        &source_units,
+        frontend_graph,
+        &dependency_graph,
+        &changed_files,
+        &.{},
+        &invalidated_structs,
+        &changed_declaration_structs,
+        &changed_graph_roots,
+    );
+
+    try std.testing.expect(invalidated_structs.contains("Alpha"));
+    try std.testing.expect(invalidated_structs.contains("Middle"));
+    try std.testing.expect(invalidated_structs.contains("Top"));
+    try std.testing.expectEqual(@as(u32, 3), invalidated_structs.count());
+}
+
+test "incremental frontend dependent guardrails force full invalidation before graph narrowing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+    state.initialized = true;
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const alpha_structs = [_][]const u8{"Alpha"};
+    const beta_structs = [_][]const u8{"Beta"};
+    const empty_structs = [_][]const u8{};
+    try file_to_structs.put("lib/alpha.zap", &alpha_structs);
+    try file_to_structs.put("lib/beta.zap", &beta_structs);
+    try file_to_structs.put("lib/empty.zap", &empty_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    const alpha_dependents = [_][]const u8{"lib/empty.zap"};
+    try file_imported_by.put("lib/alpha.zap", &alpha_dependents);
+
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const frontend_graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const source_units = [_]SourceUnit{
+        .{ .file_path = "lib/alpha.zap", .source = "", .primary_struct_name = "Alpha" },
+        .{ .file_path = "lib/beta.zap", .source = "", .primary_struct_name = "Beta" },
+        .{ .file_path = "lib/empty.zap", .source = "" },
+    };
+
+    var dependency_graph = try buildFrontendIncrementalGraph(std.testing.allocator, &source_units, frontend_graph);
+    defer dependency_graph.deinit();
+
+    var invalidated_structs = std.StringHashMap(void).init(alloc);
+    var changed_declaration_structs = std.StringHashMap(void).init(alloc);
+    var changed_graph_roots: std.ArrayListUnmanaged(zap.incremental_graph.NodeId) = .empty;
+    const changed_files = [_][]const u8{"lib/alpha.zap"};
+    try state.computeInvalidatedStructs(
+        alloc,
+        &source_units,
+        frontend_graph,
+        &dependency_graph,
+        &changed_files,
+        &.{},
+        &invalidated_structs,
+        &changed_declaration_structs,
+        &changed_graph_roots,
+    );
+
+    try std.testing.expect(invalidated_structs.contains("Alpha"));
+    try std.testing.expect(invalidated_structs.contains("Beta"));
+    try std.testing.expectEqual(@as(u32, 2), invalidated_structs.count());
+}
+
+test "incremental frontend transitive dependent guardrails force full invalidation before graph narrowing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+    state.initialized = true;
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const alpha_structs = [_][]const u8{"Alpha"};
+    const middle_structs = [_][]const u8{"Middle"};
+    const beta_structs = [_][]const u8{"Beta"};
+    const empty_structs = [_][]const u8{};
+    try file_to_structs.put("lib/alpha.zap", &alpha_structs);
+    try file_to_structs.put("lib/middle.zap", &middle_structs);
+    try file_to_structs.put("lib/beta.zap", &beta_structs);
+    try file_to_structs.put("lib/empty.zap", &empty_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    const alpha_dependents = [_][]const u8{"lib/middle.zap"};
+    const middle_dependents = [_][]const u8{"lib/empty.zap"};
+    try file_imported_by.put("lib/alpha.zap", &alpha_dependents);
+    try file_imported_by.put("lib/middle.zap", &middle_dependents);
+
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const frontend_graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const source_units = [_]SourceUnit{
+        .{ .file_path = "lib/alpha.zap", .source = "", .primary_struct_name = "Alpha" },
+        .{ .file_path = "lib/middle.zap", .source = "", .primary_struct_name = "Middle" },
+        .{ .file_path = "lib/beta.zap", .source = "", .primary_struct_name = "Beta" },
+        .{ .file_path = "lib/empty.zap", .source = "" },
+    };
+
+    var dependency_graph = try buildFrontendIncrementalGraph(std.testing.allocator, &source_units, frontend_graph);
+    defer dependency_graph.deinit();
+
+    var invalidated_structs = std.StringHashMap(void).init(alloc);
+    var changed_declaration_structs = std.StringHashMap(void).init(alloc);
+    var changed_graph_roots: std.ArrayListUnmanaged(zap.incremental_graph.NodeId) = .empty;
+    const changed_files = [_][]const u8{"lib/alpha.zap"};
+    try state.computeInvalidatedStructs(
+        alloc,
+        &source_units,
+        frontend_graph,
+        &dependency_graph,
+        &changed_files,
+        &.{},
+        &invalidated_structs,
+        &changed_declaration_structs,
+        &changed_graph_roots,
+    );
+
+    try std.testing.expect(invalidated_structs.contains("Alpha"));
+    try std.testing.expect(invalidated_structs.contains("Middle"));
+    try std.testing.expect(invalidated_structs.contains("Beta"));
+    try std.testing.expectEqual(@as(u32, 3), invalidated_structs.count());
+}
+
+test "incremental frontend graph represents compile-after inventory without import invalidation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const provider_structs = [_][]const u8{"Provider"};
+    const runner_structs = [_][]const u8{"TestRunner"};
+    try file_to_structs.put("lib/provider.zap", &provider_structs);
+    try file_to_structs.put("test/test_runner.zap", &runner_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const runner_patterns = [_][]const u8{"test/**/*_test.zap"};
+    const runner_matches = [_][]const u8{"lib/provider.zap"};
+    try file_compile_after_globs.put("test/test_runner.zap", &runner_patterns);
+    try file_compile_after_files.put("test/test_runner.zap", &runner_matches);
+
+    const frontend_graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const provider_source =
+        "pub struct Provider {\n" ++
+        "  pub fn value() -> i64 { 1 }\n" ++
+        "}\n";
+    const runner_source =
+        "pub struct TestRunner {\n" ++
+        "  pub fn main() -> i64 { 0 }\n" ++
+        "}\n";
+    const source_units = [_]SourceUnit{
+        .{ .file_path = "lib/provider.zap", .source = provider_source, .primary_struct_name = "Provider" },
+        .{ .file_path = "test/test_runner.zap", .source = runner_source, .primary_struct_name = "TestRunner" },
+    };
+
+    var dependency_graph = try buildFrontendIncrementalGraph(std.testing.allocator, &source_units, frontend_graph);
+    defer dependency_graph.deinit();
+
+    const glob_id = (try dependency_graph.getNode(frontendCompileAfterGlobNodeKey("test/test_runner.zap"))).?;
+    const runner_id = (try dependency_graph.getNode(frontendStructSurfaceNodeKey("TestRunner"))).?;
+    const provider_source_id = (try dependency_graph.getNode(frontendSourceFileNodeKey("lib/provider.zap"))).?;
+    const provider_reflection_id = (try dependency_graph.getNode(frontendStructReflectionNodeKey("Provider"))).?;
+
+    const affected = try dependency_graph.affectedFrom(std.testing.allocator, &.{glob_id});
+    defer std.testing.allocator.free(affected);
+    try std.testing.expect(nodeIdSliceContains(affected, runner_id));
+
+    const source_affected = try dependency_graph.affectedFrom(std.testing.allocator, &.{provider_source_id});
+    defer std.testing.allocator.free(source_affected);
+    try std.testing.expect(!nodeIdSliceContains(source_affected, runner_id));
+
+    const reflection_affected = try dependency_graph.affectedFrom(std.testing.allocator, &.{provider_reflection_id});
+    defer std.testing.allocator.free(reflection_affected);
+    try std.testing.expect(nodeIdSliceContains(reflection_affected, runner_id));
+}
+
+test "incremental frontend compile-after ignores provider body-only changes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const provider_structs = [_][]const u8{"Provider"};
+    const runner_structs = [_][]const u8{"TestRunner"};
+    try file_to_structs.put("lib/provider.zap", &provider_structs);
+    try file_to_structs.put("test/test_runner.zap", &runner_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const runner_patterns = [_][]const u8{"test/**/*_test.zap"};
+    const runner_matches = [_][]const u8{"lib/provider.zap"};
+    try file_compile_after_globs.put("test/test_runner.zap", &runner_patterns);
+    try file_compile_after_files.put("test/test_runner.zap", &runner_matches);
+
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const struct_order = [_][]const u8{ "Provider", "TestRunner" };
+    const provider_v1 =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+    const provider_v2 =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 2 }\n" ++
+        "}\n";
+    const runner_source =
+        "pub struct TestRunner {\n" ++
+        "  pub fn main() -> i64 { 0 }\n" ++
+        "}\n";
+
+    var initial_units = [_]SourceUnit{
+        .{ .file_path = "lib/provider.zap", .source = provider_v1, .primary_struct_name = "Provider" },
+        .{ .file_path = "test/test_runner.zap", .source = runner_source, .primary_struct_name = "TestRunner" },
+    };
+    var initial = try state.prepare(alloc, &initial_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    try initial.commit();
+    initial.deinit();
+
+    var changed_units = [_]SourceUnit{
+        .{ .file_path = "lib/provider.zap", .source = provider_v2, .primary_struct_name = "Provider" },
+        .{ .file_path = "test/test_runner.zap", .source = runner_source, .primary_struct_name = "TestRunner" },
+    };
+    var changed = try state.prepare(alloc, &changed_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    defer changed.deinit();
+
+    try std.testing.expect(!stringSliceContains(changed.invalidated_struct_names, "TestRunner"));
+    try std.testing.expectEqual(@as(usize, 1), changed.changed_graph_roots.len);
+    const root_key = changed.new_dependency_graph.nodeKey(changed.changed_graph_roots[0]).?;
+    try std.testing.expectEqual(zap.incremental_graph.NodeKind.function_body, root_key.kind());
+    try std.testing.expect(!nodeIdSliceContainsKind(&changed.new_dependency_graph, changed.changed_graph_roots, .ctfe_reflection));
+}
+
+test "incremental frontend compile-after follows reflected public interface changes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const provider_structs = [_][]const u8{"Provider"};
+    const runner_structs = [_][]const u8{"TestRunner"};
+    try file_to_structs.put("lib/provider.zap", &provider_structs);
+    try file_to_structs.put("test/test_runner.zap", &runner_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const runner_patterns = [_][]const u8{"test/**/*_test.zap"};
+    const runner_matches = [_][]const u8{"lib/provider.zap"};
+    try file_compile_after_globs.put("test/test_runner.zap", &runner_patterns);
+    try file_compile_after_files.put("test/test_runner.zap", &runner_matches);
+
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const struct_order = [_][]const u8{ "Provider", "TestRunner" };
+    const provider_v1 =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+    const provider_v2 =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> f64 { 1.0 }\n" ++
+        "}\n";
+    const runner_source =
+        "pub struct TestRunner {\n" ++
+        "  pub fn main() -> i64 { 0 }\n" ++
+        "}\n";
+
+    var initial_units = [_]SourceUnit{
+        .{ .file_path = "lib/provider.zap", .source = provider_v1, .primary_struct_name = "Provider" },
+        .{ .file_path = "test/test_runner.zap", .source = runner_source, .primary_struct_name = "TestRunner" },
+    };
+    var initial = try state.prepare(alloc, &initial_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    try initial.commit();
+    initial.deinit();
+
+    var changed_units = [_]SourceUnit{
+        .{ .file_path = "lib/provider.zap", .source = provider_v2, .primary_struct_name = "Provider" },
+        .{ .file_path = "test/test_runner.zap", .source = runner_source, .primary_struct_name = "TestRunner" },
+    };
+    var changed = try state.prepare(alloc, &changed_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    defer changed.deinit();
+
+    try std.testing.expect(stringSliceContains(changed.invalidated_struct_names, "TestRunner"));
+    try std.testing.expect(nodeIdSliceContainsKind(&changed.new_dependency_graph, changed.changed_graph_roots, .ctfe_reflection));
+}
+
+test "incremental frontend compile-after follows reflected public function doc changes" {
+    const provider_v1 =
+        "pub struct Provider {\n" ++
+        "  @doc = \"\"\"\n" ++
+        "    First reflected doc.\n" ++
+        "    \"\"\"\n\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+    const provider_v2 =
+        "pub struct Provider {\n" ++
+        "  @doc = \"\"\"\n" ++
+        "    Updated reflected doc.\n" ++
+        "    \"\"\"\n\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+
+    try expectCompileAfterRunnerInvalidation(provider_v1, provider_v2, true, true);
+}
+
+test "incremental frontend compile-after follows reflected public macro presence changes" {
+    const provider_v1 =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+    const provider_v2 =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n\n" ++
+        "  pub macro reflected_macro() -> Expr {\n" ++
+        "    quote { 1 }\n" ++
+        "  }\n" ++
+        "}\n";
+
+    try expectCompileAfterRunnerInvalidation(provider_v1, provider_v2, true, true);
+}
+
+test "incremental frontend compile-after follows reflected public macro signature changes" {
+    const provider_v1 =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n\n" ++
+        "  pub macro reflected_macro() -> Expr {\n" ++
+        "    quote { 1 }\n" ++
+        "  }\n" ++
+        "}\n";
+    const provider_v2 =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n\n" ++
+        "  pub macro reflected_macro(value :: Expr) -> Expr {\n" ++
+        "    quote { unquote(value) }\n" ++
+        "  }\n" ++
+        "}\n";
+
+    try expectCompileAfterRunnerInvalidation(provider_v1, provider_v2, true, true);
+}
+
+test "incremental frontend compile-after follows reflected public macro doc changes" {
+    const provider_v1 =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n\n" ++
+        "  @doc = \"\"\"\n" ++
+        "    First macro doc.\n" ++
+        "    \"\"\"\n\n" ++
+        "  pub macro reflected_macro() -> Expr {\n" ++
+        "    quote { 1 }\n" ++
+        "  }\n" ++
+        "}\n";
+    const provider_v2 =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n\n" ++
+        "  @doc = \"\"\"\n" ++
+        "    Updated macro doc.\n" ++
+        "    \"\"\"\n\n" ++
+        "  pub macro reflected_macro() -> Expr {\n" ++
+        "    quote { 1 }\n" ++
+        "  }\n" ++
+        "}\n";
+
+    try expectCompileAfterRunnerInvalidation(provider_v1, provider_v2, true, true);
+}
+
+test "incremental frontend compile-after follows reflected struct doc changes" {
+    const provider_v1 =
+        "@doc = \"\"\"\n" ++
+        "  First struct doc.\n" ++
+        "  \"\"\"\n\n" ++
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+    const provider_v2 =
+        "@doc = \"\"\"\n" ++
+        "  Updated struct doc.\n" ++
+        "  \"\"\"\n\n" ++
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+
+    try expectCompileAfterRunnerInvalidation(provider_v1, provider_v2, true, true);
+}
+
+test "incremental frontend compile-after follows reflected struct privacy changes" {
+    const provider_v1 =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+    const provider_v2 =
+        "struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+
+    try expectCompileAfterRunnerInvalidation(provider_v1, provider_v2, true, true);
+}
+
+test "incremental frontend reflection fingerprints include struct-level expression surface" {
+    const provider_v1 =
+        "pub struct Provider {\n" ++
+        "  emit_case(\"alpha\")\n\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+    const provider_v2 =
+        "pub struct Provider {\n" ++
+        "  emit_case(\"beta\")\n\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+
+    try expectReflectionRootForMetadataChange(provider_v1, provider_v2);
+}
+
+test "incremental frontend reflection fingerprints include use declarations" {
+    const provider_v1 =
+        "pub struct Provider {\n" ++
+        "  use MacroSurface, pattern: \"alpha\"\n\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+    const provider_v2 =
+        "pub struct Provider {\n" ++
+        "  use MacroSurface, pattern: \"beta\"\n\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+
+    try expectReflectionRootForMetadataChange(provider_v1, provider_v2);
+}
+
+test "incremental frontend reflection fingerprints include non-doc struct attributes" {
+    const provider_v1 =
+        "pub struct Provider {\n" ++
+        "  @generated_count :: i64 = 1\n\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+    const provider_v2 =
+        "pub struct Provider {\n" ++
+        "  @generated_count :: i64 = 2\n\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+
+    try expectReflectionRootForMetadataChange(provider_v1, provider_v2);
+}
+
+test "incremental frontend reflection fingerprints include source file metadata" {
+    const provider_source =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+
+    try expectReflectionRootForMetadataChangeWithPaths(
+        "lib/provider.zap",
+        provider_source,
+        "lib/renamed_provider.zap",
+        provider_source,
+    );
+}
+
+test "incremental frontend reflection fingerprints represent protocol union and impl inventory" {
+    const base_source =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n\n" ++
+        "pub protocol Reflectable {\n" ++
+        "  fn render(value :: Provider) -> String\n" ++
+        "}\n\n" ++
+        "pub union ProviderMode {\n" ++
+        "  Fast,\n" ++
+        "  Slow\n" ++
+        "}\n\n" ++
+        "pub impl Reflectable for Provider {\n" ++
+        "  pub fn render(value :: Provider) -> String { \"provider\" }\n" ++
+        "}\n";
+    const protocol_changed =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n\n" ++
+        "pub protocol Reflectable {\n" ++
+        "  fn render(value :: Provider) -> i64\n" ++
+        "}\n\n" ++
+        "pub union ProviderMode {\n" ++
+        "  Fast,\n" ++
+        "  Slow\n" ++
+        "}\n\n" ++
+        "pub impl Reflectable for Provider {\n" ++
+        "  pub fn render(value :: Provider) -> String { \"provider\" }\n" ++
+        "}\n";
+    const union_changed =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n\n" ++
+        "pub protocol Reflectable {\n" ++
+        "  fn render(value :: Provider) -> String\n" ++
+        "}\n\n" ++
+        "pub union ProviderMode {\n" ++
+        "  Fast,\n" ++
+        "  Slow,\n" ++
+        "  Tagged :: i64\n" ++
+        "}\n\n" ++
+        "pub impl Reflectable for Provider {\n" ++
+        "  pub fn render(value :: Provider) -> String { \"provider\" }\n" ++
+        "}\n";
+    const impl_changed =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n\n" ++
+        "pub protocol Reflectable {\n" ++
+        "  fn render(value :: Provider) -> String\n" ++
+        "}\n\n" ++
+        "pub union ProviderMode {\n" ++
+        "  Fast,\n" ++
+        "  Slow\n" ++
+        "}\n\n" ++
+        "impl Reflectable for Provider {\n" ++
+        "  pub fn render(value :: Provider) -> String { \"provider\" }\n" ++
+        "}\n";
+
+    try expectReflectionRootForMetadataChange(base_source, protocol_changed);
+    try expectReflectionRootForMetadataChange(base_source, union_changed);
+    try expectReflectionRootForMetadataChange(base_source, impl_changed);
+}
+
+test "incremental frontend compile-after falls back for protocol-only reflected inventory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const protocol_structs = [_][]const u8{};
+    const runner_structs = [_][]const u8{"TestRunner"};
+    try file_to_structs.put("lib/reflectable.zap", &protocol_structs);
+    try file_to_structs.put("test/test_runner.zap", &runner_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const runner_patterns = [_][]const u8{"lib/*.zap"};
+    const runner_matches = [_][]const u8{"lib/reflectable.zap"};
+    try file_compile_after_globs.put("test/test_runner.zap", &runner_patterns);
+    try file_compile_after_files.put("test/test_runner.zap", &runner_matches);
+
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const struct_order = [_][]const u8{"TestRunner"};
+    const protocol_v1 =
+        "pub protocol Reflectable {\n" ++
+        "  fn render(value) -> String\n" ++
+        "}\n";
+    const protocol_v2 =
+        "pub protocol Reflectable {\n" ++
+        "  fn render(value) -> i64\n" ++
+        "}\n";
+    const runner_source =
+        "pub struct TestRunner {\n" ++
+        "  pub fn main() -> i64 { 0 }\n" ++
+        "}\n";
+
+    var initial_units = [_]SourceUnit{
+        .{ .file_path = "lib/reflectable.zap", .source = protocol_v1 },
+        .{ .file_path = "test/test_runner.zap", .source = runner_source, .primary_struct_name = "TestRunner" },
+    };
+    var initial = try state.prepare(alloc, &initial_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    try initial.commit();
+    initial.deinit();
+
+    var changed_units = [_]SourceUnit{
+        .{ .file_path = "lib/reflectable.zap", .source = protocol_v2 },
+        .{ .file_path = "test/test_runner.zap", .source = runner_source, .primary_struct_name = "TestRunner" },
+    };
+    var changed = try state.prepare(alloc, &changed_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    defer changed.deinit();
+
+    try std.testing.expect(stringSliceContains(changed.invalidated_struct_names, "TestRunner"));
+    try std.testing.expectEqual(@as(usize, 0), changed.changed_graph_roots.len);
+}
+
+test "incremental frontend compile-after follows glob inventory changes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const provider_structs = [_][]const u8{"Provider"};
+    const extra_structs = [_][]const u8{"Extra"};
+    const runner_structs = [_][]const u8{"TestRunner"};
+    try file_to_structs.put("lib/provider.zap", &provider_structs);
+    try file_to_structs.put("lib/extra.zap", &extra_structs);
+    try file_to_structs.put("test/test_runner.zap", &runner_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const runner_patterns_v1 = [_][]const u8{"test/**/*_test.zap"};
+    const runner_patterns_v2 = [_][]const u8{ "test/**/*_test.zap", "lib/*.zap" };
+    const runner_matches_v1 = [_][]const u8{"lib/provider.zap"};
+    const runner_matches_v2 = [_][]const u8{ "lib/provider.zap", "lib/extra.zap" };
+    try file_compile_after_globs.put("test/test_runner.zap", &runner_patterns_v1);
+    try file_compile_after_files.put("test/test_runner.zap", &runner_matches_v1);
+
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const struct_order_v1 = [_][]const u8{ "Provider", "TestRunner" };
+    const struct_order_v2 = [_][]const u8{ "Provider", "Extra", "TestRunner" };
+    const provider_source =
+        "pub struct Provider {\n" ++
+        "  pub fn reflected() -> i64 { 1 }\n" ++
+        "}\n";
+    const extra_source =
+        "pub struct Extra {\n" ++
+        "  pub fn reflected() -> i64 { 2 }\n" ++
+        "}\n";
+    const runner_source =
+        "pub struct TestRunner {\n" ++
+        "  pub fn main() -> i64 { 0 }\n" ++
+        "}\n";
+
+    var initial_units = [_]SourceUnit{
+        .{ .file_path = "lib/provider.zap", .source = provider_source, .primary_struct_name = "Provider" },
+        .{ .file_path = "test/test_runner.zap", .source = runner_source, .primary_struct_name = "TestRunner" },
+    };
+    var initial = try state.prepare(alloc, &initial_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order_v1,
+    });
+    try initial.commit();
+    initial.deinit();
+
+    try file_compile_after_globs.put("test/test_runner.zap", &runner_patterns_v2);
+    try file_compile_after_files.put("test/test_runner.zap", &runner_matches_v2);
+
+    var changed_units = [_]SourceUnit{
+        .{ .file_path = "lib/provider.zap", .source = provider_source, .primary_struct_name = "Provider" },
+        .{ .file_path = "lib/extra.zap", .source = extra_source, .primary_struct_name = "Extra" },
+        .{ .file_path = "test/test_runner.zap", .source = runner_source, .primary_struct_name = "TestRunner" },
+    };
+    var changed = try state.prepare(alloc, &changed_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order_v2,
+    });
+    defer changed.deinit();
+
+    try std.testing.expect(stringSliceContains(changed.invalidated_struct_names, "TestRunner"));
+    try std.testing.expect(nodeIdSliceContainsKind(&changed.new_dependency_graph, changed.changed_graph_roots, .ctfe_glob));
+}
+
+test "incremental frontend commit stores function body nodes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const alpha_structs = [_][]const u8{"Alpha"};
+    const beta_structs = [_][]const u8{"Beta"};
+    try file_to_structs.put("lib/alpha.zap", &alpha_structs);
+    try file_to_structs.put("lib/beta.zap", &beta_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    const alpha_dependents = [_][]const u8{"lib/beta.zap"};
+    try file_imported_by.put("lib/alpha.zap", &alpha_dependents);
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const struct_order = [_][]const u8{ "Alpha", "Beta" };
+
+    const alpha_source =
+        "pub struct Alpha {\n" ++
+        "  pub fn value() -> i64 { 1 }\n" ++
+        "}\n";
+    const beta_source =
+        "pub struct Beta {\n" ++
+        "  pub fn value() -> i64 { Alpha.value() }\n" ++
+        "}\n";
+    var units = [_]SourceUnit{
+        .{ .file_path = "lib/alpha.zap", .source = alpha_source, .primary_struct_name = "Alpha" },
+        .{ .file_path = "lib/beta.zap", .source = beta_source, .primary_struct_name = "Beta" },
+    };
+
+    var prepared = try state.prepare(alloc, &units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    const alpha_function = testFunctionByStructLocal(prepared.result.ir_program, "Alpha", "value__0").?;
+    const beta_function = testFunctionByStructLocal(prepared.result.ir_program, "Beta", "value__0").?;
+    try prepared.commit();
+    prepared.deinit();
+
+    try std.testing.expect((try state.dependency_graph.getNode(try frontendFunctionBodyNodeKey(alpha_function.*))) != null);
+    try std.testing.expect((try state.dependency_graph.getNode(try frontendFunctionBodyNodeKey(beta_function.*))) != null);
+}
+
+test "incremental frontend function call edge reaches caller body from callee signature" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const alpha_structs = [_][]const u8{"Alpha"};
+    const beta_structs = [_][]const u8{"Beta"};
+    try file_to_structs.put("lib/alpha.zap", &alpha_structs);
+    try file_to_structs.put("lib/beta.zap", &beta_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    const alpha_dependents = [_][]const u8{"lib/beta.zap"};
+    try file_imported_by.put("lib/alpha.zap", &alpha_dependents);
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const struct_order = [_][]const u8{ "Alpha", "Beta" };
+
+    const alpha_source =
+        "pub struct Alpha {\n" ++
+        "  pub fn value() -> i64 { 1 }\n" ++
+        "}\n";
+    const beta_source =
+        "pub struct Beta {\n" ++
+        "  pub fn value() -> i64 { Alpha.value() }\n" ++
+        "}\n";
+    var units = [_]SourceUnit{
+        .{ .file_path = "lib/alpha.zap", .source = alpha_source, .primary_struct_name = "Alpha" },
+        .{ .file_path = "lib/beta.zap", .source = beta_source, .primary_struct_name = "Beta" },
+    };
+
+    var prepared = try state.prepare(alloc, &units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    const alpha_function = testFunctionByStructLocal(prepared.result.ir_program, "Alpha", "value__0").?;
+    const beta_function = testFunctionByStructLocal(prepared.result.ir_program, "Beta", "value__0").?;
+    try prepared.commit();
+    prepared.deinit();
+
+    const callee_signature_id = (try state.dependency_graph.getNode(try frontendFunctionSignatureNodeKey(alpha_function.*))).?;
+    const caller_body_id = (try state.dependency_graph.getNode(try frontendFunctionBodyNodeKey(beta_function.*))).?;
+    const affected = try state.dependency_graph.affectedFrom(std.testing.allocator, &.{callee_signature_id});
+    defer std.testing.allocator.free(affected);
+
+    try std.testing.expect(nodeIdSliceContains(affected, caller_body_id));
+
+    const callee_body_id = (try state.dependency_graph.getNode(try frontendFunctionBodyNodeKey(alpha_function.*))).?;
+    const body_affected = try state.dependency_graph.affectedFrom(std.testing.allocator, &.{callee_body_id});
+    defer std.testing.allocator.free(body_affected);
+
+    try std.testing.expect(!nodeIdSliceContains(body_affected, caller_body_id));
+}
+
+test "incremental frontend declaration fingerprints root body-only edits at function body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const previous_source =
+        "pub struct Alpha {\n" ++
+        "  pub fn value() -> i64 { 1 }\n" ++
+        "}\n";
+    const current_source =
+        "pub struct Alpha {\n" ++
+        "  pub fn value() -> i64 { 2 }\n" ++
+        "}\n";
+
+    const previous = try testDeclarationFingerprintsFromSource(alloc, previous_source);
+    const current = try testDeclarationFingerprintsFromSource(alloc, current_source);
+
+    var dependency_graph = zap.incremental_graph.Graph.init(std.testing.allocator);
+    defer dependency_graph.deinit();
+    const current_sets = [_]?zap.incremental_graph.DeclarationFingerprintSet{current};
+    try augmentFrontendGraphWithDeclarationFingerprints(&dependency_graph, &current_sets);
+
+    var selection = try zap.incremental_graph.selectChangedDeclarationRoots(
+        std.testing.allocator,
+        &dependency_graph,
+        previous,
+        current,
+    );
+    defer selection.deinit(std.testing.allocator);
+
+    try std.testing.expect(selection.isPrecise());
+    try std.testing.expectEqual(@as(usize, 1), selection.roots.len);
+    const root_key = dependency_graph.nodeKey(selection.roots[0]).?;
+    try std.testing.expectEqual(zap.incremental_graph.NodeKind.function_body, root_key.kind());
+}
+
+test "incremental frontend declaration fingerprints group multi-clause body edits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const previous_source =
+        "pub struct Bool {\n" ++
+        "  pub fn negate(true) -> Bool { false }\n" ++
+        "  pub fn negate(false) -> Bool { true }\n" ++
+        "}\n";
+    const current_source =
+        "pub struct Bool {\n" ++
+        "  pub fn negate(true) -> Bool { false }\n" ++
+        "  pub fn negate(false) -> Bool { false }\n" ++
+        "}\n";
+
+    const previous = try testDeclarationFingerprintsFromSource(alloc, previous_source);
+    const current = try testDeclarationFingerprintsFromSource(alloc, current_source);
+
+    var dependency_graph = zap.incremental_graph.Graph.init(std.testing.allocator);
+    defer dependency_graph.deinit();
+    const current_sets = [_]?zap.incremental_graph.DeclarationFingerprintSet{current};
+    try augmentFrontendGraphWithDeclarationFingerprints(&dependency_graph, &current_sets);
+
+    var selection = try zap.incremental_graph.selectChangedDeclarationRoots(
+        std.testing.allocator,
+        &dependency_graph,
+        previous,
+        current,
+    );
+    defer selection.deinit(std.testing.allocator);
+
+    try std.testing.expect(selection.isPrecise());
+    try std.testing.expectEqual(@as(usize, 1), selection.roots.len);
+    const root_key = dependency_graph.nodeKey(selection.roots[0]).?;
+    try std.testing.expectEqual(zap.incremental_graph.NodeKind.function_body, root_key.kind());
+    try std.testing.expectEqualStrings("negate__1", root_key.function_body.local_name);
+    try std.testing.expectEqual(@as(u32, 0), root_key.function_body.clause_index);
+}
+
+test "incremental frontend declaration fingerprints root signature edits at function signature" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const previous_source =
+        "pub struct Alpha {\n" ++
+        "  pub fn value() -> i64 { 1 }\n" ++
+        "}\n";
+    const current_source =
+        "pub struct Alpha {\n" ++
+        "  pub fn value() -> f64 { 1 }\n" ++
+        "}\n";
+
+    const previous = try testDeclarationFingerprintsFromSource(alloc, previous_source);
+    const current = try testDeclarationFingerprintsFromSource(alloc, current_source);
+
+    var dependency_graph = zap.incremental_graph.Graph.init(std.testing.allocator);
+    defer dependency_graph.deinit();
+    const current_sets = [_]?zap.incremental_graph.DeclarationFingerprintSet{current};
+    try augmentFrontendGraphWithDeclarationFingerprints(&dependency_graph, &current_sets);
+
+    var selection = try zap.incremental_graph.selectChangedDeclarationRoots(
+        std.testing.allocator,
+        &dependency_graph,
+        previous,
+        current,
+    );
+    defer selection.deinit(std.testing.allocator);
+
+    try std.testing.expect(selection.isPrecise());
+    try std.testing.expectEqual(@as(usize, 1), selection.roots.len);
+    const root_key = dependency_graph.nodeKey(selection.roots[0]).?;
+    try std.testing.expectEqual(zap.incremental_graph.NodeKind.function_signature, root_key.kind());
+
+    const affected = try dependency_graph.affectedFrom(std.testing.allocator, selection.roots);
+    defer std.testing.allocator.free(affected);
+    try std.testing.expect(nodeIdSliceContainsKind(&dependency_graph, affected, .function_body));
+}
+
+test "incremental frontend declaration fingerprints root struct member edits at struct surface" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const previous_source =
+        "pub struct Alpha {\n" ++
+        "  value :: i64\n" ++
+        "  pub fn value() -> i64 { 1 }\n" ++
+        "}\n";
+    const current_source =
+        "pub struct Alpha {\n" ++
+        "  value :: f64\n" ++
+        "  pub fn value() -> i64 { 1 }\n" ++
+        "}\n";
+
+    const previous = try testDeclarationFingerprintsFromSource(alloc, previous_source);
+    const current = try testDeclarationFingerprintsFromSource(alloc, current_source);
+
+    var dependency_graph = zap.incremental_graph.Graph.init(std.testing.allocator);
+    defer dependency_graph.deinit();
+    const current_sets = [_]?zap.incremental_graph.DeclarationFingerprintSet{current};
+    try augmentFrontendGraphWithDeclarationFingerprints(&dependency_graph, &current_sets);
+
+    var selection = try zap.incremental_graph.selectChangedDeclarationRoots(
+        std.testing.allocator,
+        &dependency_graph,
+        previous,
+        current,
+    );
+    defer selection.deinit(std.testing.allocator);
+
+    try std.testing.expect(selection.isPrecise());
+    try std.testing.expectEqual(@as(usize, 1), selection.roots.len);
+    const root_key = dependency_graph.nodeKey(selection.roots[0]).?;
+    try std.testing.expectEqual(zap.incremental_graph.NodeKind.struct_surface, root_key.kind());
+}
+
+test "incremental frontend uncommitted and failed prepares do not replace state graph" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const alpha_structs = [_][]const u8{"Alpha"};
+    const beta_structs = [_][]const u8{"Beta"};
+    try file_to_structs.put("lib/alpha.zap", &alpha_structs);
+    try file_to_structs.put("lib/beta.zap", &beta_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const struct_order = [_][]const u8{ "Alpha", "Beta" };
+
+    const alpha_source =
+        "pub struct Alpha {\n" ++
+        "  pub fn value() -> i64 { 1 }\n" ++
+        "}\n";
+    const beta_source =
+        "pub struct Beta {\n" ++
+        "  pub fn value() -> i64 { 2 }\n" ++
+        "}\n";
+
+    var initial_units = [_]SourceUnit{
+        .{ .file_path = "lib/alpha.zap", .source = alpha_source, .primary_struct_name = "Alpha" },
+    };
+    var initial = try state.prepare(alloc, &initial_units, graph, .{ .show_progress = false });
+    try initial.commit();
+    initial.deinit();
+
+    const committed_node_count = state.dependencyGraphNodeCount();
+    try std.testing.expect((try state.dependencyGraphStructSurfaceNode("Alpha")) != null);
+    try std.testing.expect((try state.dependencyGraphStructSurfaceNode("Beta")) == null);
+
+    var expanded_units = [_]SourceUnit{
+        .{ .file_path = "lib/alpha.zap", .source = alpha_source, .primary_struct_name = "Alpha" },
+        .{ .file_path = "lib/beta.zap", .source = beta_source, .primary_struct_name = "Beta" },
+    };
+    var uncommitted = try state.prepare(alloc, &expanded_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    uncommitted.deinit();
+
+    try std.testing.expectEqual(committed_node_count, state.dependencyGraphNodeCount());
+    try std.testing.expect((try state.dependencyGraphStructSurfaceNode("Beta")) == null);
+
+    const bad_beta_source = "pub struct Beta {\n  pub fn broken( -> i64 { 2 }\n}\n";
+    var bad_units = [_]SourceUnit{
+        .{ .file_path = "lib/alpha.zap", .source = alpha_source, .primary_struct_name = "Alpha" },
+        .{ .file_path = "lib/beta.zap", .source = bad_beta_source, .primary_struct_name = "Beta" },
+    };
+    try std.testing.expectError(error.ParseFailed, state.prepare(alloc, &bad_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    }));
+
+    try std.testing.expectEqual(committed_node_count, state.dependencyGraphNodeCount());
+    try std.testing.expect((try state.dependencyGraphStructSurfaceNode("Beta")) == null);
+}
+
+fn nodeIdSliceContains(haystack: []const zap.incremental_graph.NodeId, needle: zap.incremental_graph.NodeId) bool {
+    for (haystack) |candidate| {
+        if (candidate == needle) return true;
+    }
+    return false;
+}
+
+fn stringSliceContains(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |candidate| {
+        if (std.mem.eql(u8, candidate, needle)) return true;
+    }
+    return false;
+}
+
+fn nodeIdSliceContainsKind(
+    graph: *const zap.incremental_graph.Graph,
+    haystack: []const zap.incremental_graph.NodeId,
+    kind: zap.incremental_graph.NodeKind,
+) bool {
+    for (haystack) |candidate| {
+        const candidate_kind = graph.nodeKind(candidate) orelse continue;
+        if (candidate_kind == kind) return true;
+    }
+    return false;
+}
+
+fn testDeclarationFingerprintsFromSource(
+    alloc: std.mem.Allocator,
+    source: []const u8,
+) !zap.incremental_graph.DeclarationFingerprintSet {
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var parser = zap.Parser.initWithSharedInterner(alloc, source, &interner, 0);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    return try computeFrontendDeclarationFingerprints(alloc, program, source, 0, &interner);
+}
+
+fn testReflectionFingerprintsFromSource(
+    alloc: std.mem.Allocator,
+    file_path: []const u8,
+    source: []const u8,
+) !zap.incremental_graph.DeclarationFingerprintSet {
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var parser = zap.Parser.initWithSharedInterner(alloc, source, &interner, 0);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    return try computeFrontendReflectionFingerprints(alloc, program, source, 0, file_path, &interner);
+}
+
+fn expectReflectionRootForMetadataChange(
+    previous_source: []const u8,
+    current_source: []const u8,
+) !void {
+    try expectReflectionRootForMetadataChangeWithPaths(
+        "lib/provider.zap",
+        previous_source,
+        "lib/provider.zap",
+        current_source,
+    );
+}
+
+fn expectReflectionRootForMetadataChangeWithPaths(
+    previous_file_path: []const u8,
+    previous_source: []const u8,
+    current_file_path: []const u8,
+    current_source: []const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const previous = try testReflectionFingerprintsFromSource(alloc, previous_file_path, previous_source);
+    const current = try testReflectionFingerprintsFromSource(alloc, current_file_path, current_source);
+
+    var dependency_graph = zap.incremental_graph.Graph.init(std.testing.allocator);
+    defer dependency_graph.deinit();
+    const current_sets = [_]?zap.incremental_graph.DeclarationFingerprintSet{current};
+    try augmentFrontendGraphWithDeclarationFingerprints(&dependency_graph, &current_sets);
+
+    var selection = try zap.incremental_graph.selectChangedDeclarationRoots(
+        std.testing.allocator,
+        &dependency_graph,
+        previous,
+        current,
+    );
+    defer selection.deinit(std.testing.allocator);
+
+    try std.testing.expect(selection.isPrecise());
+    try std.testing.expectEqual(@as(usize, 1), selection.roots.len);
+    const root_key = dependency_graph.nodeKey(selection.roots[0]).?;
+    try std.testing.expectEqual(zap.incremental_graph.NodeKind.ctfe_reflection, root_key.kind());
+}
+
+fn expectCompileAfterRunnerInvalidation(
+    provider_v1: []const u8,
+    provider_v2: []const u8,
+    expected_runner_invalidated: bool,
+    expected_reflection_root: bool,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const provider_structs = [_][]const u8{"Provider"};
+    const runner_structs = [_][]const u8{"TestRunner"};
+    try file_to_structs.put("lib/provider.zap", &provider_structs);
+    try file_to_structs.put("test/test_runner.zap", &runner_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const runner_patterns = [_][]const u8{"test/**/*_test.zap"};
+    const runner_matches = [_][]const u8{"lib/provider.zap"};
+    try file_compile_after_globs.put("test/test_runner.zap", &runner_patterns);
+    try file_compile_after_files.put("test/test_runner.zap", &runner_matches);
+
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const struct_order = [_][]const u8{ "Provider", "TestRunner" };
+    const runner_source =
+        "pub struct TestRunner {\n" ++
+        "  pub fn main() -> i64 { 0 }\n" ++
+        "}\n";
+
+    var initial_units = [_]SourceUnit{
+        .{ .file_path = "lib/provider.zap", .source = provider_v1, .primary_struct_name = "Provider" },
+        .{ .file_path = "test/test_runner.zap", .source = runner_source, .primary_struct_name = "TestRunner" },
+    };
+    var initial = try state.prepare(alloc, &initial_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    try initial.commit();
+    initial.deinit();
+
+    var changed_units = [_]SourceUnit{
+        .{ .file_path = "lib/provider.zap", .source = provider_v2, .primary_struct_name = "Provider" },
+        .{ .file_path = "test/test_runner.zap", .source = runner_source, .primary_struct_name = "TestRunner" },
+    };
+    var changed = try state.prepare(alloc, &changed_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    defer changed.deinit();
+
+    try std.testing.expectEqual(expected_runner_invalidated, stringSliceContains(changed.invalidated_struct_names, "TestRunner"));
+    try std.testing.expectEqual(
+        expected_reflection_root,
+        nodeIdSliceContainsKind(&changed.new_dependency_graph, changed.changed_graph_roots, .ctfe_reflection),
+    );
+}
+
+fn testFunctionByStructLocal(program: ir.Program, struct_name: []const u8, local_name: []const u8) ?*const ir.Function {
+    for (program.functions) |*function| {
+        const owner = function.struct_name orelse continue;
+        if (std.mem.eql(u8, owner, struct_name) and std.mem.eql(u8, function.local_name, local_name)) {
+            return function;
+        }
+    }
+    return null;
+}
+
+fn expectCtfeBool(
+    alloc: std.mem.Allocator,
+    program: ir.Program,
+    function_name: []const u8,
+    expected: bool,
+) !void {
+    var interpreter = zap.ctfe.Interpreter.init(alloc, &program);
+    defer interpreter.deinit();
+    const value = try interpreter.evalByName(function_name, &.{});
+
+    try std.testing.expect(value == .bool_val);
+    try std.testing.expectEqual(expected, value.bool_val);
+}
+
+/// Runs the pre-drop ARC ownership pipeline. Semantic/correctness passes always
+/// run; Debug policy skips only the optimization-only rewrite boundaries.
 fn runArcOwnershipAndVerify(
+    alloc: std.mem.Allocator,
+    program: *ir.Program,
+    ownership: *const zap.arc_liveness.ProgramArcOwnership,
+    type_store: *const zap.types.TypeStore,
+    options: CompileOptions,
+) CompileError!void {
+    const policy = options.frontend_optimize_mode.passPolicy();
+    try runRequiredArcOwnershipNormalization(alloc, program, ownership, type_store, options);
+    if (policy.elide_borrowed_pass_through) {
+        try runOptionalBorrowedPassThroughElision(alloc, program, options);
+    }
+    var uniqueness_artifacts = try computeArcUniquenessArtifacts(alloc, program, type_store, options);
+    defer uniqueness_artifacts.deinit(alloc);
+    if (policy.rewrite_unchecked_uniqueness) {
+        try runOptionalUncheckedUniquenessRewrite(alloc, program, &uniqueness_artifacts, options);
+    }
+    try runArcOwnershipVerifier(alloc, program, &uniqueness_artifacts, options);
+}
+
+const ArcUniquenessArtifacts = struct {
+    post_ownership: zap.arc_liveness.ProgramArcOwnership,
+    signatures: zap.uniqueness_signature.ProgramSignatures,
+    program_uniqueness: zap.uniqueness_interprocedural.ProgramUniqueness,
+
+    fn deinit(self: *ArcUniquenessArtifacts, alloc: std.mem.Allocator) void {
+        self.program_uniqueness.deinit(alloc);
+        self.signatures.deinit(alloc);
+        self.post_ownership.deinit();
+    }
+};
+
+/// Semantic ARC normalization required before any drop insertion:
+/// owned-mutating builtins and owned-call conventions must be reflected
+/// in the IR, and ownership classification must match the type store.
+/// These are correctness passes, not optional optimize-mode gates.
+fn runRequiredArcOwnershipNormalization(
     alloc: std.mem.Allocator,
     program: *ir.Program,
     ownership: *const zap.arc_liveness.ProgramArcOwnership,
@@ -3586,6 +8506,16 @@ fn runArcOwnershipAndVerify(
         const function: *ir.Function = @constCast(&program.functions[i]);
         zap.arc_ownership.rewriteOwnedConsumeSites(alloc, function, program) catch return error.OutOfMemory;
     }
+}
+
+/// Optional borrowed pass-through elision. This removes redundant
+/// retain/release pairs around borrowed calls but preserves ARC
+/// semantics; Debug policy skips it and release policies keep it enabled.
+fn runOptionalBorrowedPassThroughElision(
+    alloc: std.mem.Allocator,
+    program: *ir.Program,
+    options: CompileOptions,
+) CompileError!void {
     // Phase 7: eliminate redundant retain/release atomic round-trips
     // for the canonical "borrowed pass-through" shape — a
     // `share_value` + `retain` + call (.borrowed slot) + `release`
@@ -3611,18 +8541,17 @@ fn runArcOwnershipAndVerify(
         const function: *ir.Function = @constCast(&program.functions[i]);
         zap.arc_ownership.elideBorrowedPassThroughShares(alloc, function, program) catch return error.OutOfMemory;
     }
-    // Phase H/uniqueness (codegen): for each owned-mutating call site whose
-    // uniqueness static-uniqueness predicate holds, swap the callee name to
-    // its `*_owned_unchecked` peer. This is a strict refinement of
-    // Phase 4's move-on-last-use rewrite — uniqueness holds only at sites
-    // where Phase 4 also fired (and additionally proved that the
-    // receiver's cell was never aliased before the call).
-    //
-    // Runs AFTER `rewriteOwnedConsumeSites` so the IR shape
-    // consumed by uniqueness matches the post-classification shape, and
-    // BEFORE `arc_verifier.verify` so the uniqueness invariant in the
-    // verifier sees this pass's rewrites and catches any mistake.
-    //
+}
+
+/// Compute the required verifier artifacts after semantic ARC rewrites. These
+/// artifacts stay active in every frontend policy because ownership verification
+/// depends on the current post-normalization IR shape.
+fn computeArcUniquenessArtifacts(
+    alloc: std.mem.Allocator,
+    program: *ir.Program,
+    type_store: *const zap.types.TypeStore,
+    options: CompileOptions,
+) CompileError!ArcUniquenessArtifacts {
     // Phase 2.5 + A1: compute the inputs the interprocedural fixpoint
     // (`uniqueness_interprocedural.analyzeProgramFull`) and the per-
     // function uniqueness dataflow both need:
@@ -3665,13 +8594,13 @@ fn runArcOwnershipAndVerify(
     var post_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, program, type_store) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    defer post_ownership.deinit();
+    errdefer post_ownership.deinit();
 
     progressStage(options, "ARC: computing uniqueness signatures", .{});
     var signatures = zap.uniqueness_fixpoint.computeSignaturesWithOwnership(alloc, program, &post_ownership) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    defer signatures.deinit(alloc);
+    errdefer signatures.deinit(alloc);
 
     // A1 (interprocedural uniqueness): run the whole-program fixpoint
     // to compute per-callee per-param unique-on-entry contracts. The
@@ -3694,18 +8623,34 @@ fn runArcOwnershipAndVerify(
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    defer program_uniqueness.deinit(alloc);
+    errdefer program_uniqueness.deinit(alloc);
 
+    return .{
+        .post_ownership = post_ownership,
+        .signatures = signatures,
+        .program_uniqueness = program_uniqueness,
+    };
+}
+
+/// Optional uniqueness rewrite. The ownership/signature/fixpoint artifacts are
+/// computed by `computeArcUniquenessArtifacts` even when this optimization is
+/// disabled so the verifier surface stays active in Debug.
+fn runOptionalUncheckedUniquenessRewrite(
+    alloc: std.mem.Allocator,
+    program: *ir.Program,
+    uniqueness_artifacts: *const ArcUniquenessArtifacts,
+    options: CompileOptions,
+) CompileError!void {
     progressStage(options, "ARC: rewriting unique call sites", .{});
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
-        const fn_ownership = post_ownership.get(function.id);
+        const fn_ownership = uniqueness_artifacts.post_ownership.get(function.id);
         var uniqueness = zap.uniqueness.analyzeUniquenessFull(
             alloc,
             function,
             program,
-            &program_uniqueness,
-            &signatures,
+            &uniqueness_artifacts.program_uniqueness,
+            &uniqueness_artifacts.signatures,
             fn_ownership,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -3732,15 +8677,26 @@ fn runArcOwnershipAndVerify(
             zap.arc_ownership.rewriteOwnedConsumeBuiltinSites(alloc, function, ownership_for_function) catch return error.OutOfMemory;
         }
     }
+}
+
+/// Correctness verifier for the pre-drop ARC pipeline. It runs regardless of
+/// optimize mode; when optional uniqueness rewrites are enabled it also catches
+/// optimization bugs before later ARC materialization or drop insertion.
+fn runArcOwnershipVerifier(
+    alloc: std.mem.Allocator,
+    program: *const ir.Program,
+    uniqueness_artifacts: *const ArcUniquenessArtifacts,
+    options: CompileOptions,
+) CompileError!void {
     progressStage(options, "ARC: verifying ownership invariants", .{});
     for (program.functions) |*function| {
-        const fn_ownership = post_ownership.get(function.id);
+        const fn_ownership = uniqueness_artifacts.post_ownership.get(function.id);
         zap.arc_verifier.verifyFull(
             alloc,
             function,
             program,
-            &program_uniqueness,
-            &signatures,
+            &uniqueness_artifacts.program_uniqueness,
+            &uniqueness_artifacts.signatures,
             fn_ownership,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -3855,6 +8811,19 @@ fn runArcDropInsertion(
     type_store: *const zap.types.TypeStore,
     options: CompileOptions,
 ) CompileError!void {
+    try runArcScopeExitDropInsertion(alloc, program, ownership, options);
+    try runArcDropInsertionVerifier(alloc, program, type_store, options);
+    dumpPostDropInsertionIrIfRequested(program);
+}
+
+/// Semantic drop insertion. These releases make ownership effects
+/// explicit in IR before ZIR emission and are required for correctness.
+fn runArcScopeExitDropInsertion(
+    alloc: std.mem.Allocator,
+    program: *ir.Program,
+    ownership: *const zap.arc_liveness.ProgramArcOwnership,
+    options: CompileOptions,
+) CompileError!void {
     progressStage(options, "ARC: inserting scope-exit drops", .{});
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
@@ -3869,7 +8838,17 @@ fn runArcDropInsertion(
         // rewrite.
         zap.arc_drop_insertion.insertTupleComponentReleases(alloc, function, fn_ownership) catch return error.OutOfMemory;
     }
+}
 
+/// Correctness verifier for post-drop IR. It recomputes ownership,
+/// signatures, and uniqueness against the final drop-inserted shape so
+/// verifier diagnostics match the IR that will be lowered.
+fn runArcDropInsertionVerifier(
+    alloc: std.mem.Allocator,
+    program: *const ir.Program,
+    type_store: *const zap.types.TypeStore,
+    options: CompileOptions,
+) CompileError!void {
     // Recompute Phase-2.5 inputs (post_ownership + signatures) against
     // the post-drop-insertion IR and pass them into the fixpoint and
     // the verifier so the post-drop check observes the same Phase 2.5
@@ -3923,7 +8902,9 @@ fn runArcDropInsertion(
             error.ArcInvariantViolation => return error.IrFailed,
         };
     }
+}
 
+fn dumpPostDropInsertionIrIfRequested(program: *const ir.Program) void {
     if (std.c.getenv("ZAP_DUMP_IR_FN")) |raw| {
         const glob_z: [*:0]const u8 = @ptrCast(raw);
         const glob = std.mem.span(glob_z);
@@ -4358,6 +9339,76 @@ fn emitDiagnostics(diag_engine: *zap.DiagnosticEngine, alloc: std.mem.Allocator)
 }
 
 const testing = std.testing;
+
+test "frontend optimize policies select Phase 3 pass behavior" {
+    const debug_policy = FrontendOptimizeMode.debug.passPolicy();
+    try testing.expect(!debug_policy.run_region_solver);
+    try testing.expect(!debug_policy.run_lambda_specialization);
+    try testing.expect(!debug_policy.run_perceus_reuse);
+    try testing.expect(!debug_policy.run_arc_optimizer);
+    try testing.expect(!debug_policy.run_contification);
+    try testing.expect(!debug_policy.elide_borrowed_pass_through);
+    try testing.expect(!debug_policy.rewrite_unchecked_uniqueness);
+    try testing.expectEqual(FrontendVerifierMode.full, debug_policy.verifier_mode);
+
+    const release_modes = [_]FrontendOptimizeMode{
+        .release_safe,
+        .release_fast,
+        .release_small,
+    };
+
+    for (release_modes) |mode| {
+        const policy = mode.passPolicy();
+        try testing.expect(policy.run_region_solver);
+        try testing.expect(policy.run_lambda_specialization);
+        try testing.expect(policy.run_perceus_reuse);
+        try testing.expect(policy.run_arc_optimizer);
+        try testing.expect(policy.run_contification);
+        try testing.expect(policy.elide_borrowed_pass_through);
+        try testing.expect(policy.rewrite_unchecked_uniqueness);
+        try testing.expectEqual(FrontendVerifierMode.full, policy.verifier_mode);
+    }
+}
+
+test "frontend optimize policy cache tags are stable and mode-specific" {
+    try testing.expectEqual(FrontendOptimizeMode.debug.cacheTag(), FrontendOptimizeMode.debug.cacheTag());
+    try testing.expect(FrontendOptimizeMode.debug.passPolicy().cacheTag() != FrontendOptimizeMode.release_fast.passPolicy().cacheTag());
+    try testing.expectEqual(FrontendOptimizeMode.release_safe.passPolicy().cacheTag(), FrontendOptimizeMode.release_fast.passPolicy().cacheTag());
+    try testing.expectEqual(FrontendOptimizeMode.release_fast.passPolicy().cacheTag(), FrontendOptimizeMode.release_small.passPolicy().cacheTag());
+    try testing.expect(FrontendOptimizeMode.debug.cacheTag() != FrontendOptimizeMode.release_safe.cacheTag());
+    try testing.expect(FrontendOptimizeMode.release_safe.cacheTag() != FrontendOptimizeMode.release_fast.cacheTag());
+    try testing.expect(FrontendOptimizeMode.release_fast.cacheTag() != FrontendOptimizeMode.release_small.cacheTag());
+}
+
+test "CTFE compile options hash includes frontend policy identity" {
+    const debug_hash = ctfeCompileOptionsHash(.{
+        .frontend_optimize_mode = .debug,
+    });
+    const release_hash = ctfeCompileOptionsHash(.{
+        .frontend_optimize_mode = .release_fast,
+    });
+
+    try testing.expect(debug_hash != release_hash);
+}
+
+test "incremental frontend invalidates cached state when policy identity changes" {
+    var state = FrontendIncrementalState.init(testing.allocator);
+    defer state.deinit();
+
+    const debug_policy_tag = FrontendOptimizeMode.debug.cacheTag();
+    const fast_policy_tag = FrontendOptimizeMode.release_fast.cacheTag();
+
+    state.ensurePolicyCacheTag(debug_policy_tag);
+    state.initialized = true;
+    try testing.expectEqual(debug_policy_tag, state.policy_cache_tag.?);
+
+    state.ensurePolicyCacheTag(debug_policy_tag);
+    try testing.expect(state.initialized);
+
+    state.ensurePolicyCacheTag(fast_policy_tag);
+    try testing.expect(!state.initialized);
+    try testing.expectEqual(fast_policy_tag, state.policy_cache_tag.?);
+}
 
 /// Run a compiled binary by name from zap-out/bin/.
 pub fn runBinary(allocator: std.mem.Allocator, pio: std.Io, bin_path: []const u8, program_args: []const []const u8) !u8 {

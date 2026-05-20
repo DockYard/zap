@@ -9,6 +9,7 @@ const perceus = @import("perceus.zig");
 const arc_optimizer = @import("arc_optimizer.zig");
 const diagnostics = @import("diagnostics.zig");
 const ast = @import("ast.zig");
+const frontend_policy = @import("frontend_policy.zig");
 
 // ============================================================
 // Analysis Pipeline Orchestrator
@@ -52,6 +53,67 @@ pub fn runAnalysisPipelineWithIo(
     program: *const ir.Program,
     pio: ?std.Io,
 ) !PipelineResult {
+    return runAnalysisPipelineWithIoAndPolicy(alloc, program, pio, frontend_policy.FrontendPassPolicy.full());
+}
+
+pub fn runAnalysisPipelineWithPolicy(
+    alloc: std.mem.Allocator,
+    program: *const ir.Program,
+    policy: frontend_policy.FrontendPassPolicy,
+) !PipelineResult {
+    return runAnalysisPipelineWithIoAndPolicy(alloc, program, null, policy);
+}
+
+/// Run the analysis pipeline with explicit frontend pass policy. Semantic
+/// analysis and closure-tier finalization always run; policy booleans only gate
+/// optimization-only analysis metadata passes.
+pub fn runAnalysisPipelineWithIoAndPolicy(
+    alloc: std.mem.Allocator,
+    program: *const ir.Program,
+    pio: ?std.Io,
+    policy: frontend_policy.FrontendPassPolicy,
+) !PipelineResult {
+    var work = try runRequiredAnalysisSemantics(alloc, program);
+    errdefer work.deinit();
+
+    if (policy.run_region_solver) {
+        try runOptionalRegionSolver(alloc, program, pio, &work.context);
+    }
+    if (policy.run_lambda_specialization) {
+        try runOptionalLambdaSpecialization(alloc, program, &work.context);
+    }
+    if (policy.run_perceus_reuse) {
+        try runOptionalPerceusReuse(alloc, program, &work.context);
+    }
+    if (policy.run_arc_optimizer) {
+        try runOptionalArcOptimization(alloc, program, &work.context);
+    }
+    try runClosureEnvironmentSemantics(program, &work.context);
+
+    return .{
+        .context = work.context,
+        .diagnostics = work.diagnostics,
+    };
+}
+
+const AnalysisPipelineWork = struct {
+    context: lattice.AnalysisContext,
+    diagnostics: std.ArrayList(diagnostics.Diagnostic),
+
+    fn deinit(self: *AnalysisPipelineWork) void {
+        self.diagnostics.deinit(self.context.allocator);
+        self.context.deinit();
+    }
+};
+
+/// Semantic analysis required for correctness and diagnostics:
+/// escape analysis, interprocedural summaries, refined escape, ownership
+/// verification at merge points, and borrow diagnostics. Phase 3 may gate
+/// later optimization stages, but these diagnostics must remain on.
+fn runRequiredAnalysisSemantics(
+    alloc: std.mem.Allocator,
+    program: *const ir.Program,
+) !AnalysisPipelineWork {
     var pipeline_diagnostics: std.ArrayList(diagnostics.Diagnostic) = .empty;
     errdefer pipeline_diagnostics.deinit(alloc);
 
@@ -61,6 +123,7 @@ pub fn runAnalysisPipelineWithIo(
     var escape_analyzer = generalized_escape.GeneralizedEscapeAnalyzer.init(alloc, program.*);
     defer escape_analyzer.deinit();
     var ctx = try escape_analyzer.analyze();
+    errdefer ctx.deinit();
 
     // --------------------------------------------------------
     // Phase 2: Interprocedural summary computation
@@ -72,7 +135,7 @@ pub fn runAnalysisPipelineWithIo(
     // Copy interprocedural summaries into the analysis context.
     var summary_iter = interproc.summaries.iterator();
     while (summary_iter.next()) |entry| {
-        try ctx.function_summaries.put(entry.key_ptr.*, entry.value_ptr.*);
+        try ctx.putFunctionSummaryClone(entry.key_ptr.*, entry.value_ptr.*);
     }
 
     // --------------------------------------------------------
@@ -83,18 +146,21 @@ pub fn runAnalysisPipelineWithIo(
     defer escape_analyzer2.deinit();
     // Inject summaries before analysis using the public API.
     try escape_analyzer2.setFunctionSummaries(&ctx.function_summaries);
-    var ctx2 = try escape_analyzer2.analyze();
+    {
+        var ctx2 = try escape_analyzer2.analyze();
+        errdefer ctx2.deinit();
 
-    // Replace context with refined results, keeping summaries.
-    // First, preserve summaries from ctx into ctx2.
-    var sum_iter3 = ctx.function_summaries.iterator();
-    while (sum_iter3.next()) |entry| {
-        if (!ctx2.function_summaries.contains(entry.key_ptr.*)) {
-            try ctx2.function_summaries.put(entry.key_ptr.*, entry.value_ptr.*);
+        // Replace context with refined results, keeping summaries.
+        // First, preserve summaries from ctx into ctx2.
+        var sum_iter3 = ctx.function_summaries.iterator();
+        while (sum_iter3.next()) |entry| {
+            if (!ctx2.function_summaries.contains(entry.key_ptr.*)) {
+                try ctx2.putFunctionSummaryClone(entry.key_ptr.*, entry.value_ptr.*);
+            }
         }
+        ctx.deinit();
+        ctx = ctx2;
     }
-    ctx.deinit();
-    ctx = ctx2;
 
     // --------------------------------------------------------
     // Phase 3.5: Ownership verification at phi/merge points
@@ -110,6 +176,21 @@ pub fn runAnalysisPipelineWithIo(
 
     try collectBorrowDiagnostics(alloc, &pipeline_diagnostics, &ctx, program);
 
+    return .{
+        .context = ctx,
+        .diagnostics = pipeline_diagnostics,
+    };
+}
+
+/// Optional region-placement analysis. It feeds allocation strategy and
+/// downstream ARC optimization metadata; Debug policy skips it, while release
+/// policies currently keep it enabled.
+fn runOptionalRegionSolver(
+    alloc: std.mem.Allocator,
+    program: *const ir.Program,
+    pio: ?std.Io,
+    context: *lattice.AnalysisContext,
+) !void {
     // --------------------------------------------------------
     // Phase 4: Region solving per function
     //   Parallelized with Io.Group when io is available.
@@ -143,7 +224,7 @@ pub fn runAnalysisPipelineWithIo(
         // Prepare per-function inputs (sequential — reads shared ctx)
         for (program.functions, 0..) |func, fi| {
             func_escapes[fi] = .empty;
-            var es_iter = ctx.escape_states.iterator();
+            var es_iter = context.escape_states.iterator();
             while (es_iter.next()) |entry| {
                 if (entry.key_ptr.function == func.id) {
                     try func_escapes[fi].put(alloc, entry.key_ptr.local, entry.value_ptr.*);
@@ -187,16 +268,16 @@ pub fn runAnalysisPipelineWithIo(
             var ra_iter = result.region_assignments.iterator();
             while (ra_iter.next()) |entry| {
                 const vkey = lattice.ValueKey{ .function = result.func_id, .local = entry.key_ptr.* };
-                try ctx.region_assignments.put(vkey, entry.value_ptr.*);
+                try context.region_assignments.put(vkey, entry.value_ptr.*);
             }
 
             var ras_iter = result.alloc_summaries.iterator();
             while (ras_iter.next()) |entry| {
-                try ctx.alloc_summaries.put(entry.key_ptr.*, entry.value_ptr.*);
+                try context.alloc_summaries.put(entry.key_ptr.*, entry.value_ptr.*);
             }
 
             for (result.outlives_constraints.items) |c| {
-                try ctx.outlives_constraints.append(alloc, c);
+                try context.outlives_constraints.append(alloc, c);
             }
         }
 
@@ -211,7 +292,7 @@ pub fn runAnalysisPipelineWithIo(
         for (program.functions) |*func| {
             var func_escape: std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState) = .empty;
             defer func_escape.deinit(alloc);
-            var es_iter = ctx.escape_states.iterator();
+            var es_iter = context.escape_states.iterator();
             while (es_iter.next()) |entry| {
                 if (entry.key_ptr.function == func.id) {
                     try func_escape.put(alloc, entry.key_ptr.local, entry.value_ptr.*);
@@ -249,32 +330,48 @@ pub fn runAnalysisPipelineWithIo(
             var ra_iter = region_result.region_assignments.iterator();
             while (ra_iter.next()) |entry| {
                 const vkey = lattice.ValueKey{ .function = func.id, .local = entry.key_ptr.* };
-                try ctx.region_assignments.put(vkey, entry.value_ptr.*);
+                try context.region_assignments.put(vkey, entry.value_ptr.*);
             }
 
             var ras_iter = region_result.alloc_summaries.iterator();
             while (ras_iter.next()) |entry| {
-                try ctx.alloc_summaries.put(entry.key_ptr.*, entry.value_ptr.*);
+                try context.alloc_summaries.put(entry.key_ptr.*, entry.value_ptr.*);
             }
 
             for (region_result.outlives_constraints.items) |c| {
-                try ctx.outlives_constraints.append(alloc, c);
+                try context.outlives_constraints.append(alloc, c);
             }
         }
     }
+}
 
+/// Optional lambda-set specialization used by contification and closure
+/// lowering decisions. Debug policy skips it; release policies keep it enabled.
+fn runOptionalLambdaSpecialization(
+    alloc: std.mem.Allocator,
+    program: *const ir.Program,
+    context: *lattice.AnalysisContext,
+) !void {
     // --------------------------------------------------------
     // Phase 5: Lambda set specialization
     // --------------------------------------------------------
     var ls_analyzer = try lambda_sets.LambdaSetAnalyzer.init(alloc, program);
     defer ls_analyzer.deinit();
     try ls_analyzer.analyze();
-    try ls_analyzer.populateContext(&ctx);
+    try ls_analyzer.populateContext(context);
+}
 
+/// Optional Perceus reuse analysis. It adds reuse/drop specialization metadata
+/// consumed later for allocation and ARC optimization; Debug policy skips it.
+fn runOptionalPerceusReuse(
+    alloc: std.mem.Allocator,
+    program: *const ir.Program,
+    context: *lattice.AnalysisContext,
+) !void {
     // --------------------------------------------------------
     // Phase 6: Perceus reuse analysis
     // --------------------------------------------------------
-    var perceus_analyzer = perceus.PerceusAnalyzer.initWithContext(alloc, program, &ctx);
+    var perceus_analyzer = perceus.PerceusAnalyzer.initWithContext(alloc, program, context);
     defer perceus_analyzer.deinit();
     const perceus_result = try perceus_analyzer.analyze();
     defer perceus_result.deinit(alloc);
@@ -288,19 +385,19 @@ pub fn runAnalysisPipelineWithIo(
     for (perceus_result.reuse_pairs) |pair| {
         var owned_pair = pair;
         owned_pair.reuse.insertion_point.path = try alloc.dupe(lattice.StreamStep, pair.reuse.insertion_point.path);
-        try ctx.addReusePair(owned_pair);
+        try context.addReusePair(owned_pair);
     }
     for (perceus_result.arc_ops) |op| {
         var owned_op = op;
         owned_op.insertion_point.path = try alloc.dupe(lattice.StreamStep, op.insertion_point.path);
-        try ctx.arc_ops.append(alloc, owned_op);
+        try context.arc_ops.append(alloc, owned_op);
     }
     for (perceus_result.drop_specializations) |spec| {
         const copied_fields = try alloc.alloc(lattice.FieldDrop, spec.field_drops.len);
         @memcpy(copied_fields, spec.field_drops);
         var owned_ip = spec.insertion_point;
         owned_ip.path = try alloc.dupe(lattice.StreamStep, spec.insertion_point.path);
-        try ctx.addDropSpecialization(.{
+        try context.addDropSpecialization(.{
             .match_site = spec.match_site,
             .constructor_tag = spec.constructor_tag,
             .field_drops = copied_fields,
@@ -309,7 +406,7 @@ pub fn runAnalysisPipelineWithIo(
         });
     }
     for (perceus_result.destructive_optional_dispatch) |entry| {
-        try ctx.destructive_optional_dispatch.put(entry.function, entry.scrutinee_param);
+        try context.destructive_optional_dispatch.put(entry.function, entry.scrutinee_param);
     }
 
     // Back-propagate used_in_reset from Perceus to interprocedural summaries.
@@ -326,7 +423,7 @@ pub fn runAnalysisPipelineWithIo(
                         .param_get => |pg| {
                             if (pg.dest == source_local) {
                                 // The reset source is a parameter. Update the summary.
-                                if (ctx.function_summaries.getPtr(func.id)) |summary| {
+                                if (context.function_summaries.getPtr(func.id)) |summary| {
                                     if (pg.index < summary.param_summaries.len) {
                                         // Note: param_summaries is []const, so we need
                                         // to cast to mutable. This is safe because we
@@ -343,14 +440,29 @@ pub fn runAnalysisPipelineWithIo(
             }
         }
     }
+}
 
+/// Optional ARC optimization over analysis metadata. It preserves observable
+/// semantics and only minimizes ARC operations; Debug policy skips it.
+fn runOptionalArcOptimization(
+    alloc: std.mem.Allocator,
+    program: *const ir.Program,
+    context: *lattice.AnalysisContext,
+) !void {
     // --------------------------------------------------------
     // Phase 6.5: ARC optimization
     // --------------------------------------------------------
-    var arc_opt = arc_optimizer.ArcOptimizer.init(alloc, program, &ctx);
+    var arc_opt = arc_optimizer.ArcOptimizer.init(alloc, program, context);
     defer arc_opt.deinit();
     try arc_opt.optimize();
+}
 
+/// Semantic closure-tier finalization. This uses the current context to keep
+/// direct-call, closure-environment, and callee parameter shapes in agreement.
+fn runClosureEnvironmentSemantics(
+    program: *const ir.Program,
+    context: *lattice.AnalysisContext,
+) !void {
     // --------------------------------------------------------
     // Phase 7: Compute closure environment tiers
     // --------------------------------------------------------
@@ -365,21 +477,16 @@ pub fn runAnalysisPipelineWithIo(
             // shape (call_direct with prepended capture args) and the
             // callee's parameter list in agreement.
             if (!hasMakeClosureForFunction(program, func.id)) {
-                try ctx.closure_tiers.put(func.id, .lambda_lifted);
+                try context.closure_tiers.put(func.id, .lambda_lifted);
                 continue;
             }
             // Find the escape state for this closure's creation site.
             // Look through all functions for a make_closure that references this function.
-            const escape = findClosureEscape(&ctx, program, func.id);
+            const escape = findClosureEscape(context, program, func.id);
             const tier = lattice.escapeToClosureTier(escape, func.captures.len > 0);
-            try ctx.closure_tiers.put(func.id, tier);
+            try context.closure_tiers.put(func.id, tier);
         }
     }
-
-    return .{
-        .context = ctx,
-        .diagnostics = pipeline_diagnostics,
-    };
 }
 
 /// Result from a parallel region solving task. Mirrors the fields of
@@ -1492,4 +1599,56 @@ test "pipeline copies drop specializations into analysis context" {
     defer result.deinit();
 
     try testing.expect(result.context.drop_specializations.items.len > 0);
+}
+
+test "debug policy skips optional analysis metadata passes" {
+    const alloc = testing.allocator;
+
+    const instrs = [_]ir.Instruction{
+        .{ .case_block = .{
+            .dest = 2,
+            .pre_instrs = &.{},
+            .arms = &[_]ir.IrCaseArm{
+                .{
+                    .condition = 0,
+                    .cond_instrs = &[_]ir.Instruction{
+                        .{ .field_get = .{ .dest = 1, .object = 0, .field = "value" } },
+                    },
+                    .body_instrs = &.{},
+                    .result = null,
+                },
+            },
+            .default_instrs = &.{},
+            .default_result = null,
+        } },
+        .{ .ret = .{ .value = null } },
+    };
+    const blocks = [_]ir.Block{.{ .label = 0, .instructions = &instrs }};
+    const params = [_]ir.Param{.{ .name = "input", .type_expr = .any }};
+    const functions = [_]ir.Function{.{
+        .id = 0,
+        .name = "debug_policy_test",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &params,
+        .return_type = .void,
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
+    }};
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var full_result = try runAnalysisPipeline(alloc, &program);
+    defer full_result.deinit();
+    try testing.expect(full_result.context.drop_specializations.items.len > 0);
+
+    var debug_result = try runAnalysisPipelineWithPolicy(
+        alloc,
+        &program,
+        frontend_policy.FrontendOptimizeMode.debug.passPolicy(),
+    );
+    defer debug_result.deinit();
+    try testing.expectEqual(@as(usize, 0), debug_result.context.drop_specializations.items.len);
+    try testing.expectEqual(@as(usize, 0), debug_result.context.reuse_pairs.items.len);
+    try testing.expectEqual(@as(usize, 0), debug_result.context.arc_ops.items.len);
 }

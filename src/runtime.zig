@@ -7662,6 +7662,11 @@ pub const Zest = struct {
         message: []const u8,
     };
 
+    const TestTiming = struct {
+        test_name: []const u8,
+        elapsed_ns: u64,
+    };
+
     var test_count: i64 = 0;
     var test_failures: i64 = 0;
     var assertion_count: i64 = 0;
@@ -7670,11 +7675,31 @@ pub const Zest = struct {
     var current_test_name: []const u8 = "<unknown test>";
     var failure_reports: std.ArrayListUnmanaged(FailureReport) = .empty;
     var failure_report_allocation_failed: bool = false;
+    var timing_reports: std.ArrayListUnmanaged(TestTiming) = .empty;
+    var timing_report_allocation_failed: bool = false;
+    var record_timings: bool = false;
+    var print_all_timings: bool = false;
+    var slowest_limit: i64 = 0;
     var seed: i64 = 0;
     var seed_set: bool = false;
+    var shuffle_global_target_index: i64 = -1;
+    var shuffle_local_target_index: i64 = -1;
+    var shuffle_cursor: i64 = 0;
+    var shuffle_case_claimed: bool = false;
+    var shuffle_suite_offset: i64 = 0;
+    var shuffle_suite_selected_index: i64 = -1;
+    var shuffle_suite_claimed: bool = false;
     var timeout_ms: i64 = 0; // per-test timeout in milliseconds (0 = no timeout)
-    var test_start_ns: i96 = 0; // timestamp when current test started
+    var test_start_ns: u64 = 0; // timestamp when current test started
     var timeout_count: i64 = 0; // number of tests that timed out
+
+    fn nowNs() u64 {
+        var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+        _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+        const total_ns: i128 = @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
+        if (total_ns <= 0) return 0;
+        return @intCast(total_ns);
+    }
 
     pub fn set_seed(s: i64) void {
         seed = s;
@@ -7701,6 +7726,94 @@ pub const Zest = struct {
         return timeout_ms;
     }
 
+    pub fn enable_timings() void {
+        record_timings = true;
+        print_all_timings = true;
+    }
+
+    pub fn set_slowest_limit(limit: i64) void {
+        if (limit <= 0) {
+            slowest_limit = 0;
+            return;
+        }
+        record_timings = true;
+        slowest_limit = limit;
+    }
+
+    pub fn shuffled_index(position: i64, count: i64, salt: []const u8) i64 {
+        if (count <= 1) return 0;
+        if (position < 0 or position >= count) return 0;
+
+        const count_u: u64 = @intCast(count);
+        const domain_size = std.math.ceilPowerOfTwoAssert(u64, count_u);
+        const mask = domain_size - 1;
+        const seed_bits: u64 = @bitCast(get_seed());
+        const salt_hash = std.hash.Wyhash.hash(seed_bits ^ 0x9E37_79B9_7F4A_7C15, salt);
+        const multiplier = ((std.hash.Wyhash.hash(salt_hash ^ 0xD1B5_4A32_D192_ED03, "multiplier") << 1) | 1) & mask;
+        const increment = std.hash.Wyhash.hash(salt_hash ^ 0x94D0_49BB_1331_11EB, "increment") & mask;
+
+        var value: u64 = @intCast(position);
+        while (true) {
+            value = (value *% multiplier +% increment) & mask;
+            if (value < count_u) return @intCast(value);
+        }
+    }
+
+    pub fn begin_selected_case(selected_index: i64) void {
+        shuffle_local_target_index = selected_index;
+        shuffle_cursor = 0;
+        shuffle_case_claimed = false;
+    }
+
+    pub fn end_selected_case() void {
+        shuffle_local_target_index = -1;
+        shuffle_cursor = 0;
+        shuffle_case_claimed = false;
+    }
+
+    pub fn should_run_selected_case() bool {
+        if (shuffle_local_target_index < 0) return true;
+        if (shuffle_case_claimed) return false;
+
+        const current_index = shuffle_cursor;
+        shuffle_cursor += 1;
+        if (current_index == shuffle_local_target_index) {
+            shuffle_case_claimed = true;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn begin_shuffle_pass(position: i64, count: i64) void {
+        shuffle_global_target_index = shuffled_index(position, count, "Zest.Runner.cases");
+        shuffle_suite_offset = 0;
+        shuffle_suite_selected_index = -1;
+        shuffle_suite_claimed = false;
+    }
+
+    pub fn end_shuffle_pass() void {
+        shuffle_global_target_index = -1;
+        shuffle_suite_offset = 0;
+        shuffle_suite_selected_index = -1;
+        shuffle_suite_claimed = false;
+    }
+
+    pub fn enter_selected_suite(case_count: i64) bool {
+        if (shuffle_global_target_index < 0 or case_count <= 0 or shuffle_suite_claimed) return false;
+        const suite_end = shuffle_suite_offset + case_count;
+        if (shuffle_global_target_index < suite_end) {
+            shuffle_suite_selected_index = shuffle_global_target_index - shuffle_suite_offset;
+            shuffle_suite_claimed = true;
+            return true;
+        }
+        shuffle_suite_offset = suite_end;
+        return false;
+    }
+
+    pub fn selected_suite_index() i64 {
+        return shuffle_suite_selected_index;
+    }
+
     pub fn begin_test() void {
         begin_named_test("<unknown test>");
     }
@@ -7709,31 +7822,28 @@ pub const Zest = struct {
         current_test_failed = false;
         current_test_name = duplicateFailureString(name) orelse name;
         test_count += 1;
-        if (timeout_ms > 0) {
-            var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
-            _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-            test_start_ns = @as(i96, ts.sec) * 1_000_000_000 + @as(i96, ts.nsec);
-        }
+        test_start_ns = if (timeout_ms > 0 or record_timings) nowNs() else 0;
     }
 
     pub fn check_timeout() bool {
         if (timeout_ms <= 0) return false;
-        var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
-        _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-        const now_ns: i96 = @as(i96, ts.sec) * 1_000_000_000 + @as(i96, ts.nsec);
-        const elapsed_ns = now_ns - test_start_ns;
-        const timeout_ns: i96 = @as(i96, timeout_ms) * 1_000_000;
+        const elapsed_ns = nowNs() - test_start_ns;
+        const timeout_ns: u64 = @as(u64, @intCast(timeout_ms)) * 1_000_000;
         if (elapsed_ns > timeout_ns) {
             current_test_failed = true;
             timeout_count += 1;
             recordFailure("test timed out");
             stdoutPrint("\x1b[1;33mT\x1b[0m", .{}); // yellow T for timeout
+            flushStdoutBuf();
             return true;
         }
         return false;
     }
 
     pub fn end_test() void {
+        if (record_timings and test_start_ns != 0) {
+            recordTiming(nowNs() - test_start_ns);
+        }
         if (current_test_failed) {
             test_failures += 1;
         }
@@ -7764,14 +7874,17 @@ pub const Zest = struct {
 
     pub fn print_dot() void {
         stdoutPrint("\x1b[1;32m.\x1b[0m", .{});
+        flushStdoutBuf();
     }
 
     pub fn print_fail() void {
         stdoutPrint("\x1b[1;31mF\x1b[0m", .{});
+        flushStdoutBuf();
     }
 
     pub fn summary() i64 {
         printFailureReports();
+        printTimingReports();
         stdoutPrint("\n\nSeed: ", .{});
         writeI64(get_seed());
         if (timeout_ms > 0) {
@@ -7814,6 +7927,16 @@ pub const Zest = struct {
         };
     }
 
+    fn recordTiming(elapsed_ns: u64) void {
+        const report = TestTiming{
+            .test_name = duplicateFailureString(current_test_name) orelse current_test_name,
+            .elapsed_ns = elapsed_ns,
+        };
+        timing_reports.append(runtime_arena.allocator(), report) catch {
+            timing_report_allocation_failed = true;
+        };
+    }
+
     fn printFailureReports() void {
         if (failure_reports.items.len == 0) {
             if (failure_report_allocation_failed) {
@@ -7832,6 +7955,68 @@ pub const Zest = struct {
 
         if (failure_report_allocation_failed) {
             stdoutPrint("\n\nAdditional failure reports could not be allocated.", .{});
+        }
+    }
+
+    fn printTimingReports() void {
+        if (!print_all_timings and slowest_limit <= 0) {
+            if (timing_report_allocation_failed) {
+                stdoutPrint("\n\nTimings: unable to allocate test timing reports", .{});
+            }
+            return;
+        }
+
+        if (print_all_timings) {
+            stdoutPrint("\n\nTest timings:", .{});
+            for (timing_reports.items) |report| {
+                stdoutPrint("\n  ", .{});
+                printDuration(report.elapsed_ns);
+                stdoutPrint("  {s}", .{report.test_name});
+            }
+        }
+
+        if (slowest_limit > 0 and timing_reports.items.len > 0) {
+            const sorted = runtime_arena.allocator().dupe(TestTiming, timing_reports.items) catch {
+                timing_report_allocation_failed = true;
+                if (timing_report_allocation_failed) {
+                    stdoutPrint("\n\nTimings: unable to allocate slow-test report", .{});
+                }
+                return;
+            };
+            sortTimingsDescending(sorted);
+            const limit = @min(@as(usize, @intCast(slowest_limit)), sorted.len);
+            stdoutPrint("\n\nSlowest tests:", .{});
+            for (sorted[0..limit], 0..) |report, index| {
+                stdoutPrint("\n  ", .{});
+                writeI64(@intCast(index + 1));
+                stdoutPrint(") ", .{});
+                printDuration(report.elapsed_ns);
+                stdoutPrint("  {s}", .{report.test_name});
+            }
+        }
+
+        if (timing_report_allocation_failed) {
+            stdoutPrint("\n\nAdditional timing reports could not be allocated.", .{});
+        }
+    }
+
+    fn sortTimingsDescending(items: []TestTiming) void {
+        var i: usize = 1;
+        while (i < items.len) : (i += 1) {
+            const item = items[i];
+            var j = i;
+            while (j > 0 and items[j - 1].elapsed_ns < item.elapsed_ns) : (j -= 1) {
+                items[j] = items[j - 1];
+            }
+            items[j] = item;
+        }
+    }
+
+    fn printDuration(elapsed_ns: u64) void {
+        if (elapsed_ns >= 1_000_000) {
+            stdoutPrint("{d}ms", .{@divTrunc(elapsed_ns + 500_000, 1_000_000)});
+        } else {
+            stdoutPrint("{d}us", .{@divTrunc(elapsed_ns + 500, 1_000)});
         }
     }
 
@@ -7861,8 +8046,20 @@ pub const Zest = struct {
         current_test_name = "<unknown test>";
         failure_reports.clearRetainingCapacity();
         failure_report_allocation_failed = false;
+        timing_reports.clearRetainingCapacity();
+        timing_report_allocation_failed = false;
+        record_timings = false;
+        print_all_timings = false;
+        slowest_limit = 0;
         seed = 0;
         seed_set = false;
+        shuffle_global_target_index = -1;
+        shuffle_local_target_index = -1;
+        shuffle_cursor = 0;
+        shuffle_case_claimed = false;
+        shuffle_suite_offset = 0;
+        shuffle_suite_selected_index = -1;
+        shuffle_suite_claimed = false;
         timeout_ms = 0;
         test_start_ns = 0;
         timeout_count = 0;
@@ -7898,6 +8095,117 @@ test "Zest records named assertion failure reports" {
     try std.testing.expectEqual(@as(usize, 1), Zest.failure_reports.items.len);
     try std.testing.expectEqualStrings("SampleTest.test_reports_failures", Zest.failure_reports.items[0].test_name);
     try std.testing.expectEqualStrings("expected true", Zest.failure_reports.items[0].message);
+}
+
+test "Zest records named test timings when enabled" {
+    Zest.testOnlyReset();
+    defer Zest.testOnlyReset();
+
+    Zest.enable_timings();
+    Zest.begin_named_test("SampleTest.test_records_timing");
+    if (Zest.test_start_ns >= 2_000_000) {
+        Zest.test_start_ns -= 2_000_000;
+    }
+    Zest.end_test();
+
+    try std.testing.expectEqual(@as(usize, 1), Zest.timing_reports.items.len);
+    try std.testing.expectEqualStrings("SampleTest.test_records_timing", Zest.timing_reports.items[0].test_name);
+    try std.testing.expect(Zest.timing_reports.items[0].elapsed_ns > 0);
+}
+
+test "Zest shuffled_index is deterministic and produces a permutation" {
+    Zest.testOnlyReset();
+    defer Zest.testOnlyReset();
+
+    Zest.set_seed(12345);
+    const count: i64 = 17;
+    var seen = [_]bool{false} ** @as(usize, @intCast(count));
+
+    var position: i64 = 0;
+    while (position < count) : (position += 1) {
+        const first = Zest.shuffled_index(position, count, "SampleSuite");
+        const second = Zest.shuffled_index(position, count, "SampleSuite");
+        try std.testing.expectEqual(first, second);
+        try std.testing.expect(first >= 0);
+        try std.testing.expect(first < count);
+        try std.testing.expect(!seen[@intCast(first)]);
+        seen[@intCast(first)] = true;
+    }
+}
+
+test "Zest shuffled_index changes order with seed" {
+    Zest.testOnlyReset();
+    defer Zest.testOnlyReset();
+
+    var seed_one = [_]i64{0} ** 8;
+    var seed_two = [_]i64{0} ** 8;
+
+    Zest.set_seed(100);
+    for (&seed_one, 0..) |*slot, position| {
+        slot.* = Zest.shuffled_index(@intCast(position), @intCast(seed_one.len), "SampleSuite");
+    }
+
+    Zest.set_seed(200);
+    for (&seed_two, 0..) |*slot, position| {
+        slot.* = Zest.shuffled_index(@intCast(position), @intCast(seed_two.len), "SampleSuite");
+    }
+
+    try std.testing.expect(!std.mem.eql(i64, &seed_one, &seed_two));
+}
+
+test "Zest shuffle pass selects one suite-local case" {
+    Zest.testOnlyReset();
+    defer Zest.testOnlyReset();
+
+    Zest.set_seed(777);
+    const total_count: i64 = 6;
+
+    var position: i64 = 0;
+    while (position < total_count) : (position += 1) {
+        const target_index = Zest.shuffled_index(position, total_count, "Zest.Runner.cases");
+
+        Zest.begin_shuffle_pass(position, total_count);
+        const first_suite_selected = Zest.enter_selected_suite(2);
+        const first_suite_index = Zest.selected_suite_index();
+        const second_suite_selected = Zest.enter_selected_suite(3);
+        const second_suite_index = Zest.selected_suite_index();
+        const third_suite_selected = Zest.enter_selected_suite(1);
+        const third_suite_index = Zest.selected_suite_index();
+
+        var selected_suite_count: u8 = 0;
+        if (first_suite_selected) selected_suite_count += 1;
+        if (second_suite_selected) selected_suite_count += 1;
+        if (third_suite_selected) selected_suite_count += 1;
+        try std.testing.expectEqual(@as(u8, 1), selected_suite_count);
+
+        if (target_index < 2) {
+            try std.testing.expect(first_suite_selected);
+            try std.testing.expectEqual(target_index, first_suite_index);
+        } else if (target_index < 5) {
+            try std.testing.expect(second_suite_selected);
+            try std.testing.expectEqual(target_index - 2, second_suite_index);
+        } else {
+            try std.testing.expect(third_suite_selected);
+            try std.testing.expectEqual(target_index - 5, third_suite_index);
+        }
+
+        try std.testing.expect(!Zest.enter_selected_suite(10));
+        Zest.end_shuffle_pass();
+    }
+}
+
+test "Zest selected case scan runs only the requested leaf case" {
+    Zest.testOnlyReset();
+    defer Zest.testOnlyReset();
+
+    Zest.begin_selected_case(2);
+    try std.testing.expect(!Zest.should_run_selected_case());
+    try std.testing.expect(!Zest.should_run_selected_case());
+    try std.testing.expect(Zest.should_run_selected_case());
+    try std.testing.expect(!Zest.should_run_selected_case());
+    Zest.end_selected_case();
+
+    try std.testing.expect(Zest.should_run_selected_case());
 }
 
 // ============================================================
