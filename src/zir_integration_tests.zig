@@ -4871,6 +4871,155 @@ test "CLI script Phase 0 Gap A: -Ddebug-info=none on Debug does NOT publish a dS
     }
 }
 
+test "CLI script Phase 0 Gap E: ReleaseFast default publishes sibling dSYM + strips main binary" {
+    // Phase 0 — DWARF foundation, Gap E. The error-system research
+    // brief (`docs/error-system-research-brief.md`, Part VI.B #13 &
+    // Part VIII) requires ReleaseFast and ReleaseSmall to ship the
+    // split-debug shape — stripped main binary + sibling `.dSYM` —
+    // BY DEFAULT, not only when the user passes `-Ddebug-info=split`
+    // explicitly. The unit test "Phase 0 Gap E: per-mode dSYM
+    // defaults follow the spec table" pins the gate-level decision;
+    // this integration test exercises the full pipeline end-to-end
+    // on aarch64-macos:
+    //
+    //   (a) Main binary contains no `__debug_*` Mach-O sections.
+    //   (b) Sibling `.dSYM` exists with a non-empty inner DWARF blob.
+    //   (c) `atos` against the dSYM resolves a Zap function to its
+    //       original `<file>.zap:<line>` source coordinates.
+    //
+    // ReleaseFast is the high-signal mode — ReleaseSmall would
+    // produce the same shape (Gap E flips both defaults
+    // identically) but rebuilding the script in two release modes
+    // doubles a slow integration-test run; the gate matrix is
+    // already covered by the unit test.
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch != .aarch64) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(
+        allocator,
+        &tmp_dir,
+        "phase0_release_fast.zap",
+        \\fn main(_args :: [String]) -> u8 {
+        \\  IO.puts("phase0-release-fast")
+        \\  0
+        \\}
+        ,
+        // ReleaseFast WITHOUT any `-Ddebug-info=` override — this is
+        // the spec-table default the Gap E fix introduces.
+        &.{"-Doptimize=ReleaseFast"},
+        &.{},
+    );
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "phase0-release-fast") != null);
+
+    const published = try findPublishedScriptBinary(allocator, &tmp_dir);
+    defer allocator.free(published);
+
+    // (b) Sibling .dSYM with non-empty inner DWARF blob.
+    const dsym_path = std.fmt.allocPrint(allocator, "{s}.dSYM", .{published}) catch return error.OutOfMemory;
+    defer allocator.free(dsym_path);
+    if (!pathExists(dsym_path)) {
+        std.debug.print(
+            "Phase 0 Gap E: ReleaseFast default did not publish sibling .dSYM at {s}.\n",
+            .{dsym_path},
+        );
+        return error.TestUnexpectedResult;
+    }
+    const dwarf_inner = std.fmt.allocPrint(
+        allocator,
+        "{s}/Contents/Resources/DWARF/script",
+        .{dsym_path},
+    ) catch return error.OutOfMemory;
+    defer allocator.free(dwarf_inner);
+    if (!pathExists(dwarf_inner)) {
+        std.debug.print(
+            "Phase 0 Gap E: ReleaseFast default sibling .dSYM is missing inner DWARF blob at {s}.\n",
+            .{dwarf_inner},
+        );
+        return error.TestUnexpectedResult;
+    }
+
+    // (a) Main binary has NO DWARF section. Read the Mach-O load
+    // commands via `otool -l` and assert no line starts with
+    // `__debug` — that is the family of section names
+    // dsymutil-extractable debug info lives in (`__debug_info`,
+    // `__debug_line`, `__debug_str`, etc.). The Gap E regression
+    // would be "Gap D wired the post-strip only for the explicit
+    // override, not for the release-mode default" — leaving the
+    // unflagged ReleaseFast binary still carrying its full DWARF
+    // debug-map and silently doubling shipped binary size.
+    const otool_result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ "otool", "-l", published },
+        .stdout_limit = .limited(8 * 1024 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch return error.RunFailed;
+    defer allocator.free(otool_result.stdout);
+    defer allocator.free(otool_result.stderr);
+    if (std.mem.indexOf(u8, otool_result.stdout, "__debug") != null) {
+        std.debug.print(
+            "Phase 0 Gap E: ReleaseFast default main binary at {s} still carries DWARF __debug sections:\n{s}\n",
+            .{ published, otool_result.stdout },
+        );
+        return error.TestUnexpectedResult;
+    }
+
+    // (c) `atos` round-trip via the sibling dSYM resolves the Zap
+    // user code to `<file>.zap:<line>`. The hoisted script main
+    // wrapper lives at symbol `_script.main`; resolving its address
+    // through the dSYM must produce the original Zap source
+    // coordinates so Phase 2's crash printer / lldb / addr2line can
+    // surface user-meaningful frames on optimized builds.
+    const nm_result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ "nm", published },
+        .stdout_limit = .limited(8 * 1024 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch return error.RunFailed;
+    defer allocator.free(nm_result.stdout);
+    defer allocator.free(nm_result.stderr);
+
+    var script_main_addr: ?[]const u8 = null;
+    var addr_buf: [64]u8 = undefined;
+    var line_iter = std.mem.splitScalar(u8, nm_result.stdout, '\n');
+    while (line_iter.next()) |line| {
+        if (std.mem.indexOf(u8, line, " _script.main") == null) continue;
+        const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+        const addr_hex = line[0..space];
+        if (addr_hex.len == 0 or addr_hex.len > 16) continue;
+        const written = std.fmt.bufPrint(&addr_buf, "0x{s}", .{addr_hex}) catch continue;
+        script_main_addr = written;
+        break;
+    }
+    const addr = script_main_addr orelse {
+        std.debug.print(
+            "Phase 0 Gap E: could not locate `_script.main` in nm output for ReleaseFast default:\n{s}\n",
+            .{nm_result.stdout},
+        );
+        return error.TestUnexpectedResult;
+    };
+
+    const atos_result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ "atos", "-o", dwarf_inner, "-arch", "arm64", "-l", "0x100000000", addr },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch return error.RunFailed;
+    defer allocator.free(atos_result.stdout);
+    defer allocator.free(atos_result.stderr);
+
+    if (std.mem.indexOf(u8, atos_result.stdout, "phase0_release_fast.zap") == null) {
+        std.debug.print(
+            "Phase 0 Gap E: atos did not resolve `_script.main` at {s} to a phase0_release_fast.zap location.\n  stdout: {s}\n  stderr: {s}\n",
+            .{ addr, atos_result.stdout, atos_result.stderr },
+        );
+        return error.TestUnexpectedResult;
+    }
+}
+
 /// Disassemble a Mach-O text section and return true if `add x29,
 /// sp, #...` appears anywhere in the matching function — the
 /// aarch64 frame-pointer materialization instruction. Used to
