@@ -178,12 +178,19 @@ pub const Desugarer = struct {
     /// - `message :: String = "<TypeName>"` — every error has a
     ///   presentable message; default is the bare type name.
     /// - `cause :: Option(Error) = Option.None` — the causal chain.
+    ///   Phase 1.2.5.e: now actually injected, backed by Phase 1.2.5's
+    ///   protocol existentials machinery (ProtocolBox + per-impl
+    ///   vtable adapters + protocol_dispatch). The default value uses
+    ///   the canonical `Option.None` struct_ref shape so HIR's
+    ///   tagged-union-variant-from-struct_ref path resolves the
+    ///   parametric `Option(Error)` instantiation from the field's
+    ///   declared type.
     ///
     /// Auto-generated impl methods (only when the user did not supply
     /// an inline override of the same name and arity):
     /// - `message/1` returns `self.message`.
     /// - `kind/1` returns the snake-cased type name as an atom.
-    /// - `source/1` returns `self.cause`.
+    /// - `source/1` returns `self.cause` (Phase 1.2.5.e).
     /// - `code/1` returns `Option.Some(:Zxxxx)` if `@code Zxxxx` was
     ///   set, else `Option.None`.
     ///
@@ -246,29 +253,29 @@ pub const Desugarer = struct {
         // The auto-injected field set is:
         //   - `message :: String = "<TypeName>"` — every error has a
         //     presentable message; default is the bare type name.
+        //   - `cause :: Option(Error) = Option.None` — the causal
+        //     chain. Stored as a `protocol_box(Error)` payload thanks
+        //     to Phase 1.2.5's protocol existentials machinery
+        //     (ProtocolBox + per-impl vtable adapters), which closes
+        //     the parametric-union substitution gap that gated Phase
+        //     1.2's omission of this field. The default value uses the
+        //     canonical `Option.None` struct_ref shape so HIR's
+        //     tagged-union-variant-from-struct_ref path infers the
+        //     `Option(Error)` instantiation from the field's declared
+        //     type via context-driven inference.
         //
-        // The brief also calls for an auto-injected `cause :: Option(Error)`
-        // field. Today the ZIR backend's parametric-union specialization
-        // path fails to substitute the formal type-var when the applied
-        // type is a protocol receiver (`Option(Error)` lowers to
-        // `Option_T` instead of `Option_Error`, then `Option_T` is not
-        // found by Sema). Until that gap closes (tracked for Phase 1.3,
-        // which lands `Result(T,E)` and exercises the same parametric
-        // codegen path end-to-end), we synthesise a constant
-        // `Option.None` body for `source/1` directly rather than read a
-        // field. Per the brief's Phase 1.2 scope note —
-        //   *"Error.source walking through the cause chain at runtime
-        //    is out of scope; for v1 having the chain present and
-        //    queryable is enough"* —
-        // the protocol surface stays intact (`Error.source(e)` always
-        // returns `Option(Error)`) and Phase 1.3 will flip the default
-        // body to read `self.cause` once Option(Error) codegen works.
+        // User declarations always win. If the user already declared
+        // `message` or `cause`, we keep their version verbatim and skip
+        // the auto-injection for that field.
         var fields: std.ArrayList(ast.StructFieldDecl) = .empty;
         var has_message_field = false;
+        var has_cause_field = false;
         const message_name = try interner_mut.intern("message");
+        const cause_name = try interner_mut.intern("cause");
         for (err_decl.fields) |field| {
             try fields.append(self.allocator, field);
             if (field.name == message_name) has_message_field = true;
+            if (field.name == cause_name) has_cause_field = true;
         }
         if (!has_message_field) {
             const default_msg_text = interner_mut.get(err_decl.name.parts[err_decl.name.parts.len - 1]);
@@ -292,6 +299,16 @@ pub const Desugarer = struct {
                 .name = message_name,
                 .type_expr = string_type,
                 .default = default_expr,
+            });
+        }
+        if (!has_cause_field) {
+            const cause_type = try self.buildOptionOfErrorType(err_decl.meta.span);
+            const cause_default = try self.buildOptionNoneExpr(err_decl.meta.span);
+            try fields.append(self.allocator, .{
+                .meta = .{ .span = err_decl.meta.span },
+                .name = cause_name,
+                .type_expr = cause_type,
+                .default = cause_default,
             });
         }
 
@@ -335,11 +352,13 @@ pub const Desugarer = struct {
             err_decl,
             "source",
             user_overrides[2],
-            // Phase 1.2 returns `Option.None` directly (no `cause`
-            // field auto-injected). Phase 1.3 will switch this back
-            // to `read_cause_field` once `Option(Error)` field-type
-            // ZIR codegen handles protocol applied-type substitution.
-            .return_none_source,
+            // Phase 1.2.5.e: with `cause :: Option(Error)` now
+            // auto-injected (Phase 1.2.5's protocol existentials
+            // machinery closed the parametric-union substitution gap),
+            // the auto-generated `source/1` returns `self.cause`. The
+            // user can still override by declaring their own inline
+            // `pub fn source(self) -> Option(Error)`.
+            .read_cause_field,
         ));
         try impl_fns.append(self.allocator, try self.buildErrorImplMethod(
             err_decl,
@@ -374,11 +393,13 @@ pub const Desugarer = struct {
     const ErrorImplMethodKind = union(enum) {
         /// Method returns `self.message` (the auto-injected `message` field).
         read_message_field,
-        /// Method returns `Option.None` for `source/1`. Phase 1.2 default
-        /// while `Option(Error)` field-type ZIR codegen is unfinished;
-        /// Phase 1.3 will swap this for `read_cause_field` once the
-        /// protocol-applied-type specialisation lands.
-        return_none_source,
+        /// Method returns `self.cause` (the auto-injected `cause`
+        /// field, type `Option(Error)`). Phase 1.2.5.e default for
+        /// `source/1` — with protocol existentials in place, the
+        /// `Option(Error)` field stores a `protocol_box(Error)` and
+        /// the dispatch path (Phase 1.2.5.d) handles `Error.kind(...)`
+        /// on the inner value.
+        read_cause_field,
         /// Method returns the snake-cased type-name atom literal.
         return_kind_atom,
         /// Method returns `Option.Some(:Zxxxx)` if a `@code` attribute
@@ -568,8 +589,19 @@ pub const Desugarer = struct {
                     },
                 });
             },
-            .return_none_source => {
-                return try self.buildOptionNoneExpr(meta.span);
+            .read_cause_field => {
+                const self_name = try interner_mut.intern("self");
+                const cause_field = try interner_mut.intern("cause");
+                const self_ref = try self.create(ast.Expr, .{
+                    .var_ref = .{ .meta = .{ .span = meta.span }, .name = self_name },
+                });
+                return try self.create(ast.Expr, .{
+                    .field_access = .{
+                        .meta = .{ .span = meta.span },
+                        .object = self_ref,
+                        .field = cause_field,
+                    },
+                });
             },
             .return_kind_atom => {
                 const type_name = err_decl.name.parts[err_decl.name.parts.len - 1];
@@ -2195,12 +2227,17 @@ test "desugar rewrites pub error into pub struct + pub impl Error" {
             "TimeoutError",
         )) {
             saw_struct_in_structs = true;
-            // Auto-injected `message :: String = "TimeoutError"` field.
-            try std.testing.expectEqual(@as(usize, 1), sd.fields.len);
+            // Auto-injected `message :: String = "TimeoutError"` field
+            // plus auto-injected `cause :: Option(Error) = Option.None`
+            // field (Phase 1.2.5.e).
+            try std.testing.expectEqual(@as(usize, 2), sd.fields.len);
+            // First field stays `message` because the cause field is
+            // appended after the message field in step 2 of the desugar.
             try std.testing.expectEqualStrings("message", parser.interner.get(sd.fields[0].name));
             const default = sd.fields[0].default orelse return error.TestExpectedDefault;
             try std.testing.expect(default.* == .string_literal);
             try std.testing.expectEqualStrings("TimeoutError", parser.interner.get(default.string_literal.value));
+            try std.testing.expectEqualStrings("cause", parser.interner.get(sd.fields[1].name));
             try std.testing.expect(!sd.is_private);
         }
     }
@@ -2271,7 +2308,8 @@ test "desugar preserves user-declared message field default" {
             }
         }
     }
-    try std.testing.expectEqual(@as(usize, 1), fields_seen); // no double-injected message
+    // With Phase 1.2.5.e: user `message` + auto-injected `cause` = 2 fields.
+    try std.testing.expectEqual(@as(usize, 2), fields_seen);
     try std.testing.expect(custom_seen);
 }
 
@@ -2395,6 +2433,160 @@ test "desugar threads `@code Zxxxx` into the auto-generated code/1 body" {
         }
     }
     try std.testing.expect(saw_some_z3041);
+}
+
+test "desugar auto-injects cause :: Option(Error) = Option.None on pub error" {
+    // Phase 1.2.5.e: every `pub error` must auto-inject `cause ::
+    // Option(Error) = Option.None` alongside the auto-injected
+    // `message :: String` field. The default value is the parser-shape
+    // `Option.None` (a `struct_ref` whose parts are `[Option, None]`)
+    // so HIR's tagged-union-variant-from-struct_ref path picks up the
+    // contextual `Option(Error)` instantiation.
+    const source =
+        \\pub error TimeoutError {}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    var program = try parser.parseProgram();
+
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
+    try desugarer.desugarErrorDecls(&program);
+
+    var saw_struct = false;
+    for (program.structs) |sd| {
+        if (sd.name.parts.len != 1) continue;
+        if (!std.mem.eql(u8, parser.interner.get(sd.name.parts[0]), "TimeoutError")) continue;
+        saw_struct = true;
+        try std.testing.expectEqual(@as(usize, 2), sd.fields.len);
+
+        var seen_message = false;
+        var seen_cause = false;
+        for (sd.fields) |field| {
+            const field_name = parser.interner.get(field.name);
+            if (std.mem.eql(u8, field_name, "message")) {
+                seen_message = true;
+                continue;
+            }
+            if (std.mem.eql(u8, field_name, "cause")) {
+                seen_cause = true;
+                // Type annotation: `Option(Error)`.
+                try std.testing.expect(field.type_expr.* == .name);
+                try std.testing.expectEqualStrings(
+                    "Option",
+                    parser.interner.get(field.type_expr.name.name),
+                );
+                try std.testing.expectEqual(@as(usize, 1), field.type_expr.name.args.len);
+                const arg_expr = field.type_expr.name.args[0];
+                try std.testing.expect(arg_expr.* == .name);
+                try std.testing.expectEqualStrings(
+                    "Error",
+                    parser.interner.get(arg_expr.name.name),
+                );
+                // Default expression: `Option.None` shape — a two-part
+                // struct_ref so HIR's tagged-union-variant-from-struct_ref
+                // path infers the parametric Option(Error) instantiation
+                // from the field's declared type.
+                const default = field.default orelse return error.TestExpectedDefault;
+                try std.testing.expect(default.* == .struct_ref);
+                try std.testing.expectEqual(@as(usize, 2), default.struct_ref.name.parts.len);
+                try std.testing.expectEqualStrings(
+                    "Option",
+                    parser.interner.get(default.struct_ref.name.parts[0]),
+                );
+                try std.testing.expectEqualStrings(
+                    "None",
+                    parser.interner.get(default.struct_ref.name.parts[1]),
+                );
+                continue;
+            }
+        }
+        try std.testing.expect(seen_message);
+        try std.testing.expect(seen_cause);
+    }
+    try std.testing.expect(saw_struct);
+}
+
+test "desugar preserves user-declared cause field" {
+    // The user-declared `cause :: Option(Error) = Option.Some(...)`
+    // wins over auto-injection. The desugared struct has exactly one
+    // `cause` field with the user's default expression.
+    const source =
+        \\pub error WrappedError {
+        \\  cause :: Option(Error) = Option.None
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    var program = try parser.parseProgram();
+
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
+    try desugarer.desugarErrorDecls(&program);
+
+    var cause_count: usize = 0;
+    for (program.structs) |sd| {
+        if (!std.mem.eql(u8, parser.interner.get(sd.name.parts[0]), "WrappedError")) continue;
+        for (sd.fields) |field| {
+            if (std.mem.eql(u8, parser.interner.get(field.name), "cause")) {
+                cause_count += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), cause_count);
+}
+
+test "desugar source/1 default body reads self.cause" {
+    // Phase 1.2.5.e: with `cause` auto-injected, the auto-generated
+    // `source/1` returns `self.cause` (not the Phase 1.2 placeholder
+    // `Option.None` constant).
+    const source =
+        \\pub error TimeoutError {}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    var program = try parser.parseProgram();
+
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
+    try desugarer.desugarErrorDecls(&program);
+
+    var saw_source_field_read = false;
+    for (program.top_items) |item| {
+        if (item != .impl_decl) continue;
+        for (item.impl_decl.functions) |func| {
+            if (!std.mem.eql(u8, parser.interner.get(func.name), "source")) continue;
+            const body = func.clauses[0].body orelse return error.TestExpectedBody;
+            try std.testing.expectEqual(@as(usize, 1), body.len);
+            const stmt = body[0];
+            try std.testing.expect(stmt == .expr);
+            const expr = stmt.expr.*;
+            // Expect `self.cause` field-access expression, NOT a
+            // bare Option.None struct_ref.
+            try std.testing.expect(expr == .field_access);
+            try std.testing.expectEqualStrings(
+                "cause",
+                parser.interner.get(expr.field_access.field),
+            );
+            const object = expr.field_access.object.*;
+            try std.testing.expect(object == .var_ref);
+            try std.testing.expectEqualStrings(
+                "self",
+                parser.interner.get(object.var_ref.name),
+            );
+            saw_source_field_read = true;
+        }
+    }
+    try std.testing.expect(saw_source_field_read);
 }
 
 test "struct-level expressions synthesize public run function during desugar" {
