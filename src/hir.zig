@@ -616,6 +616,24 @@ pub const MatchPattern = union(enum) {
     struct_match: StructMatch,
     map_match: MapMatch,
     binary_match: BinaryMatchData,
+    tagged_variant_match: TaggedVariantMatch,
+};
+
+/// HIR-level match-pattern for a tagged-union variant arm.
+///
+/// `receiver_name` is the receiver's declaration name (`Option`,
+/// `Result`); `variant_name` is the variant tag (`Some`, `None`,
+/// `Ok`, `Err`). For variants that carry a payload the inner
+/// `payload` pattern is the destructuring shape — typically a
+/// `bind` for a fresh local, `wildcard` for `_`, or any other
+/// nested compound pattern. Nullary variants leave `payload` as
+/// `null`. The IR layer translates this into an active-tag check
+/// followed by payload extraction via `scrutinee.VariantName`,
+/// matching the runtime layout produced by `union_init`.
+pub const TaggedVariantMatch = struct {
+    receiver_name: ast.StringId,
+    variant_name: ast.StringId,
+    payload: ?*const MatchPattern,
 };
 
 pub const BinaryMatchData = struct {
@@ -4332,6 +4350,25 @@ pub const HirBuilder = struct {
                     },
                 });
             },
+            .tagged_union_variant => |tuv| {
+                // The qualifier always has at least 2 parts (base,
+                // variant); the parser enforces this invariant.
+                const receiver_name = tuv.qualifier.parts[0];
+                const variant_name = tuv.qualifier.parts[tuv.qualifier.parts.len - 1];
+
+                const payload: ?*const MatchPattern = if (tuv.payload) |payload_pat|
+                    try self.compilePattern(payload_pat)
+                else
+                    null;
+
+                return try self.create(MatchPattern, .{
+                    .tagged_variant_match = .{
+                        .receiver_name = receiver_name,
+                        .variant_name = variant_name,
+                        .payload = payload,
+                    },
+                });
+            },
         };
     }
 
@@ -6473,6 +6510,16 @@ pub const HirBuilder = struct {
                     }
                 }
             },
+            .tagged_variant_match => |tvm| {
+                // Recurse into the payload pattern so a bind inside
+                // (e.g. `Option.Some(v) -> v + 1`) registers a fresh
+                // local with kind=.extracted — the IR layer's
+                // tagged-variant lowering will assign it the payload
+                // local produced by `scrutinee.VariantName` extraction.
+                if (tvm.payload) |payload_pat| {
+                    try self.collectCasePatternBindings(payload_pat, false);
+                }
+            },
             .wildcard, .literal, .pin => {},
         }
     }
@@ -6585,6 +6632,15 @@ pub const HirBuilder = struct {
                 // Binary patterns on assignment LHS are uncommon. Treat as a
                 // no-op for now — when this becomes a real use case, build a
                 // case expression via the binary segment extractor.
+            },
+            .tagged_union_variant => {
+                // Tagged-union variant patterns on assignment LHS would
+                // be an irrefutable bind on a known variant — i.e.
+                // `Option.Some(v) = opt` would crash at runtime when
+                // `opt` is `None`. Refuse silently here (the type
+                // checker will surface a destructuring-shape error
+                // when this lands as a public surface); they are
+                // only meaningful in `case` arms today.
             },
         }
     }

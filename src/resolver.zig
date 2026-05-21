@@ -429,6 +429,9 @@ pub const Resolver = struct {
                     try self.addError("pinned variable not found in scope", pin.meta.span);
                 }
             },
+            .tagged_union_variant => |tuv| {
+                if (tuv.payload) |payload| try self.resolvePattern(payload);
+            },
             .wildcard, .bind, .literal => {},
         }
     }
@@ -463,6 +466,9 @@ pub const Resolver = struct {
                         .expr, .string_literal => {},
                     }
                 }
+            },
+            .tagged_union_variant => |tuv| {
+                if (tuv.payload) |payload| try self.bindPattern(payload);
             },
             .wildcard, .literal, .pin => {},
         }

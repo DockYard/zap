@@ -1089,6 +1089,17 @@ pub const Collector = struct {
                     }
                 }
             },
+            .tagged_union_variant => |tuv| {
+                // Variant payloads can carry arbitrary nested patterns —
+                // a `bind` introduces the payload local, a `tuple` or
+                // `struct_pattern` walks deeper. Nullary variants
+                // (`Option.None`) carry no payload and introduce no
+                // bindings. The qualifier and type-args carry no
+                // pattern-bound names.
+                if (tuv.payload) |payload| {
+                    try self.collectPatternBindings(payload, scope_id);
+                }
+            },
             .wildcard, .literal, .pin => {},
         }
     }

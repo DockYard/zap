@@ -999,6 +999,7 @@ pub const Pattern = union(enum) {
     pin: PinPattern,
     paren: ParenPattern,
     binary: BinaryPattern,
+    tagged_union_variant: TaggedUnionVariantPattern,
 
     pub fn getMeta(self: *const Pattern) NodeMeta {
         return switch (self.*) {
@@ -1013,6 +1014,7 @@ pub const Pattern = union(enum) {
             .pin => |v| v.meta,
             .paren => |v| v.meta,
             .binary => |v| v.meta,
+            .tagged_union_variant => |v| v.meta,
         };
     }
 };
@@ -1140,6 +1142,33 @@ pub const BinaryLiteral = struct {
 pub const BinaryPattern = struct {
     meta: NodeMeta,
     segments: []const BinarySegment,
+};
+
+/// A tagged-union variant pattern in case-arm position:
+/// `Option.Some(v)`, `Option(i64).Some(v)`, `Option.None`, etc.
+///
+/// `qualifier.parts` always has at least two segments — the receiver
+/// name (`Option`, `Result`, ...) followed by the variant name
+/// (`Some`, `None`, `Ok`, `Err`). Multi-segment receivers like
+/// `IO.Mode` are not parametric union receivers under Phase 1.1.5 and
+/// never produce this pattern.
+///
+/// `type_args` carries explicit type arguments (`Option(i64).Some(v)`);
+/// an empty slice means the receiver's instantiation is inferred from
+/// the case scrutinee's type (`case opt :: Option(i64) { Option.Some(v) -> v }`).
+///
+/// `payload` is `null` for nullary variants (`Option.None`, `Result.Err`
+/// with no payload). When the variant carries a payload, `payload`
+/// holds the destructuring pattern — a `bind` for a fresh local, a
+/// `wildcard` for `_`, or any other nested pattern. Multi-field
+/// payloads (currently not surfaced for tagged-union variants whose
+/// payloads are single typed values, but reserved for forward
+/// compatibility) would carry a `tuple` pattern.
+pub const TaggedUnionVariantPattern = struct {
+    meta: NodeMeta,
+    qualifier: StructName,
+    type_args: []const *const TypeExpr = &.{},
+    payload: ?*const Pattern = null,
 };
 
 pub const FunctionRefExpr = struct {
@@ -1296,7 +1325,7 @@ pub const TypeParenExpr = struct {
 // nearby variants to find any pass-specific handlers.
 
 const expected_expr_variants: usize = 37;
-const expected_pattern_variants: usize = 11;
+const expected_pattern_variants: usize = 12;
 const expected_type_expr_variants: usize = 11;
 const expected_top_item_variants: usize = 14;
 

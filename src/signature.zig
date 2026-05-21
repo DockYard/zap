@@ -300,6 +300,14 @@ pub fn appendPattern(
             }
             buf.str(">>");
         },
+        .tagged_union_variant => |v| {
+            appendStructName(buf, v.qualifier, interner);
+            if (v.payload) |payload| {
+                buf.char('(');
+                appendPattern(buf, payload, interner, graph);
+                buf.char(')');
+            }
+        },
     }
 }
 

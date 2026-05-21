@@ -779,6 +779,57 @@ const MonomorphContext = struct {
                     try self.recordCaseBindingType(bindings, binding_index, types_mod.TypeStore.UNKNOWN);
                 }
             },
+            .tagged_variant_match => |tvm| {
+                // Resolve the variant's declared payload type through
+                // the case scrutinee's tagged-union declaration, then
+                // substitute any applied args before recording the
+                // inner binding's local type. Mirrors the .struct_match
+                // arm's parametric handling: an `Option(i64).Some(v)`
+                // pattern records `v :: i64`, an `Option.None` pattern
+                // records nothing (no payload, no bindings).
+                if (tvm.payload == null) return;
+                const payload_pat = tvm.payload.?;
+                const parent_typ = self.store.getType(parent_type);
+                const tagged_decl, const subs_opt = blk: {
+                    if (parent_typ == .tagged_union) {
+                        break :blk .{ parent_typ.tagged_union, @as(?SubstitutionMap, null) };
+                    }
+                    if (parent_typ == .applied) {
+                        const base_typ = self.store.getType(parent_typ.applied.base);
+                        if (base_typ != .tagged_union) break :blk .{
+                            types_mod.Type.TaggedUnionType{ .name = 0, .variants = &.{}, .type_params = &.{} },
+                            @as(?SubstitutionMap, null),
+                        };
+                        const decl_union = base_typ.tagged_union;
+                        var subs = SubstitutionMap.init(self.allocator);
+                        const pair_count = @min(decl_union.type_params.len, parent_typ.applied.args.len);
+                        for (decl_union.type_params[0..pair_count], parent_typ.applied.args[0..pair_count]) |formal_id, arg_id| {
+                            const formal_typ = self.store.getType(formal_id);
+                            if (formal_typ != .type_var) continue;
+                            subs.bind(formal_typ.type_var, arg_id);
+                        }
+                        break :blk .{ decl_union, @as(?SubstitutionMap, subs) };
+                    }
+                    break :blk .{
+                        types_mod.Type.TaggedUnionType{ .name = 0, .variants = &.{}, .type_params = &.{} },
+                        @as(?SubstitutionMap, null),
+                    };
+                };
+                var subs_mut = subs_opt;
+                defer if (subs_mut) |*owned| owned.deinit();
+                var payload_type: TypeId = types_mod.TypeStore.UNKNOWN;
+                for (tagged_decl.variants) |variant| {
+                    if (variant.name != tvm.variant_name) continue;
+                    payload_type = variant.type_id orelse types_mod.TypeStore.UNKNOWN;
+                    break;
+                }
+                if (subs_mut) |*subs| {
+                    if (payload_type != types_mod.TypeStore.UNKNOWN) {
+                        payload_type = subs.applyToType(self.store, payload_type);
+                    }
+                }
+                try self.recordCasePatternLocalTypes(payload_pat, payload_type, bindings, binding_index);
+            },
         }
     }
 

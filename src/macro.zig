@@ -3338,6 +3338,11 @@ fn stampExpansionOnPattern(pattern: *const ast.Pattern, info: *const ast.Expansi
             stampMetaIfUnset(&v.meta, info);
             for (v.segments) |*seg| stampExpansionOnBinarySegment(seg, info);
         },
+        .tagged_union_variant => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.type_args) |ta| stampExpansionOnTypeExpr(ta, info);
+            if (v.payload) |payload| stampExpansionOnPattern(payload, info);
+        },
     }
 }
 

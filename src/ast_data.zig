@@ -512,6 +512,25 @@ pub fn patternToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "%{}" }, try metaToList(alloc, store, v.meta, null), try makeListFromSlice(alloc, store, field_vals.items));
         },
         .paren => |v| patternToCtValue(alloc, interner, store, v.inner),
+        .tagged_union_variant => |v| {
+            // Encode as {:variant, meta, [qualifier_aliases, payload_pattern_or_nil]}.
+            // The CtValue surface is consumed by quote/unquote and intentionally
+            // mirrors Elixir's Macro.escape shape — qualifier becomes an
+            // `__aliases__` list, payload becomes the destructuring pattern or
+            // nil for nullary variants. Type-args are omitted from the CtValue
+            // surface (they're irrelevant to AST-walking macros).
+            var parts: std.ArrayListUnmanaged(CtValue) = .empty;
+            for (v.qualifier.parts) |part| {
+                try parts.append(alloc, CtValue{ .atom = interner.get(part) });
+            }
+            const aliases = try makeTuple3(alloc, store, .{ .atom = "__aliases__" }, try emptyList(alloc, store), try makeListFromSlice(alloc, store, parts.items));
+            const payload_val: CtValue = if (v.payload) |p|
+                try patternToCtValue(alloc, interner, store, p)
+            else
+                .nil;
+            const args = try makeList(alloc, store, &.{ aliases, payload_val });
+            return makeTuple3(alloc, store, .{ .atom = "variant" }, try metaToList(alloc, store, v.meta, null), args);
+        },
         .binary => |v| {
             // {:<<>>, meta, [segments...]} — simplified representation
             var seg_vals: std.ArrayListUnmanaged(CtValue) = .empty;

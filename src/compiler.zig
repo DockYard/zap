@@ -10962,6 +10962,32 @@ fn remapPattern(alloc: std.mem.Allocator, pattern: *ast.Pattern, remap: []const 
                 bp.segments = mutable_segs;
             }
         },
+        .tagged_union_variant => |*tuv| {
+            // Variant qualifiers carry interned segment names that must
+            // be remapped exactly like a struct_pattern's struct_name —
+            // otherwise an `Option.Some` reference in a quote-expanded
+            // pattern would resolve through the local interner ID in
+            // the merged program, silently aliasing to an unrelated
+            // string. Type-args carry their own interned identifiers;
+            // remap each TypeExpr in place. Payload patterns recurse.
+            try remapStructName(alloc, &tuv.qualifier, remap);
+            if (tuv.type_args.len > 0) {
+                const mutable_args = try alloc.alloc(*const ast.TypeExpr, tuv.type_args.len);
+                for (tuv.type_args, 0..) |arg, i| {
+                    const mutable = try alloc.create(ast.TypeExpr);
+                    mutable.* = arg.*;
+                    try remapTypeExpr(alloc, mutable, remap);
+                    mutable_args[i] = mutable;
+                }
+                tuv.type_args = mutable_args;
+            }
+            if (tuv.payload) |payload| {
+                const mutable_payload = try alloc.create(ast.Pattern);
+                mutable_payload.* = payload.*;
+                try remapPattern(alloc, mutable_payload, remap);
+                tuv.payload = mutable_payload;
+            }
+        },
         .wildcard => {},
     }
 }

@@ -1645,6 +1645,14 @@ pub const TypeChecker = struct {
                 }
             },
             .binary => {},
+            .tagged_union_variant => {
+                // Tagged-union variant patterns on assignment LHS are
+                // refutable — `Option.Some(v) = opt` would crash at
+                // runtime for `None`. The HIR layer ignores them; we
+                // record no binding types here. Forward compatibility
+                // for refutable assignment lives behind an explicit
+                // `~> Option.Some(v) = expr` rewrite (Phase 1.4).
+            },
         }
     }
 
@@ -1769,6 +1777,71 @@ pub const TypeChecker = struct {
                 }
             },
             .binary => {},
+            .tagged_union_variant => |tuv| {
+                // Resolve the variant qualifier against the case
+                // scrutinee's tagged-union type and propagate the
+                // substituted payload type to the inner binding.
+                //
+                // Walk strategy (mirrors the struct_pattern arm):
+                //
+                //   1. If parent is an `.applied { base, args }` whose
+                //      base is a tagged_union, the declaration is the
+                //      base; build a SubstitutionMap from declared
+                //      type_params -> args. Use that map to rewrite
+                //      the variant's declared payload type.
+                //   2. If parent is a bare tagged_union declaration
+                //      (no parametric args), look up the variant
+                //      directly and use its declared payload type.
+                //   3. Otherwise (unknown or mismatched parent), the
+                //      payload type collapses to UNKNOWN — the type
+                //      checker will surface a separate diagnostic
+                //      from `inferTaggedUnionVariantPattern`.
+                if (tuv.payload == null) return;
+                const payload_pat = tuv.payload.?;
+                const parent_typ = self.store.getType(parent_type);
+                const variant_name = tuv.qualifier.parts[tuv.qualifier.parts.len - 1];
+
+                const tagged_decl, const subs_opt = blk: {
+                    if (parent_typ == .tagged_union) {
+                        break :blk .{ parent_typ.tagged_union, @as(?SubstitutionMap, null) };
+                    }
+                    if (parent_typ == .applied) {
+                        const base_typ = self.store.getType(parent_typ.applied.base);
+                        if (base_typ != .tagged_union) break :blk .{
+                            Type.TaggedUnionType{ .name = 0, .variants = &.{}, .type_params = &.{} },
+                            @as(?SubstitutionMap, null),
+                        };
+                        const decl_union = base_typ.tagged_union;
+                        var subs = SubstitutionMap.init(self.allocator);
+                        const pair_count = @min(decl_union.type_params.len, parent_typ.applied.args.len);
+                        for (decl_union.type_params[0..pair_count], parent_typ.applied.args[0..pair_count]) |formal_id, arg_id| {
+                            const formal_typ = self.store.getType(formal_id);
+                            if (formal_typ != .type_var) continue;
+                            subs.bind(formal_typ.type_var, arg_id);
+                        }
+                        break :blk .{ decl_union, @as(?SubstitutionMap, subs) };
+                    }
+                    break :blk .{
+                        Type.TaggedUnionType{ .name = 0, .variants = &.{}, .type_params = &.{} },
+                        @as(?SubstitutionMap, null),
+                    };
+                };
+                var subs_mut = subs_opt;
+                defer if (subs_mut) |*owned| owned.deinit();
+
+                var payload_type: TypeId = TypeStore.UNKNOWN;
+                for (tagged_decl.variants) |variant| {
+                    if (variant.name != variant_name) continue;
+                    payload_type = variant.type_id orelse TypeStore.UNKNOWN;
+                    break;
+                }
+                if (subs_mut) |*subs| {
+                    if (payload_type != TypeStore.UNKNOWN) {
+                        payload_type = subs.applyToType(self.store, payload_type);
+                    }
+                }
+                try self.recordCasePatternBindingTypes(payload_pat, payload_type, source_span);
+            },
         }
     }
 
@@ -4357,6 +4430,9 @@ pub const TypeChecker = struct {
             .pin => {},
             .paren => |paren| try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(paren.inner),
             .binary => |binary| for (binary.segments) |segment| try self.validateBinarySegmentDoesNotCallUnderscoreFunctions(segment),
+            .tagged_union_variant => |tuv| {
+                if (tuv.payload) |payload| try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(payload);
+            },
             .wildcard,
             .bind,
             .literal,

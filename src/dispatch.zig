@@ -344,6 +344,7 @@ pub const DispatchEngine = struct {
             .struct_pattern => true,
             .pin => true,
             .binary => true,
+            .tagged_union_variant => true,
             .wildcard => false,
             .bind => false,
             .paren => |p| isPatternSpecific(p.inner),

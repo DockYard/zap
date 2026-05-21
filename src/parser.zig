@@ -23,6 +23,16 @@ pub const Parser = struct {
     /// parses as `if (Foo.bar(x) { ... })` — the trailing block gets
     /// absorbed as an argument to `bar`.
     disable_trailing_block: bool = false,
+    /// When true, `parsePattern` recognizes bare `Type.Variant` (no
+    /// payload parens, no explicit type-args) as a `tagged_union_variant`
+    /// AST node instead of the legacy `literal.atom` shape. Set only
+    /// while parsing case-arm patterns where the variant must be
+    /// resolved against the case scrutinee's tagged-union type. Outside
+    /// case arms (function-clause parameter patterns, assignment LHS),
+    /// the legacy atom-literal shape is preserved so existing
+    /// `fn color_name(Color.Red :: Color)` dispatch keeps working
+    /// unchanged.
+    case_arm_pattern_context: bool = false,
     /// Opt-in single-file script mode. Default `false` so every
     /// non-script caller (`Parser.init`, `Parser.initWithSharedInterner`)
     /// is byte-identical to the pre-script-mode behavior and the
@@ -3544,7 +3554,10 @@ pub const Parser = struct {
     fn parseCaseClause(self: *Parser) !ast.CaseClause {
         const start = self.currentSpan();
 
+        const prev_case_arm = self.case_arm_pattern_context;
+        self.case_arm_pattern_context = true;
         const pattern = try self.parsePattern();
+        self.case_arm_pattern_context = prev_case_arm;
 
         var type_annotation: ?*const ast.TypeExpr = null;
         if (self.check(.double_colon)) {
@@ -3853,6 +3866,35 @@ pub const Parser = struct {
                     if (self.check(.identifier) or self.check(.type_identifier)) {
                         const variant_tok = self.advance();
                         const variant_text = variant_tok.slice(self.source);
+                        // Lookahead for tagged-union variant pattern
+                        // with payload: `Foo.Bar(payload_pat)`. When the
+                        // variant ident is followed by `(`, parse the
+                        // payload sub-pattern and route through the new
+                        // `tagged_union_variant` AST arm. Bare
+                        // `Foo.Bar` in case-arm context also routes
+                        // through `tagged_union_variant` so case
+                        // exhaustiveness sees a uniform shape; outside
+                        // case arms (function-clause params), bare
+                        // `Foo.Bar` keeps the legacy `literal.atom`
+                        // shape so existing
+                        // `color_name(Color.Red :: Color)` dispatch
+                        // parses unchanged.
+                        if (self.check(.left_paren)) {
+                            return try self.parseTaggedUnionVariantPatternPayload(
+                                ast.SourceSpan.from(tok.loc),
+                                try self.internToken(tok),
+                                try self.interner.intern(variant_text),
+                                &.{},
+                            );
+                        }
+                        if (self.case_arm_pattern_context) {
+                            return try self.buildBareTaggedUnionVariantPattern(
+                                ast.SourceSpan.from(tok.loc),
+                                try self.internToken(tok),
+                                try self.interner.intern(variant_text),
+                                ast.SourceSpan.from(variant_tok.loc),
+                            );
+                        }
                         return self.create(ast.Pattern, .{
                             .literal = .{ .atom = .{
                                 .meta = .{ .span = ast.SourceSpan.merge(ast.SourceSpan.from(tok.loc), ast.SourceSpan.from(variant_tok.loc)) },
@@ -3870,12 +3912,42 @@ pub const Parser = struct {
             },
             .type_identifier => {
                 const tok = self.advance();
+                // Parametric tagged-union variant pattern with
+                // explicit type-args: `Option(i64).Some(v)`,
+                // `Option(i64).None`, `Result(i64, String).Err(_)`.
+                // The disambiguator scans ahead for `(<TypeExprs>).TypeIdent`
+                // and parses each type-arg via parseTypeExpr; if it
+                // matches, we route through the new `tagged_union_variant`
+                // arm. Otherwise fall through to the legacy bare
+                // `Foo.Bar` -> atom-literal handling for function-
+                // clause params.
+                if (try self.tryParseInstantiatedVariantPattern(ast.SourceSpan.from(tok.loc), try self.internToken(tok))) |constructed| {
+                    return constructed;
+                }
                 // Struct-qualified enum pattern: Color.Red
                 if (self.check(.dot)) {
                     _ = self.advance(); // consume '.'
                     if (self.check(.identifier) or self.check(.type_identifier)) {
                         const variant_tok = self.advance();
                         const variant_text = variant_tok.slice(self.source);
+                        // Same payload lookahead and case-arm routing
+                        // as the identifier branch.
+                        if (self.check(.left_paren)) {
+                            return try self.parseTaggedUnionVariantPatternPayload(
+                                ast.SourceSpan.from(tok.loc),
+                                try self.internToken(tok),
+                                try self.interner.intern(variant_text),
+                                &.{},
+                            );
+                        }
+                        if (self.case_arm_pattern_context) {
+                            return try self.buildBareTaggedUnionVariantPattern(
+                                ast.SourceSpan.from(tok.loc),
+                                try self.internToken(tok),
+                                try self.interner.intern(variant_text),
+                                ast.SourceSpan.from(variant_tok.loc),
+                            );
+                        }
                         return self.create(ast.Pattern, .{
                             .literal = .{ .atom = .{
                                 .meta = .{ .span = ast.SourceSpan.merge(ast.SourceSpan.from(tok.loc), ast.SourceSpan.from(variant_tok.loc)) },
@@ -4265,6 +4337,148 @@ pub const Parser = struct {
             .binary = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
                 .segments = try segments.toOwnedSlice(self.allocator),
+            },
+        });
+    }
+
+    /// Build a bare-form (no payload, no explicit type-args)
+    /// `tagged_union_variant` AST pattern. Used in case-arm context
+    /// for shapes like `Option.None -> 0` or `Color.Red -> "red"`
+    /// where the variant ident has no trailing `(...)`. The full
+    /// pattern's source span runs from the receiver's span through
+    /// the variant ident's span.
+    fn buildBareTaggedUnionVariantPattern(
+        self: *Parser,
+        base_span: ast.SourceSpan,
+        base_name: ast.StringId,
+        variant_name: ast.StringId,
+        variant_span: ast.SourceSpan,
+    ) !*const ast.Pattern {
+        const parts = try self.allocator.alloc(ast.StringId, 2);
+        parts[0] = base_name;
+        parts[1] = variant_name;
+        const full_span = ast.SourceSpan.merge(base_span, variant_span);
+        return try self.create(ast.Pattern, .{
+            .tagged_union_variant = .{
+                .meta = .{ .span = full_span },
+                .qualifier = .{ .parts = parts, .span = full_span },
+                .type_args = &.{},
+                .payload = null,
+            },
+        });
+    }
+
+    /// Continue parsing a tagged-union variant pattern after the
+    /// caller has already consumed `BaseTypeIdent.VariantTypeIdent` (or
+    /// `BaseTypeIdent(<TypeExprs>).VariantTypeIdent`). The lexer is
+    /// positioned at the opening `(` of the payload pattern. Parses
+    /// the inner pattern (a single sub-pattern; multi-field payload
+    /// shapes route through `tuple` inside the parens), closes the
+    /// paren, and builds the AST `tagged_union_variant` arm. The
+    /// `qualifier_parts` slice must already contain
+    /// `[base_name, variant_name]`. `type_args` is `&.{}` for the
+    /// bare form, populated for the explicit-instantiation form.
+    fn parseTaggedUnionVariantPatternPayload(
+        self: *Parser,
+        base_span: ast.SourceSpan,
+        base_name: ast.StringId,
+        variant_name: ast.StringId,
+        type_args: []const *const ast.TypeExpr,
+    ) !*const ast.Pattern {
+        _ = try self.expect(.left_paren);
+        const payload_pat = try self.parsePattern();
+        _ = try self.expect(.right_paren);
+
+        const parts = try self.allocator.alloc(ast.StringId, 2);
+        parts[0] = base_name;
+        parts[1] = variant_name;
+        const full_span = ast.SourceSpan.merge(base_span, self.previousSpan());
+        return self.create(ast.Pattern, .{
+            .tagged_union_variant = .{
+                .meta = .{ .span = full_span },
+                .qualifier = .{ .parts = parts, .span = full_span },
+                .type_args = type_args,
+                .payload = payload_pat,
+            },
+        });
+    }
+
+    /// Lookahead disambiguator for parametric tagged-union variant
+    /// patterns: `Option(i64).Some(v)`, `Option(i64).None`,
+    /// `Result(i64, String).Err(_)`. Returns the constructed
+    /// `tagged_union_variant` pattern when the next tokens are
+    /// `(<TypeExpr,...>).TypeIdent` (with or without a trailing
+    /// payload `(...)`), otherwise returns null and leaves the lexer
+    /// untouched. Mirrors `tryParseInstantiatedVariantConstructor`
+    /// (expression-side disambiguator) — same parse rules, different
+    /// AST node.
+    ///
+    /// The caller has already consumed the leading `TypeIdent` and
+    /// passes its span + interned name. The lexer is positioned at
+    /// what may be `(` (typed-receiver form) or something else
+    /// (fall-through to bare-form atom-literal handling).
+    fn tryParseInstantiatedVariantPattern(
+        self: *Parser,
+        base_span: ast.SourceSpan,
+        base_name: ast.StringId,
+    ) !?*const ast.Pattern {
+        if (!self.check(.left_paren)) return null;
+
+        const saved = self.saveLexerState();
+        _ = self.advance(); // consume `(`
+        var depth: u32 = 1;
+        while (depth > 0) {
+            if (self.check(.eof)) {
+                self.restoreLexerState(saved);
+                return null;
+            }
+            if (self.check(.left_paren)) depth += 1;
+            if (self.check(.right_paren)) depth -= 1;
+            _ = self.advance();
+        }
+        if (!self.check(.dot)) {
+            self.restoreLexerState(saved);
+            return null;
+        }
+        _ = self.advance(); // consume `.`
+        if (!self.check(.type_identifier)) {
+            self.restoreLexerState(saved);
+            return null;
+        }
+
+        // Confirmed: `BaseTypeIdent ( TypeArgs ) . VariantTypeIdent`.
+        // Roll back and re-parse the type-arg list properly.
+        self.restoreLexerState(saved);
+        _ = self.advance(); // consume `(`
+        self.skipNewlines();
+        var type_args: std.ArrayList(*const ast.TypeExpr) = .empty;
+        while (!self.check(.right_paren) and !self.check(.eof)) {
+            try type_args.append(self.allocator, try self.parseTypeExpr());
+            if (!self.match(.comma)) break;
+            self.skipNewlines();
+        }
+        _ = try self.expect(.right_paren);
+        _ = try self.expect(.dot);
+        const variant_tok = try self.expect(.type_identifier);
+        const variant_name = try self.internToken(variant_tok);
+        const args_slice = try type_args.toOwnedSlice(self.allocator);
+
+        // Trailing payload `(...)` is optional — nullary variants
+        // (`Option(i64).None`) terminate here.
+        if (self.check(.left_paren)) {
+            return try self.parseTaggedUnionVariantPatternPayload(base_span, base_name, variant_name, args_slice);
+        }
+
+        const parts = try self.allocator.alloc(ast.StringId, 2);
+        parts[0] = base_name;
+        parts[1] = variant_name;
+        const full_span = ast.SourceSpan.merge(base_span, ast.SourceSpan.from(variant_tok.loc));
+        return try self.create(ast.Pattern, .{
+            .tagged_union_variant = .{
+                .meta = .{ .span = full_span },
+                .qualifier = .{ .parts = parts, .span = full_span },
+                .type_args = args_slice,
+                .payload = null,
             },
         });
     }
@@ -7457,4 +7671,180 @@ test "contextual-keyword: `pub fn unquote(name)(...)` dynamic-name form parses" 
     const inner_fn = quote_body[0].function_decl;
     try std.testing.expect(inner_fn.name_expr != null);
     try std.testing.expect(inner_fn.name_expr.?.* == .unquote_expr);
+}
+
+// ============================================================
+// Tagged-union variant pattern parsing tests (Phase 1.1.5 gap-fix)
+// ============================================================
+
+test "parse tagged-union variant pattern with single-bind payload" {
+    // `Option.Some(v) -> v` is the canonical destructuring pattern.
+    // It must parse as `.tagged_union_variant { qualifier=[Option,Some],
+    // type_args=[], payload=bind(v) }`. The whole pattern is the case
+    // arm's pattern — NOT a leading atom literal followed by a tuple.
+    const source =
+        \\pub struct Demo {
+        \\  pub fn unwrap(opt :: Option) -> i64 {
+        \\    case opt {
+        \\      Option.Some(v) -> v
+        \\      Option.None -> 0
+        \\    }
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    const body = program.structs[0].items[0].function.clauses[0].body.?;
+    const case_expr = body[0].expr;
+    try std.testing.expect(case_expr.* == .case_expr);
+    const clauses = case_expr.case_expr.clauses;
+    try std.testing.expectEqual(@as(usize, 2), clauses.len);
+
+    // Arm 0: Option.Some(v)
+    try std.testing.expect(clauses[0].pattern.* == .tagged_union_variant);
+    const arm0 = clauses[0].pattern.tagged_union_variant;
+    try std.testing.expectEqual(@as(usize, 2), arm0.qualifier.parts.len);
+    try std.testing.expectEqualStrings("Option", parser.interner.get(arm0.qualifier.parts[0]));
+    try std.testing.expectEqualStrings("Some", parser.interner.get(arm0.qualifier.parts[1]));
+    try std.testing.expectEqual(@as(usize, 0), arm0.type_args.len);
+    try std.testing.expect(arm0.payload != null);
+    try std.testing.expect(arm0.payload.?.* == .bind);
+    try std.testing.expectEqualStrings("v", parser.interner.get(arm0.payload.?.bind.name));
+
+    // Arm 1: Option.None
+    try std.testing.expect(clauses[1].pattern.* == .tagged_union_variant);
+    const arm1 = clauses[1].pattern.tagged_union_variant;
+    try std.testing.expectEqual(@as(usize, 2), arm1.qualifier.parts.len);
+    try std.testing.expectEqualStrings("Option", parser.interner.get(arm1.qualifier.parts[0]));
+    try std.testing.expectEqualStrings("None", parser.interner.get(arm1.qualifier.parts[1]));
+    try std.testing.expectEqual(@as(usize, 0), arm1.type_args.len);
+    try std.testing.expect(arm1.payload == null);
+}
+
+test "parse tagged-union variant pattern with explicit type-args" {
+    // `Option(i64).Some(v)` carries an explicit type-arg list. The
+    // pattern's `type_args` records the inferred receiver shape; the
+    // payload binding lives under `payload`.
+    const source =
+        \\pub struct Demo {
+        \\  pub fn unwrap(opt :: Option(i64)) -> i64 {
+        \\    case opt {
+        \\      Option(i64).Some(v) -> v
+        \\      Option(i64).None -> 0
+        \\    }
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    const body = program.structs[0].items[0].function.clauses[0].body.?;
+    const case_expr = body[0].expr;
+    try std.testing.expect(case_expr.* == .case_expr);
+    const clauses = case_expr.case_expr.clauses;
+    try std.testing.expectEqual(@as(usize, 2), clauses.len);
+
+    try std.testing.expect(clauses[0].pattern.* == .tagged_union_variant);
+    const arm0 = clauses[0].pattern.tagged_union_variant;
+    try std.testing.expectEqual(@as(usize, 1), arm0.type_args.len);
+    try std.testing.expect(arm0.type_args[0].* == .name);
+    try std.testing.expectEqualStrings("i64", parser.interner.get(arm0.type_args[0].name.name));
+    try std.testing.expect(arm0.payload != null);
+    try std.testing.expect(arm0.payload.?.* == .bind);
+
+    try std.testing.expect(clauses[1].pattern.* == .tagged_union_variant);
+    const arm1 = clauses[1].pattern.tagged_union_variant;
+    try std.testing.expectEqual(@as(usize, 1), arm1.type_args.len);
+    try std.testing.expect(arm1.payload == null);
+}
+
+test "parse tagged-union variant pattern with wildcard payload" {
+    // `Option.Some(_) -> 0` — the payload is a wildcard pattern.
+    const source =
+        \\pub struct Demo {
+        \\  pub fn unwrap(opt :: Option) -> i64 {
+        \\    case opt {
+        \\      Option.Some(_) -> 0
+        \\      Option.None -> 1
+        \\    }
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    const body = program.structs[0].items[0].function.clauses[0].body.?;
+    const clauses = body[0].expr.case_expr.clauses;
+    try std.testing.expect(clauses[0].pattern.* == .tagged_union_variant);
+    try std.testing.expect(clauses[0].pattern.tagged_union_variant.payload != null);
+    try std.testing.expect(clauses[0].pattern.tagged_union_variant.payload.?.* == .wildcard);
+}
+
+test "parse tagged-union variant pattern with multi-type-arg receiver" {
+    // `Result(i64, String).Ok(v)` parses with both type-args attached
+    // and a bind payload. `Result(i64, String).Err(_)` covers the
+    // multi-arg + wildcard combination.
+    const source =
+        \\pub struct Demo {
+        \\  pub fn run(r :: Result(i64, String)) -> i64 {
+        \\    case r {
+        \\      Result(i64, String).Ok(v) -> v
+        \\      Result(i64, String).Err(_) -> 0
+        \\    }
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    const body = program.structs[0].items[0].function.clauses[0].body.?;
+    const clauses = body[0].expr.case_expr.clauses;
+    try std.testing.expectEqual(@as(usize, 2), clauses.len);
+    const arm0 = clauses[0].pattern.tagged_union_variant;
+    try std.testing.expectEqual(@as(usize, 2), arm0.type_args.len);
+    try std.testing.expectEqualStrings("Ok", parser.interner.get(arm0.qualifier.parts[1]));
+    try std.testing.expect(arm0.payload.?.* == .bind);
+
+    const arm1 = clauses[1].pattern.tagged_union_variant;
+    try std.testing.expectEqual(@as(usize, 2), arm1.type_args.len);
+    try std.testing.expectEqualStrings("Err", parser.interner.get(arm1.qualifier.parts[1]));
+    try std.testing.expect(arm1.payload.?.* == .wildcard);
+}
+
+test "tagged-union variant pattern preserves enum-style fallback for parameter clauses" {
+    // The function-clause form `fn color_name(Color.Red :: Color)`
+    // still parses the same way it did before — as an atom literal
+    // pattern (variant name only, type from annotation). The new
+    // `tagged_union_variant` arm only kicks in in case-arm position
+    // where the `Type.Variant` form is followed by either `(...)` or
+    // an arm continuation (`->`, end-of-clause).
+    const source =
+        \\pub union Color { Red, Green, Blue }
+        \\pub struct Demo {
+        \\  pub fn color_name(Color.Red :: Color) -> String {
+        \\    "red"
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    const func = program.structs[0].items[0].function;
+    const param_pat = func.clauses[0].params[0].pattern.*;
+    // Function-clause parameter patterns keep the legacy
+    // `literal.atom` shape — only case-arm patterns route through
+    // the new `tagged_union_variant` arm.
+    try std.testing.expect(param_pat == .literal);
+    try std.testing.expect(param_pat.literal == .atom);
 }
