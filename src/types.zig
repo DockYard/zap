@@ -3269,6 +3269,14 @@ pub const TypeChecker = struct {
                 const default_expr = field_decl.default orelse continue;
                 const field_type_id = self.findRegisteredFieldType(registered.struct_type, field_decl.name) orelse continue;
                 if (field_type_id == TypeStore.UNKNOWN) continue;
+                // Skip fields whose declared type is a formal type
+                // parameter (`value :: T = ...`). Defaults that
+                // reference parametric slots can only be validated
+                // once the construction site picks a concrete `T`;
+                // checking against the formal type_var here would
+                // false-positive on every literal default. Per-
+                // instantiation re-validation is Phase 1.1.5.e.
+                if (self.store.containsTypeVars(field_type_id)) continue;
 
                 const inferred = self.inferExpr(default_expr) catch TypeStore.UNKNOWN;
                 if (inferred == TypeStore.UNKNOWN) continue;
@@ -10940,6 +10948,41 @@ test "parametric type expression with wrong arity emits diagnostic" {
         }
     }
     try std.testing.expect(found_arity_diag);
+}
+
+test "parametric struct field default referencing a type-var is skipped at declaration" {
+    // `pub struct Box(T) { value :: T = 0 }` would false-positive
+    // under the declaration-time default validator because the
+    // field's recorded type is the formal type_var (`T`) while the
+    // default `0` infers to i64. The validator must skip any field
+    // whose declared type still contains a type_var — per-
+    // instantiation re-validation is Phase 1.1.5.e.
+    const source =
+        \\pub struct Box(T) {
+        \\  value :: T = 0
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 }
 
 test "applyToType rewrites tagged-union variant payload type via substitution" {
