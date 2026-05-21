@@ -814,6 +814,40 @@ pub const TypeStore = struct {
             return self.unify(type_a.map.value, type_b.map.value, subs);
         }
 
+        // Both are parametric instantiations: the bases must agree
+        // and the args must unify pairwise. This is what lets the
+        // monomorphizer bind `t -> i64` when a generic param `Box(t)`
+        // is called with a `Box(i64)` argument, mirroring the existing
+        // list/map/tuple/function arms.
+        if (type_a == .applied and type_b == .applied) {
+            if (type_a.applied.args.len != type_b.applied.args.len) return false;
+            // Bases are nominal-type *declarations*; identity is by
+            // TypeId (the type checker already deduped them via
+            // `name_to_type`). A structural recursive unify on `base`
+            // would needlessly fail across the rare cases where a
+            // declaration TypeId differs from a `.applied` base — but
+            // those cases are bugs elsewhere, not legitimate
+            // unification opportunities.
+            if (type_a.applied.base != type_b.applied.base) return false;
+            for (type_a.applied.args, type_b.applied.args) |arg_a, arg_b| {
+                if (!try self.unify(arg_a, arg_b, subs)) return false;
+            }
+            return true;
+        }
+
+        // A `.applied` instantiation paired with the matching bare
+        // declaration (`Box(i64)` vs `Box`) is the bridge that lets
+        // generic helpers with unannotated `Box` return types accept
+        // a concrete `Box(i64)` literal. `typeEquals` already encodes
+        // the same direction-symmetric rule; the unifier must agree
+        // so monomorphization scans don't drop these calls.
+        if (type_a == .applied and (type_b == .struct_type or type_b == .tagged_union)) {
+            return type_a.applied.base == resolved_b;
+        }
+        if (type_b == .applied and (type_a == .struct_type or type_a == .tagged_union)) {
+            return type_b.applied.base == resolved_a;
+        }
+
         // Both are the same primitive kind: check they're structurally identical
         // (int with matching signedness/bits, float with matching bits, etc.)
         if (type_a == .int and type_b == .int) {

@@ -1931,8 +1931,211 @@ fn mangleName(allocator: Allocator, base_name: []const u8, store: *const TypeSto
     return try parts.toOwnedSlice(allocator);
 }
 
-/// Convert a TypeId to a short mangled name for function specialization.
+// ============================================================
+// Parametric struct/union specialization tests (Phase 1.1.5.c)
+// ============================================================
+
+const Parser = @import("parser.zig").Parser;
+const Collector = @import("collector.zig").Collector;
+const HirBuilder = hir.HirBuilder;
+
+test "monomorphizer specializes generic helper on distinct parametric struct args" {
+    // `unbox` is a generic helper taking `Box(T)` and returning `T`.
+    // When the program calls `unbox(%Box(i64){value: 1})` and
+    // `unbox(%Box(String){value: "x"})`, the monomorphizer must
+    // emit two distinct specializations — one keyed on `Box(i64)`,
+    // one on `Box(String)`. This is the property IR/ZIR emission
+    // depends on to produce per-instantiation runtime types.
+    const source =
+        \\pub struct Box(t) {
+        \\  value :: t
+        \\}
+        \\pub struct Demo {
+        \\  pub fn unbox(b :: Box(t)) -> t {
+        \\    b.value
+        \\  }
+        \\  pub fn use_int() -> i64 {
+        \\    unbox(%Box(i64){value: 1})
+        \\  }
+        \\  pub fn use_str() -> String {
+        \\    unbox(%Box(String){value: "x"})
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    var next_id: u32 = builder.next_group_id;
+    const result = try monomorphize(alloc, &hir_program, checker.store, &next_id, @constCast(parser.interner));
+
+    // `unbox` is specialized once per concrete instantiation of the
+    // type variable `t` (the parametric `Box(t)` parameter type
+    // unifies through to its inner `t`, which is the binding the
+    // monomorphizer keys off). The mangled clone names contain the
+    // type-arg encoding chosen by `typeIdToMangledName` — `i64` for
+    // i64 and `String` for String — and the calling-struct prefix
+    // (`Demo_`) is what `compileStructByStruct` puts in front of
+    // cross-struct specializations.
+    var unbox_specializations: usize = 0;
+    var found_i64 = false;
+    var found_string = false;
+    for (result.program.structs) |demo| {
+        for (demo.functions) |group| {
+            const name = parser.interner.get(group.name);
+            if (std.mem.indexOf(u8, name, "unbox__") != null) {
+                unbox_specializations += 1;
+                if (std.mem.endsWith(u8, name, "__i64")) found_i64 = true;
+                if (std.mem.endsWith(u8, name, "__String")) found_string = true;
+            }
+        }
+    }
+    try std.testing.expect(unbox_specializations >= 2);
+    try std.testing.expect(found_i64);
+    try std.testing.expect(found_string);
+}
+
+test "monomorphizer dedupes specializations for identical parametric args" {
+    // Two call sites passing `Box(i64)` must produce one
+    // specialization, not two — the hashInstantiation key is the
+    // applied TypeId tuple, which TypeStore.addType structurally
+    // dedupes, so re-instantiating Box(i64) at a fresh call site
+    // returns the same TypeId and the same specialization.
+    const source =
+        \\pub struct Box(t) {
+        \\  value :: t
+        \\}
+        \\pub struct Demo {
+        \\  pub fn unbox(b :: Box(t)) -> t {
+        \\    b.value
+        \\  }
+        \\  pub fn a() -> i64 {
+        \\    unbox(%Box(i64){value: 1})
+        \\  }
+        \\  pub fn b() -> i64 {
+        \\    unbox(%Box(i64){value: 2})
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    var next_id: u32 = builder.next_group_id;
+    const result = try monomorphize(alloc, &hir_program, checker.store, &next_id, @constCast(parser.interner));
+
+    var unbox_specializations: usize = 0;
+    for (result.program.structs) |demo| {
+        for (demo.functions) |group| {
+            const name = parser.interner.get(group.name);
+            if (std.mem.indexOf(u8, name, "unbox__") != null) unbox_specializations += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), unbox_specializations);
+}
+
+test "typeIdToMangledName encodes applied parametric types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const box_name = try interner.intern("Box");
+    const pair_name = try interner.intern("Pair");
+
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const box_decl = try store.addType(.{ .struct_type = .{
+        .name = box_name,
+        .fields = &.{},
+        .type_params = &.{},
+    } });
+    const pair_decl = try store.addType(.{ .struct_type = .{
+        .name = pair_name,
+        .fields = &.{},
+        .type_params = &.{},
+    } });
+
+    const i64_args = try alloc.alloc(TypeId, 1);
+    i64_args[0] = TypeStore.I64;
+    const box_i64 = try store.addType(.{ .applied = .{ .base = box_decl, .args = i64_args } });
+    try std.testing.expectEqualStrings("Box_i64", typeIdToMangledName(&store, box_i64));
+
+    const string_args = try alloc.alloc(TypeId, 1);
+    string_args[0] = TypeStore.STRING;
+    const box_string = try store.addType(.{ .applied = .{ .base = box_decl, .args = string_args } });
+    try std.testing.expectEqualStrings("Box_String", typeIdToMangledName(&store, box_string));
+
+    const pair_args = try alloc.alloc(TypeId, 2);
+    pair_args[0] = TypeStore.I64;
+    pair_args[1] = TypeStore.STRING;
+    const pair_i64_string = try store.addType(.{ .applied = .{ .base = pair_decl, .args = pair_args } });
+    try std.testing.expectEqualStrings("Pair_i64_String", typeIdToMangledName(&store, pair_i64_string));
+}
+
+/// Convert a TypeId to a short mangled name for function
+/// specialization. Returns a borrowed slice for primitives and bare
+/// nominal types; allocates a fresh string from `store.allocator`
+/// for `.applied { base, args }` so two distinct instantiations of
+/// the same parametric struct/union get distinct mangled
+/// function-specialization names (`Box(i64) → Box_i64`, `Box(String)
+/// → Box_String`). Without the allocating arm an `else => "T"`
+/// fall-through would collapse every parametric instantiation onto
+/// the same key and the second specialization would silently
+/// overwrite the first. The allocated buffer is appended (and
+/// therefore copied) into the calling mangler's output string, so
+/// the caller owns no live reference after it returns.
 fn typeIdToMangledName(store: *const TypeStore, type_id: TypeId) []const u8 {
+    return typeIdToMangledNameAlloc(@constCast(store).allocator, store, type_id) catch "T";
+}
+
+/// Allocation-capable mangled-name builder: needed for `.applied`
+/// where the result string is composed (`Box_i64`) and therefore
+/// can't be returned as a borrowed pointer to an existing buffer.
+/// Primitive/nominal cases still return interned static strings; only
+/// `.applied` actually allocates. Callers that do not need the
+/// composed shape go through the borrowed `typeIdToMangledName`.
+fn typeIdToMangledNameAlloc(
+    allocator: Allocator,
+    store: *const TypeStore,
+    type_id: TypeId,
+) Allocator.Error![]const u8 {
     const typ = store.getType(type_id);
     return switch (typ) {
         .int => |it| switch (it.bits) {
@@ -1959,6 +2162,23 @@ fn typeIdToMangledName(store: *const TypeStore, type_id: TypeId) []const u8 {
         .unknown => "Any",
         .struct_type => |st| @constCast(store).interner.get(st.name),
         .tagged_union => |tu| @constCast(store).interner.get(tu.name),
+        .applied => |ap| blk: {
+            // Recursively mangle the base + each arg so a parametric
+            // instantiation like `Box(i64)` becomes `Box_i64` and
+            // `Pair(i64, String)` becomes `Pair_i64_String`. Nested
+            // parametrics (`Box(Box(i64))`) flatten the same way so
+            // the result remains unambiguous across siblings.
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            const base_name = try typeIdToMangledNameAlloc(allocator, store, ap.base);
+            try buf.appendSlice(allocator, base_name);
+            for (ap.args) |arg| {
+                try buf.append(allocator, '_');
+                const arg_name = try typeIdToMangledNameAlloc(allocator, store, arg);
+                try buf.appendSlice(allocator, arg_name);
+            }
+            break :blk try buf.toOwnedSlice(allocator);
+        },
         else => "T",
     };
 }
