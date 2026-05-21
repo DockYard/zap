@@ -741,6 +741,137 @@ comptime {
 }
 
 // ============================================================
+// ProtocolBox — runtime fat-pointer for protocol existentials
+// (Phase 1.2.5.a)
+//
+// `ProtocolBox` is the universal *transport shape* for "an erased
+// value implementing some protocol P" — the Rust `Box<dyn Trait>` /
+// Swift `any Error` / Java `Throwable` analog. Every protocol-typed
+// value the user writes (`source/1 -> Option(Error)`, an `Error`
+// parameter, a `cause :: Option(Error)` field, etc.) lowers to this
+// single Zig shape regardless of which protocol it boxes; the
+// receiving protocol's vtable type lives in user-emitted code and
+// is reached by casting `vtable` back to `*const FooVTable` at the
+// dispatch site.
+//
+// Layout: two pointers, 16 bytes on 64-bit.
+//
+//   data_ptr  - opaque pointer to the heap-allocated inner value
+//   vtable    - opaque pointer to the per-impl vtable constant
+//
+// Both pointers are erased to `*anyopaque` for one reason: every
+// protocol declares its own distinct vtable struct type at codegen
+// time (e.g. `ErrorVTable`, `EnumerableVTable`), and a single
+// `ProtocolBox` Zig type must be able to transport any of those
+// without templating. The cast back to the concrete vtable type is
+// the consumption-site contract (Phase 1.2.5.d) — that cast is a
+// no-op at the machine level.
+//
+// **Optional shape.** `data_ptr` and `vtable` are nullable
+// (`?*anyopaque`) so the zeroed bit-pattern can represent
+// "no protocol value" (e.g. `Option.None` on a `cause :: Option(Error)`
+// field whose `Option(Error)` lowers to a `ProtocolBox` directly).
+// Construction sites that mean "absent" set both fields to null;
+// consumption sites that need a value check `data_ptr != null`.
+//
+// **ARC ownership contract.**
+//   - The `ProtocolBox` itself is an ARC-managed cell. Heap
+//     allocations of `ProtocolBox` go through `ArcRuntime.allocAny`
+//     and `releaseAny`, the same machinery used for every other
+//     boxed value. The box has no inline `ArcHeader` — it sits in
+//     a side-table-refcounted slab slot (the default Zap layout
+//     under the v1.0+ memory ABI).
+//   - The inner value at `data_ptr` is *owned* by the box. The
+//     construction site (Phase 1.2.5.c) heap-allocates the inner
+//     through `ArcRuntime.allocAny` and stores the resulting
+//     pointer in `data_ptr`. The box's release path (Phase 1.2.5.c
+//     wires the call through the inner type's drop glue) releases
+//     the inner before freeing the box.
+//   - `vtable` is **not** ARC-managed: per-impl vtables live in
+//     `.rodata` as compile-time constants (the synthetic Zig file
+//     emits a top-level `pub const FooVTable_for_Bar: FooVTable =
+//     ...`). Releasing the box must not touch `vtable`.
+//
+// Phase 1.2.5.a contract: this header defines the type and
+// surfaces a `null` constant for the absent case. Construction /
+// retain / release sites for the box itself land in 1.2.5.c — the
+// construction site knows the inner type, which is what
+// `releaseAny` needs to dispatch to the inner's drop glue.
+// ============================================================
+
+/// Universal transport shape for protocol existentials. A
+/// `ProtocolBox` is a fat pointer `{ data_ptr, vtable }` — the
+/// runtime side of Zap's protocol-trait-object system. Every
+/// protocol-typed value at the source level (`Error`, a `Foo`
+/// parameter typed as `Foo` where `Foo` is a protocol, a field of
+/// type `Option(Foo)`, etc.) lowers to this Zig type.
+///
+/// Both fields are nullable so the all-zero bit-pattern represents
+/// "absent" — that maps cleanly onto `Option.None` for a
+/// `?ProtocolBox`-shaped field.
+///
+/// The opaque-pointer typing of `vtable` is the deliberate cost of
+/// having one Zig type cover every protocol: the dispatch site
+/// casts `vtable` back to the concrete `*const <Protocol>VTable`
+/// before reading method slots. That cast is a no-op at the
+/// machine level; it survives only in Zig's type system.
+pub const ProtocolBox = extern struct {
+    /// Heap-allocated inner value. Owned by the box: at box
+    /// construction the inner is allocated via `ArcRuntime.allocAny`
+    /// and retained; at box drop the inner is released through the
+    /// concrete type's drop glue. `null` represents the absent box
+    /// (the `Option.None` case for `Option(<protocol>)`-shaped
+    /// fields).
+    data_ptr: ?*anyopaque,
+
+    /// Per-impl vtable constant, type-erased to a generic opaque
+    /// pointer. The dispatch site casts this back to the concrete
+    /// `*const <Protocol>VTable` it expects. Vtables are
+    /// `.rodata` constants — never ARC-managed; `null` only when
+    /// `data_ptr` is also `null` (the absent box).
+    vtable: ?*const anyopaque,
+
+    /// The absent box. Both fields zero. Lower-cost than calling
+    /// `init` at every "no value yet" site, and matches the
+    /// implicit `{0, 0}` shape an `Option.None`-as-`ProtocolBox`
+    /// field gets in user-emitted Zig source.
+    pub const none: ProtocolBox = .{ .data_ptr = null, .vtable = null };
+
+    /// True iff the box carries a value. Construction sites in
+    /// Phase 1.2.5.c set `data_ptr` to a non-null inner pointer
+    /// together with a non-null vtable; consumption sites in Phase
+    /// 1.2.5.d guard dispatch on this predicate.
+    pub fn isPresent(self: ProtocolBox) bool {
+        return self.data_ptr != null;
+    }
+};
+
+comptime {
+    // Layout invariants. The runtime ABI for protocol existentials
+    // is a fat pointer — two opaque pointers, no padding, no
+    // hidden ArcHeader (the box itself sits in a side-table-
+    // refcounted slab slot under the default v1.x manager ABI).
+    // Construction-site lowering (Phase 1.2.5.c) and consumption-
+    // site lowering (Phase 1.2.5.d) bake this layout into the
+    // codegen; drift in either field would mis-cast every dispatch.
+    const expected_size = 2 * @sizeOf(*anyopaque);
+    if (@sizeOf(ProtocolBox) != expected_size) @compileError(
+        "runtime: ProtocolBox must be exactly two pointers wide",
+    );
+    if (@alignOf(ProtocolBox) != @alignOf(*anyopaque)) @compileError(
+        "runtime: ProtocolBox alignment must match pointer alignment",
+    );
+    if (@offsetOf(ProtocolBox, "data_ptr") != 0) @compileError(
+        "runtime: ProtocolBox.data_ptr must be at offset 0 — the " ++
+            "construction and consumption codegen reads the inner " ++
+            "pointer as the first machine word.",
+    );
+    if (@offsetOf(ProtocolBox, "vtable") != @sizeOf(*anyopaque)) @compileError(
+        "runtime: ProtocolBox.vtable must immediately follow data_ptr",
+    );
+}
+
+// ============================================================
 // Atomic helper exposed to external memory managers.
 //
 // ARC's primitive manager source is compiled by the
@@ -17340,4 +17471,47 @@ test "v1.0 fallback: trap stubs panic when sized slots are dispatched (compile-t
         @as(@TypeOf(cap.release), testOnlyArcRelease),
         cap.release,
     );
+}
+
+// ============================================================
+// Phase 1.2.5.a: ProtocolBox tests
+// ============================================================
+
+test "ProtocolBox layout is two pointers wide with data_ptr at offset 0" {
+    // The construction-site lowering (Phase 1.2.5.c) and
+    // consumption-site lowering (Phase 1.2.5.d) both bake this
+    // layout into the codegen — drift here would mis-cast every
+    // dispatch. The runtime-side comptime block guards the
+    // invariant, but a Zig test pins the test surface so a
+    // refactor that accidentally relaxes the comptime guard
+    // surfaces in the unit suite.
+    const pointer_size = @sizeOf(*anyopaque);
+    try std.testing.expectEqual(@as(usize, pointer_size * 2), @sizeOf(ProtocolBox));
+    try std.testing.expectEqual(@alignOf(*anyopaque), @alignOf(ProtocolBox));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(ProtocolBox, "data_ptr"));
+    try std.testing.expectEqual(@as(usize, pointer_size), @offsetOf(ProtocolBox, "vtable"));
+}
+
+test "ProtocolBox.none is the zero box and reports absent" {
+    const absent = ProtocolBox.none;
+    try std.testing.expect(absent.data_ptr == null);
+    try std.testing.expect(absent.vtable == null);
+    try std.testing.expect(!absent.isPresent());
+}
+
+test "ProtocolBox.isPresent fires when data_ptr is non-null" {
+    // The dispatch site guard reads `data_ptr != null`. A box that
+    // carries a real value reports present; the absent (zeroed)
+    // box reports absent. The vtable pointer alone does not
+    // determine presence — an inner-less box is never legal at
+    // dispatch time.
+    var sentinel_value: u32 = 7;
+    var sentinel_vtable: u8 = 0;
+    const present: ProtocolBox = .{
+        .data_ptr = @ptrCast(&sentinel_value),
+        .vtable = @ptrCast(&sentinel_vtable),
+    };
+    try std.testing.expect(present.isPresent());
+    try std.testing.expect(present.data_ptr != null);
+    try std.testing.expect(present.vtable != null);
 }
