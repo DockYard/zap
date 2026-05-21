@@ -2188,6 +2188,31 @@ pub const TypeChecker = struct {
         return try interner_mut.intern(name_buf.items);
     }
 
+    /// Wrap a parametric receiver TypeId in an `.applied { base, args }`
+    /// when the struct_ref carried use-site type-args, otherwise return
+    /// the receiver TypeId unchanged. Used by every code path that
+    /// resolves a parametric tagged-union variant reference to a
+    /// concrete value type so the per-instantiation form is what
+    /// flows downstream (monomorphizer, IR per-instantiation TypeDef
+    /// emitter, mangler).
+    fn applyTypeArgsToReceiver(
+        self: *TypeChecker,
+        receiver_type_id: TypeId,
+        type_args: []const *const ast.TypeExpr,
+    ) !TypeId {
+        if (type_args.len == 0) return receiver_type_id;
+        var arg_type_ids: std.ArrayList(TypeId) = .empty;
+        for (type_args) |arg_expr| {
+            try arg_type_ids.append(self.allocator, try self.resolveTypeExpr(arg_expr));
+        }
+        return try self.store.addType(.{
+            .applied = .{
+                .base = receiver_type_id,
+                .args = try arg_type_ids.toOwnedSlice(self.allocator),
+            },
+        });
+    }
+
     fn resolveTaggedUnionVariantReference(self: *TypeChecker, struct_name: ast.StructName, span: ast.SourceSpan) !?TypeId {
         if (struct_name.parts.len < 2) return null;
 
@@ -5292,7 +5317,13 @@ pub const TypeChecker = struct {
             .field_access => |fa| {
                 if (fa.object.* == .struct_ref) {
                     if (try self.resolveTaggedUnionVariant(fa.object.struct_ref.name, fa.field, fa.meta.span)) |type_id| {
-                        return type_id;
+                        // Parametric receivers carry type_args on the
+                        // struct_ref (e.g. `Option(i64).None`). Wrap
+                        // the resolved tagged_union TypeId in an
+                        // `.applied { base, args }` so the value's
+                        // static type matches the per-instantiation
+                        // form everywhere downstream.
+                        return try self.applyTypeArgsToReceiver(type_id, fa.object.struct_ref.type_args);
                     }
                 }
                 // Infer object type; for known struct types, look up field type
@@ -5584,7 +5615,10 @@ pub const TypeChecker = struct {
             },
             .struct_ref => |mr| {
                 if (try self.resolveTaggedUnionVariantReference(mr.name, mr.meta.span)) |type_id| {
-                    return type_id;
+                    // Wrap parametric receivers in `.applied { base,
+                    // args }` so per-instantiation substitution flows
+                    // through the rest of the pipeline.
+                    return try self.applyTypeArgsToReceiver(type_id, mr.type_args);
                 }
                 if (try self.resolveTypeReferenceTarget(mr.name)) |_| {
                     return self.resolveFirstClassTypeStructType() orelse TypeStore.UNKNOWN;

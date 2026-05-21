@@ -12282,8 +12282,8 @@ test "IR emits per-instantiation TypeDef for tagged-union applied forms" {
     // appear as a runtime TypeDef.
     const source =
         \\pub union Maybe(t) {
-        \\  Some(t),
-        \\  None,
+        \\  Some :: t
+        \\  None
         \\}
         \\pub struct Demo {
         \\  pub fn wrap_int(x :: i64) -> Maybe(i64) {
@@ -12300,17 +12300,7 @@ test "IR emits per-instantiation TypeDef for tagged-union applied forms" {
     const alloc = arena.allocator();
 
     var interner: *ast.StringInterner = undefined;
-    const program = buildIrProgramForParametricTest(alloc, source, &interner) catch |err| {
-        // Tagged-union construction with explicit type-args
-        // (`%Maybe(i64).Some(x)`) is blocked by parser ambiguity per
-        // the 1.1.5.e plan. Until that lands the test asserts the
-        // present pipeline behavior — the pipeline rejects the
-        // construction — and skips. The per-instantiation emission
-        // path for tagged_union still lands here for the IR code
-        // path's sake (covered by an HIR-only smoke test below).
-        if (err == error.UnionVariantNotFound or err == error.ParseError) return error.SkipZigTest;
-        return err;
-    };
+    const program = try buildIrProgramForParametricTest(alloc, source, &interner);
 
     try std.testing.expect(findTypeDefByName(program, "Maybe") == null);
     const maybe_i64 = findTypeDefByName(program, "Maybe_i64") orelse
@@ -12335,7 +12325,10 @@ test "IR emits per-instantiation TypeDef for tagged-union applied forms" {
     }
     for (maybe_string.kind.union_def.variants) |v| {
         if (std.mem.eql(u8, v.name, "Some")) {
-            if (v.type_name) |tn| if (std.mem.eql(u8, tn, "String")) {
+            // String values render as `[]const u8` per `ZigType.string`
+            // through `typeIdToZigTypeStrWithStore` — the same rendering
+            // used by every other String-typed slot in the IR.
+            if (v.type_name) |tn| if (std.mem.eql(u8, tn, "[]const u8")) {
                 saw_string_payload = true;
             };
         }

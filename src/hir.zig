@@ -4653,9 +4653,18 @@ pub const HirBuilder = struct {
             },
             .call => |call| {
                 // Check for union variant constructor: Result.Ok("hello")
-                // Parsed as call(struct_ref(["Result", "Ok"]), args)
+                // Parsed as call(struct_ref(["Result", "Ok"]), args).
+                //
+                // Parametric receivers carry resolved type_args on the
+                // struct_ref (e.g. `Option(i64).Some(42)`). When
+                // present, the literal's TypeId becomes the `.applied`
+                // form so per-instantiation type defs and substituted
+                // payload types flow through monomorphisation. Bare
+                // receivers (`Option.Some(42)` against a non-parametric
+                // declaration) keep the existing template-type TypeId.
                 if (call.callee.* == .struct_ref and call.args.len >= 1) {
                     const parts = call.callee.struct_ref.name.parts;
+                    const type_args = call.callee.struct_ref.type_args;
                     if (parts.len == 2) {
                         if (self.type_store.name_to_type.get(parts[0])) |tid| {
                             const typ = self.type_store.getType(tid);
@@ -4663,13 +4672,17 @@ pub const HirBuilder = struct {
                                 for (typ.tagged_union.variants) |v| {
                                     if (v.name == parts[1] and v.type_id != null) {
                                         const arg_expr = try self.buildExpr(call.args[0]);
+                                        const literal_type_id = if (type_args.len > 0)
+                                            self.buildAppliedStructLiteralType(tid, type_args)
+                                        else
+                                            tid;
                                         return try self.create(Expr, .{
                                             .kind = .{ .union_init = .{
-                                                .union_type_id = tid,
+                                                .union_type_id = literal_type_id,
                                                 .variant_name = parts[1],
                                                 .value = arg_expr,
                                             } },
-                                            .type_id = tid,
+                                            .type_id = literal_type_id,
                                             .span = call.meta.span,
                                         });
                                     }
@@ -5507,18 +5520,30 @@ pub const HirBuilder = struct {
                     if (type_tid) |tid| {
                         const typ = self.type_store.getType(tid);
                         if (typ == .tagged_union) {
+                            // Parametric nullary variant construction:
+                            // `Option(i64).None` lands here with
+                            // type_args carrying [i64]. The applied
+                            // TypeId routes through per-instantiation
+                            // type-def emission alongside payload-
+                            // bearing variants. Concrete forms like
+                            // `Color.Red` carry no type_args and keep
+                            // the bare template TypeId.
+                            const literal_type_id = if (mr.type_args.len > 0)
+                                self.buildAppliedStructLiteralType(tid, mr.type_args)
+                            else
+                                tid;
                             return try self.create(Expr, .{
                                 .kind = .{
                                     .field_get = .{
                                         .object = try self.create(Expr, .{
                                             .kind = .nil_lit, // placeholder for enum type ref
-                                            .type_id = tid,
+                                            .type_id = literal_type_id,
                                             .span = mr.meta.span,
                                         }),
                                         .field = variant_name,
                                     },
                                 },
-                                .type_id = tid,
+                                .type_id = literal_type_id,
                                 .span = mr.meta.span,
                             });
                         }
