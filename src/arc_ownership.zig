@@ -1253,6 +1253,15 @@ fn recordInstructionUses(
         .union_init => |ui| {
             try summary.recordAggregateStoreUse(allocator, ui.value);
         },
+        .box_as_protocol => |bx| {
+            // The inner value is stored into the box's heap slot — an
+            // aggregate-store position. The box claims ownership at
+            // construction (the matching release runs through the
+            // vtable's synthetic `__drop__` slot when the box dies),
+            // so the source's `.local_get` can lower as `.move_value`
+            // when the source's only remaining use is this box site.
+            try summary.recordAggregateStoreUse(allocator, bx.value);
+        },
         .field_get => |fg| try summary.recordUse(allocator, fg.object, false),
         .field_set => |fs| {
             try summary.recordUse(allocator, fs.object, false);

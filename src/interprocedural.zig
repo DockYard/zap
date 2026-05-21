@@ -694,6 +694,15 @@ pub const InterproceduralAnalyzer = struct {
                     markEscapeToHeap(aliases, ui.value, param_summaries);
                 },
 
+                // Phase 1.2.5.c construction-site auto-boxing: a fresh
+                // heap allocation whose inner value is owned by the
+                // box. Mirrors `union_init` — the box is a fresh local
+                // and the inner escapes to the box's heap slot.
+                .box_as_protocol => |bx| {
+                    try fresh_locals.put(bx.dest, {});
+                    markEscapeToHeap(aliases, bx.value, param_summaries);
+                },
+
                 .field_set => |fs| {
                     markEscapeToHeap(aliases, fs.value, param_summaries);
                 },

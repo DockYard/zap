@@ -674,6 +674,25 @@ pub const GeneralizedEscapeAnalyzer = struct {
             // Debug-info markers: no escape behavior — they are metadata
             // that maps Zap source positions / local names into DWARF.
             .dbg_stmt, .dbg_var => {},
+
+            // Construction-site auto-boxing (Phase 1.2.5.c): the box is
+            // a fresh heap allocation that owns its inner value. The
+            // inner value's escape state joins the box's because the
+            // box's release path runs the inner's drop glue — the inner
+            // cannot outlive the box. Modeling the box as an allocation
+            // site with the inner tracked as a per-field child matches
+            // how `struct_init` records its single-field aggregates and
+            // keeps `field_get`-style consumption (Phase 1.2.5.d) cleanly
+            // attributable when it lands.
+            .box_as_protocol => |bx| {
+                _ = try self.registerAllocSite(func_id, bx.dest);
+                try self.setEscapeAndEnqueue(func_id, bx.dest, .no_escape);
+                const vkey = ValueKey{ .function = func_id, .local = bx.dest };
+                var femap = try FieldEscapeMap.init(self.allocator, 1);
+                const inner_escape = self.ctx.getEscape(.{ .function = func_id, .local = bx.value });
+                femap.updateField(0, EscapeState.join(.no_escape, inner_escape));
+                try self.ctx.field_escapes.put(vkey, femap);
+            },
         }
     }
 

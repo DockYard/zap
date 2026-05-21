@@ -3662,6 +3662,7 @@ pub fn collectUses(instr: ir.Instruction, buf: *UseList) void {
         },
         .struct_init => |x| for (x.fields) |f| buf.append(allocator, f.value) catch {},
         .union_init => |x| buf.append(allocator, x.value) catch {},
+        .box_as_protocol => |x| buf.append(allocator, x.value) catch {},
         .enum_literal => {},
         .field_get => |x| buf.append(allocator, x.object) catch {},
         .field_set => |x| {

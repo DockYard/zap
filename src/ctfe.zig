@@ -869,6 +869,13 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(v.variant_name);
             hasher.update(std.mem.asBytes(&v.value));
         },
+        .box_as_protocol => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.value));
+            hasher.update(v.protocol_name);
+            hasher.update(v.target_type_name);
+            hashZigType(hasher, v.value_zig_type);
+        },
         .enum_literal => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(v.type_name);
@@ -2286,6 +2293,28 @@ pub const Interpreter = struct {
             .phi,
             => {
                 try self.emitError(.unsupported_instruction, "unsupported instruction in CTFE");
+                return error.CtfeFailure;
+            },
+
+            // === Runtime-only (Phase 1.2.5.c construction-site
+            //     auto-boxing) ===
+            //
+            // `box_as_protocol` allocates a heap cell, retains it,
+            // and binds it to a per-impl vtable constant — all of
+            // which require a runtime memory manager and a linked
+            // synthetic vtable file. CTFE has neither. The IR
+            // construction-site detector runs after CTFE in the
+            // compilation pipeline (CTFE consumes the unmonomorphized
+            // HIR-shaped program; construction-site detection is an
+            // IR-build pass), so a well-formed pipeline never feeds
+            // a `box_as_protocol` to the interpreter — the explicit
+            // reject keeps the contract honest if that invariant
+            // ever drifts.
+            .box_as_protocol => {
+                try self.emitError(
+                    .unsupported_instruction,
+                    "protocol existential boxing is a runtime operation; cannot evaluate at compile time",
+                );
                 return error.CtfeFailure;
             },
         }

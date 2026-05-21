@@ -6746,6 +6746,94 @@ pub const ZirDriver = struct {
                 }
             },
 
+            // Construction-site auto-boxing for protocol existentials
+            // (Phase 1.2.5.c). Lowers `box_as_protocol` as a runtime
+            // call to `zap_runtime.ArcRuntime.boxAsProtocol(inner_ptr,
+            // vtable_ptr)`, with `inner_ptr` produced by routing the
+            // inner value through `heapPromoteForIndirectField` (which
+            // expands to `allocAny(@TypeOf(value), allocator, value)`)
+            // and `vtable_ptr` produced by taking `&@import("<VTableInstance>").<VTableInstance>`
+            // through `emit_field_ptr` on the imported vtable file.
+            //
+            // Why a single runtime helper rather than inline ZIR struct-
+            // init plus two `@ptrCast`s: the runtime helper folds the
+            // `?*anyopaque` / `?*const anyopaque` coercions into one
+            // comptime-typed Zig function. The ZIR primitives don't
+            // expose an anyopaque-pointer type Ref directly, so emitting
+            // an inline `.{ .data_ptr = @ptrCast(p), .vtable = @ptrCast(v) }`
+            // literal would require a new C-ABI in the fork. The
+            // helper-call route stays inside the existing
+            // `call_ref(@import("zap_runtime").ArcRuntime.boxAsProtocol,
+            // ...)` surface and keeps codegen uniform with `allocAny`.
+            //
+            // ARC contract: the inner allocation IS the box's owning
+            // reference. No additional retain at this site — the
+            // box's release through the vtable's `__drop__` slot
+            // pairs against the alloc that just happened.
+            .box_as_protocol => |bx| {
+                const value_ref = self.refForValueLocal(bx.value) catch return;
+                const inner_ptr_ref = try self.heapPromoteForIndirectField(value_ref);
+
+                // Take the address of the per-impl vtable instance
+                // constant. `field_ptr` on the imported file's
+                // namespace yields `&Namespace.<const>`, a
+                // `*const <Protocol>VTable` — which `boxAsProtocol`'s
+                // `@ptrCast` lowers to `?*const anyopaque`.
+                //
+                // The synthetic vtable instance file is named after
+                // the *instance* constant (`<Protocol>VTable_for_<Target>`)
+                // — not the target — so the import target is the
+                // instance constant's name, which the IR-side
+                // `findProtocolImplVTable` resolves at HIR
+                // construction-site detection time.
+                const program_ref = if (self.program) |*p| p else return error.EmitFailed;
+                const vtable_instance_name = ir.findProtocolImplVTable(
+                    program_ref,
+                    bx.protocol_name,
+                    bx.target_type_name,
+                ) orelse {
+                    // The HIR construction-site detector is supposed
+                    // to catch missing impls before this lowering
+                    // runs; reaching here means an upstream invariant
+                    // broke. Surface explicitly rather than silently
+                    // emitting an `undefined` vtable.
+                    return error.EmitFailed;
+                };
+                const vtable_file_import = zir_builder_emit_import(
+                    self.handle,
+                    vtable_instance_name.ptr,
+                    @intCast(vtable_instance_name.len),
+                );
+                if (vtable_file_import == error_ref) return error.EmitFailed;
+                const vtable_ptr_ref = zir_builder_emit_field_ptr(
+                    self.handle,
+                    vtable_file_import,
+                    vtable_instance_name.ptr,
+                    @intCast(vtable_instance_name.len),
+                );
+                if (vtable_ptr_ref == error_ref) return error.EmitFailed;
+
+                // Call `zap_runtime.ArcRuntime.boxAsProtocol(inner_ptr,
+                // vtable_ptr)` — the helper does the
+                // `?*anyopaque`/`?*const anyopaque` casts and returns
+                // the populated `ProtocolBox` value.
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
+                if (arc_runtime == error_ref) return error.EmitFailed;
+                const box_fn = zir_builder_emit_field_val(
+                    self.handle,
+                    arc_runtime,
+                    "boxAsProtocol",
+                    13,
+                );
+                if (box_fn == error_ref) return error.EmitFailed;
+                const args = [_]u32{ inner_ptr_ref, vtable_ptr_ref };
+                const box_ref = zir_builder_emit_call_ref(self.handle, box_fn, &args, 2);
+                if (box_ref == error_ref) return error.EmitFailed;
+                try self.setLocal(bx.dest, box_ref);
+            },
+
             // Pattern matching — compare atom IDs (u32)
             .match_atom => |ma| {
                 // Scrutinee is already a u32 atom ID (from atomIntern).
@@ -8391,6 +8479,7 @@ pub const ZirDriver = struct {
             .map_init => |value| value.dest,
             .struct_init => |value| value.dest,
             .union_init => |value| value.dest,
+            .box_as_protocol => |value| value.dest,
             .enum_literal => |value| value.dest,
             .field_get => |value| value.dest,
             .index_get => |value| value.dest,

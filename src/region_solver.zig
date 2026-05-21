@@ -557,6 +557,14 @@ pub const UseDefInfo = struct {
                 try info.recordDef(ui.dest, block);
                 try info.recordUse(ui.value, block);
             },
+            // Phase 1.2.5.c construction-site auto-boxing: defines the
+            // box and reads the inner value being wrapped. Same shape
+            // as `union_init` for use-def purposes — the box is the
+            // dest, the inner is the only operand.
+            .box_as_protocol => |bx| {
+                try info.recordDef(bx.dest, block);
+                try info.recordUse(bx.value, block);
+            },
             .enum_literal => |el| try info.recordDef(el.dest, block),
 
             // Field access.

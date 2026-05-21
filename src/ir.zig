@@ -779,6 +779,11 @@ pub const Instruction = union(enum) {
     map_init: MapInit,
     struct_init: StructInit,
     union_init: UnionInit,
+    /// Construction-site auto-boxing for protocol existentials
+    /// (Phase 1.2.5.c). Wraps a concrete value as a
+    /// `runtime.ProtocolBox` for the named protocol. See
+    /// `BoxAsProtocol` for the contract and lowering shape.
+    box_as_protocol: BoxAsProtocol,
     enum_literal: EnumLiteral,
     field_get: FieldGet,
     field_set: FieldSet,
@@ -992,6 +997,13 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
             .variant_name = try cloneBytes(allocator, value.variant_name),
             .value = value.value,
             .reuse_token = value.reuse_token,
+        } },
+        .box_as_protocol => |value| .{ .box_as_protocol = .{
+            .dest = value.dest,
+            .value = value.value,
+            .protocol_name = try cloneBytes(allocator, value.protocol_name),
+            .target_type_name = try cloneBytes(allocator, value.target_type_name),
+            .value_zig_type = try cloneZigType(allocator, value.value_zig_type),
         } },
         .enum_literal => |value| .{ .enum_literal = .{
             .dest = value.dest,
@@ -1383,6 +1395,64 @@ pub const StructInit = struct {
     fields: []const StructFieldInit,
     /// Perceus reuse: see `AggregateInit.reuse_token` for the contract.
     reuse_token: ?LocalId = null,
+};
+
+/// Payload for the `.box_as_protocol` instruction (Phase 1.2.5.c).
+/// Construction-site auto-boxing: wrap a concrete `target_type_name`
+/// value in a `runtime.ProtocolBox` carrying the `protocol_name`'s
+/// vtable. Emitted whenever a concrete value flows into a slot
+/// typed as the corresponding `protocol_box(protocol_name)` —
+/// struct fields, union variant payloads, function-call arguments,
+/// return values, and explicitly-typed variable assignments.
+///
+/// Lowering contract (Phase 1.2.5.c ZIR):
+///
+///   1. Heap-allocate the inner value via
+///      `zap_runtime.ArcRuntime.allocAny(InnerT, allocator, value)`.
+///      The resulting `*InnerT` is the box's `data_ptr` (after
+///      `@ptrCast` to `?*anyopaque`).
+///   2. Look up `<Protocol>VTable_for_<TargetMangled>` (resolved
+///      from the IR's `protocol_vtable_instance_def` TypeDefs via
+///      `findProtocolImplVTable`); its address (`@ptrCast` to
+///      `?*const anyopaque`) becomes the box's `vtable`.
+///   3. Emit a `runtime.ProtocolBox{ .data_ptr = ..., .vtable = ... }`
+///      struct literal as the instruction's result.
+///
+/// ARC: the inner allocation is the box's owning reference. Box
+/// release runs the vtable's synthetic `__drop__` slot, which calls
+/// `ArcRuntime.releaseAny(InnerT, allocator, inner_ptr)` to free
+/// the inner before the box itself is reclaimed.
+pub const BoxAsProtocol = struct {
+    /// Destination local that receives the `runtime.ProtocolBox`
+    /// value. Typed `.protocol_box(protocol_name)` in the ZIR-side
+    /// inference tables.
+    dest: LocalId,
+    /// Source local carrying the concrete value being boxed. The
+    /// IR construction-site detector verifies that this local's
+    /// HIR/Zig type matches `target_type_name` before emitting the
+    /// box; the ZIR backend reads it back out via the local-type
+    /// tables to drive the `allocAny` type parameter.
+    value: LocalId,
+    /// Bare protocol name (e.g. `"Error"`). Used to find the
+    /// matching `<Protocol>VTable_for_<Target>` instance constant
+    /// at lowering time and to type `dest` as
+    /// `.protocol_box(protocol_name)`.
+    protocol_name: []const u8,
+    /// Mangled target type name as it appears on the vtable
+    /// instance constant's suffix (`MyError` for a concrete impl,
+    /// `Box_i64` for a parametric impl specialization). The
+    /// canonical source is the inner's `ZigType.struct_ref` payload
+    /// (which `typeIdMangledName`-style mangling produces upstream)
+    /// — the IR layer doesn't re-derive it because the same name
+    /// drives the vtable-instance lookup and the inner's `@import`
+    /// path at the ZIR layer.
+    target_type_name: []const u8,
+    /// The concrete Zig type of the inner value, used by the ZIR
+    /// backend as the `T` in `ArcRuntime.allocAny(T, allocator,
+    /// value)` and `releaseAny(T, allocator, ptr)`. Captured at
+    /// box-emission time so the ZIR lowering never has to re-walk
+    /// the type tables.
+    value_zig_type: ZigType,
 };
 
 pub const StructFieldInit = struct {
@@ -9783,6 +9853,47 @@ pub const IrBuilder = struct {
 /// Strategy: per-char inline replacement. Each unsafe char becomes
 /// `_<spelled-out>` (e.g., `=` → `_eq`, `+` → `_plus`). Safe chars pass
 /// through verbatim. Returns the input unchanged when no mangling is needed.
+/// Look up the per-impl vtable instance constant name for a
+/// `(protocol_name, target_type_name)` pair (Phase 1.2.5.c). Walks
+/// the program's `protocol_vtable_instance_def` TypeDefs — populated
+/// by `populateProtocolVTables` from `pub impl` declarations — and
+/// returns the matching instance's TypeDef name (e.g.
+/// `"ErrorVTable_for_MyError"` for `impl Error for MyError`, or
+/// `"ErrorVTable_for_Box_i64"` for a parametric impl specialization).
+///
+/// Construction-site lowering (`box_as_protocol` -> ZIR) uses this
+/// to resolve the vtable constant's symbol so it can take the
+/// constant's address and write the result into `ProtocolBox.vtable`.
+///
+/// Returns `null` when no impl is registered for the requested
+/// `(protocol, target)` pair. Callers must surface a rich
+/// diagnostic in that case — silently boxing without a vtable would
+/// produce a null `vtable` pointer that the consumption site
+/// (Phase 1.2.5.d) cannot dispatch against.
+///
+/// Match semantics: both the protocol name and target name are
+/// compared byte-for-byte against the instance def's stored fields,
+/// matching the canonical mangled forms emitted by
+/// `emitProtocolVTableInstance` (concrete: `"MyError"`; parametric
+/// specialization: `"Box_i64"`).
+pub fn findProtocolImplVTable(
+    program: *const Program,
+    protocol_name: []const u8,
+    target_type_name: []const u8,
+) ?[]const u8 {
+    for (program.type_defs) |type_def| {
+        switch (type_def.kind) {
+            .protocol_vtable_instance_def => |inst| {
+                if (!std.mem.eql(u8, inst.protocol_name, protocol_name)) continue;
+                if (!std.mem.eql(u8, inst.target_type_name, target_type_name)) continue;
+                return type_def.name;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
 pub fn mangleSymbolForZig(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     if (name.len == 0) return name;
     var needs_mangle = false;
@@ -13762,4 +13873,127 @@ test "ZigType.protocol_box round-trips through cloneZigType / cloneProgram" {
     // Distinct backing storage — the clone must not share the
     // original's pointer.
     try std.testing.expect(source.protocol_box.ptr != cloned.protocol_box.ptr);
+}
+
+// ============================================================
+// Phase 1.2.5.c: construction-site auto-boxing tests
+// ============================================================
+
+test "box_as_protocol instruction round-trips through cloneInstruction" {
+    // The new construction-site IR op must clone its owned byte-slice
+    // payloads (`protocol_name`, `target_type_name`) and its
+    // `value_zig_type` independently of the source. Without this the
+    // cache-correctness diff (which round-trips Programs through
+    // `cloneProgram`) would alias the original's storage and a later
+    // free of either side would invalidate the other.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source: Instruction = .{ .box_as_protocol = .{
+        .dest = 7,
+        .value = 3,
+        .protocol_name = "Error",
+        .target_type_name = "MyError",
+        .value_zig_type = .{ .struct_ref = "MyError" },
+    } };
+
+    const cloned = try cloneInstruction(alloc, source);
+    try std.testing.expect(cloned == .box_as_protocol);
+    const inst = cloned.box_as_protocol;
+    try std.testing.expectEqual(@as(LocalId, 7), inst.dest);
+    try std.testing.expectEqual(@as(LocalId, 3), inst.value);
+    try std.testing.expectEqualStrings("Error", inst.protocol_name);
+    try std.testing.expectEqualStrings("MyError", inst.target_type_name);
+    try std.testing.expect(inst.value_zig_type == .struct_ref);
+    try std.testing.expectEqualStrings("MyError", inst.value_zig_type.struct_ref);
+    // Independent backing storage — the clone must not share the
+    // source's pointers.
+    try std.testing.expect(source.box_as_protocol.protocol_name.ptr !=
+        inst.protocol_name.ptr);
+    try std.testing.expect(source.box_as_protocol.target_type_name.ptr !=
+        inst.target_type_name.ptr);
+}
+
+test "findProtocolImplVTable resolves concrete (protocol, target) pair" {
+    // The construction-site lowering needs to take the address of the
+    // per-impl vtable instance constant. `findProtocolImplVTable`
+    // bridges from the box's source-level `(protocol_name,
+    // target_type_name)` pair to the synthesized constant's TypeDef
+    // name — the symbol the ZIR backend imports and address-takes.
+    //
+    // A concrete `pub impl Error for MyError { ... }` registers a
+    // `protocol_vtable_instance_def` named `ErrorVTable_for_MyError`
+    // with `protocol_name = "Error"` and `target_type_name = "MyError"`.
+    // The lookup must return that exact name.
+    const source =
+        \\pub protocol Logger {
+        \\  fn log(l) -> String
+        \\}
+        \\pub struct Console {
+        \\  prefix :: String = ">"
+        \\}
+        \\pub impl Logger for Console {
+        \\  pub fn log(l :: Console) -> String { l.prefix }
+        \\}
+        \\pub struct UseSite {
+        \\  pub fn run() -> String {
+        \\    Logger.log(%Console{prefix: "->"})
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner: *ast.StringInterner = undefined;
+    var graph: *const scope_mod.ScopeGraph = undefined;
+    const program = try buildIrProgramForProtocolTest(alloc, source, &interner, &graph);
+
+    const vt_name = findProtocolImplVTable(&program, "Logger", "Console") orelse
+        return error.MissingLoggerForConsole;
+    try std.testing.expectEqualStrings("LoggerVTable_for_Console", vt_name);
+
+    // The unmatched pair must return null — the construction site
+    // depends on this null result to surface a rich diagnostic
+    // ("type X does not implement protocol Y").
+    try std.testing.expect(findProtocolImplVTable(&program, "Logger", "Missing") == null);
+    try std.testing.expect(findProtocolImplVTable(&program, "Missing", "Console") == null);
+}
+
+test "findProtocolImplVTable resolves parametric specialization" {
+    // A parametric impl `impl Logger for Tagged(t)` instantiated at
+    // `Tagged(i64)` produces an instance `LoggerVTable_for_Tagged_i64`.
+    // The lookup must accept the mangled per-instantiation target
+    // name — that's the form the construction-site lowering produces
+    // when boxing a `Tagged_i64` value.
+    const source =
+        \\pub protocol Logger {
+        \\  fn log(l) -> String
+        \\}
+        \\pub struct Tagged(t) {
+        \\  value :: t
+        \\}
+        \\pub impl Logger for Tagged(t) {
+        \\  pub fn log(l :: Tagged(t)) -> String { "tagged" }
+        \\}
+        \\pub struct UseSite {
+        \\  pub fn run() -> String {
+        \\    Logger.log(%Tagged(i64){value: 1})
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner: *ast.StringInterner = undefined;
+    var graph: *const scope_mod.ScopeGraph = undefined;
+    const program = try buildIrProgramForProtocolTest(alloc, source, &interner, &graph);
+
+    const vt_name = findProtocolImplVTable(&program, "Logger", "Tagged_i64") orelse
+        return error.MissingLoggerForTaggedI64;
+    try std.testing.expectEqualStrings("LoggerVTable_for_Tagged_i64", vt_name);
 }

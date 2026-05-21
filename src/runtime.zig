@@ -4287,6 +4287,48 @@ pub const ArcRuntime = struct {
     /// storage Arc'd children before destroying the inner allocation; for types
     /// without such fields the comptime walk degenerates to a shallow free.
     ///
+    /// Construct a `ProtocolBox` from a typed inner pointer and a
+    /// typed vtable pointer (Phase 1.2.5.c). Generic over both so
+    /// the construction-site ZIR lowering never has to emit explicit
+    /// `@ptrCast` chains — the helper folds the cast to
+    /// `?*anyopaque` (data) and `?*const anyopaque` (vtable) into
+    /// one comptime-typed wrapper.
+    ///
+    /// `inner_ptr_typed` must be a `*T` returned by `allocAny(T,
+    /// allocator, value)` for the same `T` the box's vtable
+    /// dispatches against; `vtable_ptr_typed` must be a `*const
+    /// <Protocol>VTable` (typically `&@import("<VTableInstance>").<VTableInstance>`).
+    /// The runtime does not check the protocol-conformance contract
+    /// — that's the IR-level construction-site detector's
+    /// responsibility before emitting the call.
+    pub inline fn boxAsProtocol(inner_ptr_typed: anytype, vtable_ptr_typed: anytype) ProtocolBox {
+        return .{
+            .data_ptr = @as(?*anyopaque, @ptrCast(inner_ptr_typed)),
+            .vtable = @as(?*const anyopaque, @ptrCast(vtable_ptr_typed)),
+        };
+    }
+
+    /// Release a `ProtocolBox`'s inner value through a typed
+    /// pointer (Phase 1.2.5.c). The per-impl synthetic vtable file
+    /// generates one
+    /// `__vtable_adapter__<Target>____drop__(data_ptr: ?*anyopaque)`
+    /// function per impl; that adapter casts `data_ptr` back to
+    /// `*T` and calls this helper to run the inner's full
+    /// `releaseAny` deep-walk.
+    ///
+    /// Distinct from a bare `releaseAny` call only in that the
+    /// vtable adapter has already recovered the typed pointer from
+    /// the box's `data_ptr` field; this helper exists primarily as
+    /// a stable name for the adapter to call without re-emitting
+    /// the `@typeInfo` dance from inside a synthetic source file.
+    pub inline fn releaseProtocolBoxInner(
+        comptime InnerT: type,
+        allocator: std.mem.Allocator,
+        inner_ptr_typed: *InnerT,
+    ) void {
+        releaseAny(allocator, inner_ptr_typed);
+    }
+
     /// Accepts the pointer as `anytype` so the ZIR backend's two-argument
     /// call site (`releaseAny(allocator, ptr)`) compiles — Zig cannot infer
     /// a leading `comptime T: type` parameter from the runtime ptr argument.
