@@ -120,6 +120,16 @@ pub const Type = union(enum) {
     pub const StructType = struct {
         name: ast.StringId,
         fields: []const StructField,
+        /// Formal type-parameter slots declared on the struct header,
+        /// one fresh `type_var` TypeId per name in `StructDecl.type_params`.
+        /// Empty for concrete structs (the common case).
+        ///
+        /// At a use site like `Box(i64)` the type checker builds a
+        /// `SubstitutionMap` binding `type_params[i]` -> `args[i]` and
+        /// applies it through field type expressions. The same
+        /// `type_var` IDs appear inside `fields[*].type_id` wherever
+        /// the source mentioned the formal name (e.g. `value :: T`).
+        type_params: []const TypeId = &.{},
     };
 
     pub const StructField = struct {
@@ -147,6 +157,14 @@ pub const Type = union(enum) {
     pub const TaggedUnionType = struct {
         name: ast.StringId,
         variants: []const TaggedUnionVariant,
+        /// Formal type-parameter slots declared on the union header,
+        /// one fresh `type_var` TypeId per name in `UnionDecl.type_params`.
+        /// Empty for concrete unions (the common case).
+        ///
+        /// At a use site like `Option(i64).Some(42)` the type checker
+        /// builds a `SubstitutionMap` binding `type_params[i]` -> `args[i]`
+        /// and applies it through variant payload types.
+        type_params: []const TypeId = &.{},
     };
     pub const TaggedUnionVariant = struct {
         name: ast.StringId,
@@ -932,9 +950,38 @@ pub const SubstitutionMap = struct {
                     .type_params = new_params,
                 } }) catch type_id;
             },
+            .applied => |applied_type| {
+                // A parametric type instantiation `Box(T)` -> `Box(i64)`:
+                // substitute every formal `type_var` in `args` so nested
+                // generics like `Box(Option(T))` rewrite their inner
+                // arguments at the call site. The `base` field already
+                // points at a declaration's StructType / TaggedUnionType
+                // — those declarations are immutable; only the
+                // instantiation's argument tuple changes.
+                var changed = false;
+                const new_args = store.allocator.alloc(TypeId, applied_type.args.len) catch return type_id;
+                for (applied_type.args, 0..) |arg, index| {
+                    const new_arg = self.applyToType(store, arg);
+                    new_args[index] = new_arg;
+                    if (new_arg != arg) changed = true;
+                }
+                if (!changed) {
+                    store.allocator.free(new_args);
+                    return type_id;
+                }
+                return store.addType(.{ .applied = .{
+                    .base = applied_type.base,
+                    .args = new_args,
+                } }) catch type_id;
+            },
             // Primitives and other types pass through unchanged
             .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => type_id,
-            .struct_type, .union_type, .tagged_union, .opaque_type, .applied => type_id,
+            // Nominal-type declarations (struct, union, tagged-union,
+            // opaque) are *declarations*, not instantiations — their
+            // field/variant payload types are fixed by the source. An
+            // instantiation lives in `.applied { base, args }`. Pass
+            // these through unchanged.
+            .struct_type, .union_type, .tagged_union, .opaque_type => type_id,
         };
     }
 
@@ -1036,8 +1083,30 @@ pub const SubstitutionMap = struct {
                     .type_params = new_params,
                 } }) catch type_id;
             },
+            .applied => |applied_type| {
+                // Generic instantiation arguments are *container*
+                // positions for Term-promotion purposes — mirrors how
+                // a list element or map value is treated.
+                var changed = false;
+                const new_args = store.allocator.alloc(TypeId, applied_type.args.len) catch return type_id;
+                for (applied_type.args, 0..) |arg, index| {
+                    const new_arg = self.applyToReturnTypeImpl(store, arg, false);
+                    new_args[index] = new_arg;
+                    if (new_arg != arg) changed = true;
+                }
+                if (!changed) {
+                    store.allocator.free(new_args);
+                    return type_id;
+                }
+                return store.addType(.{ .applied = .{
+                    .base = applied_type.base,
+                    .args = new_args,
+                } }) catch type_id;
+            },
             .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => type_id,
-            .struct_type, .union_type, .tagged_union, .opaque_type, .applied => type_id,
+            // Nominal-type declarations pass through; instantiations
+            // travel through `.applied`.
+            .struct_type, .union_type, .tagged_union, .opaque_type => type_id,
         };
     }
 };
@@ -3208,6 +3277,39 @@ pub const TypeChecker = struct {
         return null;
     }
 
+    /// Snapshot of an entry list captured from `type_var_scope` so a
+    /// nested pass can install its own bindings and restore the
+    /// caller's bindings on exit.
+    const TypeVarScopeEntry = struct {
+        name: []const u8,
+        type_id: TypeId,
+    };
+
+    /// Copy every (name -> TypeId) pair currently in `type_var_scope`
+    /// into a fresh slice. The returned slice borrows from the
+    /// existing interner strings (no allocation per entry beyond the
+    /// outer slice), so it stays valid as long as the interner does.
+    fn snapshotTypeVarScope(self: *TypeChecker) ![]TypeVarScopeEntry {
+        const count = self.type_var_scope.count();
+        const entries = try self.allocator.alloc(TypeVarScopeEntry, count);
+        var iterator = self.type_var_scope.iterator();
+        var index: usize = 0;
+        while (iterator.next()) |entry| : (index += 1) {
+            entries[index] = .{ .name = entry.key_ptr.*, .type_id = entry.value_ptr.* };
+        }
+        return entries;
+    }
+
+    /// Restore a previously snapshotted scope: clears the live scope,
+    /// re-installs every entry, and frees the snapshot slice.
+    fn restoreTypeVarScope(self: *TypeChecker, entries: []TypeVarScopeEntry) void {
+        self.type_var_scope.clearRetainingCapacity();
+        for (entries) |entry| {
+            self.type_var_scope.put(entry.name, entry.type_id) catch {};
+        }
+        self.allocator.free(entries);
+    }
+
     fn registerUserTypes(self: *TypeChecker) !void {
         // Pass 1 — forward-declare every user-defined nominal type so
         // its name is in `name_to_type` BEFORE any field/variant
@@ -3287,6 +3389,24 @@ pub const TypeChecker = struct {
                         continue;
                     }
                     const type_id = self.store.name_to_type.get(name) orelse continue;
+                    // Pre-bind formal type parameters (e.g. `T` in
+                    // `pub struct Box(T)`) as fresh type variables so
+                    // any reference to `T` inside the struct's field
+                    // type expressions resolves to the same TypeVar
+                    // TypeId. We save and restore the surrounding
+                    // type_var_scope so per-decl bindings don't leak
+                    // into sibling declarations or function clauses.
+                    var formal_type_params: std.ArrayList(TypeId) = .empty;
+                    const saved_type_var_scope = try self.snapshotTypeVarScope();
+                    defer self.restoreTypeVarScope(saved_type_var_scope);
+                    self.type_var_scope.clearRetainingCapacity();
+                    for (sd.type_params) |formal_name_id| {
+                        const formal_name = self.interner.get(formal_name_id);
+                        const fresh_type_id = try self.store.freshVar();
+                        try self.type_var_scope.put(formal_name, fresh_type_id);
+                        try formal_type_params.append(self.allocator, fresh_type_id);
+                    }
+
                     // Build struct fields with resolved types. Parent
                     // fields come first, then own fields (extending
                     // parent fields type-check here).
@@ -3336,6 +3456,7 @@ pub const TypeChecker = struct {
                     self.store.types.items[type_id] = .{ .struct_type = .{
                         .name = name,
                         .fields = try fields.toOwnedSlice(self.allocator),
+                        .type_params = try formal_type_params.toOwnedSlice(self.allocator),
                     } };
                 },
                 .union_type => |ud| {
@@ -3353,6 +3474,22 @@ pub const TypeChecker = struct {
                         continue;
                     }
                     const type_id = self.store.name_to_type.get(ud.name) orelse continue;
+                    // Pre-bind formal type parameters (e.g. `T` in
+                    // `pub union Option(T)`) as fresh type variables
+                    // so any reference to `T` inside the union's
+                    // variant payload type expressions resolves to
+                    // the same TypeVar TypeId.
+                    var formal_type_params: std.ArrayList(TypeId) = .empty;
+                    const saved_type_var_scope = try self.snapshotTypeVarScope();
+                    defer self.restoreTypeVarScope(saved_type_var_scope);
+                    self.type_var_scope.clearRetainingCapacity();
+                    for (ud.type_params) |formal_name_id| {
+                        const formal_name = self.interner.get(formal_name_id);
+                        const fresh_type_id = try self.store.freshVar();
+                        try self.type_var_scope.put(formal_name, fresh_type_id);
+                        try formal_type_params.append(self.allocator, fresh_type_id);
+                    }
+
                     var variant_entries: std.ArrayList(Type.TaggedUnionVariant) = .empty;
                     for (ud.variants) |v| {
                         const vtype = if (v.type_expr) |te|
@@ -3367,6 +3504,7 @@ pub const TypeChecker = struct {
                     self.store.types.items[type_id] = .{ .tagged_union = .{
                         .name = ud.name,
                         .variants = try variant_entries.toOwnedSlice(self.allocator),
+                        .type_params = try formal_type_params.toOwnedSlice(self.allocator),
                     } };
                 },
                 .opaque_type => |opaque_body| {
@@ -10185,4 +10323,223 @@ test "field default with nested struct expression accepted" {
         std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
     }
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+// ============================================================
+// Phase 1.1.5 — Parametric struct / union types
+//
+// `StructType.type_params` and `TaggedUnionType.type_params` hold
+// one fresh `type_var` TypeId per declared parameter name. The
+// substitution helper rewrites those type_vars to concrete
+// arguments at instantiation sites. `Type.AppliedType` carries the
+// `(base, args)` pair, structurally deduped by `addType`.
+// ============================================================
+
+test "parametric struct registration records type_params as fresh type_vars" {
+    // `pub struct Box(T) { value :: T }` registers a StructType whose
+    // `type_params` array contains exactly one TypeId; that TypeId
+    // resolves to a `.type_var` and is also the TypeId stored on the
+    // `value` field.
+    const source =
+        \\pub struct Box(T) {
+        \\  value :: T
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const box_name = parser.interner.lookupExisting("Box") orelse return error.TestExpectedBoxName;
+    const box_type_id = checker.store.name_to_type.get(box_name) orelse return error.TestExpectedBoxTypeId;
+    const box_type = checker.store.getType(box_type_id);
+    try std.testing.expect(box_type == .struct_type);
+    try std.testing.expectEqual(@as(usize, 1), box_type.struct_type.type_params.len);
+
+    const param_type_id = box_type.struct_type.type_params[0];
+    const param_type = checker.store.getType(param_type_id);
+    try std.testing.expect(param_type == .type_var);
+
+    try std.testing.expectEqual(@as(usize, 1), box_type.struct_type.fields.len);
+    try std.testing.expectEqual(param_type_id, box_type.struct_type.fields[0].type_id);
+}
+
+test "parametric union registration records type_params as fresh type_vars" {
+    // `pub union Option(T) { Some :: T, None }` should expose a single
+    // type-parameter TypeId; the `Some` variant's payload references
+    // that same TypeId.
+    const source =
+        \\pub union Option(T) {
+        \\  Some :: T
+        \\  None
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const option_name = parser.interner.lookupExisting("Option") orelse return error.TestExpectedOptionName;
+    const option_type_id = checker.store.name_to_type.get(option_name) orelse return error.TestExpectedOptionTypeId;
+    const option_type = checker.store.getType(option_type_id);
+    try std.testing.expect(option_type == .tagged_union);
+    try std.testing.expectEqual(@as(usize, 1), option_type.tagged_union.type_params.len);
+
+    const param_type_id = option_type.tagged_union.type_params[0];
+    const param_type = checker.store.getType(param_type_id);
+    try std.testing.expect(param_type == .type_var);
+
+    try std.testing.expectEqual(@as(usize, 2), option_type.tagged_union.variants.len);
+    const some_variant = option_type.tagged_union.variants[0];
+    const none_variant = option_type.tagged_union.variants[1];
+    try std.testing.expect(some_variant.type_id != null);
+    try std.testing.expectEqual(param_type_id, some_variant.type_id.?);
+    try std.testing.expectEqual(@as(?TypeId, null), none_variant.type_id);
+}
+
+test "concrete struct registers with empty type_params" {
+    // Backwards-compatibility: a struct with no header parens must
+    // produce a StructType whose `type_params` slice is empty.
+    const source =
+        \\pub struct Plain {
+        \\  value :: i64
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const plain_name = parser.interner.lookupExisting("Plain") orelse return error.TestExpectedPlainName;
+    const plain_type_id = checker.store.name_to_type.get(plain_name) orelse return error.TestExpectedPlainTypeId;
+    const plain_type = checker.store.getType(plain_type_id);
+    try std.testing.expect(plain_type == .struct_type);
+    try std.testing.expectEqual(@as(usize, 0), plain_type.struct_type.type_params.len);
+}
+
+test "applyToType substitutes through nested applied type args" {
+    // A substitution map that binds the formal `T` TypeVar must
+    // rewrite both `Box(T)` and the nested arg of `Box(Option(T))`.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // Stand-in nominal bases — we only need the TypeIds, not full
+    // declarations, for the substitution-helper test.
+    const box_name = try interner.intern("Box");
+    const option_name = try interner.intern("Option");
+    const box_base = try store.addType(.{ .struct_type = .{
+        .name = box_name,
+        .fields = &.{},
+        .type_params = &.{},
+    } });
+    const option_base = try store.addType(.{ .tagged_union = .{
+        .name = option_name,
+        .variants = &.{},
+        .type_params = &.{},
+    } });
+
+    const t_var = try store.freshVar();
+    const t_var_id = store.getType(t_var).type_var;
+
+    const inner_args = try alloc.alloc(TypeId, 1);
+    inner_args[0] = t_var;
+    const option_of_t = try store.addType(.{ .applied = .{ .base = option_base, .args = inner_args } });
+
+    const outer_args = try alloc.alloc(TypeId, 1);
+    outer_args[0] = option_of_t;
+    const box_of_option_t = try store.addType(.{ .applied = .{ .base = box_base, .args = outer_args } });
+
+    subs.bind(t_var_id, TypeStore.I64);
+
+    const substituted = subs.applyToType(&store, box_of_option_t);
+    const outer = store.getType(substituted);
+    try std.testing.expect(outer == .applied);
+    try std.testing.expectEqual(box_base, outer.applied.base);
+    try std.testing.expectEqual(@as(usize, 1), outer.applied.args.len);
+
+    const inner = store.getType(outer.applied.args[0]);
+    try std.testing.expect(inner == .applied);
+    try std.testing.expectEqual(option_base, inner.applied.base);
+    try std.testing.expectEqual(@as(usize, 1), inner.applied.args.len);
+    try std.testing.expectEqual(TypeStore.I64, inner.applied.args[0]);
+}
+
+test "applied type instantiations dedupe by base and args" {
+    // The structural-dedupe rule for `.applied` (typeStructEq) must
+    // collapse `Box(i64)` to one TypeId regardless of how many times
+    // it is constructed; `Box(String)` must remain distinct.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const box_name = try interner.intern("Box");
+    const box_base = try store.addType(.{ .struct_type = .{
+        .name = box_name,
+        .fields = &.{},
+        .type_params = &.{},
+    } });
+
+    const first_args = try alloc.alloc(TypeId, 1);
+    first_args[0] = TypeStore.I64;
+    const first = try store.addType(.{ .applied = .{ .base = box_base, .args = first_args } });
+
+    const second_args = try alloc.alloc(TypeId, 1);
+    second_args[0] = TypeStore.I64;
+    const second = try store.addType(.{ .applied = .{ .base = box_base, .args = second_args } });
+    try std.testing.expectEqual(first, second);
+
+    const string_args = try alloc.alloc(TypeId, 1);
+    string_args[0] = TypeStore.STRING;
+    const box_of_string = try store.addType(.{ .applied = .{ .base = box_base, .args = string_args } });
+    try std.testing.expect(box_of_string != first);
 }
