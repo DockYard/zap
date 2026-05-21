@@ -13539,3 +13539,227 @@ test "IR vtable emission survives Program.clone (deep-copy correctness)" {
     try std.testing.expectEqualStrings("Tick__current__1", inst_def.methods[0].impl_function_name);
 }
 
+// ============================================================
+// Phase 1.2.5.b: TypeStore + IR plumbing for protocol_constraint
+// — `ZigType.protocol_box` representation, mangler routing,
+// applied-specialization filter promotion, parametric vtable
+// enumeration, and `astTypeExprToZigTypeForProtocol`'s protocol-
+// existential lowering.
+// ============================================================
+
+test "typeIdMangledName lowers protocol_constraint to its protocol bare name" {
+    // The mangler joins per-instantiation argument names with `_`, so
+    // `Option(Error)` must mangle to `Option_Error`. Until 1.2.5.b
+    // the `.protocol_constraint` arm fell through to the `T` default,
+    // which produced the wrong joined form `Option_T` and collapsed
+    // every protocol-existential instantiation onto a single name.
+    var interner_local = ast.StringInterner.init(std.testing.allocator);
+    defer interner_local.deinit();
+    var store = types_mod.TypeStore.init(std.testing.allocator, &interner_local);
+    defer store.deinit();
+
+    const error_name_id = try interner_local.intern("Error");
+    const pc_id = try store.addType(.{
+        .protocol_constraint = .{
+            .protocol_name = error_name_id,
+            .type_params = &.{},
+        },
+    });
+
+    const mangled = try types_mod.typeIdMangledName(std.testing.allocator, &store, pc_id);
+    defer std.testing.allocator.free(mangled);
+    try std.testing.expectEqualStrings("Error", mangled);
+}
+
+test "typeIdToZigTypeWithStore lowers protocol_constraint to ZigType.protocol_box" {
+    // The Phase 1.2.5.b plumbing replaces the `.any` fallback with a
+    // first-class `.protocol_box` carrier so per-instantiation
+    // structs holding protocol-existential fields (e.g.
+    // `Option(Error)`) lower to a concrete struct shape (with a
+    // `zap_runtime.ProtocolBox` payload) rather than `anytype`.
+    var interner_local = ast.StringInterner.init(std.testing.allocator);
+    defer interner_local.deinit();
+    var store = types_mod.TypeStore.init(std.testing.allocator, &interner_local);
+    defer store.deinit();
+
+    const error_name_id = try interner_local.intern("Error");
+    const pc_id = try store.addType(.{
+        .protocol_constraint = .{
+            .protocol_name = error_name_id,
+            .type_params = &.{},
+        },
+    });
+
+    const zig_type = typeIdToZigTypeWithStore(pc_id, &store);
+    try std.testing.expect(zig_type == .protocol_box);
+    try std.testing.expectEqualStrings("Error", zig_type.protocol_box);
+}
+
+test "zigTypeToStr renders ZigType.protocol_box as zap_runtime.ProtocolBox" {
+    // Variant payload-string emission for parametric tagged unions
+    // (e.g. `Option(Error).Some(:: protocol_box(Error))`) routes
+    // through `zigTypeToStr`. The protocol-box payload must land as
+    // the runtime fat-pointer type — anything else would either
+    // mis-shape the generated `union(enum)` or collapse to
+    // `anytype`, both of which would defeat the existential
+    // boxing's whole purpose.
+    const pb: ZigType = .{ .protocol_box = "Error" };
+    try std.testing.expectEqualStrings("zap_runtime.ProtocolBox", zigTypeToStr(pb));
+}
+
+test "IR emits per-instantiation TypeDef for Option(Error)-shaped applied form" {
+    // The acid test: an applied form whose argument is a
+    // `protocol_constraint` (the Phase 1.2 `Error` protocol) must
+    // produce a per-instantiation `union_def` TypeDef named
+    // `Option_Error` whose `Some` variant carries the runtime
+    // ProtocolBox payload. Before 1.2.5.b the filter in
+    // `populateAppliedSpecializations` treated protocol_constraint as
+    // unresolved-type-var and skipped the entire instantiation, so
+    // no `Option_Error` TypeDef was emitted and any field of that
+    // type fell back to `anytype` at the ZIR layer.
+    //
+    // The Zap program declares a custom protocol + impl + a struct
+    // field of type `Option(Foo)`. The IR must surface `Option_Foo`
+    // as a `union_def` whose `Some` variant lowers to
+    // `zap_runtime.ProtocolBox`.
+    const source =
+        \\pub union Option(t) {
+        \\  Some :: t
+        \\  None
+        \\}
+        \\pub protocol Foo {
+        \\  fn ping(f) -> i64
+        \\}
+        \\pub struct Bar {
+        \\  value :: i64 = 0
+        \\}
+        \\pub impl Foo for Bar {
+        \\  pub fn ping(f :: Bar) -> i64 { f.value }
+        \\}
+        \\pub struct UseSite {
+        \\  pub fn make_none() -> Option(Foo) { %Option(Foo).None }
+        \\  pub fn dummy() -> i64 { 0 }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner: *ast.StringInterner = undefined;
+    var graph: *const scope_mod.ScopeGraph = undefined;
+    const program = try buildIrProgramForProtocolTest(alloc, source, &interner, &graph);
+
+    // The parametric template `Option` must not appear as a runtime
+    // TypeDef — only the per-instantiation `Option_Foo` form should.
+    const option_foo = findTypeDefByName(program, "Option_Foo") orelse
+        return error.MissingOptionFoo;
+    // Option(t) is a parametric tagged union with one payload variant
+    // (`Some :: t`) and one unit variant (`None`), so its per-
+    // instantiation form lowers to `union_def`.
+    try std.testing.expect(option_foo.kind == .union_def);
+    const option_foo_def = option_foo.kind.union_def;
+    try std.testing.expectEqual(@as(usize, 2), option_foo_def.variants.len);
+
+    // Find the Some variant (variant order is the union declaration
+    // order, but we look up by name to be order-independent).
+    var some_index: ?usize = null;
+    for (option_foo_def.variants, 0..) |variant, idx| {
+        if (std.mem.eql(u8, variant.name, "Some")) some_index = idx;
+    }
+    const some_idx = some_index orelse return error.MissingSomeVariant;
+    const some_type_name = option_foo_def.variants[some_idx].type_name orelse
+        return error.MissingSomePayloadType;
+    try std.testing.expectEqualStrings("zap_runtime.ProtocolBox", some_type_name);
+}
+
+test "IR emits per-instantiation vtables for parametric impls" {
+    // The 1.2.5.a populator skipped any impl with type params. 1.2.5.b
+    // lifts the guard via the `applied_specializations` enumeration:
+    // a parametric impl `impl Foo for Bar(t)` instantiated against
+    // `Bar(i64)` must emit one `FooVTable_for_Bar_i64` constant per
+    // applied instantiation.
+    //
+    // The Zap source declares a concrete protocol with a parametric
+    // impl against `Tag(t)` and a use site that instantiates
+    // `Tag(i64)`. The IR's `applied_specializations` table picks up
+    // the `Tag_i64` mangled name (driven by 1.2.5.b's
+    // `populateAppliedSpecializations` filter, which is now correct
+    // for protocol_constraint-bearing applied forms). The
+    // parametric-impl populator walks every applied specialization
+    // whose base is the impl's target nominal and emits one vtable
+    // instance per instantiation.
+    const source =
+        \\pub protocol Mark {
+        \\  fn label(m) -> String
+        \\}
+        \\pub struct Tag(t) {
+        \\  value :: t
+        \\}
+        \\pub impl Mark for Tag(t) {
+        \\  pub fn label(m :: Tag(t)) -> String { "tag" }
+        \\}
+        \\pub struct UseSite {
+        \\  pub fn use_int() -> String {
+        \\    Mark.label(%Tag(i64){value: 1})
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner: *ast.StringInterner = undefined;
+    var graph: *const scope_mod.ScopeGraph = undefined;
+    const program = try buildIrProgramForProtocolTest(alloc, source, &interner, &graph);
+
+    // The protocol's vtable type must exist (a concrete protocol's
+    // vtable is unchanged from 1.2.5.a).
+    const mark_vt = findTypeDefByName(program, "MarkVTable") orelse
+        return error.MissingMarkVTable;
+    try std.testing.expect(mark_vt.kind == .protocol_vtable_def);
+
+    // The parametric impl must surface as a vtable instance per
+    // applied target instantiation, named after the mangled
+    // per-instantiation target.
+    const instance = findTypeDefByName(program, "MarkVTable_for_Tag_i64") orelse
+        return error.MissingMarkVTableForTagI64;
+    try std.testing.expect(instance.kind == .protocol_vtable_instance_def);
+    const inst_def = instance.kind.protocol_vtable_instance_def;
+    try std.testing.expectEqualStrings("Mark", inst_def.protocol_name);
+    try std.testing.expectEqualStrings("Tag_i64", inst_def.target_type_name);
+    try std.testing.expectEqual(@as(usize, 1), inst_def.methods.len);
+    // The impl-method-pointer naming for a parametric target uses the
+    // monomorphized-impl-asymmetry symbol layout from 1.1.5.c — the
+    // calling-mod is the impl's owning struct (auto-generated by
+    // 1.1.5's parametric impl lowering), target-mod is the mangled
+    // target, and the elem-type encodes the substituted argument.
+    // For the simpler concrete-naming used by the vtable populator
+    // we encode the slot as `<Target_Mangled>__<method>__<arity>`.
+    try std.testing.expectEqualStrings(
+        "Tag_i64__label__1",
+        inst_def.methods[0].impl_function_name,
+    );
+}
+
+test "ZigType.protocol_box round-trips through cloneZigType / cloneProgram" {
+    // The cache-correctness layer serializes Program through
+    // `cloneProgram` so downstream consumers observe deep-copy
+    // semantics. The new `.protocol_box` carrier must clone its
+    // owned `[]const u8` name like every other byte-slice-bearing
+    // variant. Without this clone the cloned Program would share
+    // the original's name pointer and a later free of either side
+    // would invalidate the other.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source: ZigType = .{ .protocol_box = "Error" };
+    const cloned = try cloneZigType(alloc, source);
+    try std.testing.expect(cloned == .protocol_box);
+    try std.testing.expectEqualStrings("Error", cloned.protocol_box);
+    // Distinct backing storage — the clone must not share the
+    // original's pointer.
+    try std.testing.expect(source.protocol_box.ptr != cloned.protocol_box.ptr);
+}
