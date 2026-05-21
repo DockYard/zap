@@ -202,6 +202,7 @@ fn walkExpr(
             try walkExpr(allocator, record, p.rhs, interner);
         },
         .unwrap => |u| try walkExpr(allocator, record, u.expr, interner),
+        .try_expr => |t| try walkExpr(allocator, record, t.value, interner),
         .error_pipe => |ep| {
             try walkExpr(allocator, record, ep.chain, interner);
             switch (ep.handler) {

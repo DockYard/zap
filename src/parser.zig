@@ -2789,6 +2789,22 @@ pub const Parser = struct {
     fn parsePostfixExpr(self: *Parser) !*const ast.Expr {
         var expr = try self.parseCallExpr();
 
+        // Postfix `?` Result-propagation operator. Binds tighter than the
+        // `::` type annotation, so `foo()? :: T` annotates the unwrapped
+        // `Ok` payload. Repeated `?` (`foo()??`) chains, propagating an
+        // inner `Result` after the outer one is unwrapped. The lexer only
+        // emits `.question` after a value-ending token, so a predicate
+        // identifier like `empty?` is never split here.
+        while (self.check(.question)) {
+            const q = self.advance();
+            expr = try self.create(ast.Expr, .{
+                .try_expr = .{
+                    .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, ast.SourceSpan.from(q.loc)) },
+                    .value = expr,
+                },
+            });
+        }
+
         // Type annotation: expr :: Type (e.g., 42 :: i32)
         if (self.check(.double_colon)) {
             _ = self.advance();

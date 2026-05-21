@@ -333,6 +333,13 @@ fn substituteInExpr(
             new_expr.* = .{ .unwrap = .{ .meta = u.meta, .expr = new_inner } };
             return new_expr;
         },
+        .try_expr => |t| {
+            const new_inner = try substituteInExpr(alloc, t.value, func_attrs, mod_attrs, interner, errors);
+            if (new_inner == t.value) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .try_expr = .{ .meta = t.meta, .value = new_inner } };
+            return new_expr;
+        },
         .type_annotated => |ta| {
             const new_inner = try substituteInExpr(alloc, ta.expr, func_attrs, mod_attrs, interner, errors);
             if (new_inner == ta.expr) return expr;

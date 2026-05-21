@@ -19,6 +19,19 @@ pub const Lexer = struct {
     interp_brace_depth: u32,
     in_heredoc: bool,
 
+    /// The tag of the most recently emitted *significant* token
+    /// (everything except `newline`). Drives the `?` disambiguation:
+    /// a `?` immediately following a value-ending token (`)`, `]`,
+    /// `}`, an identifier, a literal, etc.) is the postfix
+    /// Result-propagation operator; a `?` in operand position (start
+    /// of file, or right after an operator/opener/keyword) introduces
+    /// a character literal (`?A`). `newline` does not update this so a
+    /// `?` at the head of a continuation line is still treated as the
+    /// postfix operator on the preceding value — but the parser only
+    /// ever consumes a postfix `?` with no intervening newline, so the
+    /// distinction is conservative.
+    prev_significant_tag: ?Token.Tag = null,
+
     pub fn init(source: []const u8) Lexer {
         return Lexer{
             .source = source,
@@ -29,6 +42,7 @@ pub const Lexer = struct {
             .interp_depth = 0,
             .interp_brace_depth = 0,
             .in_heredoc = false,
+            .prev_significant_tag = null,
         };
     }
 
@@ -82,9 +96,22 @@ pub const Lexer = struct {
             return self.lexAtom();
         }
 
-        // Character literals: ?A → 65, ?\n → 10, etc.
-        if (c == '?' and self.pos + 1 < self.source.len) {
-            return self.lexCharLiteral();
+        // `?` is overloaded between the postfix Result-propagation
+        // operator and the character-literal prefix (`?A` → 65). They
+        // occupy disjoint lexer positions: the operator only follows a
+        // value-ending token, while a character literal only appears in
+        // operand position. A trailing `?` glued to an identifier
+        // (`empty?`) is consumed by `lexIdentifier` and never reaches
+        // here, so predicate-method names are unaffected.
+        if (c == '?') {
+            if (self.prevTokenEndsValue()) {
+                const start = self.pos;
+                self.pos += 1;
+                return self.makeToken(.question, start, self.pos);
+            }
+            if (self.pos + 1 < self.source.len) {
+                return self.lexCharLiteral();
+            }
         }
 
         // Numbers
@@ -538,6 +565,10 @@ pub const Lexer = struct {
     }
 
     fn makeToken(self: *Lexer, tag: Token.Tag, start: u32, end: u32) Token {
+        // Track the most recent significant token for `?` disambiguation.
+        // Newlines are layout, not values, so they do not reset the
+        // value-ending context (see `prev_significant_tag`).
+        if (tag != .newline) self.prev_significant_tag = tag;
         const mapped = self.mapLocation(start, end);
         return .{
             .tag = tag,
@@ -575,6 +606,32 @@ pub const Lexer = struct {
 
     fn isIdentContinue(c: u8) bool {
         return isIdentStart(c) or isDigit(c) or c == '!' or c == '?';
+    }
+
+    /// True when the previously emitted significant token can end an
+    /// expression — i.e. a `?` immediately after it should be the
+    /// postfix Result-propagation operator rather than a character
+    /// literal. Value-ending tokens are closing delimiters, names, and
+    /// literals; everything else (operators, openers, keywords, the
+    /// start of input) leaves the lexer in operand position where `?A`
+    /// is a character literal.
+    fn prevTokenEndsValue(self: *const Lexer) bool {
+        const tag = self.prev_significant_tag orelse return false;
+        return switch (tag) {
+            .right_paren,
+            .right_bracket,
+            .right_brace,
+            .identifier,
+            .type_identifier,
+            .int_literal,
+            .float_literal,
+            .string_literal,
+            .char_literal,
+            .atom_literal,
+            .question,
+            => true,
+            else => false,
+        };
     }
 };
 

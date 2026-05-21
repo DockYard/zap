@@ -298,6 +298,11 @@ pub fn exprToCtValue(
             const args = try makeList(alloc, store, &.{msg});
             return makeTuple3(alloc, store, .{ .atom = "panic" }, try metaToList(alloc, store, v.meta, null), args);
         },
+        .try_expr => |v| {
+            const inner = try exprToCtValue(alloc, interner, store, v.value);
+            const args = try makeList(alloc, store, &.{inner});
+            return makeTuple3(alloc, store, .{ .atom = "?" }, try metaToList(alloc, store, v.meta, null), args);
+        },
         .cond_expr => |v| {
             // {:cond, meta, [do: [clauses...]]} where each clause is {:->, [], [[condition], body]}
             var clause_vals: std.ArrayListUnmanaged(CtValue) = .empty;

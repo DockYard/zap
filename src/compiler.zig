@@ -10845,6 +10845,12 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
             try remapExpr(alloc, mutable, remap);
             uw.expr = mutable;
         },
+        .try_expr => |*te| {
+            const mutable = try alloc.create(ast.Expr);
+            mutable.* = te.value.*;
+            try remapExpr(alloc, mutable, remap);
+            te.value = mutable;
+        },
         .if_expr => |*ie| {
             const mutable_cond = try alloc.create(ast.Expr);
             mutable_cond.* = ie.condition.*;

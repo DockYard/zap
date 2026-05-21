@@ -1395,6 +1395,17 @@ pub const TypeChecker = struct {
     /// impl's own type variables (consistent across params and return).
     current_impl: ?*const ast.ImplDecl = null,
 
+    /// Accumulator for the `raises` row of the function clause currently
+    /// being checked. Every `?` propagation (`value?`) on a
+    /// `Result(t, e)` operand records its `e` here; once `raise`
+    /// lands (Phase 1.4) it will record its raised type here too. The
+    /// row is the de-duplicated union of these contributions. Reset at
+    /// the start of each clause check (`checkFunctionClause`) and read
+    /// back afterward to (a) check an explicit declared `raises` row for
+    /// coverage and (b) attach the inferred row to the function's
+    /// signature. Entries are dedup'd by structural type equality.
+    current_raises: std.ArrayListUnmanaged(TypeId) = .empty,
+
     // Number of stdlib lines prepended (bindings in these lines are skipped for unused checks)
     stdlib_line_count: u32 = 0,
 
@@ -4425,6 +4436,7 @@ pub const TypeChecker = struct {
                 try self.validateExprDoesNotCallUnderscoreFunctions(pipe.rhs);
             },
             .unwrap => |unwrap| try self.validateExprDoesNotCallUnderscoreFunctions(unwrap.expr),
+            .try_expr => |try_expr| try self.validateExprDoesNotCallUnderscoreFunctions(try_expr.value),
             .tuple => |tuple| for (tuple.elements) |element| try self.validateExprDoesNotCallUnderscoreFunctions(element),
             .list => |list| for (list.elements) |element| try self.validateExprDoesNotCallUnderscoreFunctions(element),
             .map => |map| {
@@ -5112,6 +5124,22 @@ pub const TypeChecker = struct {
         );
     }
 
+    /// Record an error type contributed to the enclosing function's
+    /// inferred `raises` row. Called from the `try_expr` inference arm
+    /// (with the `Error(e)` payload type) and, once `raise` lands, from
+    /// the `raise` checker. Dedups by structural type equality so a
+    /// function that propagates the same error type from several `?`
+    /// sites lists it once. `span` is reserved for future
+    /// per-contribution provenance in `raises`-mismatch diagnostics.
+    fn recordRaisedErrorType(self: *TypeChecker, error_type: TypeId, span: ast.SourceSpan) !void {
+        _ = span;
+        if (error_type == TypeStore.UNKNOWN or error_type == TypeStore.ERROR) return;
+        for (self.current_raises.items) |existing| {
+            if (self.store.typeEquals(existing, error_type)) return;
+        }
+        try self.current_raises.append(self.allocator, error_type);
+    }
+
     fn checkFunctionClause(self: *TypeChecker, func: *const ast.FunctionDecl, clause: *const ast.FunctionClause) !void {
         const prev_scope = self.current_scope;
         self.current_scope = self.graph.resolveClauseScope(clause.meta) orelse clause.meta.scope_id;
@@ -5120,6 +5148,11 @@ pub const TypeChecker = struct {
         // Each function clause gets its own type variable scope so that
         // `a` in `fn foo(x :: a) -> a` refers to the same type variable.
         self.type_var_scope.clearRetainingCapacity();
+
+        // Fresh `raises` accumulator for this clause. Every `?` in the
+        // body records the propagated `Error(e)` payload type here; the
+        // inferred row is read back after the body is checked (below).
+        self.current_raises.clearRetainingCapacity();
 
         // Inside an impl block, pre-bind the impl's declared type
         // parameters so subsequent param/return resolution sees them as
@@ -6062,6 +6095,45 @@ pub const TypeChecker = struct {
                 return chain_type;
             },
             // error_pipe: infer the chain type as fallback.
+
+            // try_expr (`value?`): the operand must be a `Result(T, E)`.
+            // The expression yields the `Ok` payload type `T`; the
+            // `Error` payload type `E` is recorded as a contribution to
+            // the enclosing function's inferred `raises` row (the value
+            // that an `Error` arm early-returns). `try_expr` survives
+            // type-checking and is lowered to the canonical two-arm
+            // `case` in HIR (`HirBuilder.buildExpr`).
+            .try_expr => |te| {
+                const operand_type = try self.inferExpr(te.value);
+                if (operand_type < self.store.types.items.len) {
+                    const ot = self.store.types.items[operand_type];
+                    if (ot == .tagged_union) {
+                        const interner_mut: *ast.StringInterner = @constCast(self.interner);
+                        const ok_name = interner_mut.intern("Ok") catch return operand_type;
+                        const error_name = interner_mut.intern("Error") catch return operand_type;
+                        var ok_payload: TypeId = TypeStore.UNKNOWN;
+                        for (ot.tagged_union.variants) |v| {
+                            if (v.name == ok_name) ok_payload = v.type_id orelse TypeStore.UNKNOWN;
+                            if (v.name == error_name) {
+                                if (v.type_id) |err_type| {
+                                    try self.recordRaisedErrorType(err_type, te.meta.span);
+                                }
+                            }
+                        }
+                        return ok_payload;
+                    }
+                }
+                // Not a Result-shaped operand: surface a diagnostic so a
+                // misapplied `?` is caught rather than silently passing
+                // the operand type through.
+                try self.addRichError(
+                    "the `?` propagation operator can only be applied to a `Result(t, e)` value",
+                    te.meta.span,
+                    "this expression is not a `Result`",
+                    "`expr?` short-circuits on the `Error(e)` variant and unwraps the `Ok(t)` payload; the operand must be a `Result`",
+                );
+                return TypeStore.ERROR;
+            },
 
             // for_expr is desugared before type checking; return UNKNOWN if we see it
             .for_expr => TypeStore.UNKNOWN,
