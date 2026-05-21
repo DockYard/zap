@@ -1636,7 +1636,74 @@ pub const ZirDriver = struct {
         // routes through `releaseProtocolBoxInner` to run the
         // standard ARC deep-walk + slab-return path.
         try buf.appendSlice(self.allocator, "    __drop__: *const fn (data_ptr: ?*anyopaque) void,\n");
-        try buf.appendSlice(self.allocator, "};\n");
+        try buf.appendSlice(self.allocator, "};\n\n");
+
+        // Phase 1.2.5.d consumption-site helpers.
+        //
+        // `drop(box)` — type-erased release of the box's inner value.
+        // The IR-level scope-exit drop pass calls this whenever a
+        // `.protocol_box(<Protocol>)` local goes out of scope (or any
+        // other release point). The helper recovers the vtable cast
+        // and invokes the synthetic `__drop__` slot. `None` boxes
+        // (data_ptr=null,vtable=null) are no-ops — the IR avoids
+        // emitting a drop for proven-none boxes but the runtime guard
+        // here keeps the contract honest if the optimizer changes
+        // its mind later.
+        //
+        // `dispatch_<method>(box, args...)` — one helper per protocol
+        // method, performs the vtable cast and invokes the indirect
+        // function pointer with `box.data_ptr` as the implicit
+        // receiver. The IR's `protocol_dispatch` lowering reaches
+        // these helpers by name.
+        //
+        // Keeping the dispatch/drop logic in the synthetic Zig source
+        // — rather than encoded directly through low-level ZIR
+        // primitives — lets every consumption site round-trip through
+        // ordinary `call_ref` shape, matches `boxAsProtocol`'s
+        // construction pattern, and centralises the
+        // `@ptrCast(@alignCast(...))` recovery in one inspectable
+        // place per protocol.
+        try buf.appendSlice(self.allocator, "const zap_runtime = @import(\"zap_runtime\");\n\n");
+
+        // `drop(box) void`
+        try buf.appendSlice(self.allocator, "pub fn drop(box: zap_runtime.ProtocolBox) void {\n");
+        try buf.appendSlice(self.allocator, "    if (box.vtable) |vt_erased| {\n");
+        try buf.appendSlice(self.allocator, "        const vt: *const ");
+        try buf.appendSlice(self.allocator, type_def.name);
+        try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(vt_erased));\n");
+        try buf.appendSlice(self.allocator, "        vt.__drop__(box.data_ptr);\n");
+        try buf.appendSlice(self.allocator, "    }\n");
+        try buf.appendSlice(self.allocator, "}\n\n");
+
+        // `dispatch_<method>(box, args...) RT`
+        for (vt_def.methods) |method| {
+            try buf.appendSlice(self.allocator, "pub fn dispatch_");
+            try appendZigIdentifier(self.allocator, &buf, method.name);
+            try buf.appendSlice(self.allocator, "(box: zap_runtime.ProtocolBox");
+            for (method.extra_param_types, 0..) |param_zt, param_index| {
+                try buf.appendSlice(self.allocator, ", ");
+                const arg_prefix = try std.fmt.allocPrint(self.allocator, "arg{d}: ", .{param_index});
+                defer self.allocator.free(arg_prefix);
+                try buf.appendSlice(self.allocator, arg_prefix);
+                try appendZigTypeForVTable(self.allocator, &buf, param_zt);
+            }
+            try buf.appendSlice(self.allocator, ") ");
+            try appendZigTypeForVTable(self.allocator, &buf, method.return_type);
+            try buf.appendSlice(self.allocator, " {\n");
+            try buf.appendSlice(self.allocator, "    const vt: *const ");
+            try buf.appendSlice(self.allocator, type_def.name);
+            try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(box.vtable.?));\n");
+            try buf.appendSlice(self.allocator, "    return vt.");
+            try appendZigIdentifier(self.allocator, &buf, method.name);
+            try buf.appendSlice(self.allocator, "(box.data_ptr");
+            for (method.extra_param_types, 0..) |_, param_index| {
+                try buf.appendSlice(self.allocator, ", ");
+                const arg_ref = try std.fmt.allocPrint(self.allocator, "arg{d}", .{param_index});
+                defer self.allocator.free(arg_ref);
+                try buf.appendSlice(self.allocator, arg_ref);
+            }
+            try buf.appendSlice(self.allocator, ");\n}\n\n");
+        }
 
         const name_z = try self.allocator.dupeZ(u8, type_def.name);
         defer self.allocator.free(name_z);
@@ -1814,7 +1881,45 @@ pub const ZirDriver = struct {
         try buf.appendSlice(self.allocator, "    .__drop__ = &__vtable_adapter__");
         try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
         try buf.appendSlice(self.allocator, "____drop__,\n");
-        try buf.appendSlice(self.allocator, "};\n");
+        try buf.appendSlice(self.allocator, "};\n\n");
+
+        // Phase 1.2.5.d consumption-site helpers.
+        //
+        // `vtable_eq(box) bool` — pointer-compare the box's vtable
+        // slot against the address of this per-impl instance
+        // constant. The IR's pattern-match downcast emits a
+        // `guard_block` whose condition routes through this helper;
+        // when true, control flow falls into the arm body and the
+        // `protocol_box_unbox` lowering recovers the typed concrete
+        // value through `unbox(box)`.
+        //
+        // `unbox(box) TargetMod.<Target>` — recover the concrete
+        // inner value from a box whose vtable already matches this
+        // impl. The helper does the `@ptrCast(@alignCast(...)).*`
+        // recovery; the caller is responsible for having gated the
+        // call through `vtable_eq(box)` first (otherwise the cast
+        // would interpret the wrong concrete type as the named
+        // target — Undefined Behavior).
+        //
+        // Both helpers reach the vtable instance constant by name —
+        // it is declared in the same synthetic source file above —
+        // so they share its `.rodata` address. The IR pattern-match
+        // arm compilation guarantees `vtable_eq` is the guard for
+        // every `unbox` call.
+        try buf.appendSlice(self.allocator, "pub fn vtable_eq(box: zap_runtime.ProtocolBox) bool {\n");
+        try buf.appendSlice(self.allocator, "    return box.vtable == @as(?*const anyopaque, @ptrCast(&");
+        try buf.appendSlice(self.allocator, type_def.name);
+        try buf.appendSlice(self.allocator, "));\n");
+        try buf.appendSlice(self.allocator, "}\n\n");
+
+        try buf.appendSlice(self.allocator, "pub fn unbox(box: zap_runtime.ProtocolBox) TargetMod.");
+        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, " {\n");
+        try buf.appendSlice(self.allocator, "    const inner: *const TargetMod.");
+        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(box.data_ptr.?));\n");
+        try buf.appendSlice(self.allocator, "    return inner.*;\n");
+        try buf.appendSlice(self.allocator, "}\n");
 
         const name_z = try self.allocator.dupeZ(u8, type_def.name);
         defer self.allocator.free(name_z);
@@ -6946,6 +7051,132 @@ pub const ZirDriver = struct {
                 try self.setLocal(bx.dest, box_ref);
             },
 
+            // Consumption-site virtual dispatch through a
+            // `runtime.ProtocolBox` (Phase 1.2.5.d). Lowers
+            // `protocol_dispatch` to a call against the per-protocol
+            // synthetic dispatcher helper emitted alongside the
+            // `<Protocol>VTable` struct in its synthetic source file:
+            //
+            //   @import("<Protocol>VTable").dispatch_<method>(box,
+            //                                                 arg0, ..., argN)
+            //
+            // The dispatcher's body (in
+            // `emitProtocolVTableSourceFile`) performs the
+            // `@ptrCast(@alignCast(box.vtable.?))` recovery, reads the
+            // `<method>` slot, and calls the indirect function pointer
+            // with `box.data_ptr` as the implicit receiver. Keeping
+            // the cast + indirect call inside the synthetic Zig file
+            // — rather than reaching for a custom C-ABI ZIR emitter —
+            // matches the construction-site lowering style and means
+            // every dispatch round-trips through ordinary `call_ref`
+            // primitives.
+            .protocol_dispatch => |pd| {
+                const vtable_module_name = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}VTable",
+                    .{pd.protocol_name},
+                );
+                defer self.allocator.free(vtable_module_name);
+
+                const vtable_import = zir_builder_emit_import(
+                    self.handle,
+                    vtable_module_name.ptr,
+                    @intCast(vtable_module_name.len),
+                );
+                if (vtable_import == error_ref) return error.EmitFailed;
+
+                const dispatcher_name = try std.fmt.allocPrint(
+                    self.allocator,
+                    "dispatch_{s}",
+                    .{pd.method_name},
+                );
+                defer self.allocator.free(dispatcher_name);
+
+                const dispatcher_fn = zir_builder_emit_field_val(
+                    self.handle,
+                    vtable_import,
+                    dispatcher_name.ptr,
+                    @intCast(dispatcher_name.len),
+                );
+                if (dispatcher_fn == error_ref) return error.EmitFailed;
+
+                // Assemble the actual argument list: receiver + each
+                // non-receiver arg in source order. The dispatcher
+                // helper takes the receiver by value and unwraps
+                // `box.data_ptr` internally.
+                const receiver_ref = self.refForLocal(pd.receiver) catch return;
+                var call_args: std.ArrayListUnmanaged(u32) = .empty;
+                defer call_args.deinit(self.allocator);
+                try call_args.append(self.allocator, receiver_ref);
+                for (pd.args) |arg_local| {
+                    const arg_ref = self.refForLocal(arg_local) catch return;
+                    try call_args.append(self.allocator, arg_ref);
+                }
+
+                const result_ref = zir_builder_emit_call_ref(
+                    self.handle,
+                    dispatcher_fn,
+                    call_args.items.ptr,
+                    @intCast(call_args.items.len),
+                );
+                if (result_ref == error_ref) return error.EmitFailed;
+                try self.setLocal(pd.dest, result_ref);
+            },
+
+            // Consumption-site downcast of a `runtime.ProtocolBox` to
+            // a concrete inner type (Phase 1.2.5.d). The pattern-match
+            // compiler emits a `guard_block` whose condition calls the
+            // per-impl `vtable_eq_<Target>(box) bool` helper; when the
+            // guard fires, the arm's body executes the
+            // `protocol_box_unbox` lowering here:
+            //
+            //   const unboxed = @import("<Protocol>VTable_for_<Target>")
+            //                      .unbox(box);
+            //
+            // The helper is emitted in
+            // `emitProtocolVTableInstanceSourceFile` alongside the
+            // adapter functions. Its body does the
+            // `@ptrCast(@alignCast(box.data_ptr.?)).*` recovery and
+            // returns the typed concrete value. The IR-level guard
+            // wiring lives in the surrounding match-arm compilation —
+            // by the time this lowering runs, the box's vtable is
+            // already known to point at this target's instance
+            // constant.
+            .protocol_box_unbox => |bu| {
+                const instance_name = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}VTable_for_{s}",
+                    .{ bu.protocol_name, bu.target_type_name },
+                );
+                defer self.allocator.free(instance_name);
+
+                const instance_import = zir_builder_emit_import(
+                    self.handle,
+                    instance_name.ptr,
+                    @intCast(instance_name.len),
+                );
+                if (instance_import == error_ref) return error.EmitFailed;
+
+                const unbox_fn = zir_builder_emit_field_val(
+                    self.handle,
+                    instance_import,
+                    "unbox",
+                    5,
+                );
+                if (unbox_fn == error_ref) return error.EmitFailed;
+
+                const box_ref = self.refForLocal(bu.box) catch return;
+                const args = [_]u32{box_ref};
+                const result_ref = zir_builder_emit_call_ref(
+                    self.handle,
+                    unbox_fn,
+                    &args,
+                    1,
+                );
+                if (result_ref == error_ref) return error.EmitFailed;
+                try self.setLocal(bu.dest, result_ref);
+            },
+
             // Pattern matching — compare atom IDs (u32)
             .match_atom => |ma| {
                 // Scrutinee is already a u32 atom ID (from atomIntern).
@@ -8592,6 +8823,8 @@ pub const ZirDriver = struct {
             .struct_init => |value| value.dest,
             .union_init => |value| value.dest,
             .box_as_protocol => |value| value.dest,
+            .protocol_dispatch => |value| value.dest,
+            .protocol_box_unbox => |value| value.dest,
             .enum_literal => |value| value.dest,
             .field_get => |value| value.dest,
             .index_get => |value| value.dest,

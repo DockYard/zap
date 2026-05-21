@@ -1262,6 +1262,20 @@ fn recordInstructionUses(
             // when the source's only remaining use is this box site.
             try summary.recordAggregateStoreUse(allocator, bx.value);
         },
+        .protocol_dispatch => |pd| {
+            // Dispatch reads the receiver and each non-receiver arg.
+            // The receiver itself is a borrow at the dispatch site —
+            // ownership of the box stays with the surrounding scope
+            // whose scope-exit drop pairs against the construction.
+            try summary.recordUse(allocator, pd.receiver, false);
+            for (pd.args) |arg| try summary.recordUse(allocator, arg, false);
+        },
+        .protocol_box_unbox => |bu| {
+            // Unbox reads the box without transferring ownership; the
+            // extracted value is a borrowed view backed by the box's
+            // heap cell.
+            try summary.recordUse(allocator, bu.box, false);
+        },
         .field_get => |fg| try summary.recordUse(allocator, fg.object, false),
         .field_set => |fs| {
             try summary.recordUse(allocator, fs.object, false);

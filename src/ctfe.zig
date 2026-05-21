@@ -876,6 +876,24 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(v.target_type_name);
             hashZigType(hasher, v.value_zig_type);
         },
+        .protocol_dispatch => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.receiver));
+            hasher.update(v.protocol_name);
+            hasher.update(v.method_name);
+            hasher.update(std.mem.asBytes(&v.method_index));
+            hasher.update(std.mem.asBytes(&v.arity));
+            for (v.args) |arg| hasher.update(std.mem.asBytes(&arg));
+            for (v.arg_modes) |mode| hasher.update(std.mem.asBytes(&mode));
+            hashZigType(hasher, v.return_type);
+        },
+        .protocol_box_unbox => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.box));
+            hasher.update(v.protocol_name);
+            hasher.update(v.target_type_name);
+            hashZigType(hasher, v.target_zig_type);
+        },
         .enum_literal => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(v.type_name);
@@ -2314,6 +2332,27 @@ pub const Interpreter = struct {
                 try self.emitError(
                     .unsupported_instruction,
                     "protocol existential boxing is a runtime operation; cannot evaluate at compile time",
+                );
+                return error.CtfeFailure;
+            },
+
+            // Phase 1.2.5.d: dispatch + downcast against a protocol
+            // existential. Both ops require resolving a vtable
+            // function pointer or comparing against an emitted
+            // vtable instance constant — neither exists at CTFE
+            // time. Same justification as `.box_as_protocol`: the
+            // pipeline never feeds these into the interpreter.
+            .protocol_dispatch => {
+                try self.emitError(
+                    .unsupported_instruction,
+                    "protocol dispatch is a runtime operation; cannot evaluate at compile time",
+                );
+                return error.CtfeFailure;
+            },
+            .protocol_box_unbox => {
+                try self.emitError(
+                    .unsupported_instruction,
+                    "protocol existential downcast is a runtime operation; cannot evaluate at compile time",
                 );
                 return error.CtfeFailure;
             },

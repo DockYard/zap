@@ -784,6 +784,17 @@ pub const Instruction = union(enum) {
     /// `runtime.ProtocolBox` for the named protocol. See
     /// `BoxAsProtocol` for the contract and lowering shape.
     box_as_protocol: BoxAsProtocol,
+    /// Consumption-site virtual dispatch for protocol existentials
+    /// (Phase 1.2.5.d). Calls a protocol method on a `ProtocolBox`
+    /// receiver by indirecting through the box's vtable slot. See
+    /// `ProtocolDispatch` for the contract and lowering shape.
+    protocol_dispatch: ProtocolDispatch,
+    /// Consumption-site downcast for protocol existentials
+    /// (Phase 1.2.5.d). Tests whether a `ProtocolBox` carries the
+    /// named target concrete type, and on match recovers the inner
+    /// value typed as that concrete struct. See `ProtocolBoxUnbox`
+    /// for the contract and lowering shape.
+    protocol_box_unbox: ProtocolBoxUnbox,
     enum_literal: EnumLiteral,
     field_get: FieldGet,
     field_set: FieldSet,
@@ -1004,6 +1015,24 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
             .protocol_name = try cloneBytes(allocator, value.protocol_name),
             .target_type_name = try cloneBytes(allocator, value.target_type_name),
             .value_zig_type = try cloneZigType(allocator, value.value_zig_type),
+        } },
+        .protocol_dispatch => |value| .{ .protocol_dispatch = .{
+            .dest = value.dest,
+            .receiver = value.receiver,
+            .protocol_name = try cloneBytes(allocator, value.protocol_name),
+            .method_name = try cloneBytes(allocator, value.method_name),
+            .method_index = value.method_index,
+            .arity = value.arity,
+            .args = try clonePlainSlice(LocalId, allocator, value.args),
+            .arg_modes = try clonePlainSlice(ValueMode, allocator, value.arg_modes),
+            .return_type = try cloneZigType(allocator, value.return_type),
+        } },
+        .protocol_box_unbox => |value| .{ .protocol_box_unbox = .{
+            .dest = value.dest,
+            .box = value.box,
+            .protocol_name = try cloneBytes(allocator, value.protocol_name),
+            .target_type_name = try cloneBytes(allocator, value.target_type_name),
+            .target_zig_type = try cloneZigType(allocator, value.target_zig_type),
         } },
         .enum_literal => |value| .{ .enum_literal = .{
             .dest = value.dest,
@@ -1453,6 +1482,134 @@ pub const BoxAsProtocol = struct {
     /// box-emission time so the ZIR lowering never has to re-walk
     /// the type tables.
     value_zig_type: ZigType,
+};
+
+/// Payload for the `.protocol_dispatch` instruction (Phase 1.2.5.d).
+/// Consumption-site virtual dispatch: call a protocol method on a
+/// `runtime.ProtocolBox` by reading the matching vtable slot and
+/// invoking the slot's function pointer with the box's `data_ptr`
+/// as the implicit receiver. Emitted whenever HIR sees
+/// `Protocol.method(receiver, ...)` where `receiver` is statically
+/// typed `.protocol_box(<Protocol>)`.
+///
+/// Lowering contract (Phase 1.2.5.d ZIR):
+///
+///   1. Emit a call to the synthetic per-protocol dispatcher
+///      function `@import("<Protocol>VTable").dispatch_<method>(box,
+///      arg0, arg1, ...)`. The dispatcher (emitted alongside the
+///      vtable struct in `<Protocol>VTable`'s source file) does the
+///      `@ptrCast(@alignCast(box.vtable.?))` recovery and invokes
+///      the `vt.<method>(box.data_ptr, args...)` indirect call.
+///   2. The per-protocol dispatcher's return type is the method's
+///      declared return type — recorded in the IR op so the ZIR
+///      backend knows how to type the result local.
+///
+/// ARC: the dispatched method runs against the inner value through
+/// the box; ownership of the box itself is unchanged. Argument
+/// retain/release pairing is governed by the receiver's existing
+/// ARC discipline (the box is `.borrowed` at the dispatch site by
+/// default; the trailing scope-exit drop or explicit move sites
+/// own the box's release).
+pub const ProtocolDispatch = struct {
+    /// Destination local that receives the method's return value.
+    /// When the method returns `void`, the dest still receives an
+    /// IR placeholder local so downstream passes can track the
+    /// call site uniformly — the ZIR backend ignores the local
+    /// for void-returning calls (same shape every other IR call
+    /// op uses).
+    dest: LocalId,
+    /// The `runtime.ProtocolBox`-typed receiver local. Typed
+    /// `.protocol_box(protocol_name)` in the IR's local-type table.
+    receiver: LocalId,
+    /// Bare protocol name (e.g. `"Error"`). Drives the
+    /// `@import("<Protocol>VTable")` cast and the dispatcher-helper
+    /// name.
+    protocol_name: []const u8,
+    /// Protocol method name (matches a slot on the
+    /// `<Protocol>VTable` struct emitted by 1.2.5.a). Used as
+    /// `dispatch_<method>` in the per-protocol dispatcher helper.
+    method_name: []const u8,
+    /// Zero-based index of the slot in the protocol's declaration
+    /// order. The vtable struct lays out fields in this order;
+    /// recording the index here lets verifier passes and downstream
+    /// analysis cross-check the (protocol, method) pair against the
+    /// `ProtocolVTableDef` without re-scanning the method list.
+    method_index: u32,
+    /// Total method arity including the implicit receiver. Mirrors
+    /// `ProtocolVTableMethod.arity`. Recorded for symmetry with
+    /// other IR call ops and for verifier checks.
+    arity: u32,
+    /// Non-receiver argument locals in source order. Length always
+    /// equals `arity - 1`. The ZIR backend prepends the box itself
+    /// as the dispatcher helper's first argument; the args slice
+    /// supplies the remaining positional parameters.
+    args: []const LocalId,
+    /// Per-arg ownership mode. Mirrors `CallNamed.arg_modes`: the
+    /// ARC pass uses this to decide retain/release semantics for
+    /// arguments crossing the dispatch boundary.
+    arg_modes: []const ValueMode,
+    /// The protocol method's return type — captured at IR emit
+    /// time from the protocol declaration. Used by the ZIR backend
+    /// to type the destination local and by downstream IR analyses
+    /// to track the call's value flow.
+    return_type: ZigType,
+};
+
+/// Payload for the `.protocol_box_unbox` instruction (Phase 1.2.5.d).
+/// Consumption-site downcast: extract the concrete inner value from
+/// a `runtime.ProtocolBox` when its vtable matches the named
+/// per-impl instance constant. Emitted by HIR's pattern-match
+/// compilation when a downcast pattern `inner :: Target` is matched
+/// against a scrutinee whose static type is
+/// `.protocol_box(<Protocol>)`.
+///
+/// Lowering contract (Phase 1.2.5.d ZIR):
+///
+///   1. Emit a guard pointer-compare:
+///      `box.vtable == &<Protocol>VTable_for_<Target>` — the
+///      synthetic per-protocol dispatcher exposes a
+///      `vtable_eq_<Target>(box) bool` helper that does the cast-
+///      and-compare, so the ZIR primitive emit stays inside the
+///      `@import("<Protocol>VTable").vtable_eq_<Target>(box)`
+///      shape used by 1.2.5.c construction.
+///   2. When the guard is true, recover the typed inner via the
+///      per-impl `unbox_<Target>(box) TargetMod.<Target>` helper
+///      (emitted in `<Protocol>VTable_for_<Target>`'s synthetic
+///      source file). The unboxed value is by-value — the box still
+///      owns the heap cell so its scope-exit drop can free the
+///      slot.
+///   3. When the guard is false the dest local is undefined; the
+///      caller's match-arm machinery routes control flow to the
+///      next case arm before consulting the dest.
+///
+/// The IR layer leaves the guard wiring to the surrounding match-
+/// arm compilation — `protocol_box_unbox` only encodes the
+/// per-arm guard predicate and the corresponding typed extraction.
+/// Pattern-match compilation emits the op inside a
+/// `guard_block` whose condition is the same guard helper call.
+pub const ProtocolBoxUnbox = struct {
+    /// Destination local that receives the concrete inner value
+    /// when the guard fires. Typed `.struct_ref(target_type_name)`
+    /// in the IR's local-type table.
+    dest: LocalId,
+    /// Local holding the `runtime.ProtocolBox` scrutinee. Typed
+    /// `.protocol_box(protocol_name)`.
+    box: LocalId,
+    /// Bare protocol name (e.g. `"Error"`). Drives the
+    /// `@import("<Protocol>VTable")` lookup for the
+    /// `vtable_eq_<Target>` and `unbox_<Target>` helpers.
+    protocol_name: []const u8,
+    /// Mangled target concrete type name as it appears on the
+    /// vtable instance constant's suffix (`MyError` for a concrete
+    /// impl, `Box_i64` for a parametric impl specialization). Same
+    /// shape `BoxAsProtocol.target_type_name` uses.
+    target_type_name: []const u8,
+    /// The concrete Zig type the unboxed value is typed as.
+    /// Captured here so downstream analyses don't need to re-walk
+    /// type tables to recover it. Always `.struct_ref(target_type_name)`
+    /// in practice but recorded structurally to keep the
+    /// invariant local.
+    target_zig_type: ZigType,
 };
 
 pub const StructFieldInit = struct {
@@ -14114,6 +14271,83 @@ test "box_as_protocol instruction round-trips through cloneInstruction" {
         inst.protocol_name.ptr);
     try std.testing.expect(source.box_as_protocol.target_type_name.ptr !=
         inst.target_type_name.ptr);
+}
+
+test "protocol_dispatch instruction round-trips through cloneInstruction" {
+    // Phase 1.2.5.d consumption-site dispatch IR op. Mirrors the
+    // `box_as_protocol` clone contract: byte-slice payloads
+    // (`protocol_name`, `method_name`), the per-arg slices (`args`,
+    // `arg_modes`), and the captured `return_type` ZigType must each
+    // be cloned with independent storage so the cache-correctness
+    // round-trip (which calls `cloneProgram` and frees the source's
+    // arena) cannot dangle pointers in the cloned program.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const args = try alloc.dupe(LocalId, &[_]LocalId{42});
+    const modes = try alloc.dupe(ValueMode, &[_]ValueMode{.share});
+
+    const source: Instruction = .{ .protocol_dispatch = .{
+        .dest = 9,
+        .receiver = 5,
+        .protocol_name = "Error",
+        .method_name = "message",
+        .method_index = 0,
+        .arity = 1,
+        .args = args,
+        .arg_modes = modes,
+        .return_type = .string,
+    } };
+
+    const cloned = try cloneInstruction(alloc, source);
+    try std.testing.expect(cloned == .protocol_dispatch);
+    const pd = cloned.protocol_dispatch;
+    try std.testing.expectEqual(@as(LocalId, 9), pd.dest);
+    try std.testing.expectEqual(@as(LocalId, 5), pd.receiver);
+    try std.testing.expectEqualStrings("Error", pd.protocol_name);
+    try std.testing.expectEqualStrings("message", pd.method_name);
+    try std.testing.expectEqual(@as(u32, 0), pd.method_index);
+    try std.testing.expectEqual(@as(u32, 1), pd.arity);
+    try std.testing.expectEqual(@as(usize, 1), pd.args.len);
+    try std.testing.expectEqual(@as(LocalId, 42), pd.args[0]);
+    try std.testing.expectEqual(@as(usize, 1), pd.arg_modes.len);
+    try std.testing.expect(pd.return_type == .string);
+
+    // Independent backing storage.
+    try std.testing.expect(source.protocol_dispatch.protocol_name.ptr != pd.protocol_name.ptr);
+    try std.testing.expect(source.protocol_dispatch.method_name.ptr != pd.method_name.ptr);
+}
+
+test "protocol_box_unbox instruction round-trips through cloneInstruction" {
+    // Phase 1.2.5.d downcast IR op. Same clone-independence contract
+    // as `protocol_dispatch`: every owned byte-slice payload must
+    // get its own backing storage.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source: Instruction = .{ .protocol_box_unbox = .{
+        .dest = 11,
+        .box = 3,
+        .protocol_name = "Error",
+        .target_type_name = "MyError",
+        .target_zig_type = .{ .struct_ref = "MyError" },
+    } };
+
+    const cloned = try cloneInstruction(alloc, source);
+    try std.testing.expect(cloned == .protocol_box_unbox);
+    const bu = cloned.protocol_box_unbox;
+    try std.testing.expectEqual(@as(LocalId, 11), bu.dest);
+    try std.testing.expectEqual(@as(LocalId, 3), bu.box);
+    try std.testing.expectEqualStrings("Error", bu.protocol_name);
+    try std.testing.expectEqualStrings("MyError", bu.target_type_name);
+    try std.testing.expect(bu.target_zig_type == .struct_ref);
+    try std.testing.expectEqualStrings("MyError", bu.target_zig_type.struct_ref);
+
+    // Independent backing storage.
+    try std.testing.expect(source.protocol_box_unbox.protocol_name.ptr != bu.protocol_name.ptr);
+    try std.testing.expect(source.protocol_box_unbox.target_type_name.ptr != bu.target_type_name.ptr);
 }
 
 test "findProtocolImplVTable resolves concrete (protocol, target) pair" {

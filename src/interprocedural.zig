@@ -703,6 +703,23 @@ pub const InterproceduralAnalyzer = struct {
                     markEscapeToHeap(aliases, bx.value, param_summaries);
                 },
 
+                // Phase 1.2.5.d: dispatch passes the box and its args
+                // into a callee that we can't see (the dispatcher
+                // helper); treat the receiver and every arg as
+                // escaping to heap. Unbox yields a borrowed view —
+                // the dest carries the same alias state as the box.
+                .protocol_dispatch => |pd| {
+                    markEscapeToHeap(aliases, pd.receiver, param_summaries);
+                    for (pd.args) |arg_local| {
+                        markEscapeToHeap(aliases, arg_local, param_summaries);
+                    }
+                },
+                .protocol_box_unbox => |bu| {
+                    if (fresh_locals.get(bu.box) != null) {
+                        try fresh_locals.put(bu.dest, {});
+                    }
+                },
+
                 .field_set => |fs| {
                     markEscapeToHeap(aliases, fs.value, param_summaries);
                 },

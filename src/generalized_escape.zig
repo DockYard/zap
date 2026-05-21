@@ -693,6 +693,25 @@ pub const GeneralizedEscapeAnalyzer = struct {
                 femap.updateField(0, EscapeState.join(.no_escape, inner_escape));
                 try self.ctx.field_escapes.put(vkey, femap);
             },
+
+            // Phase 1.2.5.d consumption-site ops. `protocol_dispatch`
+            // makes the box and every arg escape into the dispatcher
+            // (the callee may stash references in heap state), so
+            // both flow to `global_escape`. `protocol_box_unbox`
+            // does NOT escape the box — the unbox path reads through
+            // the existing heap cell and yields a borrowed view; the
+            // dest is treated like `field_get` (escape from its
+            // source).
+            .protocol_dispatch => |pd| {
+                try self.setEscapeAndEnqueue(func_id, pd.receiver, .global_escape);
+                for (pd.args) |arg_local| {
+                    try self.setEscapeAndEnqueue(func_id, arg_local, .global_escape);
+                }
+            },
+            .protocol_box_unbox => |bu| {
+                const box_escape = self.ctx.getEscape(.{ .function = func_id, .local = bu.box });
+                try self.setEscapeAndEnqueue(func_id, bu.dest, box_escape);
+            },
         }
     }
 

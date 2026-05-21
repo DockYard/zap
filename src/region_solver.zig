@@ -565,6 +565,19 @@ pub const UseDefInfo = struct {
                 try info.recordDef(bx.dest, block);
                 try info.recordUse(bx.value, block);
             },
+            // Phase 1.2.5.d consumption-site ops. `protocol_dispatch`
+            // defines dest (the call result) and uses the receiver +
+            // every arg. `protocol_box_unbox` defines dest (the
+            // extracted concrete value) and uses the box.
+            .protocol_dispatch => |pd| {
+                try info.recordDef(pd.dest, block);
+                try info.recordUse(pd.receiver, block);
+                for (pd.args) |arg_local| try info.recordUse(arg_local, block);
+            },
+            .protocol_box_unbox => |bu| {
+                try info.recordDef(bu.dest, block);
+                try info.recordUse(bu.box, block);
+            },
             .enum_literal => |el| try info.recordDef(el.dest, block),
 
             // Field access.
