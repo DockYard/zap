@@ -3032,6 +3032,15 @@ pub const TypeChecker = struct {
         // codegen, which lands far from the actual mistake.
         try self.checkUninhabitedRecursiveTypes();
 
+        // Type-check every field default expression against its
+        // declared field type. Defaults are a general `pub struct`
+        // feature (Phase 1.1 of the error-system roadmap) — running
+        // the check here, immediately after the struct types are
+        // registered, lets the user see a clean Zap diagnostic at
+        // the default expression instead of a Zig-backend "expected
+        // type" message lifted from the implicit construction site.
+        try self.validateStructFieldDefaults();
+
         for (program.structs) |*mod| {
             try self.checkStruct(mod);
         }
@@ -3080,6 +3089,97 @@ pub const TypeChecker = struct {
             }
             try self.checkTopItem(item);
         }
+    }
+
+    /// Type-check every `pub struct` field default expression against
+    /// its declared field type. This runs after `registerUserTypes()`
+    /// populates `TypeStore.types` with the resolved field types so
+    /// `inferExpr` can validate the default against a concrete type.
+    ///
+    /// The mismatched case (`x :: i64 = "wrong"`) emits a rich
+    /// diagnostic with a caret on the default expression — not on the
+    /// containing struct — so the user lands directly on the offending
+    /// value. Contextually-typed expressions whose static type cannot
+    /// be pinned without an expected-type push (the empty list `[]`
+    /// being the canonical example) are accepted here; HIR's
+    /// `appendStructDefaults` stamps the field's expected type on
+    /// those UNKNOWN-typed expressions when the default is lowered at
+    /// every construction site.
+    ///
+    /// Inter-field references (`field_b :: T = self.field_a + 1`) are
+    /// deliberately disallowed in v1 — defaults evaluate at the
+    /// construction-site lexical scope, which does not bind `self`.
+    /// Users who need cross-field defaults write a constructor
+    /// function. This is consistent with Elixir's earliest `defstruct`
+    /// shape and avoids forcing a field-evaluation-order semantics
+    /// into a Phase-1 feature.
+    fn validateStructFieldDefaults(self: *TypeChecker) !void {
+        const prev_scope = self.current_scope;
+        defer self.current_scope = prev_scope;
+
+        for (self.graph.types.items) |type_entry| {
+            if (type_entry.kind != .struct_type) continue;
+            const struct_decl = type_entry.kind.struct_type;
+            const registered_type_id = self.store.name_to_type.get(type_entry.name) orelse continue;
+            if (registered_type_id >= self.store.types.items.len) continue;
+            const registered = self.store.getType(registered_type_id);
+            if (registered != .struct_type) continue;
+
+            // Default expressions evaluate at the construction site,
+            // not inside the struct body. Resolve them at the struct's
+            // declaration scope: that gives them access to the
+            // struct's siblings (other types, helper functions in the
+            // enclosing module) without binding `self` or other
+            // fields.
+            self.current_scope = type_entry.scope_id;
+
+            for (struct_decl.fields) |field_decl| {
+                const default_expr = field_decl.default orelse continue;
+                const field_type_id = self.findRegisteredFieldType(registered.struct_type, field_decl.name) orelse continue;
+                if (field_type_id == TypeStore.UNKNOWN) continue;
+
+                const inferred = self.inferExpr(default_expr) catch TypeStore.UNKNOWN;
+                if (inferred == TypeStore.UNKNOWN) continue;
+                if (self.store.typeEquals(inferred, field_type_id)) continue;
+                if (self.acceptsIntegerLiteralForExpectedType(default_expr, field_type_id)) continue;
+                if (self.store.canWidenTo(inferred, field_type_id)) continue;
+
+                const field_name = self.interner.get(field_decl.name);
+                // `typeToString` returns either a static slice (for
+                // primitives) or an arena-allocated buffer (for
+                // compound types). Either way the TypeChecker's
+                // allocator owns the result — we do not free here,
+                // matching every other diagnostic site in this file.
+                const declared_name = self.typeToString(field_type_id);
+                const provided_name = self.typeToString(inferred);
+
+                try self.addRichError(
+                    try std.fmt.allocPrint(
+                        self.allocator,
+                        "field `{s}` declares type `{s}` but its default value has type `{s}`",
+                        .{ field_name, declared_name, provided_name },
+                    ),
+                    default_expr.getMeta().span,
+                    "default value type does not match the declared field type",
+                    try std.fmt.allocPrint(
+                        self.allocator,
+                        "either change the default to a `{s}` value or change the field type to `{s}`",
+                        .{ declared_name, provided_name },
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Look up a registered struct field's resolved `TypeId` by name.
+    /// Used by `validateStructFieldDefaults` to pair an AST-level
+    /// `StructFieldDecl` with its already-resolved field type without
+    /// re-running `resolveTypeExpr`.
+    fn findRegisteredFieldType(_: *const TypeChecker, struct_type: Type.StructType, field_name: ast.StringId) ?TypeId {
+        for (struct_type.fields) |field| {
+            if (field.name == field_name) return field.type_id;
+        }
+        return null;
     }
 
     fn registerUserTypes(self: *TypeChecker) !void {
