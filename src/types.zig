@@ -1316,6 +1316,17 @@ fn typeIdMangledNameBorrowed(
         .struct_type => |st| @constCast(store).interner.get(st.name),
         .tagged_union => |tu| @constCast(store).interner.get(tu.name),
         .opaque_type => |ot| @constCast(store).interner.get(ot.name),
+        // A protocol existential mangles to the protocol's bare name —
+        // so `Option(Error)` joins to `Option_Error`, matching the
+        // per-instantiation TypeDef the IR emits for it (Phase
+        // 1.2.5.b). Inner `type_params` of the protocol_constraint
+        // are intentionally not appended: a protocol's vtable shape
+        // is independent of the existential boxing's payload type
+        // (the box always carries the runtime fat-pointer carrier),
+        // so parametric protocols still mangle by their bare name
+        // until and unless 1.2.5+ teaches them per-instantiation
+        // vtables of their own.
+        .protocol_constraint => |pc| @constCast(store).interner.get(pc.protocol_name),
         .applied => |ap| blk: {
             // Compose `<Base>_<Arg0>_<Arg1>...` so two distinct
             // instantiations of the same parametric base produce
