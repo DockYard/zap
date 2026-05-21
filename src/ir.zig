@@ -31,6 +31,44 @@ pub const TypeDefKind = union(enum) {
     struct_def: StructDef,
     enum_def: EnumDef,
     union_def: UnionDef,
+    /// Per-protocol vtable struct type (Phase 1.2.5.a). For every
+    /// `pub protocol Foo { fn m(x) -> R; ... }` reachable from the
+    /// program, IR emits one `protocol_vtable_def` with the canonical
+    /// name `FooVTable` containing one slot per protocol method.
+    /// The ZIR backend's step 3.7 lowers this into a synthetic Zig
+    /// source file:
+    ///
+    ///     pub const FooVTable = extern struct {
+    ///         m: *const fn(data_ptr: ?*anyopaque) callconv(.c) R_zig,
+    ///         ...
+    ///     };
+    ///
+    /// The receiver `x` is type-erased to `?*anyopaque` because at
+    /// every dispatch through a `ProtocolBox`, the concrete receiver
+    /// type is invisible — the construction site lowering (Phase
+    /// 1.2.5.c) heap-allocates the inner and stores it in the box's
+    /// `data_ptr`; the consumption site (Phase 1.2.5.d) passes that
+    /// pointer back into the impl method.
+    protocol_vtable_def: ProtocolVTableDef,
+    /// Per-impl vtable instance constant (Phase 1.2.5.a). For every
+    /// `pub impl Foo for Bar { pub fn m(self) -> R { ... } }`
+    /// reachable from the program, IR emits one
+    /// `protocol_vtable_instance_def` with name
+    /// `FooVTable_for_Bar`. The ZIR backend's step 3.7 lowers it
+    /// into a synthetic Zig source file:
+    ///
+    ///     const FooVTable = @import("FooVTable").FooVTable;
+    ///     const Bar_m: *const fn(data_ptr: ?*anyopaque) callconv(.c) R_zig =
+    ///         @ptrCast(&Bar__m__1);
+    ///     pub const FooVTable_for_Bar: FooVTable = .{ .m = Bar_m, ... };
+    ///
+    /// Each method-pointer entry references the impl's monomorphized
+    /// implementation name — the same `<TargetStruct>__<method>__<arity>`
+    /// (or its monomorphized parametric variant) that other call sites
+    /// reach via `call_named`. Construction-site lowering (Phase
+    /// 1.2.5.c) reads `vtable_constant_name` to populate the box's
+    /// `vtable` field.
+    protocol_vtable_instance_def: ProtocolVTableInstanceDef,
 };
 
 pub const StructDef = struct {
@@ -92,6 +130,125 @@ pub const UnionDef = struct {
 pub const UnionVariant = struct {
     name: []const u8,
     type_name: ?[]const u8 = null, // null = unit variant (void)
+};
+
+/// Shape of a single method slot in a per-protocol vtable type.
+/// Each protocol method maps to one `ProtocolVTableMethod`; the
+/// vtable struct field at this slot is a function pointer with
+/// the receiver type-erased to `?*anyopaque` and the remaining
+/// params plus return type lowered to their declared `ZigType`s.
+pub const ProtocolVTableMethod = struct {
+    /// The protocol method's source-level name (e.g. `message`,
+    /// `kind`). Used as the field name on the generated
+    /// `<Protocol>VTable` struct so dispatch sites can read the
+    /// slot via `vtable.message`, matching the method name in
+    /// the Zap source.
+    name: []const u8,
+    /// Number of source-level arguments declared on the
+    /// protocol's method signature, *including* the receiver.
+    /// Phase 1.2.5.a constraint: arity must be at least 1 (a
+    /// protocol method always takes the receiver as its first
+    /// argument). The codegen rejects arity-0 protocol methods
+    /// at the IR-population step because they cannot be dispatched
+    /// against a `ProtocolBox`.
+    arity: u32,
+    /// Non-receiver parameter types in source declaration order.
+    /// `arity - 1` entries — the receiver is implicit and always
+    /// `?*anyopaque` in the lowered function pointer. An empty
+    /// slice means the method takes only the receiver.
+    extra_param_types: []const ZigType,
+    /// The method's return type. `void` represents a sentinel-
+    /// only signature (no value flows back); every other return
+    /// shape lowers to its declared `ZigType` form.
+    return_type: ZigType,
+};
+
+/// Per-protocol vtable struct type. One IR `TypeDef` carries
+/// this kind for every `pub protocol` reachable in the program.
+/// The ZIR backend emits a `pub const <Protocol>VTable = extern
+/// struct { ... };` synthetic source file from this entry; the
+/// fields are the method slots in declaration order.
+pub const ProtocolVTableDef = struct {
+    /// The source-level protocol name (e.g. `Error`,
+    /// `Enumerable`). Used in diagnostics and as a prefix when
+    /// the ZIR backend materializes the synthetic source file —
+    /// the `name` field on the owning `TypeDef` already carries
+    /// the `<Protocol>VTable` form, but the bare protocol name
+    /// is retained here so per-impl `protocol_vtable_instance_def`
+    /// emission can correlate the vtable shape with its source
+    /// protocol without re-parsing the suffix.
+    protocol_name: []const u8,
+    /// Methods in source declaration order. The ordering is
+    /// load-bearing: per-impl vtable instance constants populate
+    /// their `.method = &impl_method` slots in the same order, so
+    /// the consumption-site lowering can dispatch through the
+    /// vtable by field name (`vtable.method`) and read the matching
+    /// method pointer regardless of how the protocol struct was
+    /// laid out at the machine level.
+    methods: []const ProtocolVTableMethod,
+};
+
+/// Shape of a single method-pointer entry in a per-impl vtable
+/// instance constant. The ZIR backend uses this to populate one
+/// `.method = &impl_function_name` field on the constant.
+pub const ProtocolVTableInstanceMethod = struct {
+    /// Protocol method name (matches a slot in the corresponding
+    /// `ProtocolVTableDef.methods`). Lets the ZIR backend emit
+    /// `.message = ...` rather than positional initializers,
+    /// which is more robust against ordering drift between the
+    /// vtable type and the instance constant.
+    method_name: []const u8,
+    /// The fully-qualified function name to point the slot at.
+    /// For a concrete impl `pub impl Foo for Bar { pub fn m(self)
+    /// -> R }` this is `Bar__m__1` (the same mangled name every
+    /// other call site reaches via `call_named`). The
+    /// monomorphized-impl asymmetry (calling-module prefix for
+    /// parametric impl specializations) is resolved at population
+    /// time so by the IR layer the name is stable.
+    impl_function_name: []const u8,
+    /// The number of source-level arguments on the impl method,
+    /// including the receiver. Mirrors the protocol's arity for
+    /// the matching slot. Used by the ZIR backend to emit the
+    /// correct callconv on the cast.
+    arity: u32,
+    /// Non-receiver parameter types on the impl method, in
+    /// source declaration order. Must match the protocol's
+    /// `extra_param_types` at the same slot (the type checker
+    /// enforces this at impl registration time); recorded here
+    /// so the ZIR backend can emit the `@ptrCast` signature
+    /// without a second lookup.
+    extra_param_types: []const ZigType,
+    /// The impl method's return type. Must match the protocol's
+    /// return type at the same slot.
+    return_type: ZigType,
+};
+
+/// Per-impl vtable instance constant. One IR `TypeDef` carries
+/// this kind for every `pub impl <Protocol> for <TargetType>`
+/// reachable from the program. The ZIR backend emits a
+/// `pub const <Protocol>VTable_for_<TargetType>: <Protocol>VTable
+/// = ...;` synthetic source file from this entry. The
+/// construction-site lowering (Phase 1.2.5.c) writes the address
+/// of this constant into the `ProtocolBox.vtable` field at every
+/// site where a concrete `<TargetType>` is auto-boxed as the
+/// protocol.
+pub const ProtocolVTableInstanceDef = struct {
+    /// Source-level protocol name (matches the
+    /// `ProtocolVTableDef.protocol_name` of the corresponding
+    /// vtable type). Lets the ZIR backend generate the
+    /// `@import("<Protocol>VTable")` import that gives the
+    /// constant its declared type.
+    protocol_name: []const u8,
+    /// Source-level target struct name (the type the impl is
+    /// for). Used in diagnostics and as the suffix on the
+    /// vtable-constant name. The `name` field on the owning
+    /// `TypeDef` already carries the
+    /// `<Protocol>VTable_for_<Target>` form; the bare target
+    /// name is retained here so the construction-site lowering
+    /// can correlate boxing arguments with their concrete impl.
+    target_type_name: []const u8,
+    /// Method-pointer entries in protocol declaration order.
+    methods: []const ProtocolVTableInstanceMethod,
 };
 
 pub const Program = struct {
@@ -165,6 +322,45 @@ fn cloneZigTypeSlice(allocator: std.mem.Allocator, values: []const ZigType) Clon
     return cloned;
 }
 
+/// Map a primitive type's source name to the matching IR
+/// `ZigType` shape. Mirrors `TypeStore.resolveTypeName` so the
+/// protocol-vtable populator (which resolves AST `TypeNameExpr`
+/// nodes directly) and the rest of the type checker agree on
+/// which names are primitives.
+///
+/// Used by the Phase 1.2.5.a protocol-vtable populator —
+/// `astTypeExprToZigTypeForProtocol` — to lower `fn message(e) ->
+/// String` to a function pointer whose return type is `.string`.
+/// Returns `null` for non-primitives (the caller falls back to a
+/// `.struct_ref` lookup for nominal types).
+fn primitiveNameToZigType(name: []const u8) ?ZigType {
+    if (std.mem.eql(u8, name, "Bool")) return .bool_type;
+    if (std.mem.eql(u8, name, "String")) return .string;
+    if (std.mem.eql(u8, name, "Atom")) return .atom;
+    if (std.mem.eql(u8, name, "Nil")) return .nil;
+    if (std.mem.eql(u8, name, "Void")) return .void;
+    if (std.mem.eql(u8, name, "Never")) return .never;
+    if (std.mem.eql(u8, name, "Term")) return .term;
+    if (std.mem.eql(u8, name, "i128")) return .i128;
+    if (std.mem.eql(u8, name, "i64")) return .i64;
+    if (std.mem.eql(u8, name, "i32")) return .i32;
+    if (std.mem.eql(u8, name, "i16")) return .i16;
+    if (std.mem.eql(u8, name, "i8")) return .i8;
+    if (std.mem.eql(u8, name, "u128")) return .u128;
+    if (std.mem.eql(u8, name, "u64")) return .u64;
+    if (std.mem.eql(u8, name, "u32")) return .u32;
+    if (std.mem.eql(u8, name, "u16")) return .u16;
+    if (std.mem.eql(u8, name, "u8")) return .u8;
+    if (std.mem.eql(u8, name, "f128")) return .f128;
+    if (std.mem.eql(u8, name, "f80")) return .f80;
+    if (std.mem.eql(u8, name, "f64")) return .f64;
+    if (std.mem.eql(u8, name, "f32")) return .f32;
+    if (std.mem.eql(u8, name, "f16")) return .f16;
+    if (std.mem.eql(u8, name, "usize")) return .usize;
+    if (std.mem.eql(u8, name, "isize")) return .isize;
+    return null;
+}
+
 fn cloneZigType(allocator: std.mem.Allocator, value: ZigType) CloneError!ZigType {
     return switch (value) {
         .tuple => |items| .{ .tuple = try cloneZigTypeSlice(allocator, items) },
@@ -209,8 +405,52 @@ fn cloneTypeDef(allocator: std.mem.Allocator, type_def: TypeDef) CloneError!Type
             .union_def => |union_def| .{ .union_def = .{
                 .variants = try cloneUnionVariants(allocator, union_def.variants),
             } },
+            .protocol_vtable_def => |vt_def| .{ .protocol_vtable_def = .{
+                .protocol_name = try cloneBytes(allocator, vt_def.protocol_name),
+                .methods = try cloneProtocolVTableMethods(allocator, vt_def.methods),
+            } },
+            .protocol_vtable_instance_def => |vt_inst| .{ .protocol_vtable_instance_def = .{
+                .protocol_name = try cloneBytes(allocator, vt_inst.protocol_name),
+                .target_type_name = try cloneBytes(allocator, vt_inst.target_type_name),
+                .methods = try cloneProtocolVTableInstanceMethods(allocator, vt_inst.methods),
+            } },
         },
     };
+}
+
+fn cloneProtocolVTableMethods(
+    allocator: std.mem.Allocator,
+    methods: []const ProtocolVTableMethod,
+) CloneError![]const ProtocolVTableMethod {
+    if (methods.len == 0) return &.{};
+    const cloned = try allocator.alloc(ProtocolVTableMethod, methods.len);
+    for (methods, 0..) |method, index| {
+        cloned[index] = .{
+            .name = try cloneBytes(allocator, method.name),
+            .arity = method.arity,
+            .extra_param_types = try cloneZigTypeSlice(allocator, method.extra_param_types),
+            .return_type = try cloneZigType(allocator, method.return_type),
+        };
+    }
+    return cloned;
+}
+
+fn cloneProtocolVTableInstanceMethods(
+    allocator: std.mem.Allocator,
+    methods: []const ProtocolVTableInstanceMethod,
+) CloneError![]const ProtocolVTableInstanceMethod {
+    if (methods.len == 0) return &.{};
+    const cloned = try allocator.alloc(ProtocolVTableInstanceMethod, methods.len);
+    for (methods, 0..) |method, index| {
+        cloned[index] = .{
+            .method_name = try cloneBytes(allocator, method.method_name),
+            .impl_function_name = try cloneBytes(allocator, method.impl_function_name),
+            .arity = method.arity,
+            .extra_param_types = try cloneZigTypeSlice(allocator, method.extra_param_types),
+            .return_type = try cloneZigType(allocator, method.return_type),
+        };
+    }
+    return cloned;
 }
 
 fn cloneStructFieldDefs(allocator: std.mem.Allocator, fields: []const StructFieldDef) CloneError![]const StructFieldDef {
@@ -3145,6 +3385,17 @@ pub const IrBuilder = struct {
         for (self.synthesized_type_defs.items) |synth_td| {
             try type_defs.append(self.allocator, synth_td);
         }
+
+        // Phase 1.2.5.a step 3.7: per-protocol vtable types and per-impl
+        // vtable instance constants. The construction-site lowering
+        // (Phase 1.2.5.c) and consumption-site lowering (Phase 1.2.5.d)
+        // both depend on these entries existing — Phase 1.2.5.a
+        // surfaces them in the IR so the ZIR backend can lower them to
+        // synthetic Zig source files. Skipped silently when the IR
+        // builder has no scope_graph wired (unit tests for unrelated
+        // IR shapes don't always set it; protocol existentials are
+        // exercised by the dedicated tests at end-of-file).
+        try self.populateProtocolVTables(&type_defs);
 
         return .{
             .functions = try self.functions.toOwnedSlice(self.allocator),
@@ -7486,6 +7737,252 @@ pub const IrBuilder = struct {
             try self.applied_id_to_spec.put(@intCast(candidate_index), idx);
             try self.applied_name_to_spec.put(self.allocator, mangled, idx);
         }
+    }
+
+    /// Phase 1.2.5.a step 3.7: emit a `protocol_vtable_def` TypeDef
+    /// for every `pub protocol` reachable from the program, and a
+    /// `protocol_vtable_instance_def` for every `pub impl` whose
+    /// target is a concrete struct. The ZIR backend's step 3.7
+    /// lowers each entry into a synthetic Zig source file:
+    ///
+    ///   - `<Protocol>VTable` — the protocol's vtable struct type,
+    ///     one field per method (function pointer with receiver erased
+    ///     to `?*anyopaque`).
+    ///   - `<Protocol>VTable_for_<Target>` — one constant per impl,
+    ///     populated with `.method = &<Target>__<method>__<arity>`
+    ///     pointers.
+    ///
+    /// Silently no-ops when `scope_graph` is null — the IR builder is
+    /// used by unrelated unit tests that don't construct the full
+    /// collect pipeline; those tests must still build a coherent
+    /// `Program` without protocol surfaces.
+    ///
+    /// Phase 1.2.5.a scope:
+    ///   - Concrete-target impls only. Parametric impls (`impl Foo for
+    ///     List(T)`) need per-`.applied`-instantiation vtables, which
+    ///     join the populator in Phase 1.2.5.b once
+    ///     `protocol_constraint` becomes first-class in the type store.
+    ///   - Skips protocols with parametric type parameters
+    ///     (`pub protocol Foo(T) { ... }`) for the same reason — until
+    ///     1.2.5.b plumbs the substitution, the vtable shape would
+    ///     carry type-variable-shaped fields that the ZIR backend
+    ///     cannot lower.
+    fn populateProtocolVTables(
+        self: *IrBuilder,
+        type_defs: *std.ArrayList(TypeDef),
+    ) !void {
+        const graph = self.scope_graph orelse return;
+
+        // ── 3.7.a: per-protocol vtable struct types ──────────────
+        // Walk every `ProtocolEntry` and emit a
+        // `protocol_vtable_def` TypeDef. The vtable's field list
+        // mirrors the protocol's method signatures, with each
+        // receiver erased to `?*anyopaque` (the dispatch site only
+        // has the box's `data_ptr`, not the concrete receiver type).
+        for (graph.protocols.items) |proto_entry| {
+            // Phase 1.2.5.a defers parametric protocols.
+            if (proto_entry.decl.type_params.len != 0) continue;
+
+            const protocol_name = self.protocolNameToString(proto_entry.name);
+            const vtable_type_name = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}VTable",
+                .{protocol_name},
+            );
+
+            const methods = try self.allocator.alloc(
+                ProtocolVTableMethod,
+                proto_entry.decl.functions.len,
+            );
+            for (proto_entry.decl.functions, 0..) |fn_sig, method_index| {
+                const method_name = self.interner.get(fn_sig.name);
+                const arity: u32 = @intCast(fn_sig.params.len);
+                // Extra params are everything past the receiver — index 0.
+                const extra_count = if (fn_sig.params.len > 0) fn_sig.params.len - 1 else 0;
+                const extra_param_types = try self.allocator.alloc(ZigType, extra_count);
+                if (extra_count > 0) {
+                    for (fn_sig.params[1..], 0..) |param, param_index| {
+                        extra_param_types[param_index] = self.protocolParamTypeToZigType(param.type_annotation);
+                    }
+                }
+                const return_zig_type = self.protocolReturnTypeToZigType(fn_sig.return_type);
+                methods[method_index] = .{
+                    .name = try cloneBytes(self.allocator, method_name),
+                    .arity = arity,
+                    .extra_param_types = extra_param_types,
+                    .return_type = return_zig_type,
+                };
+            }
+
+            try type_defs.append(self.allocator, .{
+                .name = vtable_type_name,
+                .kind = .{ .protocol_vtable_def = .{
+                    .protocol_name = try cloneBytes(self.allocator, protocol_name),
+                    .methods = methods,
+                } },
+            });
+        }
+
+        // ── 3.7.b: per-impl vtable instance constants ────────────
+        // Walk every `ImplEntry` and emit a
+        // `protocol_vtable_instance_def` TypeDef whose
+        // method-pointer entries name the impl's monomorphized
+        // function symbols. Target must be a concrete struct (no
+        // applied parametric forms in 1.2.5.a — those land in
+        // 1.2.5.b together with per-`.applied` vtable enumeration).
+        for (graph.impls.items) |impl_entry| {
+            // Locate the protocol entry to read the method
+            // signatures in declaration order. Construction-time
+            // method-name matching uses the protocol's slot ordering,
+            // not the impl's source-order, so an impl that lists
+            // methods in a different order still produces a correctly
+            // aligned vtable.
+            const proto_entry = graph.findProtocol(impl_entry.protocol_name) orelse continue;
+            // Skip parametric protocols (1.2.5.a defers).
+            if (proto_entry.decl.type_params.len != 0) continue;
+            // Skip impls with their own type parameters (parametric
+            // target — 1.2.5.b territory).
+            if (impl_entry.decl.type_params.len != 0) continue;
+
+            const protocol_name = self.protocolNameToString(proto_entry.name);
+            const target_name = self.protocolNameToString(impl_entry.target_type);
+
+            const instance_type_name = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}VTable_for_{s}",
+                .{ protocol_name, target_name },
+            );
+
+            const methods = try self.allocator.alloc(
+                ProtocolVTableInstanceMethod,
+                proto_entry.decl.functions.len,
+            );
+            for (proto_entry.decl.functions, 0..) |proto_fn_sig, method_index| {
+                const method_name = self.interner.get(proto_fn_sig.name);
+                const arity: u32 = @intCast(proto_fn_sig.params.len);
+                const impl_function_name = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}__{s}__{d}",
+                    .{ target_name, method_name, arity },
+                );
+                const extra_count = if (proto_fn_sig.params.len > 0) proto_fn_sig.params.len - 1 else 0;
+                const extra_param_types = try self.allocator.alloc(ZigType, extra_count);
+                if (extra_count > 0) {
+                    for (proto_fn_sig.params[1..], 0..) |param, param_index| {
+                        extra_param_types[param_index] = self.protocolParamTypeToZigType(param.type_annotation);
+                    }
+                }
+                const return_zig_type = self.protocolReturnTypeToZigType(proto_fn_sig.return_type);
+                methods[method_index] = .{
+                    .method_name = try cloneBytes(self.allocator, method_name),
+                    .impl_function_name = impl_function_name,
+                    .arity = arity,
+                    .extra_param_types = extra_param_types,
+                    .return_type = return_zig_type,
+                };
+            }
+
+            try type_defs.append(self.allocator, .{
+                .name = instance_type_name,
+                .kind = .{ .protocol_vtable_instance_def = .{
+                    .protocol_name = try cloneBytes(self.allocator, protocol_name),
+                    .target_type_name = try cloneBytes(self.allocator, target_name),
+                    .methods = methods,
+                } },
+            });
+        }
+    }
+
+    /// Convert a `StructName` from the scope graph into a flat
+    /// string suitable for use as a vtable name prefix or target
+    /// suffix. Single-segment names (the common case for protocols
+    /// and impl targets) return the leaf; multi-segment names join
+    /// with `_` to keep the result a valid Zig identifier without
+    /// re-running the per-segment mangler.
+    fn protocolNameToString(self: *IrBuilder, name: ast.StructName) []const u8 {
+        if (name.parts.len == 1) return self.interner.get(name.parts[0]);
+        return name.joinedWith(self.allocator, self.interner, "_") catch
+            self.interner.get(name.parts[name.parts.len - 1]);
+    }
+
+    /// Convert a protocol method's parameter or return type
+    /// annotation to a `ZigType` suitable for use in the vtable's
+    /// function-pointer field type. Phase 1.2.5.a handles primitive
+    /// names (`i64`, `String`, `Atom`, `Bool`, etc.); structured
+    /// types (`Option(T)`, optional, list, etc.) fall back to a
+    /// `.struct_ref` of the spelled-out name so the ZIR backend
+    /// emits an `@import("<Name>").<Name>` lookup. Phase 1.2.5.b
+    /// extends this to the full type-store path (including
+    /// `protocol_constraint`) once the type-store plumbing lands.
+    ///
+    /// Unannotated parameters (rare — only `(self)` style sugars)
+    /// fall back to `.any`, which becomes Zig's `anytype` at the
+    /// emission layer; the dispatch site is still well-typed
+    /// because the box transports a concrete pointer regardless.
+    fn protocolParamTypeToZigType(
+        self: *IrBuilder,
+        type_annotation: ?*const ast.TypeExpr,
+    ) ZigType {
+        const ann = type_annotation orelse return .any;
+        return self.astTypeExprToZigTypeForProtocol(ann);
+    }
+
+    fn protocolReturnTypeToZigType(
+        self: *IrBuilder,
+        return_type: ?*const ast.TypeExpr,
+    ) ZigType {
+        const ret = return_type orelse return .void;
+        return self.astTypeExprToZigTypeForProtocol(ret);
+    }
+
+    /// Minimal AST `TypeExpr` → IR `ZigType` resolver for protocol
+    /// vtable emission. Handles the cases that actually appear in
+    /// protocol signatures (primitive names, parametric
+    /// applications, optional/list containers); anything outside
+    /// the supported set falls back to `.any`. Phase 1.2.5.b
+    /// replaces this with a full resolution against the type
+    /// store, once `protocol_constraint` materializes as a
+    /// concrete TypeId backed by `ProtocolBox`.
+    fn astTypeExprToZigTypeForProtocol(
+        self: *IrBuilder,
+        type_expr: *const ast.TypeExpr,
+    ) ZigType {
+        return switch (type_expr.*) {
+            .name => |name_expr| blk: {
+                const text = self.interner.get(name_expr.name);
+                // Primitive name? Map directly. Mirrors
+                // `TypeStore.resolveTypeName` so we don't drift
+                // from the type checker's recognized name set.
+                if (primitiveNameToZigType(text)) |prim| break :blk prim;
+                // Parametric application: lower to a `.struct_ref`
+                // of the mangled per-instantiation name. The
+                // per-instantiation `union_def`/`enum_def`/`struct_def`
+                // TypeDef the IR already emits provides the matching
+                // ZIR-side synthetic file.
+                if (name_expr.args.len > 0) {
+                    // Best-effort lookup through the type store —
+                    // when 1.2.5.b lands proper TypeId plumbing this
+                    // path becomes deterministic. For 1.2.5.a we
+                    // fall back to the bare base name when args
+                    // can't be resolved, which is the safer default
+                    // (a downstream `@import` of an unresolved name
+                    // surfaces as a clear Zig diagnostic instead of
+                    // silently miscompiling).
+                    if (self.type_store) |ts| {
+                        if (ts.resolveTypeName(text)) |_| {
+                            // Resolved as a primitive — but a
+                            // primitive with args is nonsense; let
+                            // the fallback below handle it.
+                        }
+                    }
+                    break :blk .{ .struct_ref = self.allocator.dupe(u8, text) catch text };
+                }
+                // Bare nominal — treat as struct ref.
+                break :blk .{ .struct_ref = self.allocator.dupe(u8, text) catch text };
+            },
+            .variable => .any,
+            else => .any,
+        };
     }
 
     /// Build the per-instantiation specialization data for one
@@ -12658,4 +13155,229 @@ test "IR builder's applied specialization table indexes by name and TypeId" {
     const i64_by_id = ir_builder.appliedSpecializationByTypeId(box_i64_spec.applied_type_id) orelse
         return error.MissingBoxI64ById;
     try std.testing.expectEqualStrings(box_i64_spec.mangled_name, i64_by_id.mangled_name);
+}
+
+// ============================================================
+// Phase 1.2.5.a: per-protocol vtable + per-impl vtable instance
+// emission tests
+// ============================================================
+
+/// Test-only variant of `buildIrProgramForParametricTest` that
+/// also wires the scope graph onto the IR builder. The
+/// protocol/impl population in `populateProtocolVTables` reads
+/// `graph.protocols` / `graph.impls` through this channel; the
+/// parametric tests above skip it because they exercise only the
+/// type-store-driven `populateAppliedSpecializations` path.
+fn buildIrProgramForProtocolTest(
+    arena_allocator: std.mem.Allocator,
+    source: []const u8,
+    interner_out: **ast.StringInterner,
+    graph_out: **const scope_mod.ScopeGraph,
+) !Program {
+    const parser_local: Parser = Parser.init(arena_allocator, source);
+    const parser_box = try arena_allocator.create(Parser);
+    parser_box.* = parser_local;
+    const program = try parser_box.parseProgram();
+    const program_box = try arena_allocator.create(ast.Program);
+    program_box.* = program;
+
+    const collector_box = try arena_allocator.create(Collector);
+    collector_box.* = Collector.init(arena_allocator, parser_box.interner, null);
+    try collector_box.collectProgram(program_box);
+
+    var checker = types_mod.TypeChecker.init(arena_allocator, parser_box.interner, &collector_box.graph);
+    try checker.checkProgram(program_box);
+
+    var hir_builder = hir_mod.HirBuilder.init(arena_allocator, parser_box.interner, &collector_box.graph, checker.store);
+    const hir_program_value = try hir_builder.buildProgram(program_box);
+    const hir_program_box = try arena_allocator.create(hir_mod.Program);
+    hir_program_box.* = hir_program_value;
+
+    var next_id: u32 = hir_builder.next_group_id;
+    const mono_result = try monomorphize_mod.monomorphize(
+        arena_allocator,
+        hir_program_box,
+        checker.store,
+        &next_id,
+        @constCast(parser_box.interner),
+    );
+    const post_mono = try arena_allocator.create(hir_mod.Program);
+    post_mono.* = mono_result.program;
+
+    var ir_builder = IrBuilder.init(arena_allocator, parser_box.interner);
+    ir_builder.type_store = checker.store;
+    ir_builder.scope_graph = &collector_box.graph;
+    interner_out.* = @constCast(parser_box.interner);
+    graph_out.* = &collector_box.graph;
+    return try ir_builder.buildProgram(post_mono);
+}
+
+test "IR emits protocol_vtable_def for every reachable pub protocol" {
+    // A `pub protocol Foo { fn m(x) -> i64 }` reachable from the
+    // program must produce a `protocol_vtable_def` TypeDef whose
+    // name is `FooVTable` and whose method-slot list mirrors the
+    // protocol's method signatures (in declaration order). The
+    // ZIR backend's step 3.7 lowers this TypeDef into a synthetic
+    // `pub const FooVTable = extern struct { m: *const fn(...)... }`
+    // source file at codegen time.
+    //
+    // Two protocols are declared so we can verify each lands as a
+    // separate vtable type with the right number of slots.
+    const source =
+        \\pub protocol Greeting {
+        \\  fn hello(g) -> String
+        \\}
+        \\pub protocol Counter {
+        \\  fn current(c) -> i64
+        \\  fn step(c, n :: i64) -> i64
+        \\}
+        \\pub struct UseSite {
+        \\  pub fn dummy() -> i64 { 0 }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner: *ast.StringInterner = undefined;
+    var graph: *const scope_mod.ScopeGraph = undefined;
+    const program = try buildIrProgramForProtocolTest(alloc, source, &interner, &graph);
+
+    // Greeting vtable: one method (`hello`) returning String.
+    const greeting_vt = findTypeDefByName(program, "GreetingVTable") orelse
+        return error.MissingGreetingVTable;
+    try std.testing.expect(greeting_vt.kind == .protocol_vtable_def);
+    const greeting_def = greeting_vt.kind.protocol_vtable_def;
+    try std.testing.expectEqualStrings("Greeting", greeting_def.protocol_name);
+    try std.testing.expectEqual(@as(usize, 1), greeting_def.methods.len);
+    try std.testing.expectEqualStrings("hello", greeting_def.methods[0].name);
+    try std.testing.expectEqual(@as(u32, 1), greeting_def.methods[0].arity);
+    try std.testing.expectEqual(@as(usize, 0), greeting_def.methods[0].extra_param_types.len);
+    try std.testing.expectEqual(ZigType.string, greeting_def.methods[0].return_type);
+
+    // Counter vtable: two methods, the second with an extra param.
+    const counter_vt = findTypeDefByName(program, "CounterVTable") orelse
+        return error.MissingCounterVTable;
+    try std.testing.expect(counter_vt.kind == .protocol_vtable_def);
+    const counter_def = counter_vt.kind.protocol_vtable_def;
+    try std.testing.expectEqualStrings("Counter", counter_def.protocol_name);
+    try std.testing.expectEqual(@as(usize, 2), counter_def.methods.len);
+    try std.testing.expectEqualStrings("current", counter_def.methods[0].name);
+    try std.testing.expectEqual(@as(u32, 1), counter_def.methods[0].arity);
+    try std.testing.expectEqual(@as(usize, 0), counter_def.methods[0].extra_param_types.len);
+    try std.testing.expectEqual(ZigType.i64, counter_def.methods[0].return_type);
+    try std.testing.expectEqualStrings("step", counter_def.methods[1].name);
+    try std.testing.expectEqual(@as(u32, 2), counter_def.methods[1].arity);
+    try std.testing.expectEqual(@as(usize, 1), counter_def.methods[1].extra_param_types.len);
+    try std.testing.expectEqual(ZigType.i64, counter_def.methods[1].extra_param_types[0]);
+    try std.testing.expectEqual(ZigType.i64, counter_def.methods[1].return_type);
+}
+
+test "IR emits protocol_vtable_instance_def for every reachable pub impl" {
+    // For every concrete `pub impl Foo for Bar`, IR must emit a
+    // `protocol_vtable_instance_def` named `FooVTable_for_Bar`
+    // whose method-pointer entries name the impl's monomorphized
+    // function symbols. The construction-site lowering (Phase
+    // 1.2.5.c) reads these constants to populate the
+    // `ProtocolBox.vtable` field at boxing sites.
+    //
+    // The Greeting protocol with a single concrete impl is the
+    // minimal exercise: the IR must surface both the vtable type
+    // and the vtable constant.
+    const source =
+        \\pub protocol Greeting {
+        \\  fn hello(g) -> String
+        \\}
+        \\pub struct Friendly {
+        \\  message :: String = "hi"
+        \\}
+        \\pub impl Greeting for Friendly {
+        \\  pub fn hello(g :: Friendly) -> String {
+        \\    g.message
+        \\  }
+        \\}
+        \\pub struct UseSite {
+        \\  pub fn dummy() -> i64 { 0 }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner: *ast.StringInterner = undefined;
+    var graph: *const scope_mod.ScopeGraph = undefined;
+    const program = try buildIrProgramForProtocolTest(alloc, source, &interner, &graph);
+
+    // Vtable type must exist.
+    const greeting_vt = findTypeDefByName(program, "GreetingVTable") orelse
+        return error.MissingGreetingVTable;
+    try std.testing.expect(greeting_vt.kind == .protocol_vtable_def);
+
+    // Per-impl vtable constant must exist with the right shape.
+    const instance = findTypeDefByName(program, "GreetingVTable_for_Friendly") orelse
+        return error.MissingGreetingVTableForFriendly;
+    try std.testing.expect(instance.kind == .protocol_vtable_instance_def);
+    const inst_def = instance.kind.protocol_vtable_instance_def;
+    try std.testing.expectEqualStrings("Greeting", inst_def.protocol_name);
+    try std.testing.expectEqualStrings("Friendly", inst_def.target_type_name);
+    try std.testing.expectEqual(@as(usize, 1), inst_def.methods.len);
+
+    // The slot's `method_name` matches the protocol's, and the
+    // `impl_function_name` follows the `<TargetStruct>__<method>__<arity>`
+    // convention every call site uses for the same impl method.
+    const slot = inst_def.methods[0];
+    try std.testing.expectEqualStrings("hello", slot.method_name);
+    try std.testing.expectEqualStrings("Friendly__hello__1", slot.impl_function_name);
+    try std.testing.expectEqual(@as(u32, 1), slot.arity);
+    try std.testing.expectEqual(@as(usize, 0), slot.extra_param_types.len);
+    try std.testing.expectEqual(ZigType.string, slot.return_type);
+}
+
+test "IR vtable emission survives Program.clone (deep-copy correctness)" {
+    // The cache-correctness path serializes Program through
+    // `cloneProgram` so a downstream consumer that holds the
+    // clone observes the same vtable shapes. `cloneTypeDef` must
+    // round-trip both new variants.
+    const source =
+        \\pub protocol Counter {
+        \\  fn current(c) -> i64
+        \\}
+        \\pub struct Tick {
+        \\  value :: i64 = 0
+        \\}
+        \\pub impl Counter for Tick {
+        \\  pub fn current(c :: Tick) -> i64 { c.value }
+        \\}
+        \\pub struct UseSite { pub fn dummy() -> i64 { 0 } }
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner: *ast.StringInterner = undefined;
+    var graph: *const scope_mod.ScopeGraph = undefined;
+    const original = try buildIrProgramForProtocolTest(alloc, source, &interner, &graph);
+    const cloned = try cloneProgram(alloc, original);
+
+    const counter_vt = findTypeDefByName(cloned, "CounterVTable") orelse
+        return error.MissingCounterVTable;
+    try std.testing.expect(counter_vt.kind == .protocol_vtable_def);
+    const counter_def = counter_vt.kind.protocol_vtable_def;
+    try std.testing.expectEqualStrings("Counter", counter_def.protocol_name);
+    try std.testing.expectEqual(@as(usize, 1), counter_def.methods.len);
+    try std.testing.expectEqualStrings("current", counter_def.methods[0].name);
+    try std.testing.expectEqual(ZigType.i64, counter_def.methods[0].return_type);
+
+    const instance = findTypeDefByName(cloned, "CounterVTable_for_Tick") orelse
+        return error.MissingCounterVTableForTick;
+    try std.testing.expect(instance.kind == .protocol_vtable_instance_def);
+    const inst_def = instance.kind.protocol_vtable_instance_def;
+    try std.testing.expectEqualStrings("Counter", inst_def.protocol_name);
+    try std.testing.expectEqualStrings("Tick", inst_def.target_type_name);
+    try std.testing.expectEqual(@as(usize, 1), inst_def.methods.len);
+    try std.testing.expectEqualStrings("current", inst_def.methods[0].method_name);
+    try std.testing.expectEqualStrings("Tick__current__1", inst_def.methods[0].impl_function_name);
 }

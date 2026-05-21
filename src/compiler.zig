@@ -5674,6 +5674,51 @@ fn typeDefinitionEqual(left: ir.TypeDef, right: ir.TypeDef) bool {
             }
             break :blk true;
         },
+        .protocol_vtable_def => |left_vt| blk: {
+            // Per-protocol vtable types compare equal when their
+            // protocol name and method-slot shape are identical.
+            // Stable across rebuilds is essential for the cache
+            // sidecar — if the per-impl vtable constants depend on
+            // a vtable type that was recomputed with a different
+            // method order, every dependent impl rebuilds.
+            const right_vt = right.kind.protocol_vtable_def;
+            if (!std.mem.eql(u8, left_vt.protocol_name, right_vt.protocol_name)) break :blk false;
+            if (left_vt.methods.len != right_vt.methods.len) break :blk false;
+            for (left_vt.methods, right_vt.methods) |left_method, right_method| {
+                if (!std.mem.eql(u8, left_method.name, right_method.name)) break :blk false;
+                if (left_method.arity != right_method.arity) break :blk false;
+                if (left_method.extra_param_types.len != right_method.extra_param_types.len) break :blk false;
+                for (left_method.extra_param_types, right_method.extra_param_types) |left_param, right_param| {
+                    if (!zigTypeEqual(left_param, right_param)) break :blk false;
+                }
+                if (!zigTypeEqual(left_method.return_type, right_method.return_type)) break :blk false;
+            }
+            break :blk true;
+        },
+        .protocol_vtable_instance_def => |left_inst| blk: {
+            // Per-impl vtable instance constants compare equal when
+            // their protocol/target pair and method-slot pointers
+            // are identical. A change to either side (e.g. a new
+            // method on the protocol, a renamed monomorphized impl
+            // method) must invalidate the cache for this entry so
+            // the synthetic source file is rebuilt with the right
+            // names.
+            const right_inst = right.kind.protocol_vtable_instance_def;
+            if (!std.mem.eql(u8, left_inst.protocol_name, right_inst.protocol_name)) break :blk false;
+            if (!std.mem.eql(u8, left_inst.target_type_name, right_inst.target_type_name)) break :blk false;
+            if (left_inst.methods.len != right_inst.methods.len) break :blk false;
+            for (left_inst.methods, right_inst.methods) |left_method, right_method| {
+                if (!std.mem.eql(u8, left_method.method_name, right_method.method_name)) break :blk false;
+                if (!std.mem.eql(u8, left_method.impl_function_name, right_method.impl_function_name)) break :blk false;
+                if (left_method.arity != right_method.arity) break :blk false;
+                if (left_method.extra_param_types.len != right_method.extra_param_types.len) break :blk false;
+                for (left_method.extra_param_types, right_method.extra_param_types) |left_param, right_param| {
+                    if (!zigTypeEqual(left_param, right_param)) break :blk false;
+                }
+                if (!zigTypeEqual(left_method.return_type, right_method.return_type)) break :blk false;
+            }
+            break :blk true;
+        },
     };
 }
 
