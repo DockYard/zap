@@ -9982,6 +9982,21 @@ fn remapStructName(alloc: std.mem.Allocator, name: *ast.StructName, remap: []con
 fn remapStructDecl(alloc: std.mem.Allocator, mod: *ast.StructDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
     try remapStructName(alloc, &mod.name, remap);
     if (mod.parent) |p| mod.parent = remap[p];
+    // Parametric type parameters on `pub struct Foo(T)` carry the
+    // formal type-var names. Their interner IDs come from the unit's
+    // LOCAL interner — remap to the global interner alongside the
+    // declaration's name so the typechecker's `type_var_scope`
+    // population (in `types.zig`) sees the same StringId the IR layer
+    // looks up later. Without this remap a unit-local id for `t`
+    // would land in the global slot for some other identifier,
+    // corrupting `applyToType`'s substitution.
+    if (mod.type_params.len > 0) {
+        const mutable_params = try alloc.alloc(ast.StringId, mod.type_params.len);
+        for (mod.type_params, 0..) |tp, i| {
+            mutable_params[i] = remap[tp];
+        }
+        mod.type_params = mutable_params;
+    }
     if (mod.items.len > 0) {
         const mutable_items = try alloc.alloc(ast.StructItem, mod.items.len);
         @memcpy(mutable_items, mod.items);
@@ -10311,6 +10326,19 @@ fn remapOpaqueParams(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []con
 
 fn remapUnionDecl(alloc: std.mem.Allocator, ud: *ast.UnionDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
     ud.name = remap[ud.name];
+    // Parametric type parameters on `pub union Foo(T)` — same remap
+    // contract as `remapStructDecl`'s `mod.type_params`. The
+    // typechecker binds these names into `type_var_scope` for the
+    // duration of variant payload resolution, so a local-id leak
+    // here would unbind `T` from the union's variants and corrupt
+    // per-instantiation substitution downstream.
+    if (ud.type_params.len > 0) {
+        const mutable_params = try alloc.alloc(ast.StringId, ud.type_params.len);
+        for (ud.type_params, 0..) |tp, i| {
+            mutable_params[i] = remap[tp];
+        }
+        ud.type_params = mutable_params;
+    }
     if (ud.variants.len > 0) {
         const mutable_variants = try alloc.alloc(ast.UnionVariant, ud.variants.len);
         for (ud.variants, 0..) |v, i| {
@@ -10476,7 +10504,28 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
         .string_literal => |*sl| sl.value = remap[sl.value],
         .atom_literal => |*al| al.value = remap[al.value],
         .var_ref => |*vr| vr.name = remap[vr.name],
-        .struct_ref => |*mr| try remapStructName(alloc, &mr.name, remap),
+        .struct_ref => |*mr| {
+            try remapStructName(alloc, &mr.name, remap);
+            // Parametric variant constructors (`Option(i64).Some`,
+            // `Result(i64, String).Err`) attach type-args on the
+            // struct_ref via `tryParseInstantiatedVariantConstructor`.
+            // Each arg's interner IDs reference the source unit's
+            // LOCAL interner — translate them to the global interner
+            // alongside `mr.name`. Without this remap the type-args
+            // resolve to wildly wrong strings in the global interner
+            // (the round-1 `Option_Any` / `Option_i8` symptom: a local
+            // ID for "i64" lands in the global slot for "i8" or "any").
+            if (mr.type_args.len > 0) {
+                const mutable_args = try alloc.alloc(*const ast.TypeExpr, mr.type_args.len);
+                for (mr.type_args, 0..) |arg, i| {
+                    const mutable = try alloc.create(ast.TypeExpr);
+                    mutable.* = arg.*;
+                    try remapTypeExpr(alloc, mutable, remap);
+                    mutable_args[i] = mutable;
+                }
+                mr.type_args = mutable_args;
+            }
+        },
         .field_access => |*fa| {
             const mutable_obj = try alloc.create(ast.Expr);
             mutable_obj.* = fa.object.*;
