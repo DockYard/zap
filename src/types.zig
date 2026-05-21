@@ -1226,6 +1226,104 @@ fn joinStructNameWithUnderscore(allocator: std.mem.Allocator, interner: *const a
     return @constCast(joined);
 }
 
+/// Canonical mangled name for any `TypeId`. Public so the IR builder,
+/// ZIR backend, and symbol-table emitter share one identity convention
+/// with the monomorphizer's per-specialization naming
+/// (`monomorphize.mangleName` composes function specialization names on
+/// top of this).
+///
+/// Concrete primitives return interned static strings owned by the
+/// program text — callers must not free them. `.applied { base, args }`
+/// allocates a fresh composed name (`Box_i64`, `Pair_i64_String`,
+/// `Box_Box_i64`) from `allocator` so two distinct instantiations of
+/// the same parametric struct/union get distinct identifiers. Caller
+/// owns the returned slice when it was composed (i.e. when the input
+/// is `.applied` or recursively contains one), and must free it via
+/// `allocator`; ownership transfer is uniform because callers cannot
+/// otherwise tell whether the result was composed or borrowed.
+///
+/// To paper over that ambiguity, every primitive arm copies into the
+/// allocator too, so the contract is "always free via `allocator`."
+/// This matches how the IR builder consumes the result: it stuffs the
+/// mangled name into a `TypeDef.name` slice owned by the IR arena.
+pub fn typeIdMangledName(
+    allocator: std.mem.Allocator,
+    store: *const TypeStore,
+    type_id: TypeId,
+) std.mem.Allocator.Error![]u8 {
+    const borrowed = try typeIdMangledNameBorrowed(allocator, store, type_id);
+    // `typeIdMangledNameBorrowed` returns either a fresh allocation
+    // (for `.applied`) or a borrowed slice into the interner /
+    // static string table. Always duplicate so the caller's free
+    // contract is uniform.
+    return allocator.dupe(u8, borrowed);
+}
+
+/// Internal variant of `typeIdMangledName` that returns the borrowed
+/// slice when the result is a static name (primitives, bare nominal
+/// types) and a freshly-allocated slice when the result is composed
+/// (`.applied`). The caller cannot in general tell which case it
+/// received, so the public `typeIdMangledName` always copies — this
+/// helper exists for the internal recursive arm where the composed
+/// case appends into a buffer (no copy needed).
+fn typeIdMangledNameBorrowed(
+    allocator: std.mem.Allocator,
+    store: *const TypeStore,
+    type_id: TypeId,
+) std.mem.Allocator.Error![]const u8 {
+    const typ = store.getType(type_id);
+    return switch (typ) {
+        .int => |it| switch (it.bits) {
+            8 => if (it.signedness == .signed) @as([]const u8, "i8") else @as([]const u8, "u8"),
+            16 => if (it.signedness == .signed) @as([]const u8, "i16") else @as([]const u8, "u16"),
+            32 => if (it.signedness == .signed) @as([]const u8, "i32") else @as([]const u8, "u32"),
+            64 => if (it.signedness == .signed) @as([]const u8, "i64") else @as([]const u8, "u64"),
+            128 => if (it.signedness == .signed) @as([]const u8, "i128") else @as([]const u8, "u128"),
+            else => @as([]const u8, "int"),
+        },
+        .float => |ft| switch (ft.bits) {
+            16 => @as([]const u8, "f16"),
+            32 => @as([]const u8, "f32"),
+            64 => @as([]const u8, "f64"),
+            80 => @as([]const u8, "f80"),
+            128 => @as([]const u8, "f128"),
+            else => @as([]const u8, "float"),
+        },
+        .bool_type => @as([]const u8, "Bool"),
+        .string_type => @as([]const u8, "String"),
+        .atom_type => @as([]const u8, "Atom"),
+        .nil_type => @as([]const u8, "Nil"),
+        .never => @as([]const u8, "Never"),
+        .term_type => @as([]const u8, "Term"),
+        .list => @as([]const u8, "List"),
+        .map => @as([]const u8, "Map"),
+        .tuple => @as([]const u8, "Tuple"),
+        .function => @as([]const u8, "Fn"),
+        .unknown => @as([]const u8, "Any"),
+        .error_type => @as([]const u8, "Error"),
+        .struct_type => |st| @constCast(store).interner.get(st.name),
+        .tagged_union => |tu| @constCast(store).interner.get(tu.name),
+        .opaque_type => |ot| @constCast(store).interner.get(ot.name),
+        .applied => |ap| blk: {
+            // Compose `<Base>_<Arg0>_<Arg1>...` so two distinct
+            // instantiations of the same parametric base produce
+            // distinct names. Nested parametrics flatten the same
+            // way: `Box(Box(i64))` -> `Box_Box_i64`.
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            const base_name = try typeIdMangledNameBorrowed(allocator, store, ap.base);
+            try buf.appendSlice(allocator, base_name);
+            for (ap.args) |arg| {
+                try buf.append(allocator, '_');
+                const arg_name = try typeIdMangledNameBorrowed(allocator, store, arg);
+                try buf.appendSlice(allocator, arg_name);
+            }
+            break :blk try buf.toOwnedSlice(allocator);
+        },
+        else => @as([]const u8, "T"),
+    };
+}
+
 // ============================================================
 // Type checker
 // ============================================================
@@ -6442,6 +6540,73 @@ test "type store resolve builtin names" {
     try std.testing.expectEqual(TypeStore.BOOL, store.resolveTypeName("Bool").?);
     try std.testing.expectEqual(TypeStore.STRING, store.resolveTypeName("String").?);
     try std.testing.expect(store.resolveTypeName("Nonexistent") == null);
+}
+
+test "typeIdMangledName composes applied parametric struct names" {
+    // Two distinct instantiations of `Box(T)` must produce two
+    // distinct mangled names. Per-instantiation IR/ZIR struct
+    // emission keys off the mangled name, so a collapsed mangler
+    // would silently make `Box(i64)` and `Box(String)` share one
+    // runtime type.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const box_name = try interner.intern("Box");
+    const pair_name = try interner.intern("Pair");
+
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const box_decl = try store.addType(.{ .struct_type = .{
+        .name = box_name,
+        .fields = &.{},
+        .type_params = &.{},
+    } });
+    const pair_decl = try store.addType(.{ .struct_type = .{
+        .name = pair_name,
+        .fields = &.{},
+        .type_params = &.{},
+    } });
+
+    const box_i64_args = try alloc.alloc(TypeId, 1);
+    box_i64_args[0] = TypeStore.I64;
+    const box_i64 = try store.addType(.{ .applied = .{ .base = box_decl, .args = box_i64_args } });
+
+    const box_string_args = try alloc.alloc(TypeId, 1);
+    box_string_args[0] = TypeStore.STRING;
+    const box_string = try store.addType(.{ .applied = .{ .base = box_decl, .args = box_string_args } });
+
+    const pair_args = try alloc.alloc(TypeId, 2);
+    pair_args[0] = TypeStore.I64;
+    pair_args[1] = TypeStore.STRING;
+    const pair_i64_string = try store.addType(.{ .applied = .{ .base = pair_decl, .args = pair_args } });
+
+    const nested_outer_args = try alloc.alloc(TypeId, 1);
+    nested_outer_args[0] = box_i64;
+    const box_box_i64 = try store.addType(.{ .applied = .{ .base = box_decl, .args = nested_outer_args } });
+
+    const box_i64_name = try typeIdMangledName(alloc, &store, box_i64);
+    try std.testing.expectEqualStrings("Box_i64", box_i64_name);
+
+    const box_string_name = try typeIdMangledName(alloc, &store, box_string);
+    try std.testing.expectEqualStrings("Box_String", box_string_name);
+
+    const pair_name_str = try typeIdMangledName(alloc, &store, pair_i64_string);
+    try std.testing.expectEqualStrings("Pair_i64_String", pair_name_str);
+
+    const nested_name = try typeIdMangledName(alloc, &store, box_box_i64);
+    try std.testing.expectEqualStrings("Box_Box_i64", nested_name);
+
+    // Primitives and bare nominal types pass through unchanged.
+    const i64_name = try typeIdMangledName(alloc, &store, TypeStore.I64);
+    try std.testing.expectEqualStrings("i64", i64_name);
+    const string_name = try typeIdMangledName(alloc, &store, TypeStore.STRING);
+    try std.testing.expectEqualStrings("String", string_name);
+    const box_decl_name = try typeIdMangledName(alloc, &store, box_decl);
+    try std.testing.expectEqualStrings("Box", box_decl_name);
 }
 
 test "type store represents numeric lists structurally" {

@@ -2210,75 +2210,18 @@ test "typeIdToMangledName encodes applied parametric types" {
 }
 
 /// Convert a TypeId to a short mangled name for function
-/// specialization. Returns a borrowed slice for primitives and bare
-/// nominal types; allocates a fresh string from `store.allocator`
-/// for `.applied { base, args }` so two distinct instantiations of
-/// the same parametric struct/union get distinct mangled
-/// function-specialization names (`Box(i64) → Box_i64`, `Box(String)
-/// → Box_String`). Without the allocating arm an `else => "T"`
-/// fall-through would collapse every parametric instantiation onto
-/// the same key and the second specialization would silently
-/// overwrite the first. The allocated buffer is appended (and
-/// therefore copied) into the calling mangler's output string, so
-/// the caller owns no live reference after it returns.
+/// specialization. Delegates to the canonical `types.typeIdMangledName`
+/// so the monomorphizer's specialization keys and the IR/ZIR
+/// per-instantiation struct/union names stay in lockstep.
+///
+/// The borrowed-string API is preserved for legacy call sites that
+/// embed the result into a longer composed name (`Demo_unbox__i64`):
+/// each invocation produces a fresh allocation from
+/// `store.allocator`, but the caller appends it into its own
+/// `ArrayList` and never observes the raw pointer afterwards. The
+/// returned slice therefore aliases freshly-allocated memory that
+/// outlives the immediate `appendSlice` call but is otherwise
+/// abandoned — same lifetime contract as before.
 fn typeIdToMangledName(store: *const TypeStore, type_id: TypeId) []const u8 {
-    return typeIdToMangledNameAlloc(@constCast(store).allocator, store, type_id) catch "T";
-}
-
-/// Allocation-capable mangled-name builder: needed for `.applied`
-/// where the result string is composed (`Box_i64`) and therefore
-/// can't be returned as a borrowed pointer to an existing buffer.
-/// Primitive/nominal cases still return interned static strings; only
-/// `.applied` actually allocates. Callers that do not need the
-/// composed shape go through the borrowed `typeIdToMangledName`.
-fn typeIdToMangledNameAlloc(
-    allocator: Allocator,
-    store: *const TypeStore,
-    type_id: TypeId,
-) Allocator.Error![]const u8 {
-    const typ = store.getType(type_id);
-    return switch (typ) {
-        .int => |it| switch (it.bits) {
-            8 => if (it.signedness == .signed) "i8" else "u8",
-            16 => if (it.signedness == .signed) "i16" else "u16",
-            32 => if (it.signedness == .signed) "i32" else "u32",
-            64 => if (it.signedness == .signed) "i64" else "u64",
-            else => "int",
-        },
-        .float => |ft| switch (ft.bits) {
-            16 => "f16",
-            32 => "f32",
-            64 => "f64",
-            else => "float",
-        },
-        .bool_type => "Bool",
-        .string_type => "String",
-        .atom_type => "Atom",
-        .nil_type => "Nil",
-        .list => "List",
-        .map => "Map",
-        .tuple => "Tuple",
-        .function => "Fn",
-        .unknown => "Any",
-        .struct_type => |st| @constCast(store).interner.get(st.name),
-        .tagged_union => |tu| @constCast(store).interner.get(tu.name),
-        .applied => |ap| blk: {
-            // Recursively mangle the base + each arg so a parametric
-            // instantiation like `Box(i64)` becomes `Box_i64` and
-            // `Pair(i64, String)` becomes `Pair_i64_String`. Nested
-            // parametrics (`Box(Box(i64))`) flatten the same way so
-            // the result remains unambiguous across siblings.
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
-            errdefer buf.deinit(allocator);
-            const base_name = try typeIdToMangledNameAlloc(allocator, store, ap.base);
-            try buf.appendSlice(allocator, base_name);
-            for (ap.args) |arg| {
-                try buf.append(allocator, '_');
-                const arg_name = try typeIdToMangledNameAlloc(allocator, store, arg);
-                try buf.appendSlice(allocator, arg_name);
-            }
-            break :blk try buf.toOwnedSlice(allocator);
-        },
-        else => "T",
-    };
+    return types_mod.typeIdMangledName(@constCast(store).allocator, store, type_id) catch "T";
 }
