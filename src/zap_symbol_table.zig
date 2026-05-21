@@ -506,6 +506,57 @@ test "Builder.encode + Reader.init round-trip a small table" {
     try std.testing.expect(reader.findByZap("Missing", "fn", 0) == null);
 }
 
+test "Builder round-trips monomorphized parametric function names" {
+    // The monomorphizer produces specialization names like
+    // `Demo_unbox__i64` and `Demo_unbox__String` (one per concrete
+    // parametric instantiation). Each lands in the symbol-table as a
+    // distinct entry whose mangled name carries the per-instantiation
+    // suffix and whose Zap-local name reconstructs the source
+    // function (`unbox`) plus the original arity. The sidecar must
+    // round-trip every distinct specialization — collapsing them
+    // would erase the per-instantiation provenance the Phase-2 crash
+    // printer needs to render `Demo.unbox/1 (i64)` vs
+    // `Demo.unbox/1 (String)`.
+    var builder = Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    try builder.record("Demo.unbox__i64", "Demo", "unbox", 1);
+    try builder.record("Demo.unbox__String", "Demo", "unbox", 1);
+    try builder.record("Demo.use_int__0", "Demo", "use_int", 0);
+    try builder.record("Demo.use_str__0", "Demo", "use_str", 0);
+
+    const blob = try builder.encode();
+    defer std.testing.allocator.free(blob);
+
+    const reader = try Reader.init(blob);
+    try std.testing.expectEqual(@as(u32, 4), reader.entry_count);
+
+    // Both specializations of `unbox` are independently recoverable
+    // by their mangled per-instantiation name.
+    const i64_view = reader.findByMangled("Demo.unbox__i64") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Demo", i64_view.zap_struct.?);
+    try std.testing.expectEqualStrings("unbox", i64_view.zap_local);
+    try std.testing.expectEqual(@as(u32, 1), i64_view.zap_arity);
+
+    const str_view = reader.findByMangled("Demo.unbox__String") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Demo", str_view.zap_struct.?);
+    try std.testing.expectEqualStrings("unbox", str_view.zap_local);
+    try std.testing.expectEqual(@as(u32, 1), str_view.zap_arity);
+
+    // The Phase-2 printer's reverse lookup by Zap-qualified name +
+    // arity returns the FIRST matching specialization. That's
+    // expected (linear-scan semantics) — callers that need to find
+    // ALL specializations iterate `reader.entry(i)` directly.
+    const first = reader.findByZap("Demo", "unbox", 1) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(
+        std.mem.eql(u8, first.mangled, "Demo.unbox__i64") or
+            std.mem.eql(u8, first.mangled, "Demo.unbox__String"),
+    );
+}
+
 test "Builder.encode emits entries sorted by mangled name" {
     var builder = Builder.init(std.testing.allocator);
     defer builder.deinit();

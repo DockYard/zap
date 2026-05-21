@@ -1738,6 +1738,97 @@ test "ZIR: catch basin ~> function handler with extra args" {
 // Struct literals
 // ============================================================
 
+test "ZIR: parametric struct emits distinct per-instantiation types" {
+    // End-to-end check that the IR's per-instantiation TypeDef
+    // emission flows through ZIR correctly. Two literals
+    // `%Box(i64){...}` and `%Box(String){...}` must compile against
+    // distinct per-instantiation ZIR struct types (`Box_i64` and
+    // `Box_String`); reading `.value` from each must return values
+    // of the right concrete shape (i64 prints as a digit, String
+    // prints as itself).
+    var result = try compileAndRun(
+        \\pub struct Box(t) {
+        \\  value :: t
+        \\}
+        \\pub struct TestProg {
+        \\  pub fn read_int(b :: Box(i64)) -> i64 {
+        \\    b.value
+        \\  }
+        \\  pub fn read_str(b :: Box(String)) -> String {
+        \\    b.value
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    Kernel.inspect(read_int(%Box(i64){value: 42}))
+        \\    IO.puts(read_str(%Box(String){value: "ok"}))
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\nok\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: parametric struct with two type parameters" {
+    // Pair(a, b) instantiated as Pair(i64, String) emits a
+    // Pair_i64_String ZIR struct type. Field accesses on each
+    // declared field return the substituted-type value, exercising
+    // both formal slots through to ZIR.
+    var result = try compileAndRun(
+        \\pub struct Pair(a, b) {
+        \\  left :: a
+        \\  right :: b
+        \\}
+        \\pub struct TestProg {
+        \\  pub fn build() -> Pair(i64, String) {
+        \\    %Pair(i64, String){left: 7, right: "hi"}
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    p = build()
+        \\    Kernel.inspect(p.left)
+        \\    IO.puts(p.right)
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("7\nhi\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: parametric struct supports inferred return-type instantiation" {
+    // `make()` is declared to return `Box(i64)`. The body's
+    // `%Box{value: 42}` literal omits the explicit type-arg list and
+    // relies on the HIR's context-driven inference (1.1.5.c) to
+    // resolve to `Box(i64)`. The IR/ZIR layer must accept that the
+    // inferred instantiation produces a distinct per-instantiation
+    // type from a separately-written `Box(String)` instantiation.
+    var result = try compileAndRun(
+        \\pub struct Box(t) {
+        \\  value :: t
+        \\}
+        \\pub struct TestProg {
+        \\  pub fn make_int() -> Box(i64) {
+        \\    %Box{value: 99}
+        \\  }
+        \\  pub fn make_str() -> Box(String) {
+        \\    %Box{value: "yep"}
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    Kernel.inspect(make_int().value)
+        \\    IO.puts(make_str().value)
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("99\nyep\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR: struct literal field access" {
     var result = try compileAndRun(
         \\pub struct TestProg {
