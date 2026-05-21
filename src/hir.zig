@@ -3773,6 +3773,19 @@ pub const HirBuilder = struct {
         return null;
     }
 
+    /// Index of the last `.expr` statement in an AST statement
+    /// sequence — i.e. the statement whose value flows out as the
+    /// block's result. Returns null when no `.expr` is present (block
+    /// is purely assignments / function decls).
+    fn lastExprStmtIndex(stmts: []const ast.Stmt) ?usize {
+        var index = stmts.len;
+        while (index > 0) {
+            index -= 1;
+            if (stmts[index] == .expr) return index;
+        }
+        return null;
+    }
+
     /// Check if a HIR block contains a call to raise() or a ! function.
     fn bodyContainsRaise(self: *const HirBuilder, block: *const Block) bool {
         for (block.stmts) |stmt| {
@@ -4126,9 +4139,13 @@ pub const HirBuilder = struct {
             break :blk rexpr;
         } else null;
 
-        // Build body block (empty for bodyless declarations: protocol sigs, forward decls)
+        // Build body block (empty for bodyless declarations: protocol sigs, forward decls).
+        // When the clause has an explicit return type, feed it as the
+        // *expected tail type* so a parametric struct/union literal at
+        // the tail can inherit the function's declared instantiation
+        // (`pub fn build() -> Box(i64) { %Box{value: 42} }`).
         const body = if (clause.body) |body_stmts|
-            try self.buildBlock(body_stmts)
+            try self.buildBlockWithExpectedTail(body_stmts, return_type)
         else
             try self.buildBlock(&.{});
 
@@ -4317,6 +4334,23 @@ pub const HirBuilder = struct {
     // ============================================================
 
     fn buildBlock(self: *HirBuilder, stmts: []const ast.Stmt) anyerror!*const Block {
+        return self.buildBlockWithExpectedTail(stmts, types_mod.TypeStore.UNKNOWN);
+    }
+
+    /// Lower a statement block while threading an *expected tail
+    /// type* into the lowering of the final `.expr` statement. Used
+    /// to feed function-return-type context (or other surrounding
+    /// expected-type context) into a parametric struct/union literal
+    /// at the tail position so context-driven `.applied` inference
+    /// can fire even when the user omitted explicit `(...)` at the
+    /// literal. Statements other than the last `.expr` are lowered
+    /// with no expected-type pressure — matching the surface-syntax
+    /// expectation that only the tail flows out of the block.
+    fn buildBlockWithExpectedTail(
+        self: *HirBuilder,
+        stmts: []const ast.Stmt,
+        expected_tail_type: types_mod.TypeId,
+    ) anyerror!*const Block {
         var hir_stmts: std.ArrayList(Stmt) = .empty;
         // Inherit outer bindings so variables from enclosing scopes are
         // visible inside block expressions (e.g., macro-expanded quote blocks).
@@ -4337,9 +4371,21 @@ pub const HirBuilder = struct {
             }
         }
 
-        for (stmts) |stmt| {
+        // Index of the final `.expr` statement (the one whose value
+        // flows out as the block's result) so we can push the
+        // expected tail type only around that one statement.
+        const tail_expr_index = lastExprStmtIndex(stmts);
+
+        for (stmts, 0..) |stmt, stmt_index| {
             switch (stmt) {
                 .expr => |expr| {
+                    const apply_expected = tail_expr_index != null and
+                        stmt_index == tail_expr_index.? and
+                        expected_tail_type != types_mod.TypeStore.UNKNOWN;
+                    if (apply_expected) try self.expected_type_stack.append(self.allocator, expected_tail_type);
+                    defer if (apply_expected) {
+                        _ = self.expected_type_stack.pop();
+                    };
                     const hir_expr = try self.buildExpr(expr);
                     try hir_stmts.append(self.allocator, .{ .expr = hir_expr });
                 },
@@ -5684,7 +5730,33 @@ pub const HirBuilder = struct {
                 // Then check user-defined types (struct/enum) from scope graph
                 if (self.graph.resolveTypeByName(n.name)) |scope_type_id| {
                     // Resolve scope TypeId to TypeStore TypeId via name_to_type map
-                    if (self.type_store.name_to_type.get(n.name)) |ts_id| return ts_id;
+                    if (self.type_store.name_to_type.get(n.name)) |ts_id| {
+                        // Parametric user types in type position: build
+                        // the canonical `.applied { base, args }` form
+                        // so monomorphization sees `Box(i64)` rather
+                        // than the bare `Box` declaration. Without this
+                        // path, an annotation like `pub fn build() ->
+                        // Box(i64)` would lower as the declaration
+                        // TypeId, hiding the instantiation from
+                        // context-driven inference at struct literal
+                        // sites.
+                        if (n.args.len > 0) {
+                            const stored_typ = self.type_store.getType(ts_id);
+                            const is_parametric_nominal = (stored_typ == .struct_type and stored_typ.struct_type.type_params.len > 0) or
+                                (stored_typ == .tagged_union and stored_typ.tagged_union.type_params.len > 0);
+                            if (is_parametric_nominal) {
+                                const resolved_args = self.allocator.alloc(types_mod.TypeId, n.args.len) catch return ts_id;
+                                for (n.args, 0..) |arg, idx| {
+                                    resolved_args[idx] = self.resolveTypeExpr(arg);
+                                }
+                                return store_ptr.addType(.{ .applied = .{
+                                    .base = ts_id,
+                                    .args = resolved_args,
+                                } }) catch ts_id;
+                            }
+                        }
+                        return ts_id;
+                    }
                     // If not in TypeStore yet, it may be a forward reference
                     _ = scope_type_id;
                 }
@@ -7536,6 +7608,50 @@ test "HIR threads distinct applied TypeIds for two instantiations of the same st
     try std.testing.expect(int_typ == .applied);
     try std.testing.expect(str_typ == .applied);
     try std.testing.expectEqual(int_typ.applied.base, str_typ.applied.base);
+}
+
+test "HIR infers applied TypeId for %Box{...} from function return type" {
+    // `pub fn build() -> Box(i64) { %Box{value: 42} }` — the function
+    // return-type annotation provides the expected `.applied` so the
+    // tail expression's literal adopts the same instantiation.
+    const source =
+        \\pub struct Box(T) {
+        \\  value :: T
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Box(i64) {
+        \\    %Box{value: 42}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const demo_struct = hir_program.structs[1];
+    const build_clause = demo_struct.functions[0].clauses[0];
+    const result_expr = build_clause.body.stmts[0].expr;
+    try std.testing.expect(result_expr.kind == .struct_init);
+    const typ = checker.store.getType(result_expr.type_id);
+    try std.testing.expect(typ == .applied);
+    try std.testing.expectEqual(types_mod.TypeStore.I64, typ.applied.args[0]);
 }
 
 test "HIR keeps declaration TypeId for concrete (non-parametric) struct literals" {
