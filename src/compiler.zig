@@ -10694,6 +10694,30 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
         },
         .struct_expr => |*se| {
             try remapStructName(alloc, &se.struct_name, remap);
+            // Explicit type arguments at the literal (e.g. `i64` in
+            // `%Box(i64){...}`) carry TypeExpr nodes whose interner
+            // StringIds come from the unit's LOCAL interner. Without
+            // remapping them alongside the rest of the expression, the
+            // type-checker's `resolveTypeExpr` looks them up against
+            // the global interner and either returns UNKNOWN (silent
+            // failure: the substitution map binds the formal type-var
+            // to UNKNOWN, then `field expects {type_var}` fires) or
+            // resolves to an unrelated symbol that happens to share the
+            // stale local id. Both are the script-mode parametric
+            // struct gap surfaced by `pub struct Box(T) { value :: T }`
+            // + `%Box(i64){value: 42}`. Mirror the `struct_ref.type_args`
+            // remap at lines ~10616 above so the same gap closes on the
+            // struct-literal surface too.
+            if (se.type_args.len > 0) {
+                const mutable_args = try alloc.alloc(*const ast.TypeExpr, se.type_args.len);
+                for (se.type_args, 0..) |arg, i| {
+                    const mutable = try alloc.create(ast.TypeExpr);
+                    mutable.* = arg.*;
+                    try remapTypeExpr(alloc, mutable, remap);
+                    mutable_args[i] = mutable;
+                }
+                se.type_args = mutable_args;
+            }
             if (se.update_source) |us| {
                 const mutable = try alloc.create(ast.Expr);
                 mutable.* = us.*;

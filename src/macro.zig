@@ -315,6 +315,17 @@ pub const MacroEngine = struct {
                 .meta = mod.meta,
                 .name = mod.name,
                 .parent = mod.parent,
+                // `type_params` MUST flow through — the macro engine
+                // rewrites struct items (function bodies, nested decls),
+                // not the parametric type-parameter header. Dropping
+                // `type_params` here turns `pub struct Box(T) { ... }`
+                // into a concrete non-parametric struct AFTER macro
+                // expansion: every `T` reference inside the body then
+                // fails to resolve at type-check time with the
+                // diagnostic "I cannot find a type named T". Mirrors
+                // the parallel fix in `desugarStruct` — both passes are
+                // structural rewriters, not metadata strippers.
+                .type_params = mod.type_params,
                 .items = try new_items.toOwnedSlice(self.allocator),
                 .fields = mod.fields,
                 .is_private = mod.is_private,
