@@ -430,6 +430,15 @@ fn appendZigTypeForVTable(
         .string, .atom => try buf.appendSlice(allocator, "[]const u8"),
         .nil => try buf.appendSlice(allocator, "?void"),
         .term => try buf.appendSlice(allocator, "zap_runtime.Term"),
+        // Protocol existential — the runtime fat-pointer carrier.
+        // Phase 1.2.5.b lowers every `protocol_constraint` TypeId
+        // through `typeIdToZigTypeWithStore` to this `.protocol_box`
+        // shape; the ZIR backend renders it as the runtime
+        // `ProtocolBox` extern struct regardless of which protocol
+        // the box is statically typed as (the dispatch-time cast to
+        // a concrete `<Protocol>VTable` is the consumption-site
+        // concern, handled by Phase 1.2.5.d).
+        .protocol_box => try buf.appendSlice(allocator, "zap_runtime.ProtocolBox"),
         .struct_ref => |name| {
             // The file-IS-the-struct emission lets us reach a
             // nominal type by importing its name. Phase 1.2.5.a
@@ -1161,6 +1170,7 @@ pub const ZirDriver = struct {
             .tuple => self.mapTupleElementType(zig_type),
             .struct_ref => |name| return try self.emitStructTypeRef(name),
             .term => return try self.emitTermTypeRef(),
+            .protocol_box => return try self.emitProtocolBoxTypeRef(),
             .optional => |inner| {
                 // `?T` — emit T's ref, then wrap in optional. Used by
                 // the recursive-struct storage strategy to lower a
@@ -2992,6 +3002,23 @@ pub const ZirDriver = struct {
         return term_ref;
     }
 
+    /// Emit a reference to the runtime `ProtocolBox` fat-pointer
+    /// carrier (defined in `src/runtime.zig`). Resolves to
+    /// `@import("zap_runtime").ProtocolBox`. Phase 1.2.5.b lowers
+    /// every `ZigType.protocol_box` shape — struct fields, union
+    /// variant payloads, function parameters, return types — through
+    /// this helper so the underlying ZIR carries the right concrete
+    /// type identity regardless of which protocol's existential is
+    /// being typed. The dispatch-time vtable cast belongs to Phase
+    /// 1.2.5.d's consumption-site lowering, not the type plumbing.
+    fn emitProtocolBoxTypeRef(self: *ZirDriver) BuildError!u32 {
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+        const box_ref = zir_builder_emit_field_val(self.handle, rt_import, "ProtocolBox", 11);
+        if (box_ref == error_ref) return error.EmitFailed;
+        return box_ref;
+    }
+
     /// Emit `runtime.Term.from(value_ref)` — wraps a concrete value as
     /// a `Term`. Used by collection construction sites whose element
     /// type was promoted to `Term` because the static element types
@@ -3893,13 +3920,21 @@ pub const ZirDriver = struct {
                     return error.EmitFailed;
                 self.current_ret_type = 1;
             },
-            .function, .tagged_union, .ptr, .any, .term => {
+            .function, .tagged_union, .ptr, .any, .term, .protocol_box => {
                 // These types are structural and created anonymously in the
                 // body. Zig infers the return type from the body construction.
                 // `.term` falls into this bucket because the runtime type
                 // (`zap_runtime.Term`) is resolved by the body — declaring
                 // it explicitly here would require eagerly emitting the
                 // import path, which is unnecessary for inference.
+                //
+                // `.protocol_box` joins the same bucket for Phase 1.2.5.b
+                // — the body produces a `zap_runtime.ProtocolBox` value
+                // (via the construction-site lowering that Phase 1.2.5.c
+                // will land) and Sema infers the return type from that
+                // expression. Eagerly emitting the import path here
+                // would clutter every protocol-returning function's
+                // ret-ty body without changing the resolved identity.
                 if (zir_builder_set_generic_return_type(self.handle) != 0)
                     return error.EmitFailed;
                 self.current_ret_type = 1;

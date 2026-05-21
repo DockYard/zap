@@ -377,6 +377,7 @@ fn cloneZigType(allocator: std.mem.Allocator, value: ZigType) CloneError!ZigType
         .tagged_union => |name| .{ .tagged_union = try cloneBytes(allocator, name) },
         .optional => |item| .{ .optional = try cloneZigTypePtr(allocator, item) },
         .ptr => |item| .{ .ptr = try cloneZigTypePtr(allocator, item) },
+        .protocol_box => |name| .{ .protocol_box = try cloneBytes(allocator, name) },
         else => value,
     };
 }
@@ -2193,6 +2194,20 @@ pub const ZigType = union(enum) {
     tagged_union: []const u8,
     optional: *const ZigType,
     ptr: *const ZigType,
+    /// Protocol existential — a `runtime.ProtocolBox` fat pointer
+    /// carrying an opaque inner-value pointer plus a per-impl vtable
+    /// pointer. Payload is the protocol's bare name (e.g. `"Error"`
+    /// for the Phase 1.2 `Error` protocol), which the ZIR backend
+    /// uses to look up the corresponding `<Protocol>VTable` type when
+    /// emitting consumption-site dispatch. The Zig source rendering
+    /// for this variant is always `zap_runtime.ProtocolBox` (the
+    /// runtime carrier type defined in `src/runtime.zig`).
+    ///
+    /// Phase 1.2.5.b plumbs this variant through every layer that
+    /// touches `protocol_constraint` TypeIds; Phases 1.2.5.c and
+    /// 1.2.5.d add construction-site auto-boxing and consumption-
+    /// site dispatch that actually populate / read the box.
+    protocol_box: []const u8,
     never, // noreturn — function that never returns (e.g., raise)
     any, // for generics
 
@@ -2773,7 +2788,7 @@ pub const IrBuilder = struct {
         const store_const = self.type_store orelse return self.callTargetReturnType(target, args.len);
         const clause = self.callTargetClause(target, args.len, args) orelse return null;
         const return_type = clause.return_type;
-        if (!containsTypeVarInStore(store_const, return_type)) return return_type;
+        if (!containsUnresolvedTypeVarForSpecialization(store_const, return_type)) return return_type;
 
         var substitutions = types_mod.SubstitutionMap.init(self.allocator);
         defer substitutions.deinit();
@@ -2895,7 +2910,7 @@ pub const IrBuilder = struct {
     fn usableContextType(self: *const IrBuilder, type_id: types_mod.TypeId) ?types_mod.TypeId {
         if (type_id == types_mod.TypeStore.UNKNOWN or type_id == types_mod.TypeStore.ERROR) return null;
         if (self.type_store) |store| {
-            if (containsTypeVarInStore(store, type_id)) return null;
+            if (containsUnresolvedTypeVarForSpecialization(store, type_id)) return null;
         }
         const resolved = typeIdToZigTypeWithStore(type_id, self.type_store);
         if (resolved == .any) return null;
@@ -2908,7 +2923,7 @@ pub const IrBuilder = struct {
         const fallback_resolved = typeIdToZigTypeWithStore(fallback, self.type_store);
         if (fallback_resolved == .any) return true;
         if (self.type_store) |store| {
-            if (containsTypeVarInStore(store, fallback)) return true;
+            if (containsUnresolvedTypeVarForSpecialization(store, fallback)) return true;
         }
         return false;
     }
@@ -4283,7 +4298,8 @@ pub const IrBuilder = struct {
             // Anything routed through Zig's by-ref ABI is unsafe for
             // `musttail`. Strings (slices), structs, tuples, lists,
             // maps, tagged unions, optionals, term, function values,
-            // and `any` all fall here.
+            // and `any` all fall here. `protocol_box` is also by-ref
+            // — `runtime.ProtocolBox` is a 16-byte extern struct.
             .string,
             .struct_ref,
             .tuple,
@@ -4294,6 +4310,7 @@ pub const IrBuilder = struct {
             .optional,
             .term,
             .any,
+            .protocol_box,
             => false,
         };
     }
@@ -7694,7 +7711,7 @@ pub const IrBuilder = struct {
             // for them would either alias a concrete instantiation
             // (silent name collision) or carry type_var-shaped fields
             // (illegal at the ZIR layer).
-            if (containsTypeVarInStore(store, @intCast(candidate_index))) continue;
+            if (containsUnresolvedTypeVarForSpecialization(store, @intCast(candidate_index))) continue;
 
             // The applied base must resolve to a nominal struct /
             // tagged_union. Anything else is a malformed applied
@@ -7739,34 +7756,38 @@ pub const IrBuilder = struct {
         }
     }
 
-    /// Phase 1.2.5.a step 3.7: emit a `protocol_vtable_def` TypeDef
-    /// for every `pub protocol` reachable from the program, and a
-    /// `protocol_vtable_instance_def` for every `pub impl` whose
-    /// target is a concrete struct. The ZIR backend's step 3.7
-    /// lowers each entry into a synthetic Zig source file:
+    /// Phase 1.2.5.a step 3.7 + Phase 1.2.5.b extensions: emit a
+    /// `protocol_vtable_def` TypeDef for every `pub protocol`
+    /// reachable from the program, and a
+    /// `protocol_vtable_instance_def` for every `pub impl`. The ZIR
+    /// backend's step 3.7 lowers each entry into a synthetic Zig
+    /// source file:
     ///
     ///   - `<Protocol>VTable` — the protocol's vtable struct type,
     ///     one field per method (function pointer with receiver erased
     ///     to `?*anyopaque`).
     ///   - `<Protocol>VTable_for_<Target>` — one constant per impl,
     ///     populated with `.method = &<Target>__<method>__<arity>`
-    ///     pointers.
+    ///     pointers. For a *parametric* impl `impl Foo for Bar(t)`,
+    ///     the populator emits one instance per applied specialization
+    ///     `.applied { Bar, [<args>] }` discovered through
+    ///     `applied_specializations`, using the mangled per-
+    ///     instantiation name (`Bar_i64`) as the target suffix. The
+    ///     dispatch-side `findMonomorphizedImplFor` then resolves the
+    ///     logical `<MangledTarget>__<method>__<arity>` slot name to
+    ///     the monomorphized symbol.
     ///
     /// Silently no-ops when `scope_graph` is null — the IR builder is
     /// used by unrelated unit tests that don't construct the full
     /// collect pipeline; those tests must still build a coherent
     /// `Program` without protocol surfaces.
     ///
-    /// Phase 1.2.5.a scope:
-    ///   - Concrete-target impls only. Parametric impls (`impl Foo for
-    ///     List(T)`) need per-`.applied`-instantiation vtables, which
-    ///     join the populator in Phase 1.2.5.b once
-    ///     `protocol_constraint` becomes first-class in the type store.
-    ///   - Skips protocols with parametric type parameters
-    ///     (`pub protocol Foo(T) { ... }`) for the same reason — until
-    ///     1.2.5.b plumbs the substitution, the vtable shape would
-    ///     carry type-variable-shaped fields that the ZIR backend
-    ///     cannot lower.
+    /// Phase 1.2.5.b lifts the parametric-impl guard from 1.2.5.a's
+    /// initial cut. Parametric *protocols* (`pub protocol Foo(t)
+    /// { ... }`) still defer — the vtable shape itself needs a
+    /// per-instantiation substitution before emission, which is a
+    /// downstream upgrade beyond the runtime existential boxing this
+    /// phase enables.
     fn populateProtocolVTables(
         self: *IrBuilder,
         type_defs: *std.ArrayList(TypeDef),
@@ -7780,7 +7801,9 @@ pub const IrBuilder = struct {
         // receiver erased to `?*anyopaque` (the dispatch site only
         // has the box's `data_ptr`, not the concrete receiver type).
         for (graph.protocols.items) |proto_entry| {
-            // Phase 1.2.5.a defers parametric protocols.
+            // Phase 1.2.5.b still defers parametric protocols — the
+            // vtable shape would need to be re-instantiated per
+            // protocol argument set, which is a separate upgrade.
             if (proto_entry.decl.type_params.len != 0) continue;
 
             const protocol_name = self.protocolNameToString(proto_entry.name);
@@ -7827,9 +7850,23 @@ pub const IrBuilder = struct {
         // Walk every `ImplEntry` and emit a
         // `protocol_vtable_instance_def` TypeDef whose
         // method-pointer entries name the impl's monomorphized
-        // function symbols. Target must be a concrete struct (no
-        // applied parametric forms in 1.2.5.a — those land in
-        // 1.2.5.b together with per-`.applied` vtable enumeration).
+        // function symbols.
+        //
+        // The target naming branches on whether the impl is
+        // parametric:
+        //
+        //   - Concrete target (`impl Foo for Bar`): one instance per
+        //     impl, named `FooVTable_for_Bar` with target_name
+        //     `"Bar"` directly from the impl's `target_type`.
+        //   - Parametric target (`impl Foo for Bar(t)`): one instance
+        //     per applied specialization `.applied { Bar, [<args>] }`
+        //     visible in `applied_specializations`. Each instance is
+        //     named `FooVTable_for_<MangledTarget>` (e.g.
+        //     `FooVTable_for_Bar_i64`) and the method-pointer slots
+        //     carry the *logical* `<MangledTarget>__<method>__<arity>`
+        //     address — `findMonomorphizedImplFor` resolves that
+        //     logical address to the actual monomorphized symbol at
+        //     dispatch lowering time.
         for (graph.impls.items) |impl_entry| {
             // Locate the protocol entry to read the method
             // signatures in declaration order. Construction-time
@@ -7838,59 +7875,118 @@ pub const IrBuilder = struct {
             // methods in a different order still produces a correctly
             // aligned vtable.
             const proto_entry = graph.findProtocol(impl_entry.protocol_name) orelse continue;
-            // Skip parametric protocols (1.2.5.a defers).
+            // Parametric protocols are still deferred (see header).
             if (proto_entry.decl.type_params.len != 0) continue;
-            // Skip impls with their own type parameters (parametric
-            // target — 1.2.5.b territory).
-            if (impl_entry.decl.type_params.len != 0) continue;
 
             const protocol_name = self.protocolNameToString(proto_entry.name);
-            const target_name = self.protocolNameToString(impl_entry.target_type);
+            const declared_target_name = self.protocolNameToString(impl_entry.target_type);
 
-            const instance_type_name = try std.fmt.allocPrint(
-                self.allocator,
-                "{s}VTable_for_{s}",
-                .{ protocol_name, target_name },
-            );
-
-            const methods = try self.allocator.alloc(
-                ProtocolVTableInstanceMethod,
-                proto_entry.decl.functions.len,
-            );
-            for (proto_entry.decl.functions, 0..) |proto_fn_sig, method_index| {
-                const method_name = self.interner.get(proto_fn_sig.name);
-                const arity: u32 = @intCast(proto_fn_sig.params.len);
-                const impl_function_name = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}__{s}__{d}",
-                    .{ target_name, method_name, arity },
+            if (impl_entry.decl.type_params.len == 0) {
+                // Concrete-target impl — Phase 1.2.5.a's path.
+                try self.emitProtocolVTableInstance(
+                    type_defs,
+                    proto_entry,
+                    protocol_name,
+                    declared_target_name,
                 );
-                const extra_count = if (proto_fn_sig.params.len > 0) proto_fn_sig.params.len - 1 else 0;
-                const extra_param_types = try self.allocator.alloc(ZigType, extra_count);
-                if (extra_count > 0) {
-                    for (proto_fn_sig.params[1..], 0..) |param, param_index| {
-                        extra_param_types[param_index] = self.protocolParamTypeToZigType(param.type_annotation);
-                    }
-                }
-                const return_zig_type = self.protocolReturnTypeToZigType(proto_fn_sig.return_type);
-                methods[method_index] = .{
-                    .method_name = try cloneBytes(self.allocator, method_name),
-                    .impl_function_name = impl_function_name,
-                    .arity = arity,
-                    .extra_param_types = extra_param_types,
-                    .return_type = return_zig_type,
-                };
+                continue;
             }
 
-            try type_defs.append(self.allocator, .{
-                .name = instance_type_name,
-                .kind = .{ .protocol_vtable_instance_def = .{
-                    .protocol_name = try cloneBytes(self.allocator, protocol_name),
-                    .target_type_name = try cloneBytes(self.allocator, target_name),
-                    .methods = methods,
-                } },
-            });
+            // Parametric impl — one vtable instance per applied
+            // specialization whose base nominal name matches the
+            // impl's declared target. The applied table was already
+            // populated by `populateAppliedSpecializations` (which
+            // 1.2.5.b's `containsUnresolvedTypeVarForSpecialization`
+            // refactor unblocks for `Option(Error)`-shaped forms;
+            // ordinary parametric instantiations like `Tag(i64)` were
+            // never blocked).
+            for (self.applied_specializations.items) |spec| {
+                const base_name = self.baseStructNameForSpec(spec) orelse continue;
+                if (!std.mem.eql(u8, base_name, declared_target_name)) continue;
+                try self.emitProtocolVTableInstance(
+                    type_defs,
+                    proto_entry,
+                    protocol_name,
+                    spec.mangled_name,
+                );
+            }
         }
+    }
+
+    /// Resolve the base nominal struct/tagged-union name for an
+    /// `AppliedSpecialization`. Returns null when the base is not a
+    /// nominal type (a pathology that `populateAppliedSpecializations`
+    /// has already filtered out, but the explicit null arm keeps the
+    /// caller defensive).
+    fn baseStructNameForSpec(
+        self: *const IrBuilder,
+        spec: AppliedSpecialization,
+    ) ?[]const u8 {
+        const store = self.type_store orelse return null;
+        if (spec.base_type_id >= store.types.items.len) return null;
+        const base_type = store.types.items[spec.base_type_id];
+        return switch (base_type) {
+            .struct_type => |st| self.interner.get(st.name),
+            .tagged_union => |tu| self.interner.get(tu.name),
+            else => null,
+        };
+    }
+
+    /// Emit one `protocol_vtable_instance_def` TypeDef for the
+    /// (protocol, target) pair. Used by both the concrete-target and
+    /// parametric-target arms in `populateProtocolVTables` so the
+    /// instance shape (name layout, method-slot ordering, signature
+    /// lowering) stays in lockstep across the two paths.
+    fn emitProtocolVTableInstance(
+        self: *IrBuilder,
+        type_defs: *std.ArrayList(TypeDef),
+        proto_entry: *const scope_mod.ProtocolEntry,
+        protocol_name: []const u8,
+        target_name: []const u8,
+    ) !void {
+        const instance_type_name = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}VTable_for_{s}",
+            .{ protocol_name, target_name },
+        );
+
+        const methods = try self.allocator.alloc(
+            ProtocolVTableInstanceMethod,
+            proto_entry.decl.functions.len,
+        );
+        for (proto_entry.decl.functions, 0..) |proto_fn_sig, method_index| {
+            const method_name = self.interner.get(proto_fn_sig.name);
+            const arity: u32 = @intCast(proto_fn_sig.params.len);
+            const impl_function_name = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}__{s}__{d}",
+                .{ target_name, method_name, arity },
+            );
+            const extra_count = if (proto_fn_sig.params.len > 0) proto_fn_sig.params.len - 1 else 0;
+            const extra_param_types = try self.allocator.alloc(ZigType, extra_count);
+            if (extra_count > 0) {
+                for (proto_fn_sig.params[1..], 0..) |param, param_index| {
+                    extra_param_types[param_index] = self.protocolParamTypeToZigType(param.type_annotation);
+                }
+            }
+            const return_zig_type = self.protocolReturnTypeToZigType(proto_fn_sig.return_type);
+            methods[method_index] = .{
+                .method_name = try cloneBytes(self.allocator, method_name),
+                .impl_function_name = impl_function_name,
+                .arity = arity,
+                .extra_param_types = extra_param_types,
+                .return_type = return_zig_type,
+            };
+        }
+
+        try type_defs.append(self.allocator, .{
+            .name = instance_type_name,
+            .kind = .{ .protocol_vtable_instance_def = .{
+                .protocol_name = try cloneBytes(self.allocator, protocol_name),
+                .target_type_name = try cloneBytes(self.allocator, target_name),
+                .methods = methods,
+            } },
+        });
     }
 
     /// Convert a `StructName` from the scope graph into a flat
@@ -7954,6 +8050,24 @@ pub const IrBuilder = struct {
                 // `TypeStore.resolveTypeName` so we don't drift
                 // from the type checker's recognized name set.
                 if (primitiveNameToZigType(text)) |prim| break :blk prim;
+                // A bare protocol name (e.g. `Error` from the Phase
+                // 1.2 stdlib protocol) lowers to the protocol-box
+                // existential carrier — `protocol_box(name)`. The
+                // ZIR backend emits the receiver as
+                // `zap_runtime.ProtocolBox` so the dispatch site can
+                // run through the vtable without committing to a
+                // concrete impl target. Phase 1.2.5.b is what makes
+                // this resolve consistently across struct fields,
+                // function params, and return types.
+                if (self.scope_graph) |graph| {
+                    for (graph.protocols.items) |proto_entry| {
+                        if (proto_entry.name.parts.len > 0 and
+                            std.mem.eql(u8, self.interner.get(proto_entry.name.parts[proto_entry.name.parts.len - 1]), text))
+                        {
+                            break :blk .{ .protocol_box = self.allocator.dupe(u8, text) catch text };
+                        }
+                    }
+                }
                 // Parametric application: lower to a `.struct_ref`
                 // of the mangled per-instantiation name. The
                 // per-instantiation `union_def`/`enum_def`/`struct_def`
@@ -10001,7 +10115,7 @@ fn isGenericHirGroup(store: *const types_mod.TypeStore, group: *const hir_mod.Fu
     for (first_clause.params) |param| {
         // UNKNOWN (any) parameters are NOT generic — they compile to anytype in Zig
         if (param.type_id == types_mod.TypeStore.UNKNOWN) continue;
-        if (containsTypeVarInStore(store, param.type_id)) {
+        if (containsUnresolvedTypeVarForSpecialization(store, param.type_id)) {
             // Check if the actual type is a type_var that was unified from UNKNOWN
             if (param.type_id < store.types.items.len) {
                 const actual = store.types.items[param.type_id];
@@ -10011,46 +10125,63 @@ fn isGenericHirGroup(store: *const types_mod.TypeStore, group: *const hir_mod.Fu
         }
     }
     const ret = first_clause.return_type;
-    if (ret != types_mod.TypeStore.UNKNOWN and containsTypeVarInStore(store, ret)) return true;
+    if (ret != types_mod.TypeStore.UNKNOWN and containsUnresolvedTypeVarForSpecialization(store, ret)) return true;
     return false;
 }
 
-fn containsTypeVarInStore(store: *const types_mod.TypeStore, type_id: types_mod.TypeId) bool {
+/// Returns true iff `type_id` still carries an unresolved type
+/// variable — meaning the type is *not yet specialize-ready* and
+/// must not be lowered to a per-instantiation TypeDef or used as a
+/// concrete ZIR type. Callers include:
+///
+///   - `populateAppliedSpecializations`: skips `.applied` forms whose
+///     arguments are still abstract.
+///   - `usableContextType` / `shouldPreferContextType`: refuses to
+///     adopt a still-generic HIR type as the inferred Zig-side
+///     context for a local.
+///   - The call-target return-type unifier: only re-applies the
+///     substitution when the declared return is still abstract.
+///   - The inferred-signature genericity check: declines to emit a
+///     specialization for a generated helper whose signature still
+///     carries a type variable.
+///
+/// **Important:** as of Phase 1.2.5.b, `protocol_constraint` is
+/// concrete — it lowers to `ZigType.protocol_box` (the runtime fat
+/// pointer carrier). A function whose parameter or return type is a
+/// protocol existential is *not* generic in the parametric sense
+/// (every call site passes a `ProtocolBox`, not a type variable);
+/// likewise an `Option(Error)` is a per-instantiation TypeDef whose
+/// `Some` variant carries `zap_runtime.ProtocolBox`. We therefore
+/// return `false` for `protocol_constraint` even when its inner
+/// `type_params` still contain abstractions — the existential
+/// boxing erases the inner shape from the runtime ABI.
+fn containsUnresolvedTypeVarForSpecialization(store: *const types_mod.TypeStore, type_id: types_mod.TypeId) bool {
     if (type_id >= store.types.items.len) return false;
     const typ = store.types.items[type_id];
     return switch (typ) {
         .type_var => true,
-        .list => |lt| containsTypeVarInStore(store, lt.element),
+        .list => |lt| containsUnresolvedTypeVarForSpecialization(store, lt.element),
         .tuple => |tt| {
             for (tt.elements) |elem| {
-                if (containsTypeVarInStore(store, elem)) return true;
+                if (containsUnresolvedTypeVarForSpecialization(store, elem)) return true;
             }
             return false;
         },
         .function => |ft| {
             for (ft.params) |param| {
-                if (containsTypeVarInStore(store, param)) return true;
+                if (containsUnresolvedTypeVarForSpecialization(store, param)) return true;
             }
-            return containsTypeVarInStore(store, ft.return_type);
+            return containsUnresolvedTypeVarForSpecialization(store, ft.return_type);
         },
-        .map => |mt| containsTypeVarInStore(store, mt.key) or containsTypeVarInStore(store, mt.value),
+        .map => |mt| containsUnresolvedTypeVarForSpecialization(store, mt.key) or
+            containsUnresolvedTypeVarForSpecialization(store, mt.value),
         .applied => |at| {
             for (at.args) |arg| {
-                if (containsTypeVarInStore(store, arg)) return true;
+                if (containsUnresolvedTypeVarForSpecialization(store, arg)) return true;
             }
             return false;
         },
-        .protocol_constraint => |pc| {
-            if (pc.type_params.len > 0) {
-                for (pc.type_params) |tp| {
-                    if (containsTypeVarInStore(store, tp)) return true;
-                }
-            }
-            // Protocol constraints are compile-time dispatch constraints,
-            // not runtime value types. A function that still has one after
-            // monomorphization is still generic and must not be lowered.
-            return true;
-        },
+        .protocol_constraint => false,
         else => false,
     };
 }
@@ -10166,6 +10297,24 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                             // General union types → anytype
                             return .any;
                         },
+                        .protocol_constraint => |pc| {
+                            // Phase 1.2.5.b: lower a protocol existential
+                            // to the runtime fat-pointer carrier. The
+                            // payload is the protocol's bare name; the
+                            // ZIR backend renders this as
+                            // `zap_runtime.ProtocolBox` at every
+                            // struct-field / union-variant / function-
+                            // parameter / return-type position.
+                            //
+                            // The name is borrowed from the interner —
+                            // same lifetime contract as the `struct_type`
+                            // and `tagged_union` arms above. Interner
+                            // strings outlive the IR build, so any
+                            // downstream consumer that wants to retain
+                            // the name (e.g. `cloneZigType`) is
+                            // responsible for duplicating it.
+                            return .{ .protocol_box = ts.interner.get(pc.protocol_name) };
+                        },
                         else => {},
                     }
                 }
@@ -10222,6 +10371,11 @@ fn zigTypeReachesStruct(t: ZigType, owner_name: []const u8) bool {
         // tagged_union variants currently lower as u32 enum tags
         // anyway; if/when payload variants land they'd need
         // separate recursion handling.
+        //
+        // `protocol_box` is a runtime fat pointer to an opaque
+        // inner — it never reaches the *static* struct graph at
+        // this layer (the inner type is dynamic). For SCC analysis
+        // purposes, treat it as a leaf.
         .void,
         .bool_type,
         .nil,
@@ -10248,6 +10402,7 @@ fn zigTypeReachesStruct(t: ZigType, owner_name: []const u8) bool {
         .usize,
         .isize,
         .tagged_union,
+        .protocol_box,
         => false,
     };
 }
@@ -10359,6 +10514,7 @@ fn reachesStructInCycleImpl(
         .usize,
         .isize,
         .tagged_union,
+        .protocol_box,
         => false,
     };
 }
@@ -10396,6 +10552,7 @@ fn zigTypeToStr(zig_type: ZigType) []const u8 {
         },
         .struct_ref => |name| name,
         .tagged_union => |name| name,
+        .protocol_box => "zap_runtime.ProtocolBox",
         .function => "zap_runtime.DynClosure",
         .optional => "anytype",
         .any => "anytype",
@@ -13381,3 +13538,4 @@ test "IR vtable emission survives Program.clone (deep-copy correctness)" {
     try std.testing.expectEqualStrings("current", inst_def.methods[0].method_name);
     try std.testing.expectEqualStrings("Tick__current__1", inst_def.methods[0].impl_function_name);
 }
+
