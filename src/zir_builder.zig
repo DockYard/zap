@@ -354,6 +354,102 @@ fn concreteIntegerTypeRef(zig_type: ir.ZigType) u32 {
     };
 }
 
+/// Append a Zig identifier, quoting it with `@"..."` when the
+/// raw text contains characters Zig's tokenizer would reject.
+/// Used by the protocol-vtable synthetic-source emission to
+/// produce field names that survive any unusual method names a
+/// `pub protocol` declaration carries (e.g. operator-spelled
+/// methods that the mangler hasn't yet had a chance to rewrite).
+fn appendZigIdentifier(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    text: []const u8,
+) !void {
+    // Conservative test: an identifier is "plain" if every char is
+    // [A-Za-z0-9_] and the first char is not a digit. Anything else
+    // gets `@"..."` quoting so the synthetic source stays valid
+    // Zig regardless of source-level Zap method-name choices.
+    var needs_quote: bool = text.len == 0 or std.ascii.isDigit(text[0]);
+    if (!needs_quote) {
+        for (text) |ch| {
+            const is_ident_char = std.ascii.isAlphanumeric(ch) or ch == '_';
+            if (!is_ident_char) {
+                needs_quote = true;
+                break;
+            }
+        }
+    }
+    if (!needs_quote) {
+        try buf.appendSlice(allocator, text);
+        return;
+    }
+    try buf.appendSlice(allocator, "@\"");
+    try buf.appendSlice(allocator, text);
+    try buf.appendSlice(allocator, "\"");
+}
+
+/// Emit the Zig source form of an IR `ZigType` for use inside a
+/// vtable function-pointer signature. The set of supported shapes
+/// matches Phase 1.2.5.a's resolver (`astTypeExprToZigTypeForProtocol`
+/// in `src/ir.zig`): primitives lower to their canonical Zig
+/// spelling (`i64`, `[]const u8`, `bool`, `void`); nominal struct
+/// references emit an `@import("<Name>").<Name>` form so Sema
+/// resolves the type to its file-IS-the-struct canonical identity;
+/// anything else falls back to `anytype` (the dispatch site only
+/// passes opaque pointers through here, so a partially-typed
+/// signature still compiles).
+fn appendZigTypeForVTable(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    zig_type: ir.ZigType,
+) !void {
+    switch (zig_type) {
+        .void => try buf.appendSlice(allocator, "void"),
+        .never => try buf.appendSlice(allocator, "noreturn"),
+        .bool_type => try buf.appendSlice(allocator, "bool"),
+        .i8 => try buf.appendSlice(allocator, "i8"),
+        .i16 => try buf.appendSlice(allocator, "i16"),
+        .i32 => try buf.appendSlice(allocator, "i32"),
+        .i64 => try buf.appendSlice(allocator, "i64"),
+        .i128 => try buf.appendSlice(allocator, "i128"),
+        .u8 => try buf.appendSlice(allocator, "u8"),
+        .u16 => try buf.appendSlice(allocator, "u16"),
+        .u32 => try buf.appendSlice(allocator, "u32"),
+        .u64 => try buf.appendSlice(allocator, "u64"),
+        .u128 => try buf.appendSlice(allocator, "u128"),
+        .f16 => try buf.appendSlice(allocator, "f16"),
+        .f32 => try buf.appendSlice(allocator, "f32"),
+        .f64 => try buf.appendSlice(allocator, "f64"),
+        .f80 => try buf.appendSlice(allocator, "f80"),
+        .f128 => try buf.appendSlice(allocator, "f128"),
+        .usize => try buf.appendSlice(allocator, "usize"),
+        .isize => try buf.appendSlice(allocator, "isize"),
+        // `String` and `Atom` both lower to Zig's `[]const u8`
+        // slice shape. Sema treats them identically at the ABI
+        // boundary; the IR's distinction is purely diagnostic.
+        .string, .atom => try buf.appendSlice(allocator, "[]const u8"),
+        .nil => try buf.appendSlice(allocator, "?void"),
+        .term => try buf.appendSlice(allocator, "zap_runtime.Term"),
+        .struct_ref => |name| {
+            // The file-IS-the-struct emission lets us reach a
+            // nominal type by importing its name. Phase 1.2.5.a
+            // does not yet need to disambiguate parametric
+            // specializations because protocol signatures in
+            // 1.2.5.a are limited to bare nominal names.
+            try buf.appendSlice(allocator, "@import(\"");
+            try buf.appendSlice(allocator, name);
+            try buf.appendSlice(allocator, "\")");
+        },
+        .tagged_union => |name| {
+            try buf.appendSlice(allocator, "@import(\"");
+            try buf.appendSlice(allocator, name);
+            try buf.appendSlice(allocator, "\").");
+            try buf.appendSlice(allocator, name);
+        },
+        else => try buf.appendSlice(allocator, "anytype"),
+    }
+}
+
 /// Map a primitive Zap type to a well-known ZIR type Ref.
 /// Returns 0 for complex types that need instruction emission (use
 /// ZirDriver.emitReturnTypeRef for full coverage).
@@ -1467,6 +1563,150 @@ pub const ZirDriver = struct {
         }
     }
 
+    /// Emit a synthetic top-level Zig source file for a
+    /// `protocol_vtable_def` TypeDef. The file declares the
+    /// per-protocol vtable struct type as the file's main
+    /// (root-named) constant, so consumers reach it via
+    /// `@import("<Protocol>VTable").<Protocol>VTable`. The
+    /// receiver is type-erased to `?*anyopaque`; other params
+    /// and return types use the IR-side ZigType-to-string
+    /// lowering so primitives like `String`/`i64`/`Atom` round-
+    /// trip to their canonical Zig forms (`[]const u8`,
+    /// `i64`, `[]const u8`).
+    ///
+    /// Phase 1.2.5.a emits only the type — Phase 1.2.5.d will
+    /// teach the consumption-site lowering to cast
+    /// `ProtocolBox.vtable` back to `*const <Protocol>VTable`
+    /// and dispatch through the named slots.
+    fn emitProtocolVTableSourceFile(
+        self: *ZirDriver,
+        c: *ZirContext,
+        type_def: ir.TypeDef,
+    ) !void {
+        const vt_def = switch (type_def.kind) {
+            .protocol_vtable_def => |def| def,
+            else => return, // guarded by caller
+        };
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.allocator);
+
+        // The synthetic source declares one `extern struct` whose
+        // fields are method-slot function pointers. The fields'
+        // signatures bake in the protocol's declared param/return
+        // types but erase the receiver — the dispatch site at the
+        // ProtocolBox always carries the inner value as
+        // `?*anyopaque`.
+        try buf.appendSlice(self.allocator, "pub const ");
+        try buf.appendSlice(self.allocator, type_def.name);
+        try buf.appendSlice(self.allocator, " = extern struct {\n");
+        for (vt_def.methods) |method| {
+            try buf.appendSlice(self.allocator, "    ");
+            try appendZigIdentifier(self.allocator, &buf, method.name);
+            try buf.appendSlice(self.allocator, ": *const fn (data_ptr: ?*anyopaque");
+            for (method.extra_param_types, 0..) |param_zt, param_index| {
+                try buf.appendSlice(self.allocator, ", ");
+                const arg_prefix = try std.fmt.allocPrint(self.allocator, "arg{d}: ", .{param_index});
+                defer self.allocator.free(arg_prefix);
+                try buf.appendSlice(self.allocator, arg_prefix);
+                try appendZigTypeForVTable(self.allocator, &buf, param_zt);
+            }
+            try buf.appendSlice(self.allocator, ") ");
+            try appendZigTypeForVTable(self.allocator, &buf, method.return_type);
+            try buf.appendSlice(self.allocator, ",\n");
+        }
+        try buf.appendSlice(self.allocator, "};\n");
+
+        const name_z = try self.allocator.dupeZ(u8, type_def.name);
+        defer self.allocator.free(name_z);
+
+        if (zir_compilation_add_struct_source(
+            c,
+            name_z,
+            buf.items.ptr,
+            @intCast(buf.items.len),
+        ) != 0) {
+            return error.ZirInjectionFailed;
+        }
+    }
+
+    /// Emit a synthetic top-level Zig source file for a
+    /// `protocol_vtable_instance_def` TypeDef. The file declares
+    /// a constant of the corresponding vtable struct type whose
+    /// method-pointer slots are left as `undefined` — Phase
+    /// 1.2.5.c populates the slots with ABI-bridge adapter
+    /// functions once construction-site lowering knows how to
+    /// reach the inner type's monomorphized impl method symbols.
+    ///
+    /// The constant is named `<Protocol>VTable_for_<Target>`
+    /// (matching the TypeDef name); construction-site lowering
+    /// (Phase 1.2.5.c) takes the address of this constant and
+    /// writes it into `ProtocolBox.vtable` at every site where a
+    /// concrete `<Target>` value is auto-boxed as the protocol.
+    /// The `undefined` slot population is intentional in 1.2.5.a:
+    /// the construction-site lowering will own the adapter-
+    /// generation so the impl-symbol references resolve through
+    /// the same import path the construction site already uses.
+    fn emitProtocolVTableInstanceSourceFile(
+        self: *ZirDriver,
+        c: *ZirContext,
+        type_def: ir.TypeDef,
+    ) !void {
+        const inst_def = switch (type_def.kind) {
+            .protocol_vtable_instance_def => |def| def,
+            else => return, // guarded by caller
+        };
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.allocator);
+
+        // Bring the vtable type into scope under a stable local
+        // name. The `.<Protocol>VTable` field on the imported
+        // namespace resolves to the canonical InternPool.Index for
+        // the protocol's vtable type (the file-IS-the-struct
+        // emission guarantees one nominal identity per Zap struct,
+        // see `File-IS-Struct Emission Model` engram).
+        const import_line = try std.fmt.allocPrint(
+            self.allocator,
+            "const VTableMod = @import(\"{s}VTable\");\n",
+            .{inst_def.protocol_name},
+        );
+        defer self.allocator.free(import_line);
+        try buf.appendSlice(self.allocator, import_line);
+        try buf.appendSlice(self.allocator, "\n");
+
+        // Declare the constant with `undefined` slot values. Phase
+        // 1.2.5.c replaces this body with a properly-initialized
+        // literal whose slots point at per-impl ABI-bridge adapter
+        // functions; until then the constant is structurally
+        // present so 1.2.5.b's mangler and construction-site type
+        // lookup can find it by name without a "undefined symbol"
+        // diagnostic at link time.
+        try buf.appendSlice(self.allocator, "pub const ");
+        try buf.appendSlice(self.allocator, type_def.name);
+        try buf.appendSlice(self.allocator, ": VTableMod.");
+        try buf.appendSlice(self.allocator, inst_def.protocol_name);
+        try buf.appendSlice(self.allocator, "VTable = .{\n");
+        for (inst_def.methods) |method| {
+            try buf.appendSlice(self.allocator, "    .");
+            try appendZigIdentifier(self.allocator, &buf, method.method_name);
+            try buf.appendSlice(self.allocator, " = undefined,\n");
+        }
+        try buf.appendSlice(self.allocator, "};\n");
+
+        const name_z = try self.allocator.dupeZ(u8, type_def.name);
+        defer self.allocator.free(name_z);
+
+        if (zir_compilation_add_struct_source(
+            c,
+            name_z,
+            buf.items.ptr,
+            @intCast(buf.items.len),
+        ) != 0) {
+            return error.ZirInjectionFailed;
+        }
+    }
+
     /// Emit one nested type-decl inside the primary struct. Mirrors
     /// the original loop body — preserved verbatim for nested decls
     /// only; the primary struct path goes through `emitRootFields`
@@ -2388,6 +2628,52 @@ pub const ZirDriver = struct {
                 if (struct_funcs.contains(type_def.name)) continue;
                 if (!self.shouldEmitStruct(type_def.name)) continue;
                 try self.emitSpecializationSourceFile(c, type_def);
+            }
+
+            // ── Step 3.7: Emit per-protocol vtable types ──────────────
+            // The IR layer emits one `protocol_vtable_def` TypeDef per
+            // `pub protocol` reachable from the program (named
+            // `<Protocol>VTable`). The construction-site lowering
+            // (Phase 1.2.5.c) and consumption-site lowering (Phase
+            // 1.2.5.d) reach the type via `@import("<Protocol>VTable")
+            // .<Protocol>VTable`, so step 3.7 must register a
+            // synthetic source file under each name.
+            //
+            // The source we emit is a `pub const <Protocol>VTable =
+            // extern struct { method_a: *const fn(...) ..., ... };`
+            // declaration whose method fields are function pointers
+            // with the receiver type-erased to `?*anyopaque`. Other
+            // params and the return type retain their declared
+            // shape, lowered through `mapReturnType` for primitives
+            // and through `struct_ref`/`@import` for nominals.
+            if (self.progress) |progress| progress.stage("ZIR: emitting per-protocol vtable types", .{});
+            for (self.program.?.type_defs) |type_def| {
+                if (type_def.kind != .protocol_vtable_def) continue;
+                if (!self.shouldEmitStruct(type_def.name)) continue;
+                try self.emitProtocolVTableSourceFile(c, type_def);
+            }
+
+            // ── Step 3.7 continued: per-impl vtable instance constants ──
+            // The IR layer emits one `protocol_vtable_instance_def`
+            // TypeDef per `pub impl <Protocol> for <Target>` reachable
+            // from the program (named `<Protocol>VTable_for_<Target>`).
+            // The construction-site lowering (Phase 1.2.5.c) takes the
+            // address of this constant and writes it into the
+            // `ProtocolBox.vtable` field at every site where a
+            // concrete `<Target>` value is auto-boxed as the protocol.
+            //
+            // The source we emit is a `pub const
+            // <Protocol>VTable_for_<Target>: <Protocol>VTable = .{
+            // .method_a = ..., ... };` declaration whose method-pointer
+            // entries are `@ptrCast`s onto the impl's monomorphized
+            // function symbol. The import line at the top of the
+            // synthetic file pulls in `<Protocol>VTable`'s nominal
+            // identity so Sema knows the declared type.
+            if (self.progress) |progress| progress.stage("ZIR: emitting per-impl vtable instance constants", .{});
+            for (self.program.?.type_defs) |type_def| {
+                if (type_def.kind != .protocol_vtable_instance_def) continue;
+                if (!self.shouldEmitStruct(type_def.name)) continue;
+                try self.emitProtocolVTableInstanceSourceFile(c, type_def);
             }
 
             // ── Step 4: Generate namespace re-export structs ─────────
