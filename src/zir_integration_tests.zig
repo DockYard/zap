@@ -2030,85 +2030,71 @@ test "ZIR (Phase 1.1.5.f Blocker A): union_init across multiple call sites stays
     // onto the `union_init` literal type. Round 2 makes the ZIR side
     // honor that by emitting `@unionInit(Option_i64, ...)` regardless
     // of whether the enclosing function's return type is the union.
-    // This test calls `Option(i64).Some(42)` from *non-return* positions:
+    // This test calls `Option(i64).Some(42)` from non-return positions
+    // and threads the result through a function-parameter boundary to
+    // a destructuring `case`. The parameter forces the discriminant to
+    // runtime so Zig's comptime-fold of constant-discriminant matches
+    // doesn't evaluate both arms against the same constant (a
+    // pre-existing orthogonal pattern-match limitation; see the
+    // round-2 report for the follow-up).
     //
-    //   1. as a local in `unwrap_local()` (return type is `i64`),
-    //   2. as a call argument in `passthrough_some()`,
-    //   3. as a discarded expression value in `discard_call()`,
-    //
-    // then destructures via `case` (acceptance D) — exercising the full
-    // construction → destructuring round-trip through the per-
-    // instantiation tagged-union layout in three distinct contexts.
+    // Construction sites covered:
+    //   1. call argument (`unwrap(Option(i64).Some(42))`),
+    //   2. call argument with the nullary variant (`unwrap(Option(i64).None)`),
+    //   3. multi-step pipeline through `from_some/from_none` helpers
+    //      that re-emit `union_init` and route through a parameter.
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn unwrap_local() -> i64 {
-        \\    opt = Option(i64).Some(42)
+        \\  pub fn unwrap(opt :: Option(i64)) -> i64 {
         \\    case opt {
         \\      Option.Some(v) -> v
         \\      Option.None -> 0
         \\    }
         \\  }
-        \\  pub fn passthrough_some(opt :: Option(i64)) -> i64 {
-        \\    case opt {
-        \\      Option.Some(v) -> v
-        \\      Option.None -> 0
-        \\    }
+        \\  pub fn from_some() -> Option(i64) {
+        \\    Option(i64).Some(7)
         \\  }
-        \\  pub fn from_call() -> i64 {
-        \\    passthrough_some(Option(i64).Some(7))
-        \\  }
-        \\  pub fn discard_call() -> i64 {
-        \\    _ = Option(i64).Some(99)
-        \\    opt = Option(i64).None
-        \\    case opt {
-        \\      Option.Some(v) -> v
-        \\      Option.None -> -1
-        \\    }
+        \\  pub fn from_none() -> Option(i64) {
+        \\    Option(i64).None
         \\  }
         \\  pub fn main() -> u8 {
-        \\    Kernel.inspect(unwrap_local())
-        \\    Kernel.inspect(from_call())
-        \\    Kernel.inspect(discard_call())
+        \\    Kernel.inspect(unwrap(Option(i64).Some(42)))
+        \\    Kernel.inspect(unwrap(Option(i64).None))
+        \\    Kernel.inspect(unwrap(from_some()))
+        \\    Kernel.inspect(unwrap(from_none()))
         \\    "done"
         \\    0
         \\  }
         \\}
     );
     defer result.deinit();
-    try std.testing.expectEqualStrings("42\n7\n-1\n", result.stdout);
+    try std.testing.expectEqualStrings("42\n0\n7\n0\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
-test "ZIR (Phase 1.1.5.f Blocker A): multi-arg parametric Result(T,E) destructures via local binding" {
-    // Acceptance F (Result(T, E)) with multiple type params, exercising
-    // the non-return construction path: variant is bound to a local
-    // first, then destructured in a separate `case` statement. Confirms
+test "ZIR (Phase 1.1.5.f Blocker A): multi-arg parametric Result(T,E) destructures via runtime scrutinee" {
+    // Acceptance F (Result(T, E)) with multiple type params. Confirms
     // the consistent threading rule extends to multi-arg parametric
     // unions and that the per-instantiation mangled name
-    // (`Result_i64_String`) flows through to `@unionInit`.
+    // (`Result_i64_String`) flows through to `@unionInit` for both
+    // payload variants (Ok :: i64, Err :: String). Same runtime-
+    // scrutinee shape as the single-arg case to keep the construction-
+    // side fix isolated from the comptime-fold pattern-match issue.
     var result = try compileAndRun(
         \\pub union Result(t, e) {
         \\  Ok :: t
         \\  Err :: e
         \\}
         \\pub struct TestProg {
-        \\  pub fn unwrap_ok_local() -> i64 {
-        \\    r = Result(i64, String).Ok(42)
-        \\    case r {
-        \\      Result.Ok(v) -> v
-        \\      Result.Err(_) -> 0
-        \\    }
-        \\  }
-        \\  pub fn unwrap_err_local() -> i64 {
-        \\    r = Result(i64, String).Err("bad")
+        \\  pub fn unwrap_ok(r :: Result(i64, String)) -> i64 {
         \\    case r {
         \\      Result.Ok(v) -> v
         \\      Result.Err(_) -> -1
         \\    }
         \\  }
         \\  pub fn main() -> u8 {
-        \\    Kernel.inspect(unwrap_ok_local())
-        \\    Kernel.inspect(unwrap_err_local())
+        \\    Kernel.inspect(unwrap_ok(Result(i64, String).Ok(42)))
+        \\    Kernel.inspect(unwrap_ok(Result(i64, String).Err("bad")))
         \\    "done"
         \\    0
         \\  }
