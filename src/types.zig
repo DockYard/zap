@@ -191,6 +191,15 @@ pub const TypeStore = struct {
     next_var: TypeVarId,
     /// Inferred signatures for generated functions, keyed by function name StringId.
     inferred_signatures: std.AutoHashMap(ast.StringId, InferredSignature),
+    /// Struct TypeIds whose `field :: Type = expr` defaults have
+    /// already been validated by `TypeChecker.validateStructFieldDefaults`.
+    /// Lives on the TypeStore (not the TypeChecker) because the
+    /// per-struct compilation pipeline in `compileStructByStruct`
+    /// creates a fresh TypeChecker per struct against a shared
+    /// TypeStore — without the store-scoped guard, the validator
+    /// re-checks every previously-registered struct on every pass
+    /// and the same diagnostic prints N times for N structs.
+    validated_default_struct_ids: std.AutoHashMap(TypeId, void),
 
     // Well-known type IDs
     pub const BOOL: TypeId = 0;
@@ -228,6 +237,7 @@ pub const TypeStore = struct {
             .name_to_type = std.AutoHashMap(ast.StringId, TypeId).init(allocator),
             .next_var = 0,
             .inferred_signatures = std.AutoHashMap(ast.StringId, InferredSignature).init(allocator),
+            .validated_default_struct_ids = std.AutoHashMap(TypeId, void).init(allocator),
         };
         store.registerBuiltins() catch {};
         return store;
@@ -237,6 +247,7 @@ pub const TypeStore = struct {
         self.types.deinit(self.allocator);
         self.name_to_type.deinit();
         self.inferred_signatures.deinit();
+        self.validated_default_struct_ids.deinit();
     }
 
     fn registerBuiltins(self: *TypeStore) !void {
@@ -3117,6 +3128,19 @@ pub const TypeChecker = struct {
         const prev_scope = self.current_scope;
         defer self.current_scope = prev_scope;
 
+        // Dedupe by registered TypeId across the whole lifetime of
+        // this `TypeChecker`. The compiler pipeline reruns
+        // `checkProgram` after escape analysis (and CTFE re-runs the
+        // checker against its own program), so a per-call HashMap
+        // would re-emit the same diagnostic on every replay. Using a
+        // checker-scoped set keeps each struct validated exactly
+        // once, regardless of how many times `checkProgram` fires.
+        // Validating the same struct twice would also be redundant
+        // even within a single run — the scope graph holds one
+        // `TypeEntry` per declaration site, and a type imported under
+        // multiple aliases reaches us through several entries that
+        // all collapse onto the same TypeId.
+
         for (self.graph.types.items) |type_entry| {
             if (type_entry.kind != .struct_type) continue;
             const struct_decl = type_entry.kind.struct_type;
@@ -3124,6 +3148,8 @@ pub const TypeChecker = struct {
             if (registered_type_id >= self.store.types.items.len) continue;
             const registered = self.store.getType(registered_type_id);
             if (registered != .struct_type) continue;
+            const gop = try self.store.validated_default_struct_ids.getOrPut(registered_type_id);
+            if (gop.found_existing) continue;
 
             // Default expressions evaluate at the construction site,
             // not inside the struct body. Resolve them at the struct's
