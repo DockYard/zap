@@ -4921,10 +4921,35 @@ pub const HirBuilder = struct {
                                 for (typ.tagged_union.variants) |v| {
                                     if (v.name == parts[1] and v.type_id != null) {
                                         const arg_expr = try self.buildExpr(call.args[0]);
-                                        const literal_type_id = if (type_args.len > 0)
+                                        // Three sources for the
+                                        // instantiation TypeId (mirrors
+                                        // the nullary-variant arm above):
+                                        //   1. Explicit type-args on
+                                        //      the call's struct_ref
+                                        //      (`Option(i64).Some(42)`).
+                                        //   2. Context-driven inference
+                                        //      from the surrounding
+                                        //      `expected_type_stack`
+                                        //      (a function return type
+                                        //      `pub fn make() ->
+                                        //      Option(Atom)` with body
+                                        //      `Option.Some(:foo)`).
+                                        //   3. Bare template TypeId
+                                        //      (concrete tagged-union
+                                        //      with no formal type
+                                        //      params — `Result.Ok(x)`
+                                        //      for a non-parametric
+                                        //      `Result`).
+                                        const explicit_applied = if (type_args.len > 0)
                                             self.buildAppliedStructLiteralType(tid, type_args)
                                         else
-                                            tid;
+                                            null;
+                                        const inferred_applied = if (explicit_applied != null)
+                                            null
+                                        else
+                                            self.inferAppliedFromExpectedType(tid);
+                                        const literal_type_id =
+                                            explicit_applied orelse inferred_applied orelse tid;
                                         return try self.create(Expr, .{
                                             .kind = .{ .union_init = .{
                                                 .union_type_id = literal_type_id,
@@ -5571,10 +5596,23 @@ pub const HirBuilder = struct {
                         literal_type_id = inferred;
                     }
                 }
-                // Build field expressions
+                // Build field expressions. For each field, push the
+                // field's declared HIR type onto `expected_type_stack`
+                // around the `buildExpr` call so context-driven
+                // inference (e.g. a bare `Option.None` adopting the
+                // field's `Option(i64)` instantiation) can read the
+                // expected type. `fieldAccessResultType` does double
+                // duty here — its substitution logic carries through
+                // parametric struct instantiations so a field declared
+                // as `Option(T)` inside `Foo(T)` sees the substituted
+                // `Option(i64)` when the literal is `%Foo(i64){...}`.
                 var hir_fields: std.ArrayList(StructFieldInit) = .empty;
                 for (se.fields) |field| {
+                    const expected_field_type = self.fieldAccessResultType(literal_type_id, field.name);
+                    const apply_expected = expected_field_type != types_mod.TypeStore.UNKNOWN;
+                    if (apply_expected) try self.expected_type_stack.append(self.allocator, expected_field_type);
                     const value = try self.buildExpr(field.value);
+                    if (apply_expected) _ = self.expected_type_stack.pop();
                     try hir_fields.append(self.allocator, .{
                         .name = field.name,
                         .value = value,
@@ -5769,36 +5807,65 @@ pub const HirBuilder = struct {
                     if (type_tid) |tid| {
                         const typ = self.type_store.getType(tid);
                         if (typ == .tagged_union) {
-                            // Parametric nullary variant construction:
-                            // `Option(i64).None` lands here with
-                            // type_args carrying [i64]. The applied
-                            // TypeId routes through per-instantiation
-                            // type-def emission alongside payload-
-                            // bearing variants. Concrete forms like
-                            // `Color.Red` carry no type_args and keep
-                            // the bare template TypeId.
-                            const literal_type_id = if (mr.type_args.len > 0)
+                            // Three sources of the instantiation TypeId
+                            // for a nullary variant construction:
+                            //
+                            //   1. **Explicit type-args.**
+                            //      `Option(i64).None` lands here with
+                            //      `mr.type_args = [i64]`. Build the
+                            //      `.applied {Option, [i64]}` TypeId.
+                            //
+                            //   2. **Context-driven inference.** A bare
+                            //      `Option.None` written where the
+                            //      surrounding context supplies an
+                            //      expected `.applied` form whose base
+                            //      matches `tid` (e.g. a struct field
+                            //      declared as `cause :: Option(Error)`,
+                            //      a function return type
+                            //      `pub fn foo() -> Option(i64)`, a
+                            //      pattern arm with an annotated
+                            //      scrutinee). Adopt the expected
+                            //      `.applied` TypeId so monomorphization
+                            //      sees the instantiation and the IR
+                            //      layer routes through the per-
+                            //      instantiation TypeDef.
+                            //
+                            //   3. **Concrete enum / unit-only union.**
+                            //      `Color.Red` for a non-parametric
+                            //      `tagged_union` with no formal type
+                            //      params — keep the bare declaration
+                            //      TypeId. These lower via the
+                            //      `field_get` enum-literal path and
+                            //      coerce against the union via
+                            //      Sema's enum-to-tag inference.
+                            //
+                            // Cases 1 and 2 always emit `union_init`
+                            // (the synthetic-file union(enum) requires
+                            // explicit `@unionInit` — Sema rejects a
+                            // bare `.None` against a union type
+                            // without a tag). Case 3 keeps the
+                            // legacy `field_get` shape.
+                            const explicit_applied = if (mr.type_args.len > 0)
                                 self.buildAppliedStructLiteralType(tid, mr.type_args)
                             else
-                                tid;
-                            // Parametric tagged unions emit a synthetic
-                            // top-level `union(enum)` per instantiation
-                            // (Step 3.6 in zir_builder), so even unit
-                            // variants must materialise as
-                            // `@unionInit(<Instantiation>, "<Variant>", {})`
-                            // rather than a bare enum literal — the ZIR
-                            // layer rejects a literal `.None` against
-                            // a `union(enum)` type without an explicit
-                            // `@unionInit`. The void payload uses a
-                            // synthesized nil_lit at the union's TypeId
-                            // (carries through the ARC analyses, which
-                            // expect a typed value).
-                            //
-                            // Concrete (non-parametric) tagged unions
-                            // continue to use the `field_get` shape so
-                            // they lower as `enum_literal` and ride the
-                            // existing pattern-match coercion path.
-                            if (mr.type_args.len > 0) {
+                                null;
+                            const inferred_applied = if (explicit_applied != null)
+                                null
+                            else
+                                self.inferAppliedFromExpectedType(tid);
+                            const applied_type_id: ?types_mod.TypeId =
+                                explicit_applied orelse inferred_applied;
+
+                            if (applied_type_id) |literal_type_id| {
+                                // Parametric tagged unions emit a synthetic
+                                // top-level `union(enum)` per instantiation
+                                // (Step 3.6 in zir_builder), so even unit
+                                // variants must materialise as
+                                // `@unionInit(<Instantiation>, "<Variant>", {})`
+                                // rather than a bare enum literal. The void
+                                // payload uses a synthesized nil_lit at the
+                                // union's TypeId (carries through the ARC
+                                // analyses, which expect a typed value).
                                 const void_payload = try self.create(Expr, .{
                                     .kind = .nil_lit,
                                     .type_id = types_mod.TypeStore.NIL,
@@ -5814,18 +5881,24 @@ pub const HirBuilder = struct {
                                     .span = mr.meta.span,
                                 });
                             }
+
+                            // Concrete (non-parametric) tagged union:
+                            // emit `field_get` enum-literal shape and
+                            // ride the existing pattern-match coercion
+                            // path. The literal TypeId is the bare
+                            // declaration TypeId.
                             return try self.create(Expr, .{
                                 .kind = .{
                                     .field_get = .{
                                         .object = try self.create(Expr, .{
                                             .kind = .nil_lit, // placeholder for enum type ref
-                                            .type_id = literal_type_id,
+                                            .type_id = tid,
                                             .span = mr.meta.span,
                                         }),
                                         .field = variant_name,
                                     },
                                 },
-                                .type_id = literal_type_id,
+                                .type_id = tid,
                                 .span = mr.meta.span,
                             });
                         }
