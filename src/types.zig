@@ -513,6 +513,30 @@ pub const TypeStore = struct {
             }
         }
 
+        // Parametric type comparison: two applications are equal
+        // when both base and every argument compare structurally.
+        if (ta == .applied and tb == .applied) {
+            if (ta.applied.base != tb.applied.base and !self.typeEquals(ta.applied.base, tb.applied.base)) return false;
+            if (ta.applied.args.len != tb.applied.args.len) return false;
+            for (ta.applied.args, tb.applied.args) |arg_a, arg_b| {
+                if (!self.typeEquals(arg_a, arg_b)) return false;
+            }
+            return true;
+        }
+        // An applied instantiation `Box(i64)` matches the bare
+        // declaration `Box`. The bare-declaration form represents
+        // "any specialisation of this declaration" — that's how
+        // user code today writes generic return types like
+        // `pub fn build() -> Box` and how impl-method signatures
+        // resolve protocol receivers. Symmetric in both
+        // directions so the comparison rule is reversible.
+        if (ta == .applied and (tb == .struct_type or tb == .tagged_union)) {
+            if (ta.applied.base == b) return true;
+        }
+        if (tb == .applied and (ta == .struct_type or ta == .tagged_union)) {
+            if (tb.applied.base == a) return true;
+        }
+
         return false;
     }
 
@@ -3092,6 +3116,19 @@ pub const TypeChecker = struct {
                     }
                     return buf.toOwnedSlice(self.allocator) catch return "{type}";
                 },
+                .applied => |ap| {
+                    var buf: std.ArrayList(u8) = .empty;
+                    const base_text = self.typeToString(ap.base);
+                    buf.appendSlice(self.allocator, base_text) catch return "{type}";
+                    buf.append(self.allocator, '(') catch return "{type}";
+                    for (ap.args, 0..) |arg, idx| {
+                        if (idx > 0) buf.appendSlice(self.allocator, ", ") catch return "{type}";
+                        buf.appendSlice(self.allocator, self.typeToString(arg)) catch return "{type}";
+                    }
+                    buf.append(self.allocator, ')') catch return "{type}";
+                    return buf.toOwnedSlice(self.allocator) catch return "{type}";
+                },
+                .type_var => return "{type_var}",
                 else => {},
             }
         }
@@ -3275,6 +3312,172 @@ pub const TypeChecker = struct {
             if (field.name == field_name) return field.type_id;
         }
         return null;
+    }
+
+    /// Number of formal type parameters declared on a registered
+    /// nominal type. Returns 0 for non-parametric structs/unions and
+    /// for any non-nominal entry (primitives, applied instances,
+    /// etc.) — these do not accept generic application directly.
+    fn parametricTypeArity(self: *const TypeChecker, type_id: TypeId) usize {
+        const typ = self.store.getType(type_id);
+        return switch (typ) {
+            .struct_type => |st| st.type_params.len,
+            .tagged_union => |tu| tu.type_params.len,
+            else => 0,
+        };
+    }
+
+    /// Diagnostic for `Box(i64, String)` when `Box` declared `Box(T)`,
+    /// or `Box()` when at least one argument was expected.
+    fn reportParametricArityMismatch(
+        self: *TypeChecker,
+        name: []const u8,
+        expected: usize,
+        actual: usize,
+        span: ast.SourceSpan,
+    ) !void {
+        const word = if (expected == 1) "parameter" else "parameters";
+        try self.addRichError(
+            try std.fmt.allocPrint(
+                self.allocator,
+                "`{s}` expects {d} type {s}, got {d}",
+                .{ name, expected, word, actual },
+            ),
+            span,
+            try std.fmt.allocPrint(self.allocator, "wrong number of type arguments", .{}),
+            try std.fmt.allocPrint(
+                self.allocator,
+                "supply {d} type argument{s} (one per declared parameter)",
+                .{ expected, if (expected == 1) "" else "s" },
+            ),
+        );
+    }
+
+    /// Per-instantiation state for a struct literal: the
+    /// substitution map (formal type_var -> concrete arg) and the
+    /// final TypeId to record on the literal. Concrete (non-
+    /// parametric) struct literals get an empty substitution and the
+    /// declaration TypeId.
+    const StructLiteralInstantiation = struct {
+        substitution: SubstitutionMap,
+        literal_type_id: TypeId,
+
+        fn deinit(self: *StructLiteralInstantiation) void {
+            self.substitution.deinit();
+        }
+    };
+
+    /// Validate a struct literal's optional type-argument list
+    /// against the declaration's formal `type_params` and build a
+    /// SubstitutionMap from formal type_var -> concrete arg. Emits
+    /// rich diagnostics for arity mismatch / non-parametric
+    /// instantiation, and falls back to the best partial
+    /// substitution so downstream field checks still surface useful
+    /// errors instead of cascading silence.
+    fn buildStructLiteralInstantiation(
+        self: *TypeChecker,
+        struct_expr: ast.StructExpr,
+        struct_type: Type.StructType,
+        type_name_id: ast.StringId,
+    ) !StructLiteralInstantiation {
+        var instantiation: StructLiteralInstantiation = .{
+            .substitution = SubstitutionMap.init(self.allocator),
+            .literal_type_id = self.store.name_to_type.get(type_name_id) orelse TypeStore.UNKNOWN,
+        };
+
+        const formal_arity = struct_type.type_params.len;
+        const provided_arity = struct_expr.type_args.len;
+
+        // Concrete struct literal: empty subst, return declaration id.
+        if (formal_arity == 0 and provided_arity == 0) return instantiation;
+
+        // Non-parametric struct that was passed `(...)` anyway.
+        if (formal_arity == 0 and provided_arity > 0) {
+            const struct_name_text = self.interner.get(type_name_id);
+            try self.reportNonParametricInstantiation(struct_name_text, provided_arity, struct_expr.meta.span);
+            return instantiation;
+        }
+
+        // Parametric struct with no explicit `(...)` at the literal.
+        // 1.1.5.c will add HIR-side context-driven inference (target
+        // type annotations, function return types); here in the
+        // type-checker we accept the missing args and leave every
+        // formal type_var unbound — downstream field validation
+        // therefore behaves exactly as it did before this commit
+        // (field types stay as type_vars and the unify path is
+        // permissive). This is intentionally additive: parametric
+        // structs without explicit type-args at the literal must
+        // still type-check today so existing impl bodies, which
+        // never write the type-arg syntax, keep working.
+        if (formal_arity > 0 and provided_arity == 0) return instantiation;
+
+        // Arity mismatch.
+        if (formal_arity != provided_arity) {
+            const struct_name_text = self.interner.get(type_name_id);
+            try self.reportParametricArityMismatch(struct_name_text, formal_arity, provided_arity, struct_expr.meta.span);
+            // Still try to bind whatever positions we can — gives
+            // better cascading diagnostics on the field expressions.
+        }
+
+        // Resolve each type-arg expression and bind it against the
+        // matching formal type_var. Extra args are ignored beyond
+        // `formal_arity`; missing args leave the corresponding formal
+        // unbound. Both shapes already triggered a diagnostic above.
+        const pair_count = @min(formal_arity, provided_arity);
+        var resolved_args: std.ArrayList(TypeId) = .empty;
+        for (struct_expr.type_args, 0..) |type_arg_expr, idx| {
+            const resolved_arg = try self.resolveTypeExpr(type_arg_expr);
+            try resolved_args.append(self.allocator, resolved_arg);
+            if (idx < pair_count) {
+                const formal_type_id = struct_type.type_params[idx];
+                const formal_typ = self.store.getType(formal_type_id);
+                if (formal_typ == .type_var) {
+                    instantiation.substitution.bind(formal_typ.type_var, resolved_arg);
+                }
+            }
+        }
+
+        // Build the canonical `.applied { base, args }` instance for
+        // this literal. We always materialise it — even on arity
+        // mismatch — so downstream consumers see a concrete TypeId
+        // instead of falling back to the bare declaration.
+        const base_type_id = self.store.name_to_type.get(type_name_id) orelse TypeStore.UNKNOWN;
+        const args_slice = try resolved_args.toOwnedSlice(self.allocator);
+        instantiation.literal_type_id = try self.store.addType(.{
+            .applied = .{
+                .base = base_type_id,
+                .args = args_slice,
+            },
+        });
+        return instantiation;
+    }
+
+    /// Diagnostic for `Plain(i64)` when `Plain` has no type
+    /// parameters declared.
+    fn reportNonParametricInstantiation(
+        self: *TypeChecker,
+        name: []const u8,
+        actual: usize,
+        span: ast.SourceSpan,
+    ) !void {
+        try self.addRichError(
+            try std.fmt.allocPrint(
+                self.allocator,
+                "`{s}` does not take type parameters",
+                .{name},
+            ),
+            span,
+            try std.fmt.allocPrint(
+                self.allocator,
+                "applied {d} type argument{s} to a concrete type",
+                .{ actual, if (actual == 1) "" else "s" },
+            ),
+            try std.fmt.allocPrint(
+                self.allocator,
+                "drop the parenthesised type arguments — `{s}` is not parametric",
+                .{name},
+            ),
+        );
     }
 
     /// Snapshot of an entry list captured from `type_var_scope` so a
@@ -4991,22 +5194,38 @@ pub const TypeChecker = struct {
                         if (typ == .struct_type) {
                             // Validate required fields are provided
                             const st = typ.struct_type;
+
+                            // Parametric instantiation: build the
+                            // substitution map mapping formal type
+                            // parameters to the concrete type
+                            // arguments supplied at the literal. The
+                            // map stays empty (and substitution is a
+                            // no-op) for concrete structs.
+                            var instantiation = try self.buildStructLiteralInstantiation(se, st, type_name_id);
+                            defer instantiation.deinit();
+
                             for (st.fields) |req_field| {
                                 var found = false;
                                 for (se.fields) |provided| {
                                     if (provided.name == req_field.name) {
                                         try self.ensureClosureValueCanEscape(provided.value, "struct field storage");
                                         found = true;
-                                        // Check field value type
+                                        // Apply the per-instantiation
+                                        // substitution before comparing
+                                        // against the supplied value's
+                                        // type. For non-parametric
+                                        // structs the map is empty and
+                                        // `applyToType` is a pass-through.
+                                        const expected_type = instantiation.substitution.applyToType(self.store, req_field.type_id);
                                         const val_type = try self.inferExpr(provided.value);
-                                        if (val_type != TypeStore.UNKNOWN and req_field.type_id != TypeStore.UNKNOWN and
-                                            !self.store.typeEquals(val_type, req_field.type_id) and
-                                            !self.acceptsIntegerLiteralForExpectedType(provided.value, req_field.type_id))
+                                        if (val_type != TypeStore.UNKNOWN and expected_type != TypeStore.UNKNOWN and
+                                            !self.store.typeEquals(val_type, expected_type) and
+                                            !self.acceptsIntegerLiteralForExpectedType(provided.value, expected_type))
                                         {
                                             try self.addRichError(
                                                 try std.fmt.allocPrint(self.allocator, "field `{s}` expects `{s}`, got `{s}`", .{
                                                     self.interner.get(req_field.name),
-                                                    self.typeToString(req_field.type_id),
+                                                    self.typeToString(expected_type),
                                                     self.typeToString(val_type),
                                                 }),
                                                 provided.value.getMeta().span,
@@ -5097,7 +5316,14 @@ pub const TypeChecker = struct {
                             if (self.resolveFirstClassFunctionStructType()) |function_type_id| {
                                 try self.validateStaticFunctionStructExpr(se, function_type_id);
                             }
-                            return tid;
+                            // For a parametric instantiation
+                            // `%Box(i64){...}` the literal's *type*
+                            // is the applied form `Box(i64)`, not the
+                            // bare declaration TypeId. Concrete
+                            // structs keep returning the declaration
+                            // TypeId so existing call-sites are
+                            // unchanged.
+                            return instantiation.literal_type_id;
                         }
                     }
                 }
@@ -5863,8 +6089,40 @@ pub const TypeChecker = struct {
                         return tid;
                     }
                 }
-                // Check user-defined types registered in TypeStore
+                // Check user-defined types registered in TypeStore.
+                // A parametric struct/union (e.g. `Box(T)`) accepts
+                // generic application here: `Box(i64)` resolves to
+                // `.applied { base = BoxStruct, args = [I64] }`.
+                // Bare references like `Box` (no args) keep the
+                // existing behavior — the type stays in declaration
+                // form so monomorphisation can pick the specialisation
+                // later.
                 if (self.store.name_to_type.get(tn.name)) |tid| {
+                    if (tn.args.len > 0) {
+                        const formal_arity = self.parametricTypeArity(tid);
+                        if (formal_arity == 0) {
+                            try self.reportNonParametricInstantiation(name, tn.args.len, type_expr.getMeta().span);
+                            return tid;
+                        }
+                        if (formal_arity != tn.args.len) {
+                            try self.reportParametricArityMismatch(name, formal_arity, tn.args.len, type_expr.getMeta().span);
+                            // Fall through and still build an applied
+                            // type with whatever args the user wrote
+                            // so downstream inference has something
+                            // concrete to consume — the diagnostic
+                            // already pins the mistake to the source.
+                        }
+                        var arg_types: std.ArrayList(TypeId) = .empty;
+                        for (tn.args) |arg| {
+                            try arg_types.append(self.allocator, try self.resolveTypeExpr(arg));
+                        }
+                        return try self.store.addType(.{
+                            .applied = .{
+                                .base = tid,
+                                .args = try arg_types.toOwnedSlice(self.allocator),
+                            },
+                        });
+                    }
                     return tid;
                 }
                 if (resolved_builtin_or_meta) |tid| {
@@ -10507,6 +10765,159 @@ test "applyToType substitutes through nested applied type args" {
     try std.testing.expectEqual(option_base, inner.applied.base);
     try std.testing.expectEqual(@as(usize, 1), inner.applied.args.len);
     try std.testing.expectEqual(TypeStore.I64, inner.applied.args[0]);
+}
+
+test "parametric struct literal type-checks field expr against substituted type" {
+    // `%Box(i64){value: 42}` should accept — the literal `42` types
+    // as i64 which matches the substituted field type. The literal
+    // also receives the canonical `Box(i64)` (`.applied`) TypeId.
+    const source =
+        \\pub struct Box(T) {
+        \\  value :: T
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Box {
+        \\    %Box(i64){value: 42}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "parametric struct literal rejects field expr of the wrong substituted type" {
+    // `%Box(i64){value: \"hi\"}` must surface a clear type-mismatch
+    // diagnostic — the substitution rewrites `T` to `i64`, but the
+    // value is a String.
+    const source =
+        \\pub struct Box(T) {
+        \\  value :: T
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Box {
+        \\    %Box(i64){value: "hi"}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found_substituted_diag = false;
+    for (checker.errors.items) |type_err| {
+        if (std.mem.indexOf(u8, type_err.message, "expects `i64`") != null and
+            std.mem.indexOf(u8, type_err.message, "got `String`") != null)
+        {
+            found_substituted_diag = true;
+        }
+    }
+    try std.testing.expect(found_substituted_diag);
+}
+
+test "parametric type expression with wrong arity emits diagnostic" {
+    // `Box(i64, String)` for a `Box(T)` declaration: one type
+    // parameter expected, two supplied.
+    const source =
+        \\pub struct Box(T) {
+        \\  value :: T
+        \\}
+        \\pub struct Demo {
+        \\  pub fn take(box :: Box(i64, String)) -> i64 { 0 }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found_arity_diag = false;
+    for (checker.errors.items) |type_err| {
+        if (std.mem.indexOf(u8, type_err.message, "expects 1 type parameter") != null and
+            std.mem.indexOf(u8, type_err.message, "got 2") != null)
+        {
+            found_arity_diag = true;
+        }
+    }
+    try std.testing.expect(found_arity_diag);
+}
+
+test "applying type arguments to a non-parametric struct emits diagnostic" {
+    // `Plain` has no type parameters; `Plain(i64)` is a use-site
+    // error.
+    const source =
+        \\pub struct Plain { value :: i64 }
+        \\pub struct Demo {
+        \\  pub fn take(p :: Plain(i64)) -> i64 { 0 }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found_non_parametric_diag = false;
+    for (checker.errors.items) |type_err| {
+        if (std.mem.indexOf(u8, type_err.message, "does not take type parameters") != null) {
+            found_non_parametric_diag = true;
+        }
+    }
+    try std.testing.expect(found_non_parametric_diag);
 }
 
 test "applied type instantiations dedupe by base and args" {
