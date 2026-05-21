@@ -10846,6 +10846,63 @@ test "parametric struct literal rejects field expr of the wrong substituted type
     try std.testing.expect(found_substituted_diag);
 }
 
+test "parametric struct literal substituted-type diagnostic points at the value expression" {
+    // The substituted field-type diagnostic must caret the supplied
+    // value (\"hi\"), not the struct literal or the field name —
+    // matches the existing concrete struct-field-mismatch UX so the
+    // user sees `^^^^` directly under the offending expression.
+    const source =
+        \\pub struct Box(T) {
+        \\  value :: T
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Box {
+        \\    %Box(i64){value: "hi"}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    // Locate the struct literal expression so we can read the
+    // expected value-span directly off the AST.
+    const demo = program.structs[1];
+    var value_span: ?ast.SourceSpan = null;
+    for (demo.items) |item| {
+        if (item != .function) continue;
+        const body = item.function.clauses[0].body orelse continue;
+        if (body.len != 1) continue;
+        const expr = body[0].expr;
+        if (expr.* != .struct_expr) continue;
+        if (expr.struct_expr.fields.len == 0) continue;
+        value_span = expr.struct_expr.fields[0].value.getMeta().span;
+    }
+    const expected_span = value_span orelse return error.TestExpectedStructLiteralValue;
+
+    var matched_span = false;
+    for (checker.errors.items) |type_err| {
+        if (std.mem.indexOf(u8, type_err.message, "expects `i64`") == null) continue;
+        if (type_err.span.start == expected_span.start and type_err.span.end == expected_span.end) {
+            matched_span = true;
+        }
+    }
+    try std.testing.expect(matched_span);
+}
+
 test "parametric type expression with wrong arity emits diagnostic" {
     // `Box(i64, String)` for a `Box(T)` declaration: one type
     // parameter expected, two supplied.
@@ -10883,6 +10940,56 @@ test "parametric type expression with wrong arity emits diagnostic" {
         }
     }
     try std.testing.expect(found_arity_diag);
+}
+
+test "applyToType rewrites tagged-union variant payload type via substitution" {
+    // For `Option(T) { Some :: T, None }`, the registered
+    // TaggedUnionType records `type_params = [T_var]` and the
+    // `Some` variant's payload is `T_var`. A SubstitutionMap
+    // binding `T_var -> i64` therefore rewrites that payload to
+    // `i64` when the variant payload TypeId is run through
+    // `applyToType`. This is the same machinery struct literals
+    // use; verifying it for tagged unions ensures 1.1.5.c can
+    // reuse the substitution map verbatim for union construction.
+    const source =
+        \\pub union Option(T) {
+        \\  Some :: T
+        \\  None
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const option_name = parser.interner.lookupExisting("Option") orelse return error.TestExpectedOptionName;
+    const option_type_id = checker.store.name_to_type.get(option_name) orelse return error.TestExpectedOptionTypeId;
+    const option_type = checker.store.getType(option_type_id).tagged_union;
+
+    const formal_type_id = option_type.type_params[0];
+    const formal_var_id = checker.store.getType(formal_type_id).type_var;
+
+    const some_payload_type_id = option_type.variants[0].type_id orelse
+        return error.TestExpectedSomePayload;
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+    subs.bind(formal_var_id, TypeStore.I64);
+
+    const substituted = subs.applyToType(checker.store, some_payload_type_id);
+    try std.testing.expectEqual(TypeStore.I64, substituted);
 }
 
 test "applying type arguments to a non-parametric struct emits diagnostic" {
