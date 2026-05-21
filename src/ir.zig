@@ -7719,6 +7719,23 @@ pub const IrBuilder = struct {
     fn isArcManagedZigType(self: *const IrBuilder, type_expr: ZigType) bool {
         return switch (type_expr) {
             .list, .map => true,
+            // Phase 1.2.5.c boundary: `.protocol_box` is *owning* —
+            // the box's `data_ptr` is a heap-allocated cell created
+            // through `ArcRuntime.allocAny` — but its release path
+            // is NOT the standard `retainAny`/`releaseAny` ABI. The
+            // box's drop must dispatch through the vtable's
+            // synthetic `__drop__` slot so the inner's concrete-
+            // type-specific drop glue runs. That dispatch is
+            // Phase 1.2.5.d's consumption-site concern; until then,
+            // boxed inner values leak at scope-exit (a documented
+            // open follow-up in the phase report). Classifying
+            // `.protocol_box` as ARC-managed here would trigger
+            // `runtime.releaseAny(allocator, box_local)` emissions
+            // that don't match the box's actual layout (the box is
+            // a thin 16-byte fat-pointer value, not a slab-managed
+            // cell with an inline ArcHeader), so the
+            // construction-site lowering keeps it OUT of the
+            // ARC-managed set for now.
             .optional => |inner| self.isArcManagedZigType(inner.*),
             .ptr => |pointee| self.isArcManagedZigType(pointee.*),
             .struct_ref => |type_name| blk: {
