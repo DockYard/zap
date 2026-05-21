@@ -1188,7 +1188,11 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(v.expected);
         },
         .retain => |v| hasher.update(std.mem.asBytes(&v.value)),
-        .release => |v| hasher.update(std.mem.asBytes(&v.value)),
+        .release => |v| {
+            hasher.update(std.mem.asBytes(&v.value));
+            hasher.update(std.mem.asBytes(&v.kind));
+            if (v.protocol_name) |name| hasher.update(name);
+        },
         .reset => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(std.mem.asBytes(&v.source));

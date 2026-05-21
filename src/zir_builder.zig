@@ -8044,6 +8044,46 @@ pub const ZirDriver = struct {
                     return;
                 }
                 if (!self.shouldSkipArc(rel.value)) {
+                    // Phase 1.2.5.d: protocol-existential drops route
+                    // through the per-protocol synthetic
+                    // `<Protocol>VTable.drop(box)` helper rather than
+                    // the generic `releaseAny` dispatcher. The IR
+                    // builder's post-drop-insertion rewrite pass
+                    // (`rewriteProtocolBoxReleases`) flipped the
+                    // release kind + stamped the protocol name on
+                    // every box-local release; reaching this branch
+                    // means we just need to find the helper and pass
+                    // the box value as its sole argument.
+                    if (rel.kind == .protocol_box_drop) {
+                        const protocol_name = rel.protocol_name orelse return error.EmitFailed;
+                        const vtable_module_name = try std.fmt.allocPrint(
+                            self.allocator,
+                            "{s}VTable",
+                            .{protocol_name},
+                        );
+                        defer self.allocator.free(vtable_module_name);
+
+                        const vtable_import = zir_builder_emit_import(
+                            self.handle,
+                            vtable_module_name.ptr,
+                            @intCast(vtable_module_name.len),
+                        );
+                        if (vtable_import == error_ref) return error.EmitFailed;
+
+                        const drop_fn = zir_builder_emit_field_val(
+                            self.handle,
+                            vtable_import,
+                            "drop",
+                            4,
+                        );
+                        if (drop_fn == error_ref) return error.EmitFailed;
+
+                        const box_ref = self.refForLocal(rel.value) catch return;
+                        const drop_args = [_]u32{box_ref};
+                        _ = zir_builder_emit_call_ref(self.handle, drop_fn, &drop_args, 1);
+                        return;
+                    }
+
                     // Phase 2 Class B: dispatch on the IR-level kind
                     // enum so callers control deep vs shallow free
                     // semantics rather than every release-emission
@@ -8059,6 +8099,7 @@ pub const ZirDriver = struct {
                     const helper_name: []const u8 = switch (rel.kind) {
                         .release => "releaseAny",
                         .free => "freeAny",
+                        .protocol_box_drop => unreachable, // handled above
                     };
                     const val_ref = self.refForLocal(rel.value) catch return;
 

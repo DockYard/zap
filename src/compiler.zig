@@ -8905,6 +8905,17 @@ fn runArcScopeExitDropInsertion(
         // classification, which remains stable after the scope-exit
         // rewrite.
         zap.arc_drop_insertion.insertTupleComponentReleases(alloc, function, fn_ownership) catch return error.OutOfMemory;
+        // Phase 1.2.5.d: re-tag every release whose target local is a
+        // known protocol existential so the ZIR backend lowers it
+        // through the synthetic `<Protocol>VTable.drop(box)` helper
+        // instead of the generic `releaseAny` dispatcher (which
+        // would mis-interpret the box's fat-pointer layout). The
+        // sidecar map `function.protocol_box_locals` was populated
+        // by the IR builder at function-build time; this pass
+        // walks every release (including the ones the scope-exit
+        // pass just inserted) and flips the `kind` + `protocol_name`
+        // payload where the value local hits the sidecar.
+        zap.arc_drop_insertion.rewriteProtocolBoxReleases(function);
     }
 }
 

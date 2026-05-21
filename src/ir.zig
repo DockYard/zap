@@ -627,6 +627,27 @@ pub const Function = struct {
     /// Phase E's verifier checks every `ret` instruction's source
     /// against this convention.
     result_convention: ResultConvention = .trivial,
+    /// Phase 1.2.5.d sidecar — for every local in this function whose
+    /// tracked Zig type is `.protocol_box(P)`, maps `LocalId` ->
+    /// bare protocol name `P`. Populated by the IR builder whenever
+    /// a `box_as_protocol` produces a dest, a `param_get` reads a
+    /// protocol-existential param, a `field_get` extracts a
+    /// protocol-existential field, a `local_get` aliases one, or
+    /// any other propagation that mutates `known_local_types`. The
+    /// post-drop-insertion rewrite pass consults this map to flip
+    /// `.release{value=L, kind=.release}` instructions targeting a
+    /// known box-local to `.release{value=L, kind=.protocol_box_drop,
+    /// protocol_name=P}`, so the ZIR backend lowers them through
+    /// the synthetic `<Protocol>VTable.drop(box)` helper rather than
+    /// the standard `releaseAny(box)` dispatcher (which would
+    /// mis-interpret the 16-byte fat pointer as a slab-managed
+    /// cell).
+    ///
+    /// Empty when the function doesn't traffic in any protocol
+    /// existentials — the most common case. Carried by-value (no
+    /// pointer) so the post-drop rewrite is a single map lookup
+    /// per release with no extra indirection.
+    protocol_box_locals: std.AutoHashMapUnmanaged(LocalId, []const u8) = .empty,
 };
 
 fn cloneFunction(allocator: std.mem.Allocator, function: Function) CloneError!Function {
@@ -654,7 +675,21 @@ fn cloneFunction(allocator: std.mem.Allocator, function: Function) CloneError!Fu
         .param_conventions = try clonePlainSlice(ParamConvention, allocator, function.param_conventions),
         .local_ownership = try cloneMutableSlice(OwnershipClass, allocator, function.local_ownership),
         .result_convention = function.result_convention,
+        .protocol_box_locals = try cloneProtocolBoxLocals(allocator, function.protocol_box_locals),
     };
+}
+
+fn cloneProtocolBoxLocals(
+    allocator: std.mem.Allocator,
+    src: std.AutoHashMapUnmanaged(LocalId, []const u8),
+) CloneError!std.AutoHashMapUnmanaged(LocalId, []const u8) {
+    var out: std.AutoHashMapUnmanaged(LocalId, []const u8) = .empty;
+    var iter = src.iterator();
+    while (iter.next()) |entry| {
+        const name_copy = try cloneBytes(allocator, entry.value_ptr.*);
+        try out.put(allocator, entry.key_ptr.*, name_copy);
+    }
+    return out;
 }
 
 fn cloneDefaultValues(allocator: std.mem.Allocator, values: []const DefaultValue) CloneError![]const DefaultValue {
@@ -960,10 +995,14 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
         .bin_slice,
         .bin_read_utf8,
         .retain,
-        .release,
         .reset,
         .dbg_stmt,
         => instruction,
+        .release => |value| .{ .release = .{
+            .value = value.value,
+            .kind = value.kind,
+            .protocol_name = try cloneOptionalBytes(allocator, value.protocol_name),
+        } },
         .dbg_var => |value| .{ .dbg_var = .{
             .name = try cloneBytes(allocator, value.name),
             .value = value.value,
@@ -2341,6 +2380,16 @@ pub const ReleaseKind = enum {
     /// children were already extracted and consumed by inner
     /// calls. Lowers to `ArcRuntime.freeAny`.
     free,
+    /// Phase 1.2.5.d protocol-existential drop. Routes the release
+    /// through the per-protocol synthetic `<Protocol>VTable.drop(box)`
+    /// helper rather than the standard `releaseAny` dispatcher. The
+    /// box is a 16-byte fat-pointer value-typed local — it has no
+    /// inline `ArcHeader`, so `releaseAny` would mis-interpret it.
+    /// `drop(box)` casts the vtable slot to `*const <Protocol>VTable`
+    /// and invokes the synthetic `__drop__` slot, which routes the
+    /// inner's typed pointer through `releaseProtocolBoxInner` to
+    /// run the full ARC deep-walk and slab return.
+    protocol_box_drop,
 };
 
 pub const Release = struct {
@@ -2352,6 +2401,13 @@ pub const Release = struct {
     /// specialization pass refines selected releases to `.free`
     /// when liveness proves the value is statically unique.
     kind: ReleaseKind = .release,
+    /// Phase 1.2.5.d — when `kind == .protocol_box_drop`, the bare
+    /// protocol name used to find the synthetic
+    /// `<Protocol>VTable.drop` helper. `null` for every other kind.
+    /// The IR builder fills this whenever it rewrites a release of a
+    /// `.protocol_box(P)` local; the ZIR lowering reads it back out
+    /// at emit time.
+    protocol_name: ?[]const u8 = null,
 };
 
 /// Perceus: if RC=1, make memory available for reuse and return a reuse token.
@@ -2483,6 +2539,33 @@ pub fn isArcManagedTypeId(type_store: *const types_mod.TypeStore, type_id: types
     //
     return switch (type_store.getType(type_id)) {
         .opaque_type, .map, .list => true,
+        // Phase 1.2.5.d: protocol existentials are owning — every box
+        // value carries a heap-allocated typed inner whose release is
+        // dispatched through the synthetic `<Protocol>VTable.drop(box)`
+        // helper. Treating non-parametric `.protocol_constraint` as
+        // ARC-managed here is what flips `isArcManagedLocal(box_local)`
+        // to true, which in turn drives `arc_managed_locals` membership
+        // in the liveness pass and
+        // `local_ownership[box_local] = .owned` in
+        // `computeLocalOwnership`. Together those make
+        // `arc_drop_insertion` schedule a scope-exit release for the
+        // box — the release the IR builder rewrites to
+        // `.kind = .protocol_box_drop` so the ZIR backend lowers it
+        // through `drop(box)` instead of `releaseAny(box)`.
+        //
+        // Parametric protocol constraints (`Enumerable(t)`,
+        // `Iterator(K, V)`) are deliberately EXCLUDED: their
+        // per-protocol vtable + per-impl adapter codegen is still
+        // gated off in `populateProtocolVTables`
+        // (`if (proto_entry.decl.type_params.len != 0) continue;`),
+        // so no `<Protocol>VTable.drop` helper exists for them. The
+        // existing HIR `protocolDispatchStruct` rewrite folds parametric
+        // protocol calls to concrete-impl calls before IR sees them, so
+        // their receivers never actually flow through a `ProtocolBox`
+        // value — classifying them as ARC-managed would be a
+        // diagnostic-only no-op at best and trip the V11 verifier on
+        // share_value of trivial-classified arguments at worst.
+        .protocol_constraint => |pc| pc.type_params.len == 0,
         .struct_type => structTypeUsesRecursiveBoxing(type_store, type_id),
         .union_type => |union_type| blk: {
             for (union_type.members) |member_type_id| {
@@ -3882,6 +3965,7 @@ pub const IrBuilder = struct {
             .param_conventions = param_conventions,
             .local_ownership = local_ownership,
             .result_convention = result_convention,
+            .protocol_box_locals = try self.snapshotProtocolBoxLocals(),
         });
     }
 
@@ -4339,6 +4423,7 @@ pub const IrBuilder = struct {
             .param_conventions = param_conventions,
             .local_ownership = local_ownership,
             .result_convention = result_convention,
+            .protocol_box_locals = try self.snapshotProtocolBoxLocals(),
         });
 
         // Generate a `__try` variant whenever the catch-basin pipeline asked
@@ -4480,6 +4565,7 @@ pub const IrBuilder = struct {
                 .param_conventions = try_param_conventions,
                 .local_ownership = try_local_ownership,
                 .result_convention = try_result_convention,
+                .protocol_box_locals = try self.snapshotProtocolBoxLocals(),
             });
         }
     }
@@ -7873,26 +7959,63 @@ pub const IrBuilder = struct {
         return if (self.isArcManagedZigType(param.type_expr)) .borrowed else .trivial;
     }
 
+    /// Phase 1.2.5.d helper: true iff the scope graph carries a
+    /// non-parametric `ProtocolEntry` matching `protocol_name_text`.
+    /// Used by `isArcManagedZigType` to gate protocol-box ARC
+    /// management on whether the protocol's vtable codegen is
+    /// active (it isn't yet for parametric protocols — see the
+    /// `populateProtocolVTables` parametric guard). Without this
+    /// gate, parametric-protocol receivers would route releases
+    /// through a `<Protocol>VTable.drop` helper that the per-impl
+    /// codegen never emitted, failing at Zig Sema time.
+    ///
+    /// Returns false (defensive) when the scope graph isn't wired,
+    /// when no protocol matches the name, or when the matched
+    /// protocol carries one or more type parameters.
+    fn protocolHasVTable(self: *const IrBuilder, protocol_name_text: []const u8) bool {
+        const graph = self.scope_graph orelse return false;
+        for (graph.protocols.items) |proto_entry| {
+            if (proto_entry.decl.type_params.len != 0) continue;
+            const text = self.protocolNameToString(proto_entry.name);
+            if (std.mem.eql(u8, text, protocol_name_text)) return true;
+        }
+        return false;
+    }
+
     fn isArcManagedZigType(self: *const IrBuilder, type_expr: ZigType) bool {
         return switch (type_expr) {
             .list, .map => true,
-            // Phase 1.2.5.c boundary: `.protocol_box` is *owning* —
-            // the box's `data_ptr` is a heap-allocated cell created
-            // through `ArcRuntime.allocAny` — but its release path
-            // is NOT the standard `retainAny`/`releaseAny` ABI. The
-            // box's drop must dispatch through the vtable's
-            // synthetic `__drop__` slot so the inner's concrete-
-            // type-specific drop glue runs. That dispatch is
-            // Phase 1.2.5.d's consumption-site concern; until then,
-            // boxed inner values leak at scope-exit (a documented
-            // open follow-up in the phase report). Classifying
-            // `.protocol_box` as ARC-managed here would trigger
-            // `runtime.releaseAny(allocator, box_local)` emissions
-            // that don't match the box's actual layout (the box is
-            // a thin 16-byte fat-pointer value, not a slab-managed
-            // cell with an inline ArcHeader), so the
-            // construction-site lowering keeps it OUT of the
-            // ARC-managed set for now.
+            // Phase 1.2.5.d: non-parametric protocol existentials
+            // are owning — the box's `data_ptr` is a heap-allocated
+            // typed inner cell allocated through
+            // `ArcRuntime.allocAny`. Treating `.protocol_box` as
+            // ARC-managed here is what flips
+            // `defaultParamConventionForParam` to `.borrowed` for
+            // protocol-existential params and makes
+            // `arc_drop_insertion` schedule a scope-exit release.
+            // The IR builder rewrites the scheduled release's kind
+            // to `.protocol_box_drop` and stamps the protocol name
+            // (see `rewriteProtocolBoxReleases`) so the ZIR backend
+            // lowers the release through the synthetic
+            // `<Protocol>VTable.drop(box)` helper instead of the
+            // standard `releaseAny(box)` dispatcher (the box is a
+            // thin 16-byte fat-pointer value, not a slab-managed
+            // cell with an inline ArcHeader, so `releaseAny` would
+            // mis-interpret it).
+            //
+            // Parametric protocols (Enumerable(t), Iterator(K, V))
+            // still lower their constrained-receiver positions to
+            // `.protocol_box(<name>)` for ZIR typing, but
+            // `populateProtocolVTables` doesn't yet emit a vtable
+            // for them — and the existing HIR
+            // `protocolDispatchStruct` rewrite folds parametric
+            // protocol calls to concrete-impl calls before IR sees
+            // them, so their values never actually flow through a
+            // ProtocolBox at runtime. Classifying their box-typed
+            // ZigType as ARC-managed would route `arc_drop_insertion`
+            // toward a `drop` helper that doesn't exist; explicitly
+            // exclude them here by consulting the scope graph.
+            .protocol_box => |protocol_name| self.protocolHasVTable(protocol_name),
             .optional => |inner| self.isArcManagedZigType(inner.*),
             .ptr => |pointee| self.isArcManagedZigType(pointee.*),
             .struct_ref => |type_name| blk: {
@@ -8239,7 +8362,7 @@ pub const IrBuilder = struct {
     /// and impl targets) return the leaf; multi-segment names join
     /// with `_` to keep the result a valid Zig identifier without
     /// re-running the per-segment mangler.
-    fn protocolNameToString(self: *IrBuilder, name: ast.StructName) []const u8 {
+    fn protocolNameToString(self: *const IrBuilder, name: ast.StructName) []const u8 {
         if (name.parts.len == 1) return self.interner.get(name.parts[0]);
         return name.joinedWith(self.allocator, self.interner, "_") catch
             self.interner.get(name.parts[name.parts.len - 1]);
@@ -8540,6 +8663,41 @@ pub const IrBuilder = struct {
         var index: u32 = 0;
         while (index < local_count) : (index += 1) {
             out[index] = if (self.isArcManagedLocal(index)) .owned else .trivial;
+        }
+        return out;
+    }
+
+    /// Phase 1.2.5.d sidecar. Snapshot `known_local_types` for every
+    /// local whose tracked Zig type is `.protocol_box(P)` and return
+    /// a fresh `AutoHashMapUnmanaged` mapping LocalId -> bare
+    /// protocol name. The map is owned by the function's allocator
+    /// and lives as long as the IR program does — the post-drop
+    /// rewrite pass consults it to flip the kind on box-local
+    /// releases without needing to re-walk the type tables.
+    ///
+    /// Returns an empty map when no boxed locals exist (the common
+    /// case for functions that don't traffic in protocol
+    /// existentials).
+    fn snapshotProtocolBoxLocals(
+        self: *IrBuilder,
+    ) !std.AutoHashMapUnmanaged(LocalId, []const u8) {
+        var out: std.AutoHashMapUnmanaged(LocalId, []const u8) = .empty;
+        var iter = self.known_local_types.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* != .protocol_box) continue;
+            const protocol_name = entry.value_ptr.protocol_box;
+            // Skip parametric protocols — their vtable codegen is
+            // still gated off (see `populateProtocolVTables`), so no
+            // `<Protocol>VTable.drop` helper exists to route their
+            // releases through. The same parametric-protocol guard
+            // also protects `isArcManagedZigType` from classifying
+            // their box-typed locals as ARC-managed, so reaching
+            // the sidecar with a parametric entry would be dead —
+            // but the explicit check keeps the snapshot consistent
+            // with the release-rewrite contract.
+            if (!self.protocolHasVTable(protocol_name)) continue;
+            const protocol_name_copy = try cloneBytes(self.allocator, protocol_name);
+            try out.put(self.allocator, entry.key_ptr.*, protocol_name_copy);
         }
         return out;
     }

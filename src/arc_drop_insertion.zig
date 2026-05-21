@@ -2000,6 +2000,118 @@ fn isBorrowedLocal(
 }
 
 // ============================================================
+// Phase 1.2.5.d: rewrite protocol-box releases
+// ============================================================
+
+/// Walk every `release` instruction in the function and flip its
+/// `kind` to `.protocol_box_drop` (with the correct `protocol_name`)
+/// when the target local is a known protocol existential — that is,
+/// when `function.protocol_box_locals` carries an entry for the
+/// release's value local.
+///
+/// Why this pass is necessary: `insertScopeExitDrops` emits raw
+/// `.release` instructions for every ARC-managed local at every
+/// ret-equivalent terminator. The IR-level Release kind defaults to
+/// `.release`, which lowers in the ZIR backend to a
+/// `runtime.ArcRuntime.releaseAny(allocator, value)` call. That
+/// dispatcher expects the local to be a slab-managed cell with an
+/// inline ArcHeader — but a `ProtocolBox` is a 16-byte fat-pointer
+/// value with no header. Routing the release through `releaseAny`
+/// would mis-interpret the box's `data_ptr` field as a header and
+/// either crash or silently double-free.
+///
+/// The correct lowering for a protocol-box release is
+/// `@import("<Protocol>VTable").drop(box)`, which casts the box's
+/// vtable slot to the protocol's typed vtable, invokes the
+/// synthetic `__drop__` slot, and lets the per-impl adapter
+/// recover the typed inner pointer to feed
+/// `releaseProtocolBoxInner` — the existing ARC deep-walk +
+/// slab-return path scoped to the concrete inner type.
+///
+/// Running this rewrite as a SEPARATE pass after
+/// `insertScopeExitDrops` keeps the drop-insertion pass type-blind
+/// and policy-agnostic; the box-specific routing belongs to the
+/// consumption-site lowering surface (Phase 1.2.5.d) rather than
+/// the analysis-driven drop scheduler.
+///
+/// Idempotent: re-running the pass against an already-rewritten
+/// function is a no-op because the second iteration's
+/// `kind != .release` skip-check fires.
+pub fn rewriteProtocolBoxReleases(function: *ir.Function) void {
+    if (function.protocol_box_locals.count() == 0) return;
+    for (function.body) |*block_const| {
+        const block: *ir.Block = @constCast(block_const);
+        rewriteProtocolBoxReleasesInStream(function, @constCast(block.instructions));
+    }
+}
+
+fn rewriteProtocolBoxReleasesInStream(
+    function: *const ir.Function,
+    stream: []ir.Instruction,
+) void {
+    for (stream) |*instr_ptr| {
+        switch (instr_ptr.*) {
+            .release => |rel| {
+                if (rel.kind != .release) continue;
+                const protocol_name = function.protocol_box_locals.get(rel.value) orelse continue;
+                instr_ptr.* = .{ .release = .{
+                    .value = rel.value,
+                    .kind = .protocol_box_drop,
+                    .protocol_name = protocol_name,
+                } };
+            },
+            .if_expr => |*ie| {
+                rewriteProtocolBoxReleasesInStream(function, @constCast(ie.then_instrs));
+                rewriteProtocolBoxReleasesInStream(function, @constCast(ie.else_instrs));
+            },
+            .case_block => |*cb| {
+                rewriteProtocolBoxReleasesInStream(function, @constCast(cb.pre_instrs));
+                for (cb.arms) |*arm_const| {
+                    const arm: *ir.IrCaseArm = @constCast(arm_const);
+                    rewriteProtocolBoxReleasesInStream(function, @constCast(arm.cond_instrs));
+                    rewriteProtocolBoxReleasesInStream(function, @constCast(arm.body_instrs));
+                }
+                rewriteProtocolBoxReleasesInStream(function, @constCast(cb.default_instrs));
+            },
+            .switch_literal => |*sl| {
+                for (sl.cases) |*c| {
+                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs));
+                }
+                rewriteProtocolBoxReleasesInStream(function, @constCast(sl.default_instrs));
+            },
+            .switch_return => |*sr| {
+                for (sr.cases) |*c| {
+                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs));
+                }
+                rewriteProtocolBoxReleasesInStream(function, @constCast(sr.default_instrs));
+            },
+            .union_switch_return => |*usr| {
+                for (usr.cases) |*c| {
+                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs));
+                }
+            },
+            .union_switch => |*us| {
+                for (us.cases) |*c| {
+                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs));
+                }
+            },
+            .optional_dispatch => |*od| {
+                rewriteProtocolBoxReleasesInStream(function, @constCast(od.nil_instrs));
+                rewriteProtocolBoxReleasesInStream(function, @constCast(od.struct_instrs));
+            },
+            .guard_block => |*gb| {
+                rewriteProtocolBoxReleasesInStream(function, @constCast(gb.body));
+            },
+            .try_call_named => |*tc| {
+                rewriteProtocolBoxReleasesInStream(function, @constCast(tc.handler_instrs));
+                rewriteProtocolBoxReleasesInStream(function, @constCast(tc.success_instrs));
+            },
+            else => {},
+        }
+    }
+}
+
+// ============================================================
 // Tests
 // ============================================================
 
