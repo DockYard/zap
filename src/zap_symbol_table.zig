@@ -97,6 +97,13 @@ pub const Entry = struct {
     zap_arity: u32,
 };
 
+fn containsStructName(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |candidate| {
+        if (std.mem.eql(u8, candidate, needle)) return true;
+    }
+    return false;
+}
+
 /// Incrementally constructs a `SymbolTable` during ZIR emission.
 /// `Builder.record` is called once per emitted function; `encode`
 /// writes the final binary blob.
@@ -145,6 +152,49 @@ pub const Builder = struct {
             .zap_local = local_copy,
             .zap_arity = zap_arity,
         });
+    }
+
+    /// Adopt entries from a previously-encoded sidecar blob that the
+    /// current selected-incremental rebuild did NOT re-emit. Phase 0
+    /// Gap B: the daemon's selected-update path only collects entries
+    /// for `selected_structs` (plus the synthetic root when
+    /// `include_root` is true); writing the encoded builder verbatim
+    /// would replace the on-disk sidecar with a strict subset and
+    /// erase every unchanged struct's entries. This method reads the
+    /// baseline blob and adopts every entry whose `zap_struct` is NOT
+    /// in `selected_structs` (and, for the entry-point case where
+    /// `zap_struct` is null, only when `include_root` is false). The
+    /// adopted entries keep the baseline's authoritative `mangled` /
+    /// `zap_local` / `zap_arity` triple.
+    ///
+    /// A null `baseline` is a valid first-build state and is a
+    /// no-op. A non-null but corrupt blob (bad magic, unsupported
+    /// version, truncated) bubbles up the underlying `Reader.ParseError`
+    /// so the caller can fall back to writing only the rebuild's
+    /// entries (i.e. invalidating the stale sidecar) instead of
+    /// silently producing a half-decoded result.
+    pub fn adoptFromSidecar(
+        self: *Builder,
+        baseline: ?[]const u8,
+        selected_structs: []const []const u8,
+        include_root: bool,
+    ) (Reader.ParseError || error{OutOfMemory})!void {
+        const blob = baseline orelse return;
+        const reader = try Reader.init(blob);
+        var index: u32 = 0;
+        while (index < reader.entry_count) : (index += 1) {
+            const view = reader.entry(index);
+            if (view.zap_struct) |existing_struct| {
+                // Drop baseline entries for any struct the rebuild
+                // re-emitted — the rebuild is authoritative for those.
+                if (containsStructName(selected_structs, existing_struct)) continue;
+            } else {
+                // Entry-point entries have a null `zap_struct`; the
+                // rebuild owns them when `include_root` is true.
+                if (include_root) continue;
+            }
+            try self.record(view.mangled, view.zap_struct, view.zap_local, view.zap_arity);
+        }
     }
 
     /// Strip Zap's `__<arity>` suffix from `local_name`. Convenience
@@ -525,4 +575,171 @@ test "Reader decodes from a byte-aligned buffer regardless of alignment" {
     try std.testing.expectEqualStrings("Mod", v.zap_struct.?);
     try std.testing.expectEqualStrings("fn", v.zap_local);
     try std.testing.expectEqual(@as(u32, 1), v.zap_arity);
+}
+
+// ---------------------------------------------------------------------------
+// Selected-incremental rebuild merge — Phase 0 Gap B
+// ---------------------------------------------------------------------------
+//
+// The daemon's selected-update path only emits ZIR for the changed structs
+// (plus, optionally, the synthetic root). The driver's in-memory builder
+// therefore only collects symbol-table entries for those selected structs
+// — a `Builder.encode()` from that driver would replace the on-disk
+// sidecar with a strict *subset* of the real symbol set and erase every
+// unchanged struct's entries from view. Phase-2's crash printer would
+// then degrade to mangled symbols for every previously-built struct.
+//
+// `Builder.adoptFromSidecar` reads the prior sidecar and adopts every
+// entry whose `zap_struct` (or, for the root entry-point case, `null`)
+// is NOT in the just-rebuilt selection — those entries are unchanged
+// and remain authoritative. The selected build's freshly-recorded
+// entries are kept in place. After this call, `encode()` produces a
+// merged sidecar that is byte-deterministic and complete with respect
+// to the unchanged baseline plus the selected rebuild.
+
+test "Builder.adoptFromSidecar carries forward unchanged-struct entries" {
+    // Baseline sidecar: full build covering three structs.
+    var baseline = Builder.init(std.testing.allocator);
+    defer baseline.deinit();
+    try baseline.record("Alpha.do__1", "Alpha", "do", 1);
+    try baseline.record("Beta.run__0", "Beta", "run", 0);
+    try baseline.record("Gamma.work__2", "Gamma", "work", 2);
+    try baseline.record("main", null, "main", 1);
+    const baseline_blob = try baseline.encode();
+    defer std.testing.allocator.free(baseline_blob);
+
+    // Selected rebuild that only re-emitted Beta. The driver collected
+    // a single fresh entry for Beta — Alpha, Gamma, and the root
+    // entry-point are untouched.
+    var rebuilt = Builder.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.record("Beta.run__0", "Beta", "run", 0);
+
+    const selected_structs = [_][]const u8{"Beta"};
+    try rebuilt.adoptFromSidecar(baseline_blob, &selected_structs, false);
+
+    const merged_blob = try rebuilt.encode();
+    defer std.testing.allocator.free(merged_blob);
+
+    const reader = try Reader.init(merged_blob);
+    try std.testing.expectEqual(@as(u32, 4), reader.entry_count);
+    // Beta came from the new driver build (re-recorded), Alpha/Gamma/main
+    // were adopted from the baseline sidecar.
+    try std.testing.expect(reader.findByMangled("Alpha.do__1") != null);
+    try std.testing.expect(reader.findByMangled("Beta.run__0") != null);
+    try std.testing.expect(reader.findByMangled("Gamma.work__2") != null);
+    try std.testing.expect(reader.findByMangled("main") != null);
+}
+
+test "Builder.adoptFromSidecar drops every entry from selected structs" {
+    // Baseline has two functions in Beta. The rebuild dropped one of
+    // them (renamed/deleted) and kept the other. The merged sidecar
+    // must reflect the rebuild's view of Beta — the dropped function
+    // must NOT be carried forward from the prior sidecar.
+    var baseline = Builder.init(std.testing.allocator);
+    defer baseline.deinit();
+    try baseline.record("Alpha.keep__0", "Alpha", "keep", 0);
+    try baseline.record("Beta.stale__1", "Beta", "stale", 1);
+    try baseline.record("Beta.survivor__2", "Beta", "survivor", 2);
+    const baseline_blob = try baseline.encode();
+    defer std.testing.allocator.free(baseline_blob);
+
+    var rebuilt = Builder.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.record("Beta.survivor__2", "Beta", "survivor", 2);
+    // Beta.stale was renamed/removed in this rebuild — must vanish.
+
+    const selected_structs = [_][]const u8{"Beta"};
+    try rebuilt.adoptFromSidecar(baseline_blob, &selected_structs, false);
+
+    const merged_blob = try rebuilt.encode();
+    defer std.testing.allocator.free(merged_blob);
+
+    const reader = try Reader.init(merged_blob);
+    try std.testing.expectEqual(@as(u32, 2), reader.entry_count);
+    try std.testing.expect(reader.findByMangled("Alpha.keep__0") != null);
+    try std.testing.expect(reader.findByMangled("Beta.survivor__2") != null);
+    try std.testing.expect(reader.findByMangled("Beta.stale__1") == null);
+}
+
+test "Builder.adoptFromSidecar honors include_root flag for entry-point entries" {
+    // When the synthetic root was part of the selected rebuild, the
+    // baseline's root entries (those with a null `zap_struct`) must be
+    // dropped — the rebuild speaks authoritatively for them. When the
+    // root was NOT in the rebuild, they must be adopted.
+    var baseline = Builder.init(std.testing.allocator);
+    defer baseline.deinit();
+    try baseline.record("Alpha.fn__0", "Alpha", "fn", 0);
+    try baseline.record("main", null, "main", 1);
+    const baseline_blob = try baseline.encode();
+    defer std.testing.allocator.free(baseline_blob);
+
+    // Case 1: include_root = true and the rebuild re-emitted main.
+    {
+        var rebuilt = Builder.init(std.testing.allocator);
+        defer rebuilt.deinit();
+        try rebuilt.record("main", null, "main", 1);
+
+        const selected_structs = [_][]const u8{};
+        try rebuilt.adoptFromSidecar(baseline_blob, &selected_structs, true);
+
+        const merged_blob = try rebuilt.encode();
+        defer std.testing.allocator.free(merged_blob);
+        const reader = try Reader.init(merged_blob);
+        try std.testing.expectEqual(@as(u32, 2), reader.entry_count);
+        try std.testing.expect(reader.findByMangled("Alpha.fn__0") != null);
+        try std.testing.expect(reader.findByMangled("main") != null);
+    }
+
+    // Case 2: include_root = false — adopt the baseline's `main` entry
+    // because the rebuild did not touch the root.
+    {
+        var rebuilt = Builder.init(std.testing.allocator);
+        defer rebuilt.deinit();
+
+        const selected_structs = [_][]const u8{"Alpha"};
+        try rebuilt.adoptFromSidecar(baseline_blob, &selected_structs, false);
+
+        const merged_blob = try rebuilt.encode();
+        defer std.testing.allocator.free(merged_blob);
+        const reader = try Reader.init(merged_blob);
+        try std.testing.expectEqual(@as(u32, 1), reader.entry_count);
+        // Alpha was selected but the rebuild recorded nothing — the
+        // old Alpha entry must have been dropped (the rebuild is
+        // authoritative for selected structs). main was untouched and
+        // must remain.
+        try std.testing.expect(reader.findByMangled("Alpha.fn__0") == null);
+        try std.testing.expect(reader.findByMangled("main") != null);
+    }
+}
+
+test "Builder.adoptFromSidecar tolerates empty / missing baseline blob" {
+    var rebuilt = Builder.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.record("Beta.run__0", "Beta", "run", 0);
+
+    // A null baseline (no prior sidecar) is a valid first-build state;
+    // the merge degrades to a pass-through. The resulting blob should
+    // contain exactly what the rebuild collected.
+    const selected_structs = [_][]const u8{"Beta"};
+    try rebuilt.adoptFromSidecar(null, &selected_structs, false);
+
+    const merged_blob = try rebuilt.encode();
+    defer std.testing.allocator.free(merged_blob);
+    const reader = try Reader.init(merged_blob);
+    try std.testing.expectEqual(@as(u32, 1), reader.entry_count);
+    try std.testing.expect(reader.findByMangled("Beta.run__0") != null);
+}
+
+test "Builder.adoptFromSidecar rejects a corrupt baseline blob" {
+    var rebuilt = Builder.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.record("Beta.run__0", "Beta", "run", 0);
+
+    // A baseline with bad magic must fail the merge — the caller's
+    // contract is to invalidate (delete) the sidecar in that case
+    // rather than silently lose entries.
+    const garbage = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const selected_structs = [_][]const u8{"Beta"};
+    try std.testing.expectError(error.BadMagic, rebuilt.adoptFromSidecar(&garbage, &selected_structs, false));
 }

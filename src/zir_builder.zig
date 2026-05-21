@@ -8641,6 +8641,17 @@ pub fn buildAndInjectSelected(
     progress: ?*progress_mod.Reporter,
     selected_structs: []const []const u8,
     include_root: bool,
+    /// Phase 0 — DWARF foundation (Gap B): when non-null, the encoded
+    /// reversible mangled-symbol ↔ Zap-symbol side table for the
+    /// freshly-emitted *selected* structs (plus the root when
+    /// `include_root` is true) is written here on success. The
+    /// resulting blob is a strict subset of the full symbol set — the
+    /// caller is responsible for adopting unchanged-struct entries
+    /// from the prior sidecar via
+    /// `zap_symbol_table.Builder.adoptFromSidecar` before encoding
+    /// the merged result. `null` means the caller does not want a
+    /// table (e.g. lib/obj outputs that have no sidecar).
+    out_symbol_table: ?*?[]u8,
 ) BuildError!void {
     var driver = try ZirDriver.init(allocator);
     driver.lib_mode = lib_mode;
@@ -8657,6 +8668,19 @@ pub fn buildAndInjectSelected(
         driver.deinit();
         return err;
     };
+
+    // Encode the symbol table BEFORE the injection step (which frees
+    // the driver's collected entries on the `include_root` path) so
+    // the caller can merge it with the prior sidecar baseline. A
+    // duplicate-mangled-name collision inside the selection is still
+    // fatal — that signals a real monomorphization bug.
+    if (out_symbol_table) |out_ptr| {
+        const encoded = driver.encodeSymbolTable() catch |err| {
+            driver.deinit();
+            return err;
+        };
+        out_ptr.* = encoded;
+    }
 
     if (include_root) {
         if (progress) |reporter| reporter.stage("ZIR: injecting selected modules and root", .{});

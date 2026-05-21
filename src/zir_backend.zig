@@ -13,6 +13,7 @@ const ZirContext = zir_builder.ZirContext;
 const ir = @import("ir.zig");
 const env = @import("env.zig");
 const progress_mod = @import("progress.zig");
+const zap_symbol_table = @import("zap_symbol_table.zig");
 
 // ---------------------------------------------------------------------------
 // Extern declarations for the C-ABI functions in libzig_compiler.a
@@ -761,6 +762,30 @@ pub fn injectPreparedAndUpdate(allocator: std.mem.Allocator, program: ir.Program
 }
 
 /// Inject only the prepared modules and run the incremental update.
+///
+/// Phase 0 — DWARF foundation (Gap B): the selected-incremental path
+/// emits ZIR (and therefore collects symbol-table entries) only for
+/// the structs in `struct_names` plus, when `include_root` is true,
+/// the synthetic root. The driver's symbol table is therefore a
+/// strict subset of the full set the user binary actually links.
+/// Writing it verbatim over the prior `<artifact>.zap-symbols` sidecar
+/// would erase every unchanged struct's entries — Phase-2's crash
+/// printer would then degrade to mangled symbols across the rest of
+/// the program after the very first selected rebuild.
+///
+/// To stay correct, this routine reads the prior sidecar (if any),
+/// adopts every entry whose `zap_struct` is NOT in the just-rebuilt
+/// selection (and, for the entry-point case, whose status follows
+/// `include_root`), merges those adopted entries with the rebuild's
+/// freshly-recorded entries, and writes the resulting deterministic
+/// blob back to the sidecar path. The result is byte-identical to
+/// what a full rebuild against the same `ir.Program` would have
+/// emitted.
+///
+/// A corrupt or missing prior sidecar is recovered by the production-
+/// safe fallback (option (b) in the gap analysis): the sidecar is
+/// removed entirely so external tooling treats the binary as
+/// unsymbolicated rather than displaying stale Zap names.
 pub fn injectPreparedSelectedAndUpdate(
     allocator: std.mem.Allocator,
     program: ir.Program,
@@ -770,6 +795,10 @@ pub fn injectPreparedSelectedAndUpdate(
     include_root: bool,
 ) CompileError!void {
     const lib_mode = options.output_mode == 1;
+    const want_sidecar = options.emit_symbol_table_sidecar and options.output_mode == 0 and options.output_path.len > 0;
+    var rebuilt_symbol_table_bytes: ?[]u8 = null;
+    defer if (rebuilt_symbol_table_bytes) |bytes| allocator.free(bytes);
+    const out_sym_ptr: ?*?[]u8 = if (want_sidecar) &rebuilt_symbol_table_bytes else null;
     zir_builder.buildAndInjectSelected(
         allocator,
         program,
@@ -782,6 +811,7 @@ pub fn injectPreparedSelectedAndUpdate(
         options.progress,
         struct_names,
         include_root,
+        out_sym_ptr,
     ) catch |inject_err| {
         abortUpdate(ctx) catch |abort_err| {
             std.debug.print(
@@ -793,6 +823,116 @@ pub fn injectPreparedSelectedAndUpdate(
         return inject_err;
     };
     try runPreparedUpdate(allocator, ctx, options);
+
+    if (want_sidecar) {
+        const sidecar_path = try std.fmt.allocPrint(allocator, "{s}.zap-symbols", .{options.output_path});
+        defer allocator.free(sidecar_path);
+        try mergeAndWriteSelectedSidecar(
+            allocator,
+            sidecar_path,
+            rebuilt_symbol_table_bytes,
+            struct_names,
+            include_root,
+        );
+    }
+}
+
+/// Read the prior sidecar (if any), merge the just-rebuilt selected
+/// subset into the unchanged-struct entries adopted from it, and
+/// atomically rewrite the sidecar. On any merge failure — corrupt
+/// prior blob, allocator failure inside the merge — fall back to the
+/// production-safe baseline: remove the sidecar so consumers see a
+/// missing-symbol-table state instead of a stale one (Phase 0 Gap B
+/// option (b) safety net).
+fn mergeAndWriteSelectedSidecar(
+    allocator: std.mem.Allocator,
+    sidecar_path: []const u8,
+    rebuilt_bytes: ?[]const u8,
+    selected_structs: []const []const u8,
+    include_root: bool,
+) CompileError!void {
+    const io = std.Options.debug_io;
+
+    // Load the prior sidecar, if any. A missing prior is a first-build
+    // state and is fine; any other read error means the file is in an
+    // unexpected state — fall through to invalidation.
+    var prior_bytes_owned: ?[]u8 = null;
+    defer if (prior_bytes_owned) |bytes| allocator.free(bytes);
+    prior_bytes_owned = std.Io.Dir.cwd().readFileAlloc(io, sidecar_path, allocator, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+
+    var merged_builder = zap_symbol_table.Builder.init(allocator);
+    defer merged_builder.deinit();
+
+    // Adopt entries from the rebuilt subset (everything the selected
+    // build re-emitted) with no further filtering — the rebuild is
+    // authoritative for its own structs.
+    if (rebuilt_bytes) |bytes| {
+        merged_builder.adoptFromSidecar(bytes, &.{}, false) catch |err| {
+            invalidateSidecarFallback(sidecar_path, "merge: rebuilt blob unreadable", err);
+            return;
+        };
+    }
+
+    // Adopt unchanged-struct entries from the prior sidecar. The merge
+    // helper drops any entry whose `zap_struct` is in `selected_structs`
+    // (and root entries when `include_root`) — those are owned by the
+    // rebuild.
+    if (prior_bytes_owned) |bytes| {
+        merged_builder.adoptFromSidecar(bytes, selected_structs, include_root) catch |err| {
+            invalidateSidecarFallback(sidecar_path, "merge: prior sidecar unreadable", err);
+            return;
+        };
+    }
+
+    // Producing nothing at all means the program has no Zap-identified
+    // symbols (e.g. the selected slice was empty and there was no prior
+    // sidecar). Skip writing an empty blob — the consumer's existing
+    // missing-file handling already covers this case.
+    if (merged_builder.entries.items.len == 0) {
+        if (prior_bytes_owned == null) return;
+        // The prior sidecar exists but everything in it was selected for
+        // rebuild and the rebuild emitted nothing — remove the stale
+        // file so consumers fall back to mangled symbols.
+        std.Io.Dir.cwd().deleteFile(io, sidecar_path) catch {};
+        return;
+    }
+
+    const merged_blob = merged_builder.encode() catch |err| {
+        invalidateSidecarFallback(sidecar_path, "merge: encode failed", err);
+        return;
+    };
+    defer allocator.free(merged_blob);
+
+    writeSymbolTableSidecar(sidecar_path, merged_blob) catch |err| {
+        std.debug.print(
+            "Warning: failed to write merged zap symbol-table sidecar at {s}: {s}\n",
+            .{ sidecar_path, @errorName(err) },
+        );
+    };
+}
+
+/// Phase 0 Gap B fallback: delete the sidecar so consumers see a
+/// missing-symbol-table state rather than a stale one. The original
+/// merge error is reported through stderr so a hosting daemon log
+/// preserves the diagnostic. Best-effort delete — a removal failure is
+/// itself worth surfacing.
+fn invalidateSidecarFallback(sidecar_path: []const u8, context: []const u8, err: anyerror) void {
+    const io = std.Options.debug_io;
+    std.debug.print(
+        "Warning: invalidating stale zap symbol-table sidecar {s} ({s}: {s})\n",
+        .{ sidecar_path, context, @errorName(err) },
+    );
+    std.Io.Dir.cwd().deleteFile(io, sidecar_path) catch |del_err| switch (del_err) {
+        error.FileNotFound => {},
+        else => std.debug.print(
+            "Warning: failed to remove stale sidecar {s}: {s}\n",
+            .{ sidecar_path, @errorName(del_err) },
+        ),
+    };
 }
 
 /// Force every source hash in a prepared named struct's injected ZIR file stale.
@@ -955,4 +1095,214 @@ pub fn detectZigLibDir(allocator: std.mem.Allocator) ?[]const u8 {
     }
 
     return null;
+}
+
+// ---------------------------------------------------------------------------
+// Selected-incremental sidecar merge — Phase 0 Gap B unit tests
+// ---------------------------------------------------------------------------
+//
+// `mergeAndWriteSelectedSidecar` reaches the real filesystem (the
+// sidecar lives next to the artifact on disk and the daemon's
+// selected-update path can run concurrently with debugger / crash-
+// printer reads), so these tests exercise the merge through a temp
+// directory rather than mocking the I/O layer. A fresh temp dir is
+// used per test so the canonical CWD-relative path the merge writes
+// to never collides with sibling tests or pre-existing repo state.
+
+const testing = std.testing;
+
+/// Build a small symbol-table blob with the supplied entries. Each
+/// tuple is `{ mangled, zap_struct, zap_local, zap_arity }` where
+/// `zap_struct == null` encodes the entry-point case.
+fn encodeSymbolTableForTest(
+    allocator: std.mem.Allocator,
+    entries: []const struct { []const u8, ?[]const u8, []const u8, u32 },
+) ![]u8 {
+    var builder = zap_symbol_table.Builder.init(allocator);
+    defer builder.deinit();
+    for (entries) |entry| {
+        try builder.record(entry[0], entry[1], entry[2], entry[3]);
+    }
+    return try builder.encode();
+}
+
+test "mergeAndWriteSelectedSidecar carries forward unchanged-struct entries" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const artifact_path = try std.fs.path.join(testing.allocator, &.{ tmp_path, "probe" });
+    defer testing.allocator.free(artifact_path);
+    const sidecar_path = try std.fs.path.join(testing.allocator, &.{ tmp_path, "probe.zap-symbols" });
+    defer testing.allocator.free(sidecar_path);
+
+    // Seed a baseline sidecar covering three structs + the entry point.
+    const baseline_blob = try encodeSymbolTableForTest(testing.allocator, &.{
+        .{ "Alpha.do__1", "Alpha", "do", 1 },
+        .{ "Beta.run__0", "Beta", "run", 0 },
+        .{ "Gamma.work__2", "Gamma", "work", 2 },
+        .{ "main", null, "main", 1 },
+    });
+    defer testing.allocator.free(baseline_blob);
+    try std.Io.Dir.cwd().writeFile(std.Options.debug_io, .{ .sub_path = sidecar_path, .data = baseline_blob });
+
+    // The selected rebuild only re-emitted Beta — one entry.
+    const rebuilt_blob = try encodeSymbolTableForTest(testing.allocator, &.{
+        .{ "Beta.run__0", "Beta", "run", 0 },
+    });
+    defer testing.allocator.free(rebuilt_blob);
+
+    const selected_structs = [_][]const u8{"Beta"};
+    try mergeAndWriteSelectedSidecar(
+        testing.allocator,
+        sidecar_path,
+        rebuilt_blob,
+        &selected_structs,
+        false,
+    );
+
+    const merged = try std.Io.Dir.cwd().readFileAlloc(
+        std.Options.debug_io,
+        sidecar_path,
+        testing.allocator,
+        .limited(1 * 1024 * 1024),
+    );
+    defer testing.allocator.free(merged);
+
+    const reader = try zap_symbol_table.Reader.init(merged);
+    try testing.expectEqual(@as(u32, 4), reader.entry_count);
+    try testing.expect(reader.findByMangled("Alpha.do__1") != null);
+    try testing.expect(reader.findByMangled("Beta.run__0") != null);
+    try testing.expect(reader.findByMangled("Gamma.work__2") != null);
+    try testing.expect(reader.findByMangled("main") != null);
+}
+
+test "mergeAndWriteSelectedSidecar drops stale entries from selected structs" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const sidecar_path = try std.fs.path.join(testing.allocator, &.{ tmp_path, "probe.zap-symbols" });
+    defer testing.allocator.free(sidecar_path);
+
+    // Baseline holds two functions in Beta; the rebuild renames one
+    // and keeps the other — the dropped one must vanish from the
+    // merged sidecar.
+    const baseline_blob = try encodeSymbolTableForTest(testing.allocator, &.{
+        .{ "Alpha.keep__0", "Alpha", "keep", 0 },
+        .{ "Beta.stale__1", "Beta", "stale", 1 },
+        .{ "Beta.survivor__2", "Beta", "survivor", 2 },
+    });
+    defer testing.allocator.free(baseline_blob);
+    try std.Io.Dir.cwd().writeFile(std.Options.debug_io, .{ .sub_path = sidecar_path, .data = baseline_blob });
+
+    const rebuilt_blob = try encodeSymbolTableForTest(testing.allocator, &.{
+        .{ "Beta.survivor__2", "Beta", "survivor", 2 },
+        // The rebuild added Beta.renamed/1 in place of Beta.stale/1.
+        .{ "Beta.renamed__1", "Beta", "renamed", 1 },
+    });
+    defer testing.allocator.free(rebuilt_blob);
+
+    const selected_structs = [_][]const u8{"Beta"};
+    try mergeAndWriteSelectedSidecar(
+        testing.allocator,
+        sidecar_path,
+        rebuilt_blob,
+        &selected_structs,
+        false,
+    );
+
+    const merged = try std.Io.Dir.cwd().readFileAlloc(
+        std.Options.debug_io,
+        sidecar_path,
+        testing.allocator,
+        .limited(1 * 1024 * 1024),
+    );
+    defer testing.allocator.free(merged);
+
+    const reader = try zap_symbol_table.Reader.init(merged);
+    try testing.expectEqual(@as(u32, 3), reader.entry_count);
+    try testing.expect(reader.findByMangled("Alpha.keep__0") != null);
+    try testing.expect(reader.findByMangled("Beta.survivor__2") != null);
+    try testing.expect(reader.findByMangled("Beta.renamed__1") != null);
+    // The stale function must NOT be carried forward.
+    try testing.expect(reader.findByMangled("Beta.stale__1") == null);
+}
+
+test "mergeAndWriteSelectedSidecar invalidates the sidecar when the prior blob is corrupt" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const sidecar_path = try std.fs.path.join(testing.allocator, &.{ tmp_path, "probe.zap-symbols" });
+    defer testing.allocator.free(sidecar_path);
+
+    // A bad-magic prior sidecar forces the production-safe fallback.
+    const garbage = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try std.Io.Dir.cwd().writeFile(std.Options.debug_io, .{ .sub_path = sidecar_path, .data = &garbage });
+
+    const rebuilt_blob = try encodeSymbolTableForTest(testing.allocator, &.{
+        .{ "Beta.run__0", "Beta", "run", 0 },
+    });
+    defer testing.allocator.free(rebuilt_blob);
+
+    const selected_structs = [_][]const u8{"Beta"};
+    try mergeAndWriteSelectedSidecar(
+        testing.allocator,
+        sidecar_path,
+        rebuilt_blob,
+        &selected_structs,
+        false,
+    );
+
+    // The corrupt sidecar must have been removed (the fallback path
+    // chooses safety over a half-merged result).
+    const exists = blk: {
+        std.Io.Dir.cwd().access(std.Options.debug_io, sidecar_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    try testing.expect(!exists);
+}
+
+test "mergeAndWriteSelectedSidecar writes a fresh sidecar when none exists yet" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const sidecar_path = try std.fs.path.join(testing.allocator, &.{ tmp_path, "probe.zap-symbols" });
+    defer testing.allocator.free(sidecar_path);
+
+    const rebuilt_blob = try encodeSymbolTableForTest(testing.allocator, &.{
+        .{ "Beta.run__0", "Beta", "run", 0 },
+    });
+    defer testing.allocator.free(rebuilt_blob);
+
+    const selected_structs = [_][]const u8{"Beta"};
+    try mergeAndWriteSelectedSidecar(
+        testing.allocator,
+        sidecar_path,
+        rebuilt_blob,
+        &selected_structs,
+        false,
+    );
+
+    const merged = try std.Io.Dir.cwd().readFileAlloc(
+        std.Options.debug_io,
+        sidecar_path,
+        testing.allocator,
+        .limited(1 * 1024 * 1024),
+    );
+    defer testing.allocator.free(merged);
+
+    const reader = try zap_symbol_table.Reader.init(merged);
+    try testing.expectEqual(@as(u32, 1), reader.entry_count);
+    try testing.expect(reader.findByMangled("Beta.run__0") != null);
 }
