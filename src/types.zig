@@ -9807,3 +9807,256 @@ test "numeric widening stays within signed unsigned and float families" {
     try std.testing.expect(!store.canWidenTo(TypeStore.I32, TypeStore.F64));
     try std.testing.expect(!store.canWidenTo(TypeStore.F32, TypeStore.I64));
 }
+
+// ============================================================
+// Field-default type checking (Phase 1.1)
+//
+// `pub struct Foo { field :: Type = expr }` is a general struct
+// feature introduced alongside `pub error` (docs/error-system-
+// research-brief.md, Part V). The default expression must
+// type-check against the field's declared type at struct-
+// declaration time so the user gets a clean Zap diagnostic at
+// the default expression, not a Zig-backend error far from the
+// mistake. The tests below pin that behavior.
+// ============================================================
+
+test "field default with matching integer literal accepted" {
+    const source =
+        \\pub struct Counter {
+        \\  value :: i64 = 0
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "field default with matching string literal accepted" {
+    const source =
+        \\pub struct Config {
+        \\  host :: String = "localhost"
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "field default with empty list literal accepted on list field" {
+    // The empty list literal `[]` has UNKNOWN element type until a
+    // typed context constrains it. A defaulted list field is exactly
+    // such a context — the field's declared element type pushes down
+    // into the default expression. The typechecker treats this as a
+    // valid match rather than an UNKNOWN-vs-list mismatch.
+    const source =
+        \\pub struct Tags {
+        \\  values :: [String] = []
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "field default with mismatched type produces a clear Zap diagnostic" {
+    // Phase 1.1 Test D: `x :: i64 = "wrong"` must produce a Zap-level
+    // type error at the default expression — not propagate to the
+    // Zig backend as an opaque "expected type" failure.
+    const source =
+        \\pub struct Bad {
+        \\  x :: i64 = "wrong"
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var saw_default_error = false;
+    for (checker.errors.items) |type_err| {
+        if (std.mem.indexOf(u8, type_err.message, "default value") != null and
+            std.mem.indexOf(u8, type_err.message, "i64") != null and
+            std.mem.indexOf(u8, type_err.message, "String") != null)
+        {
+            saw_default_error = true;
+        }
+    }
+    try std.testing.expect(saw_default_error);
+}
+
+test "field default error points at the default expression span" {
+    // The diagnostic must caret the default expression itself
+    // (not the field declaration or the whole struct), so the user
+    // sees `^^^^^^^` under the offending value.
+    const source =
+        \\pub struct Bad {
+        \\  x :: i64 = "wrong"
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const bad_default_expr = program.structs[0].fields[0].default orelse
+        return error.TestExpectedDefaultExpression;
+    const expected_span = bad_default_expr.getMeta().span;
+
+    var matched_span = false;
+    for (checker.errors.items) |type_err| {
+        if (std.mem.indexOf(u8, type_err.message, "default value") == null) continue;
+        if (type_err.span.start == expected_span.start and
+            type_err.span.end == expected_span.end)
+        {
+            matched_span = true;
+        }
+    }
+    try std.testing.expect(matched_span);
+}
+
+test "field default integer literal narrowing to u16 accepted" {
+    // Numeric literals are contextually typed (see
+    // acceptsIntegerLiteralForExpectedType). `port :: u16 = 8080`
+    // must not error — 8080 fits inside a u16 and the field's
+    // declared type drives the literal's representation downstream.
+    const source =
+        \\pub struct Server {
+        \\  port :: u16 = 8080
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "field default with nested struct expression accepted" {
+    // Phase 1.1 Test E: a struct-typed field can default to a
+    // struct literal. The default expression type-checks like any
+    // other expression in the source — the inner struct's own
+    // defaults fill in the inner fields.
+    const source =
+        \\pub struct Inner {
+        \\  v :: i64 = 7
+        \\}
+        \\pub struct Outer {
+        \\  inner :: Inner = %Inner{}
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}

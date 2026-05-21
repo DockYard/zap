@@ -5233,6 +5233,101 @@ test "parse struct declaration" {
     try std.testing.expect(found_struct);
 }
 
+test "parser records field-default expression on a top-level pub struct" {
+    // Field defaults are a general `pub struct` feature (Phase 1.1 of
+    // the error-system roadmap): `field :: Type = expr` captures the
+    // default expression on `StructFieldDecl.default`. The first field
+    // is undefaulted, the second carries a `0` integer literal default.
+    const source =
+        \\pub struct Counter {
+        \\  name :: String
+        \\  value :: i64 = 0
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.structs.len);
+    const counter_struct = program.structs[0];
+    try std.testing.expectEqual(@as(usize, 2), counter_struct.fields.len);
+
+    // Field 0 — `name :: String` — has no default.
+    try std.testing.expect(counter_struct.fields[0].default == null);
+
+    // Field 1 — `value :: i64 = 0` — carries an integer-literal default.
+    const value_field_default = counter_struct.fields[1].default orelse return error.TestExpectedDefault;
+    try std.testing.expect(value_field_default.* == .int_literal);
+    try std.testing.expectEqual(@as(i128, 0), value_field_default.int_literal.value);
+}
+
+test "parser records field-default expressions across mixed types" {
+    // Exercise the parser surface across every default-expression
+    // shape the Phase 1.1 acceptance criteria call out: a string
+    // literal, a narrow integer literal, a wide integer literal,
+    // and an empty list literal. The HIR/typecheck layers handle the
+    // narrowing and element-type propagation downstream — the parser
+    // only needs to surface the raw expression on every field.
+    const source =
+        \\pub struct Config {
+        \\  host :: String = "localhost"
+        \\  port :: u16 = 8080
+        \\  timeout :: i64 = 5000
+        \\  tags :: [String] = []
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const config = program.structs[0];
+    try std.testing.expectEqual(@as(usize, 4), config.fields.len);
+
+    const host_default = config.fields[0].default orelse return error.TestExpectedDefault;
+    try std.testing.expect(host_default.* == .string_literal);
+
+    const port_default = config.fields[1].default orelse return error.TestExpectedDefault;
+    try std.testing.expect(port_default.* == .int_literal);
+    try std.testing.expectEqual(@as(i128, 8080), port_default.int_literal.value);
+
+    const timeout_default = config.fields[2].default orelse return error.TestExpectedDefault;
+    try std.testing.expect(timeout_default.* == .int_literal);
+
+    const tags_default = config.fields[3].default orelse return error.TestExpectedDefault;
+    try std.testing.expect(tags_default.* == .list);
+    try std.testing.expectEqual(@as(usize, 0), tags_default.list.elements.len);
+}
+
+test "parser leaves undefaulted fields with null default" {
+    // Mixed defaulted + required fields. The required `host` field
+    // must carry a null default; the defaulted `port` field must
+    // carry a non-null default. This guards against a future
+    // refactor accidentally always populating `.default`.
+    const source =
+        \\pub struct Server {
+        \\  port :: u16 = 8080
+        \\  host :: String
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const server = program.structs[0];
+    try std.testing.expectEqual(@as(usize, 2), server.fields.len);
+    try std.testing.expect(server.fields[0].default != null);
+    try std.testing.expect(server.fields[1].default == null);
+}
+
 test "parse panic expression" {
     const source =
         \\pub struct Test {
