@@ -208,6 +208,34 @@ extern "c" fn zir_builder_inject_struct(builder_handle: ?*ZirBuilderHandle, comp
 // Struct management
 extern "c" fn zir_compilation_add_struct(ctx: ?*ZirContext, name: [*:0]const u8, source_path: [*:0]const u8) i32;
 extern "c" fn zir_compilation_add_struct_source(ctx: ?*ZirContext, name: [*:0]const u8, source_ptr: [*]const u8, source_len: u32) i32;
+
+/// Optional debug-only dump of synthetic Zig source emitted via
+/// `zir_compilation_add_struct_source`. Activated by setting
+/// `ZAP_DUMP_SOURCES=1` (dump everything) or
+/// `ZAP_DUMP_SOURCES=Option:MyError` (colon-separated name substrings).
+/// Production builds never set the env var; the helper is a debug aid for
+/// synthetic-source emission gaps.
+fn dumpSyntheticSourceIfRequested(
+    name: [*:0]const u8,
+    source_ptr: [*]const u8,
+    source_len: u32,
+) void {
+    const raw = std.c.getenv("ZAP_DUMP_SOURCES") orelse return;
+    const filter_z: [*:0]const u8 = @ptrCast(raw);
+    const filter = std.mem.span(filter_z);
+    const name_slice = std.mem.span(name);
+    const should_dump = std.mem.eql(u8, filter, "1") or blk: {
+        var iter = std.mem.tokenizeScalar(u8, filter, ':');
+        while (iter.next()) |needle| {
+            if (std.mem.indexOf(u8, name_slice, needle) != null) break :blk true;
+        }
+        break :blk false;
+    };
+    if (should_dump) {
+        const source_slice = source_ptr[0..source_len];
+        std.debug.print("=== synthetic source: {s} (len={d}) ===\n{s}\n=== end ===\n", .{ name_slice, source_len, source_slice });
+    }
+}
 extern "c" fn zir_compilation_set_root_debug_source(ctx: ?*ZirContext, source_path_ptr: [*]const u8, source_path_len: u32) i32;
 extern "c" fn zir_compilation_set_struct_debug_source(ctx: ?*ZirContext, name_ptr: [*]const u8, name_len: u32, source_path_ptr: [*]const u8, source_path_len: u32) i32;
 
@@ -352,6 +380,91 @@ fn concreteIntegerTypeRef(zig_type: ir.ZigType) u32 {
         .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .usize, .isize => mapReturnType(zig_type),
         else => 0,
     };
+}
+
+/// Render the synthetic Zig source body for a `union_def` or
+/// `enum_def` per-instantiation TypeDef. Extracted from
+/// `ZirDriver.emitSpecializationSourceFile` so the formatting
+/// invariants (most importantly: when to inject
+/// `const zap_runtime = @import("zap_runtime");`) can be unit-
+/// tested without spinning up a full ZIR builder context.
+///
+/// The caller-owned `buf` receives the complete source body. The
+/// function is a no-op for type_def kinds outside the supported
+/// `union_def`/`enum_def` set so callers can guard exhaustiveness
+/// at their own level.
+fn renderSpecializationSourceFileBody(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    type_def: ir.TypeDef,
+) !void {
+    switch (type_def.kind) {
+        .union_def => |def| {
+            // When any variant's payload type references the
+            // `zap_runtime` namespace (e.g. a `protocol_box(P)`
+            // payload renders as `zap_runtime.ProtocolBox` via
+            // `ir.zigTypeToStr`), the synthetic file must bring
+            // that namespace into scope so Sema can resolve the
+            // identifier. Without this import the variant payload
+            // type stays unresolved through to LLVM emission,
+            // surfacing as an "attempt to use null value" panic
+            // in `Builder.toBitcode` when an `Option(<Protocol>)`
+            // value is constructed at a call site (see Phase
+            // 1.2.5 Gap 1).
+            //
+            // We emit the import only when a variant actually
+            // references `zap_runtime` so unparametrized
+            // specializations like `Option_i64` stay free of
+            // unused-namespace noise.
+            var needs_runtime_import = false;
+            for (def.variants) |variant| {
+                if (variant.type_name) |tn| {
+                    if (std.mem.indexOf(u8, tn, "zap_runtime") != null) {
+                        needs_runtime_import = true;
+                        break;
+                    }
+                }
+            }
+            if (needs_runtime_import) {
+                try buf.appendSlice(
+                    allocator,
+                    "const zap_runtime = @import(\"zap_runtime\");\n\n",
+                );
+            }
+
+            try buf.appendSlice(allocator, "pub const ");
+            try buf.appendSlice(allocator, type_def.name);
+            try buf.appendSlice(allocator, " = union(enum) {\n");
+            for (def.variants) |variant| {
+                try buf.appendSlice(allocator, "    ");
+                try buf.appendSlice(allocator, variant.name);
+                if (variant.type_name) |tn| {
+                    if (std.mem.eql(u8, tn, "void")) {
+                        try buf.appendSlice(allocator, ",\n");
+                    } else {
+                        try buf.appendSlice(allocator, ": ");
+                        try buf.appendSlice(allocator, tn);
+                        try buf.appendSlice(allocator, ",\n");
+                    }
+                } else {
+                    try buf.appendSlice(allocator, ",\n");
+                }
+            }
+            try buf.appendSlice(allocator, "};\n");
+        },
+        .enum_def => |def| {
+            try buf.appendSlice(allocator, "pub const ");
+            try buf.appendSlice(allocator, type_def.name);
+            try buf.appendSlice(allocator, " = enum {\n");
+            for (def.variants) |variant_name| {
+                try buf.appendSlice(allocator, "    ");
+                try buf.appendSlice(allocator, variant_name);
+                try buf.appendSlice(allocator, ",\n");
+            }
+            try buf.appendSlice(allocator, "};\n");
+        },
+        else => {},
+    }
 }
 
 /// Append a Zig identifier, quoting it with `@"..."` when the
@@ -1524,45 +1637,13 @@ pub const ZirDriver = struct {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
 
-        switch (type_def.kind) {
-            .union_def => |def| {
-                try buf.appendSlice(self.allocator, "pub const ");
-                try buf.appendSlice(self.allocator, type_def.name);
-                try buf.appendSlice(self.allocator, " = union(enum) {\n");
-                for (def.variants) |variant| {
-                    try buf.appendSlice(self.allocator, "    ");
-                    try buf.appendSlice(self.allocator, variant.name);
-                    if (variant.type_name) |tn| {
-                        if (std.mem.eql(u8, tn, "void")) {
-                            try buf.appendSlice(self.allocator, ",\n");
-                        } else {
-                            try buf.appendSlice(self.allocator, ": ");
-                            try buf.appendSlice(self.allocator, tn);
-                            try buf.appendSlice(self.allocator, ",\n");
-                        }
-                    } else {
-                        try buf.appendSlice(self.allocator, ",\n");
-                    }
-                }
-                try buf.appendSlice(self.allocator, "};\n");
-            },
-            .enum_def => |def| {
-                try buf.appendSlice(self.allocator, "pub const ");
-                try buf.appendSlice(self.allocator, type_def.name);
-                try buf.appendSlice(self.allocator, " = enum {\n");
-                for (def.variants) |variant_name| {
-                    try buf.appendSlice(self.allocator, "    ");
-                    try buf.appendSlice(self.allocator, variant_name);
-                    try buf.appendSlice(self.allocator, ",\n");
-                }
-                try buf.appendSlice(self.allocator, "};\n");
-            },
-            else => return, // guarded by caller
-        }
+        try renderSpecializationSourceFileBody(self.allocator, &buf, type_def);
+        if (buf.items.len == 0) return; // type_def kind not handled
 
         const name_z = try self.allocator.dupeZ(u8, type_def.name);
         defer self.allocator.free(name_z);
 
+        dumpSyntheticSourceIfRequested(name_z, buf.items.ptr, @intCast(buf.items.len));
         if (zir_compilation_add_struct_source(
             c,
             name_z,
@@ -1708,6 +1789,7 @@ pub const ZirDriver = struct {
         const name_z = try self.allocator.dupeZ(u8, type_def.name);
         defer self.allocator.free(name_z);
 
+        dumpSyntheticSourceIfRequested(name_z, buf.items.ptr, @intCast(buf.items.len));
         if (zir_compilation_add_struct_source(
             c,
             name_z,
@@ -1938,6 +2020,7 @@ pub const ZirDriver = struct {
         const name_z = try self.allocator.dupeZ(u8, type_def.name);
         defer self.allocator.free(name_z);
 
+        dumpSyntheticSourceIfRequested(name_z, buf.items.ptr, @intCast(buf.items.len));
         if (zir_compilation_add_struct_source(
             c,
             name_z,
@@ -2718,6 +2801,7 @@ pub const ZirDriver = struct {
                         const mod_name_z = try self.allocator.dupeZ(u8, mod_name);
                         defer self.allocator.free(mod_name_z);
                         const stub = "comptime {}\n";
+                        dumpSyntheticSourceIfRequested(mod_name_z, stub.ptr, @intCast(stub.len));
                         _ = zir_compilation_add_struct_source(c, mod_name_z, stub.ptr, @intCast(stub.len));
                     }
                 }
@@ -2740,6 +2824,7 @@ pub const ZirDriver = struct {
                 const mod_name_z = try self.allocator.dupeZ(u8, mod_name);
                 defer self.allocator.free(mod_name_z);
                 const stub = "comptime {}\n";
+                dumpSyntheticSourceIfRequested(mod_name_z, stub.ptr, @intCast(stub.len));
                 if (zir_compilation_add_struct_source(c, mod_name_z, stub.ptr, @intCast(stub.len)) != 0) {
                     return error.ZirInjectionFailed;
                 }
@@ -2801,6 +2886,7 @@ pub const ZirDriver = struct {
                 const struct_name_z = try self.allocator.dupeZ(u8, type_def.name);
                 defer self.allocator.free(struct_name_z);
                 const stub = "comptime {}\n";
+                dumpSyntheticSourceIfRequested(struct_name_z, stub.ptr, @intCast(stub.len));
                 if (zir_compilation_add_struct_source(c, struct_name_z, stub.ptr, @intCast(stub.len)) != 0) {
                     return error.ZirInjectionFailed;
                 }
@@ -2945,6 +3031,7 @@ pub const ZirDriver = struct {
                     const parent_z = try self.allocator.dupeZ(u8, parent_name);
                     defer self.allocator.free(parent_z);
                     // This will overwrite the empty stub if already registered
+                    dumpSyntheticSourceIfRequested(parent_z, source.ptr, @intCast(source.len));
                     if (zir_compilation_add_struct_source(c, parent_z, source.ptr, @intCast(source.len)) != 0) {
                         return error.ZirInjectionFailed;
                     }
@@ -10143,4 +10230,62 @@ test "ZirDriver.shouldSkipArc respects local state under REFCOUNT_V1" {
     // global-escape local — not stack-eligible per the escape lattice,
     // so retain/release must fire.
     try std.testing.expect(!driver.shouldSkipArc(200));
+}
+
+test "renderSpecializationSourceFileBody injects zap_runtime import for protocol_box variant payloads" {
+    // Phase 1.2.5 Gap 1 root-cause pin. A parametric union
+    // specialization like `Option_Error` whose `Some` variant payload
+    // is `zap_runtime.ProtocolBox` MUST carry an explicit
+    // `@import("zap_runtime")` in its synthetic source file —
+    // otherwise the variant payload's namespace stays unresolved
+    // through Sema and LLVM emits a constant referencing a never-
+    // registered global, panicking in `Builder.toBitcode` with
+    // "attempt to use null value" the moment a downstream call site
+    // materializes the type (e.g. a `pub error MyError {}` whose
+    // auto-injected `cause :: Option(Error)` field's default expr
+    // builds an `Option_Error.None` value).
+    const allocator = std.testing.allocator;
+    const variants = [_]ir.UnionVariant{
+        .{ .name = "Some", .type_name = "zap_runtime.ProtocolBox" },
+        .{ .name = "None", .type_name = null },
+    };
+    const type_def: ir.TypeDef = .{
+        .name = "Option_Error",
+        .kind = .{ .union_def = .{ .variants = &variants } },
+    };
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    try renderSpecializationSourceFileBody(allocator, &buf, type_def);
+
+    // The import line MUST come before the union declaration so the
+    // variant payload resolves correctly at every Sema reference.
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "const zap_runtime = @import(\"zap_runtime\");") != null);
+    const import_pos = std.mem.indexOf(u8, buf.items, "@import(\"zap_runtime\")").?;
+    const union_pos = std.mem.indexOf(u8, buf.items, "= union(enum)").?;
+    try std.testing.expect(import_pos < union_pos);
+    // Variant payload still references the runtime namespace through
+    // the freshly-imported alias.
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "Some: zap_runtime.ProtocolBox") != null);
+}
+
+test "renderSpecializationSourceFileBody omits zap_runtime import for plain instantiations" {
+    // `Option_i64` carries an `i64` payload — no `zap_runtime`
+    // reference, so the import line is dead weight (and would draw
+    // an unused-namespace warning under stricter Zig modes). The
+    // emitter must skip the import when no variant payload references
+    // the runtime namespace.
+    const allocator = std.testing.allocator;
+    const variants = [_]ir.UnionVariant{
+        .{ .name = "Some", .type_name = "i64" },
+        .{ .name = "None", .type_name = null },
+    };
+    const type_def: ir.TypeDef = .{
+        .name = "Option_i64",
+        .kind = .{ .union_def = .{ .variants = &variants } },
+    };
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    try renderSpecializationSourceFileBody(allocator, &buf, type_def);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "@import(\"zap_runtime\")") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "Some: i64") != null);
 }

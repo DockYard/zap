@@ -6587,19 +6587,38 @@ pub const HirBuilder = struct {
             if (already_provided) continue;
 
             const default_expr = declared_field.default_expr orelse continue;
+            // Push the field's declared type onto the expected-type
+            // stack BEFORE lowering the default expression. This is
+            // the same context-driven inference user-supplied fields
+            // get (search for `expected_field_type` in the struct-
+            // literal lowering); it lets a default expression like
+            // `Option.None` lower as the right parametric variant
+            // construction (`union_init(Option_Error, .None, ...)`)
+            // instead of a bare `enum_literal` whose type Sema later
+            // rejects against the field's `Option_Error` slot. The
+            // pub error `cause :: Option(Error) = Option.None` desugar
+            // depends on this propagation to type-check.
+            const apply_expected = declared_field.type_id != types_mod.TypeStore.UNKNOWN;
+            if (apply_expected) try self.expected_type_stack.append(self.allocator, declared_field.type_id);
             const value = try self.buildExpr(default_expr);
-            // Push the field's declared type down into the freshly
-            // built default expression. Without this an empty list
-            // default like `tags :: [String] = []` lowers as a bare
-            // `list_init []` with UNKNOWN element type — the IR
-            // defaults it to `List(i64)` and Zig's Sema rejects the
-            // struct init with a `List(i64)` vs `List(String)`
-            // mismatch lifted from the synthetic construction site
-            // (far from the actual mistake). Same shape for narrow-
-            // integer defaults like `port :: u16 = 8080`: the
-            // literal lowers as i64 unless we stamp the field's
-            // width. Stamping is type-directional: if the inferred
-            // type already matches, this is a no-op.
+            if (apply_expected) _ = self.expected_type_stack.pop();
+            // Stamp the field's declared type onto literals and empty
+            // containers in the freshly built default. Without this
+            // an empty list default like `tags :: [String] = []`
+            // lowers as a bare `list_init []` with UNKNOWN element
+            // type — the IR defaults it to `List(i64)` and Zig's
+            // Sema rejects the struct init with a `List(i64)` vs
+            // `List(String)` mismatch lifted from the synthetic
+            // construction site (far from the actual mistake). Same
+            // shape for narrow-integer defaults like
+            // `port :: u16 = 8080`: the literal lowers as i64 unless
+            // we stamp the field's width. Stamping is type-
+            // directional: if the inferred type already matches,
+            // this is a no-op. The expected_type_stack push above
+            // handles variant-construction default expressions that
+            // need to know the parametric instantiation up front;
+            // this stamps post-build literals that didn't need the
+            // stack push to lower correctly.
             self.propagateExpectedTypeToDefault(value, declared_field.type_id);
             try fields.append(self.allocator, .{
                 .name = declared_field.name,

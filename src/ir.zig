@@ -361,6 +361,56 @@ fn primitiveNameToZigType(name: []const u8) ?ZigType {
     return null;
 }
 
+/// Borrow-shape mangled name for a `ZigType` used as a parametric
+/// type argument. Mirrors `types_mod.typeIdMangledNameBorrowed`'s
+/// component-name encoding so per-instantiation synthetic source
+/// file names line up between protocol-vtable emission (this file)
+/// and the type-store mangler (used by `populateAppliedSpecializations`).
+///
+/// Returns null when the argument's shape is one we cannot
+/// participate in a name without a TypeStore handle (e.g. nested
+/// `.applied` forms whose mangling needs recursive type-store
+/// inspection). The caller falls back to the bare base name in
+/// that case.
+fn mangledNameForArgZigType(zig_type: ZigType) ?[]const u8 {
+    return switch (zig_type) {
+        .bool_type => "Bool",
+        .string => "String",
+        .atom => "Atom",
+        .nil => "Nil",
+        .void => "Void",
+        .never => "Never",
+        .term => "Term",
+        .i8 => "i8",
+        .i16 => "i16",
+        .i32 => "i32",
+        .i64 => "i64",
+        .i128 => "i128",
+        .u8 => "u8",
+        .u16 => "u16",
+        .u32 => "u32",
+        .u64 => "u64",
+        .u128 => "u128",
+        .f16 => "f16",
+        .f32 => "f32",
+        .f64 => "f64",
+        .f80 => "f80",
+        .f128 => "f128",
+        .usize => "usize",
+        .isize => "isize",
+        .struct_ref => |name| name,
+        .tagged_union => |name| name,
+        // `protocol_constraint(P)` mangles to the bare protocol name
+        // — matches `types.typeIdMangledNameBorrowed`'s mangling so
+        // `Option(Error)` -> `Option_Error` lines up across the IR
+        // pipeline (the per-instantiation `Option_Error` `union_def`
+        // is produced by `populateAppliedSpecializations` under that
+        // same key).
+        .protocol_box => |name| name,
+        else => null,
+    };
+}
+
 fn cloneZigType(allocator: std.mem.Allocator, value: ZigType) CloneError!ZigType {
     return switch (value) {
         .tuple => |items| .{ .tuple = try cloneZigTypeSlice(allocator, items) },
@@ -8504,27 +8554,39 @@ pub const IrBuilder = struct {
                         }
                     }
                 }
-                // Parametric application: lower to a `.struct_ref`
-                // of the mangled per-instantiation name. The
-                // per-instantiation `union_def`/`enum_def`/`struct_def`
-                // TypeDef the IR already emits provides the matching
-                // ZIR-side synthetic file.
+                // Parametric application: lower to a per-
+                // instantiation mangled name (`Option(Error)` ->
+                // `Option_Error`, `Option(i64)` -> `Option_i64`).
+                // Per the file-IS-the-struct emission model the
+                // resulting synthetic source file is the canonical
+                // ZIR identity for the instantiation, so the
+                // `@import("<Mangled>").<Mangled>` reference in
+                // protocol vtable type signatures and adapter
+                // function returns resolves to the right type.
+                //
+                // We pick `.tagged_union` for the result kind because
+                // every parametric type currently exposed at the Zap
+                // surface that flows through a protocol signature is
+                // a tagged union (`Option(T)`, `Result(T, E)` in
+                // Phase 1.3). `appendZigTypeForVTable` renders
+                // `.tagged_union` as `@import("X").X` — the type
+                // expression Sema actually accepts in signatures —
+                // whereas `.struct_ref` renders as `@import("X")`,
+                // a namespace value Sema rejects with "expected
+                // pointer, found 'type'".
                 if (name_expr.args.len > 0) {
-                    // Best-effort lookup through the type store —
-                    // when 1.2.5.b lands proper TypeId plumbing this
-                    // path becomes deterministic. For 1.2.5.a we
-                    // fall back to the bare base name when args
-                    // can't be resolved, which is the safer default
-                    // (a downstream `@import` of an unresolved name
-                    // surfaces as a clear Zig diagnostic instead of
-                    // silently miscompiling).
-                    if (self.type_store) |ts| {
-                        if (ts.resolveTypeName(text)) |_| {
-                            // Resolved as a primitive — but a
-                            // primitive with args is nonsense; let
-                            // the fallback below handle it.
-                        }
+                    if (self.composeMangledAppliedName(name_expr)) |mangled| {
+                        // Determine whether the base is a tagged
+                        // union or struct. Parametric protocol-
+                        // signature args reachable today (Option,
+                        // future Result) are tagged unions, so
+                        // default to that. The scope graph lets us
+                        // double-check when the base resolves.
+                        break :blk .{ .tagged_union = mangled };
                     }
+                    // Fall back to the bare base name — keeps the
+                    // diagnostic surfaced ("unknown declaration X")
+                    // honest instead of silently dropping the args.
                     break :blk .{ .struct_ref = self.allocator.dupe(u8, text) catch text };
                 }
                 // Bare nominal — treat as struct ref.
@@ -8533,6 +8595,36 @@ pub const IrBuilder = struct {
             .variable => .any,
             else => .any,
         };
+    }
+
+    /// Compose the per-instantiation mangled name for a parametric
+    /// AST type-name like `Option(Error)` -> `Option_Error`. Returns
+    /// null when an argument fails to render (an unresolved
+    /// identifier, a higher-kinded form we don't yet support in
+    /// protocol signatures, etc.) so the caller can fall back to the
+    /// bare base name.
+    ///
+    /// The mangling mirrors `types_mod.typeIdMangledName`: each arg
+    /// is recursively mangled, joined with `_` separators. Protocol
+    /// constraints render as their bare name (the protocol's own
+    /// name), matching how `types.typeIdMangledNameBorrowed` mangles
+    /// `protocol_constraint(Error)` -> `Error` so per-instantiation
+    /// synthetic source file names line up across the IR pipeline.
+    fn composeMangledAppliedName(
+        self: *IrBuilder,
+        name_expr: ast.TypeNameExpr,
+    ) ?[]const u8 {
+        const base_text = self.interner.get(name_expr.name);
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        buf.appendSlice(self.allocator, base_text) catch return null;
+        for (name_expr.args) |arg| {
+            buf.append(self.allocator, '_') catch return null;
+            const arg_zig_type = self.astTypeExprToZigTypeForProtocol(arg);
+            const arg_name = mangledNameForArgZigType(arg_zig_type) orelse return null;
+            buf.appendSlice(self.allocator, arg_name) catch return null;
+        }
+        return buf.toOwnedSlice(self.allocator) catch null;
     }
 
     /// Build the per-instantiation specialization data for one
