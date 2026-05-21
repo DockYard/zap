@@ -1604,28 +1604,51 @@ pub const ProtocolDispatch = struct {
 ///
 /// Lowering contract (Phase 1.2.5.d ZIR):
 ///
-///   1. Emit a guard pointer-compare:
-///      `box.vtable == &<Protocol>VTable_for_<Target>` — the
-///      synthetic per-protocol dispatcher exposes a
-///      `vtable_eq_<Target>(box) bool` helper that does the cast-
-///      and-compare, so the ZIR primitive emit stays inside the
-///      `@import("<Protocol>VTable").vtable_eq_<Target>(box)`
-///      shape used by 1.2.5.c construction.
-///   2. When the guard is true, recover the typed inner via the
-///      per-impl `unbox_<Target>(box) TargetMod.<Target>` helper
-///      (emitted in `<Protocol>VTable_for_<Target>`'s synthetic
-///      source file). The unboxed value is by-value — the box still
-///      owns the heap cell so its scope-exit drop can free the
-///      slot.
-///   3. When the guard is false the dest local is undefined; the
-///      caller's match-arm machinery routes control flow to the
-///      next case arm before consulting the dest.
+///   1. The pattern-match compiler emits a `guard_block` whose
+///      condition is
+///      `@import("<Protocol>VTable_for_<Target>").vtable_eq(box)` —
+///      a synthetic per-impl helper that pointer-compares
+///      `box.vtable` against the address of the impl's vtable
+///      instance constant. Returns `bool`.
+///   2. When the guard fires (vtable matches), the arm body's
+///      `protocol_box_unbox` lowering calls
+///      `@import("<Protocol>VTable_for_<Target>").unbox(box)` —
+///      a synthetic per-impl helper that does
+///      `@ptrCast(@alignCast(box.data_ptr.?)).*` and returns the
+///      typed concrete value (by-value). The box still owns the
+///      heap cell, so its scope-exit drop can free the slot
+///      independently of the unbox.
+///   3. When the guard is false the arm's body is skipped — the
+///      match-arm machinery routes control flow to the next case
+///      arm before consulting the unbox dest. Both synthetic
+///      helpers (`vtable_eq`, `unbox`) are emitted alongside the
+///      per-impl vtable instance constant in
+///      `emitProtocolVTableInstanceSourceFile`.
 ///
-/// The IR layer leaves the guard wiring to the surrounding match-
-/// arm compilation — `protocol_box_unbox` only encodes the
-/// per-arm guard predicate and the corresponding typed extraction.
-/// Pattern-match compilation emits the op inside a
-/// `guard_block` whose condition is the same guard helper call.
+/// **Exhaustiveness rule.** Pattern matching against a
+/// `protocol_box(P)` scrutinee is fundamentally OPEN: any impl
+/// registered for `P` (now or in a future module load) is a
+/// possible concrete inner type. Static exhaustiveness over an
+/// open existential is undecidable, so a match expression whose
+/// scrutinee is `protocol_box(P)` requires a `_` catch-all arm to
+/// be considered exhaustive — mirroring Rust's rule for matches
+/// over `Box<dyn Trait>`. The HIR pattern-match elaborator emits
+/// a non-exhaustiveness warning when this catch-all is missing
+/// (warning rather than error so the user can opt out via
+/// `@unsafe_open_match`-style suppression if needed; mechanism
+/// added with the typed-bind parser surface).
+///
+/// **Status — IR/ZIR ready; AST/HIR/parser surface deferred.** The
+/// IR op, ZIR lowering, and the synthetic `vtable_eq` / `unbox`
+/// per-impl helpers are in place and exercised through the round-
+/// trip clone test (`protocol_box_unbox instruction round-trips
+/// through cloneInstruction`). The frontend surface — extending
+/// `BindPattern` with an optional `type_annotation` and the
+/// pattern-elaborator to recognise the downcast shape against
+/// `.protocol_box(<P>)` scrutinees — is the natural follow-up for
+/// 1.2.5.e (alongside the `cause :: Option(Error)` field that
+/// motivates the downcast semantics in the first place). The IR
+/// op is ready to be consumed the moment the frontend emits it.
 pub const ProtocolBoxUnbox = struct {
     /// Destination local that receives the concrete inner value
     /// when the guard fires. Typed `.struct_ref(target_type_name)`
