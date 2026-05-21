@@ -1819,9 +1819,23 @@ pub const ZirDriver = struct {
             try buf.appendSlice(self.allocator, "    const inner: *const TargetMod.");
             try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
             try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(data_ptr.?));\n");
-            // `    return TargetMod.<impl_function_name>(inner.*[, arg0, ...]);`
+            // `    return TargetMod.<method_name>(inner.*[, arg0, ...]);`
+            //
+            // The target struct's file (file-IS-the-struct emission)
+            // publishes the impl method under its *local* name (just
+            // `message`, not `MyError__message__1`) because
+            // `emitFunction` selects `func.local_name` when
+            // `current_emit_struct != null`. Cross-struct references
+            // elsewhere in the compiler (see `emitCrossStructCall`)
+            // follow the same convention. The IR's
+            // `impl_function_name = "<Target>__<method>__<arity>"`
+            // is the GLOBAL qualified name used by call-site
+            // resolution against top-level functions, but inside a
+            // struct file the symbol is published unqualified — so
+            // the vtable adapter must call `TargetMod.<method_name>`,
+            // not `TargetMod.<impl_function_name>`.
             try buf.appendSlice(self.allocator, "    return TargetMod.");
-            try appendZigIdentifier(self.allocator, &buf, method.impl_function_name);
+            try appendZigIdentifier(self.allocator, &buf, method.method_name);
             try buf.appendSlice(self.allocator, "(inner.*");
             for (method.extra_param_types, 0..) |_, param_index| {
                 try buf.appendSlice(self.allocator, ", ");
