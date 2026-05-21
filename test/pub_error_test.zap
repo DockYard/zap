@@ -17,14 +17,24 @@
 ##   F. Bare `error` desugars to non-`pub` struct + impl; construction
 ##      and protocol dispatch still work from within the declaring file.
 ##
-## Tests C (`@code Zxxxx`) and E (cause chain) are documented in the
-## final report's "Gaps and open follow-ups" section — the `@code`
-## attribute mechanism lands here (parser + desugar capture the value
-## and synthesize the `code/1` body) but invoking `Error.code(e)` to
-## read it back currently hits a pre-existing parametric-union codegen
-## panic (Option(Atom) return-type Sema layout), and the auto-injected
-## `cause :: Option(Error)` field is deferred to Phase 1.3 alongside
-## the `Result(T,E)` parametric-union codegen fix.
+## Tests C (`@code Zxxxx`) and E (cause chain) — status after the
+## Phase 1.2.5 Gap-Analysis round:
+##
+## - The `@code Zxxxx` attribute mechanism lands here (parser + desugar
+##   capture the value and synthesize the `code/1` body).
+## - The auto-injected `cause :: Option(Error) = Option.None` field
+##   IS now functional thanks to Phase 1.2.5 protocol existentials
+##   + Gap 1 (synthetic-source `zap_runtime` import for parametric
+##   union specializations that carry a `protocol_box` payload) +
+##   Gap 2 (protocol-method return-type resolution through
+##   `protocol_constraint` receivers); a minimal `pub error MyError
+##   {}` + `%MyError{}` round-trips through `zap run` cleanly.
+## - Tests C and E remain as `zap run`-exercised script fixtures in
+##   `script_fixtures/phase_1_2_5_*`; the full Test E cause-chain
+##   end-to-end blocks on call-site auto-boxing (Phase 1 gap analysis
+##   loop) — the type-checker accepts the program now, but the
+##   construction-site auto-box only fires on struct/union literal
+##   payload positions, not yet on regular call arguments.
 
 ## Test A: minimal `pub error TimeoutError {}`.
 pub error TimeoutError {}

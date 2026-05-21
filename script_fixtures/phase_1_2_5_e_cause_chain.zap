@@ -1,5 +1,28 @@
 # Phase 1.2.5.e Acceptance Test E (cause chain end-to-end).
 #
+# Status after the Phase 1.2.5 Gap-Analysis round:
+#
+# - Phase 1.2.5 Gap 1 (LLVM panic on `pub error` construction) is
+#   closed; minimal `pub error MyError {}` + `%MyError{}` now `zap
+#   run`s cleanly (see `phase_1_2_5_gap1_minimal_pub_error.zap`).
+# - Phase 1.2.5 Gap 2 (type-checker rejected `inner` binding in
+#   `case Option.Some(inner) -> Error.kind(inner)` on
+#   `Option(protocol_constraint(Error))`) is closed at the type
+#   level: the patched `TypeChecker.inferExpr` resolves the
+#   protocol's declared return type for `Error.source(e)` and the
+#   downstream `Error.kind(inner)` typechecks cleanly.
+# - The remaining gap to run this fixture end-to-end via `zap run`
+#   is the construction-site auto-boxing at call arguments:
+#   `Demo.walk(%Outer{})` requires the concrete `Outer` value to
+#   auto-box into `runtime.ProtocolBox(Error)` at the call site
+#   (the parameter expects `protocol_constraint(Error)`). The
+#   struct-literal and union-variant paths already auto-box at
+#   construction sites (Phase 1.2.5.c); extending the same
+#   coercion to call arguments where the IR's
+#   `callTargetExpectedType` resolves cross-struct script-mode
+#   calls is the open follow-up tracked under Phase 1 gap analysis
+#   loop (task #17).
+#
 # The closing acceptance for the Phase 1.2.5 protocol-existentials
 # project: with `cause :: Option(Error) = Option.None` auto-injected
 # into every `pub error` (Phase 1.2.5.e) and the full A→B→C→D
@@ -7,7 +30,7 @@
 # inner error via its `cause` field and a caller can walk the chain
 # at runtime through `Error.source/1` and protocol-box dispatch.
 #
-# The expected output is:
+# Once the call-site auto-box gap closes, the expected output is:
 #
 #   inner
 #   0
