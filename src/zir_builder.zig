@@ -1396,6 +1396,77 @@ pub const ZirDriver = struct {
         return .foreign;
     }
 
+    /// Emit a synthetic top-level Zig source file for a per-instantiation
+    /// `union_def` or `enum_def` TypeDef whose name is a top-level
+    /// mangled form (e.g. `Option_i64`, `Color_Foo`). The file content
+    /// is a single `pub const <Name> = union(enum) { ... };` or
+    /// `pub const <Name> = enum { ... };` declaration so consumers can
+    /// reach the type via `@import("<Name>").<Name>`.
+    ///
+    /// This complements Step 3.5 (`struct_def` synthetic files) — the
+    /// IR layer already emits `union_def`/`enum_def` TypeDefs for every
+    /// `.applied { base, args }` parametric specialization in
+    /// `populateAppliedSpecializations`, but the ZIR layer would
+    /// otherwise drop them. With this step in place, the consistent
+    /// threading rule for `union_init` becomes "always use
+    /// `emitStructTypeRef(ui.union_type)` — the type exists at ZIR".
+    fn emitSpecializationSourceFile(
+        self: *ZirDriver,
+        c: *ZirContext,
+        type_def: ir.TypeDef,
+    ) !void {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.allocator);
+
+        switch (type_def.kind) {
+            .union_def => |def| {
+                try buf.appendSlice(self.allocator, "pub const ");
+                try buf.appendSlice(self.allocator, type_def.name);
+                try buf.appendSlice(self.allocator, " = union(enum) {\n");
+                for (def.variants) |variant| {
+                    try buf.appendSlice(self.allocator, "    ");
+                    try buf.appendSlice(self.allocator, variant.name);
+                    if (variant.type_name) |tn| {
+                        if (std.mem.eql(u8, tn, "void")) {
+                            try buf.appendSlice(self.allocator, ",\n");
+                        } else {
+                            try buf.appendSlice(self.allocator, ": ");
+                            try buf.appendSlice(self.allocator, tn);
+                            try buf.appendSlice(self.allocator, ",\n");
+                        }
+                    } else {
+                        try buf.appendSlice(self.allocator, ",\n");
+                    }
+                }
+                try buf.appendSlice(self.allocator, "};\n");
+            },
+            .enum_def => |def| {
+                try buf.appendSlice(self.allocator, "pub const ");
+                try buf.appendSlice(self.allocator, type_def.name);
+                try buf.appendSlice(self.allocator, " = enum {\n");
+                for (def.variants) |variant_name| {
+                    try buf.appendSlice(self.allocator, "    ");
+                    try buf.appendSlice(self.allocator, variant_name);
+                    try buf.appendSlice(self.allocator, ",\n");
+                }
+                try buf.appendSlice(self.allocator, "};\n");
+            },
+            else => return, // guarded by caller
+        }
+
+        const name_z = try self.allocator.dupeZ(u8, type_def.name);
+        defer self.allocator.free(name_z);
+
+        if (zir_compilation_add_struct_source(
+            c,
+            name_z,
+            buf.items.ptr,
+            @intCast(buf.items.len),
+        ) != 0) {
+            return error.ZirInjectionFailed;
+        }
+    }
+
     /// Emit one nested type-decl inside the primary struct. Mirrors
     /// the original loop body — preserved verbatim for nested decls
     /// only; the primary struct path goes through `emitRootFields`
@@ -1729,13 +1800,31 @@ pub const ZirDriver = struct {
         else
             name;
 
+        // Parametric union/enum specializations (Step 3.6) live as
+        // `pub const <Name> = union(enum) {...};` inside a synthetic
+        // top-level Zig source file. The file IS a struct (file-IS-
+        // struct convention), so `@import(name)` yields the struct
+        // and the actual union/enum type lives one field-access
+        // deeper. Detect this case once and reuse it across both the
+        // "no current emission" early return and the explicit
+        // foreign-top-level branch below — a parametric union must
+        // emit `@import(name).<name>` regardless of which path
+        // resolves the type ref.
+        const is_specialization_decl = std.mem.indexOf(u8, name, ".") == null and
+            (self.findUnionDef(name) != null or self.findEnumDef(name));
+
         const current_struct = self.current_emit_struct orelse {
             // No current emission context (e.g. top-level program
             // header) — fall back to import-by-name. Same behavior
             // as a foreign top-level reference.
-            const ref = zir_builder_emit_import(self.handle, name.ptr, @intCast(name.len));
-            if (ref == error_ref) return error.EmitFailed;
-            return ref;
+            const import_ref = zir_builder_emit_import(self.handle, name.ptr, @intCast(name.len));
+            if (import_ref == error_ref) return error.EmitFailed;
+            if (is_specialization_decl) {
+                const ref = zir_builder_emit_field_val(self.handle, import_ref, name.ptr, @intCast(name.len));
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            }
+            return import_ref;
         };
 
         var buf: [256]u8 = undefined;
@@ -1761,10 +1850,22 @@ pub const ZirDriver = struct {
                     if (ref == error_ref) return error.EmitFailed;
                     return ref;
                 }
-                // Foreign top-level: `@import(name)` IS the struct
-                const ref = zir_builder_emit_import(self.handle, name.ptr, @intCast(name.len));
-                if (ref == error_ref) return error.EmitFailed;
-                return ref;
+                // Foreign top-level: `@import(name)`. For a plain
+                // struct emission the file IS the struct (Step 3 /
+                // Step 3.5), so the import directly yields the type.
+                // For a parametric union/enum specialization (Step 3.6)
+                // the file is the struct but the type is a `pub const`
+                // *inside* that file — reach it via
+                // `@import(name).<name>` (see `is_specialization_decl`
+                // computed above the dispatch).
+                const import_ref = zir_builder_emit_import(self.handle, name.ptr, @intCast(name.len));
+                if (import_ref == error_ref) return error.EmitFailed;
+                if (is_specialization_decl) {
+                    const ref = zir_builder_emit_field_val(self.handle, import_ref, name.ptr, @intCast(name.len));
+                    if (ref == error_ref) return error.EmitFailed;
+                    return ref;
+                }
+                return import_ref;
             },
         }
     }
@@ -2236,6 +2337,57 @@ pub const ZirDriver = struct {
 
                 self.handle = saved_handle;
                 self.current_emit_struct = null;
+            }
+
+            // ── Step 3.6: Emit per-instantiation union/enum specializations ───
+            // The IR layer emits one `union_def` / `enum_def` TypeDef per
+            // parametric specialization (`Option_i64`, `Result_i64_String`,
+            // etc.). These have no Zap struct ownership — they're derived
+            // names produced by `populateAppliedSpecializations`. The
+            // file-IS-the-struct architecture means a Zig file is always a
+            // struct, so we can't make `@import("Option_i64")` *be* the
+            // union directly; instead we inject a stub source file
+            // `Option_i64.zig` containing
+            //
+            //     pub const Option_i64 = union(enum) { Some: i64, None };
+            //
+            // and the consumer resolves `@import("Option_i64").Option_i64`
+            // to the union type. The same shape works for unit-only
+            // tagged unions (enum_def): `pub const Color = enum { Red, Blue };`.
+            //
+            // This is the construction-side complement to the per-
+            // instantiation `union_def`/`enum_def` TypeDefs the IR already
+            // builds — Round 1 emitted them but the ZIR layer silently
+            // dropped them (only `struct_def` flowed through Step 3.5).
+            // With Step 3.6 in place, `union_init`'s ZIR handler can
+            // always go through `emitStructTypeRef` regardless of
+            // return-position context, removing the previous
+            // `cached_union_ret_type_ref` fallback to `struct_init_anon`.
+            //
+            // Concrete non-parametric tagged unions (`Color { Red, Blue }`)
+            // also land in `prog.type_defs` as `union_def`/`enum_def`, but
+            // their TypeDef name carries a dot (`Color` lives inside its
+            // owner struct, e.g. `MyMod.Color`) — those are emitted as
+            // nested decls inside the owner's primary emission and we
+            // skip them here.
+            if (self.progress) |progress| progress.stage("ZIR: emitting parametric union/enum specializations", .{});
+            for (self.program.?.type_defs) |type_def| {
+                switch (type_def.kind) {
+                    .union_def, .enum_def => {},
+                    else => continue,
+                }
+                // Nested decls (`Owner.Color`) are emitted inside the
+                // owner's primary emission via `emitNestedTypeDecl` — skip.
+                if (std.mem.indexOf(u8, type_def.name, ".") != null) continue;
+                // A non-parametric top-level tagged-union doesn't need
+                // a synthetic file when it shares a name with a struct
+                // emission that already exists (e.g. a user `pub union
+                // Top {…}` registered alongside `pub struct Top {…}` —
+                // Blocker B's namespace merge handles this case at the
+                // resolution layer).
+                if (struct_funcs.contains(type_def.name)) continue;
+                if (!self.shouldEmitStruct(type_def.name)) continue;
+                try self.emitSpecializationSourceFile(c, type_def);
             }
 
             // ── Step 4: Generate namespace re-export structs ─────────
@@ -6092,12 +6244,69 @@ pub const ZirDriver = struct {
                 try self.setLocal(mg.dest, ref);
             },
             .union_init => |ui| {
-                const val_ref = self.refForValueLocal(ui.value) catch return;
+                // Consistent threading rule (Round 2 Blocker A): the
+                // IR's `union_type` field carries the per-instantiation
+                // mangled name (e.g. `Option_i64`) populated from HIR's
+                // `.applied { base, args }` literal type. Resolve that
+                // name to a ZIR union-type ref via the same dispatcher
+                // every struct construction uses (`emitStructTypeRef`),
+                // then emit `@unionInit(UnionType, ".Variant", value)`.
+                //
+                // Step 3.6 ensures every parametric union/enum
+                // specialization has a synthetic Zig source file, so
+                // `emitStructTypeRef` resolves regardless of whether
+                // the enclosing function returns the union. Concrete
+                // dotted unions (`Owner.Color`) and the
+                // `cached_union_ret_type_ref` route stay as fallbacks
+                // for the narrow cases the structural pipeline doesn't
+                // cover yet (closures that lose the emission context;
+                // unit-only enums that flow through enum_literal
+                // instead of union_init).
+                //
+                // Unit-payload variants (e.g. `Option(i64).None`) carry
+                // a `const_nil` value local from HIR. Sema expects the
+                // payload type of a void variant to be `void`, not
+                // `?void` — using `null_value` here would force a
+                // `null` → `void` coercion failure. Detect the void-
+                // payload case via the IR-emitted `union_def` variant
+                // type_name and substitute `void_value` so
+                // `@unionInit(Option_i64, "None", {})` lowers cleanly.
+                const variant_type_name: ?[]const u8 = blk: {
+                    if (self.findUnionDef(ui.union_type)) |udef| {
+                        for (udef.variants) |variant| {
+                            if (std.mem.eql(u8, variant.name, ui.variant_name)) {
+                                break :blk variant.type_name;
+                            }
+                        }
+                    }
+                    break :blk null;
+                };
+                const variant_is_void = variant_type_name != null and std.mem.eql(u8, variant_type_name.?, "void");
+                const val_ref = if (variant_is_void)
+                    @intFromEnum(Zir.Inst.Ref.void_value)
+                else
+                    self.refForValueLocal(ui.value) catch return;
                 const names = [_][*]const u8{ui.variant_name.ptr};
                 const lens = [_]u32{@intCast(ui.variant_name.len)};
                 const vals = [_]u32{val_ref};
                 if (ui.reuse_token) |token_local| {
-                    const seed_ref = zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
+                    const seed_ref = blk: {
+                        if (!self.current_function_is_closure) {
+                            if (self.findUnionDef(ui.union_type) != null) {
+                                if (self.emitStructTypeRef(ui.union_type) catch null) |union_type_ref| {
+                                    const typed = zir_builder_emit_union_init(
+                                        self.handle,
+                                        union_type_ref,
+                                        ui.variant_name.ptr,
+                                        @intCast(ui.variant_name.len),
+                                        val_ref,
+                                    );
+                                    if (typed != error_ref) break :blk typed;
+                                }
+                            }
+                        }
+                        break :blk zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
+                    };
                     if (seed_ref == error_ref) return error.EmitFailed;
                     const type_ref = zir_builder_emit_typeof(self.handle, seed_ref);
                     if (type_ref == error_ref) return error.EmitFailed;
@@ -6110,23 +6319,53 @@ pub const ZirDriver = struct {
                     try self.setLocal(ui.dest, ptr_ref);
                 } else {
                     _ = self.reuse_backed_union_locals.remove(ui.dest);
-                    // Use proper @unionInit if a union return type was set up at function start
+
+                    // Primary path: name-resolved union type via the
+                    // shared struct/union-type dispatcher.
+                    if (!self.current_function_is_closure) {
+                        if (self.findUnionDef(ui.union_type) != null) {
+                            if (self.emitStructTypeRef(ui.union_type) catch null) |union_type_ref| {
+                                const ref = zir_builder_emit_union_init(
+                                    self.handle,
+                                    union_type_ref,
+                                    ui.variant_name.ptr,
+                                    @intCast(ui.variant_name.len),
+                                    val_ref,
+                                );
+                                if (ref != error_ref) {
+                                    try self.setLocal(ui.dest, ref);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback 1: function declared a union return type
+                    // and Sema can reuse that ref. Preserved for the
+                    // narrow case where `findUnionDef` doesn't see the
+                    // type (closures, partial emissions).
                     if (self.cached_union_ret_type_ref != 0) {
-                        const union_type_ref = self.cached_union_ret_type_ref;
                         const ref = zir_builder_emit_union_init(
                             self.handle,
-                            union_type_ref,
+                            self.cached_union_ret_type_ref,
                             ui.variant_name.ptr,
                             @intCast(ui.variant_name.len),
                             val_ref,
                         );
                         if (ref == error_ref) return error.EmitFailed;
                         try self.setLocal(ui.dest, ref);
-                    } else {
-                        const ref = zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
-                        if (ref == error_ref) return error.EmitFailed;
-                        try self.setLocal(ui.dest, ref);
+                        return;
                     }
+
+                    // Fallback 2: anonymous struct. This is the legacy
+                    // pre-Round-2 behavior; downstream `activeTag` checks
+                    // fail against this, so it should only ever land for
+                    // discard-only construction sites or builds where
+                    // the union TypeDef hasn't reached the ZIR program
+                    // (an IR-side bug we'd want to surface).
+                    const ref = zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(ui.dest, ref);
                 }
             },
 

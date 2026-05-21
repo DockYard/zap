@@ -8841,6 +8841,37 @@ pub const IrBuilder = struct {
                         });
                         return dest;
                     }
+                    // Parametric nullary variant: `Option(i64).None`.
+                    // The HIR emits a `field_get` whose object is a
+                    // `nil_lit` carrying the `.applied { base = TaggedUnion, args }`
+                    // TypeId. Route this through `enum_literal` with the
+                    // per-instantiation mangled name so the ZIR layer
+                    // can resolve `@import("Option_i64").Option_i64.<Variant>`
+                    // — distinct from the concrete-tagged-union case
+                    // above (which uses the bare declaration name).
+                    if (typ == .applied) {
+                        if (typ.applied.base < self.type_store.?.types.items.len) {
+                            const base_typ = self.type_store.?.getType(typ.applied.base);
+                            if (base_typ == .tagged_union) {
+                                // The IR's `EnumLiteral.type_name` is
+                                // consumed by ZIR via `emitStructTypeRef`
+                                // when the variant is unit-only. Carry
+                                // the per-instantiation mangled name
+                                // (`Option_i64`) so the synthetic
+                                // source file from Step 3.6 resolves
+                                // the union type.
+                                const type_name = self.resolveTypeName(fg.object.type_id);
+                                try self.current_instrs.append(self.allocator, .{
+                                    .enum_literal = .{
+                                        .dest = dest,
+                                        .type_name = type_name,
+                                        .variant = self.interner.get(fg.field),
+                                    },
+                                });
+                                return dest;
+                            }
+                        }
+                    }
                 }
                 const obj = try self.lowerExpr(fg.object);
                 const field_name = self.interner.get(fg.field);

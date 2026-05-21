@@ -5781,6 +5781,39 @@ pub const HirBuilder = struct {
                                 self.buildAppliedStructLiteralType(tid, mr.type_args)
                             else
                                 tid;
+                            // Parametric tagged unions emit a synthetic
+                            // top-level `union(enum)` per instantiation
+                            // (Step 3.6 in zir_builder), so even unit
+                            // variants must materialise as
+                            // `@unionInit(<Instantiation>, "<Variant>", {})`
+                            // rather than a bare enum literal — the ZIR
+                            // layer rejects a literal `.None` against
+                            // a `union(enum)` type without an explicit
+                            // `@unionInit`. The void payload uses a
+                            // synthesized nil_lit at the union's TypeId
+                            // (carries through the ARC analyses, which
+                            // expect a typed value).
+                            //
+                            // Concrete (non-parametric) tagged unions
+                            // continue to use the `field_get` shape so
+                            // they lower as `enum_literal` and ride the
+                            // existing pattern-match coercion path.
+                            if (mr.type_args.len > 0) {
+                                const void_payload = try self.create(Expr, .{
+                                    .kind = .nil_lit,
+                                    .type_id = types_mod.TypeStore.NIL,
+                                    .span = mr.meta.span,
+                                });
+                                return try self.create(Expr, .{
+                                    .kind = .{ .union_init = .{
+                                        .union_type_id = literal_type_id,
+                                        .variant_name = variant_name,
+                                        .value = void_payload,
+                                    } },
+                                    .type_id = literal_type_id,
+                                    .span = mr.meta.span,
+                                });
+                            }
                             return try self.create(Expr, .{
                                 .kind = .{
                                     .field_get = .{
