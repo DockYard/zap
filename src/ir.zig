@@ -7295,7 +7295,25 @@ pub const IrBuilder = struct {
     /// (e.g. an erroneously-constructed applied over a primitive) are
     /// silently skipped — they cannot have field/variant lists to
     /// substitute, and the type checker rejects such constructions
-    /// upstream. `.applied` entries whose args still contain a type
+    /// upstream.
+    ///
+    /// **Mangled-name collision risk.** The mangling scheme
+    /// (`typeIdMangledName`) joins base + args with `_`, matching
+    /// the monomorphizer's function-specialization scheme. A user
+    /// who declares a concrete struct under a name that matches a
+    /// parametric instantiation's mangled form (`pub struct Box_i64`
+    /// while also using `Box(i64)` elsewhere) would produce two
+    /// `TypeDef` entries with the same name — a defect surface that
+    /// downstream layers cannot disambiguate. Detecting and reporting
+    /// the collision as a Zap-level diagnostic is tracked as a
+    /// follow-up; for now the `StringHashMap.put` here would
+    /// overwrite the concrete-struct index with the parametric one,
+    /// which is consistent with the IR's category ordering (concrete
+    /// first, applied second) but is not a deliberate semantic. The
+    /// collision is exceedingly unlikely in practice — Zap struct
+    /// names use PascalCase and a literal `Box_i64` is not idiomatic.
+    ///
+    /// `.applied` entries whose args still contain a type
     /// variable are also skipped: those are *partial* instantiations
     /// produced by the type-checker's mid-traversal stages that the
     /// monomorphizer collapses before IR runs, so emitting a TypeDef
