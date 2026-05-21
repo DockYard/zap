@@ -791,6 +791,14 @@ pub const StructExpr = struct {
     /// matches the declaration's `type_params` arity happens in the
     /// type checker (see `inferStructExprType`).
     type_args: []const *const TypeExpr = &.{},
+    /// True when the user wrote an explicit `(...)` (possibly empty)
+    /// after the struct name. Combined with `type_args.len == 0`, this
+    /// distinguishes `%Box{...}` (no parens — defer to context-driven
+    /// inference) from `%Box(){...}` (explicit empty parens — an arity
+    /// error against a parametric declaration). Without this flag both
+    /// forms would parse to the same AST and the latter would silently
+    /// fall through to the inference path.
+    type_args_parens_present: bool = false,
     update_source: ?*const Expr,
     fields: []const StructField,
 };

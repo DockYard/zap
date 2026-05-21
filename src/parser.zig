@@ -3345,7 +3345,9 @@ pub const Parser = struct {
         // type-argument slot accepts a full TypeExpr so nested generic
         // applications like `%Box(Option(i64)){...}` work.
         var type_args: std.ArrayList(*const ast.TypeExpr) = .empty;
+        var type_args_parens_present = false;
         if (self.check(.left_paren)) {
+            type_args_parens_present = true;
             _ = self.advance();
             self.skipNewlines();
             while (!self.check(.right_paren) and !self.check(.eof)) {
@@ -3452,6 +3454,7 @@ pub const Parser = struct {
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
                 .struct_name = struct_name,
                 .type_args = try type_args.toOwnedSlice(self.allocator),
+                .type_args_parens_present = type_args_parens_present,
                 .update_source = update_source,
                 .fields = try fields.toOwnedSlice(self.allocator),
             },

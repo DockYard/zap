@@ -3795,7 +3795,24 @@ pub const TypeChecker = struct {
         // structs without explicit type-args at the literal must
         // still type-check today so existing impl bodies, which
         // never write the type-arg syntax, keep working.
-        if (formal_arity > 0 and provided_arity == 0) return instantiation;
+        //
+        // The user writing explicit empty parens (`%Box(){...}`) is a
+        // distinct case: they deliberately supplied 0 args to a
+        // parametric type that requires N. That is an arity error,
+        // not an inference opportunity — the `type_args_parens_present`
+        // flag (set by the parser only when `(...)` appears in the
+        // source) lets us route the explicit shape to the same arity
+        // diagnostic as `Box(i64, String)` against a `Box(T)`
+        // declaration. Without this distinction `%Box(){...}` and
+        // `%Box{...}` would collapse to the same AST and the explicit
+        // form would silently fall through to the inference path.
+        if (formal_arity > 0 and provided_arity == 0) {
+            if (struct_expr.type_args_parens_present) {
+                const struct_name_text = self.interner.get(type_name_id);
+                try self.reportParametricArityMismatch(struct_name_text, formal_arity, provided_arity, struct_expr.meta.span);
+            }
+            return instantiation;
+        }
 
         // Arity mismatch.
         if (formal_arity != provided_arity) {
@@ -11753,4 +11770,136 @@ test "parametric struct default re-validation dedupes per applied TypeId" {
         }
     }
     try std.testing.expectEqual(@as(usize, 1), diag_count);
+}
+
+test "parametric struct literal with zero args when one expected emits arity diagnostic" {
+    // Acceptance test G: `%Box(){value: 42}` for a `Box(T)`
+    // declaration must produce a compile error. The diagnostic
+    // comes from `buildStructLiteralInstantiation` via
+    // `reportParametricArityMismatch`.
+    const source =
+        \\pub struct Box(T) {
+        \\  value :: T
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Box {
+        \\    %Box(){value: 42}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found_arity_diag = false;
+    for (checker.errors.items) |type_err| {
+        if (std.mem.indexOf(u8, type_err.message, "expects 1 type parameter") != null and
+            std.mem.indexOf(u8, type_err.message, "got 0") != null)
+        {
+            found_arity_diag = true;
+        }
+    }
+    try std.testing.expect(found_arity_diag);
+}
+
+test "parametric tagged-union variant construction infers applied receiver type" {
+    // Acceptance test D (typing portion): `Option(i64).Some(42)` must
+    // type-infer as `.applied { base = Option, args = [i64] }`. The
+    // payload `42` must be acceptable for the substituted variant
+    // type (`i64`). Pattern destructuring (Phase 1.3) lives separately;
+    // this test pins the *construction-site* type inference so the
+    // value's static shape is the per-instantiation form everywhere
+    // downstream (monomorphizer, IR per-instantiation TypeDef emitter).
+    const source =
+        \\pub union Option(t) {
+        \\  Some :: t
+        \\  None
+        \\}
+        \\pub struct Demo {
+        \\  pub fn wrap() -> Option(i64) {
+        \\    Option(i64).Some(42)
+        \\  }
+        \\  pub fn empty() -> Option(i64) {
+        \\    Option(i64).None
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "parametric tagged-union with multiple type parameters constructs cleanly" {
+    // Acceptance test F (typing portion): `Result(i64, String).Ok(42)`
+    // must type-infer as `.applied { base = Result, args = [i64, String] }`.
+    // The Ok variant's payload type substitutes T -> i64; the Error
+    // variant's payload would substitute E -> String. Construction
+    // and the multi-param applied form land cleanly through the same
+    // disambiguation + applyTypeArgsToReceiver path.
+    const source =
+        \\pub union Result(t, e) {
+        \\  Ok :: t
+        \\  Err :: e
+        \\}
+        \\pub struct Demo {
+        \\  pub fn ok() -> Result(i64, String) {
+        \\    Result(i64, String).Ok(42)
+        \\  }
+        \\  pub fn fail() -> Result(i64, String) {
+        \\    Result(i64, String).Err("nope")
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 }
