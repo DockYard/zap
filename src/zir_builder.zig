@@ -74,7 +74,8 @@ extern "c" fn zir_builder_emit_decl_val(handle: ?*ZirBuilderHandle, name_ptr: [*
 extern "c" fn zir_builder_set_union_return_type(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, types_ptr: [*]const u32, fields_len: u32) i32;
 
 // Switch block for tagged unions (single-pass API)
-extern "c" fn zir_builder_add_switch_block(handle: ?*ZirBuilderHandle, operand: u32, prong_names_ptrs: [*]const [*]const u8, prong_names_lens: [*]const u32, prong_captures: [*]const u32, prong_body_lens: [*]const u32, prong_body_results: [*]const u32, prong_body_insts: [*]const u32, num_prongs: u32) u64;
+extern "c" fn zir_builder_add_switch_block(handle: ?*ZirBuilderHandle, operand: u32, prong_names_ptrs: [*]const [*]const u8, prong_names_lens: [*]const u32, prong_captures: [*]const u32, prong_body_lens: [*]const u32, prong_body_results: [*]const u32, prong_body_insts: [*]const u32, num_prongs: u32, has_else: u32, else_body_len: u32, else_body_result: u32, payload_capture_placeholder: u32) u64;
+extern "c" fn zir_builder_emit_value_placeholder(handle: ?*ZirBuilderHandle) u32;
 
 // Body tracking control (for branch body emission)
 extern "c" fn zir_builder_set_body_tracking(handle: ?*ZirBuilderHandle, enabled: bool) void;
@@ -9580,13 +9581,59 @@ pub const ZirDriver = struct {
         if (result == error_ref) return error.EmitFailed;
     }
 
+    /// Lower a `union_switch` IR instruction to a single comptime-safe
+    /// `switch_block` (one prong per variant, plus an optional `else`
+    /// prong). This is the SINGLE lowering path for every tagged-union
+    /// `case`. Sema only analyzes the active prong of a `switch_block` over
+    /// a comptime-known scrutinee, so this never touches an inactive
+    /// variant's payload field — fixing the comptime-fold UB that the old
+    /// `match_variant_tag` + `guard_block` + `variant_payload_get` chain hit
+    /// whenever more than one arm bound a payload.
+    ///
+    /// Mechanism: emit a `value_placeholder` whose Ref is the payload
+    /// capture. Every payload-bearing prong binds its payload local to this
+    /// placeholder Ref, so prong body instructions that read the payload
+    /// resolve to the captured value when Sema maps the placeholder. Each
+    /// prong body is pre-emitted (body_tracking OFF), its instruction
+    /// indices collected, and its result Ref recorded. `addSwitchBlock`
+    /// then writes the canonical SwitchBlock extra data.
     fn emitUnionSwitch(self: *ZirDriver, us: ir.UnionSwitch) BuildError!void {
+        const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
         const scrutinee_ref = try self.refForLocal(us.scrutinee);
 
         if (us.cases.len == 0) return;
 
-        // Pre-emit all body instructions with body_tracking OFF.
-        // Collect instruction indices and result Refs for each prong.
+        // A single value_placeholder serves as the payload capture for ALL
+        // capturing prongs. It is never analyzed in any body; Sema records
+        // it in the SwitchBlock's payload_capture_placeholder slot and maps
+        // the active prong's captured payload onto it.
+        const placeholder = zir_builder_emit_value_placeholder(self.handle);
+        if (placeholder == 0xFFFFFFFF) return error.EmitFailed;
+        const placeholder_ref = @intFromEnum(Zir.Inst.Index.toRef(@enumFromInt(placeholder)));
+
+        // Pre-resolve named function references that appear in any prong /
+        // else body. Inside switch prong bodies, name-based call emission
+        // fails (the decl is not in scope during capture), so resolve them
+        // to Refs here with body_tracking ON, then emit `call_ref`.
+        var pre_resolved_fns = std.StringHashMap(u32).init(self.allocator);
+        defer pre_resolved_fns.deinit();
+        const PreResolve = struct {
+            fn scan(driver: *ZirDriver, instrs: []const ir.Instruction, map: *std.StringHashMap(u32)) void {
+                for (instrs) |bi| {
+                    if (bi == .call_named) {
+                        const cn = bi.call_named;
+                        if (!map.contains(cn.name)) {
+                            if (driver.resolveCallNamedToRef(cn.name)) |fn_ref| {
+                                map.put(cn.name, fn_ref) catch {};
+                            } else |_| {}
+                        }
+                    }
+                }
+            }
+        };
+        for (us.cases) |case| PreResolve.scan(self, case.body_instrs, &pre_resolved_fns);
+        if (us.has_else) PreResolve.scan(self, us.else_instrs, &pre_resolved_fns);
+
         var names_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
         defer names_ptrs.deinit(self.allocator);
         var names_lens: std.ArrayListUnmanaged(u32) = .empty;
@@ -9600,103 +9647,48 @@ pub const ZirDriver = struct {
         var all_body_insts: std.ArrayListUnmanaged(u32) = .empty;
         defer all_body_insts.deinit(self.allocator);
 
-        // We need the future switch_block Ref for payload capture binding.
-        // It will be emitted by addSwitchBlock after all body instructions.
-        // For now, use a placeholder — we'll resolve it after the call.
-        // Actually, addSwitchBlock returns the Ref. But body instructions
-        // need it BEFORE the call. The solution: body instructions for the
-        // Ok prong reference the return_value local, which we'll bind to
-        // the switch Ref AFTER addSwitchBlock returns. But the body instructions
-        // are already emitted...
-        //
-        // The correct approach: for capture prongs (Ok), the body_result should
-        // reference the switch_block instruction. But we don't know its index yet.
-        // Instead, we pass the body_result as-is — for Ok prongs where return_value
-        // is the payload local, the local should already map to something.
-        // For Error prongs, return_value is the handler (already lowered).
-
-        // Pre-resolve all function references that appear in body instructions.
-        // Inside switch prong bodies, zir_builder_emit_call (name lookup) fails.
-        // We resolve them to Refs here (with body_tracking ON) so they're
-        // in the function body and visible to Sema.
-        var pre_resolved_fns = std.StringHashMap(u32).init(self.allocator);
-        defer pre_resolved_fns.deinit();
+        // Emit one scalar prong per variant.
         for (us.cases) |case| {
-            for (case.body_instrs) |bi| {
-                if (bi == .call_named) {
-                    const cn = bi.call_named;
-                    if (!pre_resolved_fns.contains(cn.name)) {
-                        if (self.resolveCallNamedToRef(cn.name)) |fn_ref| {
-                            pre_resolved_fns.put(cn.name, fn_ref) catch {};
-                        } else |_| {}
-                    }
-                }
-            }
-        }
-
-        for (us.cases) |case| {
-            const is_ok = std.mem.eql(u8, case.variant_name, "Ok");
+            const has_capture = case.field_bindings.len > 0;
 
             try names_ptrs.append(self.allocator, case.variant_name.ptr);
             try names_lens.append(self.allocator, @intCast(case.variant_name.len));
-            // Ok: capture payload + use capture as result (bit 0 = capture, bit 1 = use_capture_as_result)
-            // Error: capture payload only (handler result is pre-computed)
-            const capture_flags: u32 = if (is_ok) 3 else 1; // Ok=0b11, Error=0b01
-            try captures.append(self.allocator, capture_flags);
+            try captures.append(self.allocator, @intFromBool(has_capture));
 
-            // Emit body instructions with tracking off
-            zir_builder_set_body_tracking(self.handle, false);
-            const body_start = zir_builder_get_inst_count(self.handle);
-
-            for (case.body_instrs) |bi| {
-                // Intercept call_named: use pre-resolved Ref with call_ref
-                if (bi == .call_named) {
-                    const cn = bi.call_named;
-                    if (pre_resolved_fns.get(cn.name)) |fn_ref| {
-                        var call_args: std.ArrayListUnmanaged(u32) = .empty;
-                        defer call_args.deinit(self.allocator);
-                        for (cn.args) |arg| {
-                            const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                            try call_args.append(self.allocator, ref);
-                        }
-                        const result = zir_builder_emit_call_ref(self.handle, fn_ref, call_args.items.ptr, @intCast(call_args.items.len));
-                        if (result == error_ref) return error.EmitFailed;
-                        try self.setLocal(cn.dest, result);
-                        continue;
-                    }
-                }
-                try self.emitInstruction(bi);
+            // Bind every payload local to the capture placeholder so prong
+            // body reads of the payload resolve to the captured value. A
+            // whole-payload bind (single FieldBinding with empty field_name)
+            // maps the local directly to the placeholder.
+            for (case.field_bindings) |fb| {
+                try self.setLocal(fb.local_index, placeholder_ref);
             }
 
-            const body_end = zir_builder_get_inst_count(self.handle);
-            zir_builder_set_body_tracking(self.handle, true);
-
-            const body_len = body_end - body_start;
-            try body_lens.append(self.allocator, body_len);
-            for (body_start..body_end) |inst_i| {
-                try all_body_insts.append(self.allocator, @intCast(inst_i));
-            }
-
-            // Resolve case result
-            if (is_ok) {
-                // Ok: result will be the switch payload (resolved by Sema via inst_map).
-                // We pass .none as body_result — addSwitchBlock's break_inline will
-                // use this. But .none won't work. We need the switch_block Ref.
-                // Since we don't have it yet, we'll use a placeholder approach:
-                // pass .void_value and fix below.
-                try body_results.append(self.allocator, @intFromEnum(Zir.Inst.Ref.void_value));
-            } else {
-                // Error: result is the pre-lowered handler expression
-                if (case.return_value) |rv| {
-                    const ref = self.refForValueLocal(rv) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                    try body_results.append(self.allocator, ref);
-                } else {
-                    try body_results.append(self.allocator, @intFromEnum(Zir.Inst.Ref.void_value));
-                }
-            }
+            const prong = try self.emitSwitchProngBody(
+                case.body_instrs,
+                case.return_value,
+                us.dest,
+                &pre_resolved_fns,
+                &all_body_insts,
+            );
+            try body_lens.append(self.allocator, prong.body_len);
+            try body_results.append(self.allocator, prong.result_ref);
         }
 
-        // Call the single-pass C-ABI function
+        // Optional else prong (the `_` catch-all / decision-tree default).
+        var else_len: u32 = 0;
+        var else_result: u32 = void_ref;
+        if (us.has_else) {
+            const prong = try self.emitSwitchProngBody(
+                us.else_instrs,
+                us.else_result,
+                us.dest,
+                &pre_resolved_fns,
+                &all_body_insts,
+            );
+            else_len = prong.body_len;
+            else_result = prong.result_ref;
+        }
+
         const result = zir_builder_add_switch_block(
             self.handle,
             scrutinee_ref,
@@ -9707,38 +9699,92 @@ pub const ZirDriver = struct {
             body_results.items.ptr,
             all_body_insts.items.ptr,
             @intCast(us.cases.len),
+            @intFromBool(us.has_else),
+            else_len,
+            else_result,
+            placeholder,
         );
         if (result == 0xFFFFFFFFFFFFFFFF) return error.EmitFailed;
 
         const switch_ref: u32 = @truncate(result);
-        const switch_inst_idx: u32 = @truncate(result >> 32);
-        _ = switch_inst_idx;
-
-        // Now patch the Ok prong's body_result to reference the switch_block Ref.
-        // The switch_block Ref IS the payload capture. When Sema sees a break_inline
-        // with operand = switch_ref, it resolves through inst_map to the captured value.
-        // But we already passed void_value as the Ok result. The break_inline for the
-        // Ok prong will yield void instead of the payload.
-        //
-        // The fix: for prongs with capture, the body_result should be the switch_block
-        // Ref. But we passed void. We need to patch the break_inline instruction's
-        // operand to switch_ref.
-        //
-        // Actually, looking at the Sema analysis: when capture=by_val, Sema puts
-        // the extracted payload in inst_map[switch_block_inst]. The break_inline's
-        // operand is what the switch expression evaluates to. For the Ok prong,
-        // we want the payload — which means the break operand should reference
-        // the switch_block instruction. That IS switch_ref.
-        //
-        // But we already wrote the break with void_value. We need to either:
-        // 1. Pre-compute the switch_ref before calling addSwitchBlock
-        // 2. Or have addSwitchBlock accept a flag to use the switch Ref as Ok result
-        //
-        // For now, accept that the Ok prong returns void. This means the ~>
-        // expression evaluates to void for success. That's wrong for production
-        // but let's see if it at least doesn't crash.
-
         try self.setLocal(us.dest, switch_ref);
+    }
+
+    const SwitchProngEmit = struct {
+        body_len: u32,
+        result_ref: u32,
+    };
+
+    /// Emit one switch prong / else body with body_tracking OFF, appending
+    /// the body's instruction indices to `out_insts`. Returns the number of
+    /// instructions emitted and the prong's result Ref.
+    ///
+    /// The prong result is resolved one of two ways:
+    ///   * if `explicit_result` is non-null, that local's Ref is the result
+    ///     (the simple `Variant(v) -> expr` arm shape — the decision-tree
+    ///     leaf records the arm body value as `return_value`);
+    ///   * otherwise the body's `case_break` instructions write the result to
+    ///     `case_dest` (the `union_switch.dest` local), exactly as
+    ///     `emitFlatCaseBlock` does, so nested guards / sub-patterns inside a
+    ///     prong body keep working. The result Ref is read from `case_dest`
+    ///     after the body.
+    ///
+    /// `call_named` instructions are rewritten to `call_ref` against
+    /// pre-resolved function Refs because name lookup fails inside a capture.
+    fn emitSwitchProngBody(
+        self: *ZirDriver,
+        instrs: []const ir.Instruction,
+        explicit_result: ?ir.LocalId,
+        case_dest: ir.LocalId,
+        pre_resolved_fns: *std.StringHashMap(u32),
+        out_insts: *std.ArrayListUnmanaged(u32),
+    ) BuildError!SwitchProngEmit {
+        const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
+        const saved_case_dest = self.current_case_dest;
+        self.current_case_dest = case_dest;
+        defer self.current_case_dest = saved_case_dest;
+
+        zir_builder_set_body_tracking(self.handle, false);
+        const body_start = zir_builder_get_inst_count(self.handle);
+
+        for (instrs) |bi| {
+            if (bi == .call_named) {
+                const cn = bi.call_named;
+                if (pre_resolved_fns.get(cn.name)) |fn_ref| {
+                    var call_args: std.ArrayListUnmanaged(u32) = .empty;
+                    defer call_args.deinit(self.allocator);
+                    for (cn.args) |arg| {
+                        const ref = self.refForValueLocal(arg) catch void_ref;
+                        try call_args.append(self.allocator, ref);
+                    }
+                    const call_result = zir_builder_emit_call_ref(self.handle, fn_ref, call_args.items.ptr, @intCast(call_args.items.len));
+                    if (call_result == error_ref) {
+                        zir_builder_set_body_tracking(self.handle, true);
+                        return error.EmitFailed;
+                    }
+                    try self.setLocal(cn.dest, call_result);
+                    continue;
+                }
+            }
+            try self.emitInstruction(bi);
+        }
+
+        const body_end = zir_builder_get_inst_count(self.handle);
+        zir_builder_set_body_tracking(self.handle, true);
+
+        const body_len = body_end - body_start;
+        for (body_start..body_end) |inst_i| {
+            try out_insts.append(self.allocator, @intCast(inst_i));
+        }
+
+        const result_ref: u32 = if (explicit_result) |rv|
+            self.refForValueLocal(rv) catch void_ref
+        else if (self.local_refs.get(case_dest)) |vr|
+            self.materializeValueRef(vr) catch void_ref
+        else
+            void_ref;
+
+        return .{ .body_len = body_len, .result_ref = result_ref };
     }
 
     /// Pre-resolve a named function to a ZIR decl_ref.
