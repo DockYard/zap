@@ -1604,7 +1604,63 @@ pub const Parser = struct {
 
             var type_expr: ?*const ast.TypeExpr = null;
             if (self.match(.double_colon)) {
+                // Canonical form: `Some :: T`. The double_colon
+                // separator is the historic shape and remains the
+                // recommended style — the rest of this branch parses
+                // the payload TypeExpr.
                 type_expr = try self.parseTypeExpr();
+            } else if (self.check(.left_paren)) {
+                // Constructor-call alias form: `Some(T)`. Mirrors
+                // Elixir's `defstruct Some(t)` and Rust's
+                // `enum Option<T> { Some(T), None }` so the variant
+                // declaration matches the variant construction syntax
+                // (`Option.Some(42)` reads naturally when the
+                // declaration is `Some(T)` rather than `Some :: T`).
+                // The single payload slot becomes the variant's
+                // `type_expr`; multi-field payloads would lower to a
+                // tuple TypeExpr (intentional forward-compat). Bare
+                // `Some()` (no payload) is rejected because the
+                // already-existing zero-payload form is just `Some`
+                // with no parens.
+                _ = self.advance(); // consume `(`
+                self.skipNewlines();
+                if (self.check(.right_paren)) {
+                    try self.addRichError(
+                        "I was expecting a payload type inside this variant's parens",
+                        self.currentSpan(),
+                        "empty parens are not a valid variant payload",
+                        "drop the `()` for a nullary variant, or list a payload type like `Some(T)`",
+                    );
+                    return error.ParseError;
+                }
+                const payload_type = try self.parseTypeExpr();
+                self.skipNewlines();
+                if (self.check(.comma)) {
+                    // Multi-field payload via tuple — gather the
+                    // remaining type-exprs and synthesise a tuple
+                    // TypeExpr so downstream code sees a single
+                    // payload type, identical to `Some :: {A, B, C}`.
+                    var elems: std.ArrayList(*const ast.TypeExpr) = .empty;
+                    try elems.append(self.allocator, payload_type);
+                    while (self.match(.comma)) {
+                        self.skipNewlines();
+                        if (self.check(.right_paren)) break;
+                        try elems.append(self.allocator, try self.parseTypeExpr());
+                    }
+                    const tuple_span = ast.SourceSpan.merge(
+                        ast.SourceSpan.from(variant_tok.loc),
+                        self.currentSpan(),
+                    );
+                    type_expr = try self.create(ast.TypeExpr, .{
+                        .tuple = .{
+                            .meta = .{ .span = tuple_span },
+                            .elements = try elems.toOwnedSlice(self.allocator),
+                        },
+                    });
+                } else {
+                    type_expr = payload_type;
+                }
+                _ = try self.expect(.right_paren);
             }
 
             try variants.append(self.allocator, .{
@@ -7847,4 +7903,99 @@ test "tagged-union variant pattern preserves enum-style fallback for parameter c
     // the new `tagged_union_variant` arm.
     try std.testing.expect(param_pat == .literal);
     try std.testing.expect(param_pat.literal == .atom);
+}
+
+fn findTopLevelUnion(program: ast.Program) ?*const ast.UnionDecl {
+    for (program.top_items) |item| {
+        if (item == .union_decl) return item.union_decl;
+    }
+    return null;
+}
+
+test "parse union variant declared with Some(T) constructor-call form" {
+    // The Elixir/Rust/Roc-style declaration `Some(T)` must parse
+    // equivalently to the canonical `Some :: T`. Both produce a
+    // `UnionVariant` with `name = "Some"` and a non-null `type_expr`
+    // referencing the type-var `T`.
+    const source =
+        \\pub union Option(T) {
+        \\  Some(T)
+        \\  None
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    const decl_opt = findTopLevelUnion(program);
+    try std.testing.expect(decl_opt != null);
+    const decl = decl_opt.?;
+    try std.testing.expectEqualStrings("Option", parser.interner.get(decl.name));
+    try std.testing.expectEqual(@as(usize, 2), decl.variants.len);
+    // Some(T): non-null payload, type_expr is type-var T
+    try std.testing.expectEqualStrings("Some", parser.interner.get(decl.variants[0].name));
+    try std.testing.expect(decl.variants[0].type_expr != null);
+    const some_payload = decl.variants[0].type_expr.?;
+    try std.testing.expect(some_payload.* == .variable or some_payload.* == .name);
+    // None: nullary, no payload
+    try std.testing.expectEqualStrings("None", parser.interner.get(decl.variants[1].name));
+    try std.testing.expect(decl.variants[1].type_expr == null);
+}
+
+test "parse union variant Some(T) form matches canonical Some :: T payload shape" {
+    // Differential test: declaring `Result(T, E) { Ok(T), Err(E) }`
+    // produces the same AST shape (modulo span info) as the
+    // canonical `Result(T, E) { Ok :: T, Err :: E }`. Both forms
+    // record a single TypeExpr per payload-carrying variant.
+    const source_canonical =
+        \\pub union Result(T, E) {
+        \\  Ok :: T
+        \\  Err :: E
+        \\}
+    ;
+    const source_alias =
+        \\pub union Result(T, E) {
+        \\  Ok(T)
+        \\  Err(E)
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser_a = Parser.init(arena.allocator(), source_canonical);
+    defer parser_a.deinit();
+    const program_a = try parser_a.parseProgram();
+    var parser_b = Parser.init(arena.allocator(), source_alias);
+    defer parser_b.deinit();
+    const program_b = try parser_b.parseProgram();
+
+    const a = findTopLevelUnion(program_a).?;
+    const b = findTopLevelUnion(program_b).?;
+    try std.testing.expectEqual(a.variants.len, b.variants.len);
+    for (a.variants, b.variants) |va, vb| {
+        try std.testing.expectEqualStrings(parser_a.interner.get(va.name), parser_b.interner.get(vb.name));
+        try std.testing.expectEqual(va.type_expr == null, vb.type_expr == null);
+    }
+}
+
+test "parse union variant Some() with no payload rejects with a clear error" {
+    // Empty parens (`Some()`) are deliberately rejected — a nullary
+    // variant should be written without parens (`Some`). Surfacing
+    // a dedicated diagnostic helps developers coming from Rust who
+    // might type `Some()` for the unit-variant form.
+    const source =
+        \\pub union Bad {
+        \\  Empty()
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+    _ = parser.parseProgram() catch {
+        // Expected — the parser surfaces a richer error than
+        // a bare "unexpected token".
+        return;
+    };
+    return error.TestExpectedParseError;
 }
