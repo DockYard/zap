@@ -8245,6 +8245,52 @@ pub const IrBuilder = struct {
             self.interner.get(name.parts[name.parts.len - 1]);
     }
 
+    /// Phase 1.2.5.d consumption-site dispatch helper. Look up the
+    /// `(method_index, arity, return_type)` for a named method on a
+    /// named protocol by walking the scope graph's `ProtocolEntry`
+    /// list. Mirrors the slot layout `populateProtocolVTables`
+    /// produces for the corresponding `ProtocolVTableDef`, but is
+    /// callable during function-body lowering — before
+    /// `populateProtocolVTables` has written its TypeDefs — because
+    /// the data source (declaration order on the source `ProtocolDecl`)
+    /// is the same.
+    ///
+    /// Returns `null` when the scope graph isn't wired (unit tests
+    /// for unrelated shapes), the protocol isn't registered, or the
+    /// method name doesn't match a declared method.
+    fn findProtocolMethodSlotByScope(
+        self: *IrBuilder,
+        protocol_name_text: []const u8,
+        method_name_text: []const u8,
+    ) ?ProtocolMethodSlot {
+        const graph = self.scope_graph orelse return null;
+        for (graph.protocols.items) |proto_entry| {
+            // Phase 1.2.5.b still defers parametric protocols — the
+            // vtable shape would need to be re-instantiated per
+            // protocol argument set, which is a separate upgrade.
+            // The matching `populateProtocolVTables` guard skips
+            // these too, so reaching the dispatch site for a
+            // parametric protocol is a no-op here.
+            if (proto_entry.decl.type_params.len != 0) continue;
+
+            const proto_text = self.protocolNameToString(proto_entry.name);
+            if (!std.mem.eql(u8, proto_text, protocol_name_text)) continue;
+
+            for (proto_entry.decl.functions, 0..) |fn_sig, idx| {
+                const fn_name = self.interner.get(fn_sig.name);
+                if (!std.mem.eql(u8, fn_name, method_name_text)) continue;
+                const return_zig_type = self.protocolReturnTypeToZigType(fn_sig.return_type);
+                return .{
+                    .method_index = @intCast(idx),
+                    .arity = @intCast(fn_sig.params.len),
+                    .return_type = return_zig_type,
+                };
+            }
+            return null;
+        }
+        return null;
+    }
+
     /// Convert a protocol method's parameter or return type
     /// annotation to a `ZigType` suitable for use in the vtable's
     /// function-pointer field type. Phase 1.2.5.a handles primitive
@@ -9341,6 +9387,93 @@ pub const IrBuilder = struct {
                     },
                     .named => |nc| {
                         const call_arity = call.args.len;
+
+                        // Phase 1.2.5.d consumption-site dispatch. When the
+                        // user writes `Protocol.method(receiver, ...)` and
+                        // `receiver`'s static Zig type is
+                        // `.protocol_box(<Protocol>)`, route the call
+                        // through `protocol_dispatch` rather than the
+                        // regular `call_named` path. The regular path
+                        // would try to resolve `Protocol__method__N` and
+                        // fall through to a bare-call lookup — there is
+                        // no monomorphized impl symbol the dispatch can
+                        // point at, because the box's concrete inner
+                        // type is statically erased.
+                        //
+                        // The detection is opportunistic: we require
+                        // (1) the call to be struct-qualified, (2) the
+                        // first arg to be tracked as `.protocol_box(P)`
+                        // for some protocol `P` matching `nc.struct_name`,
+                        // and (3) the method to be declared on `P`.
+                        // Any miss falls through to the existing path
+                        // (which preserves backward compatibility for
+                        // `Protocol.method(concreteValue)` shapes — the
+                        // upstream `protocolDispatchStruct` already
+                        // rewrites those to `<Impl>.method(...)` in HIR).
+                        if (nc.struct_name) |mod| dispatch_blk: {
+                            if (args.items.len == 0) break :dispatch_blk;
+                            const receiver_local = args.items[0];
+                            const receiver_zig_type =
+                                self.known_local_types.get(receiver_local) orelse
+                                typeIdToZigTypeWithStore(
+                                    call.args[0].expr.type_id,
+                                    self.type_store,
+                                );
+                            if (receiver_zig_type != .protocol_box) break :dispatch_blk;
+                            if (!std.mem.eql(u8, receiver_zig_type.protocol_box, mod))
+                                break :dispatch_blk;
+
+                            const slot = self.findProtocolMethodSlotByScope(
+                                mod,
+                                nc.name,
+                            ) orelse break :dispatch_blk;
+
+                            // The receiver flows in as the implicit
+                            // first slot of the synthesized
+                            // dispatcher helper; the remaining args
+                            // are the user's non-receiver arguments.
+                            const lowered_args = try args.toOwnedSlice(self.allocator);
+                            const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
+
+                            const non_recv_args = lowered_args[1..];
+                            const non_recv_modes = lowered_modes[1..];
+
+                            const owned_args = try self.allocator.dupe(LocalId, non_recv_args);
+                            const owned_modes = try self.allocator.dupe(ValueMode, non_recv_modes);
+                            // `lowered_args` / `lowered_modes` are
+                            // arena-allocated by the surrounding
+                            // ArrayList; we keep the receiver slot
+                            // accessible through the dedicated
+                            // `receiver` field rather than re-pack it.
+
+                            const protocol_name_copy = try cloneBytes(self.allocator, mod);
+                            const method_name_copy = try cloneBytes(self.allocator, nc.name);
+
+                            try self.current_instrs.append(self.allocator, .{
+                                .protocol_dispatch = .{
+                                    .dest = dest,
+                                    .receiver = receiver_local,
+                                    .protocol_name = protocol_name_copy,
+                                    .method_name = method_name_copy,
+                                    .method_index = slot.method_index,
+                                    .arity = slot.arity,
+                                    .args = owned_args,
+                                    .arg_modes = owned_modes,
+                                    .return_type = slot.return_type,
+                                },
+                            });
+                            try self.trackCallResultType(dest, tracked_hir_type);
+                            // Track the dest's Zig type from the slot
+                            // so downstream lowering sees a concrete
+                            // return shape (mirrors call_named's
+                            // `known_local_types` propagation through
+                            // `trackCallResultType`).
+                            if (slot.return_type != .any and slot.return_type != .void) {
+                                try self.known_local_types.put(dest, slot.return_type);
+                            }
+                            return dest;
+                        }
+
                         // For struct-qualified calls, try exact arity first, then higher
                         // arities for functions with default parameters. The function
                         // name is mangled so operator-named functions match the
@@ -10234,6 +10367,54 @@ pub const IrBuilder = struct {
 /// matching the canonical mangled forms emitted by
 /// `emitProtocolVTableInstance` (concrete: `"MyError"`; parametric
 /// specialization: `"Box_i64"`).
+/// Look up the `(method_index, method_arity)` for a named method on
+/// a named protocol, by scanning the program's `protocol_vtable_def`
+/// TypeDefs (populated by `populateProtocolVTables`). `method_index`
+/// is the zero-based slot offset in the protocol's source-declaration
+/// order; `method_arity` is the receiver-inclusive parameter count.
+///
+/// Returns `null` when the protocol isn't registered or when the
+/// method name doesn't match any declared method on the protocol —
+/// the consumption-site lowering relies on the null result to fall
+/// through to the regular call-named path with a coherent
+/// diagnostic (the type checker should have caught the mismatch
+/// upstream, but the explicit null arm keeps the IR pass robust
+/// against drift).
+///
+/// Phase 1.2.5.d consumption-site dispatch (`protocol_dispatch` IR
+/// op) consumes this helper to fill the `method_index` and `arity`
+/// fields on the emitted instruction.
+pub const ProtocolMethodSlot = struct {
+    method_index: u32,
+    arity: u32,
+    return_type: ZigType,
+};
+
+pub fn findProtocolMethodSlot(
+    program: *const Program,
+    protocol_name: []const u8,
+    method_name: []const u8,
+) ?ProtocolMethodSlot {
+    for (program.type_defs) |type_def| {
+        switch (type_def.kind) {
+            .protocol_vtable_def => |vt| {
+                if (!std.mem.eql(u8, vt.protocol_name, protocol_name)) continue;
+                for (vt.methods, 0..) |method, idx| {
+                    if (!std.mem.eql(u8, method.name, method_name)) continue;
+                    return .{
+                        .method_index = @intCast(idx),
+                        .arity = method.arity,
+                        .return_type = method.return_type,
+                    };
+                }
+                return null;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
 pub fn findProtocolImplVTable(
     program: *const Program,
     protocol_name: []const u8,
@@ -14395,6 +14576,61 @@ test "findProtocolImplVTable resolves concrete (protocol, target) pair" {
     // ("type X does not implement protocol Y").
     try std.testing.expect(findProtocolImplVTable(&program, "Logger", "Missing") == null);
     try std.testing.expect(findProtocolImplVTable(&program, "Missing", "Console") == null);
+}
+
+test "IR emits protocol_dispatch when method call's receiver is a protocol_box" {
+    // Phase 1.2.5.d HIR/IR routing contract: when the user writes
+    // `Logger.log(e)` and `e` is statically typed as the protocol
+    // existential (`l :: Logger` in the function signature), the
+    // IR builder must emit a `.protocol_dispatch` instruction
+    // rather than the usual `.call_named` to a non-existent
+    // `Logger__log__1` function. The dispatch carries the
+    // protocol/method name pair and the method-index slot the
+    // ZIR backend uses to dereference the box's vtable.
+    const source =
+        \\pub protocol Logger {
+        \\  fn log(l) -> String
+        \\}
+        \\pub struct Console {
+        \\  prefix :: String = ">"
+        \\}
+        \\pub impl Logger for Console {
+        \\  pub fn log(l :: Console) -> String { l.prefix }
+        \\}
+        \\pub struct UseSite {
+        \\  pub fn use_box(l :: Logger) -> String {
+        \\    Logger.log(l)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner: *ast.StringInterner = undefined;
+    var graph: *const scope_mod.ScopeGraph = undefined;
+    const program = try buildIrProgramForProtocolTest(alloc, source, &interner, &graph);
+
+    var saw_protocol_dispatch = false;
+    for (program.functions) |func| {
+        if (!std.mem.eql(u8, func.name, "UseSite__use_box__1")) continue;
+        for (func.body) |block| {
+            for (block.instructions) |instr| {
+                if (instr == .protocol_dispatch) {
+                    const pd = instr.protocol_dispatch;
+                    try std.testing.expectEqualStrings("Logger", pd.protocol_name);
+                    try std.testing.expectEqualStrings("log", pd.method_name);
+                    try std.testing.expectEqual(@as(u32, 0), pd.method_index);
+                    try std.testing.expectEqual(@as(u32, 1), pd.arity);
+                    saw_protocol_dispatch = true;
+                    break;
+                }
+            }
+            if (saw_protocol_dispatch) break;
+        }
+    }
+    try std.testing.expect(saw_protocol_dispatch);
 }
 
 test "findProtocolImplVTable resolves parametric specialization" {
