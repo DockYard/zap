@@ -365,6 +365,12 @@ pub const StructDecl = struct {
     meta: NodeMeta,
     name: StructName,
     parent: ?StringId = null,
+    /// Optional type parameters declared on the struct header, e.g. `T` in
+    /// `pub struct Box(T) { value :: T }`. Each entry is a bare type-variable
+    /// name visible inside the struct's field type expressions, function
+    /// signatures, and field-default expressions. Empty when the struct is
+    /// concrete (the common case). Mirrors `ImplDecl.type_params`.
+    type_params: []const StringId = &.{},
     items: []const StructItem = &.{},
     fields: []const StructFieldDecl = &.{},
     is_private: bool = false,
@@ -384,6 +390,13 @@ pub const StructFieldDecl = struct {
 pub const UnionDecl = struct {
     meta: NodeMeta,
     name: StringId,
+    /// Optional type parameters declared on the union header, e.g. `T` in
+    /// `pub union Option(T) { Some(T), None }` or `T, E` in
+    /// `pub union Result(T, E) { Ok(T), Error(E) }`. Each entry is a bare
+    /// type-variable name visible inside the union's variant payload type
+    /// expressions. Empty for concrete unions like `union Color { Red, Green }`.
+    /// Mirrors `ImplDecl.type_params` and `StructDecl.type_params`.
+    type_params: []const StringId = &.{},
     variants: []const UnionVariant,
     is_private: bool = false,
 };

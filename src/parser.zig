@@ -728,6 +728,13 @@ pub const Parser = struct {
         }
         const name = try self.parseStructName();
 
+        // Optional type parameters: `Box(T)` or `Pair(A, B)` declares type
+        // variables visible inside the struct's field type expressions and
+        // function signatures. Each entry must be a bare identifier — no
+        // nested type expressions, no constraints. Mirrors the impl-header
+        // grammar at `parseImplDecl` via the shared `parseTypeParamHeader`.
+        const type_params = try self.parseTypeParamHeader("struct");
+
         // Parse optional extends
         var parent: ?ast.StringId = null;
         if (self.match(.keyword_extends)) {
@@ -948,10 +955,56 @@ pub const Parser = struct {
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .name = name,
             .parent = parent,
+            .type_params = type_params,
             .items = try items.toOwnedSlice(self.allocator),
             .fields = try fields.toOwnedSlice(self.allocator),
             .is_private = is_private,
         };
+    }
+
+    /// Parse the optional `(T)` or `(K, V)` header that may follow a
+    /// `pub struct Foo`, `pub union Foo`, `pub protocol Foo`, or impl-target
+    /// type name. Returns an empty slice when no `(` is present (concrete
+    /// type). Each entry must be a bare identifier — no nested type
+    /// expressions and no constraints. `decl_kind` is used in the diagnostic
+    /// hint so the error tells the user which form they tried to write.
+    fn parseTypeParamHeader(self: *Parser, comptime decl_kind: []const u8) ![]const ast.StringId {
+        if (!self.check(.left_paren)) return &.{};
+        _ = self.advance();
+        var type_params: std.ArrayList(ast.StringId) = .empty;
+        while (!self.check(.right_paren) and !self.check(.eof)) {
+            if (!self.check(.identifier) and !self.check(.type_identifier)) {
+                try self.addRichError(
+                    "I was expecting a type-parameter name (like `T`) inside the parens",
+                    self.currentSpan(),
+                    null,
+                    "type parameters look like: `pub " ++ decl_kind ++ " Box(T) { ... }`",
+                );
+                return error.ParseError;
+            }
+            // Reject nested type expressions like `List(T)` — the header
+            // slot is a binding site, not a use site, so only bare names
+            // are legal. Detect by peeking past the identifier for a `(`.
+            const saved = self.saveLexerState();
+            _ = self.advance();
+            if (self.check(.left_paren)) {
+                self.restoreLexerState(saved);
+                try self.addRichError(
+                    "type-parameter names in a " ++ decl_kind ++ " header must be bare identifiers",
+                    self.currentSpan(),
+                    "nested type expressions like `List(T)` are not allowed here",
+                    "type parameters look like: `pub " ++ decl_kind ++ " Foo(T) { ... }` — use the parameter inside the body, not in the header",
+                );
+                return error.ParseError;
+            }
+            self.restoreLexerState(saved);
+            const tok = self.advance();
+            try type_params.append(self.allocator, try self.internToken(tok));
+            if (!self.match(.comma)) break;
+            self.skipNewlines();
+        }
+        _ = try self.expect(.right_paren);
+        return try type_params.toOwnedSlice(self.allocator);
     }
 
     fn isFieldDecl(self: *Parser) bool {
@@ -1522,6 +1575,11 @@ pub const Parser = struct {
             break :blk try self.interner.intern(name_buf.items);
         };
 
+        // Optional type parameters: `Option(T)` or `Result(T, E)` declares
+        // type variables visible inside the union's variant payload type
+        // expressions. Same grammar as `parseStructDecl`/`parseImplDecl`.
+        const type_params = try self.parseTypeParamHeader("union");
+
         _ = try self.expectAt(.left_brace, start);
         self.skipNewlines();
 
@@ -1556,6 +1614,7 @@ pub const Parser = struct {
         return self.create(ast.UnionDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .name = name,
+            .type_params = type_params,
             .variants = try variants.toOwnedSlice(self.allocator),
             .is_private = is_private,
         });
@@ -6605,6 +6664,164 @@ test "parse impl rejects nested type expression as type parameter" {
     // Type-parameter slot must be a bare name. Nested calls like
     // `List(K)` inside the impl header parens belong to a future
     // where-clause / partial-application syntax — for now reject.
+    const result = parser.parseProgram();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+// ============================================================
+// Parametric pub struct / pub union header tests (Phase 1.1.5).
+// Mirrors the parse_impl_with_*_type_parameters block above. A bare
+// struct/union name with no `(...)` keeps the existing concrete shape
+// (empty `type_params`); `(T)` declares one type parameter and `(K, V)`
+// declares multiple. Nested type expressions like `List(K)` are not
+// allowed in the header slot.
+// ============================================================
+
+test "parse pub struct with single type parameter" {
+    const source =
+        \\pub struct Box(T) {
+        \\  value :: T
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.structs.len);
+    const sd = program.structs[0];
+    try std.testing.expectEqual(@as(usize, 1), sd.type_params.len);
+    try std.testing.expectEqualStrings("T", parser.interner.get(sd.type_params[0]));
+    try std.testing.expectEqual(@as(usize, 1), sd.fields.len);
+}
+
+test "parse pub struct with multiple type parameters" {
+    const source =
+        \\pub struct Pair(A, B) {
+        \\  left :: A
+        \\  right :: B
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const sd = program.structs[0];
+    try std.testing.expectEqual(@as(usize, 2), sd.type_params.len);
+    try std.testing.expectEqualStrings("A", parser.interner.get(sd.type_params[0]));
+    try std.testing.expectEqualStrings("B", parser.interner.get(sd.type_params[1]));
+}
+
+test "parse pub struct without type parameters keeps existing shape" {
+    const source =
+        \\pub struct Plain {
+        \\  value :: i64
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const sd = program.structs[0];
+    try std.testing.expectEqual(@as(usize, 0), sd.type_params.len);
+}
+
+test "parse pub struct rejects nested type expression in header" {
+    const source =
+        \\pub struct Bad(List(T)) {
+        \\  value :: T
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const result = parser.parseProgram();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "parse pub union with single type parameter" {
+    const source =
+        \\pub union Option(T) {
+        \\  Some :: T
+        \\  None
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const ud = program.top_items[0].union_decl;
+    try std.testing.expectEqual(@as(usize, 1), ud.type_params.len);
+    try std.testing.expectEqualStrings("T", parser.interner.get(ud.type_params[0]));
+    try std.testing.expectEqual(@as(usize, 2), ud.variants.len);
+}
+
+test "parse pub union with multiple type parameters" {
+    const source =
+        \\pub union Result(T, E) {
+        \\  Ok :: T
+        \\  Error :: E
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const ud = program.top_items[0].union_decl;
+    try std.testing.expectEqual(@as(usize, 2), ud.type_params.len);
+    try std.testing.expectEqualStrings("T", parser.interner.get(ud.type_params[0]));
+    try std.testing.expectEqualStrings("E", parser.interner.get(ud.type_params[1]));
+}
+
+test "parse pub union without type parameters keeps existing shape" {
+    const source =
+        \\pub union Color {
+        \\  Red
+        \\  Green
+        \\  Blue
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const ud = program.top_items[0].union_decl;
+    try std.testing.expectEqual(@as(usize, 0), ud.type_params.len);
+    try std.testing.expectEqual(@as(usize, 3), ud.variants.len);
+}
+
+test "parse pub union rejects nested type expression in header" {
+    const source =
+        \\pub union Bad(List(T)) {
+        \\  Some :: T
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
     const result = parser.parseProgram();
     try std.testing.expectError(error.ParseError, result);
 }
