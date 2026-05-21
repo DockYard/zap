@@ -6607,8 +6607,42 @@ pub const TypeChecker = struct {
                         }
                     }
                 }
-                if (self.graph.findProtocol(mod_name) != null) {
+                if (self.graph.findProtocol(mod_name)) |proto_entry| {
+                    // Protocol-existential dispatch: the receiver is a
+                    // `protocol_constraint(<Protocol>)` value (the
+                    // `.constrained` branch of `resolveProtocolDispatch`)
+                    // and no concrete impl target was substituted in.
+                    // Look up the protocol's declared method by name+arity
+                    // and resolve its declared return type expression so
+                    // the call's surface inference reflects the protocol's
+                    // contract rather than collapsing to UNKNOWN.
+                    //
+                    // Why this matters: a case-arm pattern like
+                    //
+                    //   case Error.source(e) {
+                    //     Option.Some(inner) -> Error.kind(inner)
+                    //     ...
+                    //   }
+                    //
+                    // needs the scrutinee to type as
+                    // `Option(protocol_constraint(Error))` so the
+                    // `recordCasePatternBindingTypes`'s `.applied` →
+                    // tagged_union substitution path can bind `inner` as
+                    // `protocol_constraint(Error)`. Without the protocol-
+                    // method return-type lookup the scrutinee infers as
+                    // UNKNOWN, the pattern binding stays UNKNOWN, and the
+                    // downstream `Error.kind(inner)` call fails
+                    // `resolveProtocolDispatch` with "first argument does
+                    // not satisfy protocol Error" (Phase 1.2.5 Gap 2).
                     for (call.args) |arg| _ = try self.inferExpr(arg);
+                    const field_name_text = self.interner.get(fa.field);
+                    for (proto_entry.decl.functions) |fn_sig| {
+                        const fn_name_text = self.interner.get(fn_sig.name);
+                        if (!std.mem.eql(u8, fn_name_text, field_name_text)) continue;
+                        if (fn_sig.params.len != arity) continue;
+                        const ret_expr = fn_sig.return_type orelse return TypeStore.VOID;
+                        return self.resolveTypeExpr(ret_expr) catch TypeStore.UNKNOWN;
+                    }
                     return TypeStore.UNKNOWN;
                 }
             }

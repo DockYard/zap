@@ -9619,6 +9619,35 @@ pub const IrBuilder = struct {
                     try arg_modes.append(self.allocator, arg.mode);
                 }
 
+                // Phase 1.2.5 Gap 2 follow-up: call-site auto-boxing into
+                // a `runtime.ProtocolBox`. When the target parameter slot
+                // is typed as `.protocol_box(P)` (a `protocol_constraint`
+                // function parameter) and the supplied argument is a
+                // concrete struct value implementing `P`, wrap it via
+                // `maybeBoxAsProtocol`. The struct-literal and union-
+                // variant lowering paths already auto-box at construction
+                // sites; this extends the same coercion to ordinary call
+                // arguments. Without it, calling `Demo.walk(%Outer{})`
+                // against `pub fn walk(e :: Error)` passes the bare
+                // concrete value where a ProtocolBox is expected, and
+                // downstream lowering attempts to emit a
+                // `zap_runtime.Error` namespace member that does not
+                // exist.
+                if (self.type_store) |ts| {
+                    for (call.args, 0..) |arg, i| {
+                        if (i >= args.items.len) break;
+                        const target_expected_type =
+                            self.callTargetExpectedType(call.target, call.args.len, i) orelse
+                            arg.expected_type;
+                        if (target_expected_type == types_mod.TypeStore.UNKNOWN) continue;
+                        if (target_expected_type == types_mod.TypeStore.ERROR) continue;
+                        const expected_zig_type = typeIdToZigTypeWithStore(target_expected_type, ts);
+                        if (expected_zig_type != .protocol_box) continue;
+                        const boxed = try self.maybeBoxAsProtocol(args.items[i], expected_zig_type);
+                        args.items[i] = boxed;
+                    }
+                }
+
                 // Implicit numeric widening: insert int_widen/float_widen
                 // when an arg's type is narrower than the expected param type.
                 if (self.type_store) |ts| {
