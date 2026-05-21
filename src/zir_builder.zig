@@ -1625,6 +1625,17 @@ pub const ZirDriver = struct {
             try appendZigTypeForVTable(self.allocator, &buf, method.return_type);
             try buf.appendSlice(self.allocator, ",\n");
         }
+        // Phase 1.2.5.c synthetic `__drop__` slot. Every per-impl
+        // vtable instance carries one of these alongside the user-
+        // declared methods so the box's runtime release path can
+        // dispatch the inner value's drop glue without statically
+        // knowing the concrete type. The signature is fixed: it
+        // takes the box's erased `data_ptr` and returns `void`. The
+        // per-impl adapter (see `emitProtocolVTableInstanceSourceFile`)
+        // casts the pointer back to the impl's concrete type and
+        // routes through `releaseProtocolBoxInner` to run the
+        // standard ARC deep-walk + slab-return path.
+        try buf.appendSlice(self.allocator, "    __drop__: *const fn (data_ptr: ?*anyopaque) void,\n");
         try buf.appendSlice(self.allocator, "};\n");
 
         const name_z = try self.allocator.dupeZ(u8, type_def.name);
@@ -1683,15 +1694,105 @@ pub const ZirDriver = struct {
         );
         defer self.allocator.free(import_line);
         try buf.appendSlice(self.allocator, import_line);
+
+        // Phase 1.2.5.c: bring the impl target's namespace and the
+        // Zap runtime into scope so the adapter functions can call
+        // through to the monomorphized impl methods and to
+        // `releaseProtocolBoxInner` for the `__drop__` adapter.
+        // `@import("<Target>")` resolves to the target's file-IS-the-
+        // struct emission (concrete `MyError` -> `MyError`'s source
+        // file; parametric specialization `Box_i64` -> the per-
+        // instantiation TypeDef synthetic source file).
+        const target_import_line = try std.fmt.allocPrint(
+            self.allocator,
+            "const TargetMod = @import(\"{s}\");\n",
+            .{inst_def.target_type_name},
+        );
+        defer self.allocator.free(target_import_line);
+        try buf.appendSlice(self.allocator, target_import_line);
+        try buf.appendSlice(self.allocator, "const zap_runtime = @import(\"zap_runtime\");\n");
+        try buf.appendSlice(self.allocator, "const std = @import(\"std\");\n");
         try buf.appendSlice(self.allocator, "\n");
 
-        // Declare the constant with `undefined` slot values. Phase
-        // 1.2.5.c replaces this body with a properly-initialized
-        // literal whose slots point at per-impl ABI-bridge adapter
-        // functions; until then the constant is structurally
-        // present so 1.2.5.b's mangler and construction-site type
-        // lookup can find it by name without a "undefined symbol"
-        // diagnostic at link time.
+        // Phase 1.2.5.c: per-impl ABI-bridge adapter functions.
+        // Each adapter recovers the inner value from the box's
+        // erased `data_ptr` via `@ptrCast(@alignCast(data_ptr.?))`
+        // and dispatches to the monomorphized impl function. The
+        // user-declared methods take the inner BY VALUE (the impl
+        // method's receiver is a value param, not a pointer); the
+        // `__drop__` adapter takes a mutable pointer because
+        // `releaseProtocolBoxInner` needs to free the heap cell.
+        //
+        // The adapter naming `__vtable_adapter__<Target>__<method>__<arity>`
+        // is unique per (impl, method, arity) tuple — parametric
+        // specializations (e.g. `Box_i64__label__1`) embed the
+        // mangled target so each instantiation has distinct
+        // adapters without collisions.
+        for (inst_def.methods) |method| {
+            // `fn __vtable_adapter__<Target>__<method>__<arity>(`
+            try buf.appendSlice(self.allocator, "fn __vtable_adapter__");
+            try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+            try buf.appendSlice(self.allocator, "__");
+            try appendZigIdentifier(self.allocator, &buf, method.method_name);
+            const arity_str = try std.fmt.allocPrint(self.allocator, "__{d}", .{method.arity});
+            defer self.allocator.free(arity_str);
+            try buf.appendSlice(self.allocator, arity_str);
+            try buf.appendSlice(self.allocator, "(data_ptr: ?*anyopaque");
+            for (method.extra_param_types, 0..) |param_zt, param_index| {
+                try buf.appendSlice(self.allocator, ", ");
+                const arg_prefix = try std.fmt.allocPrint(self.allocator, "arg{d}: ", .{param_index});
+                defer self.allocator.free(arg_prefix);
+                try buf.appendSlice(self.allocator, arg_prefix);
+                try appendZigTypeForVTable(self.allocator, &buf, param_zt);
+            }
+            try buf.appendSlice(self.allocator, ") ");
+            try appendZigTypeForVTable(self.allocator, &buf, method.return_type);
+            try buf.appendSlice(self.allocator, " {\n");
+            // `    const inner: *const TargetMod.<Target> = @ptrCast(@alignCast(data_ptr.?));`
+            try buf.appendSlice(self.allocator, "    const inner: *const TargetMod.");
+            try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+            try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(data_ptr.?));\n");
+            // `    return TargetMod.<impl_function_name>(inner.*[, arg0, ...]);`
+            try buf.appendSlice(self.allocator, "    return TargetMod.");
+            try appendZigIdentifier(self.allocator, &buf, method.impl_function_name);
+            try buf.appendSlice(self.allocator, "(inner.*");
+            for (method.extra_param_types, 0..) |_, param_index| {
+                try buf.appendSlice(self.allocator, ", ");
+                const arg_ref = try std.fmt.allocPrint(self.allocator, "arg{d}", .{param_index});
+                defer self.allocator.free(arg_ref);
+                try buf.appendSlice(self.allocator, arg_ref);
+            }
+            try buf.appendSlice(self.allocator, ");\n}\n\n");
+        }
+
+        // Synthetic `__drop__` adapter. Casts the box's erased
+        // `data_ptr` back to a mutable `*<Target>` and routes
+        // through `zap_runtime.ArcRuntime.releaseProtocolBoxInner`,
+        // which runs the inner's full ARC deep-walk + slab return.
+        // `std.heap.page_allocator` is the canonical default here
+        // because the inner was allocated through `allocAny`'s
+        // active memory-manager dispatcher (the allocator argument
+        // is vestigial in the manager-routed path — see the
+        // `allocAny` header — and `releaseAny` ignores it
+        // symmetrically).
+        try buf.appendSlice(self.allocator, "fn __vtable_adapter__");
+        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, "____drop__(data_ptr: ?*anyopaque) void {\n");
+        try buf.appendSlice(self.allocator, "    const inner: *TargetMod.");
+        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(data_ptr.?));\n");
+        try buf.appendSlice(self.allocator, "    zap_runtime.ArcRuntime.releaseProtocolBoxInner(TargetMod.");
+        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, ", std.heap.page_allocator, inner);\n");
+        try buf.appendSlice(self.allocator, "}\n\n");
+
+        // Declare the per-impl vtable instance constant. Phase
+        // 1.2.5.c populates each slot with the address of the
+        // corresponding adapter function so the box's runtime
+        // dispatch finds a valid pointer at every slot. The
+        // synthetic `__drop__` slot enables the box's release path
+        // to run the inner's drop glue without statically knowing
+        // the concrete type.
         try buf.appendSlice(self.allocator, "pub const ");
         try buf.appendSlice(self.allocator, type_def.name);
         try buf.appendSlice(self.allocator, ": VTableMod.");
@@ -1700,8 +1801,19 @@ pub const ZirDriver = struct {
         for (inst_def.methods) |method| {
             try buf.appendSlice(self.allocator, "    .");
             try appendZigIdentifier(self.allocator, &buf, method.method_name);
-            try buf.appendSlice(self.allocator, " = undefined,\n");
+            try buf.appendSlice(self.allocator, " = &__vtable_adapter__");
+            try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+            try buf.appendSlice(self.allocator, "__");
+            try appendZigIdentifier(self.allocator, &buf, method.method_name);
+            const slot_arity = try std.fmt.allocPrint(self.allocator, "__{d}", .{method.arity});
+            defer self.allocator.free(slot_arity);
+            try buf.appendSlice(self.allocator, slot_arity);
+            try buf.appendSlice(self.allocator, ",\n");
         }
+        // Synthetic `__drop__` slot's adapter reference.
+        try buf.appendSlice(self.allocator, "    .__drop__ = &__vtable_adapter__");
+        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, "____drop__,\n");
         try buf.appendSlice(self.allocator, "};\n");
 
         const name_z = try self.allocator.dupeZ(u8, type_def.name);
