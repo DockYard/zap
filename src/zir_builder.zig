@@ -9611,29 +9611,6 @@ pub const ZirDriver = struct {
         if (placeholder == 0xFFFFFFFF) return error.EmitFailed;
         const placeholder_ref = @intFromEnum(Zir.Inst.Index.toRef(@enumFromInt(placeholder)));
 
-        // Pre-resolve named function references that appear in any prong /
-        // else body. Inside switch prong bodies, name-based call emission
-        // fails (the decl is not in scope during capture), so resolve them
-        // to Refs here with body_tracking ON, then emit `call_ref`.
-        var pre_resolved_fns = std.StringHashMap(u32).init(self.allocator);
-        defer pre_resolved_fns.deinit();
-        const PreResolve = struct {
-            fn scan(driver: *ZirDriver, instrs: []const ir.Instruction, map: *std.StringHashMap(u32)) void {
-                for (instrs) |bi| {
-                    if (bi == .call_named) {
-                        const cn = bi.call_named;
-                        if (!map.contains(cn.name)) {
-                            if (driver.resolveCallNamedToRef(cn.name)) |fn_ref| {
-                                map.put(cn.name, fn_ref) catch {};
-                            } else |_| {}
-                        }
-                    }
-                }
-            }
-        };
-        for (us.cases) |case| PreResolve.scan(self, case.body_instrs, &pre_resolved_fns);
-        if (us.has_else) PreResolve.scan(self, us.else_instrs, &pre_resolved_fns);
-
         var names_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
         defer names_ptrs.deinit(self.allocator);
         var names_lens: std.ArrayListUnmanaged(u32) = .empty;
@@ -9675,7 +9652,6 @@ pub const ZirDriver = struct {
                 case.body_instrs,
                 case.return_value,
                 us.dest,
-                &pre_resolved_fns,
                 &all_body_insts,
             );
             try body_lens.append(self.allocator, prong.body_len);
@@ -9692,7 +9668,6 @@ pub const ZirDriver = struct {
                 us.else_instrs,
                 us.else_result,
                 us.dest,
-                &pre_resolved_fns,
                 &all_body_insts,
             );
             else_len = prong.body_len;
@@ -9741,14 +9716,21 @@ pub const ZirDriver = struct {
     ///     prong body keep working. The result Ref is read from `case_dest`
     ///     after the body.
     ///
-    /// `call_named` instructions are rewritten to `call_ref` against
-    /// pre-resolved function Refs because name lookup fails inside a capture.
+    /// Every body instruction — including `call_named` — is emitted through
+    /// the normal `emitInstruction` path. The `call_named` handler resolves
+    /// its target through the Zap-side program table (`findFunctionByName`)
+    /// and `@import`-based cross-struct calls, neither of which depends on
+    /// ZIR lexical scope, so a call works identically inside a switch prong
+    /// body. (An earlier revision pre-resolved calls to a parent-scope
+    /// `decl_ref` and re-emitted them as `call_ref` inside the prong; that
+    /// crossed the prong's AIR body boundary and produced a malformed
+    /// coercion `ty_op` that tripped AIR Liveness whenever a prong body
+    /// contained a call.)
     fn emitSwitchProngBody(
         self: *ZirDriver,
         instrs: []const ir.Instruction,
         explicit_result: ?ir.LocalId,
         case_dest: ir.LocalId,
-        pre_resolved_fns: *std.StringHashMap(u32),
         out_insts: *std.ArrayListUnmanaged(u32),
     ) BuildError!SwitchProngEmit {
         const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
@@ -9760,24 +9742,6 @@ pub const ZirDriver = struct {
         const body_start = zir_builder_get_inst_count(self.handle);
 
         for (instrs) |bi| {
-            if (bi == .call_named) {
-                const cn = bi.call_named;
-                if (pre_resolved_fns.get(cn.name)) |fn_ref| {
-                    var call_args: std.ArrayListUnmanaged(u32) = .empty;
-                    defer call_args.deinit(self.allocator);
-                    for (cn.args) |arg| {
-                        const ref = self.refForValueLocal(arg) catch void_ref;
-                        try call_args.append(self.allocator, ref);
-                    }
-                    const call_result = zir_builder_emit_call_ref(self.handle, fn_ref, call_args.items.ptr, @intCast(call_args.items.len));
-                    if (call_result == error_ref) {
-                        zir_builder_set_body_tracking(self.handle, true);
-                        return error.EmitFailed;
-                    }
-                    try self.setLocal(cn.dest, call_result);
-                    continue;
-                }
-            }
             try self.emitInstruction(bi);
         }
 
@@ -9799,36 +9763,6 @@ pub const ZirDriver = struct {
         return .{ .body_len = body_len, .result_ref = result_ref };
     }
 
-    /// Pre-resolve a named function to a ZIR decl_ref.
-    /// Must be called with body_tracking ON (before entering prong bodies).
-    /// Returns the function Ref, or error if not resolvable.
-    fn resolveCallNamedToRef(self: *ZirDriver, name: []const u8) BuildError!u32 {
-        // Check if this is a cross-struct call — resolve via @import
-        const target_func = self.findFunctionByName(name);
-        const target_struct = if (target_func) |tf| tf.struct_name else null;
-        const is_cross = blk: {
-            if (target_struct == null and self.current_emit_struct == null) break :blk false;
-            if (target_struct == null or self.current_emit_struct == null) break :blk true;
-            break :blk !std.mem.eql(u8, target_struct.?, self.current_emit_struct.?);
-        };
-        if (is_cross and target_struct != null) {
-            const target_local = if (target_func) |tf| tf.local_name else name;
-            const import_ref = zir_builder_emit_import(self.handle, target_struct.?.ptr, @intCast(target_struct.?.len));
-            if (import_ref == error_ref) return error.EmitFailed;
-            const fn_ref = zir_builder_emit_field_val(self.handle, import_ref, target_local.ptr, @intCast(target_local.len));
-            if (fn_ref == error_ref) return error.EmitFailed;
-            return fn_ref;
-        }
-
-        // Intra-struct: use local name for decl_ref
-        const resolve_name = if (self.current_emit_struct != null)
-            if (target_func) |tf| tf.local_name else name
-        else
-            name;
-        const ref = zir_builder_emit_decl_ref(self.handle, resolve_name.ptr, @intCast(resolve_name.len));
-        if (ref == error_ref) return error.EmitFailed;
-        return ref;
-    }
 };
 
 // ---------------------------------------------------------------------------
