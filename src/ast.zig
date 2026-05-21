@@ -770,6 +770,14 @@ pub const MapField = struct {
 pub const StructExpr = struct {
     meta: NodeMeta,
     struct_name: StructName,
+    /// Optional generic type arguments supplied at the instantiation
+    /// site, e.g. `i64` in `%Box(i64){value: 42}`. Empty for concrete
+    /// struct literals (the common case). The parser only populates
+    /// this when the source writes `(...)` directly after the struct
+    /// name and before the `{` body. Validation that the count
+    /// matches the declaration's `type_params` arity happens in the
+    /// type checker (see `inferStructExprType`).
+    type_args: []const *const TypeExpr = &.{},
     update_source: ?*const Expr,
     fields: []const StructField,
 };

@@ -3241,6 +3241,25 @@ pub const Parser = struct {
         _ = try self.expect(.percent);
 
         const struct_name = try self.parseStructName();
+
+        // Optional generic type arguments at the instantiation site:
+        // `%Box(i64){value: 42}`. The `(` only takes this meaning
+        // because we just consumed `%StructName`; any other expression
+        // context would already have rejected the `%`. Each
+        // type-argument slot accepts a full TypeExpr so nested generic
+        // applications like `%Box(Option(i64)){...}` work.
+        var type_args: std.ArrayList(*const ast.TypeExpr) = .empty;
+        if (self.check(.left_paren)) {
+            _ = self.advance();
+            self.skipNewlines();
+            while (!self.check(.right_paren) and !self.check(.eof)) {
+                try type_args.append(self.allocator, try self.parseTypeExpr());
+                if (!self.match(.comma)) break;
+                self.skipNewlines();
+            }
+            _ = try self.expect(.right_paren);
+        }
+
         _ = try self.expect(.left_brace);
 
         // Support multiline: %Name{\n  field: val,\n  ...\n}
@@ -3282,6 +3301,7 @@ pub const Parser = struct {
             .struct_expr = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
                 .struct_name = struct_name,
+                .type_args = try type_args.toOwnedSlice(self.allocator),
                 .update_source = update_source,
                 .fields = try fields.toOwnedSlice(self.allocator),
             },
@@ -6824,6 +6844,116 @@ test "parse pub union rejects nested type expression in header" {
 
     const result = parser.parseProgram();
     try std.testing.expectError(error.ParseError, result);
+}
+
+test "parse struct literal with single type argument" {
+    // `%Box(i64){value: 42}` records the i64 type-arg on the literal
+    // so the type checker can substitute it through the struct's
+    // formal parameter `T` when validating the field expressions.
+    const source =
+        \\pub struct Box(T) {
+        \\  value :: T
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Box {
+        \\    %Box(i64){value: 42}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    // Find the build/0 clause's lone body expression and verify the
+    // struct_expr it produces carries one TypeExpr argument.
+    const demo = program.structs[1];
+    var found_box_call = false;
+    for (demo.items) |item| {
+        if (item != .function) continue;
+        const fn_decl = item.function;
+        if (fn_decl.clauses.len == 0) continue;
+        const body = fn_decl.clauses[0].body orelse continue;
+        if (body.len != 1) continue;
+        const stmt = body[0];
+        if (stmt != .expr) continue;
+        const expr = stmt.expr;
+        if (expr.* != .struct_expr) continue;
+        try std.testing.expectEqual(@as(usize, 1), expr.struct_expr.type_args.len);
+        try std.testing.expect(expr.struct_expr.type_args[0].* == .name);
+        try std.testing.expectEqualStrings("i64", parser.interner.get(expr.struct_expr.type_args[0].name.name));
+        found_box_call = true;
+    }
+    try std.testing.expect(found_box_call);
+}
+
+test "parse struct literal with multiple type arguments" {
+    // `%Pair(i64, String){...}` parses two type-arg slots.
+    const source =
+        \\pub struct Pair(A, B) {
+        \\  left :: A
+        \\  right :: B
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Pair {
+        \\    %Pair(i64, String){left: 1, right: "hi"}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const demo = program.structs[1];
+    var found_pair_call = false;
+    for (demo.items) |item| {
+        if (item != .function) continue;
+        const body = item.function.clauses[0].body orelse continue;
+        if (body.len != 1) continue;
+        const expr = body[0].expr;
+        if (expr.* != .struct_expr) continue;
+        try std.testing.expectEqual(@as(usize, 2), expr.struct_expr.type_args.len);
+        found_pair_call = true;
+    }
+    try std.testing.expect(found_pair_call);
+}
+
+test "parse struct literal without type arguments keeps empty slice" {
+    // Backwards-compatibility: `%Plain{value: 1}` still parses with
+    // an empty `type_args` slice — every existing concrete literal in
+    // the codebase must keep working.
+    const source =
+        \\pub struct Plain { value :: i64 }
+        \\pub struct Demo {
+        \\  pub fn build() -> Plain {
+        \\    %Plain{value: 1}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const demo = program.structs[1];
+    var found_plain_call = false;
+    for (demo.items) |item| {
+        if (item != .function) continue;
+        const body = item.function.clauses[0].body orelse continue;
+        if (body.len != 1) continue;
+        const expr = body[0].expr;
+        if (expr.* != .struct_expr) continue;
+        try std.testing.expectEqual(@as(usize, 0), expr.struct_expr.type_args.len);
+        found_plain_call = true;
+    }
+    try std.testing.expect(found_plain_call);
 }
 
 test "less-than expression after struct call still parses as comparison" {
