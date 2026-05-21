@@ -5966,10 +5966,74 @@ pub const HirBuilder = struct {
 
             const default_expr = declared_field.default_expr orelse continue;
             const value = try self.buildExpr(default_expr);
+            // Push the field's declared type down into the freshly
+            // built default expression. Without this an empty list
+            // default like `tags :: [String] = []` lowers as a bare
+            // `list_init []` with UNKNOWN element type — the IR
+            // defaults it to `List(i64)` and Zig's Sema rejects the
+            // struct init with a `List(i64)` vs `List(String)`
+            // mismatch lifted from the synthetic construction site
+            // (far from the actual mistake). Same shape for narrow-
+            // integer defaults like `port :: u16 = 8080`: the
+            // literal lowers as i64 unless we stamp the field's
+            // width. Stamping is type-directional: if the inferred
+            // type already matches, this is a no-op.
+            self.propagateExpectedTypeToDefault(value, declared_field.type_id);
             try fields.append(self.allocator, .{
                 .name = declared_field.name,
                 .value = value,
             });
+        }
+    }
+
+    /// Push the declared field type down into a freshly lowered HIR
+    /// default expression. This is the construction-site analog of
+    /// `patchEmptyContainerTypes` plus integer-literal narrowing —
+    /// the same machinery `buildExpr` already runs on user-supplied
+    /// call arguments (see the `arg.expected_type` propagation
+    /// loop around line 4795).
+    fn propagateExpectedTypeToDefault(self: *const HirBuilder, expr: *const Expr, expected_type: types_mod.TypeId) void {
+        if (expected_type == types_mod.TypeStore.UNKNOWN) return;
+        if (expected_type >= self.type_store.types.items.len) return;
+        if (self.type_store.getType(expected_type) == .struct_type) {
+            // For nested struct defaults like `inner :: Inner =
+            // %Inner{}`, the HIR build already produced a
+            // `struct_init` carrying the right type. No further
+            // stamping is needed — and stamping a struct type on top
+            // of a primitive would silently corrupt the value.
+            return;
+        }
+
+        // Empty list/map literals: the existing helper carries the
+        // exact UNKNOWN-to-expected stamping the codegen needs.
+        self.patchEmptyContainerTypesExpr(expr, expected_type);
+
+        // Integer-literal narrowing: a bare `8080` lowers as a
+        // default-typed `int_lit` (HIR's `buildExpr` stamps `I64`
+        // unconditionally). When the receiving field declares a
+        // different integer width — `port :: u16 = 8080`,
+        // `flags :: u8 = 0`, etc. — we restamp the literal here so
+        // the codegen path that previously failed on
+        // `expected u8, got value 8080` gets the right slot from
+        // the start. This is the construction-site analog of the
+        // `arg.expected_type` propagation loop that buildExpr runs
+        // for user-supplied call arguments (search for
+        // "Propagate expected_type to argument expressions").
+        const expected_kind = self.type_store.getType(expected_type);
+        const mut: *Expr = @constCast(expr);
+        if (mut.kind == .int_lit and expected_kind == .int) {
+            mut.type_id = expected_type;
+            return;
+        }
+
+        // String literal whose type slot stayed UNKNOWN: same
+        // stamping. (String literals normally get STRING from
+        // `buildExpr`; this is a defensive write so a future
+        // refactor that leaves the slot UNKNOWN still types
+        // correctly at the construction site.)
+        if (mut.kind == .string_lit and mut.type_id == types_mod.TypeStore.UNKNOWN and expected_type == types_mod.TypeStore.STRING) {
+            mut.type_id = expected_type;
+            return;
         }
     }
 
