@@ -94,6 +94,13 @@ pub const Resolver = struct {
             .protocol, .priv_protocol => {},
             .impl_decl, .priv_impl_decl => {},
             .attribute => {},
+            .error_decl, .priv_error_decl => {
+                // `pub error` desugars to `pub struct + pub impl Error`
+                // in `src/desugar.zig` before the resolver runs. Reaching
+                // here with an `ErrorDecl` means the desugar pass was
+                // bypassed — a wiring bug.
+                @panic("resolver saw an ErrorDecl that should have been desugared into a StructDecl + ImplDecl");
+            },
         }
     }
 

@@ -518,10 +518,18 @@ pub const Parser = struct {
                                 self.synchronize();
                             }
                         },
+                        .keyword_error => {
+                            self.restoreLexerState(saved);
+                            if (self.parseErrorDecl(false)) |err_decl| {
+                                try top_items.append(self.allocator, .{ .error_decl = try self.create(ast.ErrorDecl, err_decl) });
+                            } else |_| {
+                                self.synchronize();
+                            }
+                        },
                         else => {
                             self.restoreLexerState(saved);
                             try self.addRichError(
-                                "I was expecting `struct`, `fn`, `macro`, `union`, `protocol`, or `impl` after `pub`",
+                                "I was expecting `struct`, `fn`, `macro`, `union`, `protocol`, `impl`, or `error` after `pub`",
                                 self.currentSpan(),
                                 null,
                                 null,
@@ -604,6 +612,16 @@ pub const Parser = struct {
                 .keyword_impl => {
                     if (self.parseImplDecl(true)) |impl_d| {
                         try top_items.append(self.allocator, .{ .priv_impl_decl = try self.create(ast.ImplDecl, impl_d) });
+                    } else |_| {
+                        self.synchronize();
+                    }
+                },
+                .keyword_error => {
+                    // Bare `error Name { ... }` — private renderable-only error.
+                    // Same desugar treatment as `pub error`, but the generated
+                    // `pub struct + pub impl Error for Name` are non-`pub`.
+                    if (self.parseErrorDecl(true)) |err_decl| {
+                        try top_items.append(self.allocator, .{ .priv_error_decl = try self.create(ast.ErrorDecl, err_decl) });
                     } else |_| {
                         self.synchronize();
                     }
@@ -1042,6 +1060,151 @@ pub const Parser = struct {
             .name = field_name,
             .type_expr = type_expr,
             .default = default,
+        };
+    }
+
+    /// Parse a `pub error Name { ... }` or `error Name { ... }`
+    /// declaration. The body grammar is a strict subset of `parseStructDecl`:
+    /// field declarations (`name :: Type [= default]`), inline `pub fn` /
+    /// `fn` methods, and `@doc` attributes attached to those methods.
+    /// Nested structs, unions, type aliases, imports, etc. are explicitly
+    /// rejected with rich diagnostics — a `pub error` is a *typed exception
+    /// shape*, not a general-purpose namespace.
+    ///
+    /// The `@code Zxxxx` attribute that may precede the declaration is
+    /// attached at desugar time by scanning the top-level item list, not
+    /// here, so this function only needs to handle the body grammar.
+    fn parseErrorDecl(self: *Parser, is_private: bool) !ast.ErrorDecl {
+        const start = self.currentSpan();
+        if (self.check(.keyword_pub)) _ = self.advance(); // consume pub
+        _ = try self.expect(.keyword_error);
+
+        if (!self.check(.type_identifier)) {
+            try self.addRichError(
+                "I was expecting an error type name (like `ParseError`) after `error`",
+                start,
+                "error declaration starts here",
+                "error names must start with an uppercase letter, e.g. `pub error TimeoutError { ... }`",
+            );
+            return error.ParseError;
+        }
+        const name = try self.parseStructName();
+
+        // Optional parametric header (`pub error DeserializeError(T) { ... }`).
+        // Mirrors the struct / union / impl-header grammar via the shared
+        // helper introduced in Phase 1.1.5.
+        const type_params = try self.parseTypeParamHeader("error");
+
+        if (!self.check(.left_brace)) {
+            try self.addRichError(
+                "I was expecting `{` to start the error body",
+                start,
+                "this error declaration needs a `{ ... }` block",
+                "even an error type with no fields uses braces: `pub error TimeoutError {}`",
+            );
+            return error.ParseError;
+        }
+        _ = self.advance();
+        self.skipNewlines();
+
+        var items: std.ArrayList(ast.StructItem) = .empty;
+        var fields: std.ArrayList(ast.StructFieldDecl) = .empty;
+
+        while (!self.check(.right_brace) and !self.check(.eof)) {
+            self.skipNewlines();
+            if (self.check(.right_brace) or self.check(.eof)) break;
+
+            switch (self.peek()) {
+                .keyword_pub => {
+                    const saved = self.saveLexerState();
+                    _ = self.advance(); // consume pub
+                    switch (self.peek()) {
+                        .keyword_fn => {
+                            self.restoreLexerState(saved);
+                            if (self.parseFunctionDecl(.public)) |func| {
+                                try items.append(self.allocator, .{ .function = func });
+                            } else |_| {
+                                self.synchronize();
+                            }
+                        },
+                        else => {
+                            self.restoreLexerState(saved);
+                            try self.addRichError(
+                                "only `pub fn` methods are allowed inside a `pub error` body",
+                                self.currentSpan(),
+                                null,
+                                "`pub error` bodies contain field declarations and optional inline methods only — no nested structs, unions, or types",
+                            );
+                            _ = self.advance();
+                        },
+                    }
+                },
+                .keyword_fn => {
+                    if (self.parseFunctionDecl(.private)) |func| {
+                        try items.append(self.allocator, .{ .priv_function = func });
+                    } else |_| {
+                        self.synchronize();
+                    }
+                },
+                .identifier => {
+                    if (self.isFieldDecl()) {
+                        const field = try self.parseStructField();
+                        try fields.append(self.allocator, field);
+                    } else {
+                        try self.addRichError(
+                            "I was expecting a field declaration (like `field :: Type`) or an inline method",
+                            self.currentSpan(),
+                            null,
+                            "`pub error` bodies contain `name :: Type [= default]` field declarations and `pub fn` / `fn` method declarations",
+                        );
+                        _ = self.advance();
+                    }
+                },
+                .at_sign => {
+                    if (self.parseAttributeDecl()) |attr| {
+                        try items.append(self.allocator, .{ .attribute = attr });
+                    } else |_| {
+                        self.synchronize();
+                    }
+                },
+                .newline => {
+                    _ = self.advance();
+                },
+                else => {
+                    try self.addRichError(
+                        std.fmt.allocPrint(self.allocator, "I was not expecting {s} inside a `pub error` body", .{
+                            tokenHumanName(self.current.tag),
+                        }) catch "unexpected token inside `pub error`",
+                        self.currentSpan(),
+                        "not valid inside an error declaration",
+                        "`pub error` bodies contain field declarations and optional inline methods only",
+                    );
+                    _ = self.advance();
+                },
+            }
+        }
+
+        self.skipNewlines();
+        if (!self.check(.right_brace)) {
+            try self.addRichError(
+                "I was expecting `}` to close the error declaration that starts here",
+                start,
+                "this error was opened here",
+                "add `}` to close the error body",
+            );
+            return error.ParseError;
+        }
+        _ = self.advance();
+
+        return .{
+            .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+            .name = name,
+            .type_params = type_params,
+            .items = try items.toOwnedSlice(self.allocator),
+            .fields = try fields.toOwnedSlice(self.allocator),
+            .code = null, // attached by desugar from the preceding `@code` attribute
+            .doc = null, // attached by desugar from the preceding `@doc` attribute
+            .is_private = is_private,
         };
     }
 
@@ -2062,6 +2225,43 @@ pub const Parser = struct {
                 .name = name,
                 .type_expr = null,
                 .value = value,
+            });
+        }
+
+        // Bareword attribute value: `@code Z3041`. Required surface for
+        // the Phase 1.2 `@code Zxxxx` annotation on `pub error` decls —
+        // the research brief specifies the no-`=` form. Scoped to the
+        // `code` attribute name to avoid changing the meaning of
+        // `@deprecated\nSomeType` or other free-floating marker-attribute
+        // forms elsewhere. The bareword must be a `type_identifier`
+        // matching `Z<digits>` so we surface a precise diagnostic at
+        // parse time rather than letting "anything goes" propagate to
+        // the desugar.
+        const name_text = self.interner.get(name);
+        if (std.mem.eql(u8, name_text, "code") and self.check(.type_identifier)) {
+            const value_tok = self.advance();
+            const value_text = value_tok.slice(self.source);
+            if (!isValidErrorCodeBareword(value_text)) {
+                try self.addRichError(
+                    "I was expecting the `@code` value to be `Z` followed by digits, like `Z3041`",
+                    ast.SourceSpan.from(value_tok.loc),
+                    "this token is not a valid error code",
+                    "stable error codes are written as `Z<digits>`, e.g. `@code Z3041`",
+                );
+                return error.ParseError;
+            }
+            const value_id = try self.interner.intern(value_text);
+            const value_expr = try self.create(ast.Expr, .{
+                .string_literal = .{
+                    .meta = .{ .span = ast.SourceSpan.from(value_tok.loc) },
+                    .value = value_id,
+                },
+            });
+            return self.create(ast.AttributeDecl, .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .name = name,
+                .type_expr = null,
+                .value = value_expr,
             });
         }
 
@@ -5123,6 +5323,20 @@ pub const Parser = struct {
     }
 };
 
+/// Return true when `text` matches the `Z<digits>` shape required for
+/// the `@code` attribute value on a `pub error` declaration. The
+/// research brief specifies the canonical form as a `Z` followed by one
+/// or more ASCII digits — anything else gets a precise parser-time
+/// error rather than propagating an ambiguous string downstream.
+fn isValidErrorCodeBareword(text: []const u8) bool {
+    if (text.len < 2) return false;
+    if (text[0] != 'Z') return false;
+    for (text[1..]) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
 /// Human-readable names for token tags, used in error messages.
 fn tokenHumanName(tag: Token.Tag) []const u8 {
     return switch (tag) {
@@ -5131,6 +5345,7 @@ fn tokenHumanName(tag: Token.Tag) []const u8 {
         .keyword_macro => "`macro`",
         .keyword_struct => "`struct`",
         .keyword_union => "`union`",
+        .keyword_error => "`error`",
         .keyword_if => "`if`",
         .keyword_else => "`else`",
         .keyword_case => "`case`",
@@ -7998,5 +8213,207 @@ test "parse union variant Some() with no payload rejects with a clear error" {
         // a bare "unexpected token".
         return;
     };
+    return error.TestExpectedParseError;
+}
+
+
+// ============================================================
+// Phase 1.2 — `pub error` declaration form
+//
+// These tests pin the parser surface for the new `pub error` /
+// `error` declaration form added in Phase 1.2 of the error-system
+// roadmap. They verify that the parser produces an `ast.ErrorDecl`
+// with the expected fields, items, type_params, visibility flag,
+// and that the `@code Z<digits>` attribute is captured as a string
+// literal value on its `AttributeDecl`. The desugar pass that
+// rewrites these into `pub struct + pub impl Error for X` is
+// exercised separately in `desugar.zig`.
+// ============================================================
+
+test "parser accepts a minimal pub error declaration" {
+    const source =
+        \\pub error TimeoutError {}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
+    try std.testing.expect(program.top_items[0] == .error_decl);
+    const err_decl = program.top_items[0].error_decl;
+    try std.testing.expectEqualStrings(
+        "TimeoutError",
+        parser.interner.get(err_decl.name.parts[0]),
+    );
+    try std.testing.expectEqual(@as(usize, 0), err_decl.fields.len);
+    try std.testing.expectEqual(@as(usize, 0), err_decl.items.len);
+    try std.testing.expect(!err_decl.is_private);
+    try std.testing.expectEqual(@as(usize, 0), err_decl.type_params.len);
+}
+
+test "parser accepts a bare error declaration as priv_error_decl" {
+    const source =
+        \\error InternalIce { message :: String = "internal" }
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
+    try std.testing.expect(program.top_items[0] == .priv_error_decl);
+    const err_decl = program.top_items[0].priv_error_decl;
+    try std.testing.expect(err_decl.is_private);
+    try std.testing.expectEqualStrings(
+        "InternalIce",
+        parser.interner.get(err_decl.name.parts[0]),
+    );
+    try std.testing.expectEqual(@as(usize, 1), err_decl.fields.len);
+    const message_field = err_decl.fields[0];
+    try std.testing.expectEqualStrings(
+        "message",
+        parser.interner.get(message_field.name),
+    );
+    const message_default = message_field.default orelse
+        return error.TestExpectedDefault;
+    try std.testing.expect(message_default.* == .string_literal);
+}
+
+test "parser preserves a pub error field with a default value" {
+    const source =
+        \\pub error NotConnected {
+        \\  message :: String = "no active connection"
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const err_decl = program.top_items[0].error_decl;
+    try std.testing.expectEqual(@as(usize, 1), err_decl.fields.len);
+    const message_default = err_decl.fields[0].default orelse
+        return error.TestExpectedDefault;
+    try std.testing.expect(message_default.* == .string_literal);
+    try std.testing.expectEqualStrings(
+        "no active connection",
+        parser.interner.get(message_default.string_literal.value),
+    );
+}
+
+test "parser preserves an inline pub fn override on a pub error" {
+    const source =
+        \\pub error KeyError {
+        \\  key :: Atom
+        \\  pub fn message(self :: KeyError) -> String { "key not found" }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const err_decl = program.top_items[0].error_decl;
+    try std.testing.expectEqual(@as(usize, 1), err_decl.fields.len);
+    try std.testing.expectEqual(@as(usize, 1), err_decl.items.len);
+    try std.testing.expect(err_decl.items[0] == .function);
+    const inline_fn = err_decl.items[0].function;
+    try std.testing.expectEqualStrings(
+        "message",
+        parser.interner.get(inline_fn.name),
+    );
+}
+
+test "parser captures `@code Z<digits>` attribute as a string-literal value" {
+    const source =
+        \\@code Z3041
+        \\pub error ParseError {
+        \\  line :: u32
+        \\  column :: u32
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    // The top-level item list is `[attribute, error_decl]`; the desugar
+    // pass associates them.
+    try std.testing.expectEqual(@as(usize, 2), program.top_items.len);
+    try std.testing.expect(program.top_items[0] == .attribute);
+    try std.testing.expect(program.top_items[1] == .error_decl);
+
+    const attr = program.top_items[0].attribute;
+    try std.testing.expectEqualStrings("code", parser.interner.get(attr.name));
+    const value = attr.value orelse return error.TestExpectedAttributeValue;
+    try std.testing.expect(value.* == .string_literal);
+    try std.testing.expectEqualStrings(
+        "Z3041",
+        parser.interner.get(value.string_literal.value),
+    );
+}
+
+test "parser rejects `@code` with a malformed bareword value" {
+    const source =
+        \\@code NotAValidCode
+        \\pub error Foo {}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    _ = parser.parseProgram() catch {
+        return; // expected: bareword failed the Z<digits> shape check
+    };
+    return error.TestExpectedParseError;
+}
+
+test "parser accepts a parametric pub error declaration" {
+    const source =
+        \\pub error DeserializeError(T) {
+        \\  message :: String = "deserialization failed"
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const err_decl = program.top_items[0].error_decl;
+    try std.testing.expectEqual(@as(usize, 1), err_decl.type_params.len);
+    try std.testing.expectEqualStrings(
+        "T",
+        parser.interner.get(err_decl.type_params[0]),
+    );
+}
+
+test "parser rejects nested structs inside a pub error body" {
+    const source =
+        \\pub error Bad {
+        \\  pub struct Nested {}
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    _ = parser.parseProgram() catch return;
     return error.TestExpectedParseError;
 }

@@ -1389,7 +1389,7 @@ pub const TypeParenExpr = struct {
 const expected_expr_variants: usize = 37;
 const expected_pattern_variants: usize = 12;
 const expected_type_expr_variants: usize = 11;
-const expected_top_item_variants: usize = 14;
+const expected_top_item_variants: usize = 16;
 
 test "ast.Expr variant count is locked" {
     // When this test fails, you've added or removed an Expr
