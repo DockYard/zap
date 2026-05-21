@@ -1919,20 +1919,23 @@ test "ZIR (acceptance E): nested parametric struct round-trip" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
-test "ZIR (Option stdlib helpers): is_some?, is_none?, unwrap_or end-to-end" {
-    // Exercises the predicate + unwrap helpers added to lib/option.zap.
-    // Confirms the new pub struct Option wrapper coexists with
-    // pub union Option(t) and that the helper functions resolve
-    // through Option.<fn>(opt, ...) call syntax.
+test "ZIR (Opt stdlib helpers): is_some?, is_none?, unwrap_or end-to-end" {
+    // Exercises the predicate + unwrap helpers shipped under
+    // lib/option.zap's `Opt` companion struct. The companion
+    // pattern works around the Phase 1.1.5 namespace constraint
+    // where `pub struct Option { ... }` alongside
+    // `pub union Option(t)` would collide at registration time
+    // (the struct wins and shadows the union, breaking
+    // `Option(i64).Some(42)`).
     var result = try compileAndRun(
         \\pub struct TestProg {
         \\  pub fn main() -> u8 {
         \\    some = Option(i64).Some(42)
         \\    none = Option(i64).None
-        \\    Kernel.inspect(Option.is_some?(some))
-        \\    Kernel.inspect(Option.is_none?(none))
-        \\    Kernel.inspect(Option.unwrap_or(some, 0))
-        \\    Kernel.inspect(Option.unwrap_or(none, 7))
+        \\    Kernel.inspect(Opt.is_some?(some))
+        \\    Kernel.inspect(Opt.is_none?(none))
+        \\    Kernel.inspect(Opt.unwrap_or(some, 0))
+        \\    Kernel.inspect(Opt.unwrap_or(none, 7))
         \\    "done"
         \\    0
         \\  }

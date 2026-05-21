@@ -18,31 +18,31 @@ pub struct OptionTest {
     }
   }
 
-  describe("Option(T) — predicates") {
+  describe("Opt — predicates") {
     test("is_some?/1 returns true for Some") {
-      assert(Option.is_some?(Option(i64).Some(42)) == true)
+      assert(Opt.is_some?(Option(i64).Some(42)) == true)
     }
 
     test("is_some?/1 returns false for None") {
-      assert(Option.is_some?(Option(i64).None) == false)
+      assert(Opt.is_some?(Option(i64).None) == false)
     }
 
     test("is_none?/1 returns true for None") {
-      assert(Option.is_none?(Option(i64).None) == true)
+      assert(Opt.is_none?(Option(i64).None) == true)
     }
 
     test("is_none?/1 returns false for Some") {
-      assert(Option.is_none?(Option(i64).Some(42)) == false)
+      assert(Opt.is_none?(Option(i64).Some(42)) == false)
     }
   }
 
-  describe("Option(T) — unwrap_or/2") {
+  describe("Opt — unwrap_or/2") {
     test("returns the payload of Some") {
-      assert(Option.unwrap_or(Option(i64).Some(42), 0) == 42)
+      assert(Opt.unwrap_or(Option(i64).Some(42), 0) == 42)
     }
 
     test("returns the default for None") {
-      assert(Option.unwrap_or(Option(i64).None, 7) == 7)
+      assert(Opt.unwrap_or(Option(i64).None, 7) == 7)
     }
   }
 
