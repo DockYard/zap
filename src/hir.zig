@@ -2350,6 +2350,35 @@ pub const HirBuilder = struct {
                 return binding.type_id;
             }
         }
+        // Parameter resolution: a name that matches a clause
+        // parameter prefers the HIR-resolved type from
+        // `current_param_types` *only when that type contains type
+        // variables*. The two stores can disagree when a type
+        // annotation carries a free type-var (`Box(t)`): the type
+        // checker creates one fresh `type_var` in its own scope and
+        // records that on the scope-graph binding; the HIR builder
+        // independently creates a different fresh `type_var` when
+        // it resolves the same annotation in `buildClause`. Using
+        // the HIR-resolved tv for parameters whose param type still
+        // carries type-vars keeps every reference to the same
+        // parameter within a clause carrying the *same* TypeId,
+        // which is what the monomorphizer's
+        // substitution-by-typevar-id depends on at call sites. For
+        // fully concrete annotations we keep the scope-graph value
+        // because it carries the (post-typecheck) ownership / span
+        // provenance that downstream tests rely on.
+        for (self.current_param_names, 0..) |maybe_name, idx| {
+            if (maybe_name) |pn| {
+                if (pn == name and idx < self.current_param_types.len) {
+                    const param_tid = self.current_param_types[idx];
+                    if (param_tid != types_mod.TypeStore.UNKNOWN and
+                        self.type_store.containsTypeVars(param_tid))
+                    {
+                        return param_tid;
+                    }
+                }
+            }
+        }
         // Scope graph binding — populated by the type checker. Tests rely on
         // mutating the type at this site after type-checking but before HIR
         // build, so this must take precedence over the in-memory parameter

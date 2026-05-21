@@ -2101,6 +2101,73 @@ test "monomorphizer dedupes specializations for identical parametric args" {
     try std.testing.expectEqual(@as(usize, 1), unbox_specializations);
 }
 
+test "monomorphizer substitutes field-access type through cloned body" {
+    // After specialization, the cloned `unbox` body's `b.value`
+    // field_get must report the substituted type (`i64` or `String`),
+    // not the raw type variable. This is what IR/ZIR lowering reads
+    // to pick storage and emit per-instantiation field-get code.
+    const source =
+        \\pub struct Box(t) {
+        \\  value :: t
+        \\}
+        \\pub struct Demo {
+        \\  pub fn unbox(b :: Box(t)) -> t {
+        \\    b.value
+        \\  }
+        \\  pub fn use_int() -> i64 {
+        \\    unbox(%Box(i64){value: 1})
+        \\  }
+        \\  pub fn use_str() -> String {
+        \\    unbox(%Box(String){value: "x"})
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    var next_id: u32 = builder.next_group_id;
+    const result = try monomorphize(alloc, &hir_program, checker.store, &next_id, @constCast(parser.interner));
+
+    var int_return_seen = false;
+    var string_return_seen = false;
+    for (result.program.structs) |demo| {
+        for (demo.functions) |group| {
+            const name = parser.interner.get(group.name);
+            if (std.mem.indexOf(u8, name, "unbox__") == null) continue;
+            const clause = group.clauses[0];
+            if (clause.return_type == types_mod.TypeStore.I64) int_return_seen = true;
+            if (clause.return_type == types_mod.TypeStore.STRING) string_return_seen = true;
+
+            // The body's first statement is the `b.value` field_get
+            // expression. Its type_id, after cloning + substitution,
+            // must match the clone's concrete return type. UNKNOWN
+            // would mean the substitution didn't reach the field_get.
+            const body_expr = clause.body.stmts[0].expr;
+            try std.testing.expectEqual(clause.return_type, body_expr.type_id);
+        }
+    }
+    try std.testing.expect(int_return_seen);
+    try std.testing.expect(string_return_seen);
+}
+
 test "typeIdToMangledName encodes applied parametric types" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
