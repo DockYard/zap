@@ -718,14 +718,47 @@ const MonomorphContext = struct {
             },
             .struct_match => |struct_match| {
                 const parent_typ = self.store.getType(parent_type);
+                // Parametric receivers — `case b { %Box{value: v} -> v }`
+                // on `b :: Box(i64)` — look through `.applied { base, args }`
+                // to the underlying struct declaration and build the
+                // per-instantiation substitution so each field-binding's
+                // recorded local type is the substituted concrete type
+                // (`i64`), not the raw type variable. Without this the
+                // monomorphizer would record UNKNOWN for parametric
+                // pattern bindings and subsequent argument-type
+                // inference at nested calls would lose the instantiation.
+                const struct_shape, const subs_opt = blk: {
+                    if (parent_typ == .struct_type) {
+                        break :blk .{ parent_typ.struct_type, @as(?SubstitutionMap, null) };
+                    }
+                    if (parent_typ == .applied) {
+                        const base_typ = self.store.getType(parent_typ.applied.base);
+                        if (base_typ != .struct_type) break :blk .{ types_mod.Type.StructType{ .name = 0, .fields = &.{} }, @as(?SubstitutionMap, null) };
+                        const decl_struct = base_typ.struct_type;
+                        var subs = SubstitutionMap.init(self.allocator);
+                        const pair_count = @min(decl_struct.type_params.len, parent_typ.applied.args.len);
+                        for (decl_struct.type_params[0..pair_count], parent_typ.applied.args[0..pair_count]) |formal_id, arg_id| {
+                            const formal_typ = self.store.getType(formal_id);
+                            if (formal_typ != .type_var) continue;
+                            subs.bind(formal_typ.type_var, arg_id);
+                        }
+                        break :blk .{ decl_struct, @as(?SubstitutionMap, subs) };
+                    }
+                    break :blk .{ types_mod.Type.StructType{ .name = 0, .fields = &.{} }, @as(?SubstitutionMap, null) };
+                };
+                var subs_mut = subs_opt;
+                defer if (subs_mut) |*owned| owned.deinit();
                 for (struct_match.field_bindings) |field| {
                     var field_type: TypeId = types_mod.TypeStore.UNKNOWN;
-                    if (parent_typ == .struct_type) {
-                        for (parent_typ.struct_type.fields) |struct_field| {
-                            if (struct_field.name == field.field_name) {
-                                field_type = struct_field.type_id;
-                                break;
-                            }
+                    for (struct_shape.fields) |struct_field| {
+                        if (struct_field.name == field.field_name) {
+                            field_type = struct_field.type_id;
+                            break;
+                        }
+                    }
+                    if (subs_mut) |*subs| {
+                        if (field_type != types_mod.TypeStore.UNKNOWN) {
+                            field_type = subs.applyToType(self.store, field_type);
                         }
                     }
                     try self.recordCasePatternLocalTypes(field.pattern, field_type, bindings, binding_index);
