@@ -2025,6 +2025,112 @@ test "ZIR (acceptance F): case destructuring on Result(T, E) extracts payload" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR (comptime-fold fix): comptime-known dual-payload Result match extracts active arm" {
+    // Phase 1 gap loop #17 item 1 — the comptime-fold UB acceptance case.
+    // BOTH arms bind a payload (`Ok(v)` and `Error(e)`), and the
+    // scrutinee is comptime-known (`Result(i64, i64).Ok(42)` assigned to
+    // a local, not threaded through a runtime parameter). Before the
+    // generalized switch_block lowering this tripped Zig Sema's
+    // "access of union field Error while Ok is active" UB because the
+    // old match_variant_tag + guard_block + variant_payload_get chain
+    // emitted `scrutinee.Error` on the inactive prong, which Sema
+    // comptime-evaluates against the constant Ok value. Routing through
+    // the switch_block-with-capture path makes Sema analyze ONLY the
+    // active prong, so the inactive payload field is never reached.
+    var result = try compileAndRun(
+        \\pub union Pair(t, e) {
+        \\  Ok :: t
+        \\  Error :: e
+        \\}
+        \\pub struct TestProg {
+        \\  pub fn from_ok() -> i64 {
+        \\    r = Pair(i64, i64).Ok(42)
+        \\    case r {
+        \\      Pair.Ok(v) -> v
+        \\      Pair.Error(e) -> e
+        \\    }
+        \\  }
+        \\  pub fn from_error() -> i64 {
+        \\    r = Pair(i64, i64).Error(7)
+        \\    case r {
+        \\      Pair.Ok(v) -> v
+        \\      Pair.Error(e) -> e
+        \\    }
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    Kernel.inspect(from_ok())
+        \\    Kernel.inspect(from_error())
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n7\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR (comptime-fold fix): comptime-known Option None nullary arm with sibling payload arm" {
+    // The acceptance case from the brief: a comptime-known scrutinee
+    // bound to a local where one arm is nullary (`Option.None -> 0`) and
+    // the sibling binds a payload (`Option.Some(v) -> v`). The brief's
+    // exact minimal repro is `Option(i64).None` matched against a
+    // two-arm case producing `0`. Confirms the generalized switch_block
+    // path handles mixed nullary + payload prongs with a comptime-known
+    // discriminant (no runtime-parameter workaround).
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn unwrap_none() -> i64 {
+        \\    opt = Option(i64).None
+        \\    case opt {
+        \\      Option.Some(v) -> v
+        \\      Option.None -> 0
+        \\    }
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    Kernel.inspect(unwrap_none())
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("0\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR (comptime-fold fix): comptime-known three-payload-arm match with catch-all" {
+    // Stress the generalized switch beyond two arms: three payload-
+    // bearing variants plus a `_` catch-all (lowered to the switch's
+    // `else` prong). Confirms N-arm fan-out, distinct payload types per
+    // variant, and the catch-all all route through one switch_block.
+    var result = try compileAndRun(
+        \\pub union Tri(a, b, c) {
+        \\  First :: a
+        \\  Second :: b
+        \\  Third :: c
+        \\}
+        \\pub struct TestProg {
+        \\  pub fn classify() -> i64 {
+        \\    t = Tri(i64, i64, i64).Second(99)
+        \\    case t {
+        \\      Tri.First(x) -> x
+        \\      Tri.Second(y) -> y
+        \\      Tri.Third(z) -> z
+        \\    }
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    Kernel.inspect(classify())
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("99\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR (Result stdlib): Result(T, E) construction round-trips both variants" {
     // Smoke-test the stdlib `Result(t, e)` declaration (lib/result.zap)
     // end-to-end: `Result(i64, String).Ok(42)` and
