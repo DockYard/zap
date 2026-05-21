@@ -769,6 +769,33 @@ pub const DebugInfoPolicyResolution = struct {
 /// The output is consumed by both `compileAndLink` (it sets
 /// `CompileOptions.debug_info_policy`) and the dSYM-bundling code
 /// path (which honors `want_split_debug`).
+/// Project a `BuildConfig.DebugInfo` override (parsed from
+/// `-Ddebug-info=`) to the tri-state cache-key byte that
+/// `BuildCacheOptions.debug_info_tag` / `ScriptContentKeyControls`
+/// fold into the artifact hash. The byte must round-trip — flipping
+/// the flag must produce a distinct cache key — so the encoding is
+/// pinned here (0 = unset, 1 = full, 2 = split, 3 = none) and the
+/// raw bytes are folded with no further transformation.
+pub fn debugInfoCacheTagFor(override: ?zap.builder.BuildConfig.DebugInfo) u8 {
+    return switch (override orelse return 0) {
+        .full => 1,
+        .split => 2,
+        .none => 3,
+    };
+}
+
+/// Project a `BuildConfig.frame_pointers` override (parsed from
+/// `-Dframe-pointers=on|off`) to the cache-key byte
+/// `BuildCacheOptions.frame_pointers_tag` /
+/// `ScriptContentKeyControls` fold in. 0 = unset (use per-mode
+/// default at resolve time), 1 = on, 2 = off.
+pub fn framePointersCacheTagFor(override: ?bool) u8 {
+    return switch (override orelse return 0) {
+        true => 1,
+        false => 2,
+    };
+}
+
 pub fn resolveDebugInfoPolicy(
     optimize: zap.builder.BuildConfig.Optimize,
     override: ?DebugInfoOverride,
@@ -1253,6 +1280,8 @@ fn cmdRunScript(
         .memory_manager_name = if (config.memory_manager) |m| m.type_name else "",
         .target = config.target orelse "",
         .cpu = config.cpu orelse "",
+        .debug_info_tag = debugInfoCacheTagFor(config.debug_info),
+        .frame_pointers_tag = framePointersCacheTagFor(config.frame_pointers),
     }) catch {
         std.debug.print("Error: out of memory computing the script content key\n", .{});
         std.process.exit(1);
@@ -4398,6 +4427,8 @@ fn computeManifestCacheKeyHex(
         .memory_manager_name = if (config.memory_manager) |m| m.type_name else "",
         .target = config.target orelse "",
         .cpu = config.cpu orelse "",
+        .debug_info_tag = debugInfoCacheTagFor(config.debug_info),
+        .frame_pointers_tag = framePointersCacheTagFor(config.frame_pointers),
     });
     return digestHexAlloc(alloc, cache_digest);
 }
@@ -4842,6 +4873,13 @@ fn compileAndLink(
         // would fall back to the V1 ABI (Debug-only DWARF) and
         // skip the ReleaseSafe coverage Phase 0 promises.
         .debug_info_policy = debug_info_resolution.in_binary,
+        // Phase 0 — DWARF foundation, Gap C: thread the per-mode
+        // frame-pointer policy into the V3 ABI so Debug + ReleaseSafe
+        // keep FP for stack-walking and ReleaseFast + ReleaseSmall
+        // omit it for the ~1-3% win. The
+        // `-Dframe-pointers=on|off` CLI flag flows through the same
+        // resolution so the user override actually reaches codegen.
+        .frame_pointer_policy = zir_backend.FramePointerPolicy.fromOptional(debug_info_resolution.frame_pointers),
     }) catch |err| {
         // stderr writer removed in 0.16. The error name discriminates
         // EmitFailed (Zap-side ZIR builder failures) from
@@ -5146,6 +5184,19 @@ const BuildCacheOptions = struct {
     /// Cross target triple ("" ⇒ native) and CPU ("" ⇒ default CPU).
     target: []const u8 = "",
     cpu: []const u8 = "",
+    /// Phase 0 — DWARF foundation: encoded `-Ddebug-info=` override
+    /// (0 = unset / mode default, 1 = full, 2 = split, 3 = none) so a
+    /// flag flip invalidates the artifact. Without this, a Debug
+    /// build with `-Ddebug-info=none` would cache-hit an earlier
+    /// Debug build that kept full DWARF — silently producing the
+    /// wrong artifact for the requested policy.
+    debug_info_tag: u8 = 0,
+    /// Phase 0 — DWARF foundation, Gap C: encoded `-Dframe-pointers=`
+    /// override (0 = unset / mode default, 1 = on, 2 = off). Same
+    /// rationale as `debug_info_tag` — flipping the FP flag must
+    /// produce a different artifact, not a stale cache hit on a
+    /// binary whose prologue does not match the request.
+    frame_pointers_tag: u8 = 0,
 
     const Section = extern struct {
         magic: u32,
@@ -5161,8 +5212,9 @@ const BuildCacheOptions = struct {
     /// change to what is folded in is self-describing in the stream.
     const CONTROL_MAGIC: u32 = 0x5a_42_43_31; // "ZBC1"
     /// Increment when the artifact cache correctness contract changes. Version
-    /// 5 folds the explicit frontend policy tag into artifact identity.
-    const CONTROL_VERSION: u16 = 5;
+    /// 6 folds the Phase 0 debug-info and frame-pointer override tags
+    /// into artifact identity.
+    const CONTROL_VERSION: u16 = 6;
 
     fn runtimeFlags(self: BuildCacheOptions) u16 {
         var flags: u16 = 0;
@@ -5193,6 +5245,14 @@ const BuildCacheOptions = struct {
             hasher.update(std.mem.asBytes(&len));
             hasher.update(s);
         }
+        // Phase 0 — DWARF foundation: fold the debug-info and
+        // frame-pointer override tags. Both are tri-state bytes
+        // (0 = mode default, 1+ = explicit override) so flipping a
+        // `-Ddebug-info=` or `-Dframe-pointers=` flag invalidates
+        // the artifact instead of cache-hitting a binary whose
+        // policy does not match the request.
+        hasher.update(std.mem.asBytes(&self.debug_info_tag));
+        hasher.update(std.mem.asBytes(&self.frame_pointers_tag));
 
         const runtime_flags = self.runtimeFlags();
         if (runtime_flags == 0) return;
@@ -5277,7 +5337,12 @@ fn computeBuildCacheKey(
 // ---------------------------------------------------------------------------
 
 const SCRIPT_CONTENT_KEY_MAGIC: u32 = 0x5a_53_43_31; // "ZSC1"
-const SCRIPT_CONTENT_KEY_VERSION: u16 = 2;
+/// Bumped to v3 with Phase 0 (Gap C): the script content key now folds
+/// the `-Ddebug-info=` and `-Dframe-pointers=` CLI overrides so a
+/// flag flip on the same source invalidates the cached artifact.
+/// Earlier v2 keys were policy-blind and would silently cache-hit
+/// the wrong prologue or DWARF policy.
+const SCRIPT_CONTENT_KEY_VERSION: u16 = 3;
 
 fn hashUpdateLenPrefixed(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
     const len: u64 = bytes.len;
@@ -5386,6 +5451,15 @@ const ScriptContentKeyControls = struct {
     memory_manager_name: []const u8,
     target: []const u8,
     cpu: []const u8,
+    /// Phase 0 — DWARF foundation: encoded `-Ddebug-info=` override
+    /// (0 = unset / mode default, 1 = full, 2 = split, 3 = none).
+    /// Mirror of `BuildCacheOptions.debug_info_tag` so the script
+    /// and manifest caches agree on the policy contract.
+    debug_info_tag: u8 = 0,
+    /// Phase 0 — DWARF foundation, Gap C: encoded `-Dframe-pointers=`
+    /// override (0 = unset / mode default, 1 = on, 2 = off). Mirror
+    /// of `BuildCacheOptions.frame_pointers_tag`.
+    frame_pointers_tag: u8 = 0,
 };
 
 /// Compute the hex content key for a script. Same full-SHA-256
@@ -5417,6 +5491,11 @@ fn computeScriptContentKey(
     hashUpdateLenPrefixed(&hasher, controls.memory_manager_name);
     hashUpdateLenPrefixed(&hasher, controls.target);
     hashUpdateLenPrefixed(&hasher, controls.cpu);
+    // Phase 0 — DWARF foundation: fold the debug-info and frame-
+    // pointer override tags so flipping either flag produces a
+    // distinct cache key.
+    hasher.update(std.mem.asBytes(&controls.debug_info_tag));
+    hasher.update(std.mem.asBytes(&controls.frame_pointers_tag));
 
     return digestHexAlloc(alloc, hasher.finalResult());
 }
@@ -6187,6 +6266,7 @@ const IncrementalWatchState = struct {
             .declared_caps = declared_caps,
             .active_manager_source_path = active_manager_source_path_owned,
             .debug_info_policy = watch_dbg_resolution.in_binary,
+            .frame_pointer_policy = zir_backend.FramePointerPolicy.fromOptional(watch_dbg_resolution.frame_pointers),
         }) catch {
             allocator.free(zig_lib_duped);
             allocator.free(output_path_duped);
@@ -6327,6 +6407,7 @@ const IncrementalWatchState = struct {
             .active_manager_source_path = self.active_manager_source_path,
             .progress = progress,
             .debug_info_policy = dbg_resolution.in_binary,
+            .frame_pointer_policy = zir_backend.FramePointerPolicy.fromOptional(dbg_resolution.frame_pointers),
         };
     }
 
@@ -10550,6 +10631,112 @@ test "Phase5 content key: control length-prefixing prevents boundary collisions"
     try testing.expect(!std.mem.eql(u8, k_ab, k_a_b));
 }
 
+test "Phase 0 Gap C: script content key folds debug-info and frame-pointer overrides" {
+    // Phase 0 — DWARF foundation. The historical key was policy-blind:
+    // running `zap run -Doptimize=ReleaseSafe -Dframe-pointers=on` and
+    // then `... -Dframe-pointers=off` on the same source would land in
+    // the same cache slot, silently producing a binary whose prologue
+    // did not match the user's request. Gap C bumps the script key
+    // version and folds both tags. This test pins that contract so a
+    // future refactor cannot silently regress it.
+    const a = testing.allocator;
+    const base_controls: ScriptContentKeyControls = .{
+        .optimize = .release_safe,
+        .frontend_policy_tag = compiler.FrontendOptimizeMode.release_safe.cacheTag(),
+        .memory_manager_name = "Memory.ARC",
+        .target = "",
+        .cpu = "",
+    };
+    const k_base = try computeScriptContentKey(a, "fn main(_ :: [String]) -> u8 { 0 }", testBuildCacheDigest(0x10), testBuildCacheDigest(0x20), testBuildCacheDigest(0x30), base_controls);
+    defer a.free(k_base);
+
+    // `-Ddebug-info=full` flips the key.
+    var dbg_controls = base_controls;
+    dbg_controls.debug_info_tag = debugInfoCacheTagFor(.full);
+    const k_dbg_full = try computeScriptContentKey(a, "fn main(_ :: [String]) -> u8 { 0 }", testBuildCacheDigest(0x10), testBuildCacheDigest(0x20), testBuildCacheDigest(0x30), dbg_controls);
+    defer a.free(k_dbg_full);
+    try testing.expect(!std.mem.eql(u8, k_base, k_dbg_full));
+
+    // `-Ddebug-info=split` is a distinct key from `=full`.
+    var dbg_split = base_controls;
+    dbg_split.debug_info_tag = debugInfoCacheTagFor(.split);
+    const k_dbg_split = try computeScriptContentKey(a, "fn main(_ :: [String]) -> u8 { 0 }", testBuildCacheDigest(0x10), testBuildCacheDigest(0x20), testBuildCacheDigest(0x30), dbg_split);
+    defer a.free(k_dbg_split);
+    try testing.expect(!std.mem.eql(u8, k_dbg_full, k_dbg_split));
+
+    // `-Ddebug-info=none` is distinct from both.
+    var dbg_none = base_controls;
+    dbg_none.debug_info_tag = debugInfoCacheTagFor(.none);
+    const k_dbg_none = try computeScriptContentKey(a, "fn main(_ :: [String]) -> u8 { 0 }", testBuildCacheDigest(0x10), testBuildCacheDigest(0x20), testBuildCacheDigest(0x30), dbg_none);
+    defer a.free(k_dbg_none);
+    try testing.expect(!std.mem.eql(u8, k_dbg_full, k_dbg_none));
+    try testing.expect(!std.mem.eql(u8, k_dbg_split, k_dbg_none));
+
+    // `-Dframe-pointers=on` flips the key (the regression Gap C closed).
+    var fp_on_controls = base_controls;
+    fp_on_controls.frame_pointers_tag = framePointersCacheTagFor(true);
+    const k_fp_on = try computeScriptContentKey(a, "fn main(_ :: [String]) -> u8 { 0 }", testBuildCacheDigest(0x10), testBuildCacheDigest(0x20), testBuildCacheDigest(0x30), fp_on_controls);
+    defer a.free(k_fp_on);
+    try testing.expect(!std.mem.eql(u8, k_base, k_fp_on));
+
+    // `-Dframe-pointers=off` is distinct from `=on` and from the
+    // unset (mode-default) base — the prologue actually differs in
+    // each case.
+    var fp_off_controls = base_controls;
+    fp_off_controls.frame_pointers_tag = framePointersCacheTagFor(false);
+    const k_fp_off = try computeScriptContentKey(a, "fn main(_ :: [String]) -> u8 { 0 }", testBuildCacheDigest(0x10), testBuildCacheDigest(0x20), testBuildCacheDigest(0x30), fp_off_controls);
+    defer a.free(k_fp_off);
+    try testing.expect(!std.mem.eql(u8, k_fp_on, k_fp_off));
+    try testing.expect(!std.mem.eql(u8, k_base, k_fp_off));
+}
+
+test "Phase 0 Gap C: BuildCacheOptions folds debug-info and frame-pointer overrides" {
+    // Manifest path mirror of the script test above — the manifest and
+    // script paths must agree on cache semantics.
+    const build_source = "pub struct App.Builder {}";
+    const units = [_]compiler.SourceUnit{
+        .{ .file_path = "lib/app.zap", .source = "pub struct App {}" },
+    };
+    const target_name = "default";
+
+    const base: BuildCacheOptions = .{
+        .manifest_result_hash = 0xAB,
+        .optimize = .release_safe,
+        .frontend_policy_tag = compiler.FrontendOptimizeMode.release_safe.cacheTag(),
+    };
+    const k_base = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, base);
+
+    var with_dbg = base;
+    with_dbg.debug_info_tag = debugInfoCacheTagFor(.full);
+    const k_dbg = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, with_dbg);
+    try testing.expect(!std.mem.eql(u8, k_base[0..], k_dbg[0..]));
+
+    var with_fp = base;
+    with_fp.frame_pointers_tag = framePointersCacheTagFor(true);
+    const k_fp = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, with_fp);
+    try testing.expect(!std.mem.eql(u8, k_base[0..], k_fp[0..]));
+    try testing.expect(!std.mem.eql(u8, k_dbg[0..], k_fp[0..]));
+
+    var both = base;
+    both.debug_info_tag = debugInfoCacheTagFor(.full);
+    both.frame_pointers_tag = framePointersCacheTagFor(false);
+    const k_both = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, both);
+    try testing.expect(!std.mem.eql(u8, k_dbg[0..], k_both[0..]));
+    try testing.expect(!std.mem.eql(u8, k_fp[0..], k_both[0..]));
+}
+
+test "Phase 0 Gap C: debugInfoCacheTagFor and framePointersCacheTagFor projections" {
+    // Pin the wire encoding — these bytes ARE the cache-key contract.
+    try testing.expectEqual(@as(u8, 0), debugInfoCacheTagFor(null));
+    try testing.expectEqual(@as(u8, 1), debugInfoCacheTagFor(.full));
+    try testing.expectEqual(@as(u8, 2), debugInfoCacheTagFor(.split));
+    try testing.expectEqual(@as(u8, 3), debugInfoCacheTagFor(.none));
+
+    try testing.expectEqual(@as(u8, 0), framePointersCacheTagFor(null));
+    try testing.expectEqual(@as(u8, 1), framePointersCacheTagFor(true));
+    try testing.expectEqual(@as(u8, 2), framePointersCacheTagFor(false));
+}
+
 test "Phase5 stdlib identity: content AND path sensitive, deterministic (no false hit across stdlibs)" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -10697,6 +10884,59 @@ test "Darwin debug symbols: bundle path is next to the artifact" {
     const dsym_path = try debugSymbolBundlePath(testing.allocator, "zap-out/bin/probe");
     defer testing.allocator.free(dsym_path);
     try testing.expectEqualStrings("zap-out/bin/probe.dSYM", dsym_path);
+}
+
+test "Phase 0 Gap C: resolveDebugInfoPolicy frame_pointers matrix (4 modes x 3 overrides)" {
+    // Phase 0 spec table (per `docs/error-system-research-brief.md`
+    // §VI.B #13): FP on in Debug / ReleaseSafe; FP off in
+    // ReleaseFast / ReleaseSmall. A `-Dframe-pointers=on` override
+    // pins FP on regardless of mode; `-Dframe-pointers=off` pins FP
+    // off regardless of mode. `null` (no flag) keeps the per-mode
+    // default. The resolver's `.frame_pointers` field is a definite
+    // `bool` after applying defaults, never `null` — so callers
+    // always pass a concrete policy to the V3 ABI.
+    const Optimize = zap.builder.BuildConfig.Optimize;
+    const cases = [_]struct {
+        optimize: Optimize,
+        override: ?bool,
+        expected_frame_pointers: bool,
+    }{
+        // Per-mode default rows (null override).
+        .{ .optimize = .debug, .override = null, .expected_frame_pointers = true },
+        .{ .optimize = .release_safe, .override = null, .expected_frame_pointers = true },
+        .{ .optimize = .release_fast, .override = null, .expected_frame_pointers = false },
+        .{ .optimize = .release_small, .override = null, .expected_frame_pointers = false },
+        // Force-on rows (-Dframe-pointers=on).
+        .{ .optimize = .debug, .override = true, .expected_frame_pointers = true },
+        .{ .optimize = .release_safe, .override = true, .expected_frame_pointers = true },
+        .{ .optimize = .release_fast, .override = true, .expected_frame_pointers = true },
+        .{ .optimize = .release_small, .override = true, .expected_frame_pointers = true },
+        // Force-off rows (-Dframe-pointers=off).
+        .{ .optimize = .debug, .override = false, .expected_frame_pointers = false },
+        .{ .optimize = .release_safe, .override = false, .expected_frame_pointers = false },
+        .{ .optimize = .release_fast, .override = false, .expected_frame_pointers = false },
+        .{ .optimize = .release_small, .override = false, .expected_frame_pointers = false },
+    };
+    for (cases) |case| {
+        const resolution = resolveDebugInfoPolicy(case.optimize, null, case.override);
+        try testing.expectEqual(case.expected_frame_pointers, resolution.frame_pointers);
+    }
+}
+
+test "Phase 0 Gap C: FramePointerPolicy.fromOptional projects bool to the V3 ABI byte" {
+    // `null` keeps Zig's per-module default (the V1/V2 path); a
+    // definite `true` / `false` maps to the explicit V3 byte. Cover
+    // each branch so the ABI projection cannot silently flip.
+    try testing.expectEqual(zir_backend.FramePointerPolicy.default, zir_backend.FramePointerPolicy.fromOptional(null));
+    try testing.expectEqual(zir_backend.FramePointerPolicy.keep, zir_backend.FramePointerPolicy.fromOptional(true));
+    try testing.expectEqual(zir_backend.FramePointerPolicy.omit, zir_backend.FramePointerPolicy.fromOptional(false));
+
+    // The raw ABI bytes are the C boundary; document them via the
+    // test so a future enum-reorder triggers a CI-visible failure
+    // instead of a silently mis-typed contract.
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(zir_backend.FramePointerPolicy.default));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(zir_backend.FramePointerPolicy.keep));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(zir_backend.FramePointerPolicy.omit));
 }
 
 fn expectSourceRoot(

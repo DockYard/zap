@@ -132,6 +132,72 @@ extern "c" fn zir_compilation_create_cross_incremental_v2(
     debug_info_policy: u8,
 ) ?*ZirContext;
 
+// Phase 0 — DWARF foundation, Gap C: V3 of every `create_*` ABI.
+// Identical shape to V2 plus a trailing `frame_pointer_policy: u8`
+// (see `FramePointerPolicy`). The two policies are independent; the
+// V3 family is added alongside V2 (never on top of V2's parameter
+// list) so V2 stays byte-identical for callers that don't need the
+// frame-pointer override.
+extern "c" fn zir_compilation_create_v3(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    debug_info_policy: u8,
+    frame_pointer_policy: u8,
+) ?*ZirContext;
+
+extern "c" fn zir_compilation_create_incremental_v3(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    debug_info_policy: u8,
+    frame_pointer_policy: u8,
+) ?*ZirContext;
+
+extern "c" fn zir_compilation_create_cross_v3(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    target_triple: ?[*:0]const u8,
+    cpu_features: ?[*:0]const u8,
+    debug_info_policy: u8,
+    frame_pointer_policy: u8,
+) ?*ZirContext;
+
+extern "c" fn zir_compilation_create_cross_incremental_v3(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    target_triple: ?[*:0]const u8,
+    cpu_features: ?[*:0]const u8,
+    debug_info_policy: u8,
+    frame_pointer_policy: u8,
+) ?*ZirContext;
+
 extern "c" fn zir_compilation_update(ctx: *ZirContext) i32;
 extern "c" fn zir_compilation_update_with_progress(ctx: *ZirContext) i32;
 extern "c" fn zir_compilation_output_path_len(ctx: *ZirContext) usize;
@@ -296,6 +362,16 @@ pub const CompileOptions = struct {
     /// mode strips) which preserves source-mode behavior for
     /// callers that haven't migrated.
     debug_info_policy: ?DebugInfoPolicy = null,
+    /// Phase 0 — DWARF foundation, Gap C: the per-mode frame-pointer
+    /// policy resolved from the optimize mode plus any
+    /// `-Dframe-pointers=on|off` CLI override. See
+    /// `FramePointerPolicy` for the value semantics. `null` keeps
+    /// Zig's per-module default — `omit_frame_pointer = false` in
+    /// every mode except ReleaseSmall on non-x86 — and routes
+    /// through the V1/V2 ABI. A non-null value forces the V3 ABI so
+    /// the policy actually reaches `Package.Module.create`'s
+    /// `inherited.omit_frame_pointer`.
+    frame_pointer_policy: ?FramePointerPolicy = null,
 };
 
 /// Per-mode debug-info policy. Mirrors the fork's `DebugInfoPolicy`
@@ -339,6 +415,42 @@ pub const DebugInfoPolicy = enum(u8) {
     }
 };
 
+/// Phase 0 — DWARF foundation, Gap C: per-mode frame-pointer policy.
+/// Mirrors the fork's `FramePointerPolicy` in
+/// `~/projects/zig/src/zir_api.zig` byte-for-byte — the raw `u8`
+/// encoding is the C-ABI contract.
+///
+/// * `default` keeps Zig's per-module default
+///   (`omit_frame_pointer = false` in every mode except ReleaseSmall
+///   on non-x86). Existing V1/V2 callers stay on this path with
+///   byte-identical behavior.
+/// * `keep` forces frame pointers on regardless of the optimize
+///   mode. The policy Zap's Debug / ReleaseSafe modes want so
+///   `perf`, `samply`, and the Phase-2 async-signal-safe crash
+///   printer can walk the stack without unwinder tables. Also the
+///   resolved policy when the user passes `-Dframe-pointers=on`.
+/// * `omit` forces frame pointers off regardless of the optimize
+///   mode. The policy ReleaseFast / ReleaseSmall use to recover the
+///   ~1-3% lost to the FP prologue. Also the resolved policy when
+///   the user passes `-Dframe-pointers=off`.
+pub const FramePointerPolicy = enum(u8) {
+    default = 0,
+    keep = 1,
+    omit = 2,
+
+    /// Project the Zap-side `?bool` flag (true = keep, false = omit,
+    /// null = mode default) to the fork ABI's tri-state byte. The
+    /// resolver in `src/main.zig` produces `?bool` after applying
+    /// the per-optimize-mode default; this helper is the boundary
+    /// between Zap's representation and the C-ABI contract.
+    pub fn fromOptional(flag: ?bool) FramePointerPolicy {
+        return switch (flag orelse return .default) {
+            true => .keep,
+            false => .omit,
+        };
+    }
+};
+
 /// Create a ZirContext compilation context from the given options.
 ///
 /// This is the first phase of compilation: it creates the Zig compilation
@@ -364,6 +476,24 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
     // still needs the cross primitive (triple = "native", CPU
     // explicit) so the CPU actually reaches `std.Target.Query`. With
     // neither, the plain native path is used unchanged.
+    // Phase 0 — DWARF foundation: select the lowest ABI version that
+    // can express the caller's requested policy stack. V3 carries both
+    // the debug-info and frame-pointer policy bytes (Gap C); V2 carries
+    // only the debug-info byte; V1 carries neither and preserves the
+    // legacy behavior (Debug keeps DWARF, every other mode strips; FP
+    // follows Zig's per-module default).
+    //   * Any non-null `frame_pointer_policy` forces V3 — V2 has no way
+    //     to express it.
+    //   * Any non-null `debug_info_policy` with no FP override picks
+    //     V2 for byte-identical V2 caller behavior.
+    //   * Otherwise V1 stays the path, byte-identical to pre-Phase-0
+    //     callers.
+    const dbg_policy_byte: u8 = @intFromEnum(options.debug_info_policy orelse DebugInfoPolicy.default);
+    const fp_policy_byte: u8 = @intFromEnum(options.frame_pointer_policy orelse FramePointerPolicy.default);
+    const has_dbg_policy = options.debug_info_policy != null;
+    const has_fp_policy = options.frame_pointer_policy != null;
+    const use_v3 = has_fp_policy;
+    const use_v2 = !has_fp_policy and has_dbg_policy;
     const ctx = if (options.target != null or options.cpu != null) blk: {
         const target_z: ?[:0]const u8 = if (options.target) |t|
             (allocator.dupeZ(u8, t) catch return error.OutOfMemory)
@@ -375,17 +505,25 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
         else
             null;
         defer if (cpu_z) |c| allocator.free(c);
-        // Phase 0 — DWARF foundation: when the caller requested an
-        // explicit debug-info policy (`Debug`/`ReleaseSafe` -> `full`,
-        // `ReleaseFast`/`ReleaseSmall` -> `none`, or a CLI override),
-        // route through the V2 ABI which threads the policy into the
-        // fork's `Compilation.Config.root_strip`. Callers that left
-        // `debug_info_policy = null` keep the V1 ABI (Debug keeps
-        // DWARF, every other mode strips) for byte-identical
-        // backwards-compatibility.
-        const dbg_policy_byte: u8 = @intFromEnum(options.debug_info_policy orelse DebugInfoPolicy.default);
-        const has_explicit_policy = options.debug_info_policy != null;
-        break :blk (if (options.incremental and has_explicit_policy)
+        const target_ptr = if (target_z) |t| t.ptr else null;
+        const cpu_ptr = if (cpu_z) |c| c.ptr else null;
+        break :blk (if (options.incremental and use_v3)
+            zir_compilation_create_cross_incremental_v3(
+                zig_lib_z,
+                cache_z,
+                global_cache_z,
+                output_z,
+                name_z,
+                options.output_mode,
+                options.optimize_mode,
+                options.is_dynamic,
+                options.link_libc,
+                target_ptr,
+                cpu_ptr,
+                dbg_policy_byte,
+                fp_policy_byte,
+            )
+        else if (options.incremental and use_v2)
             zir_compilation_create_cross_incremental_v2(
                 zig_lib_z,
                 cache_z,
@@ -396,8 +534,8 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
                 options.optimize_mode,
                 options.is_dynamic,
                 options.link_libc,
-                if (target_z) |t| t.ptr else null,
-                if (cpu_z) |c| c.ptr else null,
+                target_ptr,
+                cpu_ptr,
                 dbg_policy_byte,
             )
         else if (options.incremental)
@@ -411,10 +549,26 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
                 options.optimize_mode,
                 options.is_dynamic,
                 options.link_libc,
-                if (target_z) |t| t.ptr else null,
-                if (cpu_z) |c| c.ptr else null,
+                target_ptr,
+                cpu_ptr,
             )
-        else if (has_explicit_policy)
+        else if (use_v3)
+            zir_compilation_create_cross_v3(
+                zig_lib_z,
+                cache_z,
+                global_cache_z,
+                output_z,
+                name_z,
+                options.output_mode,
+                options.optimize_mode,
+                options.is_dynamic,
+                options.link_libc,
+                target_ptr,
+                cpu_ptr,
+                dbg_policy_byte,
+                fp_policy_byte,
+            )
+        else if (use_v2)
             zir_compilation_create_cross_v2(
                 zig_lib_z,
                 cache_z,
@@ -425,8 +579,8 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
                 options.optimize_mode,
                 options.is_dynamic,
                 options.link_libc,
-                if (target_z) |t| t.ptr else null,
-                if (cpu_z) |c| c.ptr else null,
+                target_ptr,
+                cpu_ptr,
                 dbg_policy_byte,
             )
         else
@@ -440,18 +594,20 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
                 options.optimize_mode,
                 options.is_dynamic,
                 options.link_libc,
-                if (target_z) |t| t.ptr else null,
-                if (cpu_z) |c| c.ptr else null,
+                target_ptr,
+                cpu_ptr,
             )) orelse
             return error.CompilationCreateFailed;
     } else native_path: {
-        const dbg_policy_byte: u8 = @intFromEnum(options.debug_info_policy orelse DebugInfoPolicy.default);
-        const has_explicit_policy = options.debug_info_policy != null;
-        break :native_path (if (options.incremental and has_explicit_policy)
+        break :native_path (if (options.incremental and use_v3)
+            zir_compilation_create_incremental_v3(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc, dbg_policy_byte, fp_policy_byte)
+        else if (options.incremental and use_v2)
             zir_compilation_create_incremental_v2(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc, dbg_policy_byte)
         else if (options.incremental)
             zir_compilation_create_incremental(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc)
-        else if (has_explicit_policy)
+        else if (use_v3)
+            zir_compilation_create_v3(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc, dbg_policy_byte, fp_policy_byte)
+        else if (use_v2)
             zir_compilation_create_v2(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc, dbg_policy_byte)
         else
             zir_compilation_create(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc)) orelse
