@@ -645,46 +645,44 @@ pub const Desugarer = struct {
         });
     }
 
-    /// Build the expression `Option.None`. The runtime sees this as a
-    /// no-payload tagged-union variant on the `Option` union — exactly
-    /// what `Option.None` writes in user code.
+    /// Build the expression `Option.None`. The shape mirrors the
+    /// canonical parser AST for the same surface text — a two-part
+    /// `struct_ref` whose parts are `[Option, None]` — so HIR's
+    /// tagged-union-variant-from-struct_ref path handles it
+    /// (including context-driven inference of the parametric
+    /// instantiation from the surrounding expected-type stack). The
+    /// alternate `field_access(struct_ref([Option]), None)` shape that
+    /// earlier desugar passes used skips that inference and lowers as
+    /// a bare enum literal — a u32 tag — which fails to coerce
+    /// against a `union(enum)` Option specialization at the use site.
     fn buildOptionNoneExpr(self: *Desugarer, span: ast.SourceSpan) !*const ast.Expr {
         const interner_mut: *ast.StringInterner = self.interner;
         const option_id = try interner_mut.intern("Option");
         const none_id = try interner_mut.intern("None");
-        const option_parts = try self.allocSlice(ast.StringId, &.{option_id});
-        const option_ref = try self.create(ast.Expr, .{
+        const parts = try self.allocSlice(ast.StringId, &.{ option_id, none_id });
+        return try self.create(ast.Expr, .{
             .struct_ref = .{
                 .meta = .{ .span = span },
-                .name = .{ .parts = option_parts, .span = span },
-            },
-        });
-        return try self.create(ast.Expr, .{
-            .field_access = .{
-                .meta = .{ .span = span },
-                .object = option_ref,
-                .field = none_id,
+                .name = .{ .parts = parts, .span = span },
             },
         });
     }
 
-    /// Build a call expression `Option.Some(<payload>)`.
+    /// Build a call expression `Option.Some(<payload>)`. The callee
+    /// uses the canonical parser shape — a two-part `struct_ref` with
+    /// parts `[Option, Some]` — so HIR's call-with-tagged-union-variant
+    /// path matches at line `.call =>` in `buildExpr` (which is where
+    /// context-driven inference of the parametric instantiation from
+    /// `expected_type_stack` lives).
     fn buildOptionSomeCall(self: *Desugarer, span: ast.SourceSpan, payload: *const ast.Expr) !*const ast.Expr {
         const interner_mut: *ast.StringInterner = self.interner;
         const option_id = try interner_mut.intern("Option");
         const some_id = try interner_mut.intern("Some");
-        const option_parts = try self.allocSlice(ast.StringId, &.{option_id});
-        const option_ref = try self.create(ast.Expr, .{
+        const parts = try self.allocSlice(ast.StringId, &.{ option_id, some_id });
+        const callee = try self.create(ast.Expr, .{
             .struct_ref = .{
                 .meta = .{ .span = span },
-                .name = .{ .parts = option_parts, .span = span },
-            },
-        });
-        const callee = try self.create(ast.Expr, .{
-            .field_access = .{
-                .meta = .{ .span = span },
-                .object = option_ref,
-                .field = some_id,
+                .name = .{ .parts = parts, .span = span },
             },
         });
         const args = try self.allocSlice(*const ast.Expr, &.{payload});
@@ -717,6 +715,20 @@ pub const Desugarer = struct {
             .meta = mod.meta,
             .name = mod.name,
             .parent = mod.parent,
+            // `type_params` MUST flow through — desugarStruct's job is to
+            // rewrite items (lift for-comprehension helpers, synthesize
+            // the `run/0` helper for struct-level expressions, etc.),
+            // NOT to strip declaration-level metadata. Without this
+            // pass-through, `pub struct Box(T) { ... }` would emerge
+            // from the desugar phase with an empty type_params slice,
+            // and the type-checker's `registerUserTypes` would treat it
+            // as a concrete non-parametric struct — every `T` inside
+            // the body would then be reported as "I cannot find a type
+            // named T". Surfaced by Phase 1.2's Test G `pub error
+            // DeserializeError(T)` and by `zap run` + parametric struct
+            // fixtures in script mode (the harness path that runs
+            // `desugarProgram`).
+            .type_params = mod.type_params,
             .items = try new_items.toOwnedSlice(self.allocator),
             .fields = mod.fields,
             .is_private = mod.is_private,
@@ -1189,6 +1201,21 @@ pub const Desugarer = struct {
                     .struct_expr = .{
                         .meta = se.meta,
                         .struct_name = se.struct_name,
+                        // Explicit type arguments at the literal
+                        // (`%Box(i64){...}`) MUST flow through the
+                        // desugar — they drive per-instantiation
+                        // monomorphization at the type-checker layer.
+                        // The desugar's job here is to rewrite the
+                        // `update_source` and the field VALUES; the
+                        // `(i64)` header is preserved verbatim.
+                        // Dropping it silently turned `%Box(i64){...}`
+                        // into `%Box{...}` (provided_arity == 0) and
+                        // every parametric field reported as
+                        // `expects {type_var}` because the
+                        // SubstitutionMap had no binding for the
+                        // formal type-var.
+                        .type_args = se.type_args,
+                        .type_args_parens_present = se.type_args_parens_present,
                         .update_source = null,
                         .fields = try new_fields.toOwnedSlice(self.allocator),
                     },
