@@ -3447,6 +3447,62 @@ pub const ZirDriver = struct {
             },
             .struct_ref => |name| {
                 if (self.findUnionDef(name)) |union_def| {
+                    // Per-instantiation parametric union specializations
+                    // (`Option_i64`, `Result_i64_String`) live as
+                    // `pub const <Name> = union(enum) {...};` inside a
+                    // synthetic top-level Zig file emitted by Step 3.6.
+                    // Callers reach them via `@import(name).<name>`. A
+                    // function `pub fn maybe() -> Option(i64)` MUST
+                    // declare its return type as exactly that imported
+                    // nominal type — re-declaring the union inline via
+                    // `set_union_return_type` creates a structurally
+                    // identical but nominally distinct anonymous union
+                    // per call site, which Sema flags ("expected
+                    // 'Option_i64.Option_i64', found ...") as a type
+                    // mismatch the first time anyone tries to USE the
+                    // function's return value as the synthetic-file
+                    // union.
+                    //
+                    // The rule for distinguishing the two shapes is the
+                    // exact same `is_specialization_decl` predicate
+                    // `emitStructTypeRef` uses: no dot in the name AND
+                    // the name resolves to a `union_def`/`enum_def`.
+                    // Concrete dotted unions (`IO.Mode`, `Color`) stay
+                    // on the legacy `set_union_return_type` path —
+                    // their declaration lives in the owning struct's
+                    // emission, not as a separate top-level synthetic
+                    // file, so an inline `union(enum)` decl is the
+                    // only way to surface the type at the function's
+                    // return position.
+                    const is_specialization_decl = std.mem.indexOf(u8, name, ".") == null;
+                    if (is_specialization_decl) {
+                        var support: std.ArrayListUnmanaged(u32) = .empty;
+                        defer support.deinit(self.allocator);
+                        const before = zir_builder_get_body_inst_count(self.handle);
+                        const type_ref = try self.emitStructTypeRef(name);
+                        try self.captureBodyInsts(before, &support);
+                        const result_inst = zir_builder_ref_to_inst_index(self.handle, type_ref);
+                        if (result_inst == 0xFFFFFFFF) return error.EmitFailed;
+                        if (zir_builder_set_custom_return_type(
+                            self.handle,
+                            support.items.ptr,
+                            @intCast(support.items.len),
+                            result_inst,
+                        ) != 0) return error.EmitFailed;
+                        self.current_ret_type = 1;
+                        // `cached_union_ret_type_ref` is the
+                        // construction-side cache used by `union_init`
+                        // to materialise return-position literals
+                        // against the inline anonymous union. Since
+                        // we're returning the imported nominal type
+                        // now, leave it at its sentinel zero — the
+                        // construction path always calls
+                        // `emitStructTypeRef(name)` from
+                        // `union_init`'s ZIR handler regardless, which
+                        // is the right ref for `@unionInit`.
+                        return;
+                    }
+
                     var name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
                     defer name_ptrs.deinit(self.allocator);
                     var name_lens: std.ArrayListUnmanaged(u32) = .empty;
