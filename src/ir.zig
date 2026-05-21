@@ -12362,3 +12362,134 @@ test "IR per-instantiation TypeDef substitutes nested field types" {
     try std.testing.expectEqualStrings("right", fields[1].name);
     try std.testing.expectEqual(ZigType.string, fields[1].type_expr);
 }
+
+test "IR field_get on parametric receiver carries per-instantiation struct_type" {
+    // After `b :: Box(i64)` flows through `b.value`, the IR's
+    // `field_get` instruction must record `struct_type =
+    // \"Box_i64\"` — not the parametric base name `Box`. The ZIR
+    // backend imports the per-instantiation ZIR file by this name,
+    // and field offsets / ARC ownership decisions all key off it.
+    const source =
+        \\pub struct Box(t) {
+        \\  value :: t
+        \\}
+        \\pub struct Demo {
+        \\  pub fn read_int() -> i64 {
+        \\    b = %Box(i64){value: 7}
+        \\    b.value
+        \\  }
+        \\  pub fn read_str() -> String {
+        \\    b = %Box(String){value: "hi"}
+        \\    b.value
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner: *ast.StringInterner = undefined;
+    const program = try buildIrProgramForParametricTest(alloc, source, &interner);
+
+    var saw_int_fg = false;
+    var saw_str_fg = false;
+    for (program.functions) |func| {
+        const is_int = std.mem.indexOf(u8, func.name, "read_int") != null;
+        const is_str = std.mem.indexOf(u8, func.name, "read_str") != null;
+        if (!is_int and !is_str) continue;
+        for (func.body) |block| {
+            for (block.instructions) |instr| {
+                if (instr != .field_get) continue;
+                const struct_type = instr.field_get.struct_type orelse continue;
+                if (is_int and std.mem.eql(u8, struct_type, "Box_i64")) saw_int_fg = true;
+                if (is_str and std.mem.eql(u8, struct_type, "Box_String")) saw_str_fg = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_int_fg);
+    try std.testing.expect(saw_str_fg);
+}
+
+test "IR builder's applied specialization table indexes by name and TypeId" {
+    // White-box: confirm `populateAppliedSpecializations` registered
+    // every `.applied` form under both the mangled-name index and
+    // the canonical TypeId index, and that the substituted field
+    // ZigTypes match expectation. Two distinct instantiations of
+    // the same parametric struct must NOT alias.
+    const source =
+        \\pub struct Box(t) {
+        \\  value :: t
+        \\}
+        \\pub struct Demo {
+        \\  pub fn a() -> Box(i64) {
+        \\    %Box(i64){value: 1}
+        \\  }
+        \\  pub fn b() -> Box(String) {
+        \\    %Box(String){value: "x"}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parser_local: Parser = Parser.init(alloc, source);
+    const parser_box = try alloc.create(Parser);
+    parser_box.* = parser_local;
+    const parsed = try parser_box.parseProgram();
+    const program_ast = try alloc.create(ast.Program);
+    program_ast.* = parsed;
+
+    var collector = Collector.init(alloc, parser_box.interner, null);
+    try collector.collectProgram(program_ast);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser_box.interner, &collector.graph);
+    try checker.checkProgram(program_ast);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser_box.interner, &collector.graph, checker.store);
+    const hir_program_value = try hir_builder.buildProgram(program_ast);
+    const hir_program_box = try alloc.create(hir_mod.Program);
+    hir_program_box.* = hir_program_value;
+
+    var next_id: u32 = hir_builder.next_group_id;
+    const mono_result = try monomorphize_mod.monomorphize(
+        alloc,
+        hir_program_box,
+        checker.store,
+        &next_id,
+        @constCast(parser_box.interner),
+    );
+    const post_mono = try alloc.create(hir_mod.Program);
+    post_mono.* = mono_result.program;
+
+    var ir_builder = IrBuilder.init(alloc, parser_box.interner);
+    ir_builder.type_store = checker.store;
+    _ = try ir_builder.buildProgram(post_mono);
+
+    // Both per-instantiation mangled names are indexed.
+    const box_i64_spec = ir_builder.appliedSpecializationByMangledName("Box_i64") orelse
+        return error.MissingBoxI64Spec;
+    const box_str_spec = ir_builder.appliedSpecializationByMangledName("Box_String") orelse
+        return error.MissingBoxStringSpec;
+
+    // The two specializations carry distinct applied TypeIds and
+    // distinct substituted field shapes.
+    try std.testing.expect(box_i64_spec.applied_type_id != box_str_spec.applied_type_id);
+    try std.testing.expectEqual(@as(usize, 1), box_i64_spec.substituted_field_zig_types.len);
+    try std.testing.expectEqual(@as(usize, 1), box_str_spec.substituted_field_zig_types.len);
+    try std.testing.expectEqual(ZigType.i64, box_i64_spec.substituted_field_zig_types[0]);
+    try std.testing.expectEqual(ZigType.string, box_str_spec.substituted_field_zig_types[0]);
+
+    // The HIR-side substituted field TypeIds match the canonical
+    // primitive TypeIds — this is what `lookupStructFieldHirTypeByName`
+    // returns to the IR's ARC-management classifier.
+    try std.testing.expectEqual(types_mod.TypeStore.I64, box_i64_spec.substituted_field_hir_types[0]);
+    try std.testing.expectEqual(types_mod.TypeStore.STRING, box_str_spec.substituted_field_hir_types[0]);
+
+    // The TypeId index agrees with the name index for both.
+    const i64_by_id = ir_builder.appliedSpecializationByTypeId(box_i64_spec.applied_type_id) orelse
+        return error.MissingBoxI64ById;
+    try std.testing.expectEqualStrings(box_i64_spec.mangled_name, i64_by_id.mangled_name);
+}
