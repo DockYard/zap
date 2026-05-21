@@ -1857,6 +1857,30 @@ test "ZIR (acceptance B): parametric struct with concrete default" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR (Option stdlib): Option(i64).Some construction round-trips" {
+    // Smoke-test the stdlib Option(T) declaration end-to-end:
+    // `Option(i64).Some(42)` constructs the per-instantiation tagged
+    // union and assigns it to a binding without crashing. Payload
+    // extraction lives in Phase 1.3 (case-arm tagged-union pattern
+    // destructuring); the construction half lands here and proves the
+    // stdlib type wires through to ZIR.
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    _ = Option(i64).Some(42)
+        \\    _ = Option(i64).None
+        \\    _ = Option(String).Some("hello")
+        \\    IO.puts("constructed")
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("constructed\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR (acceptance E): nested parametric struct round-trip" {
     // `Box(Option(i64))` is the canonical nested-generic shape the
     // brief calls out. The inner `Option(i64).Some(7)` returns the
