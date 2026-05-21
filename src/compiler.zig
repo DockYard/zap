@@ -3165,7 +3165,18 @@ pub fn collectAllFromUnits(
         return error.ParseFailed;
     }
 
-    const program = try mergePrograms(alloc, parsed_programs);
+    var program = try mergePrograms(alloc, parsed_programs);
+
+    // Rewrite every `pub error Foo { ... }` / `error Foo { ... }` into
+    // a `pub struct Foo + pub impl Error for Foo` pair before any
+    // collect or HIR pass sees the program. The desugar lives in
+    // `src/desugar.zig` and runs end-to-end here so the rest of the
+    // pipeline (collector → macro engine → full desugar → typecheck →
+    // HIR → IR → ZIR) never has to know about the `ErrorDecl` form.
+    // This is the only `pub error`-aware pre-collect step in the
+    // compiler — everything downstream treats the generated struct
+    // and impl as ordinary declarations.
+    try applyErrorDeclDesugar(alloc, interner, &program);
 
     // Collect declarations from the merged program first (needed for
     // macro expansion to resolve Kernel macros etc.)
@@ -9234,6 +9245,25 @@ fn findSourceUnitIndex(
     return @min(struct_index, if (source_units.len > 0) source_units.len - 1 else 0);
 }
 
+/// Rewrite every `pub error Foo { ... }` / `error Foo { ... }` in
+/// `program.top_items` into the canonical `pub struct + pub impl Error
+/// for Foo` pair. Runs in `collectAllFromUnits` between
+/// `mergePrograms` and the first collect pass — by the time any
+/// downstream stage sees the program, every `ErrorDecl` has been
+/// replaced. The Desugarer instance is short-lived and uses a null
+/// scope graph because the rewrite is purely structural: it does not
+/// need name resolution or type information. The global interner is
+/// required because the rewrite synthesizes new identifiers
+/// (`message`, `cause`, the snake-cased kind atom, etc.).
+fn applyErrorDeclDesugar(
+    alloc: std.mem.Allocator,
+    interner_arg: *ast.StringInterner,
+    program: *ast.Program,
+) CompileError!void {
+    var desugarer = zap.Desugarer.init(alloc, interner_arg, null);
+    desugarer.desugarErrorDecls(program) catch return error.DesugarFailed;
+}
+
 fn mergePrograms(alloc: std.mem.Allocator, programs: []const ast.Program) !ast.Program {
     var struct_count: usize = 0;
     var top_item_count: usize = 0;
@@ -10105,14 +10135,62 @@ fn remapTopItem(alloc: std.mem.Allocator, item: *ast.TopItem, remap: []const ast
             try remapAttributeDecl(alloc, mutable, remap);
             item.* = .{ .attribute = mutable };
         },
-        .error_decl, .priv_error_decl => {
-            // `pub error` / `error` declarations are removed by the
-            // front-end desugar pass before any post-desugar identifier
-            // remap runs over the program's top items. Reaching this
-            // remap with an `ErrorDecl` still in the AST means the
-            // desugar was bypassed — a compiler wiring bug.
-            @panic("remapTopItem saw an ErrorDecl that should have been desugared into a StructDecl + ImplDecl");
+        .error_decl, .priv_error_decl => |ed| {
+            // `pub error` / `error` survive the unit-local-to-global
+            // interner remap because the remap runs BEFORE the front-end
+            // desugar pass (see `compileCollectAllFromUnits` ordering).
+            // We rewrite the declaration's StringIds — name, type-params,
+            // fields, items, and the `@code` value when present — so the
+            // desugar that follows sees globally-interned identifiers,
+            // exactly like the struct path.
+            const mutable = try alloc.create(ast.ErrorDecl);
+            mutable.* = ed.*;
+            try remapErrorDecl(alloc, mutable, remap);
+            item.* = if (item.* == .error_decl) .{ .error_decl = mutable } else .{ .priv_error_decl = mutable };
         },
+    }
+}
+
+fn remapErrorDecl(alloc: std.mem.Allocator, ed: *ast.ErrorDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+    try remapStructName(alloc, &ed.name, remap);
+    if (ed.type_params.len > 0) {
+        const mutable_params = try alloc.alloc(ast.StringId, ed.type_params.len);
+        for (ed.type_params, 0..) |tp, i| {
+            mutable_params[i] = remap[tp];
+        }
+        ed.type_params = mutable_params;
+    }
+    if (ed.items.len > 0) {
+        const mutable_items = try alloc.alloc(ast.StructItem, ed.items.len);
+        @memcpy(mutable_items, ed.items);
+        for (mutable_items) |*item| {
+            try remapStructItem(alloc, item, remap);
+        }
+        ed.items = mutable_items;
+    }
+    if (ed.fields.len > 0) {
+        const mutable_fields = try alloc.alloc(ast.StructFieldDecl, ed.fields.len);
+        for (ed.fields, 0..) |f, i| {
+            mutable_fields[i] = f;
+            mutable_fields[i].name = remap[f.name];
+            const mutable_te = try alloc.create(ast.TypeExpr);
+            mutable_te.* = f.type_expr.*;
+            try remapTypeExpr(alloc, mutable_te, remap);
+            mutable_fields[i].type_expr = mutable_te;
+            if (f.default) |def| {
+                const mutable_def = try alloc.create(ast.Expr);
+                mutable_def.* = def.*;
+                try remapExpr(alloc, mutable_def, remap);
+                mutable_fields[i].default = mutable_def;
+            }
+        }
+        ed.fields = mutable_fields;
+    }
+    if (ed.doc) |doc_attr| {
+        const mutable_attr = try alloc.create(ast.AttributeDecl);
+        mutable_attr.* = doc_attr.*;
+        try remapAttributeDecl(alloc, mutable_attr, remap);
+        ed.doc = mutable_attr;
     }
 }
 

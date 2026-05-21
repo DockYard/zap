@@ -48,21 +48,653 @@ pub const Desugarer = struct {
     // Program desugaring
     // ============================================================
 
+    /// Walk `program.top_items` once and replace every
+    /// `error_decl` / `priv_error_decl` with the desugared
+    /// `struct_decl + impl_decl` pair, consuming any preceding
+    /// `@code Zxxxx` attribute in the stream. The generated struct is
+    /// also appended to `program.structs` so `buildStructPrograms` (in
+    /// `src/compiler.zig`) routes the impl onto the right struct and
+    /// the struct's HIR/IR emission picks up the auto-generated body.
+    /// All other top items are preserved byte-identical. Used by
+    /// `applyErrorDeclDesugar` in `src/compiler.zig` to ensure no
+    /// collect/HIR pass sees a raw `ErrorDecl` — the rewrite is the
+    /// *only* `pub error`-aware step in the pipeline.
+    ///
+    /// This is intentionally narrower than `desugarProgram` because
+    /// the broader desugar must run AFTER macro expansion (a macro
+    /// could synthesize pipes or interpolations that desugar handles);
+    /// the error rewrite runs BEFORE collect so the scope-graph
+    /// surface matches the canonical struct/impl form. Splitting the
+    /// two phases keeps each desugar idempotent on its own surface.
+    pub fn desugarErrorDecls(self: *Desugarer, program: *ast.Program) !void {
+        var new_top_items: std.ArrayList(ast.TopItem) = .empty;
+        var new_structs: std.ArrayList(ast.StructDecl) = .empty;
+        var has_error_decl = false;
+        for (program.top_items) |item| {
+            switch (item) {
+                .error_decl, .priv_error_decl => |err_decl| {
+                    has_error_decl = true;
+                    const pending_code = try self.takePendingCodeAttribute(&new_top_items);
+                    try self.desugarErrorDecl(err_decl, item == .priv_error_decl, pending_code, &new_top_items, &new_structs);
+                },
+                else => try new_top_items.append(self.allocator, item),
+            }
+        }
+        if (!has_error_decl) {
+            // No allocations needed: the input was already free of
+            // error declarations, leave it untouched so we don't churn
+            // the allocator on the common case.
+            new_top_items.deinit(self.allocator);
+            new_structs.deinit(self.allocator);
+            return;
+        }
+        program.top_items = try new_top_items.toOwnedSlice(self.allocator);
+        // Append the freshly-desugared structs to `program.structs` so
+        // `buildStructPrograms` discovers them alongside any
+        // parser-emitted `pub struct` decls.
+        if (new_structs.items.len > 0) {
+            const combined = try self.allocator.alloc(ast.StructDecl, program.structs.len + new_structs.items.len);
+            @memcpy(combined[0..program.structs.len], program.structs);
+            @memcpy(combined[program.structs.len..], new_structs.items);
+            program.structs = combined;
+            new_structs.deinit(self.allocator);
+        }
+    }
+
     pub fn desugarProgram(self: *Desugarer, program: *const ast.Program) !ast.Program {
         var new_structs: std.ArrayList(ast.StructDecl) = .empty;
         for (program.structs) |mod| {
             try new_structs.append(self.allocator, try self.desugarStruct(&mod));
         }
 
+        // Most items pass through untouched (or recurse into nested
+        // desugar). `error_decl` / `priv_error_decl` items should have
+        // been removed by the earlier `desugarErrorDecls` pass run from
+        // `compiler.applyErrorDeclDesugar`; if any survive (e.g. a
+        // macro re-emitted a `pub error` after that pass), we run the
+        // rewrite again so downstream HIR never sees one.
         var new_top_items: std.ArrayList(ast.TopItem) = .empty;
-        for (program.top_items) |item| {
-            try new_top_items.append(self.allocator, try self.desugarTopItem(item));
+        var i: usize = 0;
+        while (i < program.top_items.len) : (i += 1) {
+            const item = program.top_items[i];
+            switch (item) {
+                .error_decl, .priv_error_decl => |err_decl| {
+                    const pending_code = try self.takePendingCodeAttribute(&new_top_items);
+                    try self.desugarErrorDecl(err_decl, item == .priv_error_decl, pending_code, &new_top_items, null);
+                },
+                else => try new_top_items.append(self.allocator, try self.desugarTopItem(item)),
+            }
         }
 
         return .{
             .structs = try new_structs.toOwnedSlice(self.allocator),
             .top_items = try new_top_items.toOwnedSlice(self.allocator),
         };
+    }
+
+    /// Remove and return any `@code` attribute item that sits at the tail
+    /// of the already-emitted top-item list (interspersed with `@doc`
+    /// and other attribute items that should remain). Called when a
+    /// `pub error` / `error` declaration is about to be desugared, so
+    /// the `@code Zxxxx` value can be threaded into the generated
+    /// `code/1` impl method instead of leaking onto the desugared
+    /// `pub struct`'s attribute set. `@doc` attributes are left in
+    /// place so the collector still attaches them to the generated
+    /// struct via its normal scan-for-preceding-`@doc` path.
+    fn takePendingCodeAttribute(
+        self: *Desugarer,
+        emitted: *std.ArrayList(ast.TopItem),
+    ) !?*const ast.AttributeDecl {
+        // Scan from the end backwards. An `@code` attribute must appear
+        // contiguously next to the error decl, only separated by other
+        // attribute items (typically `@doc`). Any non-attribute item
+        // breaks the scan — `@code` can only modify the next decl.
+        var index: isize = @as(isize, @intCast(emitted.items.len)) - 1;
+        while (index >= 0) : (index -= 1) {
+            const candidate = emitted.items[@intCast(index)];
+            if (candidate != .attribute) return null;
+            const attr = candidate.attribute;
+            if (std.mem.eql(u8, self.interner.get(attr.name), "code")) {
+                _ = emitted.orderedRemove(@intCast(index));
+                return attr;
+            }
+        }
+        return null;
+    }
+
+    // ============================================================
+    // pub error → pub struct + pub impl Error desugar
+    // ============================================================
+
+    /// Rewrite a `pub error Name { ... }` (or `error Name { ... }`)
+    /// declaration into a `pub struct Name { ... }` (or non-`pub` struct)
+    /// plus a matching `pub impl Error for Name { ... }` (or non-`pub`
+    /// impl). The two generated items are appended to `out` in source
+    /// order so any preceding `@doc` attribute in the stream still
+    /// attaches to the generated struct via the existing
+    /// `attachTopLevelAttributeToStruct` path in `src/collector.zig`.
+    ///
+    /// Auto-injected fields (only when the user did not declare them):
+    /// - `message :: String = "<TypeName>"` — every error has a
+    ///   presentable message; default is the bare type name.
+    /// - `cause :: Option(Error) = Option.None` — the causal chain.
+    ///
+    /// Auto-generated impl methods (only when the user did not supply
+    /// an inline override of the same name and arity):
+    /// - `message/1` returns `self.message`.
+    /// - `kind/1` returns the snake-cased type name as an atom.
+    /// - `source/1` returns `self.cause`.
+    /// - `code/1` returns `Option.Some(:Zxxxx)` if `@code Zxxxx` was
+    ///   set, else `Option.None`.
+    ///
+    /// User-defined inline methods whose name+arity match a protocol
+    /// method become the body of the impl method, overriding the
+    /// auto-generated default. The auto-injected `message` field is
+    /// still synthesized for uniform struct shape; the user's `message/1`
+    /// method overrides what `Error.message(self)` returns. User
+    /// methods whose name+arity do NOT match a protocol method stay on
+    /// the struct as ordinary `pub fn` members (callable as
+    /// `Foo.foo(...)`).
+    fn desugarErrorDecl(
+        self: *Desugarer,
+        err_decl: *const ast.ErrorDecl,
+        is_private: bool,
+        code_attr: ?*const ast.AttributeDecl,
+        out: *std.ArrayList(ast.TopItem),
+        out_structs: ?*std.ArrayList(ast.StructDecl),
+    ) !void {
+        const interner_mut: *ast.StringInterner = self.interner;
+
+        // ----- 1. Identify which protocol methods the user overrode.
+        const proto_method_names = [_][]const u8{ "message", "kind", "source", "code" };
+        var user_overrides: [proto_method_names.len]?*const ast.FunctionDecl = .{ null, null, null, null };
+        var non_proto_items: std.ArrayList(ast.StructItem) = .empty;
+        for (err_decl.items) |item| {
+            switch (item) {
+                .function => |func| {
+                    if (matchedProtocolMethod(&proto_method_names, func, interner_mut)) |idx| {
+                        user_overrides[idx] = func;
+                    } else {
+                        try non_proto_items.append(self.allocator, .{ .function = try self.desugarFunctionDecl(func) });
+                    }
+                },
+                .priv_function => |func| {
+                    if (matchedProtocolMethod(&proto_method_names, func, interner_mut)) |_| {
+                        // Private function with a protocol-method name
+                        // does not override the protocol method (the
+                        // impl expects a `pub fn`). Keep it as a struct
+                        // member; the user explicitly opted out of
+                        // visibility. The matching auto-generated impl
+                        // method still fires.
+                        try non_proto_items.append(self.allocator, .{ .priv_function = try self.desugarFunctionDecl(func) });
+                    } else {
+                        try non_proto_items.append(self.allocator, .{ .priv_function = try self.desugarFunctionDecl(func) });
+                    }
+                },
+                .attribute => |attr| try non_proto_items.append(self.allocator, .{ .attribute = attr }),
+                else => {
+                    // The parser already rejected nested struct / union /
+                    // type / alias / import items inside an error body,
+                    // so reaching here means the parser surface drifted.
+                    @panic("desugarErrorDecl received an unexpected struct-item kind from a pub error body");
+                },
+            }
+        }
+
+        // ----- 2. Build the generated struct fields list.
+        //
+        // The auto-injected field set is:
+        //   - `message :: String = "<TypeName>"` — every error has a
+        //     presentable message; default is the bare type name.
+        //
+        // The brief also calls for an auto-injected `cause :: Option(Error)`
+        // field. Today the ZIR backend's parametric-union specialization
+        // path fails to substitute the formal type-var when the applied
+        // type is a protocol receiver (`Option(Error)` lowers to
+        // `Option_T` instead of `Option_Error`, then `Option_T` is not
+        // found by Sema). Until that gap closes (tracked for Phase 1.3,
+        // which lands `Result(T,E)` and exercises the same parametric
+        // codegen path end-to-end), we synthesise a constant
+        // `Option.None` body for `source/1` directly rather than read a
+        // field. Per the brief's Phase 1.2 scope note —
+        //   *"Error.source walking through the cause chain at runtime
+        //    is out of scope; for v1 having the chain present and
+        //    queryable is enough"* —
+        // the protocol surface stays intact (`Error.source(e)` always
+        // returns `Option(Error)`) and Phase 1.3 will flip the default
+        // body to read `self.cause` once Option(Error) codegen works.
+        var fields: std.ArrayList(ast.StructFieldDecl) = .empty;
+        var has_message_field = false;
+        const message_name = try interner_mut.intern("message");
+        for (err_decl.fields) |field| {
+            try fields.append(self.allocator, field);
+            if (field.name == message_name) has_message_field = true;
+        }
+        if (!has_message_field) {
+            const default_msg_text = interner_mut.get(err_decl.name.parts[err_decl.name.parts.len - 1]);
+            const default_msg_id = try interner_mut.intern(default_msg_text);
+            const default_expr = try self.create(ast.Expr, .{
+                .string_literal = .{
+                    .meta = .{ .span = err_decl.meta.span },
+                    .value = default_msg_id,
+                },
+            });
+            const string_type_id = try self.nativeStringTypeName();
+            const string_type = try self.create(ast.TypeExpr, .{
+                .name = .{
+                    .meta = .{ .span = err_decl.meta.span },
+                    .name = string_type_id,
+                    .args = &.{},
+                },
+            });
+            try fields.append(self.allocator, .{
+                .meta = .{ .span = err_decl.meta.span },
+                .name = message_name,
+                .type_expr = string_type,
+                .default = default_expr,
+            });
+        }
+
+        // ----- 3. Emit the generated struct declaration.
+        const generated_items = try non_proto_items.toOwnedSlice(self.allocator);
+        const generated_fields = try fields.toOwnedSlice(self.allocator);
+        const struct_value: ast.StructDecl = .{
+            .meta = err_decl.meta,
+            .name = err_decl.name,
+            .parent = null,
+            .type_params = err_decl.type_params,
+            .items = generated_items,
+            .fields = generated_fields,
+            .is_private = is_private,
+        };
+        const struct_decl = try self.create(ast.StructDecl, struct_value);
+        if (is_private) {
+            try out.append(self.allocator, .{ .priv_struct_decl = struct_decl });
+        } else {
+            try out.append(self.allocator, .{ .struct_decl = struct_decl });
+        }
+        if (out_structs) |list| {
+            try list.append(self.allocator, struct_value);
+        }
+
+        // ----- 4. Build the four protocol-method bodies.
+        var impl_fns: std.ArrayList(*const ast.FunctionDecl) = .empty;
+        try impl_fns.append(self.allocator, try self.buildErrorImplMethod(
+            err_decl,
+            "message",
+            user_overrides[0],
+            .read_message_field,
+        ));
+        try impl_fns.append(self.allocator, try self.buildErrorImplMethod(
+            err_decl,
+            "kind",
+            user_overrides[1],
+            .return_kind_atom,
+        ));
+        try impl_fns.append(self.allocator, try self.buildErrorImplMethod(
+            err_decl,
+            "source",
+            user_overrides[2],
+            // Phase 1.2 returns `Option.None` directly (no `cause`
+            // field auto-injected). Phase 1.3 will switch this back
+            // to `read_cause_field` once `Option(Error)` field-type
+            // ZIR codegen handles protocol applied-type substitution.
+            .return_none_source,
+        ));
+        try impl_fns.append(self.allocator, try self.buildErrorImplMethod(
+            err_decl,
+            "code",
+            user_overrides[3],
+            ErrorImplMethodKind{ .return_code_option = code_attr },
+        ));
+
+        // ----- 5. Emit the generated impl declaration. The `Error`
+        // protocol has no type-parameter header, so `protocol_type_args`
+        // is empty.
+        const error_proto_name_id = try interner_mut.intern("Error");
+        const error_proto_parts = try self.allocSlice(ast.StringId, &.{error_proto_name_id});
+
+        const target_type_name = err_decl.name;
+        const impl_decl = try self.create(ast.ImplDecl, .{
+            .meta = err_decl.meta,
+            .protocol_name = .{ .parts = error_proto_parts, .span = err_decl.meta.span },
+            .protocol_type_args = &.{},
+            .target_type = target_type_name,
+            .type_params = err_decl.type_params,
+            .functions = try impl_fns.toOwnedSlice(self.allocator),
+            .is_private = is_private,
+        });
+        if (is_private) {
+            try out.append(self.allocator, .{ .priv_impl_decl = impl_decl });
+        } else {
+            try out.append(self.allocator, .{ .impl_decl = impl_decl });
+        }
+    }
+
+    const ErrorImplMethodKind = union(enum) {
+        /// Method returns `self.message` (the auto-injected `message` field).
+        read_message_field,
+        /// Method returns `Option.None` for `source/1`. Phase 1.2 default
+        /// while `Option(Error)` field-type ZIR codegen is unfinished;
+        /// Phase 1.3 will swap this for `read_cause_field` once the
+        /// protocol-applied-type specialisation lands.
+        return_none_source,
+        /// Method returns the snake-cased type-name atom literal.
+        return_kind_atom,
+        /// Method returns `Option.Some(:Zxxxx)` if a `@code` attribute
+        /// was set on the declaration, else `Option.None`. The
+        /// attribute pointer is the parser-captured `@code` decl whose
+        /// value is a string-literal Expr holding the `Zxxxx` text.
+        return_code_option: ?*const ast.AttributeDecl,
+    };
+
+    /// Build one of the four auto-generated `Error` impl methods. When
+    /// `user_override` is supplied (the user wrote an inline method with
+    /// the same name and arity inside the `pub error` body), the
+    /// user's body is reused; otherwise a default body is synthesized
+    /// according to `kind`.
+    fn buildErrorImplMethod(
+        self: *Desugarer,
+        err_decl: *const ast.ErrorDecl,
+        comptime method_name_text: []const u8,
+        user_override: ?*const ast.FunctionDecl,
+        kind: ErrorImplMethodKind,
+    ) !*const ast.FunctionDecl {
+        const interner_mut: *ast.StringInterner = self.interner;
+        const method_name_id = try interner_mut.intern(method_name_text);
+        const meta = err_decl.meta;
+
+        // Method signature: `pub fn <name>(self :: <TypeName>) -> <ReturnType>`.
+        // For parametric errors the receiver carries the type-vars as
+        // applied type args, e.g. `self :: DeserializeError(T)`.
+        const self_name = try interner_mut.intern("self");
+        const receiver_type = try self.buildSelfReceiverType(err_decl);
+        const self_param: ast.Param = .{
+            .meta = .{ .span = meta.span },
+            .pattern = try self.create(ast.Pattern, .{
+                .bind = .{ .meta = .{ .span = meta.span }, .name = self_name },
+            }),
+            .type_annotation = receiver_type,
+            .ownership = .shared,
+            .ownership_explicit = false,
+            .default = null,
+        };
+        const params = try self.allocSlice(ast.Param, &.{self_param});
+
+        const return_type = try self.buildErrorImplReturnType(method_name_text, meta);
+
+        // Body: either reuse the user's body, or generate the default
+        // shape for `kind`.
+        const body: []const ast.Stmt = blk: {
+            if (user_override) |func| {
+                // The user wrote `pub fn <name>(... :: <Type>) -> ...`.
+                // We reuse the body verbatim — including its return type
+                // — but rebuild the param list to bind `self` so the
+                // generated method has the canonical shape. We accept
+                // any single-arg signature the user wrote; the
+                // statically-typed receiver binding from the impl-level
+                // is what the rest of the compiler needs to see.
+                if (func.clauses.len == 0 or func.clauses[0].body == null) {
+                    @panic("desugarErrorDecl: inline Error protocol-method override has no body");
+                }
+                const user_clause = func.clauses[0];
+                // Preserve the user's own parameter pattern so any name
+                // they used (e.g. `e`, `self`) resolves inside their
+                // body; we still re-annotate it with the receiver type
+                // so the impl's signature is uniform.
+                const user_param = user_clause.params[0];
+                const rebound_param: ast.Param = .{
+                    .meta = user_param.meta,
+                    .pattern = user_param.pattern,
+                    .type_annotation = receiver_type,
+                    .ownership = user_param.ownership,
+                    .ownership_explicit = user_param.ownership_explicit,
+                    .default = null,
+                };
+                const overridden_params = try self.allocSlice(ast.Param, &.{rebound_param});
+                const clauses = try self.allocator.alloc(ast.FunctionClause, 1);
+                clauses[0] = .{
+                    .meta = user_clause.meta,
+                    .params = overridden_params,
+                    .return_type = user_clause.return_type orelse return_type,
+                    .refinement = user_clause.refinement,
+                    .body = try self.desugarBlock(user_clause.body.?),
+                };
+                return try self.create(ast.FunctionDecl, .{
+                    .meta = meta,
+                    .name = method_name_id,
+                    .name_expr = null,
+                    .clauses = clauses,
+                    .visibility = .public,
+                });
+            }
+
+            const stmt = try self.allocator.alloc(ast.Stmt, 1);
+            stmt[0] = .{ .expr = try self.buildErrorImplDefaultBodyExpr(err_decl, kind, meta) };
+            break :blk stmt;
+        };
+
+        const clauses = try self.allocator.alloc(ast.FunctionClause, 1);
+        clauses[0] = .{
+            .meta = meta,
+            .params = params,
+            .return_type = return_type,
+            .refinement = null,
+            .body = body,
+        };
+        return try self.create(ast.FunctionDecl, .{
+            .meta = meta,
+            .name = method_name_id,
+            .name_expr = null,
+            .clauses = clauses,
+            .visibility = .public,
+        });
+    }
+
+    /// Build the AST `TypeExpr` for `self`'s declared type — the error
+    /// type itself, with applied type-args matching the declaration's
+    /// type-params so a parametric error desugars to `self :: Foo(T)`.
+    fn buildSelfReceiverType(self: *Desugarer, err_decl: *const ast.ErrorDecl) !*const ast.TypeExpr {
+        const meta = err_decl.meta;
+        var args = std.ArrayList(*const ast.TypeExpr).empty;
+        for (err_decl.type_params) |type_param| {
+            const arg = try self.create(ast.TypeExpr, .{
+                .name = .{
+                    .meta = .{ .span = meta.span },
+                    .name = type_param,
+                    .args = &.{},
+                },
+            });
+            try args.append(self.allocator, arg);
+        }
+        const type_name = err_decl.name.parts[err_decl.name.parts.len - 1];
+        return try self.create(ast.TypeExpr, .{
+            .name = .{
+                .meta = .{ .span = meta.span },
+                .name = type_name,
+                .args = try args.toOwnedSlice(self.allocator),
+            },
+        });
+    }
+
+    /// Build the return-type `TypeExpr` for a protocol method by name.
+    fn buildErrorImplReturnType(self: *Desugarer, method_name_text: []const u8, meta: ast.NodeMeta) !*const ast.TypeExpr {
+        const interner_mut: *ast.StringInterner = self.interner;
+        if (std.mem.eql(u8, method_name_text, "message")) {
+            const string_type_id = try self.nativeStringTypeName();
+            return try self.create(ast.TypeExpr, .{
+                .name = .{
+                    .meta = .{ .span = meta.span },
+                    .name = string_type_id,
+                    .args = &.{},
+                },
+            });
+        }
+        if (std.mem.eql(u8, method_name_text, "kind")) {
+            const atom_name_id = try interner_mut.intern("Atom");
+            return try self.create(ast.TypeExpr, .{
+                .name = .{
+                    .meta = .{ .span = meta.span },
+                    .name = atom_name_id,
+                    .args = &.{},
+                },
+            });
+        }
+        if (std.mem.eql(u8, method_name_text, "source")) {
+            return try self.buildOptionOfErrorType(meta.span);
+        }
+        if (std.mem.eql(u8, method_name_text, "code")) {
+            return try self.buildOptionOfAtomType(meta.span);
+        }
+        @panic("buildErrorImplReturnType called with an unknown protocol method name");
+    }
+
+    /// Build a body expression for one of the four default protocol
+    /// methods, parameterised by `kind`.
+    fn buildErrorImplDefaultBodyExpr(self: *Desugarer, err_decl: *const ast.ErrorDecl, kind: ErrorImplMethodKind, meta: ast.NodeMeta) !*const ast.Expr {
+        const interner_mut: *ast.StringInterner = self.interner;
+        switch (kind) {
+            .read_message_field => {
+                const self_name = try interner_mut.intern("self");
+                const message_field = try interner_mut.intern("message");
+                const self_ref = try self.create(ast.Expr, .{
+                    .var_ref = .{ .meta = .{ .span = meta.span }, .name = self_name },
+                });
+                return try self.create(ast.Expr, .{
+                    .field_access = .{
+                        .meta = .{ .span = meta.span },
+                        .object = self_ref,
+                        .field = message_field,
+                    },
+                });
+            },
+            .return_none_source => {
+                return try self.buildOptionNoneExpr(meta.span);
+            },
+            .return_kind_atom => {
+                const type_name = err_decl.name.parts[err_decl.name.parts.len - 1];
+                const type_name_text = interner_mut.get(type_name);
+                const snake = try snakeCaseDecl(self.allocator, type_name_text);
+                defer self.allocator.free(snake);
+                const atom_id = try interner_mut.intern(snake);
+                return try self.create(ast.Expr, .{
+                    .atom_literal = .{ .meta = .{ .span = meta.span }, .value = atom_id },
+                });
+            },
+            .return_code_option => |attr_opt| {
+                if (attr_opt) |attr| {
+                    if (attr.value) |value_expr| {
+                        if (value_expr.* == .string_literal) {
+                            const code_atom_id = value_expr.string_literal.value;
+                            const code_atom = try self.create(ast.Expr, .{
+                                .atom_literal = .{
+                                    .meta = .{ .span = meta.span },
+                                    .value = code_atom_id,
+                                },
+                            });
+                            return try self.buildOptionSomeCall(meta.span, code_atom);
+                        }
+                    }
+                }
+                return try self.buildOptionNoneExpr(meta.span);
+            },
+        }
+    }
+
+    /// Build a `TypeExpr` for `Option(Error)`.
+    fn buildOptionOfErrorType(self: *Desugarer, span: ast.SourceSpan) !*const ast.TypeExpr {
+        const interner_mut: *ast.StringInterner = self.interner;
+        const option_id = try interner_mut.intern("Option");
+        const error_id = try interner_mut.intern("Error");
+        const error_arg = try self.create(ast.TypeExpr, .{
+            .name = .{
+                .meta = .{ .span = span },
+                .name = error_id,
+                .args = &.{},
+            },
+        });
+        const args = try self.allocSlice(*const ast.TypeExpr, &.{error_arg});
+        return try self.create(ast.TypeExpr, .{
+            .name = .{
+                .meta = .{ .span = span },
+                .name = option_id,
+                .args = args,
+            },
+        });
+    }
+
+    /// Build a `TypeExpr` for `Option(Atom)`.
+    fn buildOptionOfAtomType(self: *Desugarer, span: ast.SourceSpan) !*const ast.TypeExpr {
+        const interner_mut: *ast.StringInterner = self.interner;
+        const option_id = try interner_mut.intern("Option");
+        const atom_id = try interner_mut.intern("Atom");
+        const atom_arg = try self.create(ast.TypeExpr, .{
+            .name = .{
+                .meta = .{ .span = span },
+                .name = atom_id,
+                .args = &.{},
+            },
+        });
+        const args = try self.allocSlice(*const ast.TypeExpr, &.{atom_arg});
+        return try self.create(ast.TypeExpr, .{
+            .name = .{
+                .meta = .{ .span = span },
+                .name = option_id,
+                .args = args,
+            },
+        });
+    }
+
+    /// Build the expression `Option.None`. The runtime sees this as a
+    /// no-payload tagged-union variant on the `Option` union — exactly
+    /// what `Option.None` writes in user code.
+    fn buildOptionNoneExpr(self: *Desugarer, span: ast.SourceSpan) !*const ast.Expr {
+        const interner_mut: *ast.StringInterner = self.interner;
+        const option_id = try interner_mut.intern("Option");
+        const none_id = try interner_mut.intern("None");
+        const option_parts = try self.allocSlice(ast.StringId, &.{option_id});
+        const option_ref = try self.create(ast.Expr, .{
+            .struct_ref = .{
+                .meta = .{ .span = span },
+                .name = .{ .parts = option_parts, .span = span },
+            },
+        });
+        return try self.create(ast.Expr, .{
+            .field_access = .{
+                .meta = .{ .span = span },
+                .object = option_ref,
+                .field = none_id,
+            },
+        });
+    }
+
+    /// Build a call expression `Option.Some(<payload>)`.
+    fn buildOptionSomeCall(self: *Desugarer, span: ast.SourceSpan, payload: *const ast.Expr) !*const ast.Expr {
+        const interner_mut: *ast.StringInterner = self.interner;
+        const option_id = try interner_mut.intern("Option");
+        const some_id = try interner_mut.intern("Some");
+        const option_parts = try self.allocSlice(ast.StringId, &.{option_id});
+        const option_ref = try self.create(ast.Expr, .{
+            .struct_ref = .{
+                .meta = .{ .span = span },
+                .name = .{ .parts = option_parts, .span = span },
+            },
+        });
+        const callee = try self.create(ast.Expr, .{
+            .field_access = .{
+                .meta = .{ .span = span },
+                .object = option_ref,
+                .field = some_id,
+            },
+        });
+        const args = try self.allocSlice(*const ast.Expr, &.{payload});
+        return try self.create(ast.Expr, .{
+            .call = .{
+                .meta = .{ .span = span },
+                .callee = callee,
+                .args = args,
+            },
+        });
     }
 
     fn desugarStruct(self: *Desugarer, mod: *const ast.StructDecl) !ast.StructDecl {
@@ -1247,6 +1879,97 @@ pub const Desugarer = struct {
         return slice;
     }
 };
+
+// ============================================================
+// Helpers for the `pub error` desugar
+// ============================================================
+
+/// Return the index of the protocol method whose name matches `func`'s
+/// name AND whose arity is 1 (every `Error` protocol method takes a
+/// single receiver). `null` when no match. The arity check matters
+/// because user inline methods can share a name with a protocol method
+/// at a different arity and still belong on the struct as ordinary
+/// helpers — only an exact name+arity match is treated as a protocol
+/// override.
+fn matchedProtocolMethod(
+    proto_method_names: []const []const u8,
+    func: *const ast.FunctionDecl,
+    interner: *const ast.StringInterner,
+) ?usize {
+    const fn_name = interner.get(func.name);
+    for (proto_method_names, 0..) |proto_name, idx| {
+        if (!std.mem.eql(u8, fn_name, proto_name)) continue;
+        for (func.clauses) |clause| {
+            if (clause.params.len == 1) return idx;
+        }
+    }
+    return null;
+}
+
+/// Convert a PascalCase identifier to a snake_case form suitable for
+/// an atom literal:
+///
+/// - `ParseError` → `parse_error`
+/// - `IOError` → `io_error`
+/// - `XMLParser` → `xml_parser`
+/// - `HTTP2Connection` → `http2_connection`
+/// - `URLEncoded` → `url_encoded`
+/// - `Foo` → `foo`
+///
+/// Rule: insert an underscore between
+///   (a) a lowercase or digit and a following uppercase letter, OR
+///   (b) two uppercase letters when the second is followed by a
+///       lowercase letter (treats runs of uppercase as a single word
+///       except for the last upper-then-lower transition).
+///
+/// The caller owns the returned slice.
+fn snakeCaseDecl(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    for (name, 0..) |c, idx| {
+        const prev: ?u8 = if (idx == 0) null else name[idx - 1];
+        const next: ?u8 = if (idx + 1 >= name.len) null else name[idx + 1];
+        const is_upper = c >= 'A' and c <= 'Z';
+        if (is_upper and idx > 0) {
+            const prev_is_lower_or_digit = if (prev) |p| (p >= 'a' and p <= 'z') or (p >= '0' and p <= '9') else false;
+            const prev_is_upper = if (prev) |p| (p >= 'A' and p <= 'Z') else false;
+            const next_is_lower = if (next) |n| (n >= 'a' and n <= 'z') else false;
+            const needs_underscore = prev_is_lower_or_digit or (prev_is_upper and next_is_lower);
+            if (needs_underscore) try buf.append(allocator, '_');
+        }
+        if (is_upper) {
+            try buf.append(allocator, c - 'A' + 'a');
+        } else {
+            try buf.append(allocator, c);
+        }
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+test "snakeCaseDecl handles canonical PascalCase shapes" {
+    const cases = [_][2][]const u8{
+        .{ "ParseError", "parse_error" },
+        .{ "IOError", "io_error" },
+        .{ "XMLParser", "xml_parser" },
+        .{ "HTTP2Connection", "http2_connection" },
+        .{ "URLEncoded", "url_encoded" },
+        .{ "Foo", "foo" },
+        .{ "A", "a" },
+        .{ "AB", "ab" },
+        .{ "ABc", "a_bc" },
+        .{ "TimeoutError", "timeout_error" },
+        .{ "DeserializeError", "deserialize_error" },
+        .{ "KeyError", "key_error" },
+        .{ "NotConnected", "not_connected" },
+        .{ "OuterError", "outer_error" },
+        .{ "InternalIce", "internal_ice" },
+    };
+    for (cases) |pair| {
+        const got = try snakeCaseDecl(std.testing.allocator, pair[0]);
+        defer std.testing.allocator.free(got);
+        try std.testing.expectEqualStrings(pair[1], got);
+    }
+}
 
 // ============================================================
 // Tests

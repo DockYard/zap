@@ -840,6 +840,30 @@ fn extractStructReferences(
     var struct_brace_depth: u32 = 0;
     var prev_tag: zap.Token.Tag = .eof;
 
+    // Phase 1.2 `pub error` desugar introduces references to `Option`
+    // and `Error` (via the auto-injected `cause :: Option(Error)` field
+    // and the auto-generated `pub impl Error for X` block). Those
+    // identifiers never appear in the user's source, so discovery —
+    // which is lexer-driven and runs BEFORE desugar — would otherwise
+    // never load `lib/option.zap` or `lib/error.zap`. We make the
+    // requirement explicit: as soon as the file declares a `pub error`
+    // (or bare `error`), seed the reference set with both stdlib
+    // structs so the standard import-driven loader picks them up.
+    {
+        var scout = zap.Lexer.init(source);
+        while (true) {
+            const tok = scout.next();
+            if (tok.tag == .eof) break;
+            if (tok.tag == .keyword_error) {
+                const option_name = try alloc.dupe(u8, "Option");
+                try refs.put(option_name, {});
+                const error_name = try alloc.dupe(u8, "Error");
+                try refs.put(error_name, {});
+                break;
+            }
+        }
+    }
+
     while (true) {
         const tok = lexer.next();
         if (tok.tag == .eof) break;

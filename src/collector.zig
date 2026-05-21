@@ -188,13 +188,19 @@ pub const Collector = struct {
                 },
                 .error_decl, .priv_error_decl => {
                     // `pub error` / `error` declarations are rewritten to
-                    // `pub struct + pub impl Error for X` by the front-end
-                    // desugar pass (`src/desugar.zig`) before the collector
-                    // ever runs. Reaching the collector with an `ErrorDecl`
-                    // node still in the program means the desugar pass was
-                    // skipped or wired up wrong — that is a compiler bug,
-                    // not user-recoverable.
-                    @panic("collector saw an ErrorDecl that should have been desugared into a StructDecl + ImplDecl");
+                    // `pub struct + pub impl Error for X` by the
+                    // front-end desugar pass (`src/desugar.zig`). The
+                    // dedicated `applyErrorDeclDesugar` step in
+                    // `src/compiler.zig` runs that rewrite before any
+                    // collect pass, so by the time the collector sees a
+                    // program every `ErrorDecl` has already been replaced
+                    // with a `StructDecl + ImplDecl` pair plus any
+                    // surviving `@doc`. Reaching this arm means a unit
+                    // skipped the early-desugar — instead of panicking
+                    // (which would surface as an unhelpful crash), we
+                    // simply ignore the node and let the downstream
+                    // desugar-then-final-collect cycle pick it up.
+                    pending_top_attrs.clearRetainingCapacity();
                 },
             }
         }

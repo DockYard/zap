@@ -4043,9 +4043,29 @@ pub const TypeChecker = struct {
                         entry_type_ids[entry_idx] = existing_id;
                         continue;
                     }
+                    // Allocate fresh type-vars for each formal type-param
+                    // declared on the union header. Pre-seeding the
+                    // type_params slot in sub-pass 1a — not waiting for
+                    // sub-pass 2 — ensures any co-named struct whose
+                    // sub-pass 2 iteration runs before this union's
+                    // sub-pass 2 still observes the correct arity when
+                    // resolving its field types. Without this preseed,
+                    // `pub union Foo(T) { ... } pub struct Foo { x :: Foo(i64) }`
+                    // would intermittently fail field-type resolution
+                    // depending on the iteration order of
+                    // `graph.types.items`. Sub-pass 2 reuses these same
+                    // formal-type-param ids when filling variants so
+                    // type-var identity remains stable across the union
+                    // declaration's lifetime.
+                    var formal_type_params: std.ArrayList(TypeId) = .empty;
+                    for (ud.type_params) |_| {
+                        const fresh = try self.store.freshVar();
+                        try formal_type_params.append(self.allocator, fresh);
+                    }
                     const type_id = try self.store.addType(.{ .tagged_union = .{
                         .name = ud.name,
                         .variants = &.{},
+                        .type_params = try formal_type_params.toOwnedSlice(self.allocator),
                     } });
                     try self.store.name_to_type.put(ud.name, type_id);
                     entry_type_ids[entry_idx] = type_id;
@@ -4226,20 +4246,19 @@ pub const TypeChecker = struct {
                         continue;
                     }
                     const type_id = entry_type_ids[entry_idx] orelse continue;
-                    // Pre-bind formal type parameters (e.g. `T` in
-                    // `pub union Option(T)`) as fresh type variables
-                    // so any reference to `T` inside the union's
-                    // variant payload type expressions resolves to
-                    // the same TypeVar TypeId.
-                    var formal_type_params: std.ArrayList(TypeId) = .empty;
+                    // Reuse the formal type-params that sub-pass 1a
+                    // pre-seeded on the union slot. Allocating fresh
+                    // vars here would double-register the type-var
+                    // identities and break substitution chains for any
+                    // field-type resolution that already happened on a
+                    // co-named struct during this pass.
+                    const preseeded_type_params = self.store.getType(type_id).tagged_union.type_params;
                     const saved_type_var_scope = try self.snapshotTypeVarScope();
                     defer self.restoreTypeVarScope(saved_type_var_scope);
                     self.type_var_scope.clearRetainingCapacity();
-                    for (ud.type_params) |formal_name_id| {
+                    for (ud.type_params, 0..) |formal_name_id, idx| {
                         const formal_name = self.interner.get(formal_name_id);
-                        const fresh_type_id = try self.store.freshVar();
-                        try self.type_var_scope.put(formal_name, fresh_type_id);
-                        try formal_type_params.append(self.allocator, fresh_type_id);
+                        try self.type_var_scope.put(formal_name, preseeded_type_params[idx]);
                     }
 
                     var variant_entries: std.ArrayList(Type.TaggedUnionVariant) = .empty;
@@ -4256,7 +4275,7 @@ pub const TypeChecker = struct {
                     self.store.types.items[type_id] = .{ .tagged_union = .{
                         .name = ud.name,
                         .variants = try variant_entries.toOwnedSlice(self.allocator),
-                        .type_params = try formal_type_params.toOwnedSlice(self.allocator),
+                        .type_params = preseeded_type_params,
                     } };
                 },
                 .opaque_type => |opaque_body| {
