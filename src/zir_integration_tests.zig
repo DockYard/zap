@@ -2020,6 +2020,100 @@ test "ZIR (acceptance F): case destructuring on Result(T, E) extracts payload" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR (Phase 1.1.5.f Blocker A): union_init across multiple call sites stays per-instantiation typed" {
+    // Round 1's HIR threads `.applied { base = Option, args = [i64] }`
+    // onto the `union_init` literal type. Round 2 makes the ZIR side
+    // honor that by emitting `@unionInit(Option_i64, ...)` regardless
+    // of whether the enclosing function's return type is the union.
+    // This test calls `Option(i64).Some(42)` from *non-return* positions:
+    //
+    //   1. as a local in `unwrap_local()` (return type is `i64`),
+    //   2. as a call argument in `passthrough_some()`,
+    //   3. as a discarded expression value in `discard_call()`,
+    //
+    // then destructures via `case` (acceptance D) — exercising the full
+    // construction → destructuring round-trip through the per-
+    // instantiation tagged-union layout in three distinct contexts.
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn unwrap_local() -> i64 {
+        \\    opt = Option(i64).Some(42)
+        \\    case opt {
+        \\      Option.Some(v) -> v
+        \\      Option.None -> 0
+        \\    }
+        \\  }
+        \\  pub fn passthrough_some(opt :: Option(i64)) -> i64 {
+        \\    case opt {
+        \\      Option.Some(v) -> v
+        \\      Option.None -> 0
+        \\    }
+        \\  }
+        \\  pub fn from_call() -> i64 {
+        \\    passthrough_some(Option(i64).Some(7))
+        \\  }
+        \\  pub fn discard_call() -> i64 {
+        \\    _ = Option(i64).Some(99)
+        \\    opt = Option(i64).None
+        \\    case opt {
+        \\      Option.Some(v) -> v
+        \\      Option.None -> -1
+        \\    }
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    Kernel.inspect(unwrap_local())
+        \\    Kernel.inspect(from_call())
+        \\    Kernel.inspect(discard_call())
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n7\n-1\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR (Phase 1.1.5.f Blocker A): multi-arg parametric Result(T,E) destructures via local binding" {
+    // Acceptance F (Result(T, E)) with multiple type params, exercising
+    // the non-return construction path: variant is bound to a local
+    // first, then destructured in a separate `case` statement. Confirms
+    // the consistent threading rule extends to multi-arg parametric
+    // unions and that the per-instantiation mangled name
+    // (`Result_i64_String`) flows through to `@unionInit`.
+    var result = try compileAndRun(
+        \\pub union Result(t, e) {
+        \\  Ok :: t
+        \\  Err :: e
+        \\}
+        \\pub struct TestProg {
+        \\  pub fn unwrap_ok_local() -> i64 {
+        \\    r = Result(i64, String).Ok(42)
+        \\    case r {
+        \\      Result.Ok(v) -> v
+        \\      Result.Err(_) -> 0
+        \\    }
+        \\  }
+        \\  pub fn unwrap_err_local() -> i64 {
+        \\    r = Result(i64, String).Err("bad")
+        \\    case r {
+        \\      Result.Ok(v) -> v
+        \\      Result.Err(_) -> -1
+        \\    }
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    Kernel.inspect(unwrap_ok_local())
+        \\    Kernel.inspect(unwrap_err_local())
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n-1\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR: struct literal field access" {
     var result = try compileAndRun(
         \\pub struct TestProg {
