@@ -2105,6 +2105,123 @@ test "ZIR (Phase 1.1.5.f Blocker A): multi-arg parametric Result(T,E) destructur
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+// ============================================================
+// Phase 1.2 `pub error` declaration form (acceptance suite A, B, D, F).
+//
+// Tests A/B/D/F exercise the desugar end-to-end: every `pub error` /
+// `error` is rewritten to a `pub struct + pub impl Error` pair before
+// HIR, and protocol dispatch through `Error.message/1` and
+// `Error.kind/1` returns the expected values.
+//
+// Tests C (`@code Zxxxx` round-trip) and E (cause chain) are NOT
+// pinned here. The desugar produces the right impl methods, but
+// invoking `Error.code(e)` to read the value crashes the pre-existing
+// `Option(Atom)` ZIR-codegen layout (a Sema "index out of bounds"
+// panic that also reproduces with any user-defined `pub fn` returning
+// `Option(T)` from a `pub struct`). The fix lives in Phase 1.3
+// alongside the `Result(T,E)` codegen rebuild; this comment is the
+// link from the test surface to that follow-up.
+// ============================================================
+
+test "ZIR (acceptance A — pub error): minimal pub error TimeoutError" {
+    // The brief's minimal acceptance case. `%TimeoutError{}` constructs
+    // the desugared struct with no user fields; the auto-generated impl
+    // methods give:
+    //   Error.message(e) == "TimeoutError"    (bare type name default)
+    //   Error.kind(e)    == :timeout_error    (snake_cased type name)
+    var result = try compileAndRun(
+        \\pub error TimeoutError {}
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    e = %TimeoutError{}
+        \\    IO.puts(Error.message(e))
+        \\    IO.puts(Atom.to_string(Error.kind(e)))
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("TimeoutError\ntimeout_error\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR (acceptance B — pub error): user-declared `message :: String = ...` default" {
+    // The user-declared `message` field wins over the auto-injection.
+    // `Error.message(e)` reads the user's default and `Error.kind(e)`
+    // still derives from the type name.
+    var result = try compileAndRun(
+        \\pub error NotConnected {
+        \\  message :: String = "no active connection"
+        \\}
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    e = %NotConnected{}
+        \\    IO.puts(Error.message(e))
+        \\    IO.puts(Atom.to_string(Error.kind(e)))
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("no active connection\nnot_connected\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR (acceptance D — pub error): inline `pub fn message/1` overrides the protocol method" {
+    // The brief's most subtle case. The user defines `pub fn
+    // message(self :: KeyError) -> String` *inside* the `pub error`
+    // body. The desugar matches the name+arity to the `Error` protocol
+    // method and routes the user's body into the impl's `message/1`,
+    // dropping what would otherwise have been the auto-generated
+    // `self.message` field read. `Error.kind(e)` still resolves
+    // through the auto-generated body.
+    var result = try compileAndRun(
+        \\pub error KeyError {
+        \\  key :: Atom
+        \\  pub fn message(self :: KeyError) -> String {
+        \\    "key " <> Atom.to_string(self.key) <> " not found"
+        \\  }
+        \\}
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    e = %KeyError{key: :missing}
+        \\    IO.puts(Error.message(e))
+        \\    IO.puts(Atom.to_string(Error.kind(e)))
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("key missing not found\nkey_error\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR (acceptance F — pub error): bare `error InternalIce` constructs and dispatches inside its file" {
+    // Bare `error X { ... }` desugars to non-`pub` `struct X +
+    // impl Error for X`. Inside the declaring file the type still
+    // works through the `Error` protocol (same impl walk). Phase 1.2
+    // doesn't yet enforce the matchability boundary — that lands
+    // alongside Phase 1.5's diagnostic surface — but the visibility
+    // flag is the single source of truth on both generated decls,
+    // ready for that follow-up.
+    var result = try compileAndRun(
+        \\error InternalIce {
+        \\  message :: String = "internal"
+        \\}
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    e = %InternalIce{}
+        \\    IO.puts(Error.message(e))
+        \\    IO.puts(Atom.to_string(Error.kind(e)))
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("internal\ninternal_ice\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR: struct literal field access" {
     var result = try compileAndRun(
         \\pub struct TestProg {

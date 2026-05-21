@@ -2120,6 +2120,256 @@ test "for outside macro body is still lifted into __for_N helper" {
     try std.testing.expect(found_helper);
 }
 
+// ============================================================
+// Phase 1.2 `pub error` desugar tests
+// ============================================================
+
+test "desugar rewrites pub error into pub struct + pub impl Error" {
+    // The canonical Phase 1.2 acceptance shape: `pub error
+    // TimeoutError {}` becomes a `pub struct TimeoutError {
+    // message :: String = "TimeoutError" }` plus a
+    // `pub impl Error for TimeoutError` whose four protocol methods
+    // (`message/1`, `kind/1`, `source/1`, `code/1`) are auto-generated
+    // with the expected default bodies.
+    const source =
+        \\pub error TimeoutError {}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    var program = try parser.parseProgram();
+
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
+    try desugarer.desugarErrorDecls(&program);
+
+    // No `error_decl` survives the desugar.
+    var saw_struct = false;
+    var saw_impl = false;
+    for (program.top_items) |item| {
+        try std.testing.expect(item != .error_decl);
+        try std.testing.expect(item != .priv_error_decl);
+        if (item == .struct_decl) saw_struct = true;
+        if (item == .impl_decl) saw_impl = true;
+    }
+    try std.testing.expect(saw_struct);
+    try std.testing.expect(saw_impl);
+
+    // The generated struct lives in `program.structs` too so
+    // `buildStructPrograms` discovers it alongside parser-emitted
+    // structs.
+    var saw_struct_in_structs = false;
+    for (program.structs) |sd| {
+        if (sd.name.parts.len == 1 and std.mem.eql(
+            u8,
+            parser.interner.get(sd.name.parts[0]),
+            "TimeoutError",
+        )) {
+            saw_struct_in_structs = true;
+            // Auto-injected `message :: String = "TimeoutError"` field.
+            try std.testing.expectEqual(@as(usize, 1), sd.fields.len);
+            try std.testing.expectEqualStrings("message", parser.interner.get(sd.fields[0].name));
+            const default = sd.fields[0].default orelse return error.TestExpectedDefault;
+            try std.testing.expect(default.* == .string_literal);
+            try std.testing.expectEqualStrings("TimeoutError", parser.interner.get(default.string_literal.value));
+            try std.testing.expect(!sd.is_private);
+        }
+    }
+    try std.testing.expect(saw_struct_in_structs);
+
+    // The generated impl declares the four protocol methods.
+    var impl_found = false;
+    for (program.top_items) |item| {
+        switch (item) {
+            .impl_decl => |impl_d| {
+                try std.testing.expectEqualStrings("Error", parser.interner.get(impl_d.protocol_name.parts[0]));
+                try std.testing.expectEqualStrings("TimeoutError", parser.interner.get(impl_d.target_type.parts[0]));
+                try std.testing.expect(!impl_d.is_private);
+                try std.testing.expectEqual(@as(usize, 4), impl_d.functions.len);
+                var seen_message = false;
+                var seen_kind = false;
+                var seen_source = false;
+                var seen_code = false;
+                for (impl_d.functions) |func| {
+                    const fn_name = parser.interner.get(func.name);
+                    if (std.mem.eql(u8, fn_name, "message")) seen_message = true;
+                    if (std.mem.eql(u8, fn_name, "kind")) seen_kind = true;
+                    if (std.mem.eql(u8, fn_name, "source")) seen_source = true;
+                    if (std.mem.eql(u8, fn_name, "code")) seen_code = true;
+                    try std.testing.expectEqual(ast.FunctionDecl.Visibility.public, func.visibility);
+                }
+                try std.testing.expect(seen_message and seen_kind and seen_source and seen_code);
+                impl_found = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(impl_found);
+}
+
+test "desugar preserves user-declared message field default" {
+    // The user-declared `message :: String = "custom"` wins over the
+    // auto-injection. The desugared struct has exactly one `message`
+    // field with the user's default expression.
+    const source =
+        \\pub error NotConnected {
+        \\  message :: String = "no active connection"
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    var program = try parser.parseProgram();
+
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
+    try desugarer.desugarErrorDecls(&program);
+
+    var fields_seen: usize = 0;
+    var custom_seen = false;
+    for (program.structs) |sd| {
+        if (!std.mem.eql(u8, parser.interner.get(sd.name.parts[0]), "NotConnected")) continue;
+        for (sd.fields) |field| {
+            fields_seen += 1;
+            if (std.mem.eql(u8, parser.interner.get(field.name), "message")) {
+                const default = field.default orelse return error.TestExpectedDefault;
+                try std.testing.expect(default.* == .string_literal);
+                if (std.mem.eql(u8, parser.interner.get(default.string_literal.value), "no active connection")) {
+                    custom_seen = true;
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), fields_seen); // no double-injected message
+    try std.testing.expect(custom_seen);
+}
+
+test "desugar routes inline pub fn message/1 into the Error impl" {
+    // The user's inline `pub fn message(self) -> String` matches the
+    // protocol method by name+arity and becomes the impl's `message/1`
+    // body. The auto-generated `self.message` field read does NOT fire
+    // — the user's expression appears verbatim inside the impl
+    // method.
+    const source =
+        \\pub error KeyError {
+        \\  key :: Atom
+        \\  pub fn message(self :: KeyError) -> String {
+        \\    "overridden"
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    var program = try parser.parseProgram();
+
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
+    try desugarer.desugarErrorDecls(&program);
+
+    var message_body_string: ?[]const u8 = null;
+    for (program.top_items) |item| {
+        if (item != .impl_decl) continue;
+        for (item.impl_decl.functions) |func| {
+            if (!std.mem.eql(u8, parser.interner.get(func.name), "message")) continue;
+            const body = func.clauses[0].body orelse return error.TestExpectedBody;
+            // Body shape: a single statement that returns the string
+            // literal "overridden".
+            try std.testing.expectEqual(@as(usize, 1), body.len);
+            const stmt = body[0];
+            try std.testing.expect(stmt == .expr);
+            const expr = stmt.expr.*;
+            try std.testing.expect(expr == .string_literal);
+            message_body_string = parser.interner.get(expr.string_literal.value);
+        }
+    }
+    try std.testing.expect(message_body_string != null);
+    try std.testing.expectEqualStrings("overridden", message_body_string.?);
+}
+
+test "desugar bare `error` produces non-pub struct and impl" {
+    const source =
+        \\error InternalIce {}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    var program = try parser.parseProgram();
+
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
+    try desugarer.desugarErrorDecls(&program);
+
+    var saw_priv_struct = false;
+    var saw_priv_impl = false;
+    for (program.top_items) |item| {
+        if (item == .priv_struct_decl) saw_priv_struct = true;
+        if (item == .priv_impl_decl) saw_priv_impl = true;
+    }
+    try std.testing.expect(saw_priv_struct);
+    try std.testing.expect(saw_priv_impl);
+}
+
+test "desugar threads `@code Zxxxx` into the auto-generated code/1 body" {
+    // The desugar consumes a leading `@code Zxxxx` attribute and
+    // synthesizes `code/1` with body `Option.Some(:Zxxxx)`. The
+    // attribute is removed from the output stream so the desugared
+    // struct's attribute set stays clean.
+    const source =
+        \\@code Z3041
+        \\pub error ParseError {}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    var program = try parser.parseProgram();
+
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
+    try desugarer.desugarErrorDecls(&program);
+
+    // No `@code` attribute survives in top_items.
+    for (program.top_items) |item| {
+        if (item == .attribute) {
+            const name = parser.interner.get(item.attribute.name);
+            try std.testing.expect(!std.mem.eql(u8, name, "code"));
+        }
+    }
+
+    // The impl's `code/1` body wraps the captured `Z3041` atom in
+    // `Option.Some`.
+    var saw_some_z3041 = false;
+    for (program.top_items) |item| {
+        if (item != .impl_decl) continue;
+        for (item.impl_decl.functions) |func| {
+            if (!std.mem.eql(u8, parser.interner.get(func.name), "code")) continue;
+            const body = func.clauses[0].body orelse return error.TestExpectedBody;
+            try std.testing.expectEqual(@as(usize, 1), body.len);
+            const expr = body[0].expr.*;
+            // Shape: `Option.Some(:Z3041)` — a call expression whose
+            // callee is `field_access(struct_ref(Option), Some)` and
+            // arg is the atom literal `:Z3041`.
+            try std.testing.expect(expr == .call);
+            try std.testing.expectEqual(@as(usize, 1), expr.call.args.len);
+            const arg = expr.call.args[0].*;
+            try std.testing.expect(arg == .atom_literal);
+            try std.testing.expectEqualStrings("Z3041", parser.interner.get(arg.atom_literal.value));
+            saw_some_z3041 = true;
+        }
+    }
+    try std.testing.expect(saw_some_z3041);
+}
+
 test "struct-level expressions synthesize public run function during desugar" {
     const source =
         \\pub struct Test {
