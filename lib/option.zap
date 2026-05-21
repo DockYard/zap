@@ -10,22 +10,115 @@
   ## Examples
 
       opt = Option(i64).Some(42)
-      Option.is_some?(opt)   # => true
+      Option.is_some?(opt)                # => true
       Option.is_none?(Option(i64).None)   # => true
-
-  ## Variant payload destructuring
-
-  Payload-extracting helpers (`Option.map/2`, `Option.unwrap_or/2`)
-  require tagged-union variant pattern destructuring at the case-arm
-  surface (e.g. `case opt { Option.Some(v) -> v; Option.None -> 0 }`),
-  which is delivered alongside `Result(T, E)` and the `?` propagation
-  operator in Phase 1.3 of the error-system roadmap. The predicate
-  helpers below ship now because they only need the existing
-  no-payload `Option.None` variant pattern; the payload-extracting
-  ones land in Phase 1.3.
+      Option.unwrap_or(opt, 0)            # => 42
+      Option.map(opt, fn(payload :: i64) -> i64 { payload + 1 })  # => Some(43)
   """
 
 pub union Option(t) {
   Some :: t
   None
+}
+
+pub struct Option {
+  @doc = """
+    Returns `true` when `opt` is a `Some(...)` value, `false` when
+    it is `None`.
+
+    ## Examples
+
+        Option.is_some?(Option(i64).Some(42))   # => true
+        Option.is_some?(Option(i64).None)       # => false
+    """
+
+  pub fn is_some?(opt :: Option(value)) -> Bool {
+    case opt {
+      Option.Some(_) -> true
+      Option.None -> false
+    }
+  }
+
+  @doc = """
+    Returns `true` when `opt` is `None`, `false` when it carries a
+    `Some(...)` value. Logical complement of `is_some?/1`.
+
+    ## Examples
+
+        Option.is_none?(Option(i64).None)       # => true
+        Option.is_none?(Option(i64).Some(42))   # => false
+    """
+
+  pub fn is_none?(opt :: Option(value)) -> Bool {
+    case opt {
+      Option.Some(_) -> false
+      Option.None -> true
+    }
+  }
+
+  @doc = """
+    Returns the payload of a `Some(...)` value, or `default` when
+    `opt` is `None`. `default` must be of the same type the option
+    is parameterised on — there is no implicit conversion.
+
+    ## Examples
+
+        Option.unwrap_or(Option(i64).Some(42), 0)   # => 42
+        Option.unwrap_or(Option(i64).None, 0)       # => 0
+    """
+
+  pub fn unwrap_or(opt :: Option(value), default :: value) -> value {
+    case opt {
+      Option.Some(payload) -> payload
+      Option.None -> default
+    }
+  }
+
+  @doc = """
+    Applies `f` to the payload of a `Some(...)` value, wrapping the
+    result back in `Some`. Passes `None` through unchanged. Lets
+    callers transform the inner value without leaving the `Option`
+    container.
+
+    ## Examples
+
+        opt = Option(i64).Some(2)
+        Option.map(opt, fn(payload :: i64) -> i64 { payload * payload })
+        # => Option(i64).Some(4)
+
+        Option.map(Option(i64).None, fn(payload :: i64) -> i64 { payload * payload })
+        # => Option(i64).None
+    """
+
+  pub fn map(opt :: Option(value), f :: (value -> mapped)) -> Option(mapped) {
+    case opt {
+      Option.Some(payload) -> Option.Some(f(payload))
+      Option.None -> Option.None
+    }
+  }
+
+  @doc = """
+    Monadic flatMap: applies `f` to the payload of a `Some(...)`
+    value, returning whichever `Option` the function produces.
+    `None` passes through unchanged. The key combinator for chaining
+    `Option`-returning operations without nesting matches.
+
+    ## Examples
+
+        Option.and_then(Option(i64).Some(4), fn(payload :: i64) -> Option(i64) { Option(i64).Some(payload + 1) })
+        # => Option(i64).Some(5)
+
+        Option.and_then(Option(i64).None, fn(payload :: i64) -> Option(i64) { Option(i64).Some(payload + 1) })
+        # => Option(i64).None
+
+        Option.and_then(Option(i64).Some(4), fn(_ :: i64) -> Option(i64) { Option(i64).None })
+        # => Option(i64).None
+    """
+
+  pub fn and_then(opt :: Option(value), f :: (value -> Option(mapped))) -> Option(mapped) {
+    case opt {
+      Option.Some(payload) -> f(payload)
+      Option.None -> Option.None
+    }
+  }
 }

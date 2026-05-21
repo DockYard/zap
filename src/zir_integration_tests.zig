@@ -1919,6 +1919,30 @@ test "ZIR (acceptance E): nested parametric struct round-trip" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR (Option stdlib helpers): is_some?, is_none?, unwrap_or end-to-end" {
+    // Exercises the predicate + unwrap helpers added to lib/option.zap.
+    // Confirms the new pub struct Option wrapper coexists with
+    // pub union Option(t) and that the helper functions resolve
+    // through Option.<fn>(opt, ...) call syntax.
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    some = Option(i64).Some(42)
+        \\    none = Option(i64).None
+        \\    Kernel.inspect(Option.is_some?(some))
+        \\    Kernel.inspect(Option.is_none?(none))
+        \\    Kernel.inspect(Option.unwrap_or(some, 0))
+        \\    Kernel.inspect(Option.unwrap_or(none, 7))
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("true\ntrue\n42\n7\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR (acceptance D): case destructuring on Option(i64) extracts payload" {
     // Acceptance test D — destructuring half. The construction half
     // is pinned by `parametric tagged-union variant construction
