@@ -219,6 +219,16 @@ pub const TypeStore = struct {
     /// and the same diagnostic prints N times for N structs.
     validated_default_struct_ids: std.AutoHashMap(TypeId, void),
 
+    /// Applied (per-instantiation) struct TypeIds whose substituted
+    /// field defaults have already been re-validated by
+    /// `TypeChecker.revalidateAppliedStructFieldDefaults`. Keyed by
+    /// the canonical `.applied { base, args }` TypeId so structural
+    /// dedupe collapses identical instantiations to one diagnostic.
+    /// Same lifetime contract as `validated_default_struct_ids`:
+    /// pipeline reruns and the per-struct CTFE checker all share a
+    /// single TypeStore-scoped set.
+    revalidated_default_applied_ids: std.AutoHashMap(TypeId, void),
+
     // Well-known type IDs
     pub const BOOL: TypeId = 0;
     pub const STRING: TypeId = 1;
@@ -256,6 +266,7 @@ pub const TypeStore = struct {
             .next_var = 0,
             .inferred_signatures = std.AutoHashMap(ast.StringId, InferredSignature).init(allocator),
             .validated_default_struct_ids = std.AutoHashMap(TypeId, void).init(allocator),
+            .revalidated_default_applied_ids = std.AutoHashMap(TypeId, void).init(allocator),
         };
         store.registerBuiltins() catch {};
         return store;
@@ -266,6 +277,7 @@ pub const TypeStore = struct {
         self.name_to_type.deinit();
         self.inferred_signatures.deinit();
         self.validated_default_struct_ids.deinit();
+        self.revalidated_default_applied_ids.deinit();
     }
 
     fn registerBuiltins(self: *TypeStore) !void {
@@ -3503,6 +3515,180 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// Re-check each parametric struct field default against the
+    /// substituted concrete field type at a use site (1.1.5.e).
+    ///
+    /// `validateStructFieldDefaults` skips defaults whose declared
+    /// field type still contains type-vars — checking `0 :: T` against
+    /// the formal slot `T` would always false-positive. The construction
+    /// site is the first moment the substitution is known: at
+    /// `%Bad(i64){}` we know `T -> i64`, so we can stamp the default's
+    /// expected type and run the same matching rules
+    /// `validateStructFieldDefaults` uses (typeEquals, integer-literal
+    /// narrowing, canWidenTo).
+    ///
+    /// Dedupe is keyed off the *applied* TypeId (`Bad(i64)` vs
+    /// `Bad(String)` are distinct entries) and lives on the TypeStore
+    /// for the same reason `validated_default_struct_ids` does — the
+    /// per-struct CTFE pipeline shares one store across many checker
+    /// instances and we want each `.applied` form to emit at most one
+    /// diagnostic across the whole compilation.
+    ///
+    /// The diagnostic is pinned to the struct-literal span (so the
+    /// caret lands on the user's `%Bad(i64){}` write-site, not the
+    /// declaration's `value :: T = "x"`) and names both the formal
+    /// type-parameter and the concrete arg so the user can fix
+    /// either side cleanly.
+    fn revalidateAppliedStructFieldDefaults(
+        self: *TypeChecker,
+        applied_type_id: TypeId,
+        substitution: SubstitutionMap,
+        type_name_id: ast.StringId,
+        struct_expr: ast.StructExpr,
+    ) !void {
+        if (applied_type_id == TypeStore.UNKNOWN) return;
+        if (applied_type_id >= self.store.types.items.len) return;
+        const applied_type = self.store.getType(applied_type_id);
+        // Only re-validate per-instantiation entries; concrete-struct
+        // literals already ran through `validateStructFieldDefaults`.
+        if (applied_type != .applied) return;
+
+        const gop = try self.store.revalidated_default_applied_ids.getOrPut(applied_type_id);
+        if (gop.found_existing) return;
+
+        // Locate the AST struct decl for `type_name_id` so we can walk
+        // its declared fields and reach each default expression.
+        var struct_decl_ast: ?*const ast.StructDecl = null;
+        var struct_decl_scope: ?scope_mod.ScopeId = null;
+        for (self.graph.types.items) |type_entry| {
+            if (type_entry.kind != .struct_type) continue;
+            if (type_entry.name != type_name_id) continue;
+            struct_decl_ast = type_entry.kind.struct_type;
+            struct_decl_scope = type_entry.scope_id;
+            break;
+        }
+        const decl = struct_decl_ast orelse return;
+
+        const prev_scope = self.current_scope;
+        defer self.current_scope = prev_scope;
+        // Defaults evaluate at the declaration's lexical scope — same
+        // contract as `validateStructFieldDefaults`. Without restoring
+        // the declaration scope the default's `inferExpr` would resolve
+        // identifiers in the construction-site scope, leaking the
+        // surrounding bindings into the default's name resolution.
+        if (struct_decl_scope) |sid| self.current_scope = sid;
+
+        // Walk the AST fields, grab each default expression, and
+        // re-check it against the substituted field type. We mirror
+        // the matching rules used by `validateStructFieldDefaults` so
+        // the surface accept/reject behavior is identical between
+        // concrete and parametric paths.
+        const struct_type = self.store.getType(applied_type.applied.base);
+        if (struct_type != .struct_type) return;
+        const fields = struct_type.struct_type.fields;
+        // Build a lookup from the formal type-params to their slot
+        // index so we can pull the matching concrete arg for the
+        // diagnostic help text.
+        const type_params = struct_type.struct_type.type_params;
+
+        for (decl.fields) |field_decl| {
+            const default_expr = field_decl.default orelse continue;
+
+            var declared_field_type: ?TypeId = null;
+            for (fields) |registered_field| {
+                if (registered_field.name == field_decl.name) {
+                    declared_field_type = registered_field.type_id;
+                    break;
+                }
+            }
+            const field_type_id = declared_field_type orelse continue;
+            // Skip fields whose declared type is fully concrete —
+            // those already ran through the regular validator. We
+            // gate on `containsTypeVars` rather than substituting
+            // unconditionally because the validator's "already done"
+            // state lives on the declaration TypeId; rerunning here
+            // would double-emit.
+            if (!self.store.containsTypeVars(field_type_id)) continue;
+            const expected_type = substitution.applyToType(self.store, field_type_id);
+            if (expected_type == TypeStore.UNKNOWN) continue;
+            // After substitution the expected type should be concrete.
+            // If it still bears a type-var (e.g. caller provided fewer
+            // args than the formals), skip — the arity diagnostic
+            // already fired on the literal.
+            if (self.store.containsTypeVars(expected_type)) continue;
+
+            const inferred = self.inferExpr(default_expr) catch TypeStore.UNKNOWN;
+            if (inferred == TypeStore.UNKNOWN) continue;
+            if (self.store.typeEquals(inferred, expected_type)) continue;
+            if (self.acceptsIntegerLiteralForExpectedType(default_expr, expected_type)) continue;
+            if (self.store.canWidenTo(inferred, expected_type)) continue;
+
+            // Resolve the formal type-param name (e.g. `T`) that the
+            // declared field type referenced so the diagnostic can
+            // name both the formal slot and the concrete argument.
+            const formal_name = self.findTypeVarNameInFieldType(field_type_id, type_params, decl.type_params);
+            const provided_name = self.typeToString(inferred);
+            const expected_name = self.typeToString(expected_type);
+            const field_name = self.interner.get(field_decl.name);
+            const decl_name = self.interner.get(type_name_id);
+
+            const message = try std.fmt.allocPrint(
+                self.allocator,
+                "parametric default for field `{s}` does not type-check at `{s}` instantiation: expected `{s}`, got `{s}`",
+                .{ field_name, decl_name, expected_name, provided_name },
+            );
+            const help = if (formal_name) |fname|
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "the field's declared type is `{s}`; at this instantiation `{s} = {s}` so the default must produce `{s}`",
+                    .{ fname, fname, expected_name, expected_name },
+                )
+            else
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "either change the default to a `{s}` value or change the type-arg at the literal",
+                    .{expected_name},
+                );
+
+            try self.addRichError(
+                message,
+                struct_expr.meta.span,
+                "parametric default type mismatch",
+                help,
+            );
+        }
+    }
+
+    /// Find the name of the type-variable that the declared field
+    /// type references — used by the parametric default re-validation
+    /// diagnostic to name the formal slot (`T`) alongside the concrete
+    /// argument. Walks the registered formals in order and returns
+    /// the AST name for the first slot whose TypeId matches a
+    /// type-var inside the field's declared type.
+    fn findTypeVarNameInFieldType(
+        self: *const TypeChecker,
+        field_type_id: TypeId,
+        type_param_type_ids: []const TypeId,
+        type_param_names: []const ast.StringId,
+    ) ?[]const u8 {
+        const field_type = self.store.getType(field_type_id);
+        // Direct case: `value :: T` — the field type is itself the
+        // formal type-var. Walk the registered formals to find the
+        // matching name.
+        if (field_type == .type_var) {
+            for (type_param_type_ids, 0..) |tp_id, idx| {
+                if (tp_id == field_type_id and idx < type_param_names.len) {
+                    return self.interner.get(type_param_names[idx]);
+                }
+            }
+        }
+        // Nested case: the field type is a compound that contains a
+        // type-var. The diagnostic still works without naming the
+        // formal slot — return null and let the caller fall back to
+        // the type-only help text.
+        return null;
+    }
+
     /// Look up a registered struct field's resolved `TypeId` by name.
     /// Used by `validateStructFieldDefaults` to pair an AST-level
     /// `StructFieldDecl` with its already-resolved field type without
@@ -5522,6 +5708,23 @@ pub const TypeChecker = struct {
                             if (self.resolveFirstClassFunctionStructType()) |function_type_id| {
                                 try self.validateStaticFunctionStructExpr(se, function_type_id);
                             }
+                            // Per-instantiation default re-validation.
+                            // Defaults that bear type-vars at the
+                            // declaration site (e.g. `value :: T = 0`)
+                            // are skipped by `validateStructFieldDefaults`
+                            // because the formal type-var can't be
+                            // type-checked against a literal. Here we
+                            // re-check each such default against the
+                            // *substituted* concrete field type, so
+                            // `%Bad(i64){}` against `value :: T = "x"`
+                            // fires a rich diagnostic pinned to the
+                            // construction site.
+                            try self.revalidateAppliedStructFieldDefaults(
+                                instantiation.literal_type_id,
+                                instantiation.substitution,
+                                type_name_id,
+                                se,
+                            );
                             // For a parametric instantiation
                             // `%Box(i64){...}` the literal's *type*
                             // is the applied form `Box(i64)`, not the
@@ -11422,4 +11625,132 @@ test "applied type instantiations dedupe by base and args" {
     string_args[0] = TypeStore.STRING;
     const box_of_string = try store.addType(.{ .applied = .{ .base = box_base, .args = string_args } });
     try std.testing.expect(box_of_string != first);
+}
+
+test "parametric struct default re-validates against substituted field type — mismatch" {
+    // `pub struct Bad(T) { value :: T = "string default" }` validates
+    // cleanly at the declaration site (the type-var-bearing default
+    // path is gated by `containsTypeVars`). At the instantiation site
+    // `%Bad(i64){}` the default's type (`String`) clashes with the
+    // substituted field type (`i64`) — a rich diagnostic must fire
+    // pinned to the literal's span with both the formal slot and the
+    // concrete arg in the help text.
+    const source =
+        \\pub struct Bad(t) {
+        \\  value :: t = "string default"
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Bad {
+        \\    %Bad(i64){}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found_re_validation_diag = false;
+    for (checker.errors.items) |type_err| {
+        if (std.mem.indexOf(u8, type_err.message, "parametric default") != null) {
+            found_re_validation_diag = true;
+        }
+    }
+    try std.testing.expect(found_re_validation_diag);
+}
+
+test "parametric struct default re-validates against substituted field type — match" {
+    // `pub struct Good(T) { value :: T = 0 }` instantiated as
+    // `%Good(i64){}` must type-check cleanly: the integer-literal
+    // default is acceptable for `i64`, and the per-instantiation
+    // re-validation falls through.
+    const source =
+        \\pub struct Good(t) {
+        \\  value :: t = 0
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Good {
+        \\    %Good(i64){}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "parametric struct default re-validation dedupes per applied TypeId" {
+    // Two instantiation sites for the same `.applied` form
+    // (`%Bad(i64){}` mentioned twice) must produce exactly one
+    // diagnostic, not two. The TypeStore's dedupe of `.applied` by
+    // (base, args) collapses the literal type to a single TypeId,
+    // and the re-validator keys its "already complained" set off
+    // that TypeId.
+    const source =
+        \\pub struct Bad(t) {
+        \\  value :: t = "string default"
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build_one() -> Bad {
+        \\    %Bad(i64){}
+        \\  }
+        \\  pub fn build_two() -> Bad {
+        \\    %Bad(i64){}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var diag_count: usize = 0;
+    for (checker.errors.items) |type_err| {
+        if (std.mem.indexOf(u8, type_err.message, "parametric default") != null) {
+            diag_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), diag_count);
 }
