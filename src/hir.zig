@@ -2179,6 +2179,16 @@ pub const HirBuilder = struct {
     /// first-class `Type`/`Function` values that name target-source structs
     /// before those sources are loaded.
     allow_external_static_references: bool = false,
+    /// Stack of expected types active around the *current* expression
+    /// being lowered. Used for context-driven inference of parametric
+    /// struct/union literals: when `%Box{...}` appears with no
+    /// explicit `(...)` but the surrounding context (variable
+    /// annotation, function return, function-arg type) provides a
+    /// concrete `Box(i64)` `.applied` TypeId, the literal adopts that
+    /// instantiation so monomorphization sees the concrete shape.
+    /// Pushed by `buildExprWithExpected` / `lowerWithExpected` helpers
+    /// and popped on return; lookups read the topmost entry.
+    expected_type_stack: std.ArrayListUnmanaged(types_mod.TypeId) = .empty,
     errors: std.ArrayList(Error),
 
     pub const Error = struct {
@@ -2241,6 +2251,7 @@ pub const HirBuilder = struct {
         self.current_case_bindings.deinit(self.allocator);
         self.parent_assignment_bindings.deinit(self.allocator);
         self.hir_type_var_scope.deinit();
+        self.expected_type_stack.deinit(self.allocator);
         self.errors.deinit(self.allocator);
     }
 
@@ -5182,8 +5193,15 @@ pub const HirBuilder = struct {
                 unreachable;
             },
             .struct_expr => |se| {
-                // Resolve struct type from struct name (e.g., %Point{x: 1, y: 2})
-                var struct_type_id = types_mod.TypeStore.UNKNOWN;
+                // Resolve struct type from struct name (e.g., %Point{x: 1, y: 2}).
+                // `declaration_type_id` is the bare struct/union TypeId
+                // (the type checker registered under `name_to_type`).
+                // `literal_type_id` is what we record on the HIR node:
+                // it's the canonical `.applied { base, args }` form for
+                // parametric instantiations (`%Box(i64){...}`) and the
+                // bare declaration TypeId for concrete struct literals.
+                var declaration_type_id = types_mod.TypeStore.UNKNOWN;
+                var literal_type_id = types_mod.TypeStore.UNKNOWN;
                 if (se.struct_name.parts.len > 0) {
                     const full_type_name_id = try self.internDottedStructName(se.struct_name);
                     const simple_type_name_id = se.struct_name.parts[se.struct_name.parts.len - 1];
@@ -5192,7 +5210,28 @@ pub const HirBuilder = struct {
                     else
                         simple_type_name_id;
                     if (self.type_store.name_to_type.get(type_name_id)) |tid| {
-                        struct_type_id = tid;
+                        declaration_type_id = tid;
+                        literal_type_id = tid;
+                    }
+                }
+                // When the source writes explicit type arguments
+                // (`%Box(i64){...}`), thread the canonical `.applied`
+                // instantiation TypeId onto the HIR literal. The
+                // monomorphizer keys specializations off this form, so
+                // missing it would prevent per-instantiation
+                // monomorphization of struct/union types.
+                if (se.type_args.len > 0 and declaration_type_id != types_mod.TypeStore.UNKNOWN) {
+                    literal_type_id = self.buildAppliedStructLiteralType(declaration_type_id, se.type_args);
+                } else if (declaration_type_id != types_mod.TypeStore.UNKNOWN) {
+                    // Context-driven inference (Phase 1.1.5.c): if the
+                    // current context provides an expected `.applied`
+                    // matching this declaration, adopt it as the
+                    // literal's TypeId so monomorphization sees the
+                    // instantiation even when the user omitted `(...)`
+                    // at the literal site. Concrete structs (no
+                    // formal type params) are unaffected.
+                    if (self.inferAppliedFromExpectedType(declaration_type_id)) |inferred| {
+                        literal_type_id = inferred;
                     }
                 }
                 // Build field expressions
@@ -5205,14 +5244,14 @@ pub const HirBuilder = struct {
                     });
                 }
                 if (se.update_source == null) {
-                    try self.appendStructDefaults(&hir_fields, struct_type_id);
+                    try self.appendStructDefaults(&hir_fields, declaration_type_id);
                 }
                 return try self.create(Expr, .{
                     .kind = .{ .struct_init = .{
-                        .type_id = struct_type_id,
+                        .type_id = literal_type_id,
                         .fields = try hir_fields.toOwnedSlice(self.allocator),
                     } },
-                    .type_id = struct_type_id,
+                    .type_id = literal_type_id,
                     .span = se.meta.span,
                 });
             },
@@ -5873,6 +5912,54 @@ pub const HirBuilder = struct {
         if (std.mem.eql(u8, prefix, qualifier)) return true;
 
         return self.structNameMatchesText(name, qualifier);
+    }
+
+    /// Build the canonical `.applied { base, args }` TypeId for a
+    /// parametric struct literal like `%Box(i64){...}`. Each `type_arg`
+    /// AST node is resolved via `resolveTypeExpr` so nested
+    /// instantiations (`%Box(Option(i64)){...}`) lower their inner
+    /// arguments through the same path. Falls back to the declaration
+    /// TypeId if any arg fails to resolve — the type checker already
+    /// emitted a diagnostic in that case (arity mismatch / non-
+    /// parametric type) so callers see a coherent literal type rather
+    /// than UNKNOWN cascading into IR.
+    fn buildAppliedStructLiteralType(
+        self: *HirBuilder,
+        declaration_type_id: types_mod.TypeId,
+        type_args: []const *const ast.TypeExpr,
+    ) types_mod.TypeId {
+        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+        const resolved = self.allocator.alloc(types_mod.TypeId, type_args.len) catch return declaration_type_id;
+        for (type_args, 0..) |type_arg_expr, idx| {
+            resolved[idx] = self.resolveTypeExpr(type_arg_expr);
+        }
+        return store_ptr.addType(.{ .applied = .{
+            .base = declaration_type_id,
+            .args = resolved,
+        } }) catch declaration_type_id;
+    }
+
+    /// Context-driven inference for `%Box{...}` (no explicit `(...)`).
+    /// When the enclosing context — a variable annotation, function
+    /// return type, or function-argument expected type — provides a
+    /// concrete `.applied` whose `base` matches the struct
+    /// declaration, return that `.applied` TypeId so the literal
+    /// adopts the same instantiation. Returns null if no expected
+    /// context is in scope, if the context's base doesn't match, or
+    /// if the declaration isn't parametric (concrete structs use the
+    /// declaration TypeId directly).
+    fn inferAppliedFromExpectedType(
+        self: *const HirBuilder,
+        declaration_type_id: types_mod.TypeId,
+    ) ?types_mod.TypeId {
+        if (self.expected_type_stack.items.len == 0) return null;
+        const expected = self.expected_type_stack.items[self.expected_type_stack.items.len - 1];
+        if (expected == types_mod.TypeStore.UNKNOWN) return null;
+        if (expected >= self.type_store.types.items.len) return null;
+        const expected_typ = self.type_store.getType(expected);
+        if (expected_typ != .applied) return null;
+        if (expected_typ.applied.base != declaration_type_id) return null;
+        return expected;
     }
 
     fn internDottedStructName(self: *HirBuilder, name: ast.StructName) !ast.StringId {
@@ -7338,6 +7425,160 @@ fn walkForLocalGet(expr: *const Expr, target: u32) bool {
         .unary => |u| return walkForLocalGet(u.operand, target),
         else => return false,
     }
+}
+
+// ============================================================
+// Parametric struct/union literal threading (Phase 1.1.5.c)
+// ============================================================
+
+test "HIR threads applied TypeId for parametric struct literal with explicit type args" {
+    // `%Box(i64){value: 42}` must lower to a `struct_init` whose
+    // `type_id` is the canonical `.applied { base = Box, args = [i64] }`
+    // TypeId — NOT the bare declaration TypeId. The monomorphizer keys
+    // specializations off the applied form, and downstream IR/ZIR
+    // emission depends on seeing per-instantiation TypeIds.
+    const source =
+        \\pub struct Box(T) {
+        \\  value :: T
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Box {
+        \\    %Box(i64){value: 42}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const demo_struct = hir_program.structs[1];
+    const build_clause = demo_struct.functions[0].clauses[0];
+    const result_expr = build_clause.body.stmts[0].expr;
+
+    try std.testing.expect(result_expr.kind == .struct_init);
+
+    const applied_typ = checker.store.getType(result_expr.type_id);
+    try std.testing.expect(applied_typ == .applied);
+    try std.testing.expectEqual(@as(usize, 1), applied_typ.applied.args.len);
+    try std.testing.expectEqual(types_mod.TypeStore.I64, applied_typ.applied.args[0]);
+
+    // Same TypeId must live on the inner struct_init too, since IR
+    // lowering reads it from there for per-instantiation emission.
+    try std.testing.expectEqual(result_expr.type_id, result_expr.kind.struct_init.type_id);
+}
+
+test "HIR threads distinct applied TypeIds for two instantiations of the same struct" {
+    // `%Box(i64){...}` and `%Box(String){...}` must lower to two
+    // *different* TypeIds — both `.applied`, both with `base = Box`,
+    // but with different `args`. This is the keying property the
+    // monomorphizer relies on.
+    const source =
+        \\pub struct Box(T) {
+        \\  value :: T
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build_int() -> Box {
+        \\    %Box(i64){value: 42}
+        \\  }
+        \\  pub fn build_str() -> Box {
+        \\    %Box(String){value: "hello"}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const demo_struct = hir_program.structs[1];
+    const int_expr = demo_struct.functions[0].clauses[0].body.stmts[0].expr;
+    const str_expr = demo_struct.functions[1].clauses[0].body.stmts[0].expr;
+
+    try std.testing.expect(int_expr.type_id != str_expr.type_id);
+
+    const int_typ = checker.store.getType(int_expr.type_id);
+    const str_typ = checker.store.getType(str_expr.type_id);
+    try std.testing.expect(int_typ == .applied);
+    try std.testing.expect(str_typ == .applied);
+    try std.testing.expectEqual(int_typ.applied.base, str_typ.applied.base);
+}
+
+test "HIR keeps declaration TypeId for concrete (non-parametric) struct literals" {
+    // Existing behaviour: a non-parametric struct literal still
+    // carries the bare declaration TypeId. The .applied threading is
+    // additive for parametric instantiations only.
+    const source =
+        \\pub struct Point {
+        \\  x :: i64
+        \\  y :: i64
+        \\}
+        \\pub struct Demo {
+        \\  pub fn origin() -> Point {
+        \\    %Point{x: 0, y: 0}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const demo_struct = hir_program.structs[1];
+    const origin_expr = demo_struct.functions[0].clauses[0].body.stmts[0].expr;
+    try std.testing.expect(origin_expr.kind == .struct_init);
+    const typ = checker.store.getType(origin_expr.type_id);
+    try std.testing.expect(typ == .struct_type);
 }
 
 /// Map a TypeId to a human-readable name string for synthesized type naming.
