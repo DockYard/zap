@@ -805,11 +805,22 @@ pub fn resolveDebugInfoPolicy(
         .debug, .release_safe => true,
         .release_fast, .release_small => false,
     };
+    // `.split` must compile with `in_binary = .full` even though the
+    // shipped binary will end up stripped: on Mach-O the DWARF lives
+    // in the original `.o` files and is paired to the binary via a
+    // debug-map (stabs). `dsymutil` reads that debug-map to produce
+    // the sibling `.dSYM`. If we ask the fork to set
+    // `root_strip = true` up front (the `.none` policy), the debug-
+    // map never reaches the binary and dsymutil cannot extract DWARF
+    // — the split artifact would be empty. The compile-then-strip
+    // sequence is implemented by `generateDarwinDebugSymbolsOrExit`
+    // (dsymutil pass) followed by `stripDebugMapForSplitArtifact`
+    // (Mach-O post-link strip), driven by `want_split_debug`.
     const in_binary: zir_backend.DebugInfoPolicy = blk: {
         if (override) |ov| {
             break :blk switch (ov) {
-                .full => .full,
-                .split, .none => .none,
+                .full, .split => .full,
+                .none => .none,
             };
         }
         break :blk if (debug_or_safe) .full else .none;
@@ -2328,12 +2339,22 @@ fn hostUsesDarwinDebugMap() bool {
 fn needsDarwinDebugSymbols(config: zap.builder.BuildConfig) bool {
     if (config.kind != .bin) return false;
     // Phase 0 — DWARF foundation: bundle a `.dSYM` whenever the
-    // resolved policy embeds DWARF in the artifact. Debug and
-    // ReleaseSafe default to full DWARF; ReleaseFast / ReleaseSmall
-    // strip it (the matching split-debug artifact would be produced
-    // by a sibling toolchain invocation, not the user binary's
-    // compile). A user `-Ddebug-info=full` override pulls
-    // ReleaseFast/Small into the dSYM-emitting path too.
+    // resolved policy embeds DWARF in the artifact, OR the user
+    // explicitly asked for a split-debug sibling via
+    // `-Ddebug-info=split`. The split override compiles with
+    // `in_binary = .full` so dsymutil can read the debug-map, then
+    // `stripDebugMapForSplitArtifact` post-strips the binary to
+    // satisfy the split contract (stripped binary + sibling dSYM).
+    //
+    // The ReleaseFast / ReleaseSmall *default* policy still resolves
+    // to `want_split_debug = true`, but historically Zap left that
+    // sibling to a hypothetical out-of-band toolchain invocation —
+    // the existing tests pin "no dSYM bundled for release modes by
+    // default". Honoring `want_split_debug` for explicit overrides
+    // only keeps that default contract intact while making
+    // `-Ddebug-info=split` work as the brief specifies. A future
+    // phase that ships the spec-table sibling by default will need
+    // to relax this gate and update the existing tests in lockstep.
     const override: ?DebugInfoOverride = if (config.debug_info) |dbg| switch (dbg) {
         .full => @as(DebugInfoOverride, .full),
         .split => @as(DebugInfoOverride, .split),
@@ -2341,7 +2362,24 @@ fn needsDarwinDebugSymbols(config: zap.builder.BuildConfig) bool {
     } else null;
     const resolution = resolveDebugInfoPolicy(config.optimize, override, config.frame_pointers);
     const policy = resolution.in_binary orelse return false;
-    if (policy == .none) return false;
+    const explicit_split = if (override) |ov| ov == .split else false;
+    const wants_bundle = policy != .none or explicit_split;
+    if (!wants_bundle) return false;
+    if (config.target) |target| return targetTripleUsesDarwinDebugMap(target);
+    return hostUsesDarwinDebugMap();
+}
+
+/// True when the build needs a Mach-O post-link strip pass to satisfy
+/// the split-debug contract: the binary must end up without its
+/// DWARF debug-map after `dsymutil` has already extracted the sibling
+/// `.dSYM`. Driven exclusively by the explicit `-Ddebug-info=split`
+/// override — the per-mode defaults (ReleaseFast / Small) keep the
+/// historical "no post-strip" behavior so this fix stays focused on
+/// the explicit override path the Gap D acceptance test exercises.
+fn needsDarwinDebugMapStripAfterDsymutil(config: zap.builder.BuildConfig) bool {
+    if (config.kind != .bin) return false;
+    if (config.debug_info == null) return false;
+    if (config.debug_info.? != .split) return false;
     if (config.target) |target| return targetTripleUsesDarwinDebugMap(target);
     return hostUsesDarwinDebugMap();
 }
@@ -2501,6 +2539,65 @@ fn generateDarwinDebugSymbolsOrExit(
         if (err == error.OutOfMemory) {
             std.debug.print("Error: out of memory generating debug symbols for {s}\n", .{artifact_path});
         }
+        std.process.exit(1);
+    };
+    // Phase 0 Gap D: when the user asked for `-Ddebug-info=split`,
+    // the Mach-O contract is "stripped main binary + sibling .dSYM".
+    // The binary still carries the DWARF debug-map (`__debug` /
+    // STAB symbols) needed for dsymutil's extraction pass; now that
+    // the dSYM exists, strip those bytes so the published binary
+    // matches the documented split shape.
+    if (needsDarwinDebugMapStripAfterDsymutil(config)) {
+        stripDarwinDebugMapOrExit(alloc, artifact_path, progress);
+    }
+}
+
+/// Strip the DWARF debug-map from a Mach-O artifact after dsymutil
+/// has already extracted the sibling `.dSYM`. Uses Apple's `strip
+/// -S` which removes the STAB debug entries the debug-map relies on
+/// while leaving the binary fully linkable / runnable. Any failure
+/// is a hard error — silently leaving the debug-map in place defeats
+/// the split contract (the binary would still let lldb walk DWARF
+/// directly from the `.o` files, defeating the privacy / size
+/// argument for split shipping).
+fn stripDarwinDebugMap(
+    alloc: std.mem.Allocator,
+    artifact_path: []const u8,
+    progress: ?*zap.progress.Reporter,
+) DarwinDebugSymbolError!void {
+    if (progress) |reporter| reporter.stage("Debug symbols: stripping debug-map for split artifact", .{});
+    const result = std.process.run(alloc, global_io, .{
+        .argv = &.{ "strip", "-S", artifact_path },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch |err| {
+        std.debug.print("Error: failed to run strip -S for {s}: {}\n", .{ artifact_path, err });
+        return error.DebugSymbolPublishFailed;
+    };
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+
+    const succeeded = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!succeeded) {
+        std.debug.print("Error: strip -S failed for {s}\n", .{artifact_path});
+        printProcessOutput(result.stdout, result.stderr);
+        return error.DebugSymbolPublishFailed;
+    }
+}
+
+fn stripDarwinDebugMapOrExit(
+    alloc: std.mem.Allocator,
+    artifact_path: []const u8,
+    progress: ?*zap.progress.Reporter,
+) void {
+    stripDarwinDebugMap(alloc, artifact_path, progress) catch |err| {
+        std.debug.print(
+            "Error: post-dsymutil strip failed for split artifact {s}: {s}\n",
+            .{ artifact_path, @errorName(err) },
+        );
         std.process.exit(1);
     };
 }
@@ -10857,10 +10954,34 @@ test "Darwin debug symbols: bundled for Debug and ReleaseSafe Mach-O binaries" {
     debug_none.debug_info = .none;
     try testing.expect(!needsDarwinDebugSymbols(debug_none));
 
+    // The explicit `-Ddebug-info=split` override pulls every mode
+    // into the dSYM-emitting path AND triggers the post-dsymutil
+    // strip so the published binary matches the split contract.
+    var debug_split = debug_macos;
+    debug_split.debug_info = .split;
+    try testing.expect(needsDarwinDebugSymbols(debug_split));
+    try testing.expect(needsDarwinDebugMapStripAfterDsymutil(debug_split));
+
+    var release_fast_split = release_fast_macos;
+    release_fast_split.debug_info = .split;
+    try testing.expect(needsDarwinDebugSymbols(release_fast_split));
+    try testing.expect(needsDarwinDebugMapStripAfterDsymutil(release_fast_split));
+
+    // Non-split paths must never trigger the post-dsymutil strip,
+    // even if they bundle a dSYM (the dSYM is the privileged copy;
+    // the binary keeps its own debug map for native lldb walking).
+    try testing.expect(!needsDarwinDebugMapStripAfterDsymutil(debug_macos));
+    try testing.expect(!needsDarwinDebugMapStripAfterDsymutil(release_safe_macos));
+    try testing.expect(!needsDarwinDebugMapStripAfterDsymutil(release_fast_full));
+
     // Non-Darwin targets never bundle a dSYM regardless of policy.
     var debug_linux = debug_macos;
     debug_linux.target = "aarch64-linux-gnu";
     try testing.expect(!needsDarwinDebugSymbols(debug_linux));
+    var debug_linux_split = debug_linux;
+    debug_linux_split.debug_info = .split;
+    try testing.expect(!needsDarwinDebugSymbols(debug_linux_split));
+    try testing.expect(!needsDarwinDebugMapStripAfterDsymutil(debug_linux_split));
 
     // Static-library outputs never bundle a dSYM (no executable
     // to attach the debug map to).

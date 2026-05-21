@@ -4560,6 +4560,490 @@ test "CLI script: no artifacts are written next to the script" {
     try expectOnlyScriptInDir(&tmp_dir, "clean.zap");
 }
 
+/// Locate the single published `script` binary under the per-test
+/// `ZAP_SCRIPT_CACHE_DIR` tree (`<tmp parent>/zap-script-cache/zap/
+/// scripts/<key>/script`). Returns an owned absolute path.
+/// `runScriptInTmpWithFlags` writes the cache under the tmp's
+/// parent dir, so this helper walks the same tree the test driver
+/// established. The cache is per-test (cleaned with the tmp dir's
+/// parent, also a tmp), so we expect exactly one published binary.
+fn findPublishedScriptBinary(
+    allocator: std.mem.Allocator,
+    tmp_dir: *std.testing.TmpDir,
+) TestError![]const u8 {
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const scripts_dir = std.fs.path.join(allocator, &.{ tmp_dir_path, "..", "zap-script-cache", "zap", "scripts" }) catch
+        return error.OutOfMemory;
+    defer allocator.free(scripts_dir);
+
+    var dir = std.Io.Dir.cwd().openDir(getTestIo(), scripts_dir, .{ .iterate = true }) catch
+        return error.Unexpected;
+    defer dir.close(getTestIo());
+
+    var iter = dir.iterate();
+    while (iter.next(getTestIo()) catch return error.Unexpected) |entry| {
+        if (entry.kind != .directory) continue;
+        const candidate = std.fs.path.join(allocator, &.{ scripts_dir, entry.name, "script" }) catch
+            return error.OutOfMemory;
+        std.Io.Dir.cwd().access(getTestIo(), candidate, .{}) catch {
+            allocator.free(candidate);
+            continue;
+        };
+        return candidate;
+    }
+    return error.Unexpected;
+}
+
+fn pathExists(path: []const u8) bool {
+    std.Io.Dir.cwd().access(getTestIo(), path, .{}) catch return false;
+    return true;
+}
+
+test "CLI script Phase 0 Gap A: ReleaseSafe Mach-O publishes a sibling .dSYM next to the script binary" {
+    // Phase 0 — DWARF foundation, Gap A. `cmdRunScript` was already
+    // calling `publishScriptDebugSymbolsIfNeeded` (which honors
+    // `needsDarwinDebugSymbols`), but the contract was untested end-
+    // to-end: a future refactor could move the script binary and
+    // silently lose the `.dSYM` produced by the fork. Lock in the
+    // contract by building a real ReleaseSafe script and asserting
+    // the sibling `.dSYM` bundle exists at the published path
+    // (NOT just at the staged path).
+    //
+    // ReleaseSafe is the load-bearing case the broader policy table
+    // change (`needsDarwinDebugSymbols` honoring the resolved
+    // policy, not just Debug) was meant to enable: lldb / addr2line
+    // / the Phase-2 panic handler resolve to Zap file:line on
+    // release-safe builds.
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(
+        allocator,
+        &tmp_dir,
+        "phase0_dsym.zap",
+        \\fn main(_args :: [String]) -> u8 {
+        \\  IO.puts("phase0-dsym")
+        \\  0
+        \\}
+        ,
+        // Lead flag: pin the optimize mode to ReleaseSafe so we
+        // exercise the broadened `needsDarwinDebugSymbols` branch
+        // — Debug would also produce a dSYM, but it would not
+        // discriminate the Phase 0 broadening from the legacy
+        // Debug-only behavior.
+        &.{"-Doptimize=ReleaseSafe"},
+        &.{},
+    );
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "phase0-dsym") != null);
+    try expectOnlyScriptInDir(&tmp_dir, "phase0_dsym.zap");
+
+    // The dSYM bundle must exist next to the *published* binary, not
+    // just at the (long-deleted) staging path. The staging dir is
+    // cleaned by `cmdRunScript` after the atomic rename publishes
+    // the binary; if the dSYM publication path is ever lost, this
+    // test fails — the staging-side dSYM is already gone by the
+    // time the publish completes.
+    const published = try findPublishedScriptBinary(allocator, &tmp_dir);
+    defer allocator.free(published);
+
+    const dsym_path = std.fmt.allocPrint(allocator, "{s}.dSYM", .{published}) catch return error.OutOfMemory;
+    defer allocator.free(dsym_path);
+    if (!pathExists(dsym_path)) {
+        std.debug.print(
+            "Phase 0 Gap A: expected sibling .dSYM at {s}, but it is missing.\n  published binary: {s}\n",
+            .{ dsym_path, published },
+        );
+        return error.TestUnexpectedResult;
+    }
+
+    // Sanity-check the inner DWARF blob exists too — an empty
+    // bundle would still satisfy the bare-path test but defeats the
+    // purpose. Mach-O layout: `<bin>.dSYM/Contents/Resources/DWARF/
+    // <name>`. Phase-2's crash printer relies on the inner DWARF
+    // being readable, so make sure the publisher produced it.
+    const dwarf_inner = std.fmt.allocPrint(
+        allocator,
+        "{s}/Contents/Resources/DWARF/script",
+        .{dsym_path},
+    ) catch return error.OutOfMemory;
+    defer allocator.free(dwarf_inner);
+    if (!pathExists(dwarf_inner)) {
+        std.debug.print(
+            "Phase 0 Gap A: expected inner DWARF blob at {s}, but it is missing.\n",
+            .{dwarf_inner},
+        );
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "CLI script Phase 0 Gap D: -Ddebug-info=split publishes sibling dSYM + strips main binary" {
+    // Phase 0 — DWARF foundation, Gap D. The `-Ddebug-info=split`
+    // override compiles the Zap binary with the DWARF debug-map
+    // intact so `dsymutil` can extract a sibling `.dSYM`, then the
+    // post-link strip pass removes the debug-map from the published
+    // binary. Acceptance per the gap brief:
+    //   (a) The main binary contains no `__DWARF` segment / no
+    //       `__debug_*` sections (`otool -l` / `llvm-objdump`).
+    //   (b) A sibling `.dSYM` exists with the full DWARF blob.
+    //   (c) `atos` against the binary still resolves a Zap function
+    //       to its `<file>:<line>` via the sibling.
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(
+        allocator,
+        &tmp_dir,
+        "phase0_split.zap",
+        \\fn main(_args :: [String]) -> u8 {
+        \\  IO.puts("phase0-split")
+        \\  0
+        \\}
+        ,
+        // Debug + `-Ddebug-info=split`: Debug already keeps DWARF
+        // by default, so the split override is exercising the
+        // override path (the per-mode default would be `.full`).
+        &.{ "-Doptimize=Debug", "-Ddebug-info=split" },
+        &.{},
+    );
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "phase0-split") != null);
+
+    const published = try findPublishedScriptBinary(allocator, &tmp_dir);
+    defer allocator.free(published);
+
+    // (b) Sibling .dSYM with DWARF blob.
+    const dsym_path = std.fmt.allocPrint(allocator, "{s}.dSYM", .{published}) catch return error.OutOfMemory;
+    defer allocator.free(dsym_path);
+    if (!pathExists(dsym_path)) {
+        std.debug.print(
+            "Phase 0 Gap D: expected sibling .dSYM at {s}.\n",
+            .{dsym_path},
+        );
+        return error.TestUnexpectedResult;
+    }
+    const dwarf_inner = std.fmt.allocPrint(
+        allocator,
+        "{s}/Contents/Resources/DWARF/script",
+        .{dsym_path},
+    ) catch return error.OutOfMemory;
+    defer allocator.free(dwarf_inner);
+    if (!pathExists(dwarf_inner)) {
+        std.debug.print(
+            "Phase 0 Gap D: expected inner DWARF blob at {s}.\n",
+            .{dwarf_inner},
+        );
+        return error.TestUnexpectedResult;
+    }
+
+    // (a) Main binary contains NO DWARF section. Read the Mach-O
+    // load commands via `otool -l` and assert no `sectname` line
+    // starts with `__debug` — that's the family of section names
+    // dsymutil-extractable debug info lives in (`__debug_info`,
+    // `__debug_line`, `__debug_str`, etc.). The historical Phase 0
+    // bug was that `-Ddebug-info=split` left the binary
+    // byte-identical to `-Ddebug-info=full` because the post-strip
+    // pass was missing.
+    const otool_result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ "otool", "-l", published },
+        .stdout_limit = .limited(8 * 1024 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch return error.RunFailed;
+    defer allocator.free(otool_result.stdout);
+    defer allocator.free(otool_result.stderr);
+    if (std.mem.indexOf(u8, otool_result.stdout, "__debug") != null) {
+        std.debug.print(
+            "Phase 0 Gap D: main binary at {s} still carries DWARF __debug sections:\n{s}\n",
+            .{ published, otool_result.stdout },
+        );
+        return error.TestUnexpectedResult;
+    }
+
+    // (c) `atos` round-trip via the sibling dSYM resolves the Zap
+    // user code to `<file>.zap:<line>`. The hoisted script main
+    // wrapper lives at symbol `_script.main` (the script-mode
+    // synthetic struct that owns `main/1`); resolving its address
+    // through the dSYM must produce the original Zap source
+    // coordinates.
+    const nm_result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ "nm", published },
+        .stdout_limit = .limited(8 * 1024 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch return error.RunFailed;
+    defer allocator.free(nm_result.stdout);
+    defer allocator.free(nm_result.stderr);
+
+    // Walk `nm` lines to extract the address for `_script.main`.
+    var script_main_addr: ?[]const u8 = null;
+    var addr_buf: [64]u8 = undefined;
+    var line_iter = std.mem.splitScalar(u8, nm_result.stdout, '\n');
+    while (line_iter.next()) |line| {
+        if (std.mem.indexOf(u8, line, " _script.main") == null) continue;
+        // Format: "<16hex_addr> T _script.main" — extract the leading hex.
+        const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+        const addr_hex = line[0..space];
+        if (addr_hex.len == 0 or addr_hex.len > 16) continue;
+        const written = std.fmt.bufPrint(&addr_buf, "0x{s}", .{addr_hex}) catch continue;
+        script_main_addr = written;
+        break;
+    }
+    const addr = script_main_addr orelse {
+        std.debug.print(
+            "Phase 0 Gap D: could not locate `_script.main` in nm output:\n{s}\n",
+            .{nm_result.stdout},
+        );
+        return error.TestUnexpectedResult;
+    };
+
+    const atos_result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ "atos", "-o", dwarf_inner, "-arch", "arm64", "-l", "0x100000000", addr },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch return error.RunFailed;
+    defer allocator.free(atos_result.stdout);
+    defer allocator.free(atos_result.stderr);
+
+    // Expect the resolved symbol description to mention the script
+    // file name — the dSYM carries the original Zap source path
+    // and atos formats `<symbol> (in <binary>) (<file>:<line>)`.
+    if (std.mem.indexOf(u8, atos_result.stdout, "phase0_split.zap") == null) {
+        std.debug.print(
+            "Phase 0 Gap D: atos did not resolve `_script.main` at {s} to a phase0_split.zap location.\n  stdout: {s}\n  stderr: {s}\n",
+            .{ addr, atos_result.stdout, atos_result.stderr },
+        );
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "CLI script Phase 0 Gap A: -Ddebug-info=none on Debug does NOT publish a dSYM" {
+    // The other half of the Phase 0 contract: an explicit policy
+    // override that strips debug-info MUST suppress dSYM
+    // publication. Without this, a user who asked for a fully-
+    // stripped binary would still ship the matching DWARF — a
+    // privacy regression (dSYM contains absolute source paths and
+    // a per-symbol map of the binary).
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(
+        allocator,
+        &tmp_dir,
+        "phase0_no_dsym.zap",
+        \\fn main(_args :: [String]) -> u8 {
+        \\  IO.puts("phase0-no-dsym")
+        \\  0
+        \\}
+        ,
+        &.{ "-Doptimize=Debug", "-Ddebug-info=none" },
+        &.{},
+    );
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+
+    const published = try findPublishedScriptBinary(allocator, &tmp_dir);
+    defer allocator.free(published);
+
+    const dsym_path = std.fmt.allocPrint(allocator, "{s}.dSYM", .{published}) catch return error.OutOfMemory;
+    defer allocator.free(dsym_path);
+    if (pathExists(dsym_path)) {
+        std.debug.print(
+            "Phase 0 Gap A: -Ddebug-info=none must suppress dSYM, but one was published at {s}.\n",
+            .{dsym_path},
+        );
+        return error.TestUnexpectedResult;
+    }
+}
+
+/// Disassemble a Mach-O text section and return true if `add x29,
+/// sp, #...` appears anywhere in the matching function — the
+/// aarch64 frame-pointer materialization instruction. Used to
+/// observe the FP policy from the published binary.
+fn aarch64MainHasFramePointerSetup(
+    allocator: std.mem.Allocator,
+    binary_path: []const u8,
+) TestError!bool {
+    const result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ "otool", "-tv", "-p", "_main", binary_path },
+        .stdout_limit = .limited(2 * 1024 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch return error.RunFailed;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Walk only the first ~30 lines of the disassembly — the FP
+    // setup is part of the prologue and always lands near the
+    // function entry. Looking further risks catching a callee's
+    // prologue spilled into the listing.
+    var seen_lines: usize = 0;
+    var line_iter = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (line_iter.next()) |line| : (seen_lines += 1) {
+        if (seen_lines >= 30) break;
+        // The `add x29, sp, #...` instruction is the FP setup.
+        // Loose whitespace match so the otool output format doesn't
+        // tie this assertion to a specific column.
+        if (std.mem.indexOf(u8, line, "add\tx29, sp, #") != null) return true;
+        if (std.mem.indexOf(u8, line, "add  x29, sp, #") != null) return true;
+        if (std.mem.indexOf(u8, line, "add x29, sp, #") != null) return true;
+    }
+    return false;
+}
+
+test "CLI script Phase 0 Gap C: -Dframe-pointers=off omits the aarch64 FP prologue" {
+    // Phase 0 — DWARF foundation, Gap C. The `-Dframe-pointers=`
+    // CLI flag must reach codegen so the published binary's
+    // prologue actually changes. Cover the override path on
+    // aarch64-macos: the default ReleaseSafe policy keeps FP on
+    // (the `add x29, sp, #N` instruction is present in `_main`);
+    // `-Dframe-pointers=off` removes it.
+    //
+    // ReleaseSafe is the high-signal mode for this test — Debug
+    // keeps the wrapper's FP setup in either case because the Zig
+    // startup glue has its own prologue, but the optimized Zap
+    // user code lives directly under `_main` in release modes and
+    // observes the override cleanly.
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch != .aarch64) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    // ReleaseSafe default (FP on).
+    {
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        var r = try runScriptInTmpWithFlags(
+            allocator,
+            &tmp_dir,
+            "phase0_fp_on.zap",
+            \\fn main(_args :: [String]) -> u8 {
+            \\  IO.puts("fp-on")
+            \\  0
+            \\}
+            ,
+            &.{"-Doptimize=ReleaseSafe"},
+            &.{},
+        );
+        defer r.deinit();
+        try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+        const published = try findPublishedScriptBinary(allocator, &tmp_dir);
+        defer allocator.free(published);
+        const has_fp = try aarch64MainHasFramePointerSetup(allocator, published);
+        if (!has_fp) {
+            std.debug.print(
+                "Phase 0 Gap C: expected FP prologue in ReleaseSafe default binary {s}, but none observed.\n",
+                .{published},
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // ReleaseSafe -Dframe-pointers=off (FP off).
+    {
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        var r = try runScriptInTmpWithFlags(
+            allocator,
+            &tmp_dir,
+            "phase0_fp_off.zap",
+            \\fn main(_args :: [String]) -> u8 {
+            \\  IO.puts("fp-off")
+            \\  0
+            \\}
+            ,
+            &.{ "-Doptimize=ReleaseSafe", "-Dframe-pointers=off" },
+            &.{},
+        );
+        defer r.deinit();
+        try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+        const published = try findPublishedScriptBinary(allocator, &tmp_dir);
+        defer allocator.free(published);
+        const has_fp = try aarch64MainHasFramePointerSetup(allocator, published);
+        if (has_fp) {
+            std.debug.print(
+                "Phase 0 Gap C: -Dframe-pointers=off ReleaseSafe binary {s} still has FP prologue.\n",
+                .{published},
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // ReleaseFast default (FP off — the per-mode default).
+    {
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        var r = try runScriptInTmpWithFlags(
+            allocator,
+            &tmp_dir,
+            "phase0_fp_fast.zap",
+            \\fn main(_args :: [String]) -> u8 {
+            \\  IO.puts("fp-fast")
+            \\  0
+            \\}
+            ,
+            &.{"-Doptimize=ReleaseFast"},
+            &.{},
+        );
+        defer r.deinit();
+        try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+        const published = try findPublishedScriptBinary(allocator, &tmp_dir);
+        defer allocator.free(published);
+        const has_fp = try aarch64MainHasFramePointerSetup(allocator, published);
+        if (has_fp) {
+            std.debug.print(
+                "Phase 0 Gap C: ReleaseFast default binary {s} unexpectedly carries an FP prologue.\n",
+                .{published},
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // ReleaseFast -Dframe-pointers=on (FP on via override).
+    {
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        var r = try runScriptInTmpWithFlags(
+            allocator,
+            &tmp_dir,
+            "phase0_fp_fast_on.zap",
+            \\fn main(_args :: [String]) -> u8 {
+            \\  IO.puts("fp-fast-on")
+            \\  0
+            \\}
+            ,
+            &.{ "-Doptimize=ReleaseFast", "-Dframe-pointers=on" },
+            &.{},
+        );
+        defer r.deinit();
+        try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+        const published = try findPublishedScriptBinary(allocator, &tmp_dir);
+        defer allocator.free(published);
+        const has_fp = try aarch64MainHasFramePointerSetup(allocator, published);
+        if (!has_fp) {
+            std.debug.print(
+                "Phase 0 Gap C: -Dframe-pointers=on ReleaseFast binary {s} is missing the FP prologue.\n",
+                .{published},
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 // ------------------------------------------------------------
 // Manifest-path regression under the new dispatch
 //
