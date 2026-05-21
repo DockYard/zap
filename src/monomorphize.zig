@@ -1199,6 +1199,7 @@ const MonomorphContext = struct {
             .panic => |e| try self.scanExpr(e),
             .unwrap => |e| try self.scanExpr(e),
             .union_init => |ui| try self.scanExpr(ui.value),
+            .try_project => |tp| try self.scanExpr(tp.operand),
             .error_pipe => |ep| {
                 for (ep.steps) |step| {
                     try self.scanExpr(step.expr);
@@ -1616,6 +1617,15 @@ const MonomorphContext = struct {
                     try self.applyActiveProtocolParamTypes(ui.union_type_id),
                 .variant_name = ui.variant_name,
                 .value = try self.cloneExpr(ui.value),
+            } },
+            .try_project => |tp| .{ .try_project = .{
+                .operand = try self.cloneExpr(tp.operand),
+                .result_type_id = if (self.current_subs) |subs|
+                    try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, tp.result_type_id))
+                else
+                    try self.applyActiveProtocolParamTypes(tp.result_type_id),
+                .ok_variant_name = tp.ok_variant_name,
+                .error_variant_name = tp.error_variant_name,
             } },
             .error_pipe => |ep| blk: {
                 var new_steps = try self.allocator.alloc(hir.ErrorPipeStep, ep.steps.len);

@@ -224,6 +224,16 @@ pub const ExprKind = union(enum) {
     // Union
     union_init: UnionInitExpr,
     error_pipe: ErrorPipeHir,
+    /// The realized `?` propagation operator (`value?`). Lowered to a
+    /// comptime-safe `union_switch` over `value`'s `Result(T, E)`: the
+    /// `Ok(v)` prong yields `v` to the expression's `dest`; the `Error(e)`
+    /// prong re-wraps `Result(T, E).Error(e)` and `ret`-terminates,
+    /// early-returning the enclosing function. `union_switch` is the
+    /// realized form of the design's `TryProject` node — no separate IR op
+    /// is needed. Surface Zap has no `return`, so this early-return arm
+    /// cannot exist in surface/desugar AST and is synthesized here in HIR
+    /// where a `ret` terminator is legal.
+    try_project: TryProjectHir,
 
     // Special
     closure_create: ClosureCreate,
@@ -234,6 +244,23 @@ pub const UnionInitExpr = struct {
     union_type_id: types_mod.TypeId,
     variant_name: ast.StringId,
     value: *const Expr,
+};
+
+/// Payload for `ExprKind.try_project` — the realized `?` operator.
+pub const TryProjectHir = struct {
+    /// The `Result(T, E)`-typed operand the `?` is applied to. Its
+    /// `type_id` is the concrete `Result` type (a `.tagged_union` or an
+    /// `.applied` instantiation of one).
+    operand: *const Expr,
+    /// The concrete `Result(T, E)` union type id (canonicalized to the
+    /// `.tagged_union`/`.applied` form) used to emit the `union_init`
+    /// `Error` re-wrap on the early-return arm.
+    result_type_id: types_mod.TypeId,
+    /// Interned name of the `Ok` variant (the prong that yields the
+    /// unwrapped value).
+    ok_variant_name: ast.StringId,
+    /// Interned name of the `Error` variant (the prong that early-returns).
+    error_variant_name: ast.StringId,
 };
 
 pub const ErrorPipeHir = struct {
@@ -5422,6 +5449,9 @@ pub const HirBuilder = struct {
             .error_pipe => |ep| {
                 return try self.buildErrorPipe(ep);
             },
+            .try_expr => |te| {
+                return try self.buildTryProject(te);
+            },
             .panic_expr => |pe| try self.create(Expr, .{
                 .kind = .{ .panic = try self.buildExpr(pe.message) },
                 .type_id = types_mod.TypeStore.NEVER,
@@ -5927,6 +5957,85 @@ pub const HirBuilder = struct {
     // ============================================================
     // Error pipe lowering
     // ============================================================
+
+    /// Build the realized `?` propagation operator (`value?`) into an
+    /// `ExprKind.try_project` HIR node. The operand's HIR `type_id` is the
+    /// concrete `Result(T, E)` instantiation (a `.tagged_union`, or an
+    /// `.applied { base: <Result decl>, args }` when the operand is a
+    /// monomorphic call whose declared return type carries the args). The
+    /// IR builder lowers `try_project` to a `union_switch`: the `Ok(v)`
+    /// prong yields `v` (the expression's value, an `Ok`-payload-typed
+    /// result), and the `Error(e)` prong re-wraps `Result(T, E).Error(e)`
+    /// and `ret`-terminates to early-return the enclosing function.
+    ///
+    /// The Ok/Error variant names are discovered structurally from the
+    /// resolved tagged union rather than hardcoded, so the lowering does
+    /// not bake any stdlib `Result` knowledge into the compiler.
+    fn buildTryProject(self: *HirBuilder, te: ast.TryExpr) anyerror!*const Expr {
+        const operand = try self.buildExpr(te.value);
+
+        // Resolve the underlying tagged-union declaration through `.applied`
+        // so a parametric `Result(T, E)` instantiation is handled exactly
+        // like a bare `Result` tagged union.
+        const operand_typ = self.type_store.getType(operand.type_id);
+        const decl_typ = switch (operand_typ) {
+            .tagged_union => operand_typ,
+            .applied => |ap| self.type_store.getType(ap.base),
+            else => operand_typ,
+        };
+
+        // Discover the `Ok`/`Error` variant names and the `Ok` payload type
+        // structurally. A `Result` has exactly two variants, each carrying a
+        // payload; the unwrap yields the `Ok` payload type and the
+        // early-return re-wraps the `Error` payload.
+        const interner_mut = @constCast(self.interner);
+        var ok_variant_name: ast.StringId = interner_mut.intern("Ok") catch unreachable;
+        var error_variant_name: ast.StringId = interner_mut.intern("Error") catch unreachable;
+        var ok_payload_type: types_mod.TypeId = types_mod.TypeStore.UNKNOWN;
+        if (decl_typ == .tagged_union) {
+            // Build the per-instantiation substitution so the `Ok` payload
+            // type reflects the concrete instantiation rather than the raw
+            // declaration type variable.
+            var subs: ?types_mod.SubstitutionMap = null;
+            defer if (subs) |*owned| owned.deinit();
+            if (operand_typ == .applied) {
+                const decl_union = decl_typ.tagged_union;
+                var built = types_mod.SubstitutionMap.init(self.allocator);
+                const pair_count = @min(decl_union.type_params.len, operand_typ.applied.args.len);
+                for (decl_union.type_params[0..pair_count], operand_typ.applied.args[0..pair_count]) |formal_id, arg_id| {
+                    const formal_typ = self.type_store.getType(formal_id);
+                    if (formal_typ != .type_var) continue;
+                    built.bind(formal_typ.type_var, arg_id);
+                }
+                subs = built;
+            }
+            for (decl_typ.tagged_union.variants) |variant| {
+                const variant_text = self.interner.get(variant.name);
+                if (std.mem.eql(u8, variant_text, "Ok")) {
+                    ok_variant_name = variant.name;
+                    ok_payload_type = variant.type_id orelse types_mod.TypeStore.UNKNOWN;
+                    if (subs) |*s| {
+                        if (ok_payload_type != types_mod.TypeStore.UNKNOWN) {
+                            ok_payload_type = s.applyToType(self.type_store, ok_payload_type);
+                        }
+                    }
+                } else if (std.mem.eql(u8, variant_text, "Error")) {
+                    error_variant_name = variant.name;
+                }
+            }
+        }
+
+        return try self.create(Expr, .{
+            .kind = .{ .try_project = .{
+                .operand = operand,
+                .result_type_id = operand.type_id,
+                .ok_variant_name = ok_variant_name,
+                .error_variant_name = error_variant_name,
+            } },
+            .type_id = ok_payload_type,
+            .span = te.meta.span,
+        });
+    }
 
     /// Build an error pipe expression: chain ~> handler
     /// Flattens the pipe chain, builds each step, detects which return tagged

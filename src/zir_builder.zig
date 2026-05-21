@@ -74,7 +74,7 @@ extern "c" fn zir_builder_emit_decl_val(handle: ?*ZirBuilderHandle, name_ptr: [*
 extern "c" fn zir_builder_set_union_return_type(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, types_ptr: [*]const u32, fields_len: u32) i32;
 
 // Switch block for tagged unions (single-pass API)
-extern "c" fn zir_builder_add_switch_block(handle: ?*ZirBuilderHandle, operand: u32, prong_names_ptrs: [*]const [*]const u8, prong_names_lens: [*]const u32, prong_captures: [*]const u32, prong_body_lens: [*]const u32, prong_body_results: [*]const u32, prong_body_insts: [*]const u32, num_prongs: u32, has_else: u32, else_body_len: u32, else_body_result: u32, payload_capture_placeholder: u32) u64;
+extern "c" fn zir_builder_add_switch_block(handle: ?*ZirBuilderHandle, operand: u32, prong_names_ptrs: [*]const [*]const u8, prong_names_lens: [*]const u32, prong_captures: [*]const u32, prong_body_lens: [*]const u32, prong_body_results: [*]const u32, prong_body_insts: [*]const u32, num_prongs: u32, has_else: u32, else_body_len: u32, else_body_result: u32, payload_capture_placeholder: u32, prong_noreturn_flags: [*]const u32, else_is_noreturn: u32) u64;
 extern "c" fn zir_builder_emit_value_placeholder(handle: ?*ZirBuilderHandle) u32;
 
 // Body tracking control (for branch body emission)
@@ -9646,6 +9646,13 @@ pub const ZirDriver = struct {
         defer body_results.deinit(self.allocator);
         var all_body_insts: std.ArrayListUnmanaged(u32) = .empty;
         defer all_body_insts.deinit(self.allocator);
+        // Per-prong `noreturn` flags. A prong whose body already terminates
+        // with a `ret`/`unreachable` (e.g. the `?` operator's early-return
+        // `Error` prong) must NOT get a synthesized trailing `break`, or the
+        // dead `br` dangles and trips AIR Liveness. The fork's
+        // `addSwitchBlock` honors these flags.
+        var noreturn_flags: std.ArrayListUnmanaged(u32) = .empty;
+        defer noreturn_flags.deinit(self.allocator);
 
         // Emit one scalar prong per variant.
         for (us.cases) |case| {
@@ -9654,6 +9661,7 @@ pub const ZirDriver = struct {
             try names_ptrs.append(self.allocator, case.variant_name.ptr);
             try names_lens.append(self.allocator, @intCast(case.variant_name.len));
             try captures.append(self.allocator, @intFromBool(has_capture));
+            try noreturn_flags.append(self.allocator, @intFromBool(instructionsEndNoReturn(case.body_instrs)));
 
             // Bind every payload local to the capture placeholder so prong
             // body reads of the payload resolve to the captured value. A
@@ -9677,7 +9685,9 @@ pub const ZirDriver = struct {
         // Optional else prong (the `_` catch-all / decision-tree default).
         var else_len: u32 = 0;
         var else_result: u32 = void_ref;
+        var else_is_noreturn: u32 = 0;
         if (us.has_else) {
+            else_is_noreturn = @intFromBool(instructionsEndNoReturn(us.else_instrs));
             const prong = try self.emitSwitchProngBody(
                 us.else_instrs,
                 us.else_result,
@@ -9703,6 +9713,8 @@ pub const ZirDriver = struct {
             else_len,
             else_result,
             placeholder,
+            noreturn_flags.items.ptr,
+            else_is_noreturn,
         );
         if (result == 0xFFFFFFFFFFFFFFFF) return error.EmitFailed;
 
