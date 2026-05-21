@@ -1406,6 +1406,16 @@ pub const TypeChecker = struct {
     /// signature. Entries are dedup'd by structural type equality.
     current_raises: std.ArrayListUnmanaged(TypeId) = .empty,
 
+    /// The declared return type of the function clause currently being
+    /// checked, or `null` outside any clause (and for clauses without a
+    /// declared return type). The `try_expr` arm reads this to enforce
+    /// that `?` only appears in a `Result(_, E)`-returning function: an
+    /// `Error(e)` arm early-returns the enclosing function, so the
+    /// function's own return type must itself be a `Result` capable of
+    /// carrying that `Error`. Set/restored around the body check in
+    /// `checkFunctionClause`.
+    current_declared_return: ?TypeId = null,
+
     // Number of stdlib lines prepended (bindings in these lines are skipped for unused checks)
     stdlib_line_count: u32 = 0,
 
@@ -5124,6 +5134,81 @@ pub const TypeChecker = struct {
         );
     }
 
+    /// The `Ok` and `Error` payload types extracted from a
+    /// `Result(T, E)`-shaped operand by `resolveResultPayloads`.
+    const ResultPayloads = struct {
+        ok_type: TypeId,
+        error_type: TypeId,
+    };
+
+    /// Resolve the `Ok(T)` and `Error(E)` payload types of a
+    /// `Result`-shaped operand, looking through `.applied` so a
+    /// cross-function/cross-struct call whose declared return type is
+    /// `Result(i64, String)` (an `.applied { base: <Result decl>, args:
+    /// [i64, String] }`) yields the same concrete payload pair as a
+    /// directly-constructed `Result(i64, String).Ok(...)` literal (a bare
+    /// `.tagged_union`). Returns `null` when the operand is not a tagged
+    /// union with `Ok`/`Error` variants, so the `try_expr` arm can surface
+    /// a clear "not a `Result`" diagnostic.
+    ///
+    /// The substitution mirrors the established `.applied` → `tagged_union`
+    /// walk in `recordCasePatternBindingTypes`: a per-instantiation
+    /// `SubstitutionMap` binds the declaration's formal type variables to
+    /// the applied arguments, then rewrites each variant's declared payload
+    /// type through it.
+    fn resolveResultPayloads(self: *TypeChecker, operand_type: TypeId) !?ResultPayloads {
+        if (operand_type == TypeStore.UNKNOWN or operand_type == TypeStore.ERROR) return null;
+        const operand_typ = self.store.getType(operand_type);
+
+        const tagged_decl: Type.TaggedUnionType, var subs_opt: ?SubstitutionMap = blk: {
+            if (operand_typ == .tagged_union) {
+                break :blk .{ operand_typ.tagged_union, @as(?SubstitutionMap, null) };
+            }
+            if (operand_typ == .applied) {
+                const base_typ = self.store.getType(operand_typ.applied.base);
+                if (base_typ != .tagged_union) return null;
+                const decl_union = base_typ.tagged_union;
+                var subs = SubstitutionMap.init(self.allocator);
+                const pair_count = @min(decl_union.type_params.len, operand_typ.applied.args.len);
+                for (decl_union.type_params[0..pair_count], operand_typ.applied.args[0..pair_count]) |formal_id, arg_id| {
+                    const formal_typ = self.store.getType(formal_id);
+                    if (formal_typ != .type_var) continue;
+                    subs.bind(formal_typ.type_var, arg_id);
+                }
+                break :blk .{ decl_union, @as(?SubstitutionMap, subs) };
+            }
+            return null;
+        };
+        defer if (subs_opt) |*owned| owned.deinit();
+
+        const interner_mut: *ast.StringInterner = @constCast(self.interner);
+        const ok_name = interner_mut.intern("Ok") catch return null;
+        const error_name = interner_mut.intern("Error") catch return null;
+
+        var ok_payload: TypeId = TypeStore.UNKNOWN;
+        var error_payload: TypeId = TypeStore.UNKNOWN;
+        var saw_ok = false;
+        var saw_error = false;
+        for (tagged_decl.variants) |variant| {
+            if (variant.name == ok_name) {
+                saw_ok = true;
+                ok_payload = variant.type_id orelse TypeStore.UNKNOWN;
+            } else if (variant.name == error_name) {
+                saw_error = true;
+                error_payload = variant.type_id orelse TypeStore.UNKNOWN;
+            }
+        }
+        // A `Result` has exactly the `Ok` and `Error` variants. A union
+        // missing either is not a `Result` and the operand is rejected.
+        if (!saw_ok or !saw_error) return null;
+
+        if (subs_opt) |*subs| {
+            if (ok_payload != TypeStore.UNKNOWN) ok_payload = subs.applyToType(self.store, ok_payload);
+            if (error_payload != TypeStore.UNKNOWN) error_payload = subs.applyToType(self.store, error_payload);
+        }
+        return ResultPayloads{ .ok_type = ok_payload, .error_type = error_payload };
+    }
+
     /// Record an error type contributed to the enclosing function's
     /// inferred `raises` row. Called from the `try_expr` inference arm
     /// (with the `Error(e)` payload type) and, once `raise` lands, from
@@ -5281,6 +5366,15 @@ pub const TypeChecker = struct {
         };
 
         try self.validateMainEntrypointReturnType(func, clause, declared_return);
+
+        // Expose the declared return type to the `try_expr` inference arm
+        // (via `current_declared_return`) so a `?` inside this clause can
+        // enforce that the enclosing function returns a `Result(_, E)`.
+        // Restored on clause exit so nested closures and sibling clauses
+        // see their own return type, not this one's.
+        const prev_declared_return = self.current_declared_return;
+        self.current_declared_return = declared_return;
+        defer self.current_declared_return = prev_declared_return;
 
         // Check refinement is Bool
         if (clause.refinement) |ref| {
@@ -6105,23 +6199,41 @@ pub const TypeChecker = struct {
             // `case` in HIR (`HirBuilder.buildExpr`).
             .try_expr => |te| {
                 const operand_type = try self.inferExpr(te.value);
-                if (operand_type < self.store.types.items.len) {
-                    const ot = self.store.types.items[operand_type];
-                    if (ot == .tagged_union) {
-                        const interner_mut: *ast.StringInterner = @constCast(self.interner);
-                        const ok_name = interner_mut.intern("Ok") catch return operand_type;
-                        const error_name = interner_mut.intern("Error") catch return operand_type;
-                        var ok_payload: TypeId = TypeStore.UNKNOWN;
-                        for (ot.tagged_union.variants) |v| {
-                            if (v.name == ok_name) ok_payload = v.type_id orelse TypeStore.UNKNOWN;
-                            if (v.name == error_name) {
-                                if (v.type_id) |err_type| {
-                                    try self.recordRaisedErrorType(err_type, te.meta.span);
-                                }
+                // The operand must resolve to a `Result(T, E)` tagged
+                // union. A monomorphic call returns the declared signature
+                // type, which for `-> Result(i64, String)` is an
+                // `.applied { base: <Result decl>, args: [i64, String] }`
+                // rather than a bare `.tagged_union`. `resolveResultPayloads`
+                // looks through `.applied` (building the per-instantiation
+                // substitution), so a cross-function/cross-struct call whose
+                // return type is `Result(_, _)` typechecks here exactly like
+                // a directly-constructed `Result` literal.
+                if (try self.resolveResultPayloads(operand_type)) |payloads| {
+                    // `?` early-returns the enclosing function on the
+                    // `Error(e)` arm, so that function must itself return a
+                    // `Result(_, E)` capable of carrying the propagated
+                    // error. Enforce this against the clause's declared
+                    // return type (when checkable), so a `?` in a
+                    // non-`Result`-returning function is rejected with a
+                    // clear diagnostic rather than producing an ill-typed
+                    // early return.
+                    if (self.current_declared_return) |ret_type| {
+                        if (ret_type != TypeStore.UNKNOWN and ret_type != TypeStore.ERROR) {
+                            if ((try self.resolveResultPayloads(ret_type)) == null) {
+                                try self.addRichError(
+                                    "the `?` propagation operator requires the enclosing function to return a `Result(t, e)`",
+                                    te.meta.span,
+                                    "this `?` early-returns an `Error`, but the function does not return a `Result`",
+                                    try std.fmt.allocPrint(self.allocator, "change the function's return type to a `Result(_, _)`; it is declared to return `{s}`", .{self.typeToString(ret_type)}),
+                                );
+                                return TypeStore.ERROR;
                             }
                         }
-                        return ok_payload;
                     }
+                    if (payloads.error_type != TypeStore.UNKNOWN) {
+                        try self.recordRaisedErrorType(payloads.error_type, te.meta.span);
+                    }
+                    return payloads.ok_type;
                 }
                 // Not a Result-shaped operand: surface a diagnostic so a
                 // misapplied `?` is caught rather than silently passing
