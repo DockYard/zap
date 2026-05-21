@@ -2113,14 +2113,19 @@ test "ZIR (Phase 1.1.5.f Blocker A): multi-arg parametric Result(T,E) destructur
 // HIR, and protocol dispatch through `Error.message/1` and
 // `Error.kind/1` returns the expected values.
 //
-// Tests C (`@code Zxxxx` round-trip) and E (cause chain) are NOT
-// pinned here. The desugar produces the right impl methods, but
-// invoking `Error.code(e)` to read the value crashes the pre-existing
-// `Option(Atom)` ZIR-codegen layout (a Sema "index out of bounds"
-// panic that also reproduces with any user-defined `pub fn` returning
-// `Option(T)` from a `pub struct`). The fix lives in Phase 1.3
-// alongside the `Result(T,E)` codegen rebuild; this comment is the
-// link from the test surface to that follow-up.
+// Tests C (`@code Zxxxx` round-trip) and E (cause chain end-to-end)
+// are pinned at the desugar layer (see desugar unit tests in
+// `src/desugar.zig`) and via the script fixture
+// `script_fixtures/phase_1_2_5_e_cause_chain.zap`. Their runtime
+// `compileAndRun` acceptance is gated by:
+//
+//   - Test C: the `Option(Atom)` return-type Sema layout fix
+//     (Phase 1 gap loop).
+//   - Test E: the Phase 1.2.5.a-d protocol-box construction pipeline
+//     LLVM-emission gap surfaced by Phase 1.2.5.e (cause auto-
+//     injection makes every `pub error` reachable through
+//     protocol-box construction). Documented in the Phase 1.2.5.e
+//     final report.
 // ============================================================
 
 test "ZIR (acceptance A — pub error): minimal pub error TimeoutError" {
@@ -2252,6 +2257,25 @@ test "ZIR (Phase 1.2.5.c): Option(Error) field accepts a Some(%MyError{}) box" {
     try std.testing.expectEqualStrings("boxed\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
+
+// Acceptance Test E (cause chain end-to-end via Error.source) is
+// pinned by the script fixture `script_fixtures/phase_1_2_5_e_cause_chain.zap`
+// and by the desugar-level unit tests in `src/desugar.zig`
+// (`desugar auto-injects cause :: Option(Error) ...`, `... source/1
+// default body reads self.cause`). Phase 1.2.5.e closes the desugar
+// surface (cause is now auto-injected and `source/1` reads
+// `self.cause`).
+//
+// The runtime end-to-end through this harness is currently blocked by
+// a pre-existing LLVM emission gap in Phase 1.2.5.a-d's
+// protocol-box construction pipeline: constructing any `pub error`
+// (now that it carries an Option(Error) cause field) reaches an
+// `attempt to use null value` in `getConstantIndex` during bitcode
+// emit, surfaced via `zap run` / `zap build` of a fixture that
+// constructs a `%MyError{}`. The desugar layer is verified; the LLVM
+// emission gap is documented in the final 1.2.5.e report and is the
+// blocker for adding the cause-chain compileAndRun acceptance here
+// alongside A/B/D/F.
 
 test "ZIR (acceptance F — pub error): bare `error InternalIce` constructs and dispatches inside its file" {
     // Bare `error X { ... }` desugars to non-`pub` `struct X +
