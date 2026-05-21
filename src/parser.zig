@@ -2497,11 +2497,107 @@ pub const Parser = struct {
         return expr;
     }
 
+    /// Lookahead disambiguator for parametric tagged-union variant
+    /// construction in expression position. Returns the constructed
+    /// `struct_ref` (parts = `[base, variant]`, type_args attached)
+    /// when the next tokens are `(<TypeExpr,...>).TypeIdent`, otherwise
+    /// returns null and leaves the lexer untouched. The disambiguator
+    /// requires `receiver` to be a single-segment `struct_ref` — that
+    /// matches the surface forms `Option(i64).Some(...)` and
+    /// `Option(i64).None`. Multi-segment struct refs like `IO.Mode`
+    /// never trigger the lookahead (they cannot be parametric
+    /// receivers under Phase 1.1.5).
+    fn tryParseInstantiatedVariantConstructor(
+        self: *Parser,
+        receiver: *const ast.Expr,
+    ) !?*const ast.Expr {
+        if (receiver.* != .struct_ref) return null;
+        if (receiver.struct_ref.name.parts.len != 1) return null;
+        if (receiver.struct_ref.type_args.len != 0) return null;
+        if (!self.check(.left_paren)) return null;
+
+        // Syntactic lookahead: walk tokens to confirm the `(...)` is
+        // followed by `.TypeIdent`. We balance nested parens so type
+        // expressions like `Option(i64)` inside `Option(Option(i64))`
+        // don't trip up the scan. Lookahead does NOT consume any
+        // committed tokens — it's pure peek-on-saved-state.
+        const saved = self.saveLexerState();
+        _ = self.advance(); // consume `(`
+        var depth: u32 = 1;
+        while (depth > 0) {
+            if (self.check(.eof)) {
+                self.restoreLexerState(saved);
+                return null;
+            }
+            if (self.check(.left_paren)) depth += 1;
+            if (self.check(.right_paren)) depth -= 1;
+            _ = self.advance();
+        }
+        // depth == 0; we've consumed the matching `)`. Next must be
+        // `.TypeIdent` for this to be a variant constructor.
+        if (!self.check(.dot)) {
+            self.restoreLexerState(saved);
+            return null;
+        }
+        _ = self.advance(); // consume `.`
+        if (!self.check(.type_identifier)) {
+            self.restoreLexerState(saved);
+            return null;
+        }
+
+        // Confirmed: this is `BaseTypeIdent ( TypeArgs ) . VariantTypeIdent`.
+        // Roll back and do the real parse — `parseTypeExpr` for each arg.
+        self.restoreLexerState(saved);
+        _ = self.advance(); // consume `(`
+        self.skipNewlines();
+        var type_args: std.ArrayList(*const ast.TypeExpr) = .empty;
+        while (!self.check(.right_paren) and !self.check(.eof)) {
+            try type_args.append(self.allocator, try self.parseTypeExpr());
+            if (!self.match(.comma)) break;
+            self.skipNewlines();
+        }
+        _ = try self.expect(.right_paren);
+        _ = try self.expect(.dot);
+        const variant_tok = try self.expect(.type_identifier);
+        const variant_name = try self.internToken(variant_tok);
+
+        const base_part = receiver.struct_ref.name.parts[0];
+        const combined_parts = try self.allocator.alloc(ast.StringId, 2);
+        combined_parts[0] = base_part;
+        combined_parts[1] = variant_name;
+        const combined_span = ast.SourceSpan.merge(
+            receiver.struct_ref.meta.span,
+            ast.SourceSpan.from(variant_tok.loc),
+        );
+
+        return try self.create(ast.Expr, .{
+            .struct_ref = .{
+                .meta = .{ .span = combined_span },
+                .name = .{ .parts = combined_parts, .span = combined_span },
+                .type_args = try type_args.toOwnedSlice(self.allocator),
+            },
+        });
+    }
+
     fn parseCallExpr(self: *Parser) !*const ast.Expr {
         var expr = try self.parsePrimaryExpr();
 
         while (true) {
             if (self.check(.left_paren)) {
+                // Parametric tagged-union variant construction:
+                // `Option(i64).Some(42)` and `Option(i64).None`. When
+                // `expr` is a bare single-segment `struct_ref` and the
+                // tokens after the matching `)` are `. TypeIdent`, the
+                // `(...)` is a type-argument list, not a call argument
+                // list. Pivot into `parseInstantiatedVariantConstructor`
+                // which produces a `struct_ref` carrying both the
+                // qualified variant name (`[Option, Some]`) and the
+                // type-args slice. Falls through to the regular call
+                // handler otherwise.
+                if (try self.tryParseInstantiatedVariantConstructor(expr)) |constructed| {
+                    expr = constructed;
+                    continue;
+                }
                 _ = self.advance();
                 var args: std.ArrayList(*const ast.Expr) = .empty;
 
@@ -3258,6 +3354,60 @@ pub const Parser = struct {
                 self.skipNewlines();
             }
             _ = try self.expect(.right_paren);
+        }
+
+        // Parametric tagged-union variant construction with `%` prefix:
+        // `%Option(i64).Some(42)` / `%Option(i64).None`. After the
+        // type-arg list, a `.TypeIdent` rather than `{` means the user
+        // wrote a variant constructor, not a struct literal. Pivot to
+        // building the same `struct_ref` (+ optional call) shape that
+        // the unprefixed form produces, so one HIR variant matcher
+        // handles both surfaces. The `%` doesn't change semantics here —
+        // it's accepted for symmetry with concrete struct literal
+        // syntax.
+        if (self.check(.dot) and struct_name.parts.len == 1) {
+            _ = self.advance(); // consume `.`
+            const variant_tok = try self.expect(.type_identifier);
+            const variant_name = try self.internToken(variant_tok);
+
+            const base_part = struct_name.parts[0];
+            const combined_parts = try self.allocator.alloc(ast.StringId, 2);
+            combined_parts[0] = base_part;
+            combined_parts[1] = variant_name;
+            const combined_span = ast.SourceSpan.merge(
+                start,
+                ast.SourceSpan.from(variant_tok.loc),
+            );
+
+            const variant_ref = try self.create(ast.Expr, .{
+                .struct_ref = .{
+                    .meta = .{ .span = combined_span },
+                    .name = .{ .parts = combined_parts, .span = combined_span },
+                    .type_args = try type_args.toOwnedSlice(self.allocator),
+                },
+            });
+
+            // Optional payload: `.Some(42)` parses a regular call
+            // postfix on top of the bare variant ref. Nullary
+            // variants like `.None` leave the bare struct_ref.
+            if (self.check(.left_paren)) {
+                _ = self.advance();
+                var payload_args: std.ArrayList(*const ast.Expr) = .empty;
+                while (!self.check(.right_paren) and !self.check(.eof)) {
+                    const arg = try self.parseExpr();
+                    try payload_args.append(self.allocator, arg);
+                    if (!self.match(.comma)) break;
+                }
+                const end_tok = try self.expect(.right_paren);
+                return try self.create(ast.Expr, .{
+                    .call = .{
+                        .meta = .{ .span = ast.SourceSpan.merge(start, ast.SourceSpan.from(end_tok.loc)) },
+                        .callee = variant_ref,
+                        .args = try payload_args.toOwnedSlice(self.allocator),
+                    },
+                });
+            }
+            return variant_ref;
         }
 
         _ = try self.expect(.left_brace);
@@ -6954,6 +7104,209 @@ test "parse struct literal without type arguments keeps empty slice" {
         found_plain_call = true;
     }
     try std.testing.expect(found_plain_call);
+}
+
+test "parse parametric tagged-union variant construction with payload" {
+    // `Option(i64).Some(42)` must parse as a tagged-union variant
+    // constructor whose receiver is the *applied* `Option(i64)` form,
+    // not as `call(Option, [i64]).Some(42)` (which would treat
+    // `Option(i64)` as a function call). The result is `call(struct_ref(
+    // name=[Option,Some], type_args=[i64]), [42])` so the existing HIR
+    // variant matcher picks it up.
+    const source =
+        \\pub union Option(T) {
+        \\  Some :: T
+        \\  None
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Option {
+        \\    Option(i64).Some(42)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const demo = program.structs[0];
+    var found_variant_call = false;
+    for (demo.items) |item| {
+        if (item != .function) continue;
+        const body = item.function.clauses[0].body orelse continue;
+        if (body.len != 1) continue;
+        const expr = body[0].expr;
+        try std.testing.expect(expr.* == .call);
+        const call = expr.call;
+        try std.testing.expect(call.callee.* == .struct_ref);
+        const sr = call.callee.struct_ref;
+        try std.testing.expectEqual(@as(usize, 2), sr.name.parts.len);
+        try std.testing.expectEqualStrings("Option", parser.interner.get(sr.name.parts[0]));
+        try std.testing.expectEqualStrings("Some", parser.interner.get(sr.name.parts[1]));
+        try std.testing.expectEqual(@as(usize, 1), sr.type_args.len);
+        try std.testing.expect(sr.type_args[0].* == .name);
+        try std.testing.expectEqualStrings("i64", parser.interner.get(sr.type_args[0].name.name));
+        try std.testing.expectEqual(@as(usize, 1), call.args.len);
+        found_variant_call = true;
+    }
+    try std.testing.expect(found_variant_call);
+}
+
+test "parse parametric tagged-union nullary variant construction" {
+    // `Option(i64).None` is a nullary variant constructor on the
+    // applied form. It produces a bare `struct_ref` with two parts
+    // and the type_args attached — no enclosing call.
+    const source =
+        \\pub union Option(T) {
+        \\  Some :: T
+        \\  None
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Option {
+        \\    Option(i64).None
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const demo = program.structs[0];
+    var found_nullary = false;
+    for (demo.items) |item| {
+        if (item != .function) continue;
+        const body = item.function.clauses[0].body orelse continue;
+        if (body.len != 1) continue;
+        const expr = body[0].expr;
+        try std.testing.expect(expr.* == .struct_ref);
+        const sr = expr.struct_ref;
+        try std.testing.expectEqual(@as(usize, 2), sr.name.parts.len);
+        try std.testing.expectEqualStrings("Option", parser.interner.get(sr.name.parts[0]));
+        try std.testing.expectEqualStrings("None", parser.interner.get(sr.name.parts[1]));
+        try std.testing.expectEqual(@as(usize, 1), sr.type_args.len);
+        try std.testing.expectEqualStrings("i64", parser.interner.get(sr.type_args[0].name.name));
+        found_nullary = true;
+    }
+    try std.testing.expect(found_nullary);
+}
+
+test "parse percent-prefixed parametric tagged-union variant construction" {
+    // `%Option(i64).Some(42)` is the `%`-prefixed parallel form.
+    // It also produces a `call(struct_ref(name=[Option,Some],
+    // type_args=[i64]), [42])` shape — identical to the unprefixed
+    // form so a single downstream matcher handles both.
+    const source =
+        \\pub union Option(T) {
+        \\  Some :: T
+        \\  None
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Option {
+        \\    %Option(i64).Some(42)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const demo = program.structs[0];
+    var found_variant_call = false;
+    for (demo.items) |item| {
+        if (item != .function) continue;
+        const body = item.function.clauses[0].body orelse continue;
+        if (body.len != 1) continue;
+        const expr = body[0].expr;
+        try std.testing.expect(expr.* == .call);
+        const call = expr.call;
+        try std.testing.expect(call.callee.* == .struct_ref);
+        const sr = call.callee.struct_ref;
+        try std.testing.expectEqual(@as(usize, 2), sr.name.parts.len);
+        try std.testing.expectEqualStrings("Option", parser.interner.get(sr.name.parts[0]));
+        try std.testing.expectEqualStrings("Some", parser.interner.get(sr.name.parts[1]));
+        try std.testing.expectEqual(@as(usize, 1), sr.type_args.len);
+        try std.testing.expectEqualStrings("i64", parser.interner.get(sr.type_args[0].name.name));
+        try std.testing.expectEqual(@as(usize, 1), call.args.len);
+        found_variant_call = true;
+    }
+    try std.testing.expect(found_variant_call);
+}
+
+test "parse parametric variant construction with multi-type-arg receiver" {
+    // `Result(i64, String).Ok(42)` — the type-arg list has two slots.
+    const source =
+        \\pub union Result(T, E) {
+        \\  Ok :: T
+        \\  Error :: E
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Result {
+        \\    Result(i64, String).Ok(42)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const demo = program.structs[0];
+    var found_variant_call = false;
+    for (demo.items) |item| {
+        if (item != .function) continue;
+        const body = item.function.clauses[0].body orelse continue;
+        if (body.len != 1) continue;
+        const expr = body[0].expr;
+        try std.testing.expect(expr.* == .call);
+        const call = expr.call;
+        try std.testing.expect(call.callee.* == .struct_ref);
+        const sr = call.callee.struct_ref;
+        try std.testing.expectEqual(@as(usize, 2), sr.name.parts.len);
+        try std.testing.expectEqualStrings("Result", parser.interner.get(sr.name.parts[0]));
+        try std.testing.expectEqualStrings("Ok", parser.interner.get(sr.name.parts[1]));
+        try std.testing.expectEqual(@as(usize, 2), sr.type_args.len);
+        try std.testing.expectEqualStrings("i64", parser.interner.get(sr.type_args[0].name.name));
+        try std.testing.expectEqualStrings("String", parser.interner.get(sr.type_args[1].name.name));
+        try std.testing.expectEqual(@as(usize, 1), call.args.len);
+        found_variant_call = true;
+    }
+    try std.testing.expect(found_variant_call);
+}
+
+test "parametric variant construction does not eat normal call expressions" {
+    // Sanity: a regular `IO.puts("hi")` in a struct module — its
+    // lowercase `puts` identifier is not a type_identifier, so the
+    // parametric-variant disambiguation must not trigger. The result
+    // is the existing call(field_access(struct_ref, puts), args) shape.
+    const source =
+        \\pub struct Demo {
+        \\  pub fn run() {
+        \\    helper(1)
+        \\  }
+        \\
+        \\  pub fn helper(x :: i64) -> i64 {
+        \\    x + 1
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expect(program.structs.len > 0);
 }
 
 test "less-than expression after struct call still parses as comparison" {

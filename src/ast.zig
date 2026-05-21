@@ -744,6 +744,19 @@ pub const VarRef = struct {
 pub const StructRef = struct {
     meta: NodeMeta,
     name: StructName,
+
+    /// Type arguments attached to a parametric struct/union receiver
+    /// at the use site, e.g. the `(i64)` in `Option(i64).Some(42)`,
+    /// `Option(i64).None`, or `%Option(i64).Some(42)`. Empty for every
+    /// non-parametric reference — keeping the slice optional via an
+    /// empty default preserves the existing `Color.Red` shape used by
+    /// concrete enum/tagged-union variant constructors. When non-empty
+    /// the receiver name's leading parts identify the parametric base
+    /// (e.g. `Option`) and the trailing part identifies the variant
+    /// (e.g. `Some`) — exactly the shape the HIR variant matcher
+    /// expects, with the type-args bridging through to per-instantiation
+    /// substitution.
+    type_args: []const *const TypeExpr = &.{},
 };
 
 pub const TupleExpr = struct {
