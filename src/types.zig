@@ -4002,38 +4002,106 @@ pub const TypeChecker = struct {
         // overwritten in pass 2 with the resolved field/variant
         // lists; the `TypeId`s never change, so any `name_to_type`
         // lookup made during pass 2 yields a stable identity.
-        for (self.graph.types.items) |type_entry| {
+        //
+        // Co-named struct + union merge (Phase 1.1.5 round 2 Blocker B):
+        // a `pub union Foo(...)` paired with a `pub struct Foo`
+        // (the shape Phase 1.2's `pub error Foo { ... }` will desugar
+        // to) is allowed. Each declaration gets its OWN TypeStore
+        // slot so pass 2's per-kind overwrite stays kind-local
+        // (a struct's pass-2 write must not clobber a union's
+        // forward-declared slot, and vice versa). The shared
+        // `name_to_type` entry resolves to the UNION's slot because
+        // the union owns the type's runtime identity (its variants
+        // are the values of `Foo`); the struct supplies a function
+        // namespace reachable via `Foo.member_fn` through the scope
+        // graph's `structs` list (independent of TypeStore identity).
+        //
+        // `entry_type_ids` is the per-`graph.types` parallel index
+        // pass 2 consults to find each entry's OWN slot rather than
+        // re-reading `name_to_type` (which yields one shared id when
+        // the name is merged).
+        const entry_type_ids = try self.allocator.alloc(?TypeId, self.graph.types.items.len);
+        defer self.allocator.free(entry_type_ids);
+        for (entry_type_ids) |*slot| slot.* = null;
+
+        // Sub-pass 1a — process unions first so their slot becomes
+        // the canonical `name_to_type` entry when a co-named struct
+        // also appears in the source. This is deterministic
+        // regardless of declaration order in the user's source.
+        for (self.graph.types.items, 0..) |type_entry, entry_idx| {
             switch (type_entry.kind) {
-                .struct_type => {
-                    const name = type_entry.name;
-                    if (self.store.name_to_type.get(name) != null) continue;
-                    const name_str = self.interner.get(name);
-                    if (self.store.resolveTypeName(name_str)) |builtin_type_id| {
-                        if (builtin_type_id != TypeStore.UNKNOWN) continue; // builtin wins; pass 2 will diagnose
-                    }
-                    const type_id = try self.store.addType(.{ .struct_type = .{
-                        .name = name,
-                        .fields = &.{},
-                    } });
-                    try self.store.name_to_type.put(name, type_id);
-                },
                 .union_type => |ud| {
-                    if (self.store.name_to_type.get(ud.name) != null) continue;
                     const enum_name_str = self.interner.get(ud.name);
                     if (self.store.resolveTypeName(enum_name_str)) |builtin_type_id| {
                         if (builtin_type_id != TypeStore.UNKNOWN) continue;
+                    }
+                    if (self.store.name_to_type.get(ud.name)) |existing_id| {
+                        // Earlier union with the same name — same name,
+                        // same kind: reuse the existing slot rather
+                        // than double-registering. (Repeated decls are
+                        // a separate diagnostic concern.)
+                        entry_type_ids[entry_idx] = existing_id;
+                        continue;
                     }
                     const type_id = try self.store.addType(.{ .tagged_union = .{
                         .name = ud.name,
                         .variants = &.{},
                     } });
                     try self.store.name_to_type.put(ud.name, type_id);
+                    entry_type_ids[entry_idx] = type_id;
+                },
+                else => {},
+            }
+        }
+
+        // Sub-pass 1b — structs and opaques. A struct co-named with a
+        // union already registered in sub-pass 1a gets its own slot
+        // for pass 2's field writes, but the shared `name_to_type`
+        // entry stays pointed at the union (sub-pass 1a's slot). A
+        // first-time-seen struct name claims `name_to_type`.
+        for (self.graph.types.items, 0..) |type_entry, entry_idx| {
+            switch (type_entry.kind) {
+                .struct_type => {
+                    const name = type_entry.name;
+                    const name_str = self.interner.get(name);
+                    if (self.store.resolveTypeName(name_str)) |builtin_type_id| {
+                        if (builtin_type_id != TypeStore.UNKNOWN) continue;
+                    }
+                    // Check for co-named union (already registered in
+                    // sub-pass 1a). The struct still needs its own
+                    // TypeStore slot so pass 2's `self.store.types.items[type_id]
+                    // = .{ .struct_type = ... }` write doesn't clobber
+                    // the union's variant list.
+                    const existing_id = self.store.name_to_type.get(name);
+                    var co_named_union = false;
+                    if (existing_id) |eid| {
+                        const existing_typ = self.store.getType(eid);
+                        co_named_union = (existing_typ == .tagged_union);
+                    }
+                    const type_id = try self.store.addType(.{ .struct_type = .{
+                        .name = name,
+                        .fields = &.{},
+                    } });
+                    entry_type_ids[entry_idx] = type_id;
+                    if (existing_id == null) {
+                        try self.store.name_to_type.put(name, type_id);
+                    } else if (!co_named_union) {
+                        // Duplicate struct name (struct + struct).
+                        // Leave `name_to_type` alone; pass 2 will
+                        // surface a diagnostic via the duplicate slot.
+                    }
+                    // co_named_union == true: keep `name_to_type`
+                    // pointing at the union's slot; the struct's slot
+                    // is reachable only through `entry_type_ids`.
                 },
                 .opaque_type => {
-                    if (self.store.name_to_type.get(type_entry.name) != null) continue;
                     const opaque_name_str = self.interner.get(type_entry.name);
                     if (self.store.resolveTypeName(opaque_name_str)) |builtin_type_id| {
                         if (builtin_type_id != TypeStore.UNKNOWN) continue;
+                    }
+                    if (self.store.name_to_type.get(type_entry.name)) |existing_id| {
+                        entry_type_ids[entry_idx] = existing_id;
+                        continue;
                     }
                     // Inner is a real TypeId field, not a slice — use
                     // `UNKNOWN` as the placeholder; pass 2 overwrites.
@@ -4042,6 +4110,7 @@ pub const TypeChecker = struct {
                         .inner = TypeStore.UNKNOWN,
                     } });
                     try self.store.name_to_type.put(type_entry.name, type_id);
+                    entry_type_ids[entry_idx] = type_id;
                 },
                 else => {},
             }
@@ -4049,8 +4118,12 @@ pub const TypeChecker = struct {
 
         // Pass 2 — resolve fields/variants/inner with every user-
         // defined nominal name now visible. Diagnoses builtin-shadow
-        // collisions that pass 1 silently skipped.
-        for (self.graph.types.items) |type_entry| {
+        // collisions that pass 1 silently skipped. Each entry's
+        // per-decl TypeId comes from `entry_type_ids[entry_idx]`
+        // (the per-graph-entry slot allocated in sub-pass 1a/1b) so
+        // a co-named struct + union pair writes to its own slot
+        // without clobbering the other.
+        for (self.graph.types.items, 0..) |type_entry, entry_idx| {
             switch (type_entry.kind) {
                 .struct_type => |sd| {
                     const name = type_entry.name;
@@ -4067,7 +4140,7 @@ pub const TypeChecker = struct {
                         });
                         continue;
                     }
-                    const type_id = self.store.name_to_type.get(name) orelse continue;
+                    const type_id = entry_type_ids[entry_idx] orelse continue;
                     // Pre-bind formal type parameters (e.g. `T` in
                     // `pub struct Box(T)`) as fresh type variables so
                     // any reference to `T` inside the struct's field
@@ -4152,7 +4225,7 @@ pub const TypeChecker = struct {
                         });
                         continue;
                     }
-                    const type_id = self.store.name_to_type.get(ud.name) orelse continue;
+                    const type_id = entry_type_ids[entry_idx] orelse continue;
                     // Pre-bind formal type parameters (e.g. `T` in
                     // `pub union Option(T)`) as fresh type variables
                     // so any reference to `T` inside the union's
@@ -4200,7 +4273,7 @@ pub const TypeChecker = struct {
                         });
                         continue;
                     }
-                    const type_id = self.store.name_to_type.get(type_entry.name) orelse continue;
+                    const type_id = entry_type_ids[entry_idx] orelse continue;
                     const inner_type = try self.resolveTypeExpr(opaque_body);
                     self.store.types.items[type_id] = .{ .opaque_type = .{
                         .name = type_entry.name,

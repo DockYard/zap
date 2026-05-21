@@ -163,13 +163,22 @@ pub fn exprToCtValue(
         },
 
         // Struct ref: {:__aliases__, meta, [:Part1, :Part2, ...]}
+        // Parametric variant constructors (`Option(i64).Some`,
+        // `Result(i64, String).Err`) attach a `type_args` field on
+        // `StructRef` that must round-trip through quote/unquote.
+        // Encode it as a `type_args: [...]` keyword in the meta list
+        // so the args list still mirrors Elixir's `__aliases__`
+        // convention (just atom segments). The decoder
+        // (`ctValueToExpr` in this file) reads the meta keyword back
+        // out into `mr.type_args` when reconstructing the AST node.
         .struct_ref => |v| {
             var parts: std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.name.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
             const args = try makeListFromSlice(alloc, store, parts.items);
-            return makeTuple3(alloc, store, .{ .atom = "__aliases__" }, try metaToList(alloc, store, v.meta, null), args);
+            const meta = try structRefMetaWithTypeArgs(alloc, interner, store, v.meta, v.type_args);
+            return makeTuple3(alloc, store, .{ .atom = "__aliases__" }, meta, args);
         },
 
         // Quote: {:quote, meta, [body]}
@@ -640,6 +649,40 @@ fn metaToList(alloc: Allocator, store: *AllocationStore, meta: ast.NodeMeta, typ
     return makeListFromSlice(alloc, store, pairs.items);
 }
 
+/// Build the meta-list for an `__aliases__` (struct_ref) CtValue
+/// node, appending a `type_args` keyword when the source struct_ref
+/// carries parametric type arguments (`Option(i64).Some` etc.). The
+/// base meta encoding (`metaToList`) covers span/line/scopes; this
+/// helper layers the type-args list on top so a single helper still
+/// owns the meta shape and the encoder's struct_ref arm stays a
+/// one-call site. Decoded back by `ctValueToExpr` for `__aliases__`.
+fn structRefMetaWithTypeArgs(
+    alloc: Allocator,
+    interner: *const ast.StringInterner,
+    store: *AllocationStore,
+    meta: ast.NodeMeta,
+    type_args: []const *const ast.TypeExpr,
+) error{OutOfMemory}!CtValue {
+    const base = try metaToList(alloc, store, meta, null);
+    if (type_args.len == 0) return base;
+
+    // Build the type-args list — each element is a CtValue
+    // representation of a TypeExpr (round-trippable via
+    // `typeExprToCtValue` / `ctValueToTypeExpr`).
+    var arg_vals: std.ArrayListUnmanaged(CtValue) = .empty;
+    for (type_args) |arg| {
+        try arg_vals.append(alloc, try typeExprToCtValue(alloc, interner, store, arg));
+    }
+    const args_list = try makeListFromSlice(alloc, store, arg_vals.items);
+
+    // Append the keyword pair to the base meta list.
+    const base_elems = if (base == .list) base.list.elems else &.{};
+    var combined: std.ArrayListUnmanaged(CtValue) = .empty;
+    for (base_elems) |elem| try combined.append(alloc, elem);
+    try combined.append(alloc, try makeKeywordPair(alloc, store, "type_args", args_list));
+    return makeListFromSlice(alloc, store, combined.items);
+}
+
 /// Convert a block ([]const Stmt) to CtValue.
 /// Single statement → unwrapped. Multiple → {:__block__, [], [stmts...]}.
 fn blockToCtValue(
@@ -693,13 +736,17 @@ fn calleeToCtValue(
             const args = try makeList(alloc, store, &.{ obj, field });
             return makeTuple3(alloc, store, .{ .atom = "." }, try metaToList(alloc, store, v.meta, null), args);
         },
-        .struct_ref => |v| {
-            var parts: std.ArrayListUnmanaged(CtValue) = .empty;
-            for (v.name.parts) |part| {
-                try parts.append(alloc, CtValue{ .atom = interner.get(part) });
-            }
-            const part_list = try makeListFromSlice(alloc, store, parts.items);
-            return makeTuple3(alloc, store, .{ .atom = "__aliases__" }, try emptyList(alloc, store), part_list);
+        .struct_ref => {
+            // Encode the callee struct_ref through `exprToCtValue`
+            // (which uses `structRefMetaWithTypeArgs` to round-trip
+            // parametric variant constructors like
+            // `Option(i64).Some(42)`). The previous direct
+            // construction here dropped the struct_ref's type_args,
+            // forcing the macro engine to re-encode parametric
+            // variants as a 1-part `__aliases__` without the type-
+            // arg payload — the test-mode Option(i64).Some(...) ->
+            // Nil regression.
+            return exprToCtValue(alloc, interner, store, callee);
         },
         else => exprToCtValue(alloc, interner, store, callee),
     };
@@ -1094,10 +1141,38 @@ pub fn ctValueToExpr(
                 try parts.append(alloc, try interner.intern(elem.atom));
             }
         }
+        // Decode parametric type-args from the meta keyword list.
+        // `exprToCtValue` for `.struct_ref` (in this file) encodes
+        // non-empty `mr.type_args` as a `type_args: [...]` keyword
+        // on the meta. Round-tripping through CtValue without this
+        // dropped type-args for parametric variant constructors
+        // (`Option(i64).Some(42)`) — the case the Zest macro engine
+        // hit when quoting test bodies. Empty list when the meta
+        // carries no `type_args` entry (the common case).
+        var type_args: []const *const ast.TypeExpr = &.{};
+        if (value.tuple.elems[1] == .list) {
+            const meta_pairs = value.tuple.elems[1].list.elems;
+            for (meta_pairs) |pair| {
+                if (pair != .tuple or pair.tuple.elems.len != 2) continue;
+                const key = pair.tuple.elems[0];
+                if (key != .atom) continue;
+                if (!std.mem.eql(u8, key.atom, "type_args")) continue;
+                const args_val = pair.tuple.elems[1];
+                if (args_val != .list) continue;
+                var decoded: std.ArrayListUnmanaged(*const ast.TypeExpr) = .empty;
+                for (args_val.list.elems) |arg_ct| {
+                    const te = ctValueToTypeExpr(alloc, interner, arg_ct) catch continue;
+                    try decoded.append(alloc, te);
+                }
+                type_args = try decoded.toOwnedSlice(alloc);
+                break;
+            }
+        }
         const expr = try alloc.create(ast.Expr);
         expr.* = .{ .struct_ref = .{
             .meta = node_meta,
             .name = .{ .parts = try parts.toOwnedSlice(alloc), .span = node_meta.span },
+            .type_args = type_args,
         } };
         return expr;
     }
