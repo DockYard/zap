@@ -2196,6 +2196,63 @@ test "ZIR (acceptance D — pub error): inline `pub fn message/1` overrides the 
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR (Phase 1.2.5.c): Option(Error) field accepts a None value" {
+    // Lightweight first half of the construction-site auto-boxing
+    // acceptance: a struct field typed as `Option(Error)` accepts
+    // `Option.None` directly. No protocol box is constructed (None
+    // is the absent case) — this pins the structural Option(Error)
+    // lowering through the `ZigType.protocol_box` shape from Phase
+    // 1.2.5.b.
+    var result = try compileAndRun(
+        \\pub error MyError {}
+        \\pub struct Holder {
+        \\  cause :: Option(Error) = Option.None
+        \\}
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    h = %Holder{}
+        \\    IO.puts("ok")
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("ok\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR (Phase 1.2.5.c): Option(Error) field accepts a Some(%MyError{}) box" {
+    // The construction-site auto-boxing acceptance. A `cause ::
+    // Option(Error)` field receives `Option.Some(%MyError{})`; the
+    // value flows through HIR/IR as a concrete `MyError` and the
+    // IR-level construction-site detector emits a `box_as_protocol`
+    // coercion before the `union_init`. The lowered program
+    // allocates the inner via `ArcRuntime.allocAny`, populates the
+    // box with the impl's vtable pointer, and stores it in the
+    // field. The test only verifies the program runs without a
+    // panic — consumption-site dispatch through the box (calling
+    // `Error.message(cause)`) is Phase 1.2.5.d's contract.
+    var result = try compileAndRun(
+        \\pub error MyError {
+        \\  message :: String = "something failed"
+        \\}
+        \\pub struct Holder {
+        \\  cause :: Option(Error) = Option.None
+        \\}
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    inner = %MyError{}
+        \\    h = %Holder{cause: Option.Some(inner)}
+        \\    IO.puts("boxed")
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("boxed\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR (acceptance F — pub error): bare `error InternalIce` constructs and dispatches inside its file" {
     // Bare `error X { ... }` desugars to non-`pub` `struct X +
     // impl Error for X`. Inside the declaring file the type still

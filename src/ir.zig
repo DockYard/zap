@@ -8641,6 +8641,165 @@ pub const IrBuilder = struct {
         return call_dest;
     }
 
+    /// Look up the payload ZigType for a tagged-union variant by
+    /// name. Returns the substituted-form ZigType when the union is
+    /// per-instantiation (via `appliedSpecializationByMangledName`);
+    /// returns the bare-declaration form otherwise (via the
+    /// type_store walk). Unit variants return `.nil`.
+    ///
+    /// Used by the Phase 1.2.5.c construction-site detector to find
+    /// the variant payload's expected ZigType — when that type is
+    /// `.protocol_box(P)` and the supplied value is a concrete
+    /// struct implementing `P`, the detector emits a
+    /// `box_as_protocol` coercion before the `union_init`.
+    fn variantPayloadZigTypeByName(
+        self: *const IrBuilder,
+        union_type_name: []const u8,
+        variant_name: []const u8,
+    ) ?ZigType {
+        const ts = self.type_store orelse return null;
+        // Per-instantiation form (`Option_Error`): substituted
+        // payloads live in the applied-spec cache.
+        if (self.appliedSpecializationByMangledName(union_type_name)) |spec| {
+            const base = ts.getType(spec.base_type_id);
+            if (base != .tagged_union) return null;
+            for (base.tagged_union.variants, 0..) |variant, i| {
+                const vname = self.interner.get(variant.name);
+                if (!std.mem.eql(u8, vname, variant_name)) continue;
+                if (i >= spec.substituted_field_zig_types.len) return null;
+                return spec.substituted_field_zig_types[i];
+            }
+            return null;
+        }
+        // Bare-declaration form (`Color`): walk the type_store.
+        for (ts.types.items) |typ| {
+            if (typ != .tagged_union) continue;
+            const tu = typ.tagged_union;
+            const owner = self.interner.get(tu.name);
+            if (!std.mem.eql(u8, owner, union_type_name)) continue;
+            for (tu.variants) |variant| {
+                const vname = self.interner.get(variant.name);
+                if (!std.mem.eql(u8, vname, variant_name)) continue;
+                const tid = variant.type_id orelse return ZigType.nil;
+                return typeIdToZigTypeWithStore(tid, self.type_store);
+            }
+        }
+        return null;
+    }
+
+    /// Phase 1.2.5.c construction-site auto-boxing detector. Given a
+    /// freshly-lowered value local and the ZigType the consuming
+    /// slot expects, emit a `box_as_protocol` coercion if the slot
+    /// is a `protocol_box(P)` and the value is a concrete struct
+    /// that implements `P`. Returns the LocalId to use in place of
+    /// `value_local` at the slot. When no coercion is needed (the
+    /// value is already the right shape, or the slot is not a
+    /// protocol box) returns `value_local` unchanged.
+    ///
+    /// Three legal paths through this helper:
+    ///
+    /// 1. `expected_zig_type` is NOT `.protocol_box` — pass through.
+    /// 2. `expected_zig_type` is `.protocol_box(P)` and the value's
+    ///    `known_local_types` entry is itself `.protocol_box(P)` —
+    ///    pass through (already a box of the same protocol).
+    /// 3. `expected_zig_type` is `.protocol_box(P)` and the value's
+    ///    `known_local_types` entry is a concrete `struct_ref(T)`
+    ///    with a registered `impl P for T` — emit `box_as_protocol`
+    ///    and return the box's dest.
+    ///
+    /// A registered `impl P for T` is verified via `scope_graph`'s
+    /// `findImpl`, which canonicalizes against both concrete and
+    /// parametric-target impls. When the value is a concrete struct
+    /// that does NOT implement the expected protocol, the helper
+    /// passes the value through unchanged — Sema downstream will
+    /// reject the assignment with a "expected ProtocolBox, found
+    /// MyError" diagnostic. (A richer source-level error belongs to
+    /// HIR-level type checking; Phase 1.2.5.c surfaces the
+    /// missing-impl case as a structural error, not a soft warning.)
+    fn maybeBoxAsProtocol(
+        self: *IrBuilder,
+        value_local: LocalId,
+        expected_zig_type: ZigType,
+    ) anyerror!LocalId {
+        // Path 1: not a protocol-box slot.
+        if (expected_zig_type != .protocol_box) return value_local;
+        const expected_protocol = expected_zig_type.protocol_box;
+
+        // Discover the value local's actual ZigType. Absent
+        // tracking — e.g. a primitive literal that bypassed
+        // `known_local_types` — leaves the box unemitted. Sema
+        // catches the mismatch (no concrete type to box).
+        const value_zig_type = self.known_local_types.get(value_local) orelse return value_local;
+
+        // Path 2: already a protocol box (possibly from an upstream
+        // coercion or a parameter typed as `Foo` where Foo is a
+        // protocol). No second wrap.
+        if (value_zig_type == .protocol_box) {
+            if (std.mem.eql(u8, value_zig_type.protocol_box, expected_protocol)) {
+                return value_local;
+            }
+            // Mismatched protocol box (Foo-typed value flowing into
+            // a Bar-typed slot). Pass through; Sema rejects at the
+            // type level.
+            return value_local;
+        }
+
+        // Path 3: concrete struct — check for a registered impl.
+        if (value_zig_type != .struct_ref) return value_local;
+        const target_name = value_zig_type.struct_ref;
+
+        // Look up `impl <expected_protocol> for <target_name>` in
+        // the scope graph. The protocol's `StructName` shape needs
+        // an `[StringId]` parts slice; we look up existing interned
+        // ids via `lookupExisting` (the interner is `*const` here
+        // since IR-build is a read pass over the interner; both
+        // names must already be interned for an impl to exist).
+        const graph = self.scope_graph orelse return value_local;
+        const protocol_id = self.interner.lookupExisting(expected_protocol) orelse return value_local;
+        const target_id = self.interner.lookupExisting(target_name) orelse return value_local;
+        const proto_struct_name: ast.StructName = .{
+            .parts = &[_]ast.StringId{protocol_id},
+            .span = .{ .start = 0, .end = 0 },
+        };
+        const target_struct_name: ast.StructName = .{
+            .parts = &[_]ast.StringId{target_id},
+            .span = .{ .start = 0, .end = 0 },
+        };
+        // `findImpl` handles concrete `impl P for T` directly. For
+        // parametric impls `impl P for T(t)` the registered impl's
+        // target_type carries the bare `T` (not the per-instantiation
+        // form), so a concrete `T_i64` value's `struct_ref` name
+        // would not match. The per-instantiation match is left for
+        // later — Phase 1.2.5.c gates concrete impls only; the
+        // parametric-impl-on-parametric-value box site lands as a
+        // separate exercise once the vtable instance lookup is
+        // wired through the applied-specialization table at the
+        // construction site, not just at the vtable populator.
+        if (graph.findImpl(proto_struct_name, target_struct_name) == null) return value_local;
+
+        // Emit a fresh local for the box's dest. The IR
+        // construction-site detector owns the local allocation here
+        // so the caller's `value_local` retains its original
+        // identity (important for ARC liveness; the box's new local
+        // is a distinct ownership cursor).
+        const box_dest = self.next_local;
+        self.next_local += 1;
+        try self.current_instrs.append(self.allocator, .{
+            .box_as_protocol = .{
+                .dest = box_dest,
+                .value = value_local,
+                .protocol_name = expected_protocol,
+                .target_type_name = target_name,
+                .value_zig_type = value_zig_type,
+            },
+        });
+        // Track the box's dest as a `.protocol_box(P)` so downstream
+        // type-aware passes (ARC retain/release, indirect-storage
+        // field promotion) see the right shape.
+        try self.known_local_types.put(box_dest, expected_zig_type);
+        return box_dest;
+    }
+
     fn lowerExpr(self: *IrBuilder, expr: *const hir_mod.Expr) anyerror!LocalId {
         const tracked_hir_type = self.effectiveTrackedHirType(expr);
 
@@ -9417,17 +9576,32 @@ pub const IrBuilder = struct {
                 }
             },
             .struct_init => |si| {
-                // Lower struct initialization fields
+                // Lower struct initialization fields.
+                //
+                // Phase 1.2.5.c: per field, after lowering the value
+                // expression, consult the field's declared ZigType
+                // to decide whether the value flows into a
+                // protocol-box slot. The construction-site detector
+                // `maybeBoxAsProtocol` emits a `box_as_protocol`
+                // coercion when the field is typed as `.protocol_box(P)`
+                // and the value is a concrete struct implementing `P`.
+                const struct_type_name = self.resolveTypeName(si.type_id);
                 var ir_fields: std.ArrayList(StructFieldInit) = .empty;
                 for (si.fields) |field| {
-                    const val = try self.lowerExpr(field.value);
+                    var val = try self.lowerExpr(field.value);
+                    const field_name_str = self.interner.get(field.name);
+                    if (self.fieldZigTypeAndStorage(struct_type_name, field_name_str)) |field_info| {
+                        val = try self.maybeBoxAsProtocol(val, field_info.type_expr);
+                    }
                     try ir_fields.append(self.allocator, .{
-                        .name = self.interner.get(field.name),
+                        .name = field_name_str,
                         .value = val,
                     });
                 }
-                // Resolve type name from type_id
-                const type_name = self.resolveTypeName(si.type_id);
+                // Resolve type name from type_id (cached above for
+                // the per-field coercion lookup; reuse here so the
+                // struct_init instruction carries the same name).
+                const type_name = struct_type_name;
                 try self.current_instrs.append(self.allocator, .{
                     .struct_init = .{
                         .dest = dest,
@@ -9497,13 +9671,23 @@ pub const IrBuilder = struct {
                 return pipe_val;
             },
             .union_init => |ui| {
-                const value_local = try self.lowerExpr(ui.value);
+                var value_local = try self.lowerExpr(ui.value);
                 const type_name = self.resolveTypeName(ui.union_type_id);
+                const variant_name_str = self.interner.get(ui.variant_name);
+                // Phase 1.2.5.c: when the variant's payload is typed
+                // as a `.protocol_box(P)` (e.g. `Option(Error).Some`
+                // whose substituted payload is `protocol_box("Error")`)
+                // and the supplied value is a concrete struct
+                // implementing P, wrap the value in a
+                // `runtime.ProtocolBox` via `box_as_protocol`.
+                if (self.variantPayloadZigTypeByName(type_name, variant_name_str)) |variant_payload_type| {
+                    value_local = try self.maybeBoxAsProtocol(value_local, variant_payload_type);
+                }
                 try self.current_instrs.append(self.allocator, .{
                     .union_init = .{
                         .dest = dest,
                         .union_type = type_name,
-                        .variant_name = self.interner.get(ui.variant_name),
+                        .variant_name = variant_name_str,
                         .value = value_local,
                     },
                 });
