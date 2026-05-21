@@ -1266,6 +1266,9 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
             .dest = value.dest,
             .scrutinee = value.scrutinee,
             .cases = try cloneUnionCases(allocator, value.cases),
+            .else_instrs = try cloneInstructions(allocator, value.else_instrs),
+            .else_result = value.else_result,
+            .has_else = value.has_else,
         } },
         .optional_dispatch => |value| .{ .optional_dispatch = .{
             .scrutinee_param = value.scrutinee_param,
@@ -2163,10 +2166,39 @@ pub const UnionSwitchReturn = struct {
     cases: []const UnionCase,
 };
 
+/// Comptime-safe tagged-union case matching. Lowered by the ZIR backend
+/// (`emitUnionSwitch`) to a single `switch_block` instruction (one prong
+/// per variant, plus an optional `else` prong). Because Sema only analyzes
+/// the active prong of a `switch_block` over a comptime-known scrutinee,
+/// this avoids the "access of union field X while Y is active" UB that the
+/// older `match_variant_tag` + `guard_block` + `variant_payload_get` chain
+/// hit when both arms bound payloads.
+///
+/// This is the SINGLE lowering path for every `case` over a tagged-union
+/// scrutinee — 1, 2, or N arms; nullary, single-payload, or multi-payload
+/// variants; with or without a `_` catch-all. The decision-tree lowering
+/// (`lowerDecisionTreeForCase` / `lowerDecisionTreeForDispatch`
+/// `.switch_variant`) builds it directly.
+///
+/// Each prong is a `UnionCase`: `body_instrs` + `return_value` carry the
+/// prong body and its value; `field_bindings` carries the payload binding.
+/// For a payload-bearing variant, the prong has exactly one `FieldBinding`
+/// whose `field_name` is the empty string (a whole-payload bind) and whose
+/// `local_index` is the local the prong body reads the captured payload
+/// through. Nullary variants have no field bindings. Reusing `UnionCase`
+/// (rather than a bespoke case type) lets every ARC analysis pass that
+/// already walks `union_switch.cases[].body_instrs` / `.return_value` /
+/// `.field_bindings` keep working without change.
 pub const UnionSwitch = struct {
     dest: LocalId,
     scrutinee: LocalId,
     cases: []const UnionCase,
+    /// Catch-all (`_` / decision-tree default) prong, lowered to the
+    /// switch's `else` prong. Empty + `has_else == false` when the
+    /// variants are exhaustive (no catch-all arm).
+    else_instrs: []const Instruction = &.{},
+    else_result: ?LocalId = null,
+    has_else: bool = false,
 };
 
 /// Multi-clause `f(nil) / f(t :: T)` dispatch on an optional parameter.
@@ -6619,6 +6651,101 @@ pub const IrBuilder = struct {
         }
     }
 
+    /// Context for `buildUnionSwitchFromVariantNode`: case expressions
+    /// lower each prong body via `lowerDecisionTreeForCase` (case_break
+    /// leaves), dispatch lowers via `lowerDecisionTreeForDispatch` (ret
+    /// leaves).
+    const VariantSwitchContext = enum { case, dispatch };
+
+    /// Build a comptime-safe `UnionSwitch` from a `switch_variant` decision
+    /// node. Each variant case becomes a prong: the payload (if any) is
+    /// bound to a fresh local recorded in `scrutinee_map` under the case's
+    /// `payload_scrutinee_id`, then the case's sub-decision-tree is lowered
+    /// into the prong body. The decision-tree default becomes the `else`
+    /// prong unless it is an unconditional failure (non-exhaustive match
+    /// with no `_` arm), in which case the switch is left exhaustive.
+    ///
+    /// The prong's payload binding is encoded as a single whole-payload
+    /// `FieldBinding` (empty `field_name`) so the ZIR backend wires the
+    /// bound local to the switch's payload capture. The result of each
+    /// prong flows through the shared `dest` local via the body's terminal
+    /// `case_break` / `ret`, so `return_value` is left `null`.
+    fn buildUnionSwitchFromVariantNode(
+        self: *IrBuilder,
+        sw: hir_mod.SwitchVariantNode,
+        scrutinee_local: LocalId,
+        dest: LocalId,
+        scrutinee_map: *std.AutoHashMap(u32, LocalId),
+        context: VariantSwitchContext,
+        case_arms: []const hir_mod.CaseArm,
+        clauses: []const hir_mod.Clause,
+    ) anyerror!UnionSwitch {
+        var union_cases: std.ArrayList(UnionCase) = .empty;
+        for (sw.cases) |case| {
+            const variant_name = self.interner.get(case.variant_name);
+
+            var field_bindings: std.ArrayList(FieldBinding) = .empty;
+            if (case.has_payload) {
+                const payload_local = self.next_local;
+                self.next_local += 1;
+                try scrutinee_map.put(case.payload_scrutinee_id, payload_local);
+                // Whole-payload bind: empty field_name signals the ZIR
+                // backend to map this local directly to the switch's
+                // payload capture (no struct-field projection).
+                try field_bindings.append(self.allocator, .{
+                    .field_name = "",
+                    .local_name = "",
+                    .local_index = payload_local,
+                });
+            }
+
+            const saved = self.current_instrs;
+            self.current_instrs = .empty;
+            switch (context) {
+                .case => try self.lowerDecisionTreeForCase(case.next, case_arms, scrutinee_map, dest),
+                .dispatch => try self.lowerDecisionTreeForDispatch(case.next, clauses, scrutinee_map),
+            }
+            const body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+            self.current_instrs = saved;
+
+            try union_cases.append(self.allocator, .{
+                .variant_name = variant_name,
+                .field_bindings = try field_bindings.toOwnedSlice(self.allocator),
+                .body_instrs = body_instrs,
+                .return_value = null,
+            });
+        }
+
+        // The decision-tree default becomes the switch's `else` prong only
+        // when it is a real catch-all body. A bare `.failure` default (a
+        // non-exhaustive match with no `_` arm) is dropped: the variants
+        // are exhaustive over the tagged union, so Sema needs no else prong.
+        var else_instrs: []const Instruction = &.{};
+        var else_result: ?LocalId = null;
+        var has_else = false;
+        if (sw.default.* != .failure) {
+            const saved = self.current_instrs;
+            self.current_instrs = .empty;
+            switch (context) {
+                .case => try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, dest),
+                .dispatch => try self.lowerDecisionTreeForDispatch(sw.default, clauses, scrutinee_map),
+            }
+            else_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+            self.current_instrs = saved;
+            else_result = null;
+            has_else = true;
+        }
+
+        return .{
+            .dest = dest,
+            .scrutinee = scrutinee_local,
+            .cases = try union_cases.toOwnedSlice(self.allocator),
+            .else_instrs = else_instrs,
+            .else_result = else_result,
+            .has_else = has_else,
+        };
+    }
+
     /// Lower a decision tree for case expressions, emitting case_break at leaves.
     fn lowerDecisionTreeForCase(
         self: *IrBuilder,
@@ -6627,7 +6754,6 @@ pub const IrBuilder = struct {
         scrutinee_map: *std.AutoHashMap(u32, LocalId),
         dest: LocalId,
     ) anyerror!void {
-        _ = dest;
         switch (decision.*) {
             .success => |leaf| {
                 const arm = case_arms[leaf.body_index];
@@ -6657,13 +6783,13 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{ .set_safety = true });
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
-                try self.lowerDecisionTreeForCase(guard_node.success, case_arms, scrutinee_map, 0);
+                try self.lowerDecisionTreeForCase(guard_node.success, case_arms, scrutinee_map, dest);
                 const guard_body = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved;
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = guard_local, .body = guard_body },
                 });
-                try self.lowerDecisionTreeForCase(guard_node.failure, case_arms, scrutinee_map, 0);
+                try self.lowerDecisionTreeForCase(guard_node.failure, case_arms, scrutinee_map, dest);
             },
             .switch_literal => |sw| {
                 const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
@@ -6671,14 +6797,14 @@ pub const IrBuilder = struct {
                     const check_local = try self.emitSubPatternCheck(scrutinee_local, case.value);
                     const saved = self.current_instrs;
                     self.current_instrs = .empty;
-                    try self.lowerDecisionTreeForCase(case.next, case_arms, scrutinee_map, 0);
+                    try self.lowerDecisionTreeForCase(case.next, case_arms, scrutinee_map, dest);
                     const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
                     self.current_instrs = saved;
                     try self.current_instrs.append(self.allocator, .{
                         .guard_block = .{ .condition = check_local, .body = case_body },
                     });
                 }
-                try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, 0);
+                try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, dest);
             },
             .switch_tag => |sw| {
                 const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
@@ -6691,50 +6817,35 @@ pub const IrBuilder = struct {
                     });
                     const saved = self.current_instrs;
                     self.current_instrs = .empty;
-                    try self.lowerDecisionTreeForCase(case.next, case_arms, scrutinee_map, 0);
+                    try self.lowerDecisionTreeForCase(case.next, case_arms, scrutinee_map, dest);
                     const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
                     self.current_instrs = saved;
                     try self.current_instrs.append(self.allocator, .{
                         .guard_block = .{ .condition = match_local, .body = case_body },
                     });
                 }
-                try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, 0);
+                try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, dest);
             },
             .switch_variant => |sw| {
+                // Comptime-safe tagged-union matching. Emit ONE `union_switch`
+                // instruction (lowered by the ZIR backend to a single
+                // `switch_block`-with-capture) instead of the old
+                // `match_variant_tag` + `guard_block` + `variant_payload_get`
+                // chain, which tripped Sema's "access of union field X while Y
+                // is active" UB on comptime-known scrutinees whose match bound
+                // payloads on more than one arm. The switch_block analyzes only
+                // the active prong, so inactive payload fields are never read.
                 const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
-                for (sw.cases) |case| {
-                    const variant_name = self.interner.get(case.variant_name);
-                    const tag_check_local = self.next_local;
-                    self.next_local += 1;
-                    try self.current_instrs.append(self.allocator, .{
-                        .match_variant_tag = .{
-                            .dest = tag_check_local,
-                            .scrutinee = scrutinee_local,
-                            .variant_name = variant_name,
-                        },
-                    });
-                    const saved = self.current_instrs;
-                    self.current_instrs = .empty;
-                    if (case.has_payload) {
-                        const payload_local = self.next_local;
-                        self.next_local += 1;
-                        try self.current_instrs.append(self.allocator, .{
-                            .variant_payload_get = .{
-                                .dest = payload_local,
-                                .scrutinee = scrutinee_local,
-                                .variant_name = variant_name,
-                            },
-                        });
-                        try scrutinee_map.put(case.payload_scrutinee_id, payload_local);
-                    }
-                    try self.lowerDecisionTreeForCase(case.next, case_arms, scrutinee_map, 0);
-                    const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                    self.current_instrs = saved;
-                    try self.current_instrs.append(self.allocator, .{
-                        .guard_block = .{ .condition = tag_check_local, .body = case_body },
-                    });
-                }
-                try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, 0);
+                const union_switch = try self.buildUnionSwitchFromVariantNode(
+                    sw,
+                    scrutinee_local,
+                    dest,
+                    scrutinee_map,
+                    .case,
+                    case_arms,
+                    &.{},
+                );
+                try self.current_instrs.append(self.allocator, .{ .union_switch = union_switch });
             },
             .check_tuple => |ct| {
                 // For case expressions in statically typed code, the tuple type
@@ -6775,7 +6886,7 @@ pub const IrBuilder = struct {
                 }
                 // Lower success subtree at the same level — inner guards become
                 // flat guard_blocks that emitFlatCaseBlock can process
-                try self.lowerDecisionTreeForCase(ct.success, case_arms, scrutinee_map, 0);
+                try self.lowerDecisionTreeForCase(ct.success, case_arms, scrutinee_map, dest);
             },
             .check_list => |cl| {
                 const scrutinee_local = self.resolveScrutinee(cl.scrutinee, scrutinee_map);
@@ -6824,13 +6935,13 @@ pub const IrBuilder = struct {
                         findParamGetIdInDecision(cl.success, i);
                     try scrutinee_map.put(elem_id, elem_local);
                 }
-                try self.lowerDecisionTreeForCase(cl.success, case_arms, scrutinee_map, 0);
+                try self.lowerDecisionTreeForCase(cl.success, case_arms, scrutinee_map, dest);
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved;
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = len_check_local, .body = success_body },
                 });
-                try self.lowerDecisionTreeForCase(cl.failure, case_arms, scrutinee_map, 0);
+                try self.lowerDecisionTreeForCase(cl.failure, case_arms, scrutinee_map, dest);
             },
             .check_list_cons => |clc| {
                 const scrutinee_local = self.resolveScrutinee(clc.scrutinee, scrutinee_map);
@@ -6881,13 +6992,13 @@ pub const IrBuilder = struct {
                 try self.known_local_types.put(tail_local, scrutinee_list_type);
                 try self.recordListChildHirType(scrutinee_local, tail_local, .list);
                 try scrutinee_map.put(clc.tail_scrutinee_id, tail_local);
-                try self.lowerDecisionTreeForCase(clc.success, case_arms, scrutinee_map, 0);
+                try self.lowerDecisionTreeForCase(clc.success, case_arms, scrutinee_map, dest);
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved;
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = len_check_local, .body = success_body },
                 });
-                try self.lowerDecisionTreeForCase(clc.failure, case_arms, scrutinee_map, 0);
+                try self.lowerDecisionTreeForCase(clc.failure, case_arms, scrutinee_map, dest);
             },
             .check_binary => |cb| {
                 const scrutinee_local = self.resolveScrutinee(cb.scrutinee, scrutinee_map);
@@ -6924,13 +7035,13 @@ pub const IrBuilder = struct {
                 // instruction to extract the value into the binding's local.
                 try self.emitBinarySegmentExtractions(cb.segments, scrutinee_local, case_arms);
 
-                try self.lowerDecisionTreeForCase(cb.success, case_arms, scrutinee_map, 0);
+                try self.lowerDecisionTreeForCase(cb.success, case_arms, scrutinee_map, dest);
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved;
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = condition_local, .body = success_body },
                 });
-                try self.lowerDecisionTreeForCase(cb.failure, case_arms, scrutinee_map, 0);
+                try self.lowerDecisionTreeForCase(cb.failure, case_arms, scrutinee_map, dest);
             },
             .bind => |bind_node| {
                 // Emit binding: resolve scrutinee and assign to binding local
@@ -6944,7 +7055,7 @@ pub const IrBuilder = struct {
                         }
                     }
                 }
-                try self.lowerDecisionTreeForCase(bind_node.next, case_arms, scrutinee_map, 0);
+                try self.lowerDecisionTreeForCase(bind_node.next, case_arms, scrutinee_map, dest);
             },
             .extract_struct => |es| {
                 const scrutinee_local = self.resolveScrutinee(es.scrutinee, scrutinee_map);
@@ -6996,7 +7107,7 @@ pub const IrBuilder = struct {
                     }
                     try scrutinee_map.put(fe.scrutinee_id, field_local);
                 }
-                try self.lowerDecisionTreeForCase(es.success, case_arms, scrutinee_map, 0);
+                try self.lowerDecisionTreeForCase(es.success, case_arms, scrutinee_map, dest);
             },
             .extract_map => |em| {
                 const scrutinee_local = self.resolveScrutinee(em.scrutinee, scrutinee_map);
@@ -7042,7 +7153,7 @@ pub const IrBuilder = struct {
                     try self.known_local_types.put(value_local, value_type);
                     try scrutinee_map.put(ke.scrutinee_id, value_local);
                 }
-                try self.lowerDecisionTreeForCase(em.success, case_arms, scrutinee_map, 0);
+                try self.lowerDecisionTreeForCase(em.success, case_arms, scrutinee_map, dest);
             },
         }
     }

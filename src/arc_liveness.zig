@@ -717,6 +717,9 @@ const Analyzer = struct {
                 for (us.cases) |case| {
                     try self.flattenStream(case.body_instrs, .{ .union_switch_case = parent_id });
                 }
+                if (us.has_else) {
+                    try self.flattenStream(us.else_instrs, .{ .union_switch_case = parent_id });
+                }
             },
             .union_switch_return => |usr| {
                 for (usr.cases) |case| {
