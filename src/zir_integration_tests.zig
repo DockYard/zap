@@ -1919,6 +1919,80 @@ test "ZIR (acceptance E): nested parametric struct round-trip" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR (acceptance D): case destructuring on Option(i64) extracts payload" {
+    // Acceptance test D — destructuring half. The construction half
+    // is pinned by `parametric tagged-union variant construction
+    // infers applied receiver type`; this exercises end-to-end:
+    //   case Option(i64).Some(42) {
+    //     Option.Some(v) -> v
+    //     Option.None -> 0
+    //   } ⇒ 42
+    // Confirms parser routes `Option.Some(v)` to a
+    // `tagged_union_variant` pattern, type-check binds `v :: i64`,
+    // the match-matrix compiler emits a `switch_variant` decision,
+    // and the IR + ZIR emit `activeTag` + `.Some` payload extraction
+    // against the per-instantiation tagged-union layout produced by
+    // 1.1.5.d.
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn unwrap_some() -> i64 {
+        \\    opt = Option(i64).Some(42)
+        \\    case opt {
+        \\      Option.Some(v) -> v
+        \\      Option.None -> 0
+        \\    }
+        \\  }
+        \\  pub fn unwrap_none() -> i64 {
+        \\    opt = Option(i64).None
+        \\    case opt {
+        \\      Option.Some(v) -> v
+        \\      Option.None -> 0
+        \\    }
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    Kernel.inspect(unwrap_some())
+        \\    Kernel.inspect(unwrap_none())
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n0\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR (acceptance F): case destructuring on Result(T, E) extracts payload" {
+    // Acceptance test F — destructuring half. Result(T, E) is
+    // declared locally in the test fixture (the stdlib `Result(T, E)`
+    // lands in Phase 1.3). Confirms the parametric tagged-union
+    // case-arm destructuring works with multiple type parameters and
+    // distinct payload types per variant.
+    var result = try compileAndRun(
+        \\pub union Result(T, E) {
+        \\  Ok :: T
+        \\  Err :: E
+        \\}
+        \\pub struct TestProg {
+        \\  pub fn unwrap_ok() -> i64 {
+        \\    r = Result(i64, String).Ok(42)
+        \\    case r {
+        \\      Result.Ok(v) -> v
+        \\      Result.Err(_) -> 0
+        \\    }
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    Kernel.inspect(unwrap_ok())
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR: struct literal field access" {
     var result = try compileAndRun(
         \\pub struct TestProg {

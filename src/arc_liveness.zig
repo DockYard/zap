@@ -3752,6 +3752,8 @@ pub fn collectUses(instr: ir.Instruction, buf: *UseList) void {
             }
         },
         .match_atom => |x| buf.append(allocator, x.scrutinee) catch {},
+        .match_variant_tag => |x| buf.append(allocator, x.scrutinee) catch {},
+        .variant_payload_get => |x| buf.append(allocator, x.scrutinee) catch {},
         .match_int => |x| buf.append(allocator, x.scrutinee) catch {},
         .match_float => |x| buf.append(allocator, x.scrutinee) catch {},
         .match_string => |x| buf.append(allocator, x.scrutinee) catch {},
@@ -3906,6 +3908,8 @@ pub fn collectDefs(instr: ir.Instruction) DefList {
         .switch_literal => |x| out.append(x.dest),
         .union_switch => |x| out.append(x.dest),
         .match_atom => |x| out.append(x.dest),
+        .match_variant_tag => |x| out.append(x.dest),
+        .variant_payload_get => |x| out.append(x.dest),
         .match_int => |x| out.append(x.dest),
         .match_float => |x| out.append(x.dest),
         .match_string => |x| out.append(x.dest),

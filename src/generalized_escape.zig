@@ -598,6 +598,15 @@ pub const GeneralizedEscapeAnalyzer = struct {
 
             // Pattern matching: results are no_escape (booleans/primitives).
             .match_atom => |ma| try self.setEscapeAndEnqueue(func_id, ma.dest, .no_escape),
+            .match_variant_tag => |mvt| try self.setEscapeAndEnqueue(func_id, mvt.dest, .no_escape),
+            // Variant payload extraction propagates escape state from the
+            // tagged-union scrutinee — the payload aliases the scrutinee's
+            // payload field, so its escape state is at least the scrutinee's.
+            .variant_payload_get => |vpg| {
+                const src_escape = self.ctx.getEscape(.{ .function = func_id, .local = vpg.scrutinee });
+                try self.setEscapeAndEnqueue(func_id, vpg.dest, src_escape);
+                try self.propagateAllocSite(func_id, vpg.scrutinee, vpg.dest);
+            },
             .match_int => |mi2| try self.setEscapeAndEnqueue(func_id, mi2.dest, .no_escape),
             .match_float => |mf| try self.setEscapeAndEnqueue(func_id, mf.dest, .no_escape),
             .match_string => |ms| try self.setEscapeAndEnqueue(func_id, ms.dest, .no_escape),

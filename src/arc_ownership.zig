@@ -1320,6 +1320,8 @@ fn recordInstructionUses(
         .union_switch => |us| try summary.recordUse(allocator, us.scrutinee, false),
         .optional_dispatch => {},
         .match_atom => |ma| try summary.recordUse(allocator, ma.scrutinee, false),
+        .match_variant_tag => |mvt| try summary.recordUse(allocator, mvt.scrutinee, false),
+        .variant_payload_get => |vpg| try summary.recordUse(allocator, vpg.scrutinee, false),
         .match_int => |mi| try summary.recordUse(allocator, mi.scrutinee, false),
         .match_float => |mf| try summary.recordUse(allocator, mf.scrutinee, false),
         .match_string => |ms| try summary.recordUse(allocator, ms.scrutinee, false),

@@ -585,6 +585,8 @@ pub const Instruction = union(enum) {
     union_switch: UnionSwitch,
     optional_dispatch: OptionalDispatch,
     match_atom: MatchAtom,
+    match_variant_tag: MatchVariantTag,
+    variant_payload_get: VariantPayloadGet,
     match_int: MatchInt,
     match_float: MatchFloat,
     match_string: MatchString,
@@ -907,6 +909,16 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
             .scrutinee = value.scrutinee,
             .atom_name = try cloneBytes(allocator, value.atom_name),
             .skip_type_check = value.skip_type_check,
+        } },
+        .match_variant_tag => |value| .{ .match_variant_tag = .{
+            .dest = value.dest,
+            .scrutinee = value.scrutinee,
+            .variant_name = try cloneBytes(allocator, value.variant_name),
+        } },
+        .variant_payload_get => |value| .{ .variant_payload_get = .{
+            .dest = value.dest,
+            .scrutinee = value.scrutinee,
+            .variant_name = try cloneBytes(allocator, value.variant_name),
         } },
         .match_string => |value| .{ .match_string = .{
             .dest = value.dest,
@@ -1657,6 +1669,30 @@ pub const MatchAtom = struct {
     scrutinee: LocalId,
     atom_name: []const u8,
     skip_type_check: bool = false,
+};
+
+/// Compare a tagged-union scrutinee's active tag against an
+/// expected variant name. Lowers to
+/// `std.meta.activeTag(scrutinee) == .VariantName` via the ZIR
+/// backend's existing enum-literal comparison machinery (also used
+/// by `union_switch_return`). The result local holds a bool that
+/// `guard_block` consumes.
+pub const MatchVariantTag = struct {
+    dest: LocalId,
+    scrutinee: LocalId,
+    variant_name: []const u8,
+};
+
+/// Extract a tagged-union scrutinee's payload for the named variant
+/// — `scrutinee.VariantName` in Zig terms. Mirrors the
+/// payload-extraction step inside `union_switch_return`'s
+/// case-body lowering. Emitted only inside a guard_block whose
+/// condition is a matching `match_variant_tag`, so it is sound to
+/// reach the variant's payload field directly.
+pub const VariantPayloadGet = struct {
+    dest: LocalId,
+    scrutinee: LocalId,
+    variant_name: []const u8,
 };
 
 pub const MatchInt = struct {
@@ -6010,6 +6046,42 @@ pub const IrBuilder = struct {
                 }
                 try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, 0);
             },
+            .switch_variant => |sw| {
+                const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
+                for (sw.cases) |case| {
+                    const variant_name = self.interner.get(case.variant_name);
+                    const tag_check_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .match_variant_tag = .{
+                            .dest = tag_check_local,
+                            .scrutinee = scrutinee_local,
+                            .variant_name = variant_name,
+                        },
+                    });
+                    const saved = self.current_instrs;
+                    self.current_instrs = .empty;
+                    if (case.has_payload) {
+                        const payload_local = self.next_local;
+                        self.next_local += 1;
+                        try self.current_instrs.append(self.allocator, .{
+                            .variant_payload_get = .{
+                                .dest = payload_local,
+                                .scrutinee = scrutinee_local,
+                                .variant_name = variant_name,
+                            },
+                        });
+                        try scrutinee_map.put(case.payload_scrutinee_id, payload_local);
+                    }
+                    try self.lowerDecisionTreeForCase(case.next, case_arms, scrutinee_map, 0);
+                    const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                    self.current_instrs = saved;
+                    try self.current_instrs.append(self.allocator, .{
+                        .guard_block = .{ .condition = tag_check_local, .body = case_body },
+                    });
+                }
+                try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, 0);
+            },
             .check_tuple => |ct| {
                 // For case expressions in statically typed code, the tuple type
                 // check always passes. Emit element extraction and inner guards
@@ -6495,6 +6567,48 @@ pub const IrBuilder = struct {
                     self.current_instrs = saved;
                     try self.current_instrs.append(self.allocator, .{
                         .guard_block = .{ .condition = match_local, .body = case_body },
+                    });
+                }
+                try self.lowerDecisionTreeForDispatch(sw.default, clauses, scrutinee_map);
+            },
+            .switch_variant => |sw| {
+                // Function-clause dispatch on a tagged-union variant
+                // pattern — same emit shape as the case-arm path's
+                // `lowerDecisionTreeForCase.switch_variant`: emit a
+                // tag check, then inside the guard body extract the
+                // payload via variant_payload_get and bind it under
+                // the case's payload_scrutinee_id before recursing.
+                const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
+                for (sw.cases) |case| {
+                    const variant_name = self.interner.get(case.variant_name);
+                    const tag_check_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .match_variant_tag = .{
+                            .dest = tag_check_local,
+                            .scrutinee = scrutinee_local,
+                            .variant_name = variant_name,
+                        },
+                    });
+                    const saved = self.current_instrs;
+                    self.current_instrs = .empty;
+                    if (case.has_payload) {
+                        const payload_local = self.next_local;
+                        self.next_local += 1;
+                        try self.current_instrs.append(self.allocator, .{
+                            .variant_payload_get = .{
+                                .dest = payload_local,
+                                .scrutinee = scrutinee_local,
+                                .variant_name = variant_name,
+                            },
+                        });
+                        try scrutinee_map.put(case.payload_scrutinee_id, payload_local);
+                    }
+                    try self.lowerDecisionTreeForDispatch(case.next, clauses, scrutinee_map);
+                    const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                    self.current_instrs = saved;
+                    try self.current_instrs.append(self.allocator, .{
+                        .guard_block = .{ .condition = tag_check_local, .body = case_body },
                     });
                 }
                 try self.lowerDecisionTreeForDispatch(sw.default, clauses, scrutinee_map);
@@ -9130,6 +9244,16 @@ fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u
                 return em.scrutinee.kind.param_get;
             }
             return findParamGetIdInDecision(em.success, target_element);
+        },
+        .switch_variant => |sw| {
+            if (sw.scrutinee.kind == .param_get) {
+                if (target_element == 0) return sw.scrutinee.kind.param_get;
+                if (sw.cases.len > 0) {
+                    return findParamGetIdInDecision(sw.cases[0].next, target_element - 1);
+                }
+                return findParamGetIdInDecision(sw.default, target_element - 1);
+            }
+            return findParamGetIdInDecision(sw.default, target_element);
         },
         .guard => |g| return findParamGetIdInDecision(g.success, target_element),
         .bind => |b| {

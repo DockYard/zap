@@ -1071,6 +1071,16 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(std.mem.asBytes(&v.scrutinee));
             hasher.update(v.atom_name);
         },
+        .match_variant_tag => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.scrutinee));
+            hasher.update(v.variant_name);
+        },
+        .variant_payload_get => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.scrutinee));
+            hasher.update(v.variant_name);
+        },
         .match_int => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(std.mem.asBytes(&v.scrutinee));
@@ -1899,6 +1909,37 @@ pub const Interpreter = struct {
                     else => false,
                 };
                 frame.setLocal(ma.dest, .{ .bool_val = matches });
+                return .continued;
+            },
+            .match_variant_tag => |mvt| {
+                // CTFE evaluates tagged-union scrutinees as
+                // `union_val` CtValues carrying the variant name;
+                // comparing the name matches the runtime activeTag
+                // check. Enum CtValues compare via their variant
+                // field; atom fallback mirrors `match_atom`'s
+                // liberal handling for hand-built fixtures.
+                const scrutinee = try self.readLocal(frame, mvt.scrutinee);
+                const matches = switch (scrutinee) {
+                    .union_val => |uv| std.mem.eql(u8, uv.variant, mvt.variant_name),
+                    .enum_val => |ev| std.mem.eql(u8, ev.variant, mvt.variant_name),
+                    .atom => |a| std.mem.eql(u8, a, mvt.variant_name),
+                    else => false,
+                };
+                frame.setLocal(mvt.dest, .{ .bool_val = matches });
+                return .continued;
+            },
+            .variant_payload_get => |vpg| {
+                // Extract the variant's payload value from a CTFE
+                // union_val CtValue. Enum values (nullary variants
+                // with no payload) yield nil, as do non-union
+                // scrutinees — a guard_block precedes this in the
+                // emitted IR so unreachable extraction is harmless.
+                const scrutinee = try self.readLocal(frame, vpg.scrutinee);
+                const payload: CtValue = switch (scrutinee) {
+                    .union_val => |uv| uv.payload.*,
+                    else => .nil,
+                };
+                frame.setLocal(vpg.dest, payload);
                 return .continued;
             },
             .match_int => |mi| {

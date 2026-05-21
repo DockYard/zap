@@ -473,6 +473,10 @@ pub const Decision = union(enum) {
     /// Extract map values for named keys and continue. Each key is verified
     /// to exist; missing keys route to `failure`.
     extract_map: ExtractMapNode,
+    /// Switch on a tagged-union variant's active tag, optionally
+    /// extracting the variant's payload into a fresh scrutinee for
+    /// the matched case's sub-decision tree.
+    switch_variant: SwitchVariantNode,
 };
 
 pub const SuccessLeaf = struct {
@@ -507,6 +511,34 @@ pub const SwitchLiteralNode = struct {
     scrutinee: *const Expr,
     cases: []const LiteralCase,
     default: *const Decision,
+};
+
+/// Decision-tree node for a tagged-union variant switch. The IR
+/// layer reads `scrutinee` to recover the runtime tagged-union
+/// value, emits `std.meta.activeTag(scrutinee) == .VariantName`
+/// comparisons per case, and (when `has_payload` is true on the
+/// matched case) extracts the payload via `scrutinee.VariantName`
+/// and binds it to `payload_scrutinee_id` for the case's
+/// sub-decision tree.
+pub const SwitchVariantNode = struct {
+    scrutinee: *const Expr,
+    /// Receiver type's declaration name (`Option`, `Result`). The
+    /// per-instantiation mangled name is recovered downstream from
+    /// the scrutinee's HIR type — `receiver_name` is purely a
+    /// diagnostic aid.
+    receiver_name: ast.StringId,
+    cases: []const SwitchVariantCase,
+    default: *const Decision,
+};
+
+pub const SwitchVariantCase = struct {
+    variant_name: ast.StringId,
+    has_payload: bool,
+    /// Fresh scrutinee id allocated by the pattern-matrix compiler
+    /// for the payload sub-tree to reference. Meaningful only when
+    /// `has_payload` is true.
+    payload_scrutinee_id: u32,
+    next: *const Decision,
 };
 
 pub const LiteralCase = struct {
@@ -941,11 +973,191 @@ fn compileConstructorColumn(
         .map_match => {
             return compileMapFields(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id, bound_scrutinees);
         },
+        .tagged_variant_match => {
+            return compileTaggedVariantSwitch(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id, bound_scrutinees);
+        },
         else => {
             // Fallback: treat as variable rule
             return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id, bound_scrutinees);
         },
     }
+}
+
+/// Compile a column where the first pattern is `tagged_variant_match`.
+///
+/// Strategy:
+///   1. Collect the distinct variant names across rows.
+///   2. For each variant, build a sub-matrix containing only the
+///      rows that match (or wildcard) that variant. The first
+///      column of each row is rewritten: the variant pattern's
+///      payload (or wildcard if the variant had no payload pattern)
+///      replaces it, so the recursive call sees the payload's shape.
+///      A fresh scrutinee id is allocated for the payload extraction.
+///   3. Build a default sub-matrix containing only the wildcard rows
+///      (for the no-match-any-variant fallthrough; statically
+///      exhaustive matches make this unreachable).
+///   4. Emit a `Decision.switch_variant` with one case per variant
+///      tag plus a `default` decision tree.
+///
+/// The resulting decision tree is consumed by IR's
+/// `lowerDecisionTreeForCase`, which emits `activeTag` checks and
+/// `scrutinee.VariantName` payload extraction.
+fn compileTaggedVariantSwitch(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    scrutinee_expr: *const Expr,
+    next_id: *u32,
+    bound_scrutinees: *BoundScrutinees,
+) anyerror!*const Decision {
+    // Collect distinct variant names from rows that match the
+    // tagged-variant constructor. Wildcard rows fan out across every
+    // variant slot, exactly like .struct_match's union-of-fields
+    // collection.
+    var variant_names: std.ArrayList(ast.StringId) = .empty;
+    var has_payload_per_variant: std.ArrayList(bool) = .empty;
+    var receiver_name: ?ast.StringId = null;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (isWildcardPattern(pat)) continue;
+        if (pat.?.* != .tagged_variant_match) continue;
+        const tvm = pat.?.tagged_variant_match;
+        if (receiver_name == null) receiver_name = tvm.receiver_name;
+        var found_index: ?usize = null;
+        for (variant_names.items, 0..) |existing, i| {
+            if (existing == tvm.variant_name) {
+                found_index = i;
+                break;
+            }
+        }
+        if (found_index == null) {
+            try variant_names.append(allocator, tvm.variant_name);
+            try has_payload_per_variant.append(allocator, tvm.payload != null);
+        } else if (tvm.payload != null) {
+            has_payload_per_variant.items[found_index.?] = true;
+        }
+    }
+
+    if (variant_names.items.len == 0) {
+        return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id, bound_scrutinees);
+    }
+
+    const remaining_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
+
+    // Pre-allocate one fresh payload scrutinee id per variant so
+    // multiple rows for the same variant share it.
+    var variant_payload_ids: std.ArrayList(u32) = .empty;
+    for (variant_names.items, 0..) |_, i| {
+        if (has_payload_per_variant.items[i]) {
+            const sid = next_id.*;
+            next_id.* += 1;
+            try variant_payload_ids.append(allocator, sid);
+        } else {
+            try variant_payload_ids.append(allocator, std.math.maxInt(u32));
+        }
+    }
+
+    // Build the per-variant sub-matrices. Each variant's sub-matrix
+    // contains: the payload pattern (if any) prepended to the rest
+    // of the row's columns. Wildcard rows broadcast to every
+    // variant — their payload column becomes wildcard.
+    var case_decisions: std.ArrayList(SwitchVariantCase) = .empty;
+    for (variant_names.items, 0..) |variant_name, vi| {
+        const has_payload = has_payload_per_variant.items[vi];
+        const payload_sid = variant_payload_ids.items[vi];
+
+        var sub_rows: std.ArrayList(PatternRow) = .empty;
+        for (matrix.rows) |row| {
+            if (row.patterns.len == 0) continue;
+            const head = row.patterns[0];
+            const tail = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+            if (isWildcardPattern(head)) {
+                // Wildcard rows match every variant; expand to a
+                // wildcard payload (if the variant carries one) plus
+                // the tail unchanged.
+                var new_pats: std.ArrayList(?*const MatchPattern) = .empty;
+                if (has_payload) try new_pats.append(allocator, null);
+                try new_pats.appendSlice(allocator, tail);
+                try sub_rows.append(allocator, .{
+                    .patterns = try new_pats.toOwnedSlice(allocator),
+                    .body_index = row.body_index,
+                    .guard = row.guard,
+                });
+                continue;
+            }
+            if (head.?.* != .tagged_variant_match) continue;
+            const tvm = head.?.tagged_variant_match;
+            if (tvm.variant_name != variant_name) continue;
+            var new_pats: std.ArrayList(?*const MatchPattern) = .empty;
+            if (has_payload) {
+                try new_pats.append(allocator, tvm.payload);
+            }
+            try new_pats.appendSlice(allocator, tail);
+            try sub_rows.append(allocator, .{
+                .patterns = try new_pats.toOwnedSlice(allocator),
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+        }
+
+        var sub_scrutinees: std.ArrayList(u32) = .empty;
+        if (has_payload) try sub_scrutinees.append(allocator, payload_sid);
+        try sub_scrutinees.appendSlice(allocator, remaining_scrutinees);
+
+        const sub_column_count: u32 = @intCast((if (has_payload) @as(u32, 1) else @as(u32, 0)) + @as(u32, @intCast(remaining_scrutinees.len)));
+
+        const sub_decision = try compilePatternMatrixWithBindings(
+            allocator,
+            .{
+                .rows = try sub_rows.toOwnedSlice(allocator),
+                .column_count = sub_column_count,
+            },
+            try sub_scrutinees.toOwnedSlice(allocator),
+            next_id,
+            bound_scrutinees,
+        );
+        try case_decisions.append(allocator, .{
+            .variant_name = variant_name,
+            .has_payload = has_payload,
+            .payload_scrutinee_id = if (has_payload) payload_sid else 0,
+            .next = sub_decision,
+        });
+    }
+
+    // Default: only the wildcard rows survive (no variant constructor).
+    var default_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        if (!isWildcardPattern(row.patterns[0])) continue;
+        const tail = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+        try default_rows.append(allocator, .{
+            .patterns = tail,
+            .body_index = row.body_index,
+            .guard = row.guard,
+        });
+    }
+    const default_decision = try compilePatternMatrixWithBindings(
+        allocator,
+        .{
+            .rows = try default_rows.toOwnedSlice(allocator),
+            .column_count = @intCast(remaining_scrutinees.len),
+        },
+        remaining_scrutinees,
+        next_id,
+        bound_scrutinees,
+    );
+
+    const d = try allocator.create(Decision);
+    d.* = .{
+        .switch_variant = .{
+            .scrutinee = scrutinee_expr,
+            .receiver_name = receiver_name.?,
+            .cases = try case_decisions.toOwnedSlice(allocator),
+            .default = default_decision,
+        },
+    };
+    return d;
 }
 
 /// Compile a column where the first pattern is `struct_match`. Collects the

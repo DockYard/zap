@@ -1740,6 +1740,23 @@ const MonomorphContext = struct {
                 .success = try self.cloneDecision(em.success),
                 .failure = try self.cloneDecision(em.failure),
             } },
+            .switch_variant => |sw| blk: {
+                var new_cases = try self.allocator.alloc(hir.SwitchVariantCase, sw.cases.len);
+                for (sw.cases, 0..) |case, i| {
+                    new_cases[i] = .{
+                        .variant_name = case.variant_name,
+                        .has_payload = case.has_payload,
+                        .payload_scrutinee_id = case.payload_scrutinee_id,
+                        .next = try self.cloneDecision(case.next),
+                    };
+                }
+                break :blk .{ .switch_variant = .{
+                    .scrutinee = try self.cloneExpr(sw.scrutinee),
+                    .receiver_name = sw.receiver_name,
+                    .cases = new_cases,
+                    .default = try self.cloneDecision(sw.default),
+                } };
+            },
         };
         return result;
     }

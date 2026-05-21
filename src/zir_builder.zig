@@ -6155,6 +6155,44 @@ pub const ZirDriver = struct {
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(ma.dest, ref);
             },
+            .match_variant_tag => |mvt| {
+                // Compare a tagged-union scrutinee's active tag
+                // against the expected variant name. Mirrors the
+                // tag-check logic at the head of `emitUnionSwitchReturn`:
+                //   activeTag(scrutinee) == .VariantName
+                // The result is a bool the surrounding guard_block
+                // consumes for branching.
+                const scrutinee_ref = self.refForLocal(mvt.scrutinee) catch return;
+                const std_import = zir_builder_emit_import(self.handle, "std", 3);
+                if (std_import == error_ref) return error.EmitFailed;
+                const meta_mod = zir_builder_emit_field_val(self.handle, std_import, "meta", 4);
+                if (meta_mod == error_ref) return error.EmitFailed;
+                const active_tag_fn = zir_builder_emit_field_val(self.handle, meta_mod, "activeTag", 9);
+                if (active_tag_fn == error_ref) return error.EmitFailed;
+                const tag_args = [_]u32{scrutinee_ref};
+                const tag_ref = zir_builder_emit_call_ref(self.handle, active_tag_fn, &tag_args, 1);
+                if (tag_ref == error_ref) return error.EmitFailed;
+
+                const variant_ref = zir_builder_emit_enum_literal(self.handle, mvt.variant_name.ptr, @intCast(mvt.variant_name.len));
+                if (variant_ref == error_ref) return error.EmitFailed;
+                const cmp_tag = @intFromEnum(Zir.Inst.Tag.cmp_eq);
+                const ref = zir_builder_emit_binop(self.handle, cmp_tag, tag_ref, variant_ref);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(mvt.dest, ref);
+            },
+            .variant_payload_get => |vpg| {
+                // Extract a tagged-union payload via the variant's
+                // field name — `scrutinee.VariantName`. Mirrors the
+                // payload-extraction step inside
+                // `emitUnionSwitchReturn`'s per-case body. The
+                // preceding `match_variant_tag` + `guard_block`
+                // ensures Sema reaches this only when the variant
+                // actually matches.
+                const scrutinee_ref = self.refForLocal(vpg.scrutinee) catch return;
+                const payload_ref = zir_builder_emit_field_val(self.handle, scrutinee_ref, vpg.variant_name.ptr, @intCast(vpg.variant_name.len));
+                if (payload_ref == error_ref) return error.EmitFailed;
+                try self.setLocal(vpg.dest, payload_ref);
+            },
             .match_int => |mi| {
                 // Compare scrutinee against expected int via cmp_eq
                 const scrutinee_ref = self.refForLocal(mi.scrutinee) catch return;
@@ -7761,6 +7799,8 @@ pub const ZirDriver = struct {
             .switch_literal => |value| value.dest,
             .union_switch => |value| value.dest,
             .match_atom => |value| value.dest,
+            .match_variant_tag => |value| value.dest,
+            .variant_payload_get => |value| value.dest,
             .match_int => |value| value.dest,
             .match_float => |value| value.dest,
             .match_string => |value| value.dest,

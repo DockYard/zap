@@ -1061,6 +1061,17 @@ pub const InterproceduralAnalyzer = struct {
                 .capture_get => |cg| try fresh_locals.put(cg.dest, {}),
                 .enum_literal => |el| try fresh_locals.put(el.dest, {}),
                 .match_atom => |ma| try fresh_locals.put(ma.dest, {}),
+                .match_variant_tag => |mvt| try fresh_locals.put(mvt.dest, {}),
+                // variant_payload_get reads through the scrutinee: its
+                // dest aliases the same parameter set as the scrutinee
+                // because the payload is a field of the union value.
+                .variant_payload_get => |vpg| {
+                    if (aliases.get(vpg.scrutinee)) |param_set| {
+                        try aliases.put(vpg.dest, param_set);
+                    } else {
+                        try fresh_locals.put(vpg.dest, {});
+                    }
+                },
                 .match_int => |mi| try fresh_locals.put(mi.dest, {}),
                 .match_float => |mf| try fresh_locals.put(mf.dest, {}),
                 .match_string => |ms| try fresh_locals.put(ms.dest, {}),

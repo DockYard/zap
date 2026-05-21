@@ -772,6 +772,14 @@ pub const UseDefInfo = struct {
                 try info.recordDef(ma.dest, block);
                 try info.recordUse(ma.scrutinee, block);
             },
+            .match_variant_tag => |mvt| {
+                try info.recordDef(mvt.dest, block);
+                try info.recordUse(mvt.scrutinee, block);
+            },
+            .variant_payload_get => |vpg| {
+                try info.recordDef(vpg.dest, block);
+                try info.recordUse(vpg.scrutinee, block);
+            },
             .match_int => |mi| {
                 try info.recordDef(mi.dest, block);
                 try info.recordUse(mi.scrutinee, block);
@@ -1168,6 +1176,8 @@ fn instructionUsesLocal(local: ir.LocalId, instr: ir.Instruction) bool {
         .union_init => |ui| return ui.value == local,
         .optional_unwrap => |ou| return ou.source == local,
         .match_atom => |ma| return ma.scrutinee == local,
+        .match_variant_tag => |mvt| return mvt.scrutinee == local,
+        .variant_payload_get => |vpg| return vpg.scrutinee == local,
         .match_int => |mi| return mi.scrutinee == local,
         .match_float => |mf| return mf.scrutinee == local,
         .match_string => |ms| return ms.scrutinee == local,
@@ -1811,6 +1821,8 @@ pub const RegionSolver = struct {
             .capture_get => |cg| cg.dest,
             .optional_unwrap => |ou| ou.dest,
             .match_atom => |ma| ma.dest,
+            .match_variant_tag => |mvt| mvt.dest,
+            .variant_payload_get => |vpg| vpg.dest,
             .match_int => |mi| mi.dest,
             .match_float => |mf| mf.dest,
             .match_string => |ms| ms.dest,
