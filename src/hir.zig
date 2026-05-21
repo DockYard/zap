@@ -5389,12 +5389,13 @@ pub const HirBuilder = struct {
                         }
                     }
                 }
+                const field_type = self.fieldAccessResultType(object.type_id, fa.field);
                 return try self.create(Expr, .{
                     .kind = .{ .field_get = .{
                         .object = object,
                         .field = fa.field,
                     } },
-                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .type_id = field_type,
                     .span = fa.meta.span,
                 });
             },
@@ -6009,6 +6010,59 @@ pub const HirBuilder = struct {
             .base = declaration_type_id,
             .args = resolved,
         } }) catch declaration_type_id;
+    }
+
+    /// Compute the substituted result type of a field-access `obj.field`
+    /// where `obj`'s static type is `receiver_type_id`. When the
+    /// receiver is `.applied { base = StructDecl(T1..Tn), args = [A1..An] }`,
+    /// the field's declared type is rewritten through the
+    /// per-instantiation substitution `Ti -> Ai`. When the receiver is
+    /// a bare struct declaration the field's declared type is returned
+    /// verbatim (matches existing concrete-struct semantics). Returns
+    /// `TypeStore.UNKNOWN` when the receiver type carries no struct
+    /// shape (UNKNOWN, primitive, etc.) or when the field name does
+    /// not exist on the declared struct.
+    fn fieldAccessResultType(
+        self: *const HirBuilder,
+        receiver_type_id: types_mod.TypeId,
+        field_name: ast.StringId,
+    ) types_mod.TypeId {
+        if (receiver_type_id == types_mod.TypeStore.UNKNOWN) return types_mod.TypeStore.UNKNOWN;
+        if (receiver_type_id >= self.type_store.types.items.len) return types_mod.TypeStore.UNKNOWN;
+        const receiver_type = self.type_store.getType(receiver_type_id);
+
+        const struct_type, const arg_types = switch (receiver_type) {
+            .struct_type => |st| .{ st, @as(?[]const types_mod.TypeId, null) },
+            .applied => |ap| blk: {
+                if (ap.base >= self.type_store.types.items.len) return types_mod.TypeStore.UNKNOWN;
+                const base_typ = self.type_store.getType(ap.base);
+                if (base_typ != .struct_type) return types_mod.TypeStore.UNKNOWN;
+                break :blk .{ base_typ.struct_type, @as(?[]const types_mod.TypeId, ap.args) };
+            },
+            else => return types_mod.TypeStore.UNKNOWN,
+        };
+
+        const declared_field_type = blk: {
+            for (struct_type.fields) |field| {
+                if (field.name == field_name) break :blk field.type_id;
+            }
+            return types_mod.TypeStore.UNKNOWN;
+        };
+
+        const args = arg_types orelse return declared_field_type;
+        if (args.len == 0 or struct_type.type_params.len == 0) return declared_field_type;
+
+        var subs = types_mod.SubstitutionMap.init(self.allocator);
+        defer subs.deinit();
+        const pair_count = @min(struct_type.type_params.len, args.len);
+        for (struct_type.type_params[0..pair_count], args[0..pair_count]) |formal_id, arg_id| {
+            if (formal_id >= self.type_store.types.items.len) continue;
+            const formal_typ = self.type_store.getType(formal_id);
+            if (formal_typ != .type_var) continue;
+            subs.bind(formal_typ.type_var, arg_id);
+        }
+        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+        return subs.applyToType(store_ptr, declared_field_type);
     }
 
     /// Context-driven inference for `%Box{...}` (no explicit `(...)`).
@@ -7652,6 +7706,50 @@ test "HIR infers applied TypeId for %Box{...} from function return type" {
     const typ = checker.store.getType(result_expr.type_id);
     try std.testing.expect(typ == .applied);
     try std.testing.expectEqual(types_mod.TypeStore.I64, typ.applied.args[0]);
+}
+
+test "HIR substitutes field-access type for applied parametric struct receiver" {
+    // For `obj :: Box(i64)` followed by `obj.value`, the field-access
+    // result type must be `i64` (the substituted form of `T`) — not
+    // the raw type-var that lives on the Box declaration's field.
+    // This is what downstream IR/ZIR sees when picking storage and
+    // emitting field-get instructions per instantiation.
+    const source =
+        \\pub struct Box(T) {
+        \\  value :: T
+        \\}
+        \\pub struct Demo {
+        \\  pub fn unbox(b :: Box(i64)) -> i64 {
+        \\    b.value
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const demo_struct = hir_program.structs[1];
+    const unbox_clause = demo_struct.functions[0].clauses[0];
+    const result_expr = unbox_clause.body.stmts[0].expr;
+    try std.testing.expect(result_expr.kind == .field_get);
+    try std.testing.expectEqual(types_mod.TypeStore.I64, result_expr.type_id);
 }
 
 test "HIR keeps declaration TypeId for concrete (non-parametric) struct literals" {
