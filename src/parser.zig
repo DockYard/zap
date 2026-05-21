@@ -384,7 +384,7 @@ pub const Parser = struct {
     fn synchronize(self: *Parser) void {
         while (!self.check(.eof)) {
             switch (self.peek()) {
-                .keyword_pub, .keyword_fn, .keyword_macro, .keyword_struct, .keyword_union, .keyword_protocol, .keyword_impl, .keyword_error, .right_brace => return,
+                .keyword_pub, .keyword_fn, .keyword_macro, .keyword_struct, .keyword_union, .keyword_protocol, .keyword_impl, .right_brace => return,
                 .newline => {
                     _ = self.advance();
                     // After newline, check if next token starts a new statement
@@ -397,7 +397,6 @@ pub const Parser = struct {
                         .keyword_union,
                         .keyword_protocol,
                         .keyword_impl,
-                        .keyword_error,
                         .keyword_type,
                         .keyword_opaque,
                         .keyword_alias,
@@ -518,11 +517,28 @@ pub const Parser = struct {
                                 self.synchronize();
                             }
                         },
-                        .keyword_error => {
-                            self.restoreLexerState(saved);
-                            if (self.parseErrorDecl(false)) |err_decl| {
-                                try top_items.append(self.allocator, .{ .error_decl = try self.create(ast.ErrorDecl, err_decl) });
-                            } else |_| {
+                        .identifier => {
+                            // `error` is contextual: only when it appears in
+                            // declaration position after `pub` (and the next
+                            // token is a TypeIdentifier or `(` for a
+                            // parametric error). Any other identifier here
+                            // is a parse error.
+                            if (self.checkIdentifier("error")) {
+                                self.restoreLexerState(saved);
+                                if (self.parseErrorDecl(false)) |err_decl| {
+                                    try top_items.append(self.allocator, .{ .error_decl = try self.create(ast.ErrorDecl, err_decl) });
+                                } else |_| {
+                                    self.synchronize();
+                                }
+                            } else {
+                                self.restoreLexerState(saved);
+                                try self.addRichError(
+                                    "I was expecting `struct`, `fn`, `macro`, `union`, `protocol`, `impl`, or `error` after `pub`",
+                                    self.currentSpan(),
+                                    null,
+                                    null,
+                                );
+                                _ = self.advance();
                                 self.synchronize();
                             }
                         },
@@ -616,13 +632,25 @@ pub const Parser = struct {
                         self.synchronize();
                     }
                 },
-                .keyword_error => {
-                    // Bare `error Name { ... }` — private renderable-only error.
-                    // Same desugar treatment as `pub error`, but the generated
-                    // `pub struct + pub impl Error for Name` are non-`pub`.
-                    if (self.parseErrorDecl(true)) |err_decl| {
-                        try top_items.append(self.allocator, .{ .priv_error_decl = try self.create(ast.ErrorDecl, err_decl) });
-                    } else |_| {
+                // Bare `error Name { ... }` — private renderable-only error.
+                // `error` is contextual; the lexer no longer emits a hard
+                // keyword token for it. Catch it as an `.identifier` whose
+                // text is exactly "error" via `checkIdentifier("error")`.
+                .identifier => {
+                    if (self.checkIdentifier("error")) {
+                        if (self.parseErrorDecl(true)) |err_decl| {
+                            try top_items.append(self.allocator, .{ .priv_error_decl = try self.create(ast.ErrorDecl, err_decl) });
+                        } else |_| {
+                            self.synchronize();
+                        }
+                    } else {
+                        try self.addRichError(
+                            "I was not expecting an identifier at the top level",
+                            self.currentSpan(),
+                            null,
+                            "the top level can contain `pub struct`, `struct`, `pub enum`, `type`, and `opaque` declarations",
+                        );
+                        _ = self.advance();
                         self.synchronize();
                     }
                 },
@@ -1077,7 +1105,20 @@ pub const Parser = struct {
     fn parseErrorDecl(self: *Parser, is_private: bool) !ast.ErrorDecl {
         const start = self.currentSpan();
         if (self.check(.keyword_pub)) _ = self.advance(); // consume pub
-        _ = try self.expect(.keyword_error);
+        // `error` is a contextual keyword (Token.isErrorIdent / checkIdentifier).
+        // It arrives as a bare identifier whose text is exactly "error". The
+        // pub/bare top-level dispatcher already verified the contextual match,
+        // so just consume it here.
+        if (!self.checkIdentifier("error")) {
+            try self.addRichError(
+                "I was expecting the `error` contextual keyword to start this declaration",
+                self.currentSpan(),
+                null,
+                "`error` introduces an error declaration: `pub error TimeoutError { ... }`",
+            );
+            return error.ParseError;
+        }
+        _ = self.advance();
 
         if (!self.check(.type_identifier)) {
             try self.addRichError(
@@ -5345,7 +5386,6 @@ fn tokenHumanName(tag: Token.Tag) []const u8 {
         .keyword_macro => "`macro`",
         .keyword_struct => "`struct`",
         .keyword_union => "`union`",
-        .keyword_error => "`error`",
         .keyword_if => "`if`",
         .keyword_else => "`else`",
         .keyword_case => "`case`",

@@ -600,11 +600,12 @@ test "lex simple tokens" {
     try std.testing.expectEqual(Token.Tag.left_brace, t4.tag);
 }
 
-// Phase 1.2 introduces the `error` keyword so the parser can accept the
-// `pub error Name { ... }` declaration form. The lexer must emit
-// `keyword_error` rather than a bare identifier so the top-level parser
-// can dispatch into `parseErrorDecl` without disambiguating by lookahead.
-test "lex error keyword" {
+// `error` is a contextual keyword (see Token.isErrorIdent). The lexer
+// emits a bare `identifier` whose text is exactly "error"; the parser
+// dispatches into `parseErrorDecl` by checking `checkIdentifier("error")`
+// at top-level declaration positions. This keeps `error` available as a
+// variant name (Result.Error), field name, and so on.
+test "lex error contextual keyword" {
     const source = "pub error TimeoutError";
     var lexer = Lexer.init(source);
 
@@ -612,7 +613,8 @@ test "lex error keyword" {
     try std.testing.expectEqual(Token.Tag.keyword_pub, t1.tag);
 
     const t2 = lexer.next();
-    try std.testing.expectEqual(Token.Tag.keyword_error, t2.tag);
+    try std.testing.expectEqual(Token.Tag.identifier, t2.tag);
+    try std.testing.expect(t2.isErrorIdent(source));
 
     const t3 = lexer.next();
     try std.testing.expectEqual(Token.Tag.type_identifier, t3.tag);

@@ -2025,6 +2025,105 @@ test "ZIR (acceptance F): case destructuring on Result(T, E) extracts payload" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR (Result stdlib): Result(T, E) construction round-trips both variants" {
+    // Smoke-test the stdlib `Result(t, e)` declaration (lib/result.zap)
+    // end-to-end: `Result(i64, String).Ok(42)` and
+    // `Result(i64, String).Error("boom")` each construct the
+    // per-instantiation tagged union and assign without crashing. The
+    // `Error` variant name exercises the Phase 1.3 contextual-keyword
+    // change (`error` is no longer a hard keyword, so `Result.Error`
+    // parses as an ordinary variant qualifier).
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    _ = Result(i64, String).Ok(42)
+        \\    _ = Result(i64, String).Error("boom")
+        \\    IO.puts("constructed")
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("constructed\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR (Result stdlib helpers): is_ok?, is_error?, unwrap_or end-to-end" {
+    // Exercises the predicate + unwrap helpers shipped under `Result`
+    // in lib/result.zap. As with the Option helpers, the scrutinee is
+    // threaded through each helper's function parameter, which forces a
+    // runtime discriminant so the match does not hit the pre-existing
+    // comptime-fold limitation on constant-discriminant scrutinees.
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    ok = Result(i64, String).Ok(42)
+        \\    err = Result(i64, String).Error("boom")
+        \\    Kernel.inspect(Result.is_ok?(ok))
+        \\    Kernel.inspect(Result.is_error?(err))
+        \\    Kernel.inspect(Result.unwrap_or(ok, 0))
+        \\    Kernel.inspect(Result.unwrap_or(err, 7))
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("true\ntrue\n42\n7\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR (Result stdlib): map/map_error transform the matching variant" {
+    // `Result.map/2` transforms the Ok payload and passes Error
+    // through; `Result.map_error/2` does the inverse. Both route the
+    // scrutinee through their function parameter (runtime discriminant)
+    // and read the result back via param-boundary helpers so neither
+    // hits the comptime-fold limitation.
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn ok_value(r :: Result(i64, String)) -> i64 {
+        \\    case r {
+        \\      Result.Ok(v) -> v
+        \\      Result.Error(_) -> 0
+        \\    }
+        \\  }
+        \\  pub fn err_reason(r :: Result(i64, String)) -> String {
+        \\    case r {
+        \\      Result.Ok(_) -> "no"
+        \\      Result.Error(e) -> e
+        \\    }
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    ok = Result(i64, String).Ok(21)
+        \\    err = Result(i64, String).Error("boom")
+        \\    Kernel.inspect(ok_value(Result.map(ok, fn(v :: i64) -> i64 { v * 2 })))
+        \\    Kernel.inspect(err_reason(Result.map(err, fn(v :: i64) -> i64 { v * 2 })))
+        \\    Kernel.inspect(ok_value(Result.map_error(ok, fn(e :: String) -> String { e <> "!" })))
+        \\    Kernel.inspect(err_reason(Result.map_error(err, fn(e :: String) -> String { e <> "!" })))
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\nboom\n21\nboom!\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// NOTE: `Result.and_then/2` is fully implemented in lib/result.zap and is
+// structurally identical to the working `Option.and_then/2`. An end-to-end
+// integration test is intentionally deferred: exercising it requires passing
+// a continuation (closure or `&fn/1`) to a parameter whose declared type is
+// the *generic* callable `(value -> Result(mapped, err))`. Passing a
+// function reference or a `Result`-returning closure through a type-var
+// callable parameter currently fails callable-signature matching — a
+// pre-existing higher-order-generic inference gap (orthogonal to Phase 1.3,
+// surfaced to the Phase 1 gap loop). `Result.map/2` and `Result.map_error/2`
+// are covered above because their continuations have *concrete* return types
+// (`i64`, `String`), which the inliner resolves without the generic-callable
+// path.
+
 test "ZIR (Phase 1.1.5.f Blocker A): union_init across multiple call sites stays per-instantiation typed" {
     // Round 1's HIR threads `.applied { base = Option, args = [i64] }`
     // onto the `union_init` literal type. Round 2 makes the ZIR side

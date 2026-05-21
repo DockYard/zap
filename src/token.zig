@@ -61,7 +61,6 @@ pub const Token = struct {
         keyword_protocol,
         keyword_impl,
         keyword_in,
-        keyword_error,
 
         // Operators
         plus, // +
@@ -142,6 +141,18 @@ pub const Token = struct {
         return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "unquote_splicing");
     }
 
+    /// True when this token is an identifier whose text is exactly `error`.
+    /// `error` is a contextual keyword: only the top-level declaration
+    /// parser dispatches into `parseErrorDecl` on this shape. Treating
+    /// `error` as a hard keyword would prevent `Result(t, e)` from having
+    /// an `Error(e)` variant — and more generally, would reserve a common
+    /// English word across every expression position. The parser uses
+    /// this helper at the exact decl positions (`pub error`, bare
+    /// `error`) where the contextual reading is unambiguous.
+    pub fn isErrorIdent(self: Token, source: []const u8) bool {
+        return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "error");
+    }
+
     pub const keywords = std.StaticStringMap(Tag).initComptime(.{
         .{ "pub", .keyword_pub },
         .{ "fn", .keyword_fn },
@@ -181,7 +192,10 @@ pub const Token = struct {
         .{ "protocol", .keyword_protocol },
         .{ "impl", .keyword_impl },
         .{ "in", .keyword_in },
-        .{ "error", .keyword_error },
+        // "error" is contextual — see Token.isErrorIdent. It is intentionally
+        // omitted from this static keyword table so that `Result.Error`,
+        // record fields named `error`, and other ordinary identifier
+        // positions are not stolen by a hard keyword token.
     });
 
     pub fn getKeyword(bytes: []const u8) ?Tag {

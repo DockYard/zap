@@ -854,7 +854,11 @@ fn extractStructReferences(
         while (true) {
             const tok = scout.next();
             if (tok.tag == .eof) break;
-            if (tok.tag == .keyword_error) {
+            // `error` is a contextual keyword (Token.isErrorIdent): the
+            // lexer emits a bare `identifier` whose text is exactly
+            // "error". Match on the slice so this discovery scout stays
+            // in sync with the parser's contextual reading.
+            if (tok.isErrorIdent(source)) {
                 const option_name = try alloc.dupe(u8, "Option");
                 try refs.put(option_name, {});
                 const error_name = try alloc.dupe(u8, "Error");
