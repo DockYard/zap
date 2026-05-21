@@ -1824,6 +1824,12 @@ fn appendReflectedFileInventory(
             .function, .priv_function, .macro, .priv_macro, .type_decl, .opaque_decl => {
                 pending_doc = null;
             },
+            .error_decl, .priv_error_decl => {
+                // `pub error` desugars to `pub struct + pub impl Error` in
+                // `src/desugar.zig` before any reflective traversal of the
+                // top-level item list. Seeing one here is a wiring bug.
+                @panic("incremental fingerprint saw an ErrorDecl that should have been desugared");
+            },
         }
     }
 }
@@ -1981,6 +1987,10 @@ fn topLevelStructDocAttribute(
             .type_decl,
             .opaque_decl,
             => pending_doc = null,
+            .error_decl, .priv_error_decl => {
+                // Desugar runs before this scan; an ErrorDecl here is a wiring bug.
+                @panic("topLevelStructDocAttribute saw an ErrorDecl that should have been desugared");
+            },
         }
     }
     return null;
@@ -4600,6 +4610,8 @@ fn topItemSourceSpan(item: ast.TopItem) ast.SourceSpan {
         .macro => |decl| decl.meta.span,
         .priv_macro => |decl| decl.meta.span,
         .attribute => |decl| decl.meta.span,
+        .error_decl => |decl| decl.meta.span,
+        .priv_error_decl => |decl| decl.meta.span,
     };
 }
 
@@ -10092,6 +10104,14 @@ fn remapTopItem(alloc: std.mem.Allocator, item: *ast.TopItem, remap: []const ast
             mutable.* = attr.*;
             try remapAttributeDecl(alloc, mutable, remap);
             item.* = .{ .attribute = mutable };
+        },
+        .error_decl, .priv_error_decl => {
+            // `pub error` / `error` declarations are removed by the
+            // front-end desugar pass before any post-desugar identifier
+            // remap runs over the program's top items. Reaching this
+            // remap with an `ErrorDecl` still in the AST means the
+            // desugar was bypassed — a compiler wiring bug.
+            @panic("remapTopItem saw an ErrorDecl that should have been desugared into a StructDecl + ImplDecl");
         },
     }
 }

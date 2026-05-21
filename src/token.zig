@@ -61,6 +61,7 @@ pub const Token = struct {
         keyword_protocol,
         keyword_impl,
         keyword_in,
+        keyword_error,
 
         // Operators
         plus, // +
@@ -180,6 +181,7 @@ pub const Token = struct {
         .{ "protocol", .keyword_protocol },
         .{ "impl", .keyword_impl },
         .{ "in", .keyword_in },
+        .{ "error", .keyword_error },
     });
 
     pub fn getKeyword(bytes: []const u8) ?Tag {

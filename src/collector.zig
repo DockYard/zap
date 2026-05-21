@@ -186,6 +186,16 @@ pub const Collector = struct {
                     try self.collectImpl(impl_d);
                     pending_top_attrs.clearRetainingCapacity();
                 },
+                .error_decl, .priv_error_decl => {
+                    // `pub error` / `error` declarations are rewritten to
+                    // `pub struct + pub impl Error for X` by the front-end
+                    // desugar pass (`src/desugar.zig`) before the collector
+                    // ever runs. Reaching the collector with an `ErrorDecl`
+                    // node still in the program means the desugar pass was
+                    // skipped or wired up wrong — that is a compiler bug,
+                    // not user-recoverable.
+                    @panic("collector saw an ErrorDecl that should have been desugared into a StructDecl + ImplDecl");
+                },
             }
         }
     }

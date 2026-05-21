@@ -215,6 +215,18 @@ pub const TopItem = union(enum) {
     priv_protocol: *const ProtocolDecl,
     impl_decl: *const ImplDecl,
     priv_impl_decl: *const ImplDecl,
+    /// `pub error Name { ... }` — public matchable error type. Carried as
+    /// a distinct top-item kind so the front-end desugar pass
+    /// (`src/desugar.zig`) can recognise the declaration form and rewrite
+    /// it to `pub struct Name + pub impl Error for Name` before any
+    /// downstream stage sees it. After desugar there is no `ErrorDecl`
+    /// left in the program.
+    error_decl: *const ErrorDecl,
+    /// Bare `error Name { ... }` — private renderable-only error type.
+    /// Same desugar treatment as `error_decl`, but the resulting struct
+    /// and impl are non-`pub` so the type cannot be matched from outside
+    /// its declaring file/module.
+    priv_error_decl: *const ErrorDecl,
     type_decl: *const TypeDecl,
     opaque_decl: *const OpaqueDecl,
     union_decl: *const UnionDecl,
@@ -405,6 +417,56 @@ pub const UnionVariant = struct {
     meta: NodeMeta,
     name: StringId,
     type_expr: ?*const TypeExpr = null, // null = unit variant
+};
+
+// ============================================================
+// Error declarations
+// ============================================================
+
+/// `pub error Name { ... }` / `error Name { ... }` — the canonical
+/// declaration form for an exception type. Mirrors `StructDecl` in shape:
+/// optional type parameters (parametric errors via the 1.1.5 machinery),
+/// a body of fields with optional defaults, and a body of inline
+/// methods. The front-end-only desugar (`src/desugar.zig`) rewrites this
+/// node into a `StructDecl` with the user fields plus auto-injected
+/// `message :: String = "<TypeName>"` and `cause :: Option(Error) = Option.None`,
+/// together with an `ImplDecl` for `Error for Name` whose `message`,
+/// `kind`, `source`, and `code` methods are auto-generated. After desugar
+/// no downstream stage sees `ErrorDecl` — the rest of the pipeline only
+/// looks at the produced struct + impl.
+pub const ErrorDecl = struct {
+    meta: NodeMeta,
+    /// Name of the error type. Single-segment in the MVP, kept as a
+    /// `StructName` so future dotted forms (`MyApp.ParseError`) don't
+    /// require AST churn.
+    name: StructName,
+    /// Optional parametric header (`pub error DeserializeError(T) { ... }`).
+    /// Empty for concrete errors; the desugar propagates these to the
+    /// generated `StructDecl` and `ImplDecl` so the existing 1.1.5
+    /// parametric machinery picks them up untouched.
+    type_params: []const StringId = &.{},
+    /// Items declared inside the body. Restricted to `pub fn` / `fn`
+    /// declarations and `@doc` / `@code` attributes — the parser refuses
+    /// nested structs, unions, type/alias/import/use. The desugar walks
+    /// these to discover inline-method overrides for `Error` protocol
+    /// methods and to forward unrelated methods onto the struct itself.
+    items: []const StructItem = &.{},
+    /// Field declarations exactly as for `StructDecl`. The desugar
+    /// preserves all user fields with their declared defaults and
+    /// adds `message` / `cause` only when not already present.
+    fields: []const StructFieldDecl = &.{},
+    /// Value of the optional `@code Z<digits>` attribute, interned as
+    /// the bareword (`"Z3041"`). `null` when the user did not supply a
+    /// numeric code. The desugar wraps the present value in
+    /// `Option.Some(:Zxxxx)` for the auto-generated `code/1` method and
+    /// returns `Option.None` otherwise.
+    code: ?StringId = null,
+    /// Optional `@doc = """..."""` attached to the declaration. The
+    /// desugar attaches this back to the rewritten `pub struct` so the
+    /// canonical `@doc` lookup path (a struct-level `@doc` attribute
+    /// item) keeps working unchanged.
+    doc: ?*const AttributeDecl = null,
+    is_private: bool = false,
 };
 
 // ============================================================

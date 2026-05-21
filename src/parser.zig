@@ -384,7 +384,7 @@ pub const Parser = struct {
     fn synchronize(self: *Parser) void {
         while (!self.check(.eof)) {
             switch (self.peek()) {
-                .keyword_pub, .keyword_fn, .keyword_macro, .keyword_struct, .keyword_union, .keyword_protocol, .keyword_impl, .right_brace => return,
+                .keyword_pub, .keyword_fn, .keyword_macro, .keyword_struct, .keyword_union, .keyword_protocol, .keyword_impl, .keyword_error, .right_brace => return,
                 .newline => {
                     _ = self.advance();
                     // After newline, check if next token starts a new statement
@@ -397,6 +397,7 @@ pub const Parser = struct {
                         .keyword_union,
                         .keyword_protocol,
                         .keyword_impl,
+                        .keyword_error,
                         .keyword_type,
                         .keyword_opaque,
                         .keyword_alias,

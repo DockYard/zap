@@ -600,6 +600,25 @@ test "lex simple tokens" {
     try std.testing.expectEqual(Token.Tag.left_brace, t4.tag);
 }
 
+// Phase 1.2 introduces the `error` keyword so the parser can accept the
+// `pub error Name { ... }` declaration form. The lexer must emit
+// `keyword_error` rather than a bare identifier so the top-level parser
+// can dispatch into `parseErrorDecl` without disambiguating by lookahead.
+test "lex error keyword" {
+    const source = "pub error TimeoutError";
+    var lexer = Lexer.init(source);
+
+    const t1 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.keyword_pub, t1.tag);
+
+    const t2 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.keyword_error, t2.tag);
+
+    const t3 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.type_identifier, t3.tag);
+    try std.testing.expectEqualStrings("TimeoutError", t3.slice(source));
+}
+
 test "lex numbers" {
     const source = "42 3.14";
     var lexer = Lexer.init(source);
