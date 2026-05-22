@@ -4508,21 +4508,44 @@ pub const ZirDriver = struct {
                     return error.EmitFailed;
                 self.current_ret_type = 1;
             },
-            .function, .tagged_union, .ptr, .any, .term, .protocol_box => {
+            .protocol_box => {
+                // A function declared `-> <Protocol>` (a protocol
+                // existential) returns the runtime fat-pointer carrier
+                // `zap_runtime.ProtocolBox`. Emit the return type
+                // EXPLICITLY rather than relying on body inference
+                // (`set_generic_return_type`).
+                //
+                // Body inference is only sound when the body literally
+                // constructs the box in a Sema-visible way (the Phase
+                // 1.2.5.c construction-site `box_as_protocol` lowering).
+                // A function whose body is a direct `:zig.*` bridge call
+                // returning `ProtocolBox` — e.g. `Kernel.take_recoverable_raise`
+                // (Phase 3.a), whose body is `:zig.Kernel.take_recoverable_raise()`
+                // — provides no such anonymous construction, so an
+                // inferred/generic return type resolves to `void` and
+                // clashes with the `ProtocolBox` the body actually yields
+                // (`expected 'void', found 'zap_runtime.ProtocolBox'`).
+                // Declaring `-> zap_runtime.ProtocolBox` up front, exactly
+                // as the `.struct_ref` imported-type arm does, makes the
+                // declared and produced types agree for every
+                // protocol-existential-returning function regardless of how
+                // the box is produced.
+                if (zir_builder_set_imported_return_type(
+                    self.handle,
+                    "zap_runtime",
+                    11,
+                    "ProtocolBox",
+                    11,
+                ) != 0) return error.EmitFailed;
+                self.current_ret_type = 1;
+            },
+            .function, .tagged_union, .ptr, .any, .term => {
                 // These types are structural and created anonymously in the
                 // body. Zig infers the return type from the body construction.
                 // `.term` falls into this bucket because the runtime type
                 // (`zap_runtime.Term`) is resolved by the body — declaring
                 // it explicitly here would require eagerly emitting the
                 // import path, which is unnecessary for inference.
-                //
-                // `.protocol_box` joins the same bucket for Phase 1.2.5.b
-                // — the body produces a `zap_runtime.ProtocolBox` value
-                // (via the construction-site lowering that Phase 1.2.5.c
-                // will land) and Sema infers the return type from that
-                // expression. Eagerly emitting the import path here
-                // would clutter every protocol-returning function's
-                // ret-ty body without changing the resolved identity.
                 if (zir_builder_set_generic_return_type(self.handle) != 0)
                     return error.EmitFailed;
                 self.current_ret_type = 1;
