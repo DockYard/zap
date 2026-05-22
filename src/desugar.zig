@@ -428,7 +428,21 @@ pub const Desugarer = struct {
         // Method signature: `pub fn <name>(self :: <TypeName>) -> <ReturnType>`.
         // For parametric errors the receiver carries the type-vars as
         // applied type args, e.g. `self :: DeserializeError(T)`.
-        const self_name = try interner_mut.intern("self");
+        //
+        // The default `kind/1` and `code/1` bodies return a constant
+        // (the snake-cased type-name atom; `Option.Some(:Zxxxx)` /
+        // `Option.None`) and never read the receiver, so binding it as
+        // `self` would trip the unused-binding check (fatal under
+        // `zap test`). Name the receiver `_self` for those constant-
+        // returning kinds; `message/1` and `source/1` read a field so
+        // they keep `self`. (The user-override path below builds its own
+        // param list from the user's pattern, so this only governs the
+        // default-body shape.)
+        const default_body_reads_self = switch (kind) {
+            .read_message_field, .read_cause_field => true,
+            .return_kind_atom, .return_code_option => false,
+        };
+        const self_name = try interner_mut.intern(if (default_body_reads_self) "self" else "_self");
         const receiver_type = try self.buildSelfReceiverType(err_decl);
         const self_param: ast.Param = .{
             .meta = .{ .span = meta.span },
