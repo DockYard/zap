@@ -325,6 +325,22 @@ pub fn build(b: *std.Build) void {
     run_cache_correctness_tests.step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_cache_correctness_tests.step);
 
+    // `zap addr2line` offline-symbolization integration test (Phase 2.e).
+    // Drives the installed `zap` CLI to build a crashing script across
+    // optimize modes and symbolize a known address against the produced
+    // binary + its split-debug artifact + `.zap-symbols` sidecar.
+    const zap_addr2line_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/zap_addr2line_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_zap_addr2line_tests = b.addRunArtifact(zap_addr2line_tests);
+    run_zap_addr2line_tests.setEnvironmentVariable("ZAP_BINARY", b.getInstallPath(.bin, "zap"));
+    run_zap_addr2line_tests.step.dependOn(b.getInstallStep());
+    test_step.dependOn(&run_zap_addr2line_tests.step);
+
     // -----------------------------------------------------------------------
     // Run step
     // -----------------------------------------------------------------------
