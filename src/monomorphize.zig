@@ -302,6 +302,29 @@ const MonomorphContext = struct {
         return false;
     }
 
+    /// A parameter typed as a *bare* `protocol_constraint(P)` (one with no
+    /// `type_params`, e.g. `e :: Error`) is a `dyn`-style existential: it
+    /// lowers to a single `ProtocolBox`-taking body and every protocol-method
+    /// call on it dispatches through the box vtable (`protocol_dispatch`).
+    /// Such a parameter must NOT be monomorphized per concrete argument type —
+    /// the whole point of the box is to avoid per-impl specialization, and
+    /// substituting the parameter to a concrete struct leaves the body's
+    /// protocol calls lowered against the `P` namespace (they were emitted
+    /// existentially at HIR-build, when the receiver was still `P`), producing
+    /// a broken `call_named P__method__N` that references the protocol type
+    /// rather than a value (`expected pointer, found 'type'`).
+    ///
+    /// A *parametric* `protocol_constraint(P(args))` (one with `type_params`,
+    /// e.g. `Enumerable(element)`) is the orthogonal "generic-with-bound" case:
+    /// `HirBuilder.protocolDispatchStruct` devirtualizes its protocol calls to
+    /// a `call_direct` against the concrete impl during HIR build, so per-
+    /// instantiation specialization is both correct and required there. Only
+    /// the bare/existential form returns true here.
+    fn isExistentialProtocolConstraint(self: *const MonomorphContext, type_id: TypeId) bool {
+        const typ = self.store.getType(type_id);
+        return typ == .protocol_constraint and typ.protocol_constraint.type_params.len == 0;
+    }
+
     fn protocolParamConcreteType(
         self: *const MonomorphContext,
         param_type: TypeId,
@@ -311,6 +334,10 @@ const MonomorphContext = struct {
 
         const param_typ = self.store.getType(param_type);
         if (param_typ != .protocol_constraint) return null;
+        // Bare protocol constraints are existentials (box-dispatched); never
+        // pin them to a concrete argument type. See
+        // `isExistentialProtocolConstraint` for the full rationale.
+        if (param_typ.protocol_constraint.type_params.len == 0) return null;
         if (!self.typeImplementsProtocol(param_typ.protocol_constraint.protocol_name, arg_type)) return null;
         return arg_type;
     }
@@ -1240,6 +1267,14 @@ const MonomorphContext = struct {
     ) bool {
         for (params, 0..) |param, param_index| {
             if (self.store.getType(param.type_id) != .protocol_constraint) continue;
+            // Bare/existential protocol constraints (`e :: Error`) are
+            // intentionally box-dispatched and carry no concrete substitution;
+            // they must not block specialization driven by OTHER generic
+            // params (e.g. `fn f(e :: Error, xs :: [t])` still specializes on
+            // `t` while `e` stays a `ProtocolBox`). Only a *parametric*
+            // protocol constraint that failed to resolve a concrete type is a
+            // genuinely unbound specialization input.
+            if (self.isExistentialProtocolConstraint(param.type_id)) continue;
             if (param_index >= protocol_param_types.len) return true;
             if (protocol_param_types[param_index] == types_mod.TypeStore.UNKNOWN) return true;
         }

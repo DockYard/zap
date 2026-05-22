@@ -2003,11 +2003,21 @@ fn isBorrowedLocal(
 // Phase 1.2.5.d: rewrite protocol-box releases
 // ============================================================
 
-/// Walk every `release` instruction in the function and flip its
-/// `kind` to `.protocol_box_drop` (with the correct `protocol_name`)
-/// when the target local is a known protocol existential — that is,
-/// when `function.protocol_box_locals` carries an entry for the
-/// release's value local.
+/// Walk every `release` AND `retain` instruction in the function and
+/// flip its `kind` to `.protocol_box_drop` / `.protocol_box_retain`
+/// (with the correct `protocol_name`) when the target local is a known
+/// protocol existential — that is, when `function.protocol_box_locals`
+/// carries an entry for the instruction's value local.
+///
+/// Retain and release are symmetric here: a `ProtocolBox` is a 16-byte
+/// fat-pointer value with no inline `ArcHeader`, so BOTH the generic
+/// `retainAny(box)` and `releaseAny(box)` dispatchers mishandle it (the
+/// former `@compileError`s — it only accepts single-item pointers — and
+/// the latter would mis-interpret the box's `data_ptr` as a header).
+/// Both must instead route through the per-protocol synthetic
+/// `<Protocol>VTable.retain(box)` / `.drop(box)` helpers, which recover
+/// the typed inner pointer via the vtable and run the standard ARC
+/// retain/deep-release on it.
 ///
 /// Why this pass is necessary: `insertScopeExitDrops` emits raw
 /// `.release` instructions for every ARC-managed local at every
@@ -2057,6 +2067,27 @@ fn rewriteProtocolBoxReleasesInStream(
                 instr_ptr.* = .{ .release = .{
                     .value = rel.value,
                     .kind = .protocol_box_drop,
+                    .protocol_name = protocol_name,
+                } };
+            },
+            // Symmetric to the release rewrite: a `.retain` of a known
+            // protocol-box local must route through the synthetic
+            // `<Protocol>VTable.retain(box)` helper, not the generic
+            // `retainAny` dispatcher (which `@compileError`s on a
+            // 16-byte `ProtocolBox` value — it only accepts single-item
+            // pointers). The share-side analysis emits `.retain` with
+            // `.kind = .normal`; flip the box-local ones to
+            // `.protocol_box_retain` and stamp the protocol name. Both
+            // `.persistent` and already-rewritten `.protocol_box_retain`
+            // retains are left alone (the persistent path is never
+            // emitted for a box local — a box is not stashed via the
+            // `.copy_value` persistent-retain route).
+            .retain => |ret| {
+                if (ret.kind != .normal) continue;
+                const protocol_name = function.protocol_box_locals.get(ret.value) orelse continue;
+                instr_ptr.* = .{ .retain = .{
+                    .value = ret.value,
+                    .kind = .protocol_box_retain,
                     .protocol_name = protocol_name,
                 } };
             },

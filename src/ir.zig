@@ -1044,10 +1044,14 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
         .bin_read_float,
         .bin_slice,
         .bin_read_utf8,
-        .retain,
         .reset,
         .dbg_stmt,
         => instruction,
+        .retain => |value| .{ .retain = .{
+            .value = value.value,
+            .kind = value.kind,
+            .protocol_name = try cloneOptionalBytes(allocator, value.protocol_name),
+        } },
         .release => |value| .{ .release = .{
             .value = value.value,
             .kind = value.kind,
@@ -2452,6 +2456,17 @@ pub const RetainKind = enum {
     /// routes through the type's own `retain` method when one
     /// exists so the Map-workload share-event tracking fires.
     persistent,
+    /// Phase 1.2.5 protocol-existential retain — the share/borrow
+    /// counterpart of `ReleaseKind.protocol_box_drop`. Routes the
+    /// retain through the per-protocol synthetic
+    /// `<Protocol>VTable.retain(box)` helper rather than the generic
+    /// `retainAny` dispatcher. A `ProtocolBox` is a 16-byte fat-pointer
+    /// value with no inline `ArcHeader`, so `retainAny(box)` would
+    /// `@compileError` (it only accepts single-item pointers).
+    /// `retain(box)` casts the vtable slot to `*const <Protocol>VTable`
+    /// and invokes the synthetic `__retain__` slot, which routes the
+    /// inner's typed pointer through `retainProtocolBoxInner`.
+    protocol_box_retain,
 };
 
 pub const Retain = struct {
@@ -2463,6 +2478,13 @@ pub const Retain = struct {
     /// share emit `.normal`; `arc_ownership.zig`'s `.copy_value`
     /// rewrite path emits `.persistent`.
     kind: RetainKind = .normal,
+    /// Phase 1.2.5 — when `kind == .protocol_box_retain`, the bare
+    /// protocol name used to find the synthetic
+    /// `<Protocol>VTable.retain` helper. `null` for every other kind.
+    /// Stamped by `rewriteProtocolBoxRetains` whenever it rewrites a
+    /// retain of a `.protocol_box(P)` local; the ZIR lowering reads it
+    /// back out at emit time. Mirrors `Release.protocol_name`.
+    protocol_name: ?[]const u8 = null,
 };
 
 /// Flavor of release. Each kind selects a different runtime helper

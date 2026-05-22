@@ -1708,9 +1708,23 @@ pub const ZirDriver = struct {
         // types but erase the receiver — the dispatch site at the
         // ProtocolBox always carries the inner value as
         // `?*anyopaque`.
+        // A PLAIN Zig `struct`, NOT `extern struct`. The vtable is never
+        // passed across a C-ABI boundary — `ProtocolBox.vtable` is a
+        // type-erased `?*const anyopaque` recovered via
+        // `@ptrCast(@alignCast(...))` back to this synthetic struct type
+        // and accessed only by named field, so its in-memory layout is a
+        // private contract between the synthetic emissions. Using a plain
+        // struct (default `.auto` calling convention for the fn-pointer
+        // fields) is required: an `extern struct` forces every fn-pointer
+        // field to specify a calling convention, and a C-ABI convention
+        // cannot return a slice (`[]const u8` for `message`/`kind`) or a
+        // bare Zig union (`Option_Error`/`Option_Atom` for
+        // `source`/`code`) — "return type not allowed in function with
+        // calling convention 'aarch64_aapcs_darwin'". The default
+        // convention has no such restriction.
         try buf.appendSlice(self.allocator, "pub const ");
         try buf.appendSlice(self.allocator, type_def.name);
-        try buf.appendSlice(self.allocator, " = extern struct {\n");
+        try buf.appendSlice(self.allocator, " = struct {\n");
         for (vt_def.methods) |method| {
             try buf.appendSlice(self.allocator, "    ");
             try appendZigIdentifier(self.allocator, &buf, method.name);
@@ -1726,16 +1740,18 @@ pub const ZirDriver = struct {
             try appendZigTypeForVTable(self.allocator, &buf, method.return_type);
             try buf.appendSlice(self.allocator, ",\n");
         }
-        // Phase 1.2.5.c synthetic `__drop__` slot. Every per-impl
-        // vtable instance carries one of these alongside the user-
-        // declared methods so the box's runtime release path can
-        // dispatch the inner value's drop glue without statically
-        // knowing the concrete type. The signature is fixed: it
-        // takes the box's erased `data_ptr` and returns `void`. The
-        // per-impl adapter (see `emitProtocolVTableInstanceSourceFile`)
-        // casts the pointer back to the impl's concrete type and
-        // routes through `releaseProtocolBoxInner` to run the
-        // standard ARC deep-walk + slab-return path.
+        // Phase 1.2.5.c synthetic `__drop__` slot, plus its `__retain__`
+        // counterpart. Every per-impl vtable instance carries both
+        // alongside the user-declared methods so the box's runtime
+        // release/share paths can dispatch the inner value's drop/retain
+        // glue without statically knowing the concrete type. Both
+        // signatures are fixed: they take the box's erased `data_ptr` and
+        // return `void`. The per-impl adapters (see
+        // `emitProtocolVTableInstanceSourceFile`) cast the pointer back to
+        // the impl's concrete type and route through
+        // `releaseProtocolBoxInner` / `retainProtocolBoxInner`
+        // respectively.
+        try buf.appendSlice(self.allocator, "    __retain__: *const fn (data_ptr: ?*anyopaque) void,\n");
         try buf.appendSlice(self.allocator, "    __drop__: *const fn (data_ptr: ?*anyopaque) void,\n");
         try buf.appendSlice(self.allocator, "};\n\n");
 
@@ -1773,6 +1789,22 @@ pub const ZirDriver = struct {
         try buf.appendSlice(self.allocator, type_def.name);
         try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(vt_erased));\n");
         try buf.appendSlice(self.allocator, "        vt.__drop__(box.data_ptr);\n");
+        try buf.appendSlice(self.allocator, "    }\n");
+        try buf.appendSlice(self.allocator, "}\n\n");
+
+        // `retain(box) void` — type-erased retain of the box's inner
+        // value, the share/borrow counterpart of `drop`. The IR-level
+        // `.retain { kind = .protocol_box_retain }` (stamped by
+        // `rewriteProtocolBoxRetains`) lowers to this helper whenever a
+        // `.protocol_box(<Protocol>)` local is shared. It recovers the
+        // vtable cast and invokes the synthetic `__retain__` slot. `None`
+        // boxes (data_ptr=null, vtable=null) are no-ops.
+        try buf.appendSlice(self.allocator, "pub fn retain(box: zap_runtime.ProtocolBox) void {\n");
+        try buf.appendSlice(self.allocator, "    if (box.vtable) |vt_erased| {\n");
+        try buf.appendSlice(self.allocator, "        const vt: *const ");
+        try buf.appendSlice(self.allocator, type_def.name);
+        try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(vt_erased));\n");
+        try buf.appendSlice(self.allocator, "        vt.__retain__(box.data_ptr);\n");
         try buf.appendSlice(self.allocator, "    }\n");
         try buf.appendSlice(self.allocator, "}\n\n");
 
@@ -1969,6 +2001,23 @@ pub const ZirDriver = struct {
         try buf.appendSlice(self.allocator, ", std.heap.page_allocator, inner);\n");
         try buf.appendSlice(self.allocator, "}\n\n");
 
+        // Synthetic `__retain__` adapter — the share/borrow counterpart
+        // of `__drop__`. Casts the box's erased `data_ptr` back to a
+        // mutable `*<Target>` and routes through
+        // `zap_runtime.ArcRuntime.retainProtocolBoxInner`, which bumps
+        // the inner's refcount via the standard `retainAny` path. Keeps
+        // box construction/share/drop refcount-balanced.
+        try buf.appendSlice(self.allocator, "fn __vtable_adapter__");
+        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, "____retain__(data_ptr: ?*anyopaque) void {\n");
+        try buf.appendSlice(self.allocator, "    const inner: *TargetMod.");
+        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(data_ptr.?));\n");
+        try buf.appendSlice(self.allocator, "    zap_runtime.ArcRuntime.retainProtocolBoxInner(TargetMod.");
+        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, ", inner);\n");
+        try buf.appendSlice(self.allocator, "}\n\n");
+
         // Declare the per-impl vtable instance constant. Phase
         // 1.2.5.c populates each slot with the address of the
         // corresponding adapter function so the box's runtime
@@ -1993,7 +2042,10 @@ pub const ZirDriver = struct {
             try buf.appendSlice(self.allocator, slot_arity);
             try buf.appendSlice(self.allocator, ",\n");
         }
-        // Synthetic `__drop__` slot's adapter reference.
+        // Synthetic `__retain__` / `__drop__` slot adapter references.
+        try buf.appendSlice(self.allocator, "    .__retain__ = &__vtable_adapter__");
+        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, "____retain__,\n");
         try buf.appendSlice(self.allocator, "    .__drop__ = &__vtable_adapter__");
         try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
         try buf.appendSlice(self.allocator, "____drop__,\n");
@@ -2035,6 +2087,27 @@ pub const ZirDriver = struct {
         try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
         try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(box.data_ptr.?));\n");
         try buf.appendSlice(self.allocator, "    return inner.*;\n");
+        try buf.appendSlice(self.allocator, "}\n\n");
+
+        // `vtable_addr() ?*const anyopaque` — the canonical way for the
+        // construction-site lowering (`box_as_protocol`) to obtain the
+        // `.rodata` address of this per-impl vtable instance constant.
+        //
+        // Taking `&<InstanceConst>` MUST happen inside this synthetic Zig
+        // source (where the constant is a value in scope), not from the
+        // root module via a `field_ptr` ZIR primitive: the ZIR `field_ptr`
+        // op expects a *pointer* object operand, but `@import("<file>")`
+        // yields a `type` (the file's namespace). Emitting
+        // `field_ptr(@import(...), <const>)` therefore makes Sema reject
+        // the construction site with `expected pointer, found 'type'`. By
+        // returning the erased pointer from a helper here, the call site
+        // round-trips through an ordinary `call_ref` — the same pattern
+        // `drop`/`dispatch_*`/`unbox` already use — and the address-of is
+        // resolved in real Zig source where it is well-formed.
+        try buf.appendSlice(self.allocator, "pub fn vtable_addr() ?*const anyopaque {\n");
+        try buf.appendSlice(self.allocator, "    return @ptrCast(&");
+        try buf.appendSlice(self.allocator, type_def.name);
+        try buf.appendSlice(self.allocator, ");\n");
         try buf.appendSlice(self.allocator, "}\n");
 
         const name_z = try self.allocator.dupeZ(u8, type_def.name);
@@ -3619,6 +3692,33 @@ pub const ZirDriver = struct {
         return ref;
     }
 
+    /// Emit a parameter typed `zap_runtime.ProtocolBox` for a
+    /// `protocol_constraint(P)` (existential) parameter. The box type is
+    /// produced by `emitProtocolBoxTypeRef` (an `@import("zap_runtime")`
+    /// + `.ProtocolBox` field access), whose support instructions must be
+    /// hoisted into the param's type body so the streaming
+    /// `param_type_body` API can replay them when materializing the
+    /// parameter type. Modeled on `emitTupleParam`.
+    fn emitProtocolBoxParam(self: *ZirDriver, param: ir.Param) BuildError!u32 {
+        var support_inst_indices: std.ArrayListUnmanaged(u32) = .empty;
+        defer support_inst_indices.deinit(self.allocator);
+
+        const before = zir_builder_get_body_inst_count(self.handle);
+        const box_ref = try self.emitProtocolBoxTypeRef();
+        try self.captureBodyInsts(before, &support_inst_indices);
+
+        const ref = zir_builder_emit_param_type_body(
+            self.handle,
+            param.name.ptr,
+            @intCast(param.name.len),
+            support_inst_indices.items.ptr,
+            @intCast(support_inst_indices.items.len),
+            box_ref,
+        );
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
     fn setContainerReturnTypeWithSupport(
         self: *ZirDriver,
         generic_name: []const u8,
@@ -3958,6 +4058,20 @@ pub const ZirDriver = struct {
             );
             if (ref == error_ref) return error.EmitFailed;
             return ref;
+        }
+        // A `protocol_constraint(P)` parameter (e.g. `e :: Error`) lowers
+        // to a concrete `zap_runtime.ProtocolBox` value, NOT `anytype`.
+        // Emitting it as `anytype` (the `mapParamType` fallback below)
+        // leaves the parameter unconstrained: a cross-struct caller's
+        // foreign emission of `@import("M").f(box)` then cannot resolve a
+        // monomorphic signature, and the `protocol_dispatch` body's
+        // vtable recovery (`@ptrCast(@alignCast(box.vtable.?))`) sees the
+        // erased type `type` rather than a ProtocolBox value
+        // (`expected pointer, found 'type'`). The box carrier is a fixed
+        // 16-byte runtime type, so we emit an explicit param type body
+        // referencing `zap_runtime.ProtocolBox`.
+        if (std.meta.activeTag(param.type_expr) == .protocol_box) {
+            return try self.emitProtocolBoxParam(param);
         }
         const effective_type = mapParamType(param.type_expr);
         const ref = zir_builder_emit_param(
@@ -7137,11 +7251,28 @@ pub const ZirDriver = struct {
                     @intCast(vtable_instance_name.len),
                 );
                 if (vtable_file_import == error_ref) return error.EmitFailed;
-                const vtable_ptr_ref = zir_builder_emit_field_ptr(
+                // Obtain `&<InstanceConst>` via the synthetic
+                // `vtable_addr()` helper rather than a `field_ptr` ZIR op.
+                // `@import(...)` yields a `type` (the file namespace), and
+                // the ZIR `field_ptr` primitive requires a pointer object
+                // — emitting `field_ptr(@import(...), <const>)` makes Sema
+                // reject the site with `expected pointer, found 'type'`.
+                // The helper resolves the address-of inside real Zig
+                // source where it is well-formed and returns the erased
+                // `?*const anyopaque` the runtime `boxAsProtocol` expects.
+                // See `emitProtocolVTableInstanceSourceFile`.
+                const vtable_addr_fn = zir_builder_emit_field_val(
                     self.handle,
                     vtable_file_import,
-                    vtable_instance_name.ptr,
-                    @intCast(vtable_instance_name.len),
+                    "vtable_addr",
+                    11,
+                );
+                if (vtable_addr_fn == error_ref) return error.EmitFailed;
+                const vtable_ptr_ref = zir_builder_emit_call_ref(
+                    self.handle,
+                    vtable_addr_fn,
+                    &.{},
+                    0,
                 );
                 if (vtable_ptr_ref == error_ref) return error.EmitFailed;
 
@@ -8090,6 +8221,46 @@ pub const ZirDriver = struct {
             // Memory/ARC
             .retain => |ret| {
                 if (!self.shouldSkipArc(ret.value)) {
+                    // Phase 1.2.5: protocol-existential retains route
+                    // through the per-protocol synthetic
+                    // `<Protocol>VTable.retain(box)` helper rather than
+                    // the generic `retainAny` dispatcher. The IR builder's
+                    // post-drop-insertion rewrite pass
+                    // (`rewriteProtocolBoxReleases`) flipped the retain
+                    // kind + stamped the protocol name on every box-local
+                    // retain; reaching this branch means we just find the
+                    // helper and pass the box value as its sole argument.
+                    // Mirrors the `.protocol_box_drop` release path.
+                    if (ret.kind == .protocol_box_retain) {
+                        const protocol_name = ret.protocol_name orelse return error.EmitFailed;
+                        const vtable_module_name = try std.fmt.allocPrint(
+                            self.allocator,
+                            "{s}VTable",
+                            .{protocol_name},
+                        );
+                        defer self.allocator.free(vtable_module_name);
+
+                        const vtable_import = zir_builder_emit_import(
+                            self.handle,
+                            vtable_module_name.ptr,
+                            @intCast(vtable_module_name.len),
+                        );
+                        if (vtable_import == error_ref) return error.EmitFailed;
+
+                        const retain_helper = zir_builder_emit_field_val(
+                            self.handle,
+                            vtable_import,
+                            "retain",
+                            6,
+                        );
+                        if (retain_helper == error_ref) return error.EmitFailed;
+
+                        const box_ref = self.refForLocal(ret.value) catch return;
+                        const retain_args = [_]u32{box_ref};
+                        _ = zir_builder_emit_call_ref(self.handle, retain_helper, &retain_args, 1);
+                        return;
+                    }
+
                     // Phase 1 Class A: dispatch on the IR-level kind
                     // enum so callers control the helper choice
                     // (normal vs persistent) rather than every retain
@@ -8104,6 +8275,7 @@ pub const ZirDriver = struct {
                     const helper_name: []const u8 = switch (ret.kind) {
                         .normal => "retainAny",
                         .persistent => "retainAnyPersistent",
+                        .protocol_box_retain => unreachable, // handled above
                     };
                     const val_ref = self.refForLocal(ret.value) catch return;
 

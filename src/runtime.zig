@@ -4329,6 +4329,28 @@ pub const ArcRuntime = struct {
         releaseAny(allocator, inner_ptr_typed);
     }
 
+    /// Retain a `ProtocolBox`'s inner value through a typed pointer
+    /// (Phase 1.2.5 gap closure). The construction-site auto-box keeps
+    /// the inner value heap-allocated and ARC-managed; when the box is
+    /// shared (passed as a borrowed argument, copied into a second
+    /// owner, etc.) the analysis-driven `.retain` must bump the inner's
+    /// refcount. A `ProtocolBox` is a 16-byte fat-pointer value with no
+    /// inline `ArcHeader`, so the generic `retainAny(box)` would
+    /// mis-interpret the box value and `@compileError` (it only accepts
+    /// single-item pointers). The per-impl synthetic vtable file
+    /// generates one
+    /// `__vtable_adapter__<Target>____retain__(data_ptr: ?*anyopaque)`
+    /// per impl; that adapter casts `data_ptr` back to `*T` and calls
+    /// this helper to run the inner's `retainAny`. Symmetric with
+    /// `releaseProtocolBoxInner` so box construction/share/drop stay
+    /// refcount-balanced.
+    pub inline fn retainProtocolBoxInner(
+        comptime InnerT: type,
+        inner_ptr_typed: *InnerT,
+    ) void {
+        retainAny(inner_ptr_typed);
+    }
+
     /// Accepts the pointer as `anytype` so the ZIR backend's two-argument
     /// call site (`releaseAny(allocator, ptr)`) compiles — Zig cannot infer
     /// a leading `comptime T: type` parameter from the runtime ptr argument.
