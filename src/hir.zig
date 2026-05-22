@@ -296,6 +296,39 @@ pub const TryRescueHir = struct {
     /// raises (its tail value is then a `Never`-stamped recoverable raise,
     /// which would otherwise type as `void` and clash with the arms).
     result_type_id: types_mod.TypeId,
+    /// Per-arm runtime type discriminator (Phase 3.a, #185). One entry per
+    /// `arms` clause, in source order, so the IR's `lowerRescueDispatch`
+    /// knows which concrete error type each arm matches against the raised
+    /// `Error` box. Without this the arms lower as a plain `case` whose
+    /// type-binding patterns are wildcard-equivalent — the bug where
+    /// multi-clause `rescue` always takes the first arm regardless of the
+    /// boxed error's real runtime type. The final arm is always a catch-all
+    /// (`buildTryRescue` synthesizes a re-raise catch-all when the user
+    /// omitted one) so the dispatch is total: an unmatched type re-raises
+    /// rather than being silently swallowed.
+    arm_discriminators: []const RescueDiscriminator,
+};
+
+/// How a single `rescue` arm matches the raised `Error` box at runtime
+/// (Phase 3.a, #185). Computed by `buildTryRescue` from the clause's
+/// pattern + optional `:: Type` annotation; consumed by the IR's
+/// `lowerRescueDispatch` to decide whether to gate the arm behind a
+/// `protocol_box_vtable_eq` runtime type test.
+pub const RescueDiscriminator = union(enum) {
+    /// `_`, a bare binding `e`, or `e :: <Protocol>` (the protocol the box
+    /// already carries) — matches any boxed error without a runtime test.
+    /// The bound variable, if any, stays the boxed `Error` existential.
+    catch_all,
+    /// `e :: ConcreteError` or `%ConcreteError{...}` — matches only when the
+    /// box's runtime concrete type is `target_type_name`. `needs_unbox` is
+    /// true for a struct-pattern clause (its fields must be read off the
+    /// downcast concrete value via `protocol_box_unbox`); a pure
+    /// type-binding clause keeps the binding as the box (no unbox), so a
+    /// `raise e` / `Error.method(e)` in the body still sees an `Error`.
+    concrete: struct {
+        target_type_name: []const u8,
+        needs_unbox: bool,
+    },
 };
 
 pub const UnionInitExpr = struct {
@@ -6174,7 +6207,18 @@ pub const HirBuilder = struct {
         // (bound to `error_local`). This mirrors the `case_expr` lowering:
         // each arm gets its own pattern bindings, scoped guard+body, and a
         // snapshot of just-this-arm's bindings.
+        //
+        // Phase 3.a (#185): alongside each arm we compute a
+        // `RescueDiscriminator` from the clause's pattern + `:: Type`
+        // annotation. The IR's `lowerRescueDispatch` reads it to gate each
+        // type-discriminating arm behind a `protocol_box_vtable_eq` runtime
+        // type test against the raised `Error` box — so multi-clause
+        // `rescue` dispatches on the boxed error's *real* concrete type
+        // instead of always taking the first arm. A catch-all clause (`_`,
+        // a bare bind `e`, or `e :: <Protocol>`) matches any box untested.
         var arms: std.ArrayList(CaseArm) = .empty;
+        var discriminators: std.ArrayList(RescueDiscriminator) = .empty;
+        var has_user_catch_all = false;
         for (tr.rescue_clauses) |clause| {
             const start_idx = self.current_case_bindings.items.len;
             const pattern = try self.compilePattern(clause.pattern);
@@ -6198,9 +6242,33 @@ pub const HirBuilder = struct {
                 .body = arm_body,
                 .bindings = bindings,
             });
+            const discriminator = self.rescueDiscriminatorForClause(clause);
+            // A guard makes even a catch-all-shaped arm conditional, so it
+            // can never be the total fallback; only an unguarded catch-all
+            // discharges the re-raise obligation.
+            if (discriminator == .catch_all and clause.guard == null) {
+                has_user_catch_all = true;
+            }
+            try discriminators.append(self.allocator, discriminator);
             self.current_case_bindings.shrinkRetainingCapacity(start_idx);
         }
+
+        // Phase 3.a (#185) "unrescued types propagate" rule: when the user
+        // did not write a total catch-all, append a synthetic final arm
+        // that re-raises the recovered `Error`. Building it as
+        // `__rescue_unmatched__ -> raise __rescue_unmatched__` reuses the
+        // ordinary `raise` lowering verbatim — inside an enclosing `try`
+        // it routes to `recoverable_raise` (propagates to the outer
+        // handler); at top level it routes to `do_raise` (the Phase 2
+        // crash report). The IR dispatch makes this arm the terminal
+        // `else`, so an error matching none of the user arms is never
+        // silently swallowed.
+        if (!has_user_catch_all) {
+            try self.appendRescueReraiseArm(&arms, &discriminators, tr.meta);
+        }
+
         const arm_slice = try arms.toOwnedSlice(self.allocator);
+        const discriminator_slice = try discriminators.toOwnedSlice(self.allocator);
 
         // Build the optional `after` (finally) block.
         const after_block: ?*const Block = if (tr.after_block) |cleanup|
@@ -6229,7 +6297,14 @@ pub const HirBuilder = struct {
         var result_type: types_mod.TypeId = body.result_type;
         for (arm_slice) |arm| {
             const t = arm.body.result_type;
-            if (t == types_mod.TypeStore.UNKNOWN) continue;
+            // A `NEVER`/`UNKNOWN` arm contributes no value type to the peer
+            // join: a diverging arm — a user `e :: X -> raise e` re-raise, or
+            // the synthesized re-raise catch-all (#185) — never yields a
+            // value, so it must NOT collapse the join to `UNKNOWN`. Skipping
+            // both lets the join settle on the value-producing arms' type
+            // (e.g. `String`), which `lowerRescueDispatch` then uses to
+            // coerce the divergent arms' dead merge edges.
+            if (t == types_mod.TypeStore.UNKNOWN or t == types_mod.TypeStore.NEVER) continue;
             if (result_type == types_mod.TypeStore.UNKNOWN or
                 result_type == types_mod.TypeStore.NIL or
                 result_type == types_mod.TypeStore.NEVER)
@@ -6252,9 +6327,151 @@ pub const HirBuilder = struct {
                 .take_raise_call = take_raise_call,
                 .after_block = after_block,
                 .result_type_id = result_type,
+                .arm_discriminators = discriminator_slice,
             } },
             .type_id = result_type,
             .span = tr.meta.span,
+        });
+    }
+
+    /// Classify how a single `rescue` clause matches the raised `Error` box
+    /// at runtime (Phase 3.a, #185). Drives whether the IR dispatch gates
+    /// the arm behind a `protocol_box_vtable_eq` test:
+    ///
+    ///   * `_` (wildcard) or a bare bind `e` with no `:: Type`  -> catch-all.
+    ///   * `e :: <Protocol>` where the annotation names the protocol the box
+    ///     already carries (e.g. `Error`)                       -> catch-all
+    ///     (the existential already satisfies it; no downcast).
+    ///   * `e :: ConcreteError`                                 -> concrete,
+    ///     no unbox (the binding stays the boxed `Error` so the body's
+    ///     `raise e` / `Error.method(e)` still sees an `Error`).
+    ///   * `%ConcreteError{...}` struct pattern                 -> concrete,
+    ///     needs_unbox (its fields are read off the downcast concrete value).
+    fn rescueDiscriminatorForClause(self: *HirBuilder, clause: ast.CaseClause) RescueDiscriminator {
+        // A struct pattern always names a concrete type and binds fields off
+        // the concrete value, so it requires the downcast.
+        if (clause.pattern.* == .struct_pattern) {
+            const sp = clause.pattern.struct_pattern;
+            if (sp.struct_name.parts.len > 0) {
+                const target = self.interner.get(sp.struct_name.parts[sp.struct_name.parts.len - 1]);
+                return .{ .concrete = .{ .target_type_name = target, .needs_unbox = true } };
+            }
+            return .catch_all;
+        }
+
+        // A wildcard `_` matches any box.
+        if (clause.pattern.* == .wildcard) return .catch_all;
+
+        // A bind `e` is a catch-all unless qualified by `:: ConcreteType`.
+        if (clause.pattern.* == .bind) {
+            const annotation = clause.type_annotation orelse return .catch_all;
+            // Resolve the annotation's leading type name. A bare named type
+            // (`IOError`, `Error`) is what a rescue annotation is in
+            // practice; anything more complex (applied, function type) is
+            // not a concrete error impl, so treat it as a catch-all.
+            const type_name = self.leadingTypeName(annotation) orelse return .catch_all;
+            const type_struct_name: ast.StructName = .{
+                .parts = &[_]ast.StringId{type_name},
+                .span = .{ .start = 0, .end = 0 },
+            };
+            // `e :: <Protocol>` (the existential the box already carries)
+            // matches any box: no downcast.
+            if (self.isProtocolName(type_struct_name)) return .catch_all;
+            // `e :: ConcreteError`: gate on the runtime type, bind the box.
+            return .{ .concrete = .{ .target_type_name = self.interner.get(type_name), .needs_unbox = false } };
+        }
+
+        // Any other pattern shape (literal, tuple, …) is not a meaningful
+        // rescue discriminator; treat as catch-all so the dispatch stays
+        // total and the type checker's exhaustiveness pass owns diagnostics.
+        return .catch_all;
+    }
+
+    /// Extract the type identifier of a `TypeExpr` when it is a bare named
+    /// type (`IOError`, `Error`). Returns its interned id, or null for
+    /// non-named type expressions (applied, function, tuple, …). Used by
+    /// `rescueDiscriminatorForClause` to resolve a `:: Type` annotation to a
+    /// concrete error name / protocol name.
+    fn leadingTypeName(self: *HirBuilder, type_expr: *const ast.TypeExpr) ?ast.StringId {
+        switch (type_expr.*) {
+            .name => |named| return named.name,
+            .paren => |paren| return self.leadingTypeName(paren.inner),
+            else => return null,
+        }
+    }
+
+    /// Append the synthetic re-raise catch-all arm (Phase 3.a, #185).
+    /// Builds `__rescue_unmatched__ -> raise __rescue_unmatched__` through
+    /// the ordinary `raise` lowering: the binding resolves to the recovered
+    /// `Error` box (the IR dispatch wires the bind local to `error_local`),
+    /// and the `raise` re-raises it — recoverable when nested in an
+    /// enclosing `try`, aborting via the crash report at top level. The arm
+    /// carries a `catch_all` discriminator so the IR dispatch emits it as
+    /// the terminal `else` with no runtime type test.
+    fn appendRescueReraiseArm(
+        self: *HirBuilder,
+        arms: *std.ArrayList(CaseArm),
+        discriminators: *std.ArrayList(RescueDiscriminator),
+        meta: ast.NodeMeta,
+    ) anyerror!void {
+        const interner_mut = @constCast(self.interner);
+        const bind_name = try interner_mut.intern("__rescue_unmatched__");
+
+        // The bind pattern, registered as a top-level (scrutinee) case
+        // binding so a `var_ref` to it inside the arm body resolves to the
+        // recovered box via `buildBindingReference`'s `current_case_bindings`
+        // lookup, and the IR dispatch wires its local to `error_local`.
+        const start_idx = self.current_case_bindings.items.len;
+        const bind_pattern = try self.create(MatchPattern, .{ .bind = bind_name });
+        try self.collectCasePatternBindings(bind_pattern, true);
+
+        // The body: `raise __rescue_unmatched__`. Build the AST `raise`
+        // (whose value is `Kernel.do_raise(<var>)`, exactly what the desugar
+        // produces for a user `raise e`) and lower it through `buildExpr` so
+        // the recoverable-vs-abort selection (`try_scope_depth`) and the
+        // `Never`-stamping fire identically to a hand-written re-raise arm.
+        const var_ref = try self.create(ast.Expr, .{
+            .var_ref = .{ .meta = meta, .name = bind_name },
+        });
+        const do_raise_call = try self.buildDoRaiseCallForReraise(var_ref, meta);
+        const raise_ast = try self.create(ast.Expr, .{
+            .raise_expr = .{ .meta = meta, .value = do_raise_call },
+        });
+        const raise_stmt = try self.allocator.alloc(ast.Stmt, 1);
+        raise_stmt[0] = .{ .expr = raise_ast };
+        const arm_body = try self.buildBlock(raise_stmt);
+
+        const clause_slice = self.current_case_bindings.items[start_idx..];
+        const bindings = try self.allocator.dupe(CaseBinding, clause_slice);
+        try arms.append(self.allocator, .{
+            .pattern = bind_pattern,
+            .guard = null,
+            .body = arm_body,
+            .bindings = bindings,
+        });
+        try discriminators.append(self.allocator, .catch_all);
+        self.current_case_bindings.shrinkRetainingCapacity(start_idx);
+    }
+
+    /// Build the `Kernel.do_raise(<value>)` AST call the synthetic re-raise
+    /// arm's `raise_expr` wraps. Mirrors the desugar's `buildDoRaiseCall`
+    /// for an `Error`-typed value: `raise <value>` desugars to
+    /// `Kernel.do_raise(<value>)`, which the HIR `raise_expr` arm then
+    /// routes to the recoverable sink inside a `try` scope.
+    fn buildDoRaiseCallForReraise(self: *HirBuilder, value: *const ast.Expr, meta: ast.NodeMeta) anyerror!*const ast.Expr {
+        const interner_mut = @constCast(self.interner);
+        const kernel_name = try interner_mut.intern("Kernel");
+        const do_raise_name = try interner_mut.intern("do_raise");
+        const kernel_parts = try self.allocator.dupe(ast.StringId, &.{kernel_name});
+        const kernel_ref = try self.create(ast.Expr, .{
+            .struct_ref = .{ .meta = meta, .name = .{ .parts = kernel_parts, .span = meta.span } },
+        });
+        const callee = try self.create(ast.Expr, .{
+            .field_access = .{ .meta = meta, .object = kernel_ref, .field = do_raise_name },
+        });
+        const args = try self.allocator.dupe(*const ast.Expr, &.{value});
+        return try self.create(ast.Expr, .{
+            .call = .{ .meta = meta, .callee = callee, .args = args },
         });
     }
 

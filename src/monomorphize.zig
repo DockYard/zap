@@ -1700,6 +1700,22 @@ const MonomorphContext = struct {
                         .bindings = arm.bindings,
                     };
                 }
+                // Clone the per-arm rescue discriminators (Phase 3.a, #185).
+                // The concrete target type names are nominal `pub error`
+                // names that survive monomorphization unchanged, so a
+                // shallow per-entry copy of the discriminator slice suffices
+                // — only the owned name byte-slices are duplicated so the
+                // clone never aliases the source program's storage.
+                const new_discriminators = try self.allocator.alloc(hir.RescueDiscriminator, tr.arm_discriminators.len);
+                for (tr.arm_discriminators, 0..) |disc, i| {
+                    new_discriminators[i] = switch (disc) {
+                        .catch_all => .catch_all,
+                        .concrete => |c| .{ .concrete = .{
+                            .target_type_name = try self.allocator.dupe(u8, c.target_type_name),
+                            .needs_unbox = c.needs_unbox,
+                        } },
+                    };
+                }
                 break :blk .{ .try_rescue = .{
                     .body = try self.cloneBlock(tr.body),
                     .arms = new_arms,
@@ -1711,6 +1727,7 @@ const MonomorphContext = struct {
                         try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, tr.result_type_id))
                     else
                         try self.applyActiveProtocolParamTypes(tr.result_type_id),
+                    .arm_discriminators = new_discriminators,
                 } };
             },
             .error_pipe => |ep| blk: {

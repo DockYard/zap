@@ -6992,7 +6992,14 @@ pub const IrBuilder = struct {
                 try self.known_local_types.put(handler_dest, handler_joined_zig);
             }
         }
-        try self.lowerCaseExprBody(handler_dest, error_local, .{ .scrutinee = tr.take_raise_call, .arms = tr.arms });
+        // Phase 3.a (#185): dispatch the rescue arms with RUNTIME type
+        // discrimination against the recovered `Error` box, rather than as a
+        // plain `case` (whose type-binding patterns are wildcard-equivalent
+        // and always take the first arm). Each type-discriminating arm is
+        // gated behind a `protocol_box_vtable_eq` test; the terminal arm is
+        // a catch-all (the synthesized re-raise when the user omitted one),
+        // so an unmatched error re-raises instead of being swallowed.
+        try self.lowerRescueDispatch(handler_dest, error_local, tr.arms, tr.arm_discriminators, tr.result_type_id);
         const then_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
         self.current_instrs = saved_then;
 
@@ -7068,6 +7075,281 @@ pub const IrBuilder = struct {
                 _ = try self.lowerTryRescueBodyStmt(stmt);
             }
         }
+    }
+
+    /// Dispatch the `rescue` arms with RUNTIME type discrimination against
+    /// the recovered `Error` box (Phase 3.a, #185). Emits, in source order,
+    /// a chain of `if protocol_box_vtable_eq(box, <Arm i type>) { <arm i> }
+    /// else { <arm i+1 …> }`, terminating in the final catch-all arm. This
+    /// is what makes multi-clause `rescue` test the boxed error's REAL
+    /// concrete type instead of always taking the first arm (the previous
+    /// behaviour: the arms lowered as a plain `case` whose `e :: T` patterns
+    /// were wildcard-equivalent). The terminal catch-all is the user's `_`
+    /// (or `e`/`e :: <Protocol>`), or the synthesized re-raise arm
+    /// `buildTryRescue` appends — so an error matching no arm re-raises
+    /// rather than being silently swallowed.
+    ///
+    /// `arms[i]` and `discriminators[i]` are 1:1. The last entry is always a
+    /// catch-all (HIR guarantees this), so the recursion has a base case.
+    /// All arm bodies yield to the shared `handler_dest`. `joined_type` is
+    /// the whole `try`/`rescue` result type, used to coerce a divergent
+    /// (`Never`-tailed, e.g. a re-raise) arm's dead merge edge so it peer-
+    /// types cleanly against value-producing sibling arms.
+    fn lowerRescueDispatch(
+        self: *IrBuilder,
+        handler_dest: LocalId,
+        error_local: LocalId,
+        arms: []const hir_mod.CaseArm,
+        discriminators: []const hir_mod.RescueDiscriminator,
+        joined_type: types_mod.TypeId,
+    ) anyerror!void {
+        _ = try self.lowerRescueDispatchFrom(handler_dest, error_local, arms, discriminators, joined_type, 0);
+    }
+
+    /// Recursive worker for `lowerRescueDispatch`: emit the dispatch chain
+    /// for arms `[index..]`, returning the result local the subtree yields
+    /// to `handler_dest` (or null when every reachable arm diverges). A
+    /// catch-all arm emits its body directly (the terminal `else`); a
+    /// type-discriminating arm emits an
+    /// `if vtable_eq(box, Target) { <bound body> } else { <rest> }`.
+    fn lowerRescueDispatchFrom(
+        self: *IrBuilder,
+        handler_dest: LocalId,
+        error_local: LocalId,
+        arms: []const hir_mod.CaseArm,
+        discriminators: []const hir_mod.RescueDiscriminator,
+        joined_type: types_mod.TypeId,
+        index: usize,
+    ) anyerror!?LocalId {
+        const arm = arms[index];
+        const discriminator = discriminators[index];
+
+        switch (discriminator) {
+            .catch_all => {
+                // Terminal arm: bind any whole-scrutinee binding to the box
+                // and lower the body straight into the current stream,
+                // yielding its value to `handler_dest`.
+                return try self.emitRescueArmBody(handler_dest, error_local, arm, null, joined_type);
+            },
+            .concrete => |concrete| {
+                // Resolve the protocol the recovered box carries from
+                // `error_local`'s ZigType (`.protocol_box(<Protocol>)`),
+                // recorded when `take_recoverable_raise`'s result was bound.
+                // Falls back to the `Error` protocol — the only protocol a
+                // recoverable raise stashes — when the box's ZigType has not
+                // been stamped (defensive; the stamp is always present in
+                // practice).
+                const protocol_name = self.protocolNameForBox(error_local) orelse "Error";
+
+                // Guard: does the box hold a `concrete.target_type_name`?
+                const guard_local = self.next_local;
+                self.next_local += 1;
+                try self.known_local_types.put(guard_local, .bool_type);
+                try self.current_instrs.append(self.allocator, .{
+                    .protocol_box_vtable_eq = .{
+                        .dest = guard_local,
+                        .box = error_local,
+                        .protocol_name = protocol_name,
+                        .target_type_name = concrete.target_type_name,
+                    },
+                });
+
+                // Then-branch: the arm fires. Recover the concrete value
+                // when the clause is a struct pattern (its fields are read
+                // off the downcast value); a pure type-binding clause keeps
+                // the binding as the box.
+                const saved_then = self.current_instrs;
+                self.current_instrs = .empty;
+                var unboxed_local: ?LocalId = null;
+                if (concrete.needs_unbox) {
+                    unboxed_local = try self.emitRescueUnbox(error_local, protocol_name, concrete.target_type_name);
+                }
+                const then_result = try self.emitRescueArmBody(handler_dest, error_local, arm, unboxed_local, joined_type);
+                const then_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved_then;
+
+                // Else-branch: the remaining arms (recursively). The final
+                // arm is a catch-all, so this bottoms out.
+                const saved_else = self.current_instrs;
+                self.current_instrs = .empty;
+                const else_result = try self.lowerRescueDispatchFrom(handler_dest, error_local, arms, discriminators, joined_type, index + 1);
+                const else_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved_else;
+
+                try self.current_instrs.append(self.allocator, .{
+                    .if_expr = .{
+                        .dest = handler_dest,
+                        .condition = guard_local,
+                        .then_instrs = then_instrs,
+                        .then_result = then_result,
+                        .else_instrs = else_instrs,
+                        .else_result = else_result,
+                    },
+                });
+                // The merge yields `handler_dest` when at least one edge
+                // produced a value; if both edges diverged it yields null
+                // (the whole subtree diverges).
+                return if (then_result != null or else_result != null) handler_dest else null;
+            },
+        }
+    }
+
+    /// Lower one rescue arm's bindings + body into the current instruction
+    /// stream, assigning the body's value to `handler_dest`.
+    ///
+    /// `scrutinee_for_match` is the local the arm's pattern matches against:
+    /// the box (`error_local`) for a catch-all or a pure type-binding arm
+    /// (the binding stays the boxed `Error`), or the downcast concrete value
+    /// (`unboxed_local`) for a struct-pattern arm (its fields are read off
+    /// the concrete value). A type-binding/whole-value bind is wired with a
+    /// direct `local_get` from the box; a struct-pattern arm reuses the
+    /// general `case`-body lowering against the unboxed scrutinee so its
+    /// field extraction + nested patterns keep working unchanged.
+    fn emitRescueArmBody(
+        self: *IrBuilder,
+        handler_dest: LocalId,
+        error_local: LocalId,
+        arm: hir_mod.CaseArm,
+        unboxed_local: ?LocalId,
+        joined_type: types_mod.TypeId,
+    ) anyerror!?LocalId {
+        if (unboxed_local) |concrete_local| {
+            // Struct-pattern arm: match the (single-arm) pattern against the
+            // unboxed concrete value via the general case-body lowering so
+            // field extraction, nested patterns and guards work unchanged.
+            // A fresh single-arm CaseData reuses `lowerCaseExprBody`'s
+            // decision-tree path; its result flows to `handler_dest`. The
+            // `scrutinee` expr is only a placeholder for the matrix
+            // compiler's id-0 mapping (the real scrutinee is the passed
+            // `concrete_local`), so a bare `local_get` of the unboxed value
+            // is the honest stand-in.
+            const scrutinee_expr = try self.allocator.create(hir_mod.Expr);
+            scrutinee_expr.* = .{
+                .kind = .{ .local_get = concrete_local },
+                .type_id = self.local_hir_types.get(concrete_local) orelse types_mod.TypeStore.UNKNOWN,
+                .span = .{ .start = 0, .end = 0 },
+            };
+            const single_arm = try self.allocSlice(hir_mod.CaseArm, &.{arm});
+            try self.lowerCaseExprBody(handler_dest, concrete_local, .{
+                .scrutinee = scrutinee_expr,
+                .arms = single_arm,
+            });
+            // `lowerCaseExprBody` emits a `case_block` whose own internal
+            // `case_break`s yield to `handler_dest`, so the merge edge's
+            // result is `handler_dest`.
+            return handler_dest;
+        }
+
+        // Catch-all or type-binding arm: bind any whole-scrutinee binding to
+        // the box, then lower the body. The bound variable (e.g. `e`) stays
+        // the boxed `Error` existential so `raise e` / `Error.method(e)` in
+        // the body sees an `Error`.
+        for (arm.bindings) |binding| {
+            if (binding.kind == .scrutinee) {
+                try self.emitLocalGet(binding.local_index, error_local);
+            }
+        }
+        const body_result = try self.lowerBlock(arm.body) orelse return null;
+
+        // A divergent arm body (e.g. the synthesized re-raise, whose tail is
+        // a `Never`-stamped `raise`) must not feed its actual runtime tail
+        // value into the merge: at top level the re-raise's `do_raise` is
+        // `noreturn`, but a recoverable re-raise's `recoverable_raise`
+        // returns `Nil`, which would clash with a value-producing sibling
+        // arm. Mirror `lowerBlockExpecting`'s dead-edge rule: when the body
+        // type is `Never`, the edge is statically dead, so yield a
+        // `typed_undef` of the joined type — a never-read placeholder with
+        // the right peer type. Codegen still emits the divergent call.
+        //
+        // The divergence verdict comes from the HIR `arm.body.result_type`
+        // (the `raise_expr` arm stamps its tail `NEVER`), not the lowered
+        // result local's tracked type — the `do_raise`/`recoverable_raise`
+        // call's result local may carry the runtime return type (`Nil`)
+        // rather than `Never`.
+        const body_hir_type = if (arm.body.result_type == types_mod.TypeStore.NEVER)
+            types_mod.TypeStore.NEVER
+        else
+            self.local_hir_types.get(body_result) orelse types_mod.TypeStore.UNKNOWN;
+        if (body_hir_type == types_mod.TypeStore.NEVER and
+            joined_type != types_mod.TypeStore.UNKNOWN and
+            joined_type != types_mod.TypeStore.NIL and
+            joined_type != types_mod.TypeStore.NEVER)
+        {
+            const placeholder = self.next_local;
+            self.next_local += 1;
+            const joined_zig = typeIdToZigTypeWithStore(joined_type, self.type_store);
+            try self.current_instrs.append(self.allocator, .{
+                .typed_undef = .{ .dest = placeholder, .ty = joined_zig },
+            });
+            try self.local_hir_types.put(placeholder, joined_type);
+            if (joined_zig != .any and joined_zig != .void) {
+                try self.known_local_types.put(placeholder, joined_zig);
+            }
+            try self.current_instrs.append(self.allocator, .{
+                .local_set = .{ .dest = handler_dest, .value = placeholder },
+            });
+            return handler_dest;
+        }
+
+        try self.current_instrs.append(self.allocator, .{
+            .local_set = .{ .dest = handler_dest, .value = body_result },
+        });
+        return handler_dest;
+    }
+
+    /// Emit a `protocol_box_unbox` recovering the concrete `target_type_name`
+    /// value from the recovered `Error` box, returning the concrete local.
+    /// The caller has already gated this behind the matching
+    /// `protocol_box_vtable_eq`, so the downcast is sound.
+    fn emitRescueUnbox(
+        self: *IrBuilder,
+        box_local: LocalId,
+        protocol_name: []const u8,
+        target_type_name: []const u8,
+    ) anyerror!LocalId {
+        const unboxed_local = self.next_local;
+        self.next_local += 1;
+        const target_zig: ZigType = .{ .struct_ref = target_type_name };
+        try self.current_instrs.append(self.allocator, .{
+            .protocol_box_unbox = .{
+                .dest = unboxed_local,
+                .box = box_local,
+                .protocol_name = protocol_name,
+                .target_type_name = target_type_name,
+                .target_zig_type = target_zig,
+            },
+        });
+        try self.known_local_types.put(unboxed_local, target_zig);
+        // Record the unboxed value's HIR struct type so field extraction in
+        // the arm body (struct_match) resolves field types/storage correctly.
+        if (self.structHirTypeByName(target_type_name)) |struct_hir_type| {
+            try self.local_hir_types.put(unboxed_local, struct_hir_type);
+        }
+        return unboxed_local;
+    }
+
+    /// Resolve the bare protocol name a `protocol_box` local carries from its
+    /// recorded ZigType (`.protocol_box(<Protocol>)`). Returns null when the
+    /// local's ZigType is absent or not a protocol box.
+    fn protocolNameForBox(self: *const IrBuilder, box_local: LocalId) ?[]const u8 {
+        const zig_type = self.known_local_types.get(box_local) orelse blk: {
+            const hir_type = self.local_hir_types.get(box_local) orelse return null;
+            break :blk typeIdToZigTypeWithStore(hir_type, self.type_store);
+        };
+        if (zig_type == .protocol_box) return zig_type.protocol_box;
+        return null;
+    }
+
+    /// Look up the HIR struct TypeId for a concrete struct by its name, used
+    /// to stamp an unboxed rescue value so its field extraction resolves the
+    /// right struct layout. Returns null when the store is absent, the name
+    /// is not interned, or no matching struct type exists.
+    fn structHirTypeByName(self: *const IrBuilder, name: []const u8) ?hir_mod.TypeId {
+        const store = self.type_store orelse return null;
+        const name_id = self.interner.lookupExisting(name) orelse return null;
+        const type_id = store.name_to_type.get(name_id) orelse return null;
+        if (store.getType(type_id) == .struct_type) return type_id;
+        return null;
     }
 
     /// Lower one statement of a `try` body or `after` block, returning the
