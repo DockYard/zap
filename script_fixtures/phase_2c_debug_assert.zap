@@ -6,10 +6,10 @@
 #   * ReleaseSmall: ELIDED  — runs past it, returns 0.
 #
 # So:
-#   zap run  ... -Doptimize=debug         -> aborts (assertion_error)
-#   zap run  ... -Doptimize=release_safe  -> prints "survived" exit 0
-#   zap run  ... -Doptimize=release_fast  -> prints "survived" exit 0
-#   zap run  ... -Doptimize=release_small -> prints "survived" exit 0
+#   zap run -Doptimize=Debug ...         -> aborts (assertion_error)
+#   zap run -Doptimize=ReleaseSafe ...  -> prints "survived" exit 0
+#   zap run -Doptimize=ReleaseFast ...  -> prints "survived" exit 0
+#   zap run -Doptimize=ReleaseSmall ... -> prints "survived" exit 0
 
 pub struct DebugAssertCrash {
   pub fn check() -> Nil {

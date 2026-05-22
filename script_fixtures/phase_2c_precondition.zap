@@ -7,10 +7,10 @@
 #   * ReleaseSmall: ELIDED  — runs past it, prints "survived", exit 0.
 #
 # So:
-#   zap run ... -Doptimize=debug         -> aborts (assertion_error)
-#   zap run ... -Doptimize=release_safe  -> aborts (assertion_error)
-#   zap run ... -Doptimize=release_fast  -> prints "survived" exit 0
-#   zap run ... -Doptimize=release_small -> prints "survived" exit 0
+#   zap run -Doptimize=Debug ...         -> aborts (assertion_error)
+#   zap run -Doptimize=ReleaseSafe ...  -> aborts (assertion_error)
+#   zap run -Doptimize=ReleaseFast ...  -> prints "survived" exit 0
+#   zap run -Doptimize=ReleaseSmall ... -> prints "survived" exit 0
 
 pub struct PreconditionCrash {
   pub fn check() -> Nil {

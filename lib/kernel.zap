@@ -408,19 +408,24 @@ pub struct Kernel {
     a symbolized Zap backtrace. Returns `Never` — it does not return.
     """
 
+  fn contract_location_suffix(location :: String) -> String {
+    if location == "" {
+      ""
+    } else {
+      :zig.String.concat(:zig.String.concat(" (at ", location), ")")
+    }
+  }
+
+  fn contract_message_prefix(condition_source :: String, message :: String) -> String {
+    if message == "" {
+      :zig.String.concat("assertion failed: ", condition_source)
+    } else {
+      :zig.String.concat(:zig.String.concat(message, ": "), condition_source)
+    }
+  }
+
   pub fn contract_violation(condition_source :: String, message :: String, location :: String) -> Never {
-    prefix = if message == "" {
-      "assertion failed: " <> condition_source
-    } else {
-      message <> ": " <> condition_source
-    }
-
-    rendered = if location == "" {
-      prefix
-    } else {
-      prefix <> " (at " <> location <> ")"
-    }
-
+    rendered = :zig.String.concat(contract_message_prefix(condition_source, message), contract_location_suffix(location))
     do_raise(%AssertionError{message: rendered})
   }
 

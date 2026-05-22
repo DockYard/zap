@@ -4719,6 +4719,7 @@ fn cachedOrExpandTopLevelProgram(
             collector,
             diag_engine,
             compiled_executor,
+            optimize_mode,
         );
         try updateImplDeclsInProgram(collector, &expanded);
         return expanded;
