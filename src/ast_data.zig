@@ -795,6 +795,64 @@ fn unopToString(op: ast.UnaryOp.Op) []const u8 {
 // Reverse conversion: CtValue 3-tuple → ast.Expr
 // ============================================================
 
+/// Decode an `{:__aliases__, meta, [:Part1, :Part2, ...]}` CtValue
+/// 3-tuple back into a `.struct_ref` AST node, reconstructing any
+/// parametric `type_args` the encoder stashed on the meta keyword
+/// list (see `structRefMetaWithTypeArgs`). Shared by the two decode
+/// sites that can encounter an `__aliases__` form: a bare struct
+/// reference (`Option(i64).None`) and a parametric variant
+/// constructor used as a *call callee* (`Option(i64).Some(42)`,
+/// whose call form slot holds this very 3-tuple). `aliases_tuple`
+/// MUST be a 3-tuple whose first element is the `__aliases__` atom.
+fn aliasesTupleToStructRef(
+    alloc: Allocator,
+    interner: *ast.StringInterner,
+    aliases_tuple: CtValue,
+    node_meta: ast.NodeMeta,
+) error{OutOfMemory}!*const ast.Expr {
+    const elems = aliases_tuple.tuple.elems;
+    const meta_value = elems[1];
+    const args_value = elems[2];
+
+    var parts: std.ArrayListUnmanaged(ast.StringId) = .empty;
+    if (args_value == .list) {
+        for (args_value.list.elems) |elem| {
+            if (elem == .atom) {
+                try parts.append(alloc, try interner.intern(elem.atom));
+            }
+        }
+    }
+
+    // Decode parametric type-args from the meta keyword list, mirroring
+    // the bare-`__aliases__` decode arm in `ctValueToExpr`.
+    var type_args: []const *const ast.TypeExpr = &.{};
+    if (meta_value == .list) {
+        for (meta_value.list.elems) |pair| {
+            if (pair != .tuple or pair.tuple.elems.len != 2) continue;
+            const key = pair.tuple.elems[0];
+            if (key != .atom) continue;
+            if (!std.mem.eql(u8, key.atom, "type_args")) continue;
+            const args_val = pair.tuple.elems[1];
+            if (args_val != .list) continue;
+            var decoded: std.ArrayListUnmanaged(*const ast.TypeExpr) = .empty;
+            for (args_val.list.elems) |arg_ct| {
+                const te = ctValueToTypeExpr(alloc, interner, arg_ct) catch continue;
+                try decoded.append(alloc, te);
+            }
+            type_args = try decoded.toOwnedSlice(alloc);
+            break;
+        }
+    }
+
+    const expr = try alloc.create(ast.Expr);
+    expr.* = .{ .struct_ref = .{
+        .meta = node_meta,
+        .name = .{ .parts = try parts.toOwnedSlice(alloc), .span = node_meta.span },
+        .type_args = type_args,
+    } };
+    return expr;
+}
+
 /// Convert a CtValue 3-tuple back to an ast.Expr.
 pub fn ctValueToExpr(
     alloc: Allocator,
@@ -957,6 +1015,36 @@ pub fn ctValueToExpr(
                 callee.* = .{ .field_access = .{ .meta = node_meta, .object = object, .field = field_name } };
 
                 // Build the call with the dot-access callee
+                const arg_elems = if (args == .list) args.list.elems else &[_]CtValue{};
+                var call_args: std.ArrayListUnmanaged(*const ast.Expr) = .empty;
+                for (arg_elems) |arg| {
+                    try call_args.append(alloc, try ctValueToExpr(alloc, interner, arg));
+                }
+
+                const expr = try alloc.create(ast.Expr);
+                expr.* = .{ .call = .{
+                    .meta = node_meta,
+                    .callee = callee,
+                    .args = try call_args.toOwnedSlice(alloc),
+                } };
+                return expr;
+            }
+
+            // Parametric variant constructor used as a call callee:
+            // `Option(i64).Some(42)` parses to a `.call` whose callee
+            // is a `struct_ref` (`name.parts = [Option, Some]`,
+            // `type_args = [i64]`). The encoder turns that callee into
+            // an `{:__aliases__, meta, [:Option, :Some]}` form tuple
+            // sitting in the call's form slot. Reconstruct the
+            // struct_ref callee (preserving `type_args`) and rebuild
+            // the call. Without this the form fell through to the
+            // `nil_literal` fallback below, collapsing the whole
+            // construction to `nil` — the `zap test`
+            // "argument 1 expects `Option({type_var})`, got `Nil`"
+            // regression for quoted (Zest `test`/`describe`) bodies.
+            if (dot_form == .atom and std.mem.eql(u8, dot_form.atom, "__aliases__")) {
+                const callee = try aliasesTupleToStructRef(alloc, interner, form, node_meta);
+
                 const arg_elems = if (args == .list) args.list.elems else &[_]CtValue{};
                 var call_args: std.ArrayListUnmanaged(*const ast.Expr) = .empty;
                 for (arg_elems) |arg| {
@@ -1832,6 +1920,41 @@ fn ctValueToPattern(
                 const tail = try ctValueToPattern(alloc, interner, pat_args.list.elems[1]);
                 const pat = try alloc.create(ast.Pattern);
                 pat.* = .{ .list_cons = .{ .meta = meta, .heads = try heads.toOwnedSlice(alloc), .tail = tail } };
+                return pat;
+            }
+        }
+
+        // Tagged-union variant pattern: {:variant, meta, [aliases, payload_or_nil]}.
+        // Mirrors the `.tagged_union_variant` encoder in `patternToCtValue`:
+        // the qualifier is an `__aliases__` segment list (`[Option, Some]`)
+        // and the payload is either a nested destructuring pattern or `nil`
+        // for a nullary variant (`Option.None`). Reconstructing this is what
+        // keeps a `case` arm like `Option.Some(v) -> v` binding `v` after a
+        // quote/unquote round-trip (Zest `test`/`describe` bodies); without
+        // it the pattern collapsed to a bare wildcard and dropped the binding.
+        if (form == .atom and std.mem.eql(u8, form.atom, "variant")) {
+            if (pat_args == .list and pat_args.list.elems.len == 2) {
+                const aliases_ct = pat_args.list.elems[0];
+                const payload_ct = pat_args.list.elems[1];
+
+                var parts: std.ArrayListUnmanaged(ast.StringId) = .empty;
+                if (aliases_ct == .tuple and aliases_ct.tuple.elems.len == 3 and aliases_ct.tuple.elems[2] == .list) {
+                    for (aliases_ct.tuple.elems[2].list.elems) |part| {
+                        if (part == .atom) try parts.append(alloc, try interner.intern(part.atom));
+                    }
+                }
+
+                const payload: ?*const ast.Pattern = if (payload_ct == .nil)
+                    null
+                else
+                    try ctValueToPattern(alloc, interner, payload_ct);
+
+                const pat = try alloc.create(ast.Pattern);
+                pat.* = .{ .tagged_union_variant = .{
+                    .meta = meta,
+                    .qualifier = .{ .parts = try parts.toOwnedSlice(alloc), .span = meta.span },
+                    .payload = payload,
+                } };
                 return pat;
             }
         }
@@ -3408,6 +3531,118 @@ test "round-trip: nil literal" {
     const back = try ctValueToExpr(alloc, &interner, ct);
 
     try std.testing.expect(back.* == .nil_literal);
+}
+
+test "round-trip: parametric variant constructor call (Option(i64).Some(42))" {
+    // G4: `Option(i64).Some(42)` parses to a `.call` whose callee is a
+    // `struct_ref { name.parts = [Option, Some], type_args = [i64] }`.
+    // The encoder turns the callee into a `{:__aliases__, meta, [...]}`
+    // CtValue; the decoder must recognise an `__aliases__` form sitting
+    // in the call's *form* slot and rebuild the variant-constructor
+    // call (callee struct_ref + args). Before the fix the decoder hit
+    // the "unrecognised non-atom form" fallback and emitted `nil`,
+    // collapsing the whole construction to a `nil_literal` — the
+    // `zap test` "argument 1 expects Option({type_var}), got Nil" bug.
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const meta = ast.NodeMeta{ .span = span };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = AllocationStore{};
+
+    const option_id = try interner.intern("Option");
+    const some_id = try interner.intern("Some");
+    const i64_id = try interner.intern("i64");
+
+    const i64_type = try alloc.create(ast.TypeExpr);
+    i64_type.* = .{ .name = .{ .meta = meta, .name = i64_id, .args = &.{} } };
+    const type_args = try alloc.alloc(*const ast.TypeExpr, 1);
+    type_args[0] = i64_type;
+
+    const parts = try alloc.alloc(ast.StringId, 2);
+    parts[0] = option_id;
+    parts[1] = some_id;
+
+    const callee = try alloc.create(ast.Expr);
+    callee.* = .{ .struct_ref = .{
+        .meta = meta,
+        .name = .{ .parts = parts, .span = span },
+        .type_args = type_args,
+    } };
+
+    const arg = try alloc.create(ast.Expr);
+    arg.* = .{ .int_literal = .{ .meta = meta, .value = 42 } };
+    const args = try alloc.alloc(*const ast.Expr, 1);
+    args[0] = arg;
+
+    const orig = try alloc.create(ast.Expr);
+    orig.* = .{ .call = .{ .meta = meta, .callee = callee, .args = args } };
+
+    const ct = try exprToCtValue(alloc, &interner, &store, orig);
+    const back = try ctValueToExpr(alloc, &interner, ct);
+
+    try std.testing.expect(back.* == .call);
+    try std.testing.expect(back.call.callee.* == .struct_ref);
+    try std.testing.expectEqual(@as(usize, 2), back.call.callee.struct_ref.name.parts.len);
+    try std.testing.expect(std.mem.eql(u8, interner.get(back.call.callee.struct_ref.name.parts[0]), "Option"));
+    try std.testing.expect(std.mem.eql(u8, interner.get(back.call.callee.struct_ref.name.parts[1]), "Some"));
+    try std.testing.expectEqual(@as(usize, 1), back.call.callee.struct_ref.type_args.len);
+    try std.testing.expectEqual(@as(usize, 1), back.call.args.len);
+    try std.testing.expect(back.call.args[0].* == .int_literal);
+    try std.testing.expectEqual(@as(i64, 42), back.call.args[0].int_literal.value);
+}
+
+test "round-trip: tagged-union variant pattern (Option.Some(v))" {
+    // G4 (pattern half): a `case` arm pattern `Option.Some(v)` is a
+    // `tagged_union_variant` pattern (qualifier `[Option, Some]`,
+    // payload bind `v`). The encoder emits `{:variant, meta, [aliases,
+    // payload]}`; the decoder must rebuild the variant pattern with its
+    // payload binding intact. Before the fix the decoder had no
+    // `variant` arm and fell through to a bare `wildcard`, dropping the
+    // `v` binding — so the arm body `-> v` referenced an undefined
+    // value and lowering produced "expected type 'i64', found 'void'"
+    // for the destructuring tests in option_test.zap / result_test.zap.
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const meta = ast.NodeMeta{ .span = span };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = AllocationStore{};
+
+    const option_id = try interner.intern("Option");
+    const some_id = try interner.intern("Some");
+    const v_id = try interner.intern("v");
+
+    const parts = try alloc.alloc(ast.StringId, 2);
+    parts[0] = option_id;
+    parts[1] = some_id;
+
+    const payload = try alloc.create(ast.Pattern);
+    payload.* = .{ .bind = .{ .meta = meta, .name = v_id } };
+
+    const orig = try alloc.create(ast.Pattern);
+    orig.* = .{ .tagged_union_variant = .{
+        .meta = meta,
+        .qualifier = .{ .parts = parts, .span = span },
+        .payload = payload,
+    } };
+
+    const ct = try patternToCtValue(alloc, &interner, &store, orig);
+    const back = try ctValueToPattern(alloc, &interner, ct);
+
+    try std.testing.expect(back.* == .tagged_union_variant);
+    try std.testing.expectEqual(@as(usize, 2), back.tagged_union_variant.qualifier.parts.len);
+    try std.testing.expect(std.mem.eql(u8, interner.get(back.tagged_union_variant.qualifier.parts[0]), "Option"));
+    try std.testing.expect(std.mem.eql(u8, interner.get(back.tagged_union_variant.qualifier.parts[1]), "Some"));
+    try std.testing.expect(back.tagged_union_variant.payload != null);
+    try std.testing.expect(back.tagged_union_variant.payload.?.* == .bind);
+    try std.testing.expect(std.mem.eql(u8, interner.get(back.tagged_union_variant.payload.?.bind.name), "v"));
 }
 
 test "round-trip: pipe" {
