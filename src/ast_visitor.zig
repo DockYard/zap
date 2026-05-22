@@ -284,6 +284,7 @@ pub fn AstVisitor(comptime Context: type) type {
                 .unquote_expr => |ue| try visitExpr(ctx, ue.expr),
                 .unquote_splicing_expr => |ue| try visitExpr(ctx, ue.expr),
                 .panic_expr => |pe| try visitExpr(ctx, pe.message),
+                .raise_expr => |re| try visitExpr(ctx, re.value),
                 .error_pipe => |ep| {
                     try visitExpr(ctx, ep.chain);
                     switch (ep.handler) {

@@ -5457,6 +5457,19 @@ pub const HirBuilder = struct {
                 .type_id = types_mod.TypeStore.NEVER,
                 .span = pe.meta.span,
             }),
+            .raise_expr => |re| {
+                // Phase 1.4: the desugar pass already rewrote `raise <value>`
+                // into a `raise_expr` whose `value` is the
+                // `Kernel.do_raise(<value>)` call (the Error-aware abort, a
+                // `Never`-returning function). The `raise_expr` wrapper only
+                // survived desugar so the type-checker could record the
+                // raised error type into the inferred `raises` row; HIR
+                // lowers it transparently by building the inner call. The
+                // call to a `Never` function is the diverging terminator —
+                // Zig sees it as noreturn, so no explicit unreachable is
+                // needed.
+                return try self.buildExpr(re.value);
+            },
             .tuple => |t| {
                 var elems: std.ArrayList(*const Expr) = .empty;
                 for (t.elements) |elem| {

@@ -298,6 +298,11 @@ pub fn exprToCtValue(
             const args = try makeList(alloc, store, &.{msg});
             return makeTuple3(alloc, store, .{ .atom = "panic" }, try metaToList(alloc, store, v.meta, null), args);
         },
+        .raise_expr => |v| {
+            const value = try exprToCtValue(alloc, interner, store, v.value);
+            const args = try makeList(alloc, store, &.{value});
+            return makeTuple3(alloc, store, .{ .atom = "raise" }, try metaToList(alloc, store, v.meta, null), args);
+        },
         .try_expr => |v| {
             const inner = try exprToCtValue(alloc, interner, store, v.value);
             const args = try makeList(alloc, store, &.{inner});
@@ -1422,6 +1427,15 @@ pub fn ctValueToExpr(
             const msg = try ctValueToExpr(alloc, interner, arg_elems[0]);
             const expr = try alloc.create(ast.Expr);
             expr.* = .{ .panic_expr = .{ .meta = node_meta, .message = msg } };
+            return expr;
+        }
+    }
+
+    if (std.mem.eql(u8, form_name, "raise")) {
+        if (arg_elems.len == 1) {
+            const raised_value = try ctValueToExpr(alloc, interner, arg_elems[0]);
+            const expr = try alloc.create(ast.Expr);
+            expr.* = .{ .raise_expr = .{ .meta = node_meta, .value = raised_value } };
             return expr;
         }
     }

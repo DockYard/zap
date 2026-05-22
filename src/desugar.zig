@@ -1362,6 +1362,48 @@ pub const Desugarer = struct {
                     },
                 });
             },
+            .raise_expr => |re| {
+                // Phase 1.4 `raise <value>` lowering: rewrite to a call of
+                // `Kernel.do_raise(<value>)`, the Error-aware abort. The
+                // `do_raise/1` family (lib/kernel.zap) is multi-clause:
+                //
+                //   * `do_raise(message :: String)` — the `raise "string"`
+                //     shorthand path: wraps the message in
+                //     `%RuntimeError{message: ...}` and recurses. This lives
+                //     in Zap (not the desugar) so it handles ANY String-typed
+                //     value (`raise "x" <> y`, `raise some_string`), not just
+                //     bare string literals.
+                //   * `do_raise(error_value :: Error)` — extracts
+                //     `Error.message`/`Error.kind` and aborts non-zero.
+                //
+                // Building the call here in desugar — BEFORE the type-checker
+                // runs — lets it resolve through the normal call-inference +
+                // multi-clause-dispatch + monomorphization path (synthesising
+                // it post-typecheck in HIR would leave the callee untyped and
+                // fall back to a closure call). The `raise_expr` wrapper
+                // survives only so the type-checker can record the raised
+                // error type into the enclosing function's inferred `raises`
+                // row; HIR lowers it transparently.
+                const desugared_value = try self.desugarExpr(re.value);
+                // Eagerly normalise a bare string LITERAL / interpolation to
+                // `%RuntimeError{message: ...}` so the common `raise "msg"`
+                // case carries a concrete `RuntimeError` value (this makes
+                // the type-checker record `RuntimeError` — not `String` — in
+                // the inferred `raises` row). Non-literal String-typed values
+                // (`raise x <> y`) are left as-is and handled by the
+                // `do_raise(String)` clause at runtime.
+                const error_value: *const ast.Expr = switch (desugared_value.*) {
+                    .string_literal, .string_interpolation => try self.wrapStringInRuntimeError(desugared_value, re.meta),
+                    else => desugared_value,
+                };
+                const do_raise_call = try self.buildDoRaiseCall(error_value, re.meta);
+                return try self.create(ast.Expr, .{
+                    .raise_expr = .{
+                        .meta = re.meta,
+                        .value = do_raise_call,
+                    },
+                });
+            },
             .type_annotated => |ta| {
                 return try self.create(ast.Expr, .{
                     .type_annotated = .{
@@ -1946,6 +1988,61 @@ pub const Desugarer = struct {
     // ============================================================
     // Allocation helpers
     // ============================================================
+
+    /// Wrap a `String`-valued expression in a `%RuntimeError{message: ...}`
+    /// struct literal. Backs the Phase 1.4 `raise "string"` shorthand: the
+    /// `raise_expr` desugar normalises a bare string value into a concrete
+    /// `RuntimeError` Error value so the rest of the pipeline sees a uniform
+    /// `raise <Error>` shape. `RuntimeError` is the stdlib default error
+    /// type defined in `lib/error.zap`.
+    fn wrapStringInRuntimeError(self: *Desugarer, string_value: *const ast.Expr, meta: ast.NodeMeta) !*const ast.Expr {
+        const runtime_error_name = try self.interner.intern("RuntimeError");
+        const message_field_name = try self.interner.intern("message");
+
+        const parts = try self.allocSlice(ast.StringId, &.{runtime_error_name});
+        const fields = try self.allocSlice(ast.StructField, &.{
+            .{ .name = message_field_name, .value = string_value },
+        });
+
+        return try self.create(ast.Expr, .{
+            .struct_expr = .{
+                .meta = meta,
+                .struct_name = .{ .parts = parts, .span = meta.span },
+                .update_source = null,
+                .fields = fields,
+            },
+        });
+    }
+
+    /// Build the `Kernel.do_raise(<error_value>)` call that backs the
+    /// Phase 1.4 `raise` keyword. `do_raise/1` (lib/kernel.zap) is the
+    /// Error-aware abort: it extracts `Error.message`/`Error.kind` from the
+    /// value and aborts non-zero. Constructed in desugar so the call is
+    /// type-checked and monomorphized through the normal path.
+    fn buildDoRaiseCall(self: *Desugarer, error_value: *const ast.Expr, meta: ast.NodeMeta) !*const ast.Expr {
+        const kernel_name = try self.interner.intern("Kernel");
+        const do_raise_name = try self.interner.intern("do_raise");
+
+        // `Kernel` is a struct (type) name — it must be a `struct_ref`, not
+        // a `var_ref`, so call resolution treats
+        // `field_access(struct_ref(Kernel), do_raise)` as a static struct
+        // function call rather than a dynamic field access (which would
+        // lower to a `call_closure` and fail to emit).
+        const kernel_parts = try self.allocSlice(ast.StringId, &.{kernel_name});
+        const kernel_ref = try self.create(ast.Expr, .{
+            .struct_ref = .{
+                .meta = meta,
+                .name = .{ .parts = kernel_parts, .span = meta.span },
+            },
+        });
+        const callee = try self.create(ast.Expr, .{
+            .field_access = .{ .meta = meta, .object = kernel_ref, .field = do_raise_name },
+        });
+        const args = try self.allocSlice(*const ast.Expr, &.{error_value});
+        return try self.create(ast.Expr, .{
+            .call = .{ .meta = meta, .callee = callee, .args = args },
+        });
+    }
 
     fn create(self: *Desugarer, comptime T: type, value: T) !*const T {
         const ptr = try self.allocator.create(T);

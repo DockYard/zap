@@ -868,6 +868,32 @@ fn extractStructReferences(
         }
     }
 
+    // Phase 1.4 `raise` desugar introduces references to `RuntimeError`
+    // (for the `raise "string"` shorthand, normalised to
+    // `%RuntimeError{...}`) plus `Error`/`Option` (RuntimeError is a
+    // `pub error`, so its auto-injected `cause :: Option(Error)` field and
+    // `pub impl Error` block pull those in). Those identifiers never
+    // appear in the user's source, so the lexer-driven discovery — which
+    // runs BEFORE desugar — would otherwise never load `lib/error.zap`.
+    // As soon as the file uses the contextual `raise` keyword, seed the
+    // reference set so the standard import-driven loader picks them up.
+    {
+        var scout = zap.Lexer.init(source);
+        while (true) {
+            const tok = scout.next();
+            if (tok.tag == .eof) break;
+            if (tok.isRaiseIdent(source)) {
+                const runtime_error_name = try alloc.dupe(u8, "RuntimeError");
+                try refs.put(runtime_error_name, {});
+                const option_name = try alloc.dupe(u8, "Option");
+                try refs.put(option_name, {});
+                const error_name = try alloc.dupe(u8, "Error");
+                try refs.put(error_name, {});
+                break;
+            }
+        }
+    }
+
     while (true) {
         const tok = lexer.next();
         if (tok.tag == .eof) break;

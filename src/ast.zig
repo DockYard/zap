@@ -703,6 +703,7 @@ pub const Expr = union(enum) {
 
     // Error handling
     panic_expr: PanicExpr,
+    raise_expr: RaiseExpr,
     error_pipe: ErrorPipeExpr,
     try_expr: TryExpr,
 
@@ -758,6 +759,7 @@ pub const Expr = union(enum) {
             .unquote_expr => |v| v.meta,
             .unquote_splicing_expr => |v| v.meta,
             .panic_expr => |v| v.meta,
+            .raise_expr => |v| v.meta,
             .error_pipe => |v| v.meta,
             .try_expr => |v| v.meta,
             .block => |v| v.meta,
@@ -1063,6 +1065,22 @@ pub const UnquoteSplicingExpr = struct {
 pub const PanicExpr = struct {
     meta: NodeMeta,
     message: *const Expr,
+};
+
+/// The Error-aware `raise` keyword (Phase 1.4).
+///
+/// `raise <value>` aborts the program by routing `value` — which must
+/// implement the `Error` protocol — through `Kernel.do_raise/1`, which
+/// extracts `Error.message`/`Error.kind` and aborts non-zero. The
+/// `raise "string"` shorthand is normalised in `src/desugar.zig` by
+/// wrapping the string literal in a `%RuntimeError{message: <string>}`
+/// struct expression, so by HIR time every `raise` carries a concrete
+/// Error value. The type-checker records `value`'s type into the
+/// enclosing function's inferred `raises` row; the expression's own
+/// type is `Never`.
+pub const RaiseExpr = struct {
+    meta: NodeMeta,
+    value: *const Expr,
 };
 
 pub const BlockExpr = struct {
@@ -1422,7 +1440,7 @@ pub const TypeParenExpr = struct {
 // visitors. Adding a variant always warrants a `git grep` for the
 // nearby variants to find any pass-specific handlers.
 
-const expected_expr_variants: usize = 38;
+const expected_expr_variants: usize = 39;
 const expected_pattern_variants: usize = 12;
 const expected_type_expr_variants: usize = 11;
 const expected_top_item_variants: usize = 16;

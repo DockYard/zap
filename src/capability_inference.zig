@@ -216,6 +216,7 @@ fn walkExpr(
             }
         },
         .panic_expr => |pe| try walkExpr(allocator, record, pe.message, interner),
+        .raise_expr => |re| try walkExpr(allocator, record, re.value, interner),
         .type_annotated => |ta| try walkExpr(allocator, record, ta.expr, interner),
 
         .call => |call| try walkCall(allocator, record, call, interner),

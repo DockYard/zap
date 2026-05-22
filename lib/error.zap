@@ -86,3 +86,36 @@ pub protocol Error {
 
   fn code(e) -> Option(Atom)
 }
+
+@doc = """
+  The default error type for ad-hoc, unstructured failures.
+
+  `RuntimeError` is the target of the `raise "string"` shorthand
+  (Phase 1.4): the compiler desugars
+
+      raise "boom"
+
+  into
+
+      raise %RuntimeError{message: "boom"}
+
+  routing through the Error-aware `Kernel.do_raise/1` abort. It is a
+  plain `pub error` declaration, so the Phase 1.2 desugar auto-injects
+  its `message :: String = "RuntimeError"` and
+  `cause :: Option(Error) = Option.None` fields and the four `Error`
+  protocol methods. Its `kind/1` is the snake-cased type name
+  (`:runtime_error`).
+
+  `RuntimeError` is kept deliberately for ergonomic scripting and test
+  code. Production code reaching a `pub` API surface should prefer a
+  named `pub error`; the `raise "string"` shorthand on `pub` functions
+  is CI-linted (warn-only) toward that end.
+
+  ## Examples
+
+      e = %RuntimeError{message: "disk full"}
+      Error.message(e)   # => "disk full"
+      Error.kind(e)      # => :runtime_error
+  """
+
+pub error RuntimeError {}

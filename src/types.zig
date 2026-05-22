@@ -3184,7 +3184,7 @@ pub const TypeChecker = struct {
                 return false;
             },
             .anonymous_function => return false,
-            .case_expr, .panic_expr, .quote_expr, .unquote_expr, .intrinsic, .attr_ref, .binary_literal, .function_ref => return true,
+            .case_expr, .panic_expr, .raise_expr, .quote_expr, .unquote_expr, .intrinsic, .attr_ref, .binary_literal, .function_ref => return true,
             else => return false,
         }
     }
@@ -4518,6 +4518,7 @@ pub const TypeChecker = struct {
             .unquote_expr => |unquote| try self.validateExprDoesNotCallUnderscoreFunctions(unquote.expr),
             .unquote_splicing_expr => |unquote_splicing| try self.validateExprDoesNotCallUnderscoreFunctions(unquote_splicing.expr),
             .panic_expr => |panic_expr| try self.validateExprDoesNotCallUnderscoreFunctions(panic_expr.message),
+            .raise_expr => |raise_expr| try self.validateExprDoesNotCallUnderscoreFunctions(raise_expr.value),
             .error_pipe => |error_pipe| {
                 try self.validateExprDoesNotCallUnderscoreFunctions(error_pipe.chain);
                 switch (error_pipe.handler) {
@@ -6214,6 +6215,30 @@ pub const TypeChecker = struct {
             },
             .panic_expr => |pe| {
                 _ = try self.inferExpr(pe.message);
+                return TypeStore.NEVER;
+            },
+            .raise_expr => |re| {
+                // Phase 1.4: `raise <value>` contributes the raised error's
+                // type to the enclosing function's inferred `raises` row,
+                // exactly like a propagated `?`. `raise %ParseError{...}`
+                // records `ParseError`; `raise "string"` records
+                // `RuntimeError` (the desugar already wrapped the string).
+                //
+                // The desugar lowered `re.value` to a `Kernel.do_raise(arg)`
+                // call, so the raised error type is the type of that call's
+                // single argument. We type-check the whole call (so the
+                // `do_raise` resolution + arg auto-boxing happen normally),
+                // then read the argument's type for the `raises` row. The
+                // expression itself diverges, so its type is `Never`.
+                if (re.value.* == .call and re.value.call.args.len == 1) {
+                    const raised_type = try self.inferExpr(re.value.call.args[0]);
+                    _ = try self.inferExpr(re.value);
+                    if (raised_type != TypeStore.UNKNOWN and raised_type != TypeStore.NEVER) {
+                        try self.recordRaisedErrorType(raised_type, re.meta.span);
+                    }
+                } else {
+                    _ = try self.inferExpr(re.value);
+                }
                 return TypeStore.NEVER;
             },
             .unwrap => TypeStore.UNKNOWN,

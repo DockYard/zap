@@ -5105,6 +5105,7 @@ fn findUndesugaredMacroFormInExpr(expr: *const ast.Expr) ?UndesugaredMacroForm {
             break :blk null;
         },
         .panic_expr => |panic_expr| findUndesugaredMacroFormInExpr(panic_expr.message),
+        .raise_expr => |raise_expr| findUndesugaredMacroFormInExpr(raise_expr.value),
         .unwrap => |unwrap| findUndesugaredMacroFormInExpr(unwrap.expr),
         .type_annotated => |type_annotated| findUndesugaredMacroFormInExpr(type_annotated.expr),
         .anonymous_function => |anonymous| findUndesugaredMacroFormInFunction(anonymous.decl),
@@ -10996,6 +10997,17 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
             mutable.* = pe.message.*;
             try remapExpr(alloc, mutable, remap);
             pe.message = mutable;
+        },
+        // Phase 1.4: the `raise_expr` value subtree carries StringIds (the
+        // wrapped `%RuntimeError{message: ...}` struct name and field names,
+        // or a `%CustomError{...}` literal), so it MUST be remapped across
+        // the per-unit local interner → merged global interner boundary,
+        // exactly like every other StringId-bearing AST field.
+        .raise_expr => |*re| {
+            const mutable = try alloc.create(ast.Expr);
+            mutable.* = re.value.*;
+            try remapExpr(alloc, mutable, remap);
+            re.value = mutable;
         },
         .error_pipe => |*ep| {
             const mutable_chain = try alloc.create(ast.Expr);

@@ -3064,6 +3064,16 @@ pub const Parser = struct {
                 if (self.current.isUnquoteSplicingIdent(self.source) and self.peekNext() == .left_paren) {
                     return self.parseUnquoteSplicingExpr();
                 }
+                // `raise` is a contextual keyword (Phase 1.4). It triggers
+                // the Error-aware raise form only when it leads an
+                // expression — i.e. the next token can begin a value. A
+                // bare `raise` not followed by a value token (or followed
+                // by `.`, making it `raise.field`) keeps its identifier
+                // reading so `Kernel.raise/1` and any local named `raise`
+                // are unaffected.
+                if (self.current.isRaiseIdent(self.source) and tokenStartsRaiseValue(self.peekNext())) {
+                    return self.parseRaiseExpr();
+                }
                 return self.parseVarRef();
             },
             .type_identifier => return self.parseStructRefExpr(),
@@ -4157,6 +4167,66 @@ pub const Parser = struct {
             .panic_expr = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
                 .message = message,
+            },
+        });
+    }
+
+    /// True when `tag` can begin the value expression of the Error-aware
+    /// `raise` keyword form (`raise "msg"`, `raise %E{...}`, `raise expr`).
+    ///
+    /// `.left_paren` is intentionally EXCLUDED: `raise(...)` keeps its
+    /// legacy reading as a plain call to the `Kernel.raise/1` String
+    /// function (used across the stdlib, e.g. `lib/file.zap`'s
+    /// `raise("..." <> path)`). The keyword form is the paren-less
+    /// `raise <value>` spelling, which the spec reserves for the
+    /// Error-aware abort (`raise "string"` → `%RuntimeError{...}`).
+    fn tokenStartsRaiseValue(tag: Token.Tag) bool {
+        return switch (tag) {
+            .int_literal,
+            .char_literal,
+            .float_literal,
+            .string_literal,
+            .string_literal_start,
+            .atom_literal,
+            .keyword_true,
+            .keyword_false,
+            .keyword_nil,
+            .identifier,
+            .type_identifier,
+            .left_bracket,
+            .percent_brace,
+            .percent,
+            .left_angle_angle,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Parse the Error-aware `raise` keyword form (Phase 1.4):
+    /// `raise <value>`. The leading `raise` identifier was already
+    /// confirmed as the contextual keyword by `parsePrimaryExpr`. The
+    /// value is a full expression — a string literal (normalised to
+    /// `%RuntimeError{...}` in desugar), a `%CustomError{...}` struct
+    /// literal, or any other Error-implementing value.
+    fn parseRaiseExpr(self: *Parser) !*const ast.Expr {
+        const start = self.currentSpan();
+        _ = self.advance(); // consume the `raise` identifier
+
+        // Disable trailing-block parsing while reading the raised value so
+        // that `raise %Error{...}` inside a `case` arm (`pattern -> raise
+        // %E{...}`) does not greedily absorb the arm's / case's closing
+        // braces as a `func(args) { block }` trailing block. Mirrors how
+        // guard expressions guard their own brace context.
+        const saved = self.disable_trailing_block;
+        self.disable_trailing_block = true;
+        defer self.disable_trailing_block = saved;
+
+        const value = try self.parseExpr();
+
+        return self.create(ast.Expr, .{
+            .raise_expr = .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .value = value,
             },
         });
     }

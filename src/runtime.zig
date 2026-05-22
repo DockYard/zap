@@ -7218,6 +7218,26 @@ pub const Kernel = struct {
         std.process.exit(1);
     }
 
+    /// Error-aware abort backing the Phase 1.4 polymorphic `raise`.
+    ///
+    /// `Kernel.do_raise/1` in `lib/kernel.zap` extracts the raised value's
+    /// `Error.kind` (as a string) and `Error.message` through the `Error`
+    /// protocol, then calls this primitive. It prints `** (<kind>) <message>`
+    /// to stderr and exits non-zero — the same shape as `raise/1` but with the
+    /// programmatic kind tag instead of the hard-coded `RuntimeError` label.
+    ///
+    /// Phase 2 replaces this with the structured crash printer (backtrace
+    /// capture via `zap_capture_backtrace`, async-signal-safe rendering); for
+    /// Phase 1.4 the abort is intentionally message-only, no backtrace.
+    pub fn raise_with_kind(kind: []const u8, message: []const u8) noreturn {
+        stderrWriteFlushed("** (");
+        posixWrite(STDERR_FD, kind);
+        posixWrite(STDERR_FD, ") ");
+        posixWrite(STDERR_FD, message);
+        posixWrite(STDERR_FD, "\n");
+        std.process.exit(1);
+    }
+
     // Operator primitives backing the generic `pub fn ==`/`!=`/`<`/`>`/
     // `<=`/`>=` in lib/kernel.zap. The Zap monomorphizer specializes the
     // Kernel operator per concrete type pair, so each instantiation here

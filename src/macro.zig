@@ -1231,6 +1231,17 @@ pub const MacroEngine = struct {
                 };
             },
 
+            .raise_expr => |re| {
+                const inner = try self.expandExpr(re.value);
+                if (!inner.changed) return .{ .expr = expr, .changed = false };
+                return .{
+                    .expr = try self.create(ast.Expr, .{
+                        .raise_expr = .{ .meta = re.meta, .value = inner.expr },
+                    }),
+                    .changed = true,
+                };
+            },
+
             .cond_expr => |conde| {
                 // Bootstrap fallback: expand cond to nested case.
                 // Kernel.cond macro (if defined) provides the same behavior.
@@ -3261,6 +3272,10 @@ fn stampExpansionOnExpr(expr: *const ast.Expr, info: *const ast.ExpansionInfo) v
         .panic_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
             stampExpansionOnExpr(v.message, info);
+        },
+        .raise_expr => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.value, info);
         },
         .error_pipe => |*v| {
             stampMetaIfUnset(&v.meta, info);

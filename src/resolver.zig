@@ -338,6 +338,7 @@ pub const Resolver = struct {
                 if (re.step) |s| try self.resolveExpr(s);
             },
             .panic_expr => |pe| try self.resolveExpr(pe.message),
+            .raise_expr => |re| try self.resolveExpr(re.value),
             .pipe => |pipe| {
                 try self.resolveExpr(pipe.lhs);
                 try self.resolveExpr(pipe.rhs);

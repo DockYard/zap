@@ -352,10 +352,39 @@ pub struct Kernel {
 
   @doc = """
     Raises a runtime error with the provided message.
+
+    This is the low-level string form. The surface `raise` keyword is
+    Error-aware (Phase 1.4): `raise "boom"` desugars to
+    `Kernel.do_raise(%RuntimeError{message: "boom"})` and `raise %E{...}`
+    desugars to `Kernel.do_raise(%E{...})`, routing through `do_raise/1`
+    so the abort carries the value's programmatic `Error.kind` tag.
     """
 
   pub fn raise(message :: String) -> Never {
     :zig.Kernel.raise(message)
+  }
+
+  @doc = """
+    Error-aware abort backing the surface `raise` keyword (Phase 1.4).
+
+    Accepts any value whose type implements the `Error` protocol,
+    extracts its presentable `Error.message/1` and programmatic
+    `Error.kind/1` (rendered as a string), and aborts the process
+    non-zero, printing `** (<kind>) <message>` to stderr.
+
+    The compiler's `raise` desugar (`src/desugar.zig`) lowers both the
+    `raise "string"` shorthand (after wrapping the string in a
+    `%RuntimeError{...}`) and the `raise %CustomError{...}` form to a
+    call of this function. Returns `Never` — it does not return.
+
+    Phase 2 extends the abort with backtrace capture and a structured
+    crash report; Phase 1.4 is intentionally message-only.
+    """
+
+  pub fn do_raise(error_value :: Error) -> Never {
+    kind_string = Atom.to_string(Error.kind(error_value))
+    error_message = Error.message(error_value)
+    :zig.Kernel.raise_with_kind(kind_string, error_message)
   }
 
   @doc = """

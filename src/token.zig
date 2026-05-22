@@ -154,6 +154,16 @@ pub const Token = struct {
         return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "error");
     }
 
+    /// `raise` is a contextual keyword (Phase 1.4), recognised only when
+    /// it leads an expression (`raise "boom"`, `raise %E{...}`). It is not
+    /// a hard keyword so the existing `Kernel.raise/1` function and any
+    /// identifier named `raise` outside leading-expression position keep
+    /// working. The parser confirms the contextual reading with a
+    /// lookahead at `parsePrimaryExpr`.
+    pub fn isRaiseIdent(self: Token, source: []const u8) bool {
+        return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "raise");
+    }
+
     pub const keywords = std.StaticStringMap(Tag).initComptime(.{
         .{ "pub", .keyword_pub },
         .{ "fn", .keyword_fn },

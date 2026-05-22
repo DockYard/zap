@@ -440,6 +440,13 @@ fn substituteInExpr(
             new_expr.* = .{ .list_cons_expr = .{ .meta = lc.meta, .head = new_head, .tail = new_tail } };
             return new_expr;
         },
+        .raise_expr => |re| {
+            const new_value = try substituteInExpr(alloc, re.value, func_attrs, mod_attrs, interner, errors);
+            if (new_value == re.value) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .raise_expr = .{ .meta = re.meta, .value = new_value } };
+            return new_expr;
+        },
         // Leaf expressions — no substitution needed
         .int_literal,
         .float_literal,
