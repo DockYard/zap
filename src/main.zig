@@ -1261,12 +1261,18 @@ fn cmdRunScript(
     };
 
     // Detect zig lib dir (same fallback chain as the manifest path).
-    const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
-        break :blk extractEmbeddedZigLib(alloc) catch {
+    // Precedence: explicit/trusted (env or exe-relative fork stdlib) → the
+    // embedded fork stdlib extracted to the cache → only then a system Zig.
+    // The embedded fork stdlib MUST outrank a system Zig because the latter
+    // is upstream and lacks the fork-only `std.debug` dSYM fallback the crash
+    // reporter needs to resolve backtraces to Zap source.
+    const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse
+        (extractEmbeddedZigLib(alloc) catch null) orelse
+        zir_backend.detectZigLibDirSystemFallback(alloc) orelse
+        {
             std.debug.print("Error: could not find or extract Zig lib\n", .{});
             std.process.exit(1);
         };
-    };
 
     // ----- Assemble source roots (stdlib ONLY — no project, no deps) ------
     // This is also what structurally forbids external packages in
@@ -1467,6 +1473,15 @@ fn cmdRunScript(
         }
         std.process.exit(1);
     };
+
+    // Publish the `<artifact>.zap-symbols` sidecar alongside the binary so
+    // the Phase 2 crash reporter can resolve mangled frames to Zap symbols
+    // at runtime. The sidecar is emitted into the staging dir by the ZIR
+    // backend; without this copy it would be discarded with the staging
+    // tree (the rename above only moves the binary itself), and the crash
+    // printer would degrade to mangled names. Best-effort: a script that
+    // never crashes does not need it, so a publish failure is non-fatal.
+    publishScriptSymbolTableSidecar(alloc, artifact.path, published_path);
 
     // The artifact is now safely published; the staging directory has
     // served its purpose. Best-effort removal keeps the cache root
@@ -2814,6 +2829,37 @@ fn publishScriptDebugSymbolsIfNeeded(
         std.debug.print("Error: could not publish script debug symbols to {s}: {}\n", .{ published_dsym_path, err });
         return error.DebugSymbolPublishFailed;
     };
+}
+
+/// Publish the `.zap-symbols` reversible-symbol sidecar from the staging
+/// directory to the content-key directory, next to the published binary.
+///
+/// The ZIR backend writes `<staged_artifact>.zap-symbols` when emitting a
+/// `.bin` (see `zir_backend.want_sidecar`). The crash reporter
+/// (`src/runtime.zig`) loads `<exe>.zap-symbols` at the first `raise` to map
+/// mangled frames back to Zap symbols, so the sidecar must travel with the
+/// binary into its stable cache location. Best-effort: a missing sidecar (or
+/// a rename failure) only degrades crash reports to mangled names, never
+/// breaks the run — so failures are intentionally swallowed rather than
+/// aborting an otherwise-successful build.
+fn publishScriptSymbolTableSidecar(
+    alloc: std.mem.Allocator,
+    staged_artifact_path: []const u8,
+    published_artifact_path: []const u8,
+) void {
+    const suffix = ".zap-symbols";
+    const staged = std.fmt.allocPrint(alloc, "{s}{s}", .{ staged_artifact_path, suffix }) catch return;
+    defer alloc.free(staged);
+    if (!cwdPathExists(staged)) return;
+
+    const published = std.fmt.allocPrint(alloc, "{s}{s}", .{ published_artifact_path, suffix }) catch return;
+    defer alloc.free(published);
+
+    // Replace any stale sidecar from a previous publish of the same key.
+    if (cwdPathExists(published)) {
+        std.Io.Dir.cwd().deleteFile(global_io, published) catch {};
+    }
+    std.Io.Dir.cwd().rename(staged, std.Io.Dir.cwd(), published, global_io) catch {};
 }
 
 fn buildOverrideIdentity(overrides: BuildOverrides) build_cache.OverrideIdentity {
@@ -4464,12 +4510,16 @@ fn buildTarget(
     // build plan.
     var zig_stdlib_node = ScopedProgressNode.start(progress_reporter, toolchain_node.node, "Zig stdlib");
     defer zig_stdlib_node.deinit();
-    const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
-        break :blk extractEmbeddedZigLib(alloc) catch {
+    // Precedence: trusted (env or exe-relative fork stdlib) → embedded fork
+    // stdlib → system Zig last (see the script-mode call site for why the
+    // embedded fork stdlib must outrank a system install).
+    const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse
+        (extractEmbeddedZigLib(alloc) catch null) orelse
+        zir_backend.detectZigLibDirSystemFallback(alloc) orelse
+        {
             std.debug.print("Error: could not find or extract Zig lib\n", .{});
             std.process.exit(1);
         };
-    };
     zig_stdlib_node.updateCurrentItem(zig_lib_dir, "Toolchain: resolving Zig stdlib", .{});
     zig_stdlib_node.succeed();
 
@@ -6379,7 +6429,11 @@ const IncrementalWatchState = struct {
         const optimize_policy = optimizePolicyForBuildConfig(config.optimize);
 
         if (progress) |reporter| reporter.stage("Toolchain: resolving Zig stdlib", .{});
-        const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse (extractEmbeddedZigLib(alloc) catch return null);
+        // Trusted detection → embedded fork stdlib → system Zig last resort.
+        const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse
+            (extractEmbeddedZigLib(alloc) catch null) orelse
+            zir_backend.detectZigLibDirSystemFallback(alloc) orelse
+            return null;
         const toolchain_cache_dir = ".zap-cache/toolchain";
         if (progress) |reporter| reporter.stage("Toolchain: checking compiler identity", .{});
         const compiler_identity_digest = hashCompilerIdentity(alloc, toolchain_cache_dir) catch return null;

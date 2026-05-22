@@ -116,6 +116,22 @@ pub fn build(b: *std.Build) void {
     const run_slab_pool_drift_tests = b.addRunArtifact(slab_pool_drift_tests);
     test_step.dependOn(&run_slab_pool_drift_tests.step);
 
+    // Phase 2.a crash reporter: the `.zap-symbols` sidecar format and the
+    // `ZapSymbolInfo` C-ABI are declared in three files that cannot import
+    // one another (`src/zap_symbol_table.zig`, `src/runtime.zig`, and the
+    // fork's `src/zir_api.zig`). This test reads all three as text and fails
+    // the build if the load-bearing format constants or the C-ABI field
+    // order drift apart.
+    const zap_symbol_abi_drift_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/zap_symbol_abi_drift_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_zap_symbol_abi_drift_tests = b.addRunArtifact(zap_symbol_abi_drift_tests);
+    test_step.dependOn(&run_zap_symbol_abi_drift_tests.step);
+
     // -----------------------------------------------------------------------
     // Dependency paths
     // -----------------------------------------------------------------------
@@ -194,8 +210,22 @@ pub fn build(b: *std.Build) void {
     // -----------------------------------------------------------------------
     // Zig stdlib embedding
     // -----------------------------------------------------------------------
+    // The embedded stdlib MUST be the Zap fork's `lib/`, not whatever Zig
+    // happens to be building Zap. The fork carries stdlib changes the runtime
+    // depends on (e.g. the `std.debug.MachOFile` dSYM fallback + linkage-name
+    // reporting that let the Phase 2 crash reporter resolve `zap run`
+    // backtraces to Zap source); an upstream/system Zig stdlib lacks them.
+    // The fork root is already resolved above (from `-Dzig-fork-root`, the
+    // `-Dzap-compiler-lib` tree, or the `../zig` default), so its sibling
+    // `lib/` is the authoritative stdlib that matches `libzap_compiler.a`.
+    // Fall back to the building Zig's lib only when the fork tree is absent
+    // (e.g. a CI job handed a prebuilt archive without the fork checkout).
+    const fork_zig_lib_dir = b.fmt("{s}/lib", .{zig_fork_root});
     const zig_lib_dir = b.option([]const u8, "zig-lib-dir", "Path to Zig lib directory (contains std/)") orelse
-        detectBuildZigLibDir(b);
+        (if (pathExists(b, b.pathJoin(&.{ fork_zig_lib_dir, "std", "std.zig" })))
+            fork_zig_lib_dir
+        else
+            detectBuildZigLibDir(b));
 
     const tar_step = b.addSystemCommand(&.{ "tar", "-cf" });
     const tar_output = tar_step.addOutputFileArg("zig_lib.tar");

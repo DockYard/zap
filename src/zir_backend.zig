@@ -1183,6 +1183,18 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
 /// Checks ZAP_ZIG_LIB_DIR, ZIG_LIB_DIR env vars, exe-relative paths, then
 /// well-known installation paths. Returns null if detection fails.
 /// Caller owns the returned memory.
+/// Resolve the Zig stdlib directory for compiling user binaries, in
+/// **trusted** precedence only: explicit environment override, then a copy
+/// shipped next to the `zap` executable. Both of these are guaranteed to be
+/// the Zap fork stdlib (an operator who sets the env var, or an install that
+/// bundles `lib/` beside the binary), so they carry Phase 0's DWARF / dSYM
+/// machinery the crash reporter depends on.
+///
+/// This deliberately does NOT consult a system Zig install (asdf,
+/// `/usr/local`, …): those are upstream Zig, not the fork, and lack the
+/// fork-only stdlib changes (e.g. the `MachOFile` dSYM fallback). Callers
+/// must prefer the embedded fork stdlib over the system fallback — see
+/// `detectZigLibDirSystemFallback`.
 pub fn detectZigLibDir(allocator: std.mem.Allocator) ?[]const u8 {
     // 1. Try the ZAP_ZIG_LIB_DIR environment variable (project-specific override).
     if (env.getenv("ZAP_ZIG_LIB_DIR")) |val| {
@@ -1225,7 +1237,18 @@ pub fn detectZigLibDir(allocator: std.mem.Allocator) ?[]const u8 {
         }
     } else |_| {}
 
-    // 4. Try well-known paths based on the system zig installation.
+    return null;
+}
+
+/// Last-resort Zig stdlib resolution against a **system** Zig install (asdf,
+/// `/usr/local/lib/zig`, `/usr/lib/zig`). This is intentionally the lowest
+/// priority: a system Zig is upstream, not the Zap fork, so its stdlib lacks
+/// the fork-only changes the crash reporter relies on (notably the
+/// `std.debug.MachOFile` dSYM fallback that resolves `zap run` backtraces to
+/// Zap source). Callers MUST try `detectZigLibDir` and the embedded fork
+/// stdlib first, and only fall back here when neither is available — at which
+/// point a degraded backtrace beats no compilation at all.
+pub fn detectZigLibDirSystemFallback(allocator: std.mem.Allocator) ?[]const u8 {
     const home_dir: ?[]const u8 = env.getenv("HOME");
 
     // Build asdf candidate only if HOME is available.

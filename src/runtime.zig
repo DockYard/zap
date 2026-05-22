@@ -7269,14 +7269,551 @@ pub const String = struct {
 };
 
 // ============================================================
+// Crash reporter — Phase 2.a of the Zap error system
+//
+// An unrescued `raise %Error{}` (and the legacy string `raise`/`panic`)
+// renders a structured, async-signal-safe crash report:
+//
+//     ** (<kind>) <message>
+//       <Zap.Symbol>/<arity> at <file>.zap:<line>
+//       <Zap.Symbol>/<arity> at <file>.zap:<line>
+//       ...
+//
+// Design (see `docs/error-system-research-brief.md` Part V + VI.B #4):
+//
+//   * Backtrace capture happens ONLY here, on the abort path — never on a
+//     `Result`-returned error. The happy path pays nothing.
+//
+//   * Capture is allocation-free: `captureBacktraceInto` wraps
+//     `std.debug.captureCurrentStackTrace` (frame-pointer walk with
+//     DWARF-CFI fallback) into a fixed stack buffer. This makes the whole
+//     printer reachable from a SIGTRAP/SIGSEGV handler (wired in Phase
+//     2.b/2.f) — no `malloc`, only `write`(2) and `_exit`. The capture and
+//     symbolize primitives live HERE in the runtime (Zig source compiled
+//     into every Zap binary) rather than as a fork C-ABI export, because the
+//     fork's `zir_api.zig` is linked only into the compiler — a fork export
+//     would be unresolved at the user binary's link step. Calling
+//     `std.debug` directly reuses the fork's signal-aware DWARF reader, which
+//     is the brief's actual intent.
+//
+//   * Each return address is symbolized via `symbolizeAddress`, which calls
+//     the fork's `std.debug.SelfInfo.getSymbols` — the same DWARF reader
+//     Zig's own panic handler uses. The resulting Zig-mangled name is mapped
+//     back to its authoritative Zap name (`Demo.deeper/0`) through the Phase
+//     0 `.zap-symbols` side-table loaded once at first use. When the
+//     side-table is unavailable we fall back to the mangled name plus the
+//     DWARF `file:line` (which is already Zap source thanks to Phase 0's
+//     `.dbg_stmt` emission). Symbolization allocates through the page-backed
+//     debug-info arena (never libc `malloc`), the allocator Zig itself
+//     trusts from its signal-context dump path.
+//
+//   * `ZAP_BACKTRACE=full|short|0`, `NO_COLOR`, and stderr-TTY state are
+//     read ONCE at first use and cached in statics — `getenv` is not
+//     strictly async-signal-safe, so it must never run from a signal
+//     context. The first `raise` is a normal call, so this lazy-once init
+//     is safe; `zapCrashReporterInit` is also exposed so a future program
+//     entry / signal-handler installer can force the read eagerly at
+//     startup.
+// ============================================================
+
+/// A resolved source symbol for one return address. Native Zig (not a
+/// C-ABI struct) — the capture and symbolize primitives are implemented
+/// directly in this runtime, which is the Zig source compiled INTO every
+/// Zap binary, so they reach the fork's `std.debug` DWARF reader without any
+/// extern boundary. (The fork's `zir_api.zig` C-ABI is linked only into the
+/// compiler, never into user binaries, so a fork export would be unresolved
+/// here.) Slices reference the process-lifetime debug-info arena.
+const ZapSymbolInfo = struct {
+    /// Zig-mangled (linker) symbol name, e.g. `Demo.deeper__0`, or `null`
+    /// when the address mapped to no symbol.
+    name: ?[]const u8,
+    /// DWARF source location, or `null` when unavailable.
+    source: ?std.debug.SourceLocation,
+};
+
+/// Maximum number of return addresses a `Backtrace` can hold. Fixed
+/// capacity so capture is allocation-free and the value lives entirely on
+/// the stack — a deep Zap program rarely needs more, and the printer caps
+/// what it shows via `ZAP_BACKTRACE` anyway.
+const BACKTRACE_MAX_FRAMES: usize = 64;
+
+/// Capture the current call stack into `out[0..]`, dropping the first `skip`
+/// frames, and return the number of return addresses written.
+///
+/// Wraps the fork's `std.debug.captureCurrentStackTrace`, which fills the
+/// caller's buffer via a frame-pointer walk (with a DWARF-CFI fallback) and
+/// performs **no allocation** — so this is safe to call from a signal
+/// context. `skip` is applied after capture (the leading `skip` addresses
+/// are dropped and the tail shifted down) because the runtime knows the
+/// frame *count* to drop, not a specific return address. `noinline` so its
+/// own frame is the stable frame-0 the caller's `skip` accounting expects.
+noinline fn captureBacktraceInto(out: []usize, skip: usize) usize {
+    if (out.len == 0) return 0;
+    if (!std.options.allow_stack_tracing) return 0;
+    const trace = std.debug.captureCurrentStackTrace(.{}, out);
+    const captured = trace.return_addresses.len;
+    if (skip == 0) return captured;
+    if (skip >= captured) return 0;
+    const kept = captured - skip;
+    std.mem.copyForwards(usize, out[0..kept], out[skip..captured]);
+    return kept;
+}
+
+/// Resolve a single return address to its source symbol via the fork's
+/// `std.debug.SelfInfo.getSymbols` — the same DWARF reader Zig's own panic
+/// handler uses, so the line table is the Zap-keyed DWARF emitted in Phase
+/// 0. Allocates through `std.debug.getDebugInfoAllocator` (a
+/// page-allocator-backed arena, never libc `malloc` — the allocator Zig
+/// trusts from its signal-context dump path). Returned slices live in that
+/// arena for the process lifetime. Returns `null` when the address maps to
+/// nothing (stripped binary, no module, etc.).
+fn symbolizeAddress(addr: usize) ?ZapSymbolInfo {
+    if (std.debug.SelfInfo == void) return null;
+    if (!std.options.allow_stack_tracing) return null;
+
+    const di = std.debug.getSelfDebugInfo() catch return null;
+    const io = std.Options.debug_io;
+    const arena = std.debug.getDebugInfoAllocator();
+
+    var symbols: std.ArrayList(std.debug.Symbol) = .empty;
+    // Resolve only the physical frame (no inline-caller expansion — the Zap
+    // backtrace lists physical frames 1:1 with captured addresses, which the
+    // side-table lookup relies on).
+    di.getSymbols(io, arena, arena, addr, false, &symbols) catch return null;
+    if (symbols.items.len == 0) return null;
+    const sym = symbols.items[0];
+    if (sym.name == null and sym.source_location == null) return null;
+    return .{ .name = sym.name, .source = sym.source_location };
+}
+
+/// A captured call stack: a fixed-capacity array of return addresses plus a
+/// count. No heap; the value is produced at a `raise` site and consumed
+/// immediately by the crash printer. The backtrace deliberately lives in
+/// this abort-path side-channel, NOT inside any Error struct value — a
+/// `Result`-returned error carries no backtrace and costs nothing.
+pub const Backtrace = extern struct {
+    addresses: [BACKTRACE_MAX_FRAMES]usize,
+    len: usize,
+
+    /// Capture the current call stack, dropping the first `skip` frames
+    /// (the runtime trampoline between the user's `raise` and the capture
+    /// call). Allocation-free; safe from a signal context.
+    ///
+    /// Marked `inline` so it adds NO stack frame of its own — the caller's
+    /// `skip` accounting then only has to count `captureBacktraceInto`
+    /// (frame 0) plus the explicit runtime frames between the caller and the
+    /// user code, with no hidden trampoline to reason about.
+    pub inline fn capture(skip: usize) Backtrace {
+        var bt: Backtrace = .{ .addresses = undefined, .len = 0 };
+        bt.len = captureBacktraceInto(&bt.addresses, skip);
+        return bt;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// `.zap-symbols` side-table — read-only decoder
+//
+// `src/runtime.zig` is injected into Zap binaries as standalone source with
+// no sibling files in the emission cache, so it cannot `@import` the
+// canonical `src/zap_symbol_table.zig`. This is a self-contained read-only
+// decoder for the SAME frozen `ZSYM` v1 format. The canonical *builder* and
+// the authoritative format documentation live in `zap_symbol_table.zig`;
+// `tools/zap_symbol_abi_drift_test.zig` asserts the two stay in lockstep on
+// the format constants below.
+// ---------------------------------------------------------------------------
+
+const ZSYM_MAGIC: [4]u8 = .{ 'Z', 'S', 'Y', 'M' };
+const ZSYM_FORMAT_VERSION: u32 = 1;
+/// Bytes per packed entry: seven little-endian u32 fields.
+const ZSYM_PACKED_ENTRY_SIZE: usize = @sizeOf(u32) * 7;
+/// Header: 4-byte magic + (version, entry_count, blob_size) u32s.
+const ZSYM_HEADER_SIZE: usize = ZSYM_MAGIC.len + @sizeOf(u32) * 3;
+
+/// One decoded side-table entry. All slices reference the backing blob.
+const ZapSymbolEntry = struct {
+    mangled: []const u8,
+    zap_struct: ?[]const u8,
+    zap_local: []const u8,
+    zap_arity: u32,
+};
+
+/// Read-only view over a loaded `.zap-symbols` blob. Decodes fields on
+/// demand via `std.mem.readInt` so the backing buffer's alignment is
+/// irrelevant (matches the canonical `Reader`).
+const ZapSymbolReader = struct {
+    bytes: []const u8,
+    entry_count: u32,
+    string_blob: []const u8,
+    entries_offset: usize,
+
+    fn init(bytes: []const u8) ?ZapSymbolReader {
+        if (bytes.len < ZSYM_HEADER_SIZE) return null;
+        if (!std.mem.eql(u8, bytes[0..ZSYM_MAGIC.len], &ZSYM_MAGIC)) return null;
+        const version = std.mem.readInt(u32, bytes[ZSYM_MAGIC.len..][0..4], .little);
+        if (version != ZSYM_FORMAT_VERSION) return null;
+        const entry_count = std.mem.readInt(u32, bytes[ZSYM_MAGIC.len + 4 ..][0..4], .little);
+        const blob_size = std.mem.readInt(u32, bytes[ZSYM_MAGIC.len + 8 ..][0..4], .little);
+        const entries_offset = ZSYM_HEADER_SIZE + blob_size;
+        const entries_bytes: usize = @as(usize, entry_count) * ZSYM_PACKED_ENTRY_SIZE;
+        if (bytes.len < entries_offset + entries_bytes) return null;
+        return .{
+            .bytes = bytes,
+            .entry_count = entry_count,
+            .string_blob = bytes[ZSYM_HEADER_SIZE..entries_offset],
+            .entries_offset = entries_offset,
+        };
+    }
+
+    fn stringAt(self: ZapSymbolReader, offset: u32, length: u32) []const u8 {
+        if (length == 0) return "";
+        if (offset > self.string_blob.len or offset + length > self.string_blob.len) return "";
+        return self.string_blob[offset .. offset + length];
+    }
+
+    fn entry(self: ZapSymbolReader, index: u32) ZapSymbolEntry {
+        const offset = self.entries_offset + @as(usize, index) * ZSYM_PACKED_ENTRY_SIZE;
+        const mangled_offset = std.mem.readInt(u32, self.bytes[offset + 0 ..][0..4], .little);
+        const mangled_length = std.mem.readInt(u32, self.bytes[offset + 4 ..][0..4], .little);
+        const zap_struct_offset = std.mem.readInt(u32, self.bytes[offset + 8 ..][0..4], .little);
+        const zap_struct_length = std.mem.readInt(u32, self.bytes[offset + 12 ..][0..4], .little);
+        const zap_local_offset = std.mem.readInt(u32, self.bytes[offset + 16 ..][0..4], .little);
+        const zap_local_length = std.mem.readInt(u32, self.bytes[offset + 20 ..][0..4], .little);
+        const zap_arity = std.mem.readInt(u32, self.bytes[offset + 24 ..][0..4], .little);
+        const zap_struct: ?[]const u8 = if (zap_struct_length == 0)
+            null
+        else
+            self.stringAt(zap_struct_offset, zap_struct_length);
+        return .{
+            .mangled = self.stringAt(mangled_offset, mangled_length),
+            .zap_struct = zap_struct,
+            .zap_local = self.stringAt(zap_local_offset, zap_local_length),
+            .zap_arity = zap_arity,
+        };
+    }
+
+    /// Binary search for an entry by mangled name (the blob is sorted by
+    /// mangled name). O(log n), no allocation.
+    fn findByMangled(self: ZapSymbolReader, mangled: []const u8) ?ZapSymbolEntry {
+        var lo: u32 = 0;
+        var hi: u32 = self.entry_count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const v = self.entry(mid);
+            switch (std.mem.order(u8, v.mangled, mangled)) {
+                .eq => return v,
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+            }
+        }
+        return null;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Crash-reporter configuration — cached once at first use
+// ---------------------------------------------------------------------------
+
+/// How many backtrace frames to render.
+const BacktraceVerbosity = enum {
+    /// Message only — no backtrace (today's pre-Phase-2 behavior).
+    off,
+    /// Message + the top `CRASH_SHORT_FRAME_LIMIT` frames. The default.
+    short,
+    /// Message + every captured frame.
+    full,
+};
+
+/// When `short`, the maximum number of frames printed.
+const CRASH_SHORT_FRAME_LIMIT: usize = 10;
+
+/// Backing storage for the side-table blob, loaded once. A fixed static
+/// buffer keeps the load off the heap; 1 MiB is far larger than any real
+/// program's symbol table (a few dozen bytes per function). A table that
+/// somehow exceeds this simply degrades to mangled-name reporting.
+const ZAP_SYMBOLS_MAX_BYTES: usize = 1 << 20;
+
+const CrashReporterConfig = struct {
+    verbosity: BacktraceVerbosity = .short,
+    use_color: bool = false,
+    /// `null` until the side-table load has been attempted. After that,
+    /// either a valid reader or `null` (absent/corrupt → mangled fallback).
+    symbols: ?ZapSymbolReader = null,
+};
+
+var crash_reporter_config: CrashReporterConfig = .{};
+var crash_reporter_initialized: bool = false;
+var zap_symbols_buf: [ZAP_SYMBOLS_MAX_BYTES]u8 = undefined;
+
+/// Parse `ZAP_BACKTRACE`. Unset/empty → default `short`. Recognized values
+/// (case-insensitive on the first byte is unnecessary — the spec spells them
+/// lowercase): `0`/`none`/`off` → off; `full`/`all` → full; anything else
+/// (including `short`) → short.
+fn parseBacktraceVerbosity(value: ?[]const u8) BacktraceVerbosity {
+    const v = value orelse return .short;
+    if (v.len == 0) return .short;
+    if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "none") or std.mem.eql(u8, v, "off")) return .off;
+    if (std.mem.eql(u8, v, "full") or std.mem.eql(u8, v, "all")) return .full;
+    return .short;
+}
+
+/// Load the `<self-exe>.zap-symbols` sidecar into the static buffer and
+/// return a reader, or `null` if it is missing, too large, or corrupt. Done
+/// once; the convention (sidecar path = executable path + ".zap-symbols") is
+/// the Phase 0 contract.
+///
+/// Uses the fork's `std.Io.Dir`/`std.process.executablePath` API (the
+/// classic `std.fs` surface is deprecated in this Zig 0.16 fork). `readFile`
+/// errors when the file is missing or larger than the buffer — both degrade
+/// cleanly to mangled-name reporting.
+fn loadZapSymbols() ?ZapSymbolReader {
+    const io = std.Options.debug_io;
+    // Room for the executable path plus the ".zap-symbols" suffix.
+    const suffix = ".zap-symbols";
+    var path_buf: [std.Io.Dir.max_path_bytes + suffix.len]u8 = undefined;
+    const exe_len = std.process.executablePath(io, path_buf[0 .. path_buf.len - suffix.len]) catch return null;
+    @memcpy(path_buf[exe_len..][0..suffix.len], suffix);
+    const sidecar_path = path_buf[0 .. exe_len + suffix.len];
+
+    const bytes = std.Io.Dir.cwd().readFile(io, sidecar_path, &zap_symbols_buf) catch return null;
+    return ZapSymbolReader.init(bytes);
+}
+
+/// Read `ZAP_BACKTRACE`, `NO_COLOR`, and the stderr-TTY state ONCE and cache
+/// them, then load the side-table once. Idempotent. Safe to call eagerly at
+/// program start (preferred — see the section comment) or lazily on the
+/// first crash; it must NOT be the first thing a signal handler does because
+/// `getenv`/file IO are not async-signal-safe.
+pub fn zapCrashReporterInit() void {
+    if (crash_reporter_initialized) return;
+    crash_reporter_initialized = true;
+
+    crash_reporter_config.verbosity = parseBacktraceVerbosity(envGetRuntime("ZAP_BACKTRACE"));
+
+    // Color when stderr is a TTY and NO_COLOR is unset/empty (the de-facto
+    // https://no-color.org convention). Reserved for the colored renderer;
+    // Phase 2.a keeps the report monochrome, but the state is cached now so
+    // the later colored renderer needs no startup change.
+    const no_color = envGetRuntime("NO_COLOR");
+    const no_color_set = no_color != null and no_color.?.len > 0;
+    crash_reporter_config.use_color = !no_color_set and std.c.isatty(STDERR_FD) != 0;
+
+    crash_reporter_config.symbols = loadZapSymbols();
+}
+
+/// True when absolute paths must be stripped to their basename in crash
+/// reports. Per the brief's diagnostic security tiers (VI.B #9), release
+/// builds (`ReleaseFast`/`ReleaseSmall`) must not leak filesystem layout;
+/// `Debug`/`ReleaseSafe` keep full paths for developer ergonomics.
+const crash_report_strip_paths: bool = switch (builtin.mode) {
+    .Debug, .ReleaseSafe => false,
+    .ReleaseFast, .ReleaseSmall => true,
+};
+
+/// Return the basename of `path` (the segment after the last `/`). Used to
+/// strip absolute paths in release-mode reports. No allocation.
+fn pathBasename(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |idx| return path[idx + 1 ..];
+    return path;
+}
+
+/// Write a base-10 unsigned integer to stderr without allocating.
+fn crashWriteUnsigned(value: u64) void {
+    var buf: [20]u8 = undefined; // u64 max is 20 digits
+    var i: usize = buf.len;
+    var v = value;
+    if (v == 0) {
+        posixWrite(STDERR_FD, "0");
+        return;
+    }
+    while (v != 0) {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @intCast(v % 10));
+        v /= 10;
+    }
+    posixWrite(STDERR_FD, buf[i..]);
+}
+
+/// Strip the platform's leading underscore from a linker symbol name.
+/// Mach-O (and some other ABIs) prefix every C symbol with `_`, so
+/// `getSymbols` returns `_Demo.deeper__0` while the `.zap-symbols`
+/// side-table stores the un-prefixed `Demo.deeper__0`. Strip one leading
+/// `_` before any side-table lookup. On ELF (no prefix) this is a no-op
+/// because names never start with `_` in the Zap mangling scheme
+/// (`Struct.local__N`).
+fn stripSymbolUnderscore(name: []const u8) []const u8 {
+    if (comptime builtin.object_format == .macho) {
+        if (name.len > 0 and name[0] == '_') return name[1..];
+    }
+    return name;
+}
+
+/// True when a (underscore-stripped) mangled name is the runtime's `raise`
+/// plumbing — `Kernel.do_raise__N` or `Kernel.raise__N`. These Zap frames
+/// sit between the user's raising frame and the `:zig.` runtime entry; they
+/// are correct but noise, so the crash report suppresses them to begin at
+/// the user code that raised. Path-independent: the string `raise` goes
+/// through `Kernel.raise`, the Error form through `Kernel.do_raise`.
+fn isRaisePlumbingSymbol(stripped_mangled: []const u8) bool {
+    return std.mem.eql(u8, stripped_mangled, "Kernel.do_raise__1") or
+        std.mem.eql(u8, stripped_mangled, "Kernel.raise__1");
+}
+
+/// Render a single backtrace frame line to stderr. `addr` is the raw return
+/// address; we subtract one byte before symbolizing so the line points
+/// *into* the calling statement rather than at the instruction after the
+/// call (matching the fork's `ra_call_offset` handling). Pure `write`(2);
+/// any bytes from the debug-info arena are used in place and never freed.
+///
+/// Returns `true` when the frame was emitted, `false` when it was
+/// suppressed (the runtime `raise` plumbing) so the caller does not count it
+/// against the `ZAP_BACKTRACE=short` frame budget.
+fn crashReportFrame(addr: usize) bool {
+    const call_site_addr = if (addr != 0) addr - 1 else addr;
+    const info = symbolizeAddress(call_site_addr);
+
+    const name: ?[]const u8 = if (info) |i| i.name else null;
+    const source: ?std.debug.SourceLocation = if (info) |i| i.source else null;
+
+    if (name == null or name.?.len == 0) {
+        // No symbol: emit the raw address as an offset so a post-mortem tool
+        // can still resolve it. Brief VI.B #9: prefer offsets when
+        // symbolication is unavailable.
+        posixWrite(STDERR_FD, "  0x");
+        crashWriteUnsignedHex(call_site_addr);
+        // Still print a source location if DWARF had one.
+        if (source) |loc| crashReportSourceLocation(loc);
+        posixWrite(STDERR_FD, "\n");
+        return true;
+    }
+
+    const mangled = stripSymbolUnderscore(name.?);
+
+    // Suppress the runtime's `raise` plumbing frames so the trace starts at
+    // the user code that raised.
+    if (isRaisePlumbingSymbol(mangled)) return false;
+
+    posixWrite(STDERR_FD, "  ");
+
+    // Map the mangled name back to the authoritative Zap name via the
+    // side-table. On a hit, print `Struct.local/arity` (or `local/arity`
+    // for the top-level entry point); on a miss, fall back to the
+    // (underscore-stripped) mangled name (still useful — it is the linker
+    // symbol).
+    if (crash_reporter_config.symbols) |reader| {
+        if (reader.findByMangled(mangled)) |sym| {
+            if (sym.zap_struct) |struct_name| {
+                posixWrite(STDERR_FD, struct_name);
+                posixWrite(STDERR_FD, ".");
+            }
+            posixWrite(STDERR_FD, sym.zap_local);
+            posixWrite(STDERR_FD, "/");
+            crashWriteUnsigned(sym.zap_arity);
+        } else {
+            posixWrite(STDERR_FD, mangled);
+        }
+    } else {
+        posixWrite(STDERR_FD, mangled);
+    }
+
+    if (source) |loc| crashReportSourceLocation(loc);
+    posixWrite(STDERR_FD, "\n");
+    return true;
+}
+
+/// Write a hexadecimal address to stderr without allocating.
+fn crashWriteUnsignedHex(value: usize) void {
+    const digits = "0123456789abcdef";
+    var buf: [16]u8 = undefined; // usize max is 16 hex digits on 64-bit
+    var i: usize = buf.len;
+    var v = value;
+    if (v == 0) {
+        posixWrite(STDERR_FD, "0");
+        return;
+    }
+    while (v != 0) {
+        i -= 1;
+        buf[i] = digits[@intCast(v & 0xF)];
+        v >>= 4;
+    }
+    posixWrite(STDERR_FD, buf[i..]);
+}
+
+/// Append the ` at <file>:<line>` suffix for a resolved frame. In release
+/// modes the file path is stripped to its basename (brief VI.B #9). Skips
+/// empty file names (a source location with no file is not useful).
+fn crashReportSourceLocation(loc: std.debug.SourceLocation) void {
+    if (loc.file_name.len == 0) return;
+    const shown = if (crash_report_strip_paths) pathBasename(loc.file_name) else loc.file_name;
+    posixWrite(STDERR_FD, " at ");
+    posixWrite(STDERR_FD, shown);
+    posixWrite(STDERR_FD, ":");
+    crashWriteUnsigned(loc.line);
+}
+
+/// The async-signal-safe crash report. Prints `** (<kind>) <message>`
+/// followed by the symbolized Zap backtrace (subject to `ZAP_BACKTRACE`),
+/// then terminates the process via `_exit` (which, unlike
+/// `std.process.exit`, runs no `atexit` handlers and is async-signal-safe).
+///
+/// `skip_frames` is the number of leading runtime frames between the user's
+/// `raise` and the `Backtrace.capture` call inside this function, so the
+/// printed trace begins at the user code that raised.
+///
+/// This is `noinline` so its own frame is a stable, single frame the
+/// capture's `skip` accounting can rely on.
+noinline fn crashReport(kind: []const u8, message: []const u8) noreturn {
+    // Make sure any buffered stdout is flushed before the error text so the
+    // report does not race ahead of the program's own output. `flushStdoutBuf`
+    // is a plain `write`(2) — no allocation, no atexit.
+    flushStdoutBuf();
+
+    // Cache env/TTY/side-table once. On the direct-`raise` path this is a
+    // normal call (not yet a signal context), so the non-async-signal-safe
+    // `getenv`/file-read here is fine; Phase 2.b's signal handlers will have
+    // already forced this via `zapCrashReporterInit` at startup.
+    zapCrashReporterInit();
+
+    // Header: ** (<kind>) <message>\n
+    posixWrite(STDERR_FD, "** (");
+    posixWrite(STDERR_FD, kind);
+    posixWrite(STDERR_FD, ") ");
+    posixWrite(STDERR_FD, message);
+    posixWrite(STDERR_FD, "\n");
+
+    if (crash_reporter_config.verbosity != .off) {
+        // Skip frames: (0) `captureBacktraceInto` itself (frame 0 of the
+        // walk, since `Backtrace.capture` is `inline`), (1) this
+        // `crashReport` frame, (2) the `raise_with_kind`/`raise` runtime
+        // entry that called us. The user's raising frame is next, at index
+        // 3. (`crashReport` is `noinline`; `raise`/`raise_with_kind` cross
+        // the `:zig.` FFI boundary so they are real, non-inlined frames.)
+        // The Zap-level `Kernel.do_raise`/`Kernel.raise` plumbing frame that
+        // sits just above the user frame is suppressed by name inside
+        // `crashReportFrame` (it varies by raise form, so it cannot be a
+        // fixed skip count).
+        const skip: usize = 3;
+        const bt = Backtrace.capture(skip);
+        const max_shown: usize = switch (crash_reporter_config.verbosity) {
+            .off => 0,
+            .short => CRASH_SHORT_FRAME_LIMIT,
+            .full => bt.len,
+        };
+        var shown: usize = 0;
+        var i: usize = 0;
+        while (i < bt.len and shown < max_shown) : (i += 1) {
+            if (crashReportFrame(bt.addresses[i])) shown += 1;
+        }
+    }
+
+    std.c._exit(1);
+}
+
+// ============================================================
 // Kernel functions (spec §30.2)
 // ============================================================
 
 pub fn panic(message: []const u8) noreturn {
-    stderrWriteFlushed("** (NilError) ");
-    posixWrite(STDERR_FD, message);
-    posixWrite(STDERR_FD, "\n");
-    std.process.exit(1);
+    crashReport("NilError", message);
 }
 
 pub const Range = struct {
@@ -7509,11 +8046,13 @@ pub const Kernel = struct {
         return false;
     }
 
+    /// Low-level string abort backing `Kernel.raise/1` in `lib/kernel.zap`.
+    /// Routes through the Phase 2 structured crash printer with the
+    /// hard-coded `RuntimeError` kind, so a bare `raise "boom"` now prints
+    /// the `** (RuntimeError) boom` header followed by a symbolized Zap
+    /// backtrace (subject to `ZAP_BACKTRACE`).
     pub fn raise(message: []const u8) noreturn {
-        stderrWriteFlushed("** (RuntimeError) ");
-        posixWrite(STDERR_FD, message);
-        posixWrite(STDERR_FD, "\n");
-        std.process.exit(1);
+        crashReport("RuntimeError", message);
     }
 
     /// Error-aware abort backing the Phase 1.4 polymorphic `raise`.
@@ -7521,19 +8060,18 @@ pub const Kernel = struct {
     /// `Kernel.do_raise/1` in `lib/kernel.zap` extracts the raised value's
     /// `Error.kind` (as a string) and `Error.message` through the `Error`
     /// protocol, then calls this primitive. It prints `** (<kind>) <message>`
-    /// to stderr and exits non-zero — the same shape as `raise/1` but with the
-    /// programmatic kind tag instead of the hard-coded `RuntimeError` label.
+    /// to stderr and a symbolized Zap backtrace, then aborts non-zero — the
+    /// same shape as `raise/1` but with the programmatic kind tag instead of
+    /// the hard-coded `RuntimeError` label.
     ///
-    /// Phase 2 replaces this with the structured crash printer (backtrace
-    /// capture via `zap_capture_backtrace`, async-signal-safe rendering); for
-    /// Phase 1.4 the abort is intentionally message-only, no backtrace.
+    /// Phase 2.a: the abort now goes through the async-signal-safe crash
+    /// printer (`crashReport`) — it captures a backtrace at this site,
+    /// symbolizes each frame through the fork's DWARF reader + the Phase 0
+    /// `.zap-symbols` side-table, honors `ZAP_BACKTRACE=full|short|0`, and
+    /// terminates via `_exit` (no `atexit`, signal-safe). The capture costs
+    /// nothing on the happy path — it runs only here, on the abort path.
     pub fn raise_with_kind(kind: []const u8, message: []const u8) noreturn {
-        stderrWriteFlushed("** (");
-        posixWrite(STDERR_FD, kind);
-        posixWrite(STDERR_FD, ") ");
-        posixWrite(STDERR_FD, message);
-        posixWrite(STDERR_FD, "\n");
-        std.process.exit(1);
+        crashReport(kind, message);
     }
 
     // Operator primitives backing the generic `pub fn ==`/`!=`/`<`/`>`/
@@ -17972,5 +18510,199 @@ test "Kernel integer arithmetic: wrapping modes wrap on overflow (non-trapping o
             try std.testing.expectEqual(@as(u8, 0), Kernel.add_u8(255, 1));
         },
         .Debug, .ReleaseSafe => {},
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Crash-reporter unit tests (Phase 2.a)
+// ---------------------------------------------------------------------------
+
+/// Build a minimal `ZSYM` v1 blob with the SAME byte layout the canonical
+/// `zap_symbol_table.Builder.encode` produces, so the runtime's read-only
+/// `ZapSymbolReader` can be exercised in isolation. Entries must be passed
+/// pre-sorted by mangled name (the canonical builder sorts; this helper does
+/// not, to keep the test's intent explicit). Returns an owned blob.
+fn buildTestZsymBlob(
+    allocator: std.mem.Allocator,
+    entries: []const ZapSymbolEntry,
+) ![]u8 {
+    var blob: std.ArrayListUnmanaged(u8) = .empty;
+    defer blob.deinit(allocator);
+    // Naive string interning: append each unique string once.
+    var offsets = std.StringHashMap(u32).init(allocator);
+    defer offsets.deinit();
+    const intern = struct {
+        fn call(b: *std.ArrayListUnmanaged(u8), o: *std.StringHashMap(u32), a: std.mem.Allocator, s: []const u8) !u32 {
+            if (o.get(s)) |existing| return existing;
+            const off: u32 = @intCast(b.items.len);
+            try b.appendSlice(a, s);
+            try o.put(s, off);
+            return off;
+        }
+    }.call;
+
+    const PackedEntry = extern struct {
+        mangled_offset: u32,
+        mangled_length: u32,
+        zap_struct_offset: u32,
+        zap_struct_length: u32,
+        zap_local_offset: u32,
+        zap_local_length: u32,
+        zap_arity: u32,
+    };
+    var packed_entries = try allocator.alloc(PackedEntry, entries.len);
+    defer allocator.free(packed_entries);
+    for (entries, 0..) |e, i| {
+        const m_off = try intern(&blob, &offsets, allocator, e.mangled);
+        const s_off: u32 = if (e.zap_struct) |s| try intern(&blob, &offsets, allocator, s) else std.math.maxInt(u32);
+        const s_len: u32 = if (e.zap_struct) |s| @intCast(s.len) else 0;
+        const l_off = try intern(&blob, &offsets, allocator, e.zap_local);
+        packed_entries[i] = .{
+            .mangled_offset = m_off,
+            .mangled_length = @intCast(e.mangled.len),
+            .zap_struct_offset = s_off,
+            .zap_struct_length = s_len,
+            .zap_local_offset = l_off,
+            .zap_local_length = @intCast(e.zap_local.len),
+            .zap_arity = e.zap_arity,
+        };
+    }
+
+    const entries_bytes = packed_entries.len * @sizeOf(PackedEntry);
+    const total = ZSYM_HEADER_SIZE + blob.items.len + entries_bytes;
+    const out = try allocator.alloc(u8, total);
+    errdefer allocator.free(out);
+    @memcpy(out[0..ZSYM_MAGIC.len], &ZSYM_MAGIC);
+    std.mem.writeInt(u32, out[ZSYM_MAGIC.len..][0..4], ZSYM_FORMAT_VERSION, .little);
+    std.mem.writeInt(u32, out[ZSYM_MAGIC.len + 4 ..][0..4], @intCast(entries.len), .little);
+    std.mem.writeInt(u32, out[ZSYM_MAGIC.len + 8 ..][0..4], @intCast(blob.items.len), .little);
+    @memcpy(out[ZSYM_HEADER_SIZE..][0..blob.items.len], blob.items);
+    @memcpy(out[ZSYM_HEADER_SIZE + blob.items.len ..][0..entries_bytes], std.mem.sliceAsBytes(packed_entries));
+    return out;
+}
+
+test "ZapSymbolReader decodes a ZSYM v1 blob and finds entries by mangled name" {
+    const allocator = std.testing.allocator;
+    // Pre-sorted by mangled name: "Demo.deeper__0" < "Demo.main__1" < "main".
+    const entries = [_]ZapSymbolEntry{
+        .{ .mangled = "Demo.deeper__0", .zap_struct = "Demo", .zap_local = "deeper", .zap_arity = 0 },
+        .{ .mangled = "Demo.main__1", .zap_struct = "Demo", .zap_local = "main", .zap_arity = 1 },
+        .{ .mangled = "main", .zap_struct = null, .zap_local = "main", .zap_arity = 1 },
+    };
+    const blob = try buildTestZsymBlob(allocator, &entries);
+    defer allocator.free(blob);
+
+    const reader = ZapSymbolReader.init(blob) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 3), reader.entry_count);
+
+    const deeper = reader.findByMangled("Demo.deeper__0") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Demo", deeper.zap_struct.?);
+    try std.testing.expectEqualStrings("deeper", deeper.zap_local);
+    try std.testing.expectEqual(@as(u32, 0), deeper.zap_arity);
+
+    const top = reader.findByMangled("main") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(top.zap_struct == null);
+    try std.testing.expectEqualStrings("main", top.zap_local);
+    try std.testing.expectEqual(@as(u32, 1), top.zap_arity);
+
+    try std.testing.expect(reader.findByMangled("does_not_exist") == null);
+}
+
+test "ZapSymbolReader.init rejects bad magic, wrong version, truncated blob" {
+    // Empty / too short.
+    try std.testing.expect(ZapSymbolReader.init("") == null);
+    try std.testing.expect(ZapSymbolReader.init("ZSYM") == null);
+
+    // Bad magic.
+    const bad_magic = [_]u8{ 'X', 'X', 'X', 'X', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try std.testing.expect(ZapSymbolReader.init(&bad_magic) == null);
+
+    // Right magic, wrong version.
+    var bad_version: [16]u8 = undefined;
+    @memcpy(bad_version[0..4], &ZSYM_MAGIC);
+    std.mem.writeInt(u32, bad_version[4..][0..4], 999, .little);
+    std.mem.writeInt(u32, bad_version[8..][0..4], 0, .little);
+    std.mem.writeInt(u32, bad_version[12..][0..4], 0, .little);
+    try std.testing.expect(ZapSymbolReader.init(&bad_version) == null);
+
+    // Right header, claims one entry, but the entry bytes are missing.
+    var truncated: [16]u8 = undefined;
+    @memcpy(truncated[0..4], &ZSYM_MAGIC);
+    std.mem.writeInt(u32, truncated[4..][0..4], ZSYM_FORMAT_VERSION, .little);
+    std.mem.writeInt(u32, truncated[8..][0..4], 1, .little); // entry_count = 1
+    std.mem.writeInt(u32, truncated[12..][0..4], 0, .little); // blob_size = 0
+    try std.testing.expect(ZapSymbolReader.init(&truncated) == null);
+}
+
+test "ZapSymbolReader decodes from a misaligned buffer" {
+    const allocator = std.testing.allocator;
+    const entries = [_]ZapSymbolEntry{
+        .{ .mangled = "Mod.fn__1", .zap_struct = "Mod", .zap_local = "fn", .zap_arity = 1 },
+    };
+    const blob = try buildTestZsymBlob(allocator, &entries);
+    defer allocator.free(blob);
+
+    const padded = try allocator.alloc(u8, blob.len + 1);
+    defer allocator.free(padded);
+    @memcpy(padded[1..], blob);
+
+    const reader = ZapSymbolReader.init(padded[1..]) orelse return error.TestUnexpectedResult;
+    const v = reader.findByMangled("Mod.fn__1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Mod", v.zap_struct.?);
+    try std.testing.expectEqualStrings("fn", v.zap_local);
+    try std.testing.expectEqual(@as(u32, 1), v.zap_arity);
+}
+
+test "parseBacktraceVerbosity honors ZAP_BACKTRACE conventions" {
+    try std.testing.expectEqual(BacktraceVerbosity.short, parseBacktraceVerbosity(null));
+    try std.testing.expectEqual(BacktraceVerbosity.short, parseBacktraceVerbosity(""));
+    try std.testing.expectEqual(BacktraceVerbosity.short, parseBacktraceVerbosity("short"));
+    try std.testing.expectEqual(BacktraceVerbosity.short, parseBacktraceVerbosity("garbage"));
+    try std.testing.expectEqual(BacktraceVerbosity.off, parseBacktraceVerbosity("0"));
+    try std.testing.expectEqual(BacktraceVerbosity.off, parseBacktraceVerbosity("none"));
+    try std.testing.expectEqual(BacktraceVerbosity.off, parseBacktraceVerbosity("off"));
+    try std.testing.expectEqual(BacktraceVerbosity.full, parseBacktraceVerbosity("full"));
+    try std.testing.expectEqual(BacktraceVerbosity.full, parseBacktraceVerbosity("all"));
+}
+
+test "pathBasename strips directories" {
+    try std.testing.expectEqualStrings("demo.zap", pathBasename("/abs/path/to/demo.zap"));
+    try std.testing.expectEqualStrings("demo.zap", pathBasename("demo.zap"));
+    try std.testing.expectEqualStrings("", pathBasename("/trailing/slash/"));
+    try std.testing.expectEqualStrings("a", pathBasename("a"));
+}
+
+test "Backtrace.capture captures non-empty frames and is bounded" {
+    // This unit test runs in the host test binary (Debug), which has frame
+    // pointers and stack-tracing enabled, so a capture from a few frames
+    // deep must return at least one frame and never exceed the buffer.
+    const Helper = struct {
+        noinline fn level2() Backtrace {
+            return Backtrace.capture(0);
+        }
+        noinline fn level1() Backtrace {
+            return level2();
+        }
+    };
+    const bt = Helper.level1();
+    try std.testing.expect(bt.len <= BACKTRACE_MAX_FRAMES);
+    // `allow_stack_tracing` is on for Debug; expect a real capture.
+    if (std.options.allow_stack_tracing and std.debug.SelfInfo != void) {
+        try std.testing.expect(bt.len > 0);
+    }
+}
+
+test "Backtrace.capture skip drops leading frames" {
+    const Helper = struct {
+        noinline fn capN(skip: usize) Backtrace {
+            return Backtrace.capture(skip);
+        }
+    };
+    const full = Helper.capN(0);
+    const skipped = Helper.capN(1);
+    if (std.options.allow_stack_tracing and std.debug.SelfInfo != void and full.len > 1) {
+        // Dropping one frame yields exactly one fewer (the captured depth is
+        // identical between the two calls — same call site).
+        try std.testing.expectEqual(full.len - 1, skipped.len);
     }
 }
