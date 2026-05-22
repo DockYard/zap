@@ -3332,6 +3332,23 @@ pub const IrBuilder = struct {
         return type_id;
     }
 
+    /// When `current_expected_type` names a concrete integer type, return
+    /// its `ZigType`. Used by the `int_lit` lowering to type a default-
+    /// `I64`-stamped literal against the surrounding expected type (a
+    /// callee's parameter type for a call argument, or the enclosing
+    /// function's return type for a tail/return-position literal). Returns
+    /// `null` for absent, non-integer, or unresolved contexts so the
+    /// caller falls back to the literal's own type.
+    fn expectedConcreteIntegerType(self: *const IrBuilder) ?ZigType {
+        const context = self.current_expected_type orelse return null;
+        if (self.usableContextType(context) == null) return null;
+        const context_zig_type = typeIdToZigTypeWithStore(context, self.type_store);
+        return switch (context_zig_type) {
+            .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .usize, .isize => context_zig_type,
+            else => null,
+        };
+    }
+
     fn shouldPreferContextType(self: *const IrBuilder, fallback: types_mod.TypeId, context: types_mod.TypeId) bool {
         _ = self.usableContextType(context) orelse return false;
         if (fallback == types_mod.TypeStore.UNKNOWN or fallback == types_mod.TypeStore.ERROR) return true;
@@ -9535,8 +9552,35 @@ pub const IrBuilder = struct {
 
         switch (expr.kind) {
             .int_lit => |v| {
-                const int_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
-                const resolved = if (int_type == .any) .i64 else int_type;
+                // Integer-literal typing precedence:
+                //   1. The type-checker concretized a non-default integer
+                //      type onto this node (`expr.type_id`). This is the
+                //      most authoritative source and always wins.
+                //   2. Otherwise the literal still carries HIR's default
+                //      `I64` stamp. In that case the *expected type* of the
+                //      surrounding context — the callee's parameter type for
+                //      a call argument, or the enclosing function's return
+                //      type for a tail/return-position literal — drives the
+                //      concrete integer type. `current_expected_type` is set
+                //      to exactly that context by the call-argument loop
+                //      (`callTargetExpectedType`) and by `lowerBlockExpecting`
+                //      for the block tail. Reading it here lets a call-arg
+                //      literal like `D.f(-5)` inherit the parameter's `i64`
+                //      instead of being mis-narrowed by the caller's return
+                //      type in the ZIR layer.
+                //   3. Else a bare `i64`-tracked literal (no concrete context),
+                //      emitted untyped so straight-line uses stay flexible.
+                const declared_int_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                const context_int_type: ?ZigType = if (declared_int_type == .any or declared_int_type == .i64)
+                    self.expectedConcreteIntegerType()
+                else
+                    null;
+                const resolved = if (context_int_type) |ctx|
+                    ctx
+                else if (declared_int_type == .any)
+                    .i64
+                else
+                    declared_int_type;
                 const hint: ?ZigType = if (resolved != .i64) resolved else null;
                 try self.current_instrs.append(self.allocator, .{
                     .const_int = .{ .dest = dest, .value = v, .type_hint = hint },
