@@ -8057,7 +8057,30 @@ pub const IrBuilder = struct {
                     last_local = try self.lowerExpr(expr);
                 },
                 .local_set => |ls| {
-                    const val = try self.lowerExpr(ls.value);
+                    // The expected-type context for a let-binding's RHS is the
+                    // binding's *own* declared value type — never the enclosing
+                    // function's return type. When a function body is lowered
+                    // via `lowerBlockExpecting`, `current_expected_type` holds
+                    // that return type for the whole block scope so a tail
+                    // literal narrows to it (see the `.expr` arm below). A
+                    // non-tail `name = <int literal>` must NOT inherit that:
+                    // a bare integer literal with no genuine type-expectation
+                    // site defaults to `i64` per the language spec. Mirror the
+                    // call-argument loop and scope `current_expected_type` to
+                    // the binding's value type (the type-checker concretized
+                    // any annotation or inferred type onto `ls.value.type_id`),
+                    // or clear it to `null` when that type is not a usable
+                    // concrete context — so the literal falls back to `i64`
+                    // rather than the leaked return type.
+                    const val = blk: {
+                        const saved_expected_type = self.current_expected_type;
+                        self.current_expected_type = if (self.usableContextType(ls.value.type_id)) |usable_type_id|
+                            usable_type_id
+                        else
+                            null;
+                        defer self.current_expected_type = saved_expected_type;
+                        break :blk try self.lowerExpr(ls.value);
+                    };
                     // Skip redundant self-assignment (e.g., struct init already in the right local)
                     if (val != ls.index) {
                         try self.current_instrs.append(self.allocator, .{
