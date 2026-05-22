@@ -1041,6 +1041,12 @@ pub const Collector = struct {
                 .attribute => |attr| {
                     if (attr.value) |value| try self.collectExprScopes(value, parent_scope);
                 },
+                .defer_stmt => |defer_node| {
+                    // The deferred cleanup expression is ordinary code; its
+                    // closures/var refs need the same scope collection as
+                    // any other expression statement.
+                    try self.collectExprScopes(defer_node.expr, parent_scope);
+                },
                 .function_decl, .macro_decl => {},
             }
         }

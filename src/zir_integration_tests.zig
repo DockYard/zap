@@ -8194,3 +8194,221 @@ test "Phase5 script cache: concurrent identical runs are race-safe (atomic publi
     try std.testing.expectEqual(@as(usize, 1), try countScriptKeyDirs(allocator, &tmp_dir));
     try expectOnlyScriptInDir(&tmp_dir, script_name);
 }
+
+// ============================================================
+// Phase 2.d — defer / errdefer (block-scoped LIFO cleanup)
+// ============================================================
+//
+// Semantics (Zig's single-LIFO-stack model):
+//   * `defer <expr>`    runs at scope exit on EVERY value-return path
+//                       (normal fall-through return AND the `?` Error
+//                       early-return), in reverse registration order.
+//   * `errdefer <expr>` runs at scope exit ONLY on an error return
+//                       (the `?` Error early-return), in reverse order.
+//   * defer + errdefer share ONE LIFO stack: on the success path the
+//     errdefer entries are skipped; on the error path they fire.
+//   * Block-scoped: a defer inside an inner `{ }` block runs at that
+//     inner block's exit.
+//   * raise/panic/contract abort `_exit` WITHOUT unwinding, so deferred
+//     cleanup intentionally does NOT run on those paths.
+
+test "Phase2d defer: runs on normal return in reverse (LIFO) order" {
+    // Two defers registered A then B must fire B then A after the
+    // function body's tail expression is evaluated.
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    defer IO.puts("defer-A")
+        \\    defer IO.puts("defer-B")
+        \\    IO.puts("body")
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("body\ndefer-B\ndefer-A\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "Phase2d defer: runs on the ? Error early-return path" {
+    // `step(0)?` takes the Error prong and early-returns. The function's
+    // `defer` must still fire before the early return propagates.
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn step(n :: i64) -> Result(i64, String) {
+        \\    case n > 0 {
+        \\      true -> Result(i64, String).Ok(n - 1)
+        \\      false -> Result(i64, String).Error("stop")
+        \\    }
+        \\  }
+        \\
+        \\  pub fn run() -> Result(i64, String) {
+        \\    defer IO.puts("cleanup-ran")
+        \\    next = TestProg.step(0)?
+        \\    Result(i64, String).Ok(next)
+        \\  }
+        \\
+        \\  pub fn main() -> u8 {
+        \\    case TestProg.run() {
+        \\      Result.Ok(_v) -> IO.puts("ok")
+        \\      Result.Error(reason) -> IO.puts(reason)
+        \\    }
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    // defer fires before the Error propagates out of run/0, then main
+    // prints the Error reason.
+    try std.testing.expectEqualStrings("cleanup-ran\nstop\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "Phase2d errdefer: fires on ? Error path but NOT on normal return" {
+    // run(0) hits the Error prong -> errdefer fires.
+    // run(1) succeeds -> errdefer skipped, defer still fires.
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn step(n :: i64) -> Result(i64, String) {
+        \\    case n > 0 {
+        \\      true -> Result(i64, String).Ok(n - 1)
+        \\      false -> Result(i64, String).Error("stop")
+        \\    }
+        \\  }
+        \\
+        \\  pub fn run(n :: i64) -> Result(i64, String) {
+        \\    defer IO.puts("always")
+        \\    errdefer IO.puts("on-error-only")
+        \\    next = TestProg.step(n)?
+        \\    Result(i64, String).Ok(next)
+        \\  }
+        \\
+        \\  pub fn main() -> u8 {
+        \\    IO.puts("--- error path ---")
+        \\    case TestProg.run(0) {
+        \\      Result.Ok(_v) -> IO.puts("ok")
+        \\      Result.Error(_r) -> IO.puts("err")
+        \\    }
+        \\    IO.puts("--- success path ---")
+        \\    case TestProg.run(1) {
+        \\      Result.Ok(_v) -> IO.puts("ok")
+        \\      Result.Error(_r) -> IO.puts("err")
+        \\    }
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    // Error path: errdefer fires, then defer (LIFO: errdefer registered
+    // after defer, so it unwinds first), then main prints "err".
+    // Success path: ONLY defer fires (errdefer skipped), then "ok".
+    try std.testing.expectEqualStrings(
+        "--- error path ---\non-error-only\nalways\nerr\n--- success path ---\nalways\nok\n",
+        result.stdout,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "Phase2d interleave: source defer A; errdefer B; defer C — single LIFO stack" {
+    // Zig model: ONE LIFO stack. Source order: defer A, errdefer B,
+    // defer C. Success path runs C, A (B skipped). Error path runs
+    // C, B, A.
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn step(n :: i64) -> Result(i64, String) {
+        \\    case n > 0 {
+        \\      true -> Result(i64, String).Ok(n - 1)
+        \\      false -> Result(i64, String).Error("stop")
+        \\    }
+        \\  }
+        \\
+        \\  pub fn run(n :: i64) -> Result(i64, String) {
+        \\    defer IO.puts("A")
+        \\    errdefer IO.puts("B")
+        \\    defer IO.puts("C")
+        \\    next = TestProg.step(n)?
+        \\    Result(i64, String).Ok(next)
+        \\  }
+        \\
+        \\  pub fn main() -> u8 {
+        \\    IO.puts("error:")
+        \\    case TestProg.run(0) {
+        \\      Result.Ok(_v) -> IO.puts("ok")
+        \\      Result.Error(_r) -> IO.puts("done")
+        \\    }
+        \\    IO.puts("success:")
+        \\    case TestProg.run(1) {
+        \\      Result.Ok(_v) -> IO.puts("ok")
+        \\      Result.Error(_r) -> IO.puts("done")
+        \\    }
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings(
+        "error:\nC\nB\nA\ndone\nsuccess:\nC\nA\nok\n",
+        result.stdout,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "Phase2d block scope: defer inside an inner if-body runs at that block's exit" {
+    // Zap's user-facing inner block scopes are `if`/`else` and `case`/
+    // `cond` arm bodies (statement lists) — a free-standing `{ ... }`
+    // block-expression is not Zap surface syntax. A `defer` inside the
+    // `if` body must fire when the if-block exits (before "after-if"),
+    // not at function exit; the function-level defer fires last.
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn run(n :: i64) -> u8 {
+        \\    defer IO.puts("fn-exit")
+        \\    if n > 0 {
+        \\      defer IO.puts("if-exit")
+        \\      IO.puts("in-if")
+        \\    } else {
+        \\      IO.puts("in-else")
+        \\    }
+        \\    IO.puts("after-if")
+        \\    0
+        \\  }
+        \\
+        \\  pub fn main() -> u8 {
+        \\    TestProg.run(1)
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    // in-if, then if-body defer at if-block exit, then after-if, then
+    // fn-level defer at function exit.
+    try std.testing.expectEqualStrings(
+        "in-if\nif-exit\nafter-if\nfn-exit\n",
+        result.stdout,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "Phase2d raise: deferred cleanup does NOT run on the unrecoverable abort path" {
+    // raise/panic/contract abort `_exit` without unwinding, so the
+    // `defer` here intentionally never fires. The process aborts
+    // non-zero with the Zap crash report; "should-not-print" must be
+    // absent from stdout.
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn boom() -> Nil {
+        \\    defer IO.puts("should-not-print")
+        \\    raise "kaboom"
+        \\  }
+        \\
+        \\  pub fn main() -> u8 {
+        \\    TestProg.boom()
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    // Defer must NOT have run on the abort path.
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "should-not-print") == null);
+    // The raise aborts non-zero.
+    try std.testing.expect(result.exit_code != 0);
+}

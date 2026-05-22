@@ -3067,6 +3067,20 @@ pub const IrBuilder = struct {
     /// argument expression. Used for empty container literals whose own HIR
     /// type is intentionally underconstrained.
     current_expected_type: ?types_mod.TypeId = null,
+    /// Phase 2.d — `defer`/`errdefer` cleanup stack (Zig's single-LIFO
+    /// model). Each block scope (a `lowerBlock` invocation) records the
+    /// stack length on entry and pushes one entry per `defer`/`errdefer`
+    /// statement it encounters; it does NOT emit the cleanup inline.
+    /// At the block's normal fall-through exit it emits the `.always`
+    /// entries it pushed (reverse order, skipping `.on_error`) and
+    /// truncates back to its base. The `?` operator's Error early-return
+    /// (`lowerTryProject`) emits BOTH `.always` and `.on_error` entries
+    /// across the ENTIRE stack (every enclosing scope) before its `ret`.
+    /// Reset to `.empty` at each function-clause entry. raise/panic/
+    /// contract aborts bypass this entirely (they `_exit` without
+    /// unwinding), so deferred cleanup correctly never runs on those
+    /// paths.
+    defer_stack: std.ArrayListUnmanaged(DeferEntry) = .empty,
     /// Per-instantiation specialization table for every concrete
     /// `.applied { base, args }` TypeId that appears in the TypeStore
     /// at the start of `buildProgram`. Each entry records the
@@ -3089,6 +3103,15 @@ pub const IrBuilder = struct {
     /// post-monomorphization nominal name rather than the parametric
     /// base name.
     applied_name_to_spec: std.StringHashMapUnmanaged(usize) = .empty,
+
+    /// One scheduled `defer`/`errdefer` cleanup (Phase 2.d). The HIR
+    /// expression is RE-LOWERED at each scope-exit edge (so it observes
+    /// its captured locals' exit-time values, matching Zig), and the
+    /// resulting instructions participate in ARC like any other code.
+    pub const DeferEntry = struct {
+        kind: ast.DeferKind,
+        expr: *const hir_mod.Expr,
+    };
 
     /// One precomputed entry per concrete `.applied { base, args }`
     /// TypeId observed in the TypeStore. See `applied_specializations`
@@ -4127,6 +4150,12 @@ pub const IrBuilder = struct {
         self.term_tuple_locals.clearRetainingCapacity();
         self.current_param_types = .empty;
         self.current_param_hir_types = .empty;
+        // Phase 2.d: each function body starts with an empty `defer`/
+        // `errdefer` cleanup stack. The per-block base/truncate discipline
+        // in `lowerBlock` keeps it balanced within a body; resetting here
+        // makes it robust against any control-flow edge that exits a body
+        // without unwinding.
+        self.defer_stack.clearRetainingCapacity();
 
         var captures: std.ArrayList(Capture) = .empty;
         for (group.captures, 0..) |capture, idx| {
@@ -4231,6 +4260,9 @@ pub const IrBuilder = struct {
         self.local_hir_types.clearRetainingCapacity();
         self.param_backed_locals.clearRetainingCapacity();
         self.term_tuple_locals.clearRetainingCapacity();
+        // Phase 2.d: clean cleanup stack per function group (see the
+        // single-clause reset above for rationale).
+        self.defer_stack.clearRetainingCapacity();
         self.current_param_types = .empty;
         self.current_param_hir_types = .empty;
 
@@ -6853,6 +6885,17 @@ pub const IrBuilder = struct {
                 .value = error_value_local,
             },
         });
+        // Phase 2.d: this `?` Error prong is an error early-return. Before
+        // the `ret`, run the ENTIRE enclosing cleanup stack — every
+        // `defer` AND every `errdefer` registered so far across all
+        // enclosing block scopes — in reverse (LIFO) order. The re-wrapped
+        // `Result.Error(...)` return value was already constructed above
+        // (so it is unaffected by the cleanup, matching Zig's "return value
+        // evaluated, then deferred cleanup runs, then control leaves"
+        // ordering). The stack is NOT truncated here: this prong is
+        // `noreturn`, so the enclosing blocks' own normal-exit cleanup is
+        // never reached on this path and cannot double-run.
+        try self.emitDeferCleanup(0, .error_return);
         try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = rewrapped_local } });
         const err_body = try self.current_instrs.toOwnedSlice(self.allocator);
         self.current_instrs = saved_err;
@@ -8110,6 +8153,7 @@ pub const IrBuilder = struct {
         const span: ast.SourceSpan = switch (stmt) {
             .expr => |expr| expr.span,
             .local_set => |ls| ls.value.span,
+            .defer_stmt => |defer_node| defer_node.expr.span,
             .function_group => return,
         };
         // The lexer emits 1-based line/column, the existing IR
@@ -8128,6 +8172,11 @@ pub const IrBuilder = struct {
     }
 
     fn lowerBlock(self: *IrBuilder, block: *const hir_mod.Block) anyerror!?LocalId {
+        // Phase 2.d: this block opens a cleanup scope. Record the LIFO
+        // stack length on entry so its normal fall-through exit emits only
+        // the `defer`/`errdefer` entries pushed inside THIS block and
+        // truncates back to here.
+        const defer_base = self.defer_stack.items.len;
         var last_local: ?LocalId = null;
         for (block.stmts, 0..) |stmt, stmt_index| {
             // Phase 0 — DWARF foundation: emit a `.dbg_stmt` at every
@@ -8226,9 +8275,64 @@ pub const IrBuilder = struct {
                     self.current_instrs = saved_instrs;
                     self.next_local = saved_next_local;
                 },
+                .defer_stmt => |defer_node| {
+                    // Phase 2.d: do NOT emit the cleanup here. Record it on
+                    // the LIFO stack; the cleanup runs at scope exit (normal
+                    // fall-through emits it below, the `?` Error early-return
+                    // emits it in `lowerTryProject`).
+                    try self.defer_stack.append(self.allocator, .{
+                        .kind = defer_node.kind,
+                        .expr = defer_node.expr,
+                    });
+                },
             }
         }
+
+        // Phase 2.d: normal fall-through exit of this block scope. Run the
+        // `.always` (`defer`) entries pushed inside this block in reverse
+        // (LIFO) order; `.on_error` (`errdefer`) entries are skipped on the
+        // success path. Then truncate the stack back to this scope's base.
+        try self.emitDeferCleanup(defer_base, .normal_exit);
+        self.defer_stack.shrinkRetainingCapacity(defer_base);
+
         return last_local;
+    }
+
+    /// Which scope-exit edge is emitting cleanup (Phase 2.d). On
+    /// `.normal_exit` only `.always` (`defer`) entries fire; on
+    /// `.error_return` both `.always` and `.on_error` (`errdefer`) entries
+    /// fire — Zig's single-LIFO model.
+    const DeferExitKind = enum { normal_exit, error_return };
+
+    /// Emit the scheduled `defer`/`errdefer` cleanup for the stack slice
+    /// `[from_index .. len)` in reverse (LIFO) registration order
+    /// (Phase 2.d). Each entry's HIR expression is RE-LOWERED here so it
+    /// observes its captured locals' exit-time values and so the emitted
+    /// instructions (calls, `local_get`s) participate in ARC normally —
+    /// retain/release route through the canonical `zir_builder.zig`
+    /// handlers exactly as for any other code. The deferred expression's
+    /// own result value is discarded (cleanup is run for its effect).
+    ///
+    /// This does NOT mutate the stack — callers decide whether to truncate
+    /// (normal block exit truncates; the `?` early-return leaves the stack
+    /// intact because its `ret` is `noreturn` and the enclosing block's
+    /// own fall-through cleanup is never reached on that path).
+    fn emitDeferCleanup(self: *IrBuilder, from_index: usize, exit_kind: DeferExitKind) anyerror!void {
+        if (self.defer_stack.items.len <= from_index) return;
+        var index = self.defer_stack.items.len;
+        while (index > from_index) {
+            index -= 1;
+            const entry = self.defer_stack.items[index];
+            const run_this = switch (entry.kind) {
+                .always => true,
+                .on_error => exit_kind == .error_return,
+            };
+            if (!run_this) continue;
+            // Re-lower the cleanup expression into the current instruction
+            // stream. Its result local is intentionally unused — the
+            // deferred expression runs for its side effects.
+            _ = try self.lowerExpr(entry.expr);
+        }
     }
 
     fn lowerBlockExpecting(
@@ -9284,6 +9388,7 @@ pub const IrBuilder = struct {
             switch (stmt) {
                 .expr => |expr| try self.scanExprForTryVariants(expr, struct_prefix),
                 .local_set => |ls| try self.scanExprForTryVariants(ls.value, struct_prefix),
+                .defer_stmt => |defer_node| try self.scanExprForTryVariants(defer_node.expr, struct_prefix),
                 .function_group => |fg| {
                     for (fg.clauses) |clause| {
                         try self.scanForTryVariantNames(clause.body, struct_prefix);
@@ -9355,6 +9460,7 @@ pub const IrBuilder = struct {
             switch (stmt) {
                 .expr => |expr| try self.scanExprForTryVariants(expr, struct_prefix),
                 .local_set => |ls| try self.scanExprForTryVariants(ls.value, struct_prefix),
+                .defer_stmt => |defer_node| try self.scanExprForTryVariants(defer_node.expr, struct_prefix),
                 .function_group => |fg| {
                     for (fg.clauses) |clause| {
                         try self.scanForTryVariantNames(clause.body, struct_prefix);
@@ -10577,12 +10683,27 @@ pub const IrBuilder = struct {
                 try self.lowerCaseExprBody(dest, try self.lowerExpr(case_data.scrutinee), case_data);
             },
             .block => |blk| {
-                // Lower each statement in the block; result is the last expression value
+                // Lower each statement in the block; result is the last expression value.
+                //
+                // Phase 2.d: a `block` expression opens its own cleanup
+                // scope. `defer`/`errdefer` statements written inside it run
+                // at THIS block's exit (block-scoped, matching Zig), not at
+                // the enclosing function's exit.
+                const block_defer_base = self.defer_stack.items.len;
                 var last_local: ?LocalId = null;
                 for (blk.stmts) |stmt| {
                     switch (stmt) {
                         .expr => |e| {
                             last_local = try self.lowerExpr(e);
+                        },
+                        .defer_stmt => |defer_node| {
+                            // Record on the LIFO stack; emitted at this
+                            // block's scope exit below (and on any `?`
+                            // Error early-return reached inside it).
+                            try self.defer_stack.append(self.allocator, .{
+                                .kind = defer_node.kind,
+                                .expr = defer_node.expr,
+                            });
                         },
                         .local_set => |ls| {
                             const val = try self.lowerExpr(ls.value);
@@ -10619,6 +10740,15 @@ pub const IrBuilder = struct {
                         },
                     }
                 }
+                // Phase 2.d: normal exit of this block-expression scope.
+                // Run the `.always` (`defer`) entries pushed inside this
+                // block in reverse order — AFTER the block's tail value is
+                // computed but BEFORE it is aliased to `dest`, so the
+                // cleanup observes exit-time values and the result is
+                // unaffected. `.on_error` entries are skipped on this
+                // success path. Then truncate back to this scope's base.
+                try self.emitDeferCleanup(block_defer_base, .normal_exit);
+                self.defer_stack.shrinkRetainingCapacity(block_defer_base);
                 if (last_local) |ll| {
                     // Alias the block result to the destination
                     try self.current_instrs.append(self.allocator, .{
@@ -11419,6 +11549,13 @@ fn maxLocalSetIndexInBlock(block: *const hir_mod.Block) LocalId {
             },
             .expr => |expr| {
                 const expr_max = maxLocalSetIndexInExpr(expr);
+                max_local = @max(max_local, expr_max);
+            },
+            .defer_stmt => |defer_node| {
+                // The deferred cleanup expression is re-lowered at scope
+                // exit and may itself bind locals (e.g. inner blocks), so
+                // its `local_set` indices must reserve space too.
+                const expr_max = maxLocalSetIndexInExpr(defer_node.expr);
                 max_local = @max(max_local, expr_max);
             },
             .function_group => |group| {

@@ -164,6 +164,26 @@ pub const Token = struct {
         return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "raise");
     }
 
+    /// `defer` is a contextual keyword (Phase 2.d), recognised only when
+    /// it leads a statement (`defer <expr>`). It schedules `<expr>` to run
+    /// at the enclosing block's scope exit on every value-return path, in
+    /// reverse (LIFO) registration order. It is not a hard keyword so an
+    /// identifier named `defer` outside leading-statement position keeps
+    /// working; the parser confirms the contextual reading at `parseStmt`.
+    pub fn isDeferIdent(self: Token, source: []const u8) bool {
+        return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "defer");
+    }
+
+    /// `errdefer` is a contextual keyword (Phase 2.d), recognised only
+    /// when it leads a statement (`errdefer <expr>`). It schedules `<expr>`
+    /// to run at the enclosing block's scope exit ONLY on an error-return
+    /// path (the `?` operator's Error early-return), in reverse order,
+    /// sharing one LIFO cleanup stack with `defer`. It is not a hard
+    /// keyword; the parser confirms the contextual reading at `parseStmt`.
+    pub fn isErrdeferIdent(self: Token, source: []const u8) bool {
+        return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "errdefer");
+    }
+
     pub const keywords = std.StaticStringMap(Tag).initComptime(.{
         .{ "pub", .keyword_pub },
         .{ "fn", .keyword_fn },

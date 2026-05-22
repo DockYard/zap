@@ -3129,6 +3129,9 @@ pub const TypeChecker = struct {
                         if (self.exprUsesClosureParamUnsafely(value, param_name, false)) return false;
                     }
                 },
+                .defer_stmt => |defer_node| {
+                    if (self.exprUsesClosureParamUnsafely(defer_node.expr, param_name, false)) return false;
+                },
                 .function_decl, .macro_decl, .import_decl => {},
             }
         }
@@ -4429,6 +4432,7 @@ pub const TypeChecker = struct {
             .function_decl => |func| try self.validateFunctionBodyDoesNotCallUnderscoreFunctions(func),
             .macro_decl => |mac| try self.validateMacroBodyDoesNotCallUnderscoreFunctions(mac),
             .attribute => |attr| if (attr.value) |value| try self.validateExprDoesNotCallUnderscoreFunctions(value),
+            .defer_stmt => |defer_node| try self.validateExprDoesNotCallUnderscoreFunctions(defer_node.expr),
             .import_decl => {},
         }
     }
@@ -5516,7 +5520,14 @@ pub const TypeChecker = struct {
         if (clause.body) |body| {
             for (body) |stmt| {
                 if (stmt == .expr) last_expr = stmt.expr;
-                body_type = try self.checkStmt(stmt);
+                // Phase 2.d: still type-check the deferred cleanup
+                // expression (to catch errors and resolve calls), but a
+                // trailing `defer`/`errdefer` is NOT the body's tail value
+                // — it yields `Nil` and must not override the real
+                // value-producing tail's type. Mirror the HIR block
+                // result-type scan, which walks back past `defer_stmt`.
+                const stmt_type = try self.checkStmt(stmt);
+                if (stmt != .defer_stmt) body_type = stmt_type;
             }
         }
 
@@ -5631,6 +5642,15 @@ pub const TypeChecker = struct {
             .import_decl => TypeStore.NIL,
             .attribute => |attr| {
                 if (attr.value) |value| _ = try self.inferExpr(value);
+                return TypeStore.NIL;
+            },
+            .defer_stmt => |defer_node| {
+                // Type-check the deferred cleanup expression (so a type
+                // error inside `defer <expr>` / `errdefer <expr>` is caught
+                // and any called functions resolve). The `defer`/`errdefer`
+                // statement is not an expression, so it yields `Nil` and
+                // never participates in the block's tail-value type.
+                _ = try self.inferExpr(defer_node.expr);
                 return TypeStore.NIL;
             },
         };

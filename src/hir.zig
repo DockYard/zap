@@ -448,6 +448,18 @@ pub const Stmt = union(enum) {
     expr: *const Expr,
     local_set: LocalSet,
     function_group: *const FunctionGroup,
+    /// `defer <expr>` / `errdefer <expr>` (Phase 2.d). Recorded in
+    /// statement order; the IR builder pushes it onto the enclosing
+    /// block's LIFO cleanup stack rather than emitting it inline, and
+    /// re-lowers it at each scope-exit edge.
+    defer_stmt: DeferStmt,
+};
+
+/// HIR form of a `defer`/`errdefer` statement (Phase 2.d). Carries the
+/// lowered cleanup expression and which value-return paths it runs on.
+pub const DeferStmt = struct {
+    kind: ast.DeferKind,
+    expr: *const Expr,
 };
 
 pub const LocalSet = struct {
@@ -4053,6 +4065,7 @@ pub const HirBuilder = struct {
             switch (stmt) {
                 .expr => |expr| return expr.span,
                 .local_set => |local_set| return local_set.value.span,
+                .defer_stmt => |defer_node| return defer_node.expr.span,
                 .function_group => {},
             }
         }
@@ -4075,7 +4088,15 @@ pub const HirBuilder = struct {
     /// Check if a HIR block contains a call to raise() or a ! function.
     fn bodyContainsRaise(self: *const HirBuilder, block: *const Block) bool {
         for (block.stmts) |stmt| {
-            if (self.exprContainsRaise(stmt.expr)) return true;
+            const expr: ?*const Expr = switch (stmt) {
+                .expr => |e| e,
+                .local_set => |ls| ls.value,
+                .defer_stmt => |defer_node| defer_node.expr,
+                .function_group => null,
+            };
+            if (expr) |e| {
+                if (self.exprContainsRaise(e)) return true;
+            }
         }
         return false;
     }
@@ -4746,6 +4767,19 @@ pub const HirBuilder = struct {
                         );
                     }
                 },
+                .defer_stmt => |defer_node| {
+                    // Phase 2.d: lower the cleanup expression now (so it
+                    // type-resolves against the scope where it was written),
+                    // but record it as a `defer_stmt` HIR node. The IR
+                    // builder does NOT emit it inline — it pushes it onto the
+                    // enclosing block's LIFO cleanup stack and re-lowers it at
+                    // each scope-exit edge.
+                    const hir_expr = try self.buildExpr(defer_node.expr);
+                    try hir_stmts.append(self.allocator, .{ .defer_stmt = .{
+                        .kind = defer_node.kind,
+                        .expr = hir_expr,
+                    } });
+                },
                 .function_decl => {},
                 else => {},
             }
@@ -4757,13 +4791,26 @@ pub const HirBuilder = struct {
         // and what `case_expr`'s arm-type unifier expects to read so
         // it can propagate a concrete container type back into
         // structurally-empty siblings (`[]`, `%{}`).
+        //
+        // A trailing `defer`/`errdefer` is never the block's tail value
+        // (it is a cleanup statement, not an expression), so the
+        // result-type scan walks backward past `defer_stmt` entries to the
+        // last value-producing statement.
         var block_result_type: types_mod.TypeId = types_mod.TypeStore.UNKNOWN;
-        if (owned_stmts.len > 0) {
-            const last = owned_stmts[owned_stmts.len - 1];
-            switch (last) {
-                .expr => |expr| block_result_type = expr.type_id,
-                .local_set => |ls| block_result_type = ls.value.type_id,
-                .function_group => {},
+        var result_scan = owned_stmts.len;
+        while (result_scan > 0) {
+            result_scan -= 1;
+            switch (owned_stmts[result_scan]) {
+                .expr => |expr| {
+                    block_result_type = expr.type_id;
+                    break;
+                },
+                .local_set => |ls| {
+                    block_result_type = ls.value.type_id;
+                    break;
+                },
+                .function_group => break,
+                .defer_stmt => continue,
             }
         }
         return try self.create(Block, .{
@@ -6873,6 +6920,10 @@ pub const HirBuilder = struct {
             switch (stmt) {
                 .expr => |expr| self.patchEmptyContainerTypesExpr(expr, expected_type),
                 .local_set => |ls| self.patchEmptyContainerTypesExpr(ls.value, expected_type),
+                // A `defer`/`errdefer` cleanup is never the block's tail
+                // value, so an empty container literal inside it never needs
+                // the block's expected-type patch.
+                .defer_stmt => {},
                 .function_group => {},
             }
         }

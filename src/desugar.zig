@@ -941,6 +941,16 @@ pub const Desugarer = struct {
             .function_decl => |func| .{ .function_decl = try self.desugarFunctionDecl(func) },
             .macro_decl => |mac| .{ .macro_decl = try self.desugarMacroDecl(mac) },
             .import_decl => stmt,
+            .defer_stmt => |defer_node| .{
+                // Desugar the deferred cleanup expression in place (so e.g.
+                // `defer raise "x"` gets the `raise "string"` -> RuntimeError
+                // normalisation applied to its inner expression).
+                .defer_stmt = try self.create(ast.DeferStmt, .{
+                    .meta = defer_node.meta,
+                    .kind = defer_node.kind,
+                    .expr = try self.desugarExpr(defer_node.expr),
+                }),
+            },
             .attribute => |attr| .{
                 .attribute = try self.create(ast.AttributeDecl, .{
                     .meta = attr.meta,

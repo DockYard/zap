@@ -646,6 +646,33 @@ pub const Stmt = union(enum) {
     macro_decl: *const FunctionDecl,
     import_decl: *const ImportDecl,
     attribute: *const AttributeDecl,
+    /// `defer <expr>` / `errdefer <expr>` (Phase 2.d). Schedules a
+    /// cleanup expression to run at the enclosing block's scope exit.
+    defer_stmt: *const DeferStmt,
+};
+
+/// Which value-return paths a scheduled cleanup runs on (Phase 2.d).
+pub const DeferKind = enum {
+    /// `defer` — runs on EVERY value-return path (normal fall-through
+    /// return AND the `?` Error early-return).
+    always,
+    /// `errdefer` — runs ONLY on an error-return path (the `?` Error
+    /// early-return). Skipped on the normal/success path.
+    on_error,
+};
+
+/// A `defer <expr>` or `errdefer <expr>` statement (Phase 2.d).
+///
+/// The cleanup `expr` is NOT evaluated where it is written; it is
+/// recorded onto the enclosing block's LIFO cleanup stack and lowered
+/// (re-read against its captured locals' exit-time values) at each
+/// scope-exit edge — matching Zig's `defer`/`errdefer` model. `defer`
+/// and `errdefer` share ONE stack; on the success path the `errdefer`
+/// entries are skipped, on the `?` Error early-return path they fire.
+pub const DeferStmt = struct {
+    meta: NodeMeta,
+    kind: DeferKind,
+    expr: *const Expr,
 };
 
 pub const Assignment = struct {

@@ -2467,6 +2467,19 @@ pub const Parser = struct {
             return .{ .attribute = attr };
         }
 
+        // Phase 2.d: `defer <expr>` / `errdefer <expr>` are contextual
+        // statement-leading keywords. They are recognised only when the
+        // identifier `defer`/`errdefer` leads a statement and the next
+        // token starts a value expression (so an identifier named `defer`
+        // used as an expression — `defer.field`, `defer(x)`, `defer = ...`
+        // — keeps its ordinary meaning).
+        if (self.current.isDeferIdent(self.source) and tokenStartsRaiseValue(self.peekNext())) {
+            return try self.parseDeferStmt(.always);
+        }
+        if (self.current.isErrdeferIdent(self.source) and tokenStartsRaiseValue(self.peekNext())) {
+            return try self.parseDeferStmt(.on_error);
+        }
+
         const expr = try self.parseExpr();
 
         if (self.check(.equal)) {
@@ -4199,6 +4212,35 @@ pub const Parser = struct {
             .left_angle_angle,
             => true,
             else => false,
+        };
+    }
+
+    /// Parse a `defer <expr>` / `errdefer <expr>` statement (Phase 2.d).
+    /// The leading `defer`/`errdefer` identifier was already confirmed as
+    /// the contextual keyword by `parseStmt` (next token starts a value).
+    /// `kind` selects the cleanup semantics (`.always` for `defer`,
+    /// `.on_error` for `errdefer`). The cleanup expression is a full
+    /// expression evaluated later, at scope exit.
+    fn parseDeferStmt(self: *Parser, kind: ast.DeferKind) !ast.Stmt {
+        const start = self.currentSpan();
+        _ = self.advance(); // consume the `defer` / `errdefer` identifier
+
+        // Mirror `parseRaiseExpr`: suppress trailing-block parsing so a
+        // `defer foo(x)` written as the last statement of a `case` arm or
+        // block does not greedily absorb the enclosing closing braces as a
+        // `func(args) { block }` trailing block.
+        const saved = self.disable_trailing_block;
+        self.disable_trailing_block = true;
+        defer self.disable_trailing_block = saved;
+
+        const expr = try self.parseExpr();
+
+        return .{
+            .defer_stmt = try self.create(ast.DeferStmt, .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .kind = kind,
+                .expr = expr,
+            }),
         };
     }
 
