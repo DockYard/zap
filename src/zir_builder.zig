@@ -547,10 +547,16 @@ fn appendZigTypeForVTable(
         .f128 => try buf.appendSlice(allocator, "f128"),
         .usize => try buf.appendSlice(allocator, "usize"),
         .isize => try buf.appendSlice(allocator, "isize"),
-        // `String` and `Atom` both lower to Zig's `[]const u8`
-        // slice shape. Sema treats them identically at the ABI
-        // boundary; the IR's distinction is purely diagnostic.
-        .string, .atom => try buf.appendSlice(allocator, "[]const u8"),
+        // `String` lowers to Zig's `[]const u8` slice. `Atom`, in
+        // contrast, is an interned `u32` ID at runtime (see the `.atom`
+        // arms in `mapParamType`/`mapReturnType`/`emitImportedTypeRef`
+        // and the `const_atom` lowering). A vtable method slot whose
+        // protocol return type is `Atom` (e.g. `Error.kind`) MUST render
+        // as `u32` so it matches the impl method's actual `u32` return —
+        // rendering it as `[]const u8` makes Sema reject the per-impl
+        // adapter with `expected type '[]const u8', found 'u32'`.
+        .string => try buf.appendSlice(allocator, "[]const u8"),
+        .atom => try buf.appendSlice(allocator, "u32"),
         .nil => try buf.appendSlice(allocator, "?void"),
         .term => try buf.appendSlice(allocator, "zap_runtime.Term"),
         // Protocol existential — the runtime fat-pointer carrier.
@@ -1986,8 +1992,20 @@ pub const ZirDriver = struct {
             // struct file the symbol is published unqualified — so
             // the vtable adapter must call `TargetMod.<method_name>`,
             // not `TargetMod.<impl_function_name>`.
+            // The impl method is published inside the target struct's
+            // ZIR file under its `func.local_name`, which carries the
+            // arity suffix (`message__1`, not `message`) — see
+            // `emitFunction`'s `emit_name = func.local_name` selection
+            // when `current_emit_struct != null`. The adapter therefore
+            // calls `TargetMod.<method>__<arity>`, matching the published
+            // declaration name. (The earlier assumption that methods were
+            // published bare was wrong; `@import("Target").message` has
+            // no such member — only `message__1`.)
             try buf.appendSlice(self.allocator, "    return TargetMod.");
             try appendZigIdentifier(self.allocator, &buf, method.method_name);
+            const method_arity_suffix = try std.fmt.allocPrint(self.allocator, "__{d}", .{method.arity});
+            defer self.allocator.free(method_arity_suffix);
+            try buf.appendSlice(self.allocator, method_arity_suffix);
             try buf.appendSlice(self.allocator, "(inner.*");
             for (method.extra_param_types, 0..) |_, param_index| {
                 try buf.appendSlice(self.allocator, ", ");

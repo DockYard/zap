@@ -2073,17 +2073,19 @@ fn rewriteProtocolBoxReleasesInStream(
             // Symmetric to the release rewrite: a `.retain` of a known
             // protocol-box local must route through the synthetic
             // `<Protocol>VTable.retain(box)` helper, not the generic
-            // `retainAny` dispatcher (which `@compileError`s on a
-            // 16-byte `ProtocolBox` value — it only accepts single-item
-            // pointers). The share-side analysis emits `.retain` with
-            // `.kind = .normal`; flip the box-local ones to
-            // `.protocol_box_retain` and stamp the protocol name. Both
-            // `.persistent` and already-rewritten `.protocol_box_retain`
-            // retains are left alone (the persistent path is never
-            // emitted for a box local — a box is not stashed via the
-            // `.copy_value` persistent-retain route).
+            // `retainAny`/`retainAnyPersistent` dispatchers (both
+            // `@compileError` on a 16-byte `ProtocolBox` value — they
+            // accept only single-item pointers). BOTH the transient
+            // `.normal` retain (borrow / call-arg share) and the
+            // `.persistent` retain (box stashed into struct-field /
+            // container storage, e.g. `%Outer{cause: Option.Some(box)}`)
+            // must be flipped: a ProtocolBox carries no inline ArcHeader,
+            // so there is no separate persistent retain semantics — the
+            // box's vtable `retain` bumps the inner's refcount either way.
+            // Already-rewritten `.protocol_box_retain` retains are left
+            // alone (idempotent re-run guard).
             .retain => |ret| {
-                if (ret.kind != .normal) continue;
+                if (ret.kind == .protocol_box_retain) continue;
                 const protocol_name = function.protocol_box_locals.get(ret.value) orelse continue;
                 instr_ptr.* = .{ .retain = .{
                     .value = ret.value,
