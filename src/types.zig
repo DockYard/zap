@@ -210,15 +210,27 @@ pub const TypeStore = struct {
     /// Inferred signatures for generated functions, keyed by function name StringId.
     inferred_signatures: std.AutoHashMap(ast.StringId, InferredSignature),
     /// Inferred (or declared-and-verified) `raises` error row per function,
-    /// keyed by function name StringId. Populated by
+    /// keyed by the function's stable fully-qualified-name `StringId`
+    /// (`"<Struct>.<method>/<arity>"`, built by `raisesRowKey`). A name-based
+    /// key is collision-free across structs (unlike a bare method name) AND
+    /// stable across the multi-pass / per-struct compilation pipeline (unlike
+    /// a `FunctionFamilyId`, which is reassigned per scope-graph build).
+    /// Populated by
     /// `TypeChecker.checkFunctionClause` after the body is checked: the row
-    /// is the union of every `Error(E)` payload propagated through a `?` in
-    /// the body, deduplicated structurally. When a function declares an
-    /// explicit `raises` row that the body satisfies, the declared row is
-    /// stored verbatim. Phase 1.3 records this for soundness checking and
-    /// future consumers (ERT, Phase 3 effect rows); it is not yet threaded
-    /// across the call graph because every propagated error already flows
-    /// through a concrete `Result(T,E)` return type at each call site.
+    /// is the union of every `Error(E)` payload propagated through a `?`,
+    /// every `raise`d error type, and — Phase 3.b — every error type a
+    /// CALLEE with a non-empty row propagates across the call boundary
+    /// (cross-function `raises` propagation, an implicit `?`). Deduplicated
+    /// structurally. When a function declares an explicit `raises` row that
+    /// the body satisfies, the declared row is stored verbatim.
+    ///
+    /// Phase 1.3 recorded this for soundness checking only; Phase 3.b reads
+    /// it back at call sites (`recordCalleeRaisesRow`) so a `raise` in a
+    /// callee contributes to the caller's row and an enclosing `try`/`rescue`
+    /// can discharge it. This is the type-surface half of the nominal
+    /// `raises` effect; the codegen half lowers a non-empty row to a Zig
+    /// error-union return (`error{ZapRaise}!T`) carrying the boxed `Error`
+    /// existential through the thread-local side-channel.
     inferred_raises: std.AutoHashMap(ast.StringId, []const TypeId),
     /// Struct TypeIds whose `field :: Type = expr` defaults have
     /// already been validated by `TypeChecker.validateStructFieldDefaults`.
@@ -5403,22 +5415,110 @@ pub const TypeChecker = struct {
                 }
             }
 
-            try self.storeRaisesRow(func.name, declared_row.items);
+            try self.storeRaisesRow(func, clause, declared_row.items);
         } else {
-            try self.storeRaisesRow(func.name, self.current_raises.items);
+            try self.storeRaisesRow(func, clause, self.current_raises.items);
         }
     }
 
-    /// Persist a resolved `raises` row on the function's stored signature.
-    /// Copies the row into store-owned memory (freeing any prior row for
-    /// the same name) so it outlives the per-clause accumulator and the
-    /// per-struct TypeChecker that produced it.
-    fn storeRaisesRow(self: *TypeChecker, func_name: ast.StringId, row: []const TypeId) !void {
+    /// Build the stable, collision-free key into `store.inferred_raises` for
+    /// the function family `family_id`: the fully-qualified
+    /// `"<Struct>.<method>/<arity>"` string, interned to an `ast.StringId`.
+    ///
+    /// A NAME-based key (not the raw `FunctionFamilyId`) is required because
+    /// family ids are assigned per scope-graph build and are NOT stable
+    /// across the multi-pass / per-struct compilation pipeline — a callee's
+    /// row stored under one pass's family id would never be found under the
+    /// call site's family id in a later pass. The qualified name is invariant
+    /// across passes, so producer (`storeRaisesRow`, keyed via the callee's
+    /// own family) and consumer (`recordCalleeRaisesRow`, keyed via the
+    /// call-site-resolved family) agree.
+    ///
+    /// The owning struct name is found by walking up parent scopes from the
+    /// family's scope until a registered struct scope is hit (a top-level
+    /// `main` has no struct and yields the bare `"<name>/<arity>"`).
+    fn raisesRowKey(self: *TypeChecker, family_id: scope_mod.FunctionFamilyId) ?ast.StringId {
+        const family = self.graph.getFamily(family_id);
+        const method_name = self.interner.get(family.name);
+
+        var struct_prefix: ?[]const u8 = null;
+        var struct_prefix_buf: ?[]const u8 = null;
+        defer if (struct_prefix_buf) |buf| self.allocator.free(buf);
+        var scope_cursor: ?scope_mod.ScopeId = family.scope_id;
+        while (scope_cursor) |sid| {
+            if (self.graph.findStructByScope(sid)) |entry| {
+                const joined = entry.name.joinedWith(self.allocator, self.interner, ".") catch break;
+                struct_prefix_buf = joined;
+                struct_prefix = joined;
+                break;
+            }
+            scope_cursor = self.graph.getScope(sid).parent;
+        }
+
+        const key_text = if (struct_prefix) |prefix|
+            std.fmt.allocPrint(self.allocator, "{s}.{s}/{d}", .{ prefix, method_name, family.arity }) catch return null
+        else
+            std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ method_name, family.arity }) catch return null;
+        defer self.allocator.free(key_text);
+
+        const interner_mut: *ast.StringInterner = @constCast(self.interner);
+        return interner_mut.intern(key_text) catch null;
+    }
+
+    /// Resolve the stable `inferred_raises` key for `func`/`clause` by first
+    /// resolving the function's family from its clause scope, then deriving
+    /// the qualified-name key. Returns null when the function has no
+    /// resolvable family (e.g. a synthetic helper outside the scope graph).
+    fn raisesRowKeyForDecl(
+        self: *TypeChecker,
+        func: *const ast.FunctionDecl,
+        clause: *const ast.FunctionClause,
+    ) ?ast.StringId {
+        const clause_scope = self.graph.resolveClauseScope(clause.meta) orelse
+            (if (clause.meta.scope_id != 0) clause.meta.scope_id else self.current_scope) orelse
+            return null;
+        const arity: u32 = @intCast(clause.params.len);
+        const family_id = self.graph.resolveFamily(clause_scope, func.name, arity) orelse return null;
+        return self.raisesRowKey(family_id);
+    }
+
+    /// Persist a resolved `raises` row keyed by the function's stable
+    /// qualified-name key. Copies the row into store-owned memory (freeing
+    /// any prior row for the same key) so it outlives the per-clause
+    /// accumulator and the per-struct TypeChecker that produced it. A
+    /// function with no resolvable key (e.g. a synthetic helper outside the
+    /// scope graph) is skipped — it cannot be a cross-function `raise`
+    /// propagation target.
+    fn storeRaisesRow(
+        self: *TypeChecker,
+        func: *const ast.FunctionDecl,
+        clause: *const ast.FunctionClause,
+        row: []const TypeId,
+    ) !void {
+        const key = self.raisesRowKeyForDecl(func, clause) orelse return;
         const owned = try self.store.allocator.dupe(TypeId, row);
-        if (self.store.inferred_raises.fetchRemove(func_name)) |prior| {
+        if (self.store.inferred_raises.fetchRemove(key)) |prior| {
             self.store.allocator.free(prior.value);
         }
-        try self.store.inferred_raises.put(func_name, owned);
+        try self.store.inferred_raises.put(key, owned);
+    }
+
+    /// Phase 3.b — record a CALLEE's stored `raises` row into the enclosing
+    /// function's live `raises` accumulator (`current_raises`), as if every
+    /// error the callee can raise were propagated by an implicit `?` at the
+    /// call site. This is the cross-function half of `raises` inference: a
+    /// `raise` in a callee flows to the caller's row here, so an enclosing
+    /// `try`/`rescue` (which discharges the body's accumulated row) can catch
+    /// it, and an undischarged row keeps propagating outward — exactly the
+    /// nominal one-shot abortive effect. `family_id` is the resolved callee
+    /// family (from the call-site resolver); a callee with no stored row (a
+    /// pure function, or one not yet checked) contributes nothing.
+    fn recordCalleeRaisesRow(self: *TypeChecker, family_id: scope_mod.FunctionFamilyId, span: ast.SourceSpan) !void {
+        const key = self.raisesRowKey(family_id) orelse return;
+        const row = self.store.inferred_raises.get(key) orelse return;
+        for (row) |error_type| {
+            try self.recordRaisedErrorType(error_type, span);
+        }
     }
 
     /// Render an error row as a `(A | B | ...)`-style string for
@@ -6756,6 +6856,11 @@ pub const TypeChecker = struct {
             return TypeStore.UNKNOWN;
         }
 
+        // Phase 3.b: a call to a function whose `raises` row is non-empty
+        // propagates that row into the enclosing function's row (implicit
+        // `?`). Recorded once per call site, keyed by the resolved family.
+        try self.recordCalleeRaisesRow(target.family_id, call.meta.span);
+
         const signature = (try self.resolveClauseSignature(function_name, @intCast(call.args.len), target.declared_arity, family.clauses.items[0])) orelse {
             for (call.args) |arg| _ = try self.inferExpr(arg);
             return TypeStore.UNKNOWN;
@@ -6833,6 +6938,10 @@ pub const TypeChecker = struct {
                 const arg_types = try self.inferCallArgTypes(call.args);
                 if (try self.resolveFamilyCallSignature(scope_id, vr.name, arity, arg_types)) |resolved_call| {
                     const signature = resolved_call.signature;
+                    // Phase 3.b: propagate the callee's `raises` row into the
+                    // enclosing function's row (implicit `?`), keyed by the
+                    // resolved family so cross-struct method names never alias.
+                    try self.recordCalleeRaisesRow(resolved_call.family_id, call.meta.span);
                     const safe_params = self.safeClosureParamsForCurrentCallee(vr.name, arity);
                     for (call.args, 0..) |arg, idx| {
                         if (arg.* != .var_ref) continue;
@@ -7104,6 +7213,16 @@ pub const TypeChecker = struct {
                             const arg_types = try self.inferCallArgTypes(call.args);
                             if (try self.resolveFamilyCallSignature(mod_entry.scope_id, fa.field, arity, arg_types)) |resolved_call| {
                                 const signature = resolved_call.signature;
+                                // Phase 3.b: a struct-qualified call `Mod.f(...)`
+                                // to a function whose `raises` row is non-empty
+                                // propagates that row into the enclosing
+                                // function's row (implicit `?`). This is the
+                                // primary cross-function `raise` propagation
+                                // site: `Worker.deep()` inside a `try` body
+                                // routes here, so the body's accumulated row
+                                // picks up `deep`'s row and the `rescue`
+                                // discharges it.
+                                try self.recordCalleeRaisesRow(resolved_call.family_id, call.meta.span);
                                 // Check if the signature is generic (contains type variables)
                                 var mod_sig_is_generic = false;
                                 for (signature.params) |param_type| {
