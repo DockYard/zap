@@ -3453,7 +3453,26 @@ fn collectAllFromParsedPrograms(
         return error.ParseFailed;
     }
 
-    const program = try mergePrograms(alloc, parsed_programs);
+    var program = try mergePrograms(alloc, parsed_programs);
+
+    // Rewrite every `pub error Foo { ... }` / `error Foo { ... }` into a
+    // `pub struct Foo + pub impl Error for Foo` pair before any collect,
+    // macro, or staged-desugar pass sees the program. This mirrors the
+    // identical pre-collect step in `collectAllFromUnits` (the whole-program
+    // path). Without it, the incremental-daemon path leaves the `ErrorDecl`
+    // form intact through `mergePrograms`; the desugared struct then only
+    // surfaces via the per-program desugar fallback, which appends it to
+    // `top_items` rather than `program.structs`. `buildStructPrograms` only
+    // promotes `program.structs` entries into struct programs, so the
+    // generated error structs (e.g. `AssertionError`) would be dropped from
+    // the re-collected scope graph — leaving `%AssertionError{}` literals in
+    // stdlib code (such as `Kernel.contract_violation`) typed UNKNOWN, which
+    // suppresses the protocol-box auto-boxing and trips Sema's
+    // `expected zap_runtime.ProtocolBox, found Kernel.contract_violation__3__struct`
+    // in the whole-stdlib `zap test` build (#186). Running the desugar here
+    // makes the daemon path treat `pub error` exactly like the whole-program
+    // path so the rest of the pipeline never sees a raw `ErrorDecl`.
+    try applyErrorDeclDesugar(alloc, interner, &program);
 
     step += 1;
     progressStage(options, "[{d}/{d}] Collect", .{ step, total_steps });
