@@ -3199,6 +3199,15 @@ pub fn collectAllFromUnits(
         zap.lints.runPhase14Lints(parsed_program, interner, &diag_engine) catch {};
     }
 
+    // Phase 1.5 — error-code collision check. `@code Zxxxx` values are
+    // stable public API and must be globally unique across every unit
+    // (stdlib + user). This runs over ALL parsed programs (stdlib units
+    // included, so a user code colliding with a reserved stdlib code is
+    // caught) and emits a hard `.error` diagnostic per collision. Unlike
+    // the warn-only lints above this aborts the build via the
+    // `hasErrors` gate below.
+    _ = zap.error_codes.checkCodeCollisions(alloc, parsed_programs, interner, &diag_engine) catch {};
+
     if (diag_engine.hasErrors()) {
         progressClear(options);
         emitDiagnostics(&diag_engine, alloc);

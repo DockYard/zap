@@ -1,18 +1,26 @@
-//! Phase 1.4 warn-only lints.
+//! Phase 1.4 / 1.5 warn-only lints.
 //!
-//! Two advisory lints that nudge code toward the structured error system
-//! without breaking anything (every diagnostic is `.warning` severity):
+//! Three advisory lints that nudge code toward the structured error
+//! system without breaking anything (every diagnostic is `.warning`
+//! severity):
 //!
 //!   1. `raise "string-literal"` on a `pub fn` API surface — suggests a
 //!      named `pub error` instead of the ad-hoc `RuntimeError` shorthand.
 //!   2. Bare `{:ok, _}` / `{:error, _}` tuple PATTERNS in any function
 //!      body — suggests migrating the producing code to `Result(t, e)`
 //!      (and `Result.tuple_to_result/1` as the bridge).
+//!   3. (Phase 1.5) A `pub error` declaration on the public API surface
+//!      that omits `@code Zxxxx` — suggests assigning a stable numeric
+//!      code, since codes are part of the public diagnostic surface and
+//!      back `zap explain`. Private (`error`, non-`pub`) declarations are
+//!      not flagged: they never reach a public boundary.
 //!
 //! The pass runs per source unit on the freshly parsed AST (BEFORE
 //! desugar, so `raise "literal"` still carries its `raise_expr` + string
-//! literal and `{:ok, _}` patterns are intact). The compiler skips stdlib
-//! units so the stdlib's own legacy idioms are not flagged.
+//! literal, `{:ok, _}` patterns are intact, and `error_decl` items still
+//! carry their `code: ?StringId`). The compiler skips stdlib units so the
+//! stdlib's own legacy idioms are not flagged — and stdlib `pub error`
+//! types are seeded with `@code`s directly anyway.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -30,6 +38,11 @@ pub const BARE_ERROR_TUPLE_MESSAGE =
     "bare `{:error, _}` tuple pattern — consider migrating to `Result(t, e)` " ++
     "(`Result.tuple_to_result/1` bridges legacy tuples)";
 
+pub const MISSING_CODE_PUB_ERROR_MESSAGE =
+    "`pub error` on a public API surface without an `@code Zxxxx` — assign a " ++
+    "stable numeric code (`@code Z3001` above the declaration) so callers and " ++
+    "`zap explain` can reference it; codes are public diagnostic API";
+
 /// Run the Phase 1.4 advisory lints over one parsed program, emitting
 /// warn-only diagnostics into `engine`. `program` is a single source
 /// unit's AST (the caller filters out stdlib units).
@@ -42,12 +55,46 @@ pub fn runPhase14Lints(
     for (program.structs) |struct_decl| {
         try linter.lintStructItems(struct_decl.items);
     }
-    for (program.top_items) |top_item| {
+    for (program.top_items, 0..) |top_item, index| {
         switch (top_item) {
             .struct_decl, .priv_struct_decl => |sd| try linter.lintStructItems(sd.items),
+            // Lint 3 (Phase 1.5): a `pub error` reaching the public API
+            // surface without `@code`. `.error_decl` is the public form
+            // (`pub error`); `.priv_error_decl` (`error`, non-`pub`) is
+            // exempt because it never crosses a public boundary.
+            //
+            // The parser leaves `ErrorDecl.code` null and emits the
+            // `@code Zxxxx` value as a separate preceding top-level
+            // `attribute` item (the desugar folds it into the generated
+            // `code/1` later). So at lint time we detect the code by
+            // scanning the immediately-preceding contiguous attribute
+            // items for one named `code` — mirroring the desugar's
+            // `takePendingCodeAttribute`.
+            .error_decl => |ed| if (!precedingCodeAttribute(linter.interner, program.top_items, index) and ed.code == null) {
+                try linter.engine.warn(MISSING_CODE_PUB_ERROR_MESSAGE, ed.meta.span);
+            },
             else => {},
         }
     }
+}
+
+/// True when the top item at `decl_index` is immediately preceded by a
+/// `@code` attribute item (separated only by other attribute items such
+/// as `@doc`). Mirrors `Desugarer.takePendingCodeAttribute` so the lint's
+/// notion of "has a code" matches what the desugar will actually consume.
+fn precedingCodeAttribute(
+    interner: *const ast.StringInterner,
+    top_items: []const ast.TopItem,
+    decl_index: usize,
+) bool {
+    if (decl_index == 0) return false;
+    var i: isize = @as(isize, @intCast(decl_index)) - 1;
+    while (i >= 0) : (i -= 1) {
+        const item = top_items[@intCast(i)];
+        if (item != .attribute) return false;
+        if (std.mem.eql(u8, interner.get(item.attribute.name), "code")) return true;
+    }
+    return false;
 }
 
 const Linter = struct {
@@ -177,4 +224,65 @@ fn isStringLiteral(expr: *const ast.Expr) bool {
         .string_literal, .string_interpolation => true,
         else => false,
     };
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+const Parser = @import("parser.zig").Parser;
+
+test "missing-@code lint warns on pub error without @code" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub error UncodedError {}
+    ;
+    var parser = Parser.init(alloc, source);
+    const program = try parser.parseProgram();
+
+    var engine = diagnostics.DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+
+    try runPhase14Lints(&program, parser.interner, &engine);
+    try std.testing.expectEqual(@as(usize, 1), engine.warningCount());
+}
+
+test "missing-@code lint is silent when @code is present" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\@code Z3001
+        \\pub error CodedError {}
+    ;
+    var parser = Parser.init(alloc, source);
+    const program = try parser.parseProgram();
+
+    var engine = diagnostics.DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+
+    try runPhase14Lints(&program, parser.interner, &engine);
+    try std.testing.expectEqual(@as(usize, 0), engine.warningCount());
+}
+
+test "missing-@code lint exempts private error declarations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\error PrivateError {}
+    ;
+    var parser = Parser.init(alloc, source);
+    const program = try parser.parseProgram();
+
+    var engine = diagnostics.DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+
+    try runPhase14Lints(&program, parser.interner, &engine);
+    try std.testing.expectEqual(@as(usize, 0), engine.warningCount());
 }

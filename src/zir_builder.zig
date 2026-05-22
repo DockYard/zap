@@ -256,23 +256,39 @@ const error_ref: u32 = 0xFFFFFFFF;
 const Zir = std.zig.Zir;
 
 /// Map an IR binary op to its primitive ZIR `Inst.Tag`. Arithmetic tags
-/// are type-sensitive: integer Zap arithmetic keeps the existing wrapping
-/// and truncating behavior, while float arithmetic must use Zig's ordinary
-/// float-capable operators. Generic `List(f64)` element reads can bypass
-/// protocol dispatch and reach this primitive fallback directly, so the
-/// IR carries the binary result type for this decision.
+/// are type-sensitive AND optimize-mode-sensitive:
+///
+/// * Float arithmetic always uses Zig's ordinary float-capable operators
+///   (`add`/`sub`/`mul`).
+/// * Integer arithmetic follows the Phase 1.5 per-optimize-mode overflow
+///   policy via `overflow_traps`:
+///     - `overflow_traps == true` (Debug / ReleaseSafe) → the checked
+///       tags (`add`/`sub`/`mul`). In safe modes Zig emits an overflow
+///       safety check on these; the runtime's panic handler routes the
+///       check to `** (arithmetic_error) ...`.
+///     - `overflow_traps == false` (ReleaseFast / ReleaseSmall) → the
+///       wrapping tags (`addwrap`/`subwrap`/`mulwrap`), so overflow wraps
+///       two's-complement with no trap. This matches Zig's optimize-mode
+///       model while guaranteeing *wrapping* (never UB) in fast modes.
+///
+/// Generic `List(f64)` element reads can bypass protocol dispatch and
+/// reach this primitive fallback directly, so the IR carries the binary
+/// result type for the float/int decision.
 ///
 /// Returns null for operators handled outside of `emit_binop` —
 /// short-circuit booleans, string compare, concat, and membership tests.
-fn mapBinopTag(op: ir.BinaryOp.Op, result_type: ir.ZigType) ?u8 {
+fn mapBinopTag(op: ir.BinaryOp.Op, result_type: ir.ZigType, overflow_traps: bool) ?u8 {
     const is_float = switch (result_type) {
         .f16, .f32, .f64, .f80, .f128 => true,
         else => false,
     };
+    // Integer arithmetic uses the checked tag when overflow must trap,
+    // the wrapping tag otherwise. Floats always use the plain tag.
+    const int_checked = is_float or overflow_traps;
     return switch (op) {
-        .add => @intFromEnum(if (is_float) Zir.Inst.Tag.add else Zir.Inst.Tag.addwrap),
-        .sub => @intFromEnum(if (is_float) Zir.Inst.Tag.sub else Zir.Inst.Tag.subwrap),
-        .mul => @intFromEnum(if (is_float) Zir.Inst.Tag.mul else Zir.Inst.Tag.mulwrap),
+        .add => @intFromEnum(if (int_checked) Zir.Inst.Tag.add else Zir.Inst.Tag.addwrap),
+        .sub => @intFromEnum(if (int_checked) Zir.Inst.Tag.sub else Zir.Inst.Tag.subwrap),
+        .mul => @intFromEnum(if (int_checked) Zir.Inst.Tag.mul else Zir.Inst.Tag.mulwrap),
         .div => @intFromEnum(if (is_float) Zir.Inst.Tag.div else Zir.Inst.Tag.div_trunc),
         .rem_op => @intFromEnum(if (is_float) Zir.Inst.Tag.rem else Zir.Inst.Tag.mod_rem),
         .eq => @intFromEnum(Zir.Inst.Tag.cmp_eq),
@@ -663,6 +679,16 @@ pub const ZirDriver = struct {
     allocator: Allocator,
     program: ?ir.Program,
     lib_mode: bool = false,
+    /// Phase 1.5 — per-optimize-mode arithmetic-overflow policy. When
+    /// true (Debug / ReleaseSafe), integer arithmetic lowers to Zig's
+    /// safety-checked tags (`add`/`sub`/`mul`) so overflow traps and
+    /// routes to the runtime's `** (arithmetic_error) ...` abort. When
+    /// false (ReleaseFast / ReleaseSmall), integer arithmetic lowers to
+    /// the wrapping tags (`addwrap`/`subwrap`/`mulwrap`) so overflow
+    /// wraps two's-complement with no trap. The build pipeline sets this
+    /// from `FrontendOptimizeMode.arithmeticOverflowTraps`. Defaults to
+    /// `true` (the safe default) so synthetic / test drivers trap.
+    arithmetic_overflow_traps: bool = true,
     /// Reversible mangled-name ↔ Zap-symbol table populated as each
     /// IR function is emitted (see Phase 0 of the error-system
     /// roadmap). Owned by the driver; flushed to a sidecar
@@ -5355,7 +5381,7 @@ pub const ZirDriver = struct {
                     else
                         self.emitBoolBrOr(lhs, &empty_body, rhs) catch return error.EmitFailed;
                     try self.setLocal(bo.dest, ref);
-                } else if (mapBinopTag(bo.op, bo.result_type)) |tag| {
+                } else if (mapBinopTag(bo.op, bo.result_type, self.arithmetic_overflow_traps)) |tag| {
                     const lhs = self.refForLocal(bo.lhs) catch return;
                     const rhs = self.refForLocal(bo.rhs) catch return;
                     const ref = zir_builder_emit_binop(self.handle, tag, lhs, rhs);
@@ -9792,6 +9818,11 @@ pub fn buildAndInject(
     arc_ownership: ?*const @import("arc_liveness.zig").ProgramArcOwnership,
     declared_caps: u64,
     progress: ?*progress_mod.Reporter,
+    /// Phase 1.5 — per-optimize-mode arithmetic-overflow policy. True for
+    /// Debug / ReleaseSafe (overflow traps → `arithmetic_error`), false
+    /// for ReleaseFast / ReleaseSmall (overflow wraps). Forwarded to
+    /// `ZirDriver.arithmetic_overflow_traps`.
+    arithmetic_overflow_traps: bool,
     /// Phase 0 — DWARF foundation: when non-null, the encoded
     /// reversible mangled-symbol ↔ Zap-symbol side table is
     /// written here on success. Caller takes ownership of the
@@ -9818,6 +9849,7 @@ pub fn buildAndInject(
     driver.declared_caps = declared_caps;
     driver.compilation_ctx = compilation_ctx;
     driver.progress = progress;
+    driver.arithmetic_overflow_traps = arithmetic_overflow_traps;
 
     driver.buildProgram(program) catch |err| {
         driver.deinit(); // destroy builder on error path
@@ -9859,6 +9891,9 @@ pub fn buildAndInjectSelected(
     arc_ownership: ?*const @import("arc_liveness.zig").ProgramArcOwnership,
     declared_caps: u64,
     progress: ?*progress_mod.Reporter,
+    /// Phase 1.5 — per-optimize-mode arithmetic-overflow policy (see
+    /// `buildAndInject`). Forwarded to `ZirDriver.arithmetic_overflow_traps`.
+    arithmetic_overflow_traps: bool,
     selected_structs: []const []const u8,
     include_root: bool,
     /// Phase 0 — DWARF foundation (Gap B): when non-null, the encoded
@@ -9881,6 +9916,7 @@ pub fn buildAndInjectSelected(
     driver.declared_caps = declared_caps;
     driver.compilation_ctx = compilation_ctx;
     driver.progress = progress;
+    driver.arithmetic_overflow_traps = arithmetic_overflow_traps;
     driver.selected_structs = selected_structs;
     driver.selected_emit_root = include_root;
 

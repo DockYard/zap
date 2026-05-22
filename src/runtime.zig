@@ -5422,7 +5422,13 @@ pub fn List(comptime T: type) type {
         pub fn get(vec: ?*const Self, index: i64) T {
             const v = vec orelse @panic("List.get: null list");
             const slot: u32 = @intCast(index);
-            if (slot >= v.len) @panic("List.get: index out of bounds");
+            // Phase 1.5 bounds policy: an out-of-range list index aborts
+            // with the canonical `** (index_error) ...` shape — the same
+            // observable behavior as `raise %IndexError{...}` and as the
+            // compiler-emitted slice-bounds trap. This is a library check
+            // (not a compiler-elided one), so it is enforced in every
+            // optimize mode.
+            if (slot >= v.len) Kernel.raise_with_kind("index_error", "List.get: index out of bounds");
             const value = v.slotAtConst(slot).*;
             retainElement(value);
             return value;
@@ -5473,7 +5479,9 @@ pub fn List(comptime T: type) type {
         pub fn set(vec: ?*const Self, index: i64, value: T) ?*const Self {
             const v = vec orelse @panic("List.set: null list");
             const slot: u32 = @intCast(index);
-            if (slot >= v.len) @panic("List.set: index out of bounds");
+            // Phase 1.5 bounds policy — see `List.get`. Out-of-range
+            // index aborts with `** (index_error) ...`.
+            if (slot >= v.len) Kernel.raise_with_kind("index_error", "List.set: index out of bounds");
 
             incrementRuntimeStatCounter(&list_mut_calls_total);
             if (v.header.count() == 1) {

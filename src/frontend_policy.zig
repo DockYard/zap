@@ -69,6 +69,22 @@ pub const FrontendOptimizeMode = enum(u8) {
         };
     }
 
+    /// Phase 1.5 — per-optimize-mode arithmetic-overflow policy. In Debug
+    /// and ReleaseSafe builds, integer arithmetic that overflows traps
+    /// (the safe-mode checked arithmetic tags emit a safety check that
+    /// routes to the runtime's `** (arithmetic_error) ...` abort). In
+    /// ReleaseFast and ReleaseSmall builds, integer arithmetic wraps
+    /// (two's-complement), matching Zig's optimize-mode model. This
+    /// predicate is the single source of truth for that decision — the
+    /// ZIR builder consults it when choosing checked vs wrapping
+    /// arithmetic tags (`add` vs `addwrap`, etc.).
+    pub fn arithmeticOverflowTraps(self: FrontendOptimizeMode) bool {
+        return switch (self) {
+            .debug, .release_safe => true,
+            .release_fast, .release_small => false,
+        };
+    }
+
     pub fn cacheTag(self: FrontendOptimizeMode) u64 {
         return (FRONTEND_POLICY_TAG_MAGIC << 32) |
             (@as(u64, FRONTEND_POLICY_TAG_VERSION) << 24) |

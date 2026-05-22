@@ -152,6 +152,8 @@ pub fn main(init: std.process.Init) !void {
         try cmdDeps(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "doc")) {
         try cmdDoc(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "explain")) {
+        try cmdExplain(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "__manifest-incremental-daemon")) {
         if (args.len != 3) {
             std.process.exit(2);
@@ -186,6 +188,7 @@ fn printUsage() void {
         \\  doc [options]     Generate documentation from @doc attributes
         \\  deps update       Re-resolve all dependencies and rewrite zap.lock
         \\  deps update <name> Re-resolve a single dependency
+        \\  explain Zxxxx     Print the long-form explanation for a diagnostic code
         \\
         \\Build flags (Zig build-system syntax; one shared pipeline for
         \\build + run, manifest + script — the CLI overrides the manifest):
@@ -1899,6 +1902,102 @@ fn cmdDeps(allocator: std.mem.Allocator, args: []const []const u8) !void {
 // ---------------------------------------------------------------------------
 // Command: init
 // ---------------------------------------------------------------------------
+
+/// `zap explain Zxxxx` — print the long-form explanation for a stable
+/// diagnostic code. The explanation content lives in Zap source
+/// (`lib/error_catalog.zap`); this command is a thin reader that resolves
+/// the stdlib directory, loads that catalog, and renders the matching
+/// `[Zxxxx]` record. Codes with no catalog entry print a helpful
+/// "not registered yet" message rather than failing — the catalog is
+/// expected to grow over time while the scaffold stays stable.
+fn cmdExplain(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    // Locate the requested code and an optional --zap-lib-dir override.
+    var code_arg: ?[]const u8 = null;
+    var lib_dir_flag: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--zap-lib-dir")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("Error: --zap-lib-dir requires a directory argument\n", .{});
+                std.process.exit(2);
+            }
+            lib_dir_flag = args[i + 1];
+            i += 1;
+        } else if (code_arg == null) {
+            code_arg = arg;
+        }
+    }
+
+    const code = code_arg orelse {
+        std.debug.print(
+            "Usage: zap explain Zxxxx\n\nPrint the long-form explanation for a diagnostic code (e.g. `zap explain Z1003`).\n",
+            .{},
+        );
+        std.process.exit(2);
+    };
+
+    if (!zap.error_codes.isValidCode(code)) {
+        std.debug.print(
+            "Error: `{s}` is not a valid diagnostic code — codes are written `Z<digits>`, e.g. `Z1003`.\n",
+            .{code},
+        );
+        std.process.exit(2);
+    }
+
+    const lib_dir = resolveZapLibDir(allocator, lib_dir_flag, null) catch null orelse {
+        std.debug.print(
+            "Error: could not locate the Zap stdlib directory (set ZAP_LIB_DIR or pass --zap-lib-dir).\n",
+            .{},
+        );
+        std.process.exit(1);
+    };
+    defer allocator.free(lib_dir);
+
+    const catalog_path = try std.fs.path.join(allocator, &.{ lib_dir, "error_catalog.zap" });
+    defer allocator.free(catalog_path);
+
+    const catalog_source = std.Io.Dir.cwd().readFileAlloc(global_io, catalog_path, allocator, .limited(4 * 1024 * 1024)) catch {
+        std.debug.print(
+            "{s}: no explanation catalog found (expected `{s}`).\n",
+            .{ code, catalog_path },
+        );
+        std.process.exit(1);
+    };
+    defer allocator.free(catalog_source);
+
+    var entry_arena = std.heap.ArenaAllocator.init(allocator);
+    defer entry_arena.deinit();
+
+    const entry = (try zap.error_codes.findCatalogEntry(entry_arena.allocator(), catalog_source, code)) orelse {
+        std.debug.print(
+            "{s}: no explanation registered for this code yet.\n" ++
+                "  The diagnostic-code catalog (`lib/error_catalog.zap`) grows over time;\n" ++
+                "  this code is valid but does not have a long-form entry.\n",
+            .{code},
+        );
+        std.process.exit(0);
+    };
+
+    printCatalogEntry(entry);
+}
+
+fn printCatalogEntry(entry: zap.error_codes.CatalogEntry) void {
+    std.debug.print("{s}", .{entry.code});
+    if (entry.title.len > 0) {
+        std.debug.print(" — {s}", .{entry.title});
+    }
+    std.debug.print("\n", .{});
+    if (entry.explanation.len > 0) {
+        std.debug.print("\n{s}\n", .{entry.explanation});
+    }
+    if (entry.repro.len > 0) {
+        std.debug.print("\nMinimal repro:\n  {s}\n", .{entry.repro});
+    }
+    if (entry.fix.len > 0) {
+        std.debug.print("\nFix:\n  {s}\n", .{entry.fix});
+    }
+}
 
 fn cmdInit(allocator: std.mem.Allocator) !void {
     // Check directory is empty

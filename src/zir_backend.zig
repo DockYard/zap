@@ -707,6 +707,17 @@ fn publishIncrementalOutput(allocator: std.mem.Allocator, ctx: *ZirContext, outp
     ) catch return error.EmitFailed;
 }
 
+/// Phase 1.5 — map the numeric optimize mode (0=Debug, 1=ReleaseSafe,
+/// 2=ReleaseFast, 3=ReleaseSmall) to the per-mode arithmetic-overflow
+/// policy: Debug and ReleaseSafe trap on overflow (route to
+/// `arithmetic_error`), ReleaseFast and ReleaseSmall wrap. This is the
+/// single boundary where the build config's optimize byte becomes the
+/// ZIR builder's checked-vs-wrapping arithmetic decision, kept in lockstep
+/// with `frontend_policy.FrontendOptimizeMode.arithmeticOverflowTraps`.
+fn arithmeticOverflowTrapsForMode(optimize_mode: u8) bool {
+    return optimize_mode == 0 or optimize_mode == 1;
+}
+
 pub fn injectAndUpdate(allocator: std.mem.Allocator, program: ir.Program, ctx: *ZirContext, options: CompileOptions) CompileError!void {
     // Build ZIR via C-ABI calls and inject into compilation.
     const lib_mode = options.output_mode == 1;
@@ -725,6 +736,7 @@ pub fn injectAndUpdate(allocator: std.mem.Allocator, program: ir.Program, ctx: *
         options.arc_ownership,
         options.declared_caps,
         options.progress,
+        arithmeticOverflowTrapsForMode(options.optimize_mode),
         out_sym_ptr,
     );
 
@@ -890,6 +902,7 @@ pub fn injectPreparedAndUpdate(allocator: std.mem.Allocator, program: ir.Program
         options.arc_ownership,
         options.declared_caps,
         options.progress,
+        arithmeticOverflowTrapsForMode(options.optimize_mode),
         out_sym_ptr,
     ) catch |inject_err| {
         abortUpdate(ctx) catch |abort_err| {
@@ -965,6 +978,7 @@ pub fn injectPreparedSelectedAndUpdate(
         options.arc_ownership,
         options.declared_caps,
         options.progress,
+        arithmeticOverflowTrapsForMode(options.optimize_mode),
         struct_names,
         include_root,
         out_sym_ptr,

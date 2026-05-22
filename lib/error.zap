@@ -118,4 +118,73 @@ pub protocol Error {
       Error.kind(e)      # => :runtime_error
   """
 
+@code Z1001
 pub error RuntimeError {}
+
+@doc = """
+  Raised when a function receives an argument that is the wrong shape,
+  out of its accepted domain, or otherwise invalid in a way the type
+  system did not catch. Use it at validation boundaries to reject bad
+  input with a descriptive message.
+
+  Distinct from `ArithmeticError` / `IndexError`, which the runtime
+  raises from its arithmetic and bounds safety checks rather than from
+  explicit validation.
+
+  ## Examples
+
+      raise %ArgumentError{message: "expected a positive integer"}
+      # ** (argument_error) expected a positive integer
+  """
+
+@code Z1002
+pub error ArgumentError {}
+
+@doc = """
+  Raised when integer arithmetic overflows its result type. This is the
+  trap target for the per-optimize-mode overflow policy (Phase 1.5):
+
+  * In Debug and ReleaseSafe builds, an overflowing `+`, `-`, or `*`
+    traps and aborts with `** (arithmetic_error) ...` — overflow never
+    silently corrupts a value.
+  * In ReleaseFast and ReleaseSmall builds, integer arithmetic wraps
+    (two's-complement), matching Zig's optimize-mode model; no trap is
+    emitted.
+
+  The trap routes through the runtime abort path, so the observable
+  shape matches `raise %ArithmeticError{...}`. See `zap explain Z1003`.
+
+  ## Examples
+
+      x = 9223372036854775807   # i64 max
+      y = x + 1                 # ReleaseSafe: ** (arithmetic_error) ...
+  """
+
+@code Z1003
+pub error ArithmeticError {}
+
+@doc = """
+  Raised when a list or array is indexed outside its valid
+  `0..length` range. This is the trap target for the per-optimize-mode
+  bounds policy (Phase 1.5):
+
+  * In Debug and ReleaseSafe builds, an out-of-bounds index traps and
+    aborts with `** (index_error) ...`.
+  * In ReleaseFast and ReleaseSmall builds, the compiler elides the
+    bounds check where it can prove safety, matching Zig's model — it
+    never introduces undefined behavior beyond what Zig itself permits.
+
+  The `index` and `length` fields record the offending access for
+  diagnostics. See `zap explain Z1004`.
+
+  ## Examples
+
+      items = [1, 2, 3]
+      items[5]   # ReleaseSafe: ** (index_error) ...
+  """
+
+@code Z1004
+pub error IndexError {
+  index :: i64
+  length :: i64
+}
