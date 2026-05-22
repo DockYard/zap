@@ -7658,16 +7658,39 @@ fn isRaisePlumbingSymbol(stripped_mangled: []const u8) bool {
         std.mem.eql(u8, stripped_mangled, "Kernel.raise__1");
 }
 
+/// True when a (underscore-stripped) linkage name belongs to the Zig runtime
+/// entry that sits *below* the user's Zap entry point — the `std.start`
+/// namespace (`start.callMain`, `start.wrapMain`, `start.main`, …) and the
+/// process `_start` stub (which symbolizes as the bare `start`). Everything
+/// at or below this boundary is Zig's program-startup glue, not Zap code, so
+/// the crash report stops there: a Zap backtrace ends at the user's `main`.
+fn isBelowUserEntrySymbol(stripped_mangled: []const u8) bool {
+    return std.mem.startsWith(u8, stripped_mangled, "start.") or
+        std.mem.eql(u8, stripped_mangled, "start");
+}
+
+/// What the frame loop should do with one backtrace frame.
+const FrameAction = enum {
+    /// The frame was written; count it against the `short` budget.
+    emitted,
+    /// Suppressed runtime `raise` plumbing; do not count it, keep going.
+    skipped,
+    /// Reached the Zig runtime entry below the user's `main`; stop the trace.
+    stop,
+};
+
 /// Render a single backtrace frame line to stderr. `addr` is the raw return
 /// address; we subtract one byte before symbolizing so the line points
 /// *into* the calling statement rather than at the instruction after the
 /// call (matching the fork's `ra_call_offset` handling). Pure `write`(2);
 /// any bytes from the debug-info arena are used in place and never freed.
 ///
-/// Returns `true` when the frame was emitted, `false` when it was
-/// suppressed (the runtime `raise` plumbing) so the caller does not count it
-/// against the `ZAP_BACKTRACE=short` frame budget.
-fn crashReportFrame(addr: usize) bool {
+/// Returns a `FrameAction`: `emitted` when the line was written, `skipped`
+/// when it was suppressed runtime `raise` plumbing (so the caller does not
+/// count it against the `ZAP_BACKTRACE=short` budget), or `stop` when the
+/// frame is the Zig startup glue below the user's entry point (the trace
+/// ends there).
+fn crashReportFrame(addr: usize) FrameAction {
     const call_site_addr = if (addr != 0) addr - 1 else addr;
     const info = symbolizeAddress(call_site_addr);
 
@@ -7683,14 +7706,18 @@ fn crashReportFrame(addr: usize) bool {
         // Still print a source location if DWARF had one.
         if (source) |loc| crashReportSourceLocation(loc);
         posixWrite(STDERR_FD, "\n");
-        return true;
+        return .emitted;
     }
 
     const mangled = stripSymbolUnderscore(name.?);
 
     // Suppress the runtime's `raise` plumbing frames so the trace starts at
     // the user code that raised.
-    if (isRaisePlumbingSymbol(mangled)) return false;
+    if (isRaisePlumbingSymbol(mangled)) return .skipped;
+
+    // Stop at the Zig program-startup glue below the user's `main` — those
+    // frames are not Zap code and only add noise to the report.
+    if (isBelowUserEntrySymbol(mangled)) return .stop;
 
     posixWrite(STDERR_FD, "  ");
 
@@ -7717,7 +7744,7 @@ fn crashReportFrame(addr: usize) bool {
 
     if (source) |loc| crashReportSourceLocation(loc);
     posixWrite(STDERR_FD, "\n");
-    return true;
+    return .emitted;
 }
 
 /// Write a hexadecimal address to stderr without allocating.
@@ -7801,7 +7828,13 @@ noinline fn crashReport(kind: []const u8, message: []const u8) noreturn {
         var shown: usize = 0;
         var i: usize = 0;
         while (i < bt.len and shown < max_shown) : (i += 1) {
-            if (crashReportFrame(bt.addresses[i])) shown += 1;
+            switch (crashReportFrame(bt.addresses[i])) {
+                .emitted => shown += 1,
+                .skipped => {},
+                // Reached the Zig startup glue below the user's `main`; the
+                // Zap backtrace ends here.
+                .stop => break,
+            }
         }
     }
 

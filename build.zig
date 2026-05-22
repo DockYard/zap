@@ -231,7 +231,13 @@ pub fn build(b: *std.Build) void {
     const tar_output = tar_step.addOutputFileArg("zig_lib.tar");
     tar_step.addArg("-C");
     tar_step.addArg(zig_lib_dir);
-    tar_step.addArgs(&.{ "std", "compiler_rt", "compiler_rt.zig", "c.zig", "c" });
+    // Include every top-level compiler-runtime entry a user binary may link:
+    // `compiler_rt.zig`, `ubsan_rt.zig` (the UBSan runtime, linked into Debug
+    // and ReleaseSafe builds), `fuzzer.zig`, and `c.zig`, plus the `std`/`c`/
+    // `compiler_rt` trees. Omitting `ubsan_rt.zig`/`fuzzer.zig` only worked
+    // while resolution fell back to a full system Zig lib dir; now that the
+    // embedded fork stdlib is authoritative it must be self-contained.
+    tar_step.addArgs(&.{ "std", "compiler_rt", "compiler_rt.zig", "ubsan_rt.zig", "fuzzer.zig", "c.zig", "c" });
 
     const wf = b.addWriteFiles();
     _ = wf.addCopyFile(tar_output, "zig_lib.tar");
