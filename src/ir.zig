@@ -3110,14 +3110,37 @@ pub const IrBuilder = struct {
 
     fn resolveNamedHirGroup(self: *const IrBuilder, named: hir_mod.NamedCall, arity: u32) ?*const hir_mod.FunctionGroup {
         const target_struct = named.struct_name orelse return null;
-        const program = self.current_hir_program orelse return null;
+        // Search the program currently being lowered first, then fall back
+        // to the whole-program view (`known_name_program`). In script mode
+        // and the per-struct compile pipeline, `current_hir_program` holds
+        // only the struct being lowered, so a cross-struct call like
+        // `Demo.walk(...)` from `__ZapScriptMain.main` cannot find `Demo`
+        // there. `known_name_program` carries every struct (it backs the
+        // cross-struct name-registration and type-only overload passes), so
+        // consulting it surfaces the callee's typed parameter signature —
+        // which is what the call-site protocol auto-box and numeric-widening
+        // loops need to coerce arguments correctly.
+        if (self.findNamedHirGroupIn(self.current_hir_program, target_struct, named.name, arity)) |group| {
+            return group;
+        }
+        return self.findNamedHirGroupIn(self.known_name_program, target_struct, named.name, arity);
+    }
+
+    fn findNamedHirGroupIn(
+        self: *const IrBuilder,
+        maybe_program: ?*const hir_mod.Program,
+        target_struct: []const u8,
+        function_name: []const u8,
+        arity: u32,
+    ) ?*const hir_mod.FunctionGroup {
+        const program = maybe_program orelse return null;
         for (program.structs) |*struct_info| {
             if (struct_info.name.parts.len == 0) continue;
             const last_part = self.interner.get(struct_info.name.parts[struct_info.name.parts.len - 1]);
             if (!std.mem.eql(u8, last_part, target_struct)) continue;
             for (struct_info.functions) |*function_group| {
                 if (function_group.arity == arity and
-                    std.mem.eql(u8, self.interner.get(function_group.name), named.name))
+                    std.mem.eql(u8, self.interner.get(function_group.name), function_name))
                 {
                     return function_group;
                 }
