@@ -7699,6 +7699,20 @@ fn isRaisePlumbingSymbol(stripped_mangled: []const u8) bool {
         std.mem.eql(u8, stripped_mangled, "Kernel.raise__1");
 }
 
+/// True when a (underscore-stripped) linkage name belongs to the Phase 2.b
+/// root `panic`-namespace dispatch trampoline — a `ZapPanic.<handler>`
+/// (`ZapPanic.divideByZero`, `ZapPanic.reachedUnreachable`, …) or the
+/// shared `zapPanicReport` sink. Zig's panic interface routes a safety
+/// check through one of these before reaching the crash printer; the frame
+/// is correct but pure plumbing, so the report suppresses it to begin at
+/// the genuine faulting operation (e.g. `Kernel.divide_i64`) rather than
+/// the panic handler. Matched as a substring so the `zap_runtime.` module
+/// prefix and any mangling suffix are tolerated.
+fn isPanicPlumbingSymbol(stripped_mangled: []const u8) bool {
+    return std.mem.indexOf(u8, stripped_mangled, "ZapPanic") != null or
+        std.mem.indexOf(u8, stripped_mangled, "zapPanicReport") != null;
+}
+
 /// True when a (underscore-stripped) linkage name belongs to the Zig runtime
 /// entry that sits *below* the user's Zap entry point — the `std.start`
 /// namespace (`start.callMain`, `start.wrapMain`, `start.main`, …) and the
@@ -7752,9 +7766,12 @@ fn crashReportFrame(addr: usize) FrameAction {
 
     const mangled = stripSymbolUnderscore(name.?);
 
-    // Suppress the runtime's `raise` plumbing frames so the trace starts at
-    // the user code that raised.
+    // Suppress the runtime's `raise` plumbing and the Phase 2.b `panic`-
+    // namespace dispatch trampoline so the trace starts at the genuine
+    // faulting frame (the user code that raised, or the operation that
+    // tripped a safety check) rather than the abort machinery.
     if (isRaisePlumbingSymbol(mangled)) return .skipped;
+    if (isPanicPlumbingSymbol(mangled)) return .skipped;
 
     // Stop at the Zig program-startup glue below the user's `main` — those
     // frames are not Zap code and only add noise to the report.
@@ -7984,15 +8001,22 @@ pub const ZapPanic = struct {
 
     pub fn sentinelMismatch(_expected: anytype, _found: anytype) noreturn {
         @branchHint(.cold);
-        _ = _expected;
-        _ = _found;
+        // Discard via the parameter *types*, not the values: `anytype` here
+        // may be instantiated with an error-set type, and `_ = err_value;`
+        // is a "discarded error set" compile error. Referencing `@TypeOf`
+        // sidesteps that for any instantiation.
+        _ = @TypeOf(_expected);
+        _ = @TypeOf(_found);
         zapPanicReport("runtime_error", "sentinel mismatch", @returnAddress());
     }
 
-    pub fn unwrapError(_err: anyerror) noreturn {
+    pub fn unwrapError(err: anyerror) noreturn {
         @branchHint(.cold);
-        _ = _err;
-        zapPanicReport("runtime_error", "attempt to unwrap error", @returnAddress());
+        // `@errorName` yields a static `[]const u8` from the error-name
+        // table (no allocation — async-signal-safe), so the report names
+        // the specific error rather than discarding it (which would be a
+        // "discarded error set" compile error anyway).
+        zapPanicReport("runtime_error", @errorName(err), @returnAddress());
     }
 
     pub fn outOfBounds(_index: usize, _len: usize) noreturn {
@@ -8011,8 +8035,11 @@ pub const ZapPanic = struct {
 
     pub fn inactiveUnionField(_active: anytype, _accessed: anytype) noreturn {
         @branchHint(.cold);
-        _ = _active;
-        _ = _accessed;
+        // Discard via types (see `sentinelMismatch`): these `anytype` enum
+        // tags could be error-set-typed at some instantiation, where
+        // `_ = value;` would be a "discarded error set" compile error.
+        _ = @TypeOf(_active);
+        _ = @TypeOf(_accessed);
         zapPanicReport("runtime_error", "access of inactive union field", @returnAddress());
     }
 
