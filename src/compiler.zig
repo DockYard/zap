@@ -638,6 +638,16 @@ pub const FrontendIncrementalState = struct {
 
             try appendUniqueFilePath(alloc, &changed_files, unit.file_path);
             const parsed = try self.parseSourceUnit(unit, source_units, source_index, current_hash, alloc, &diag_engine);
+
+            // Phase 1.4 warn-only advisory lints (`raise "string"` on a
+            // `pub` API surface; bare `{:ok, _}`/`{:error, _}` patterns).
+            // Run only on newly-parsed user units — skip the stdlib (its
+            // own legacy idioms are not the lint's concern) and skip cached
+            // units (already linted on their first parse).
+            if (!isStdlibUnitPath(unit.file_path)) {
+                zap.lints.runPhase14Lints(&parsed.program, &self.interner, &diag_engine) catch {};
+            }
+
             try new_parsed_files.append(alloc, parsed);
             parsed_programs[source_index] = parsed.program;
             parsed_fingerprint_sets[source_index] = parsed.declaration_fingerprints;
@@ -658,6 +668,16 @@ pub const FrontendIncrementalState = struct {
             progressClear(options);
             emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, source_units, diag_engine.use_color);
             return error.ParseFailed;
+        }
+
+        // Surface warn-only diagnostics accumulated during parsing — most
+        // notably the Phase 1.4 advisory lints (`raise "string"` on a `pub`
+        // API surface; bare `{:ok, _}`/`{:error, _}` tuple patterns). These
+        // never abort the build; without an explicit flush here they would
+        // be silently dropped (the parse loop only emits on the error path).
+        if (diag_engine.warningCount() > 0) {
+            progressClear(options);
+            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, source_units, diag_engine.use_color);
         }
 
         var new_dependency_graph = try buildFrontendIncrementalGraph(self.allocator, source_units, graph);
@@ -2360,6 +2380,15 @@ fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
+/// True when `file_path` names a Zap standard-library source unit (the
+/// `lib/...` tree). Used to scope the Phase 1.4 advisory lints to user
+/// code — the stdlib's own legacy idioms (`raise("...")`, `{:ok, _}`
+/// tuples) are intentionally exempt.
+fn isStdlibUnitPath(file_path: []const u8) bool {
+    return std.mem.startsWith(u8, file_path, "lib/") or
+        std.mem.indexOf(u8, file_path, "/lib/") != null;
+}
+
 const WholeFrontendInvalidationReason = enum {
     missing_file_struct_mapping,
     empty_file_struct_mapping,
@@ -3159,10 +3188,26 @@ pub fn collectAllFromUnits(
     const interner = try alloc.create(ast.StringInterner);
     interner.* = global_interner;
 
+    // Phase 1.4 warn-only advisory lints (`raise "string"` on a `pub` API
+    // surface; bare `{:ok, _}`/`{:error, _}` tuple patterns). Runs on the
+    // parsed-and-remapped per-unit ASTs (StringIds are now global, so the
+    // shared `interner` resolves atom text) BEFORE desugar rewrites
+    // `raise_expr`/tuple patterns away. User units only — the stdlib's own
+    // legacy idioms are exempt.
+    for (parsed_programs, 0..) |*parsed_program, i| {
+        if (isStdlibUnitPath(all_source_units[i].file_path)) continue;
+        zap.lints.runPhase14Lints(parsed_program, interner, &diag_engine) catch {};
+    }
+
     if (diag_engine.hasErrors()) {
         progressClear(options);
         emitDiagnostics(&diag_engine, alloc);
         return error.ParseFailed;
+    }
+
+    if (diag_engine.warningCount() > 0) {
+        progressClear(options);
+        emitDiagnostics(&diag_engine, alloc);
     }
 
     var program = try mergePrograms(alloc, parsed_programs);

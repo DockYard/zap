@@ -35,6 +35,39 @@ pub union Result(t, e) {
 
 pub struct Result {
   @doc = """
+    Migration shim (Phase 1.4): convert a legacy `{:ok, v}` / `{:error, e}`
+    tuple into the canonical `Result` variants.
+
+        tuple_to_result({:ok, v})    # => Result.Ok(v)
+        tuple_to_result({:error, e}) # => Result.Error(e)
+
+    Bare `{:ok, _}` / `{:error, _}` tuples are the pre-`Result` idiom for
+    fallible outcomes. This shim bridges code that still produces them to
+    the `Result(t, e)` type so it can flow through `?`, `~>`, and the
+    `Result.*` combinators. The compiler emits a warn-only deprecation
+    lint on bare-tuple `{:ok, _}` / `{:error, _}` patterns pointing here.
+
+    The success and failure payloads share one type parameter, so this
+    shim applies to tuples whose `:ok` and `:error` payloads are the same
+    type; heterogeneous tuples should construct `Result` variants directly.
+
+    ## Examples
+
+        Result.tuple_to_result({:ok, 42})
+        # => Result(i64, i64).Ok(42)
+
+        Result.tuple_to_result({:error, 7})
+        # => Result(i64, i64).Error(7)
+    """
+
+  pub fn tuple_to_result(tuple :: {Atom, payload}) -> Result(payload, payload) {
+    case tuple {
+      {:ok, value} -> Result(payload, payload).Ok(value)
+      {:error, reason} -> Result(payload, payload).Error(reason)
+    }
+  }
+
+  @doc = """
     Returns `true` when `r` is `Ok(...)`, `false` when it is
     `Error(...)`.
 

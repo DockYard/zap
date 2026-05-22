@@ -46,6 +46,7 @@ pub const uniqueness_signature = @import("uniqueness_signature.zig");
 pub const uniqueness_fixpoint = @import("uniqueness_fixpoint.zig");
 pub const runtime = @import("runtime.zig");
 pub const diagnostics = @import("diagnostics.zig");
+pub const lints = @import("lints.zig");
 pub const DiagnosticEngine = diagnostics.DiagnosticEngine;
 pub const Severity = diagnostics.Severity;
 pub const similarity = @import("similarity.zig");
