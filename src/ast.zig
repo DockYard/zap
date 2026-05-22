@@ -1520,7 +1520,7 @@ pub const TypeParenExpr = struct {
 // visitors. Adding a variant always warrants a `git grep` for the
 // nearby variants to find any pass-specific handlers.
 
-const expected_expr_variants: usize = 39;
+const expected_expr_variants: usize = 40;
 const expected_pattern_variants: usize = 12;
 const expected_type_expr_variants: usize = 11;
 const expected_top_item_variants: usize = 16;

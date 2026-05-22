@@ -405,6 +405,8 @@ pub struct Kernel {
     Returns `Nil` (not `Never`): the recoverable path's non-local exit is
     realized by the compiler-emitted landing-pad branch, not by this
     function diverging — so it must be allowed to return after stashing.
+    The compiler-emitted handler landing pad (`Kernel.raise_occurred()` test
+    after the body) is what actually diverts control to the `rescue` arms.
     """
 
   pub fn recoverable_raise(error_value :: Error) -> Nil {

@@ -1164,6 +1164,26 @@ pub const Collector = struct {
                     try self.collectBlock(clause.body, clause_scope);
                 }
             },
+            .try_rescue => |tr| {
+                // The `try` body is its own block scope. Each `rescue` arm is a
+                // case-clause scope carrying its pattern bindings (`e` in
+                // `e :: IOError -> …`) — mirrors `.case_expr` so the binding +
+                // scope discovery the type checker and HIR rely on is in place.
+                // `after` is a block scope.
+                const body_scope = try self.graph.createScope(parent_scope, .block);
+                try self.collectBlock(tr.body, body_scope);
+                for (tr.rescue_clauses) |*clause| {
+                    const clause_scope = try self.graph.createScope(parent_scope, .case_clause);
+                    try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(clause.meta.span), clause_scope);
+                    @constCast(&clause.meta).scope_id = clause_scope;
+                    try self.collectPatternBindings(clause.pattern, clause_scope);
+                    try self.collectBlock(clause.body, clause_scope);
+                }
+                if (tr.after_block) |cleanup| {
+                    const after_scope = try self.graph.createScope(parent_scope, .block);
+                    try self.collectBlock(cleanup, after_scope);
+                }
+            },
             .block => |blk| {
                 // Hoist function declarations from block expressions to the parent
                 // scope so they're visible to the enclosing function. This enables
