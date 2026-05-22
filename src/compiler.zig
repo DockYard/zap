@@ -769,6 +769,36 @@ pub const FrontendIncrementalState = struct {
             for (graph_order) |struct_name| {
                 names.append(alloc, struct_name) catch {};
             }
+            // The precomputed `struct_order` is the discovery-time
+            // topological ordering of the SOURCE structs. Structs that
+            // only exist after desugaring — notably the `pub struct Foo`
+            // produced by every `pub error Foo` rewrite (e.g.
+            // `AssertionError`, `RuntimeError`) — are absent from it
+            // because discovery ran before `applyErrorDeclDesugar`. They
+            // ARE present in `ctx.struct_programs` (built from the fully
+            // desugared programs and registered in the re-collected
+            // scope graph). Compiling only `struct_order` would silently
+            // drop these structs from the merged IR: their `pub impl
+            // Error` method functions (`AssertionError.message__1`, …)
+            // would never be lowered, so the protocol vtable instance
+            // `ErrorVTable_for_AssertionError` — which IS emitted — would
+            // reference methods that do not exist, tripping the ZIR
+            // backend's "struct 'AssertionError' has no member named
+            // 'message__1'" (#186). Append every collected struct program
+            // missing from the precomputed order so the compilation set
+            // is the union of the discovery order and the actually
+            // collected structs. The per-struct loops downstream dedup by
+            // name, so appending an already-present name is harmless.
+            for (ctx.struct_programs) |mp| {
+                var already_ordered = false;
+                for (names.items) |existing| {
+                    if (std.mem.eql(u8, existing, mp.name)) {
+                        already_ordered = true;
+                        break;
+                    }
+                }
+                if (!already_ordered) names.append(alloc, mp.name) catch {};
+            }
         } else {
             for (ctx.struct_programs) |mp| {
                 names.append(alloc, mp.name) catch {};
