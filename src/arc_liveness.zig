@@ -3891,6 +3891,14 @@ pub fn collectDefs(instr: ir.Instruction) DefList {
         .map_init => |x| out.append(x.dest),
         .struct_init => |x| out.append(x.dest),
         .union_init => |x| out.append(x.dest),
+        // `box_as_protocol` defines the box (a `ProtocolBox` value) that
+        // OWNS its heap-allocated inner. Without this arm the box dest is
+        // invisible to `identifyArcLocals` (which flags ARC-managed
+        // locals by walking `collectDefs` and consulting
+        // `local_ownership[def]`), so the box is never owned-at-ret and
+        // its scope-exit drop is never scheduled — leaking the inner the
+        // construction-site `allocAny` produced (G-box, round 2).
+        .box_as_protocol => |x| out.append(x.dest),
         .enum_literal => |x| out.append(x.dest),
         .field_get => |x| out.append(x.dest),
         .index_get => |x| out.append(x.dest),

@@ -2693,15 +2693,86 @@ pub fn isArcManagedTypeId(type_store: *const types_mod.TypeStore, type_id: types
         // diagnostic-only no-op at best and trip the V11 verifier on
         // share_value of trivial-classified arguments at worst.
         .protocol_constraint => |pc| pc.type_params.len == 0,
-        .struct_type => structTypeUsesRecursiveBoxing(type_store, type_id),
+        // A plain struct VALUE is ARC-managed when it either uses
+        // recursive boxing (self-referential trees, heap-promoted via the
+        // indirect-storage `?*const Self` field) OR carries an
+        // ARC-managed field — most importantly a `ProtocolBox` reached
+        // through an `Option(<protocol>)`/`Result(...)` field (G-box,
+        // round 2). Without the field-walk arm a `pub error` whose
+        // auto-injected `cause :: Option(Error)` holds a boxed inner
+        // error never gets a scope-exit release scheduled, so the boxed
+        // inner leaks. The deep-walk that the scheduled release drives
+        // (`ArcRuntime.releaseChildrenAny`) routes the box through its
+        // vtable header drop.
+        .struct_type => structTypeUsesRecursiveBoxing(type_store, type_id) or
+            structTypeHasArcManagedField(type_store, type_id, 0),
         .union_type => |union_type| blk: {
             for (union_type.members) |member_type_id| {
                 if (isArcManagedTypeId(type_store, member_type_id)) break :blk true;
             }
             break :blk false;
         },
+        // `Option(Error)` etc. surface as `.applied{base, args}` before
+        // monomorphization rewrites them to a concrete union. The
+        // instance is ARC-managed when its base declaration is (a
+        // recursive-boxing / box-bearing struct or union). NOTE: we do
+        // NOT inspect the type ARGUMENTS here — an arg being ARC-managed
+        // does not make the instance own it (e.g. a phantom-typed
+        // wrapper). Only the resolved base's own fields/variants decide.
+        .applied => |applied_type| isArcManagedTypeIdDepth(type_store, applied_type.base, 1),
         else => false,
     };
+}
+
+/// Depth-guarded recursive worker behind `isArcManagedTypeId`. The public
+/// entry delegates here with `depth = 0`; aggregate arms recurse with an
+/// incremented depth. The `depth > types.items.len` cutoff terminates on
+/// any self-referential type graph (a recursive struct/union) without a
+/// visited set — the type count is a strict upper bound on the longest
+/// acyclic type path, so exceeding it proves a cycle was entered, and a
+/// cyclic type is handled by the recursive-boxing predicate at depth 0.
+fn isArcManagedTypeIdDepth(
+    type_store: *const types_mod.TypeStore,
+    type_id: types_mod.TypeId,
+    depth: usize,
+) bool {
+    if (type_id >= type_store.types.items.len) return false;
+    if (depth > type_store.types.items.len) return false;
+    return switch (type_store.getType(type_id)) {
+        .opaque_type, .map, .list => true,
+        .protocol_constraint => |pc| pc.type_params.len == 0,
+        .struct_type => structTypeUsesRecursiveBoxing(type_store, type_id) or
+            structTypeHasArcManagedField(type_store, type_id, depth + 1),
+        .union_type => |union_type| blk: {
+            for (union_type.members) |member_type_id| {
+                if (isArcManagedTypeIdDepth(type_store, member_type_id, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .applied => |applied_type| isArcManagedTypeIdDepth(type_store, applied_type.base, depth + 1),
+        else => false,
+    };
+}
+
+/// True iff `type_id` is a struct with at least one ARC-managed field
+/// (recursively). Distinct from `structTypeUsesRecursiveBoxing` (which
+/// detects self-reference / heap-promoted recursive nodes); this detects
+/// a struct that OWNS an ARC value by value — chiefly a `ProtocolBox`
+/// reached through an `Option(<protocol>)` field. Depth-guarded against
+/// cyclic type graphs.
+fn structTypeHasArcManagedField(
+    type_store: *const types_mod.TypeStore,
+    type_id: types_mod.TypeId,
+    depth: usize,
+) bool {
+    if (type_id >= type_store.types.items.len) return false;
+    if (depth > type_store.types.items.len) return false;
+    if (type_store.getType(type_id) != .struct_type) return false;
+    const struct_type = type_store.getType(type_id).struct_type;
+    for (struct_type.fields) |field| {
+        if (isArcManagedTypeIdDepth(type_store, field.type_id, depth + 1)) return true;
+    }
+    return false;
 }
 
 fn structTypeUsesRecursiveBoxing(type_store: *const types_mod.TypeStore, type_id: types_mod.TypeId) bool {
@@ -9596,7 +9667,47 @@ pub const IrBuilder = struct {
         // type-aware passes (ARC retain/release, indirect-storage
         // field promotion) see the right shape.
         try self.known_local_types.put(box_dest, expected_zig_type);
+
+        // Record the box dest's HIR type as the protocol's
+        // `protocol_constraint` so the ARC ownership pass classifies the
+        // box as an OWNED local that needs a scope-exit drop. Without
+        // this, `computeLocalOwnership` -> `isArcManagedLocal(box_dest)`
+        // reads `local_hir_types` (NOT `known_local_types`), finds no
+        // entry, classifies the box `.trivial`, and `arc_drop_insertion`
+        // never schedules its release — leaking the heap-allocated inner
+        // the box owns (the construction-site `allocAny`). The
+        // `protocol_constraint` TypeId already exists in the store (the
+        // program type-checked with `<Protocol>`-typed values); look it
+        // up by protocol name rather than synthesising one (the IR
+        // builder holds `type_store` as `*const`). `rewriteProtocolBoxReleases`
+        // then flips the scheduled `.release` to `.protocol_box_drop`.
+        if (self.findProtocolConstraintHirType(protocol_id)) |constraint_type_id| {
+            try self.local_hir_types.put(box_dest, constraint_type_id);
+        }
         return box_dest;
+    }
+
+    /// Find the `protocol_constraint` TypeId in the store whose protocol
+    /// name matches `protocol_name_id`. Returns null when no such type is
+    /// interned (no `<Protocol>`-typed value appeared in the program) or
+    /// the store is absent. Used by `maybeBoxAsProtocol` to stamp a box
+    /// dest's HIR type so ARC ownership classifies it as owned.
+    fn findProtocolConstraintHirType(
+        self: *const IrBuilder,
+        protocol_name_id: ast.StringId,
+    ) ?hir_mod.TypeId {
+        const store = self.type_store orelse return null;
+        for (store.types.items, 0..) |typ, index| {
+            switch (typ) {
+                .protocol_constraint => |pc| {
+                    if (pc.protocol_name == protocol_name_id and pc.type_params.len == 0) {
+                        return @intCast(index);
+                    }
+                },
+                else => {},
+            }
+        }
+        return null;
     }
 
     fn lowerExpr(self: *IrBuilder, expr: *const hir_mod.Expr) anyerror!LocalId {

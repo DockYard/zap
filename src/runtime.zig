@@ -871,6 +871,83 @@ comptime {
     );
 }
 
+/// Fixed-layout prefix of every per-protocol vtable — the ABI contract
+/// that lets the runtime's *generic* ARC deep-walk retain/drop a
+/// `ProtocolBox` value WITHOUT statically knowing which protocol it
+/// belongs to (G-box ABI, round 2 of the Phase 1 error-system gap loop).
+///
+/// ## The problem this solves
+///
+/// A `ProtocolBox` nested in a container — an `Option(Error)` field, a
+/// struct field, a union variant — is reached by the runtime's comptime
+/// `releaseChildrenAny` / `retainChildrenAny` field-walk, NOT by the
+/// IR-level `rewriteProtocolBoxReleases` pass (which only rewrites
+/// box-LOCAL `.retain`/`.release` instructions). The generic walk cannot
+/// dispatch the box's `vtable` slot because it is type-erased
+/// (`?*const anyopaque`) and every protocol's vtable has a different
+/// field layout. Calling the generic `retainAny`/`releaseAny` on the
+/// 16-byte box value `@compileError`s (it only accepts single-item
+/// pointers).
+///
+/// ## The contract
+///
+/// Every synthetic `<Protocol>VTable` (emitted by
+/// `zir_builder.emitProtocolVTableSourceFile`) embeds a
+/// `ProtocolBoxVTableHeader` **as its first field** (`__box_header__`),
+/// so `retain` lives at vtable offset 0 and `drop` at offset
+/// `@sizeOf(*anyopaque)`. The vtable itself stays a *plain* struct
+/// (its method slots return slices / unions, which an `extern struct`
+/// forbids), but a plain struct gives no layout guarantee — so the
+/// emitter also bakes a `comptime` assertion that `__box_header__` sits
+/// at offset 0. If a future Zig reorders `.auto` struct fields the build
+/// fails loudly rather than miscompiling.
+///
+/// The deep-walk recovers the header by casting the box's *runtime*
+/// `vtable` pointer (`?*const anyopaque`) to `*const
+/// ProtocolBoxVTableHeader` and invoking `retain(box.data_ptr)` /
+/// `drop(box.data_ptr)`. Each slot points at a per-impl adapter
+/// (`__vtable_adapter__<Target>____retain__` / `____drop__`) that
+/// recovers the concrete inner pointer and routes through
+/// `retainProtocolBoxInner` / `releaseProtocolBoxInner`. The cast is
+/// sound because `box.vtable` is a genuine runtime pointer (a comptime
+/// cast+deref of a plain-struct vtable would be rejected by Zig with
+/// "requires well-defined layout").
+///
+/// The fn-pointer fields are `callconv(.c)` because an `extern struct`
+/// rejects a bare `*const fn(...) void` field ("extern function must
+/// specify calling convention"); the per-impl adapters assigned to the
+/// header slots are emitted `callconv(.c)` to match.
+pub const ProtocolBoxVTableHeader = extern struct {
+    /// Type-erased retain of the box's inner value. Bumps the inner's
+    /// refcount via the concrete impl's `__vtable_adapter__…____retain__`,
+    /// which casts `data_ptr` back to the impl's concrete type and calls
+    /// `ArcRuntime.retainProtocolBoxInner`.
+    retain: *const fn (data_ptr: ?*anyopaque) callconv(.c) void,
+
+    /// Type-erased deep-release of the box's inner value. Runs the
+    /// concrete inner type's full ARC deep-walk + slab return via the
+    /// impl's `__vtable_adapter__…____drop__`, which calls
+    /// `ArcRuntime.releaseProtocolBoxInner`.
+    drop: *const fn (data_ptr: ?*anyopaque) callconv(.c) void,
+};
+
+comptime {
+    // The header is the runtime side of a layout contract baked into the
+    // synthetic vtable emission. Construction- and consumption-site
+    // codegen, plus the generic deep-walk's `@ptrCast` recovery, all
+    // assume `retain` at offset 0 and `drop` immediately after.
+    if (@sizeOf(ProtocolBoxVTableHeader) != 2 * @sizeOf(*anyopaque)) @compileError(
+        "runtime: ProtocolBoxVTableHeader must be exactly two fn-pointers wide",
+    );
+    if (@offsetOf(ProtocolBoxVTableHeader, "retain") != 0) @compileError(
+        "runtime: ProtocolBoxVTableHeader.retain must be at offset 0 — the " ++
+            "generic deep-walk recovers it as the first vtable word.",
+    );
+    if (@offsetOf(ProtocolBoxVTableHeader, "drop") != @sizeOf(*anyopaque)) @compileError(
+        "runtime: ProtocolBoxVTableHeader.drop must immediately follow retain",
+    );
+}
+
 // ============================================================
 // Atomic helper exposed to external memory managers.
 //
@@ -4006,10 +4083,51 @@ pub const ArcRuntime = struct {
     /// Used to elide the `deep_walk` callback for flat types (no
     /// recursive pointer fields) — the dispatcher passes `null` and
     /// the manager skips the indirect call.
+    /// True iff `T` is the runtime `ProtocolBox` fat-pointer. A box is a
+    /// struct, so the generic struct walk in `typeHasArcChildren` /
+    /// `releaseChildrenAny` would otherwise mis-read its `data_ptr`
+    /// (`?*anyopaque`) as a single-item Arc pointer and try to release a
+    /// raw `anyopaque` cell. Every deep-walk entry point checks this
+    /// FIRST and routes the box through its vtable header instead.
+    fn isProtocolBox(comptime T: type) bool {
+        return T == ProtocolBox;
+    }
+
+    /// True iff `T` is a by-VALUE aggregate that the generic ARC
+    /// dispatchers (`retainAny` / `releaseAny` / `freeAny` /
+    /// `retainAnyPersistent`) should treat as "deep-walk my ARC children"
+    /// rather than "I am a single-item slab pointer". A `ProtocolBox`
+    /// (a fat-pointer struct) and a stack `pub error`/struct/tagged-union
+    /// VALUE that owns an ARC child both arrive at these entry points as
+    /// the aggregate value itself; neither is a slab cell.
+    ///
+    /// Inline-header ARC types (`Map(K,V)`, `List(T)`) are excluded
+    /// because the ABI always passes them BY POINTER (`?*const Map`),
+    /// which `@typeInfo` reports as `.pointer` / `.optional`, not
+    /// `.@"struct"`. They keep the existing slab/inline-header path.
+    fn isByValueAggregate(comptime T: type) bool {
+        return switch (@typeInfo(T)) {
+            .@"struct", .@"union" => true,
+            else => false,
+        };
+    }
+
     fn typeHasArcChildren(comptime T: type) bool {
+        if (comptime isProtocolBox(T)) return true;
         return switch (@typeInfo(T)) {
             .@"struct" => |s| blk: {
                 inline for (s.fields) |field| {
+                    if (fieldTypeHasArcChild(field.type)) break :blk true;
+                }
+                break :blk false;
+            },
+            // A `union(enum)` is the lowering of a Zap tagged union
+            // (`Option(<protocol>)` -> `union(enum){Some: ProtocolBox,
+            // None}`, `Result(t,e)`, user unions). Any variant carrying
+            // an Arc child (a `ProtocolBox`, an indirect-storage pointer,
+            // a nested aggregate) makes the union itself need a deep-walk.
+            .@"union" => |u| blk: {
+                inline for (u.fields) |field| {
                     if (fieldTypeHasArcChild(field.type)) break :blk true;
                 }
                 break :blk false;
@@ -4019,9 +4137,14 @@ pub const ArcRuntime = struct {
     }
 
     fn fieldTypeHasArcChild(comptime FieldType: type) bool {
+        if (comptime isProtocolBox(FieldType)) return true;
         return switch (@typeInfo(FieldType)) {
             .optional => |opt| fieldTypeHasArcChild(opt.child),
             .pointer => |p| p.size == .one,
+            // A by-value aggregate field (a nested struct, or a
+            // `union(enum)` like `Option(<protocol>)`) needs walking when
+            // any of its own fields/variants carry an Arc child.
+            .@"struct", .@"union" => typeHasArcChildren(FieldType),
             else => false,
         };
     }
@@ -4076,6 +4199,15 @@ pub const ArcRuntime = struct {
     /// Validation mirrors `releaseAny` — the dispatcher refuses to
     /// dispatch against a manager that does not declare REFCOUNT_V1.
     pub inline fn freeAny(allocator: std.mem.Allocator, ptr: anytype) void {
+        // G-box ABI: a by-value aggregate routes through the children
+        // deep-walk (see `releaseAny`). For a `ProtocolBox` this drops the
+        // single owned inner reference; for a stack struct/union value it
+        // releases each owned ARC child. There is no separate "shallow"
+        // free for a stack aggregate — it owns no slab cell of its own.
+        if (comptime isByValueAggregate(@TypeOf(ptr))) {
+            releaseChildrenAny(@TypeOf(ptr), allocator, ptr);
+            return;
+        }
         if (comptime !refcount_v1_active) {
             // Phase 6 lifecycle pairing: under no-REFCOUNT_V1, every
             // `allocAny` call routed through `core.allocate` (see the
@@ -4351,6 +4483,45 @@ pub const ArcRuntime = struct {
         retainAny(inner_ptr_typed);
     }
 
+    /// Deep-retain a `ProtocolBox` value reached by the generic ARC
+    /// field-walk (a box nested in a container — an `Option(<protocol>)`
+    /// field, a struct field, a union variant). The box is type-erased,
+    /// so this recovers the `ProtocolBoxVTableHeader` from `box.vtable`
+    /// and invokes the header's `retain(box.data_ptr)` slot, which routes
+    /// through the per-impl adapter to bump the inner value's refcount.
+    ///
+    /// `None` boxes (`data_ptr == null`) are no-ops — the absent box owns
+    /// nothing. A present box always carries a non-null vtable (the
+    /// construction-site lowering sets both together), so the
+    /// `data_ptr != null` guard alone is sufficient; the `vtable` capture
+    /// keeps the contract honest if a malformed box ever reaches here.
+    ///
+    /// This is the container-walk counterpart of the box-LOCAL
+    /// `.protocol_box_retain` IR op: that op handles a box that is itself
+    /// an SSA local; this helper handles a box embedded inside another
+    /// ARC-managed aggregate the runtime tears down generically.
+    pub inline fn retainProtocolBoxValue(box: ProtocolBox) void {
+        if (box.data_ptr == null) return;
+        const vtable_erased = box.vtable orelse return;
+        const header: *const ProtocolBoxVTableHeader = @ptrCast(@alignCast(vtable_erased));
+        header.retain(box.data_ptr);
+    }
+
+    /// Deep-release a `ProtocolBox` value reached by the generic ARC
+    /// field-walk. Symmetric with `retainProtocolBoxValue`: recovers the
+    /// `ProtocolBoxVTableHeader` from `box.vtable` and invokes the
+    /// header's `drop(box.data_ptr)` slot, which runs the concrete inner
+    /// type's full ARC deep-walk + slab return via the per-impl adapter.
+    ///
+    /// `None` boxes are no-ops. This is the container-walk counterpart of
+    /// the box-LOCAL `.protocol_box_drop` IR op.
+    pub inline fn releaseProtocolBoxValue(box: ProtocolBox) void {
+        if (box.data_ptr == null) return;
+        const vtable_erased = box.vtable orelse return;
+        const header: *const ProtocolBoxVTableHeader = @ptrCast(@alignCast(vtable_erased));
+        header.drop(box.data_ptr);
+    }
+
     /// Accepts the pointer as `anytype` so the ZIR backend's two-argument
     /// call site (`releaseAny(allocator, ptr)`) compiles — Zig cannot infer
     /// a leading `comptime T: type` parameter from the runtime ptr argument.
@@ -4362,6 +4533,21 @@ pub const ArcRuntime = struct {
     /// for why the typed slab-pool path still uses the typed impl
     /// directly rather than the byte-level vtable.
     pub fn releaseAny(allocator: std.mem.Allocator, ptr: anytype) void {
+        // G-box ABI: a by-VALUE aggregate (a `ProtocolBox`, or a stack
+        // `pub error`/struct/tagged-union value that OWNS an ARC child
+        // such as an `Option(Error)`-boxed inner) reaches this dispatcher
+        // as the aggregate value itself, NOT a slab pointer. The
+        // aggregate lives on the stack — it must NOT be freed as a slab
+        // cell (the generic `arcPtrChild` path `@compileError`s on a
+        // non-pointer and would mis-free stack memory). Instead deep-walk
+        // its ARC children: every owned `ProtocolBox` routes through its
+        // vtable header drop, every owned Map/List/box-bearing field
+        // recurses. This is the scope-exit release the IR schedules for an
+        // ARC-managed struct VALUE (see `ir.isArcManagedTypeId`).
+        if (comptime isByValueAggregate(@TypeOf(ptr))) {
+            releaseChildrenAny(@TypeOf(ptr), allocator, ptr);
+            return;
+        }
         if (comptime !refcount_v1_active) {
             // Phase 6 lifecycle pairing: under no-REFCOUNT_V1, the
             // matching `allocAny` call routed through `core.allocate`
@@ -4575,10 +4761,39 @@ pub const ArcRuntime = struct {
     /// any indirect-storage Arc'd children encountered. Non-aggregates are
     /// a no-op; flat aggregates compile to nothing.
     pub fn releaseChildrenAny(comptime T: type, allocator: std.mem.Allocator, value: T) void {
+        // A `ProtocolBox` reached as a top-level deep-walk subject (the
+        // cell IS a box) routes through its vtable header drop, never the
+        // generic field walk — its `data_ptr`/`vtable` fields are not
+        // independently Arc-managed pointers.
+        if (comptime isProtocolBox(T)) {
+            releaseProtocolBoxValue(value);
+            return;
+        }
+        // Skip the entire walk for types with no ARC children. This
+        // keeps the deep-walk from emitting a runtime tag-switch (or any
+        // field recursion) over pure-data aggregates — without this guard
+        // a union whose variants are all comptime-only / non-ARC (common
+        // in framework code like the Zest runner) would emit a runtime
+        // `std.meta.activeTag` comparison that Sema rejects with
+        // "comptime-only type … depends on runtime control flow".
+        if (comptime !typeHasArcChildren(T)) return;
         switch (@typeInfo(T)) {
             .@"struct" => |s| {
                 inline for (s.fields) |field| {
                     releaseFieldChildAny(field.type, allocator, @field(value, field.name));
+                }
+            },
+            // Walk the active variant of a tagged union — only reached
+            // when some variant carries an Arc child (the guard above).
+            // `std.meta.activeTag` reads the runtime tag once; the
+            // `inline for` matches it against each variant at comptime
+            // and recurses into the live payload.
+            .@"union" => {
+                const active = std.meta.activeTag(value);
+                inline for (std.meta.fields(T)) |field| {
+                    if (active == @field(std.meta.Tag(T), field.name)) {
+                        releaseFieldChildAny(field.type, allocator, @field(value, field.name));
+                    }
                 }
             },
             else => {},
@@ -4586,6 +4801,10 @@ pub const ArcRuntime = struct {
     }
 
     fn releaseFieldChildAny(comptime FieldType: type, allocator: std.mem.Allocator, value: FieldType) void {
+        if (comptime isProtocolBox(FieldType)) {
+            releaseProtocolBoxValue(value);
+            return;
+        }
         switch (@typeInfo(FieldType)) {
             .optional => |opt| {
                 if (value) |inner| releaseFieldChildAny(opt.child, allocator, inner);
@@ -4595,6 +4814,10 @@ pub const ArcRuntime = struct {
                     releaseArcAny(p.child, allocator, @constCast(value));
                 }
             },
+            // A nested by-value aggregate (struct or `union(enum)`) is
+            // walked recursively so a `ProtocolBox` or indirect-storage
+            // pointer buried inside it still gets released.
+            .@"struct", .@"union" => releaseChildrenAny(FieldType, allocator, value),
             else => {},
         }
     }
@@ -4607,10 +4830,28 @@ pub const ArcRuntime = struct {
     /// later own and release it (e.g. `List.next` returning `cell.head`
     /// when the cell still owns the same value).
     pub fn retainChildrenAny(comptime T: type, value: T) void {
+        if (comptime isProtocolBox(T)) {
+            retainProtocolBoxValue(value);
+            return;
+        }
+        // Mirror `releaseChildrenAny`: skip the walk (and any runtime
+        // tag-switch) for types with no ARC children.
+        if (comptime !typeHasArcChildren(T)) return;
         switch (@typeInfo(T)) {
             .@"struct" => |s| {
                 inline for (s.fields) |field| {
                     retainFieldChildAny(field.type, @field(value, field.name));
+                }
+            },
+            // Symmetric with `releaseChildrenAny`: walk the active variant
+            // of a tagged union (reached only when a variant carries an
+            // Arc child) and retain it.
+            .@"union" => {
+                const active = std.meta.activeTag(value);
+                inline for (std.meta.fields(T)) |field| {
+                    if (active == @field(std.meta.Tag(T), field.name)) {
+                        retainFieldChildAny(field.type, @field(value, field.name));
+                    }
                 }
             },
             else => {},
@@ -4618,6 +4859,10 @@ pub const ArcRuntime = struct {
     }
 
     fn retainFieldChildAny(comptime FieldType: type, value: FieldType) void {
+        if (comptime isProtocolBox(FieldType)) {
+            retainProtocolBoxValue(value);
+            return;
+        }
         switch (@typeInfo(FieldType)) {
             .optional => |opt| {
                 if (value) |inner| retainFieldChildAny(opt.child, inner);
@@ -4632,6 +4877,10 @@ pub const ArcRuntime = struct {
                     retainAnyPersistent(@as(*const p.child, value));
                 }
             },
+            // A nested by-value aggregate (struct or `union(enum)`) is
+            // walked recursively so a `ProtocolBox` or indirect-storage
+            // pointer buried inside it still gets retained.
+            .@"struct", .@"union" => retainChildrenAny(FieldType, value),
             else => {},
         }
     }
@@ -4662,6 +4911,17 @@ pub const ArcRuntime = struct {
     /// `release_sized` (slab-lookup via 64-KiB-aligned pointer mask
     /// + size class).
     pub inline fn retainAny(ptr: anytype) void {
+        // G-box ABI: a by-VALUE aggregate (a `ProtocolBox` extracted from
+        // an `Option(<protocol>)`, a stack struct/tagged-union value that
+        // owns an ARC child) reaches the generic retain dispatcher as the
+        // aggregate value, NOT a slab pointer. Deep-retain its ARC
+        // children — every owned `ProtocolBox` bumps its inner's refcount
+        // through the vtable header retain. Treating it as a slab pointer
+        // would `@compileError` (`arcPtrChild` rejects a non-pointer).
+        if (comptime isByValueAggregate(@TypeOf(ptr))) {
+            retainChildrenAny(@TypeOf(ptr), ptr);
+            return;
+        }
         // Phase 6: codegen elides every retainAny call under no-REFCOUNT_V1.
         if (comptime !refcount_v1_active) return;
         // Phase 6 inline: the body is small enough (5 loads + 3 panics +
@@ -4756,6 +5016,14 @@ pub const ArcRuntime = struct {
     ///
     /// Validation pattern mirrors `retainAny`.
     pub inline fn retainAnyPersistent(ptr: anytype) void {
+        // G-box ABI: deep-retain the ARC children of a by-value aggregate
+        // (see `retainAny`). A `ProtocolBox` carries no inline ArcHeader,
+        // so there is no distinct persistent retain semantics — the box's
+        // vtable retain bumps the inner's refcount either way.
+        if (comptime isByValueAggregate(@TypeOf(ptr))) {
+            retainChildrenAny(@TypeOf(ptr), ptr);
+            return;
+        }
         // Phase 6: codegen elides every retainAnyPersistent call under no-REFCOUNT_V1.
         if (comptime !refcount_v1_active) return;
         // Phase 6 inline: same rationale as `retainAny`. Preflight body
