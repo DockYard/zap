@@ -3913,6 +3913,18 @@ pub const IrBuilder = struct {
         self.current_hir_program = hir_program;
         defer self.current_hir_program = saved_hir_program;
 
+        // Intern any parametric type a protocol method signature names
+        // (e.g. `Error.code(e) -> Option(Atom)`) into the shared
+        // TypeStore BEFORE the specialization table is built. These
+        // instantiations are reachable only through the protocol vtable's
+        // method-slot types, which `populateProtocolVTables` emits by
+        // mangled name; without the matching `.applied` TypeId in the
+        // store, `populateAppliedSpecializations` would never emit the
+        // per-instantiation union module the vtable references (the
+        // `no module named 'Option_Atom'` failure in the whole-stdlib
+        // `zap test` build). See `internProtocolSignatureInstantiations`.
+        self.internProtocolSignatureInstantiations();
+
         // Precompute the per-instantiation specialization table for
         // every concrete `.applied { base, args }` TypeId in the
         // TypeStore. Every downstream lowering path that needs to
@@ -9200,6 +9212,84 @@ pub const IrBuilder = struct {
     /// produced by the type-checker's mid-traversal stages that the
     /// monomorphizer collapses before IR runs, so emitting a TypeDef
     /// for them would be both meaningless and a name collision risk.
+    /// Resolve an `ast.TypeExpr` to a concrete `TypeId` in the shared
+    /// TypeStore, interning parametric applications (`Option(Atom)` ->
+    /// `.applied { Option, [Atom] }`) on the way. Mirrors the subset of
+    /// `TypeChecker.resolveTypeExpr` needed to materialise the
+    /// instantiations referenced only by protocol method signatures.
+    /// Returns `null` for type variables and names the store cannot
+    /// resolve (those are not concrete instantiations that need a
+    /// per-instantiation TypeDef).
+    fn resolveConcreteAppliedTypeId(self: *IrBuilder, type_expr: *const ast.TypeExpr) ?types_mod.TypeId {
+        const store_const = self.type_store orelse return null;
+        switch (type_expr.*) {
+            .name => |name_expr| {
+                const text = self.interner.get(name_expr.name);
+                const base_id = blk: {
+                    if (store_const.resolveTypeName(text)) |builtin| {
+                        if (builtin != types_mod.TypeStore.UNKNOWN) break :blk builtin;
+                    }
+                    if (store_const.name_to_type.get(name_expr.name)) |tid| break :blk tid;
+                    return null;
+                };
+                if (name_expr.args.len == 0) return base_id;
+                // Parametric application: resolve every arg to a concrete
+                // TypeId and intern the `.applied` form so the per-
+                // instantiation TypeDef emitter (`populateAppliedSpecializations`)
+                // produces the synthetic module the protocol vtable references.
+                // The IR builder owns the same TypeStore the type checker
+                // built (`@constCast` mirrors `populateAppliedSpecializations`),
+                // so interning a new `.applied` here is the IR build extending
+                // its own store, not mutating a foreign one.
+                var arg_ids = std.ArrayListUnmanaged(types_mod.TypeId).empty;
+                defer arg_ids.deinit(self.allocator);
+                for (name_expr.args) |arg| {
+                    const arg_id = self.resolveConcreteAppliedTypeId(arg) orelse return null;
+                    arg_ids.append(self.allocator, arg_id) catch return null;
+                }
+                const owned_args = arg_ids.toOwnedSlice(self.allocator) catch return null;
+                const store = @constCast(store_const);
+                return store.addType(.{ .applied = .{ .base = base_id, .args = owned_args } }) catch null;
+            },
+            else => return null,
+        }
+    }
+
+    /// Intern every parametric type referenced by a non-parametric
+    /// protocol's method signatures (param + return positions) into the
+    /// shared TypeStore as a concrete `.applied` TypeId. `Error.code(e)
+    /// -> Option(Atom)` is the motivating case: `Option(Atom)` is
+    /// reachable ONLY through the protocol method signature, never
+    /// through a struct field or call site, so the type-checker's
+    /// signature traversal is the only thing that interns it. In the
+    /// whole-program compile path that traversal runs and the `.applied`
+    /// lands in the store, so `populateAppliedSpecializations` emits the
+    /// `Option_Atom` per-instantiation union module that `ErrorVTable`'s
+    /// `code` slot type references. The incremental-daemon per-struct
+    /// compile path does not type-check protocol method signatures the
+    /// same way, so the `.applied` was missing and the ZIR backend's
+    /// `@import("Option_Atom")` failed with "no module named 'Option_Atom'".
+    /// Running this intern pass before `populateAppliedSpecializations`
+    /// makes both paths emit the same per-instantiation modules for every
+    /// type a protocol vtable signature names, independent of how the
+    /// TypeStore was otherwise populated.
+    fn internProtocolSignatureInstantiations(self: *IrBuilder) void {
+        const graph = self.scope_graph orelse return;
+        for (graph.protocols.items) |proto_entry| {
+            if (proto_entry.decl.type_params.len != 0) continue;
+            for (proto_entry.decl.functions) |fn_sig| {
+                for (fn_sig.params) |param| {
+                    if (param.type_annotation) |annotation| {
+                        _ = self.resolveConcreteAppliedTypeId(annotation);
+                    }
+                }
+                if (fn_sig.return_type) |return_type| {
+                    _ = self.resolveConcreteAppliedTypeId(return_type);
+                }
+            }
+        }
+    }
+
     fn populateAppliedSpecializations(self: *IrBuilder) !void {
         const store = self.type_store orelse return;
         for (store.types.items, 0..) |candidate_type, candidate_index| {
