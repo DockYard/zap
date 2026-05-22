@@ -6261,7 +6261,24 @@ pub const HirBuilder = struct {
         const new_call = try self.create(ast.Expr, .{
             .call = .{ .meta = call.meta, .callee = new_callee, .args = call.args },
         });
-        return try self.buildExpr(new_call);
+        const lowered = try self.buildExpr(new_call);
+        // Stamp the recoverable-raise call as `Never`-typed even though the
+        // `Kernel.recoverable_raise` stdlib fn returns `Nil` at runtime. A
+        // `raise` is a diverging terminator in the type system, so a
+        // recoverable raise in tail position must coerce to the enclosing
+        // `try`/`rescue` result type (like the abort `do_raise`). Without
+        // this the body's tail would type as `Nil` and the handler-vs-body
+        // branch merge in `lowerTryRescue` would reject `Nil` vs the rescue
+        // arms' result type. The runtime fn still returns normally — control
+        // falls through to the compiler-emitted `raise_occurred()` landing
+        // pad — so this is purely a type-surface coercion, not a codegen
+        // noreturn claim.
+        const never_typed = try self.create(Expr, .{
+            .kind = lowered.kind,
+            .type_id = types_mod.TypeStore.NEVER,
+            .span = lowered.span,
+        });
+        return never_typed;
     }
 
     fn buildTryProject(self: *HirBuilder, te: ast.TryExpr) anyerror!*const Expr {
