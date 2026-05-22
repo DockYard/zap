@@ -5620,7 +5620,24 @@ pub const HirBuilder = struct {
                         return recoverable;
                     }
                 }
-                return try self.buildExpr(re.value);
+                // Abort path (`Kernel.do_raise(<value>)`): a `raise` is a
+                // diverging terminator, so stamp the lowered expression
+                // `Never` regardless of the inner `do_raise` call's surface
+                // type. This lets a `raise` in a value-producing tail position
+                // — e.g. a re-raise rescue arm `e :: IOError -> raise e`
+                // peer-merged against a `… -> "recovered"` sibling, or a
+                // `case` arm `_ -> raise err` merged against a `String` arm —
+                // coerce to whatever the merge expects, exactly as the
+                // recoverable path's `buildRecoverableRaise` already does. The
+                // runtime call still diverges (`do_raise` is `Never`-returning
+                // and aborts via `crashReport`); this only fixes the HIR type
+                // surface so divergent arms unify cleanly.
+                const lowered_raise = try self.buildExpr(re.value);
+                return try self.create(Expr, .{
+                    .kind = lowered_raise.kind,
+                    .type_id = types_mod.TypeStore.NEVER,
+                    .span = lowered_raise.span,
+                });
             },
             .tuple => |t| {
                 var elems: std.ArrayList(*const Expr) = .empty;

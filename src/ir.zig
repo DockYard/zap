@@ -6921,6 +6921,27 @@ pub const IrBuilder = struct {
         }
         const handler_dest = self.next_local;
         self.next_local += 1;
+        // Stamp the dispatch result local with the joined result type BEFORE
+        // lowering the arms — exactly as `lowerExpr(.case)` stamps a regular
+        // `case` expression's dest. The ZIR backend reads `known_local_types`
+        // for the case-block's result type, which is the peer type its arms
+        // resolve against. Without this hint a rescue arm whose body diverges
+        // — e.g. a re-raise `e :: IOError -> raise e` (a `Never`-typed abort) —
+        // would peer-resolve to `void` and clash with a value-producing
+        // sibling arm (`… -> "recovered"`) (`incompatible types '…' and
+        // 'void'`). A standalone `case` bound to a local works for exactly this
+        // reason; the landing-pad dispatch must mirror it.
+        const handler_joined = tr.result_type_id;
+        if (handler_joined != types_mod.TypeStore.UNKNOWN and
+            handler_joined != types_mod.TypeStore.NIL and
+            handler_joined != types_mod.TypeStore.NEVER)
+        {
+            try self.local_hir_types.put(handler_dest, handler_joined);
+            const handler_joined_zig = typeIdToZigTypeWithStore(handler_joined, self.type_store);
+            if (handler_joined_zig != .any and handler_joined_zig != .void) {
+                try self.known_local_types.put(handler_dest, handler_joined_zig);
+            }
+        }
         try self.lowerCaseExprBody(handler_dest, error_local, .{ .scrutinee = tr.take_raise_call, .arms = tr.arms });
         const then_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
         self.current_instrs = saved_then;
