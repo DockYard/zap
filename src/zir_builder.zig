@@ -1915,6 +1915,24 @@ pub const ZirDriver = struct {
         try buf.appendSlice(self.allocator, "const std = @import(\"std\");\n");
         try buf.appendSlice(self.allocator, "\n");
 
+        // How to refer to the target's CONCRETE TYPE from this adapter
+        // file. Every Zap struct emits file-IS-the-struct (its fields
+        // live at the imported file's root struct_decl — see
+        // `emitStructTypeDecls`/`emitRootFields`), so for a top-level
+        // target `@import("Outer")` IS the `Outer` type: the reference is
+        // `TargetMod`, NOT `TargetMod.Outer` (the file has no nested
+        // member named `Outer`). A NESTED target (dotted name) lives as a
+        // `pub const <leaf> = struct {...}` inside its parent's emission,
+        // reached as `TargetMod.<leaf>`. The target's METHODS are always
+        // published at the target file's root (`emitFunction` selects
+        // `func.local_name` under `current_emit_struct`), so method calls
+        // stay `TargetMod.<method>` in both cases.
+        const target_type_ref = if (std.mem.lastIndexOfScalar(u8, inst_def.target_type_name, '.')) |dot_idx| blk: {
+            const leaf = inst_def.target_type_name[dot_idx + 1 ..];
+            break :blk try std.fmt.allocPrint(self.allocator, "TargetMod.{s}", .{leaf});
+        } else try self.allocator.dupe(u8, "TargetMod");
+        defer self.allocator.free(target_type_ref);
+
         // Phase 1.2.5.c: per-impl ABI-bridge adapter functions.
         // Each adapter recovers the inner value from the box's
         // erased `data_ptr` via `@ptrCast(@alignCast(data_ptr.?))`
@@ -1949,9 +1967,9 @@ pub const ZirDriver = struct {
             try buf.appendSlice(self.allocator, ") ");
             try appendZigTypeForVTable(self.allocator, &buf, method.return_type);
             try buf.appendSlice(self.allocator, " {\n");
-            // `    const inner: *const TargetMod.<Target> = @ptrCast(@alignCast(data_ptr.?));`
-            try buf.appendSlice(self.allocator, "    const inner: *const TargetMod.");
-            try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+            // `    const inner: *const <target_type_ref> = @ptrCast(@alignCast(data_ptr.?));`
+            try buf.appendSlice(self.allocator, "    const inner: *const ");
+            try buf.appendSlice(self.allocator, target_type_ref);
             try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(data_ptr.?));\n");
             // `    return TargetMod.<method_name>(inner.*[, arg0, ...]);`
             //
@@ -1993,11 +2011,11 @@ pub const ZirDriver = struct {
         try buf.appendSlice(self.allocator, "fn __vtable_adapter__");
         try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
         try buf.appendSlice(self.allocator, "____drop__(data_ptr: ?*anyopaque) void {\n");
-        try buf.appendSlice(self.allocator, "    const inner: *TargetMod.");
-        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, "    const inner: *");
+        try buf.appendSlice(self.allocator, target_type_ref);
         try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(data_ptr.?));\n");
-        try buf.appendSlice(self.allocator, "    zap_runtime.ArcRuntime.releaseProtocolBoxInner(TargetMod.");
-        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, "    zap_runtime.ArcRuntime.releaseProtocolBoxInner(");
+        try buf.appendSlice(self.allocator, target_type_ref);
         try buf.appendSlice(self.allocator, ", std.heap.page_allocator, inner);\n");
         try buf.appendSlice(self.allocator, "}\n\n");
 
@@ -2010,11 +2028,11 @@ pub const ZirDriver = struct {
         try buf.appendSlice(self.allocator, "fn __vtable_adapter__");
         try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
         try buf.appendSlice(self.allocator, "____retain__(data_ptr: ?*anyopaque) void {\n");
-        try buf.appendSlice(self.allocator, "    const inner: *TargetMod.");
-        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, "    const inner: *");
+        try buf.appendSlice(self.allocator, target_type_ref);
         try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(data_ptr.?));\n");
-        try buf.appendSlice(self.allocator, "    zap_runtime.ArcRuntime.retainProtocolBoxInner(TargetMod.");
-        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, "    zap_runtime.ArcRuntime.retainProtocolBoxInner(");
+        try buf.appendSlice(self.allocator, target_type_ref);
         try buf.appendSlice(self.allocator, ", inner);\n");
         try buf.appendSlice(self.allocator, "}\n\n");
 
@@ -2080,11 +2098,11 @@ pub const ZirDriver = struct {
         try buf.appendSlice(self.allocator, "));\n");
         try buf.appendSlice(self.allocator, "}\n\n");
 
-        try buf.appendSlice(self.allocator, "pub fn unbox(box: zap_runtime.ProtocolBox) TargetMod.");
-        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, "pub fn unbox(box: zap_runtime.ProtocolBox) ");
+        try buf.appendSlice(self.allocator, target_type_ref);
         try buf.appendSlice(self.allocator, " {\n");
-        try buf.appendSlice(self.allocator, "    const inner: *const TargetMod.");
-        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, "    const inner: *const ");
+        try buf.appendSlice(self.allocator, target_type_ref);
         try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(box.data_ptr.?));\n");
         try buf.appendSlice(self.allocator, "    return inner.*;\n");
         try buf.appendSlice(self.allocator, "}\n\n");
