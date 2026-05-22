@@ -3908,8 +3908,21 @@ pub const Parser = struct {
                 stmts[0] = .{ .expr = expr };
                 body = stmts;
             }
+        } else if (self.check(.left_brace) and self.sameLineBraceBodyIsBlock()) {
+            // Same-line multi-statement block arm: `pattern -> { stmt; stmt }`.
+            // A leading `{` is otherwise a tuple literal (`{:ok, v}`), so a
+            // lookahead distinguishes a statement block (contains a top-level
+            // assignment or newline-separated statements) from a tuple/map.
+            // This is what lets `?` propagation appear inside a brace arm:
+            //   true -> { value = step(n)?\n recurse(value) }
+            _ = self.advance();
+            self.skipNewlines();
+            body = try self.parseBlock();
+            self.skipNewlines();
+            _ = try self.expect(.right_brace);
         } else {
-            // Same line: always parse as single expression (handles tuples like {:ok, v})
+            // Same line: parse as a single expression (handles tuples like
+            // {:ok, v} and maps like %{...}).
             const expr = try self.parseExpr();
             const stmts = try self.allocator.alloc(ast.Stmt, 1);
             stmts[0] = .{ .expr = expr };
@@ -3923,6 +3936,58 @@ pub const Parser = struct {
             .guard = guard,
             .body = body,
         };
+    }
+
+    /// Lookahead from a same-line `{` in a case-arm body: decide whether the
+    /// brace introduces a multi-statement block or a tuple literal.
+    ///
+    /// A statement block is recognised when, scanning at brace depth 1 (the
+    /// arm's own `{`), we encounter either a top-level assignment `=` (not the
+    /// `==` comparison) or a newline that separates two statements without an
+    /// intervening comma. A tuple/map uses comma-separated elements with no
+    /// top-level `=`, so it falls through to the single-expression path. The
+    /// lexer state is saved and restored so this peek never disturbs parsing.
+    fn sameLineBraceBodyIsBlock(self: *Parser) bool {
+        const saved = self.saveLexerState();
+        defer self.restoreLexerState(saved);
+
+        if (!self.check(.left_brace)) return false;
+        _ = self.advance(); // consume the `{`
+
+        var depth: u32 = 0;
+        var saw_comma_at_top = false;
+        var pending_newline = false;
+        while (!self.check(.eof)) {
+            const tag = self.current.tag;
+            switch (tag) {
+                .left_brace, .left_paren, .left_bracket, .percent_brace => depth += 1,
+                .right_brace => {
+                    if (depth == 0) return false; // closed the arm brace: tuple/map
+                    depth -= 1;
+                },
+                .right_paren, .right_bracket => {
+                    if (depth > 0) depth -= 1;
+                },
+                .equal => if (depth == 0) return true, // top-level assignment ⇒ block
+                .comma => if (depth == 0) {
+                    saw_comma_at_top = true;
+                },
+                .newline => if (depth == 0) {
+                    // A newline at top level after a non-comma element marks a
+                    // second statement ⇒ block. Inside a tuple the elements are
+                    // comma-separated, so a bare newline-separated continuation
+                    // never appears at depth 0.
+                    if (pending_newline and !saw_comma_at_top) return true;
+                    pending_newline = true;
+                    _ = self.advance();
+                    continue;
+                },
+                else => {},
+            }
+            if (tag != .newline) pending_newline = false;
+            _ = self.advance();
+        }
+        return false;
     }
 
     fn parseCondExpr(self: *Parser) !*const ast.Expr {
