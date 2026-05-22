@@ -10280,6 +10280,38 @@ pub const IrBuilder = struct {
         if (expected_zig_type != .protocol_box) return value_local;
         const expected_protocol = expected_zig_type.protocol_box;
 
+        // Path 0 (HIR-authoritative already-boxed check): if the value's HIR
+        // type is the `protocol_constraint(<expected_protocol>)` existential,
+        // the value IS a `runtime.ProtocolBox` at runtime — no second wrap.
+        // The HIR type is the source of truth here; we must consult it BEFORE
+        // the ZigType because the ZigType can be a stale/failed resolution.
+        //
+        // This is the #186 fix: in the `zap test` whole-stdlib incremental
+        // build, a value typed `protocol_constraint(Error)` in HIR can carry a
+        // `known_local_types` ZigType of `struct_ref("UnknownType")` — the
+        // `resolveTypeName` fallback for a type the daemon's merged store
+        // couldn't name. Without this HIR check, the ZigType path below would
+        // see a non-`protocol_box`, non-impl `struct_ref`, pass the value
+        // through un-boxed, and emit a raw struct (the `contract_violation`
+        // abort value at the raise call site) into an `Error` parameter —
+        // tripping Sema's `expected zap_runtime.ProtocolBox, found
+        // Kernel.contract_violation__3__struct`. The boxed existential needs
+        // no further boxing regardless of how its ZigType resolved.
+        if (self.type_store) |ts| {
+            if (self.local_hir_types.get(value_local)) |hir_type_id| {
+                const hir_type = ts.getType(hir_type_id);
+                if (hir_type == .protocol_constraint) {
+                    const value_protocol = ts.interner.get(hir_type.protocol_constraint.protocol_name);
+                    if (std.mem.eql(u8, value_protocol, expected_protocol)) {
+                        // Ensure downstream emission sees the box ZigType even
+                        // if a stale `struct_ref` was recorded.
+                        try self.known_local_types.put(value_local, expected_zig_type);
+                        return value_local;
+                    }
+                }
+            }
+        }
+
         // Discover the value local's actual ZigType. When the value
         // bypassed `known_local_types` (e.g. a cross-struct call argument
         // whose local came from a `local_get`/`param_get` alias chain that
