@@ -322,6 +322,19 @@ fn cloneZigTypeSlice(allocator: std.mem.Allocator, values: []const ZigType) Clon
     return cloned;
 }
 
+/// True when `zig_type` is one of the fixed-width integer ZigType
+/// shapes (`i8`..`i128`, `u8`..`u128`, `usize`, `isize`). Used by the
+/// block-tail expected-type resolution to decide whether the outer
+/// expectation (e.g. a `-> u8` function return) should out-rank a
+/// block's defaulted-to-`i64` result type when narrowing integer
+/// literals in the tail expression.
+fn isConcreteIntegerZigType(zig_type: ZigType) bool {
+    return switch (zig_type) {
+        .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .usize, .isize => true,
+        else => false,
+    };
+}
+
 /// Map a primitive type's source name to the matching IR
 /// `ZigType` shape. Mirrors `TypeStore.resolveTypeName` so the
 /// protocol-vtable populator (which resolves AST `TypeNameExpr`
@@ -8749,7 +8762,38 @@ pub const IrBuilder = struct {
                     const saved_expected_type = self.current_expected_type;
                     if (stmt_index + 1 == block.stmts.len) {
                         if (self.usableContextType(block.result_type)) |block_result_type| {
-                            self.current_expected_type = block_result_type;
+                            // The tail expression's expected type is normally
+                            // the block's own inferred `result_type`. But when
+                            // the block was entered via `lowerBlockExpecting`
+                            // (a function body lowered against its declared
+                            // return type, a call argument against the
+                            // parameter type, …), `current_expected_type`
+                            // already holds the AUTHORITATIVE outer expectation.
+                            // If both are concrete integer types and they
+                            // disagree, the outer expectation must win: a
+                            // `pub fn f() -> u8 { if c { 0 } else { 1 } }`
+                            // has `block.result_type` defaulted to `i64` by the
+                            // type checker (the integer-literal join), but the
+                            // genuine target is `u8`. Adopting the defaulted
+                            // `i64` here would make the branch literals resolve
+                            // to `i64`, which the int-literal lowering emits as
+                            // an UNTYPED comptime_int (no `i64` hint) — and a
+                            // comptime_int flowing out of the runtime `if`/switch
+                            // trips Zig's "comptime-only type 'comptime_int'
+                            // depends on runtime control flow". Keep the
+                            // narrower outer integer expectation so the literals
+                            // resolve to it (`u8`) and carry a concrete hint.
+                            const keep_outer_integer = blk: {
+                                const outer = self.current_expected_type orelse break :blk false;
+                                const outer_zig = typeIdToZigTypeWithStore(outer, self.type_store);
+                                const block_zig = typeIdToZigTypeWithStore(block_result_type, self.type_store);
+                                break :blk isConcreteIntegerZigType(outer_zig) and
+                                    isConcreteIntegerZigType(block_zig) and
+                                    outer != block_result_type;
+                            };
+                            if (!keep_outer_integer) {
+                                self.current_expected_type = block_result_type;
+                            }
                         }
                     }
                     defer self.current_expected_type = saved_expected_type;
