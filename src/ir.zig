@@ -1314,6 +1314,7 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
         .match_fail => |value| .{ .match_fail = .{
             .message = try cloneBytes(allocator, value.message),
             .message_local = value.message_local,
+            .kind = value.kind,
         } },
         .make_closure => |value| .{ .make_closure = .{
             .dest = value.dest,
@@ -2344,6 +2345,22 @@ pub const MatchFail = struct {
     message: []const u8,
     /// For panic expressions, the local holding the runtime message string.
     message_local: ?LocalId = null,
+    /// The semantic class of this unrecoverable abort. The ZIR builder maps
+    /// each class to a distinct `Kernel` crash sink so the unified Phase 2
+    /// crash report carries the correct canonical kind (`match_error` for a
+    /// pattern-match exhaustion, `runtime_error` for an explicit `panic`/
+    /// `unreachable`). Defaults to `match_clause` since the overwhelming
+    /// majority of `match_fail` sites are non-exhaustive `case`/clause sets.
+    kind: Kind = .match_clause,
+
+    pub const Kind = enum {
+        /// No `case`/function clause matched the scrutinee at runtime.
+        match_clause,
+        /// An explicit Zap `panic(msg)` builtin.
+        panic,
+        /// An explicit Zap `unreachable`/`never` builtin.
+        unreachable_reached,
+    };
 };
 
 /// Like match_fail but returns error.NoMatchingClause instead of panicking.
@@ -10656,12 +10673,12 @@ pub const IrBuilder = struct {
             .panic => |msg| {
                 const msg_local = try self.lowerExpr(msg);
                 try self.current_instrs.append(self.allocator, .{
-                    .match_fail = .{ .message = "panic", .message_local = msg_local },
+                    .match_fail = .{ .message = "panic", .message_local = msg_local, .kind = .panic },
                 });
             },
             .never => {
                 try self.current_instrs.append(self.allocator, .{
-                    .match_fail = .{ .message = "unreachable" },
+                    .match_fail = .{ .message = "reached unreachable code", .kind = .unreachable_reached },
                 });
             },
             .unwrap => |inner| {

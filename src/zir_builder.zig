@@ -7707,22 +7707,39 @@ pub const ZirDriver = struct {
                 try self.setLocal(mt.dest, ref);
             },
             .match_fail => |mf| {
-                // Emit @import("zap_runtime").Kernel.panic(message)
+                // Every unrecoverable abort routes through the unified Phase 2
+                // crash path — a `Kernel` sink that calls `crashReport` with a
+                // canonical kind plus a symbolized Zap backtrace (Phase 2.f
+                // GP1). The semantic class on the IR op selects the sink so
+                // the report's `** (<kind>)` header is correct: a non-matching
+                // `case`/clause set is `match_error`, while an explicit `panic`
+                // or `unreachable` is `runtime_error`. The older bare
+                // `Kernel.panic` (`panic:`+`exit(1)`, no backtrace) is retired.
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
 
                 const kernel = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.kernel);
                 if (kernel == error_ref) return error.EmitFailed;
 
-                const panic_fn = zir_builder_emit_field_val(self.handle, kernel, "panic", 5);
-                if (panic_fn == error_ref) return error.EmitFailed;
+                const sink_name: []const u8 = switch (mf.kind) {
+                    .match_clause => "match_fail",
+                    .panic, .unreachable_reached => "panic",
+                };
+                const sink_fn = zir_builder_emit_field_val(self.handle, kernel, sink_name.ptr, @intCast(sink_name.len));
+                if (sink_fn == error_ref) return error.EmitFailed;
 
-                const msg_ref = zir_builder_emit_str(self.handle, mf.message.ptr, @intCast(mf.message.len));
+                // `panic(msg)` carries a runtime message string in a local;
+                // forward it so the report shows the user's message. All other
+                // sites use the static IR message.
+                const msg_ref = if (mf.kind == .panic and mf.message_local != null)
+                    try self.refForLocal(mf.message_local.?)
+                else
+                    zir_builder_emit_str(self.handle, mf.message.ptr, @intCast(mf.message.len));
                 if (msg_ref == error_ref) return error.EmitFailed;
 
                 const args = [_]u32{msg_ref};
-                _ = zir_builder_emit_call_ref(self.handle, panic_fn, &args, 1);
-                // panic is noreturn — emit unreachable so Zig knows control never continues
+                _ = zir_builder_emit_call_ref(self.handle, sink_fn, &args, 1);
+                // The sink is noreturn — emit unreachable so Zig knows control never continues
                 _ = zir_builder_emit_unreachable(self.handle);
             },
             .match_error_return => {
@@ -8127,13 +8144,16 @@ pub const ZirDriver = struct {
                 defer then_insts.deinit(self.allocator);
                 then_insts.appendSliceAssumeCapacity(then_ptr[0..then_len]);
 
-                // Else branch: panic with message
+                // Else branch: abort on nil access through the unified crash
+                // path — @import("zap_runtime").Kernel.nil_access(message),
+                // which calls crashReport with the canonical `nil_error` kind
+                // plus a symbolized Zap backtrace (Phase 2.f GP1).
                 self.beginCapture();
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
                 const kernel = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.kernel);
                 if (kernel == error_ref) return error.EmitFailed;
-                const panic_fn = zir_builder_emit_field_val(self.handle, kernel, "panic", 5);
+                const panic_fn = zir_builder_emit_field_val(self.handle, kernel, "nil_access", 10);
                 if (panic_fn == error_ref) return error.EmitFailed;
                 const msg = "attempted to unwrap nil value";
                 const msg_ref = zir_builder_emit_str(self.handle, msg.ptr, @intCast(msg.len));

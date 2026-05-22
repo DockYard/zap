@@ -7737,15 +7737,20 @@ fn stripSymbolUnderscore(name: []const u8) []const u8 {
     return name;
 }
 
-/// True when a (underscore-stripped) mangled name is the runtime's `raise`
-/// plumbing — `Kernel.do_raise__N` or `Kernel.raise__N`. These Zap frames
-/// sit between the user's raising frame and the `:zig.` runtime entry; they
-/// are correct but noise, so the crash report suppresses them to begin at
-/// the user code that raised. Path-independent: the string `raise` goes
-/// through `Kernel.raise`, the Error form through `Kernel.do_raise`.
+/// True when a (underscore-stripped) mangled name is the runtime's abort
+/// plumbing — the `Kernel` sinks every unrecoverable abort funnels into on
+/// its way to `crashReport`: `Kernel.raise__N`/`Kernel.do_raise__N` (the
+/// `raise` string/Error forms), `Kernel.match_fail__N` (pattern-match
+/// exhaustion), `Kernel.nil_access__N` (nil-value use), and `Kernel.panic__N`
+/// (the generic sink). These Zap frames sit between the user's faulting frame
+/// and the `:zig.` runtime entry; they are correct but noise, so the crash
+/// report suppresses them to begin the trace at the genuine user frame.
 fn isRaisePlumbingSymbol(stripped_mangled: []const u8) bool {
     return std.mem.eql(u8, stripped_mangled, "Kernel.do_raise__1") or
-        std.mem.eql(u8, stripped_mangled, "Kernel.raise__1");
+        std.mem.eql(u8, stripped_mangled, "Kernel.raise__1") or
+        std.mem.eql(u8, stripped_mangled, "Kernel.match_fail__1") or
+        std.mem.eql(u8, stripped_mangled, "Kernel.nil_access__1") or
+        std.mem.eql(u8, stripped_mangled, "Kernel.panic__1");
 }
 
 /// True when a (underscore-stripped) linkage name belongs to the Phase 2.b
@@ -8449,8 +8454,14 @@ pub fn installZapCrashHandlers() void {
 // Kernel functions (spec §30.2)
 // ============================================================
 
+/// Module-level unrecoverable abort sink, kept for any caller that imports
+/// `@import("zap_runtime").panic` directly. Routes through the unified Phase 2
+/// crash printer with the canonical `runtime_error` kind — the legacy
+/// `NilError` (PascalCase) kind is retired in favor of the snake_case kind
+/// vocabulary shared by `raise`, contracts, and the `ZapPanic` handlers, so
+/// every abort path prints a consistent `** (<kind>) <message>` header.
 pub fn panic(message: []const u8) noreturn {
-    crashReport("NilError", message);
+    crashReport("runtime_error", message);
 }
 
 pub const Range = struct {
@@ -8545,11 +8556,35 @@ pub const Kernel = struct {
         }
     }
 
+    /// Generic unrecoverable abort sink. Routes through the unified Phase 2
+    /// crash printer (`crashReport`) with the canonical `runtime_error` kind,
+    /// so a bare panic prints the `** (runtime_error) <message>` header plus a
+    /// symbolized Zap backtrace — the SAME shape as `raise`, the contract
+    /// violations, and the root `panic`-namespace (`ZapPanic`) handlers. There
+    /// is no longer a bare `panic:`+`exit(1)` path that bypasses the crash
+    /// report; every unrecoverable abort goes through one path.
     pub fn panic(message: []const u8) noreturn {
-        stderrWriteFlushed("panic: ");
-        posixWrite(STDERR_FD, message);
-        posixWrite(STDERR_FD, "\n");
-        std.process.exit(1);
+        crashReport("runtime_error", message);
+    }
+
+    /// Unrecoverable abort for a pattern-match exhaustion — a `case`/function
+    /// clause set where no clause matched the scrutinee at runtime. The ZIR
+    /// builder lowers the `match_fail` IR op to a call of this sink, so an
+    /// unmatched `case` prints `** (match_error) <message>` plus a symbolized
+    /// Zap backtrace that begins at the user frame whose match failed.
+    /// `match_error` is the canonical kind for pattern-match exhaustion,
+    /// distinct from `nil_error` (nil access) and `runtime_error` (generic).
+    pub fn match_fail(message: []const u8) noreturn {
+        crashReport("match_error", message);
+    }
+
+    /// Unrecoverable abort for an attempt to use a nil value where a present
+    /// value was required — e.g. `?`-unwrapping an absent optional. The ZIR
+    /// builder lowers the nil-unwrap guard's else branch to a call of this
+    /// sink, so it prints `** (nil_error) <message>` plus a symbolized Zap
+    /// backtrace that begins at the user frame that touched the nil value.
+    pub fn nil_access(message: []const u8) noreturn {
+        crashReport("nil_error", message);
     }
 
     pub fn halt(message: []const u8) noreturn {
