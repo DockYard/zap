@@ -4,6 +4,7 @@ const scope = @import("scope.zig");
 const ast_data = @import("ast_data.zig");
 const ctfe = @import("ctfe.zig");
 const ir = @import("ir.zig");
+const frontend_policy = @import("frontend_policy.zig");
 
 // ============================================================
 // Macro engine
@@ -72,6 +73,15 @@ pub const MacroEngine = struct {
     /// the (struct_scope, hook_struct_name_id) pair so the same
     /// struct can register multiple distinct hooks.
     before_compile_fired: std.AutoHashMap(BeforeCompileKey, void),
+    /// The optimize mode of the compilation being expanded. Stamped onto
+    /// every `macro_eval.Env` the engine constructs so macro bodies can
+    /// read it through the comptime `optimize_mode()` intrinsic (the
+    /// three-tier contract macros in `Kernel` use this to elide their
+    /// guarded form per mode). Production callers in `src/compiler.zig`
+    /// set this from the compilation's `frontend_optimize_mode` via
+    /// `setOptimizeMode`; unit-test and other callers keep the `.debug`
+    /// default, which leaves every contract checked.
+    optimize_mode: frontend_policy.FrontendOptimizeMode = .debug,
 
     pub const Error = struct {
         message: []const u8,
@@ -92,11 +102,21 @@ pub const MacroEngine = struct {
             .errors = .empty,
             .compiled_executor = null,
             .before_compile_fired = std.AutoHashMap(BeforeCompileKey, void).init(allocator),
+            .optimize_mode = .debug,
         };
     }
 
     pub fn setCompiledExecutor(self: *MacroEngine, executor: *CompiledMacroExecutor) void {
         self.compiled_executor = executor;
+    }
+
+    /// Set the optimize mode propagated into every `macro_eval.Env`
+    /// this engine builds. Called once right after `init` by the
+    /// production macro-expansion entry points in `src/compiler.zig`,
+    /// so the comptime `optimize_mode()` intrinsic reports the build
+    /// mode the contract macros elide against.
+    pub fn setOptimizeMode(self: *MacroEngine, mode: frontend_policy.FrontendOptimizeMode) void {
+        self.optimize_mode = mode;
     }
 
     fn compiledProgram(self: *const MacroEngine) ?*const ir.Program {
@@ -628,6 +648,7 @@ pub const MacroEngine = struct {
         const macro_eval = @import("macro_eval.zig");
         var store = ctfe.AllocationStore{};
         var env = macro_eval.Env.init(self.allocator, &store);
+        env.optimize_mode = self.optimize_mode;
         defer env.deinit();
         env.compiled_program = self.compiledProgram();
         env.struct_ctx = .{
@@ -1589,6 +1610,7 @@ pub const MacroEngine = struct {
             const macro_eval = @import("macro_eval.zig");
             var store = ctfe.AllocationStore{};
             var env = macro_eval.Env.init(self.allocator, &store);
+            env.optimize_mode = self.optimize_mode;
             defer env.deinit();
             env.compiled_program = self.compiledProgram();
             // Wire struct context so struct attribute intrinsics can
@@ -2269,6 +2291,7 @@ pub const MacroEngine = struct {
         {
             const macro_eval = @import("macro_eval.zig");
             var env = macro_eval.Env.init(self.allocator, &store);
+            env.optimize_mode = self.optimize_mode;
             defer env.deinit();
             env.compiled_program = self.compiledProgram();
 
@@ -2570,6 +2593,7 @@ pub const MacroEngine = struct {
         // Phase 3: evaluator path
         const macro_eval = @import("macro_eval.zig");
         var env = macro_eval.Env.init(self.allocator, &store);
+        env.optimize_mode = self.optimize_mode;
         defer env.deinit();
         env.compiled_program = self.compiledProgram();
         // Wire struct context so struct attribute and other comptime
@@ -2690,6 +2714,7 @@ pub const MacroEngine = struct {
         // Non-template macro body — use the evaluator
         const macro_eval = @import("macro_eval.zig");
         var env = macro_eval.Env.init(self.allocator, &store);
+        env.optimize_mode = self.optimize_mode;
         defer env.deinit();
         env.compiled_program = self.compiledProgram();
 
@@ -2776,6 +2801,7 @@ pub const MacroEngine = struct {
         // Non-template macro body — use the evaluator
         const macro_eval = @import("macro_eval.zig");
         var env = macro_eval.Env.init(self.allocator, &store);
+        env.optimize_mode = self.optimize_mode;
         defer env.deinit();
         env.compiled_program = self.compiledProgram();
         env.struct_ctx = .{
