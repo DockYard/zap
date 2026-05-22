@@ -9468,11 +9468,22 @@ pub const IrBuilder = struct {
         if (expected_zig_type != .protocol_box) return value_local;
         const expected_protocol = expected_zig_type.protocol_box;
 
-        // Discover the value local's actual ZigType. Absent
-        // tracking — e.g. a primitive literal that bypassed
-        // `known_local_types` — leaves the box unemitted. Sema
-        // catches the mismatch (no concrete type to box).
-        const value_zig_type = self.known_local_types.get(value_local) orelse return value_local;
+        // Discover the value local's actual ZigType. When the value
+        // bypassed `known_local_types` (e.g. a cross-struct call argument
+        // whose local came from a `local_get`/`param_get` alias chain that
+        // tracked only the HIR type), recover the ZigType from the HIR-type
+        // map. This is what lets `Demo.walk(outer)` see that `outer`'s value
+        // is already a `protocol_box` (so no re-box) or a concrete struct
+        // (so it can be boxed) instead of silently bailing. The recovered
+        // ZigType is also recorded back so downstream emission sees a
+        // consistent box type for the local.
+        const value_zig_type = self.known_local_types.get(value_local) orelse blk: {
+            const hir_type = self.local_hir_types.get(value_local) orelse return value_local;
+            const recovered = typeIdToZigTypeWithStore(hir_type, self.type_store);
+            if (recovered == .any) return value_local;
+            try self.known_local_types.put(value_local, recovered);
+            break :blk recovered;
+        };
 
         // Path 2: already a protocol box (possibly from an upstream
         // coercion or a parameter typed as `Foo` where Foo is a
