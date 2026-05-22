@@ -60,6 +60,20 @@ pub const NodeMeta = struct {
     pub fn primaryScope(self: NodeMeta) ?scope_mod.ScopeId {
         return self.scopes.primary();
     }
+
+    /// The span to attribute this node to in user-facing debug output
+    /// (DWARF line entries, crash-report backtraces). For a source-level
+    /// node this is its own `span`. For a macro-expanded node it is the
+    /// OUTERMOST macro call site — the place in user source where the
+    /// (possibly nested) macro invocation was written — so a backtrace
+    /// frame inside macro-generated code points at the user's call, not
+    /// the macro template body in `kernel.zap`. This mirrors how Rust's
+    /// `#[track_caller]` and Elixir's macro location handling attribute
+    /// expanded code to its invocation site.
+    pub fn debugSpan(self: NodeMeta) SourceSpan {
+        const info = self.expansion orelse return self.span;
+        return info.outermostCallSite();
+    }
 };
 
 /// Reference to a source-level binding that was substituted away by a
@@ -109,6 +123,18 @@ pub const ExpansionInfo = struct {
     /// Parent expansion frame for nested macros. Null for an expansion
     /// triggered from user source (the outermost frame).
     parent: ?*const ExpansionInfo = null,
+
+    /// Walk the `parent` chain to the outermost expansion frame and return
+    /// its `call_site` — the span in genuine user source where the macro
+    /// invocation was written. For a single-level expansion this is just
+    /// `self.call_site`; for a macro that expanded into another macro it is
+    /// the user-source call of the outermost macro. This is the span debug
+    /// output should attribute expanded nodes to.
+    pub fn outermostCallSite(self: *const ExpansionInfo) SourceSpan {
+        var frame: *const ExpansionInfo = self;
+        while (frame.parent) |parent_frame| frame = parent_frame;
+        return frame.call_site;
+    }
 };
 
 pub fn makeMeta(span: SourceSpan) NodeMeta {

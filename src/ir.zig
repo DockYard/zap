@@ -8167,10 +8167,18 @@ pub const IrBuilder = struct {
     /// once at the ZIR boundary keeps every IR-level analysis pass
     /// agnostic to the distinction.
     fn emitDbgStmtForStmt(self: *IrBuilder, stmt: hir_mod.Stmt) !void {
+        // Use the driving expr's *debug* span, which resolves through any
+        // macro expansion to the user's call site (Phase 2.f GP2). Without
+        // this, a statement synthesized by a macro (e.g. the `case` an
+        // `assert`/`precondition` expands to) would stamp its DWARF line at
+        // the macro template body in kernel.zap, so the crash-report frame
+        // for the user's function pointed there instead of at the user's
+        // `assert(...)` call. `debugSpan` is the identity for source-level
+        // statements (the common case).
         const span: ast.SourceSpan = switch (stmt) {
-            .expr => |expr| expr.span,
-            .local_set => |ls| ls.value.span,
-            .defer_stmt => |defer_node| defer_node.expr.span,
+            .expr => |expr| expr.debugSpan(),
+            .local_set => |ls| ls.value.debugSpan(),
+            .defer_stmt => |defer_node| defer_node.expr.debugSpan(),
             .function_group => return,
         };
         // The lexer emits 1-based line/column, the existing IR

@@ -172,6 +172,22 @@ pub const Expr = struct {
     kind: ExprKind,
     type_id: TypeId,
     span: ast.SourceSpan,
+    /// Macro-expansion provenance carried over from the AST node's
+    /// `NodeMeta.expansion` (null for source-level nodes — the common
+    /// case). Diagnostic-only: lowering uses it solely to attribute a
+    /// macro-expanded node's DWARF line entry to the user's macro call
+    /// site (Phase 2.f GP2) instead of the macro template body, so a
+    /// crash-report frame inside expanded code points at user source.
+    expansion: ?*const ast.ExpansionInfo = null,
+
+    /// The span to attribute this expr to in user-facing debug output
+    /// (DWARF line entries / backtraces). Resolves through any macro
+    /// expansion to the outermost user call site; otherwise the expr's
+    /// own span. Mirrors `ast.NodeMeta.debugSpan`.
+    pub fn debugSpan(self: Expr) ast.SourceSpan {
+        const info = self.expansion orelse return self.span;
+        return info.outermostCallSite();
+    }
 };
 
 pub const ExprKind = union(enum) {
@@ -4823,7 +4839,28 @@ pub const HirBuilder = struct {
     // Expression building
     // ============================================================
 
+    /// Build a HIR `Expr` from an AST `Expr`, then carry over the AST
+    /// node's macro-expansion provenance (Phase 2.f GP2). The provenance
+    /// is the only thing the dispatch below does not thread through; it is
+    /// stamped here, at the single `buildExpr` chokepoint, so every HIR
+    /// node produced from a macro-expanded AST node knows its user call
+    /// site for debug-line attribution. The `@constCast` is sound: every
+    /// arm of `buildExprDispatch` returns a node freshly allocated by
+    /// `self.create` in this single-pass builder (HIR is built once, not
+    /// shared/cached), so we own the node we are stamping; we only set the
+    /// field when the source AST node actually carries expansion info and
+    /// the built node has not already been stamped by a deeper expansion.
     fn buildExpr(self: *HirBuilder, expr: *const ast.Expr) anyerror!*const Expr {
+        const built = try self.buildExprDispatch(expr);
+        if (expr.getMeta().expansion) |info| {
+            if (built.expansion == null) {
+                @constCast(built).expansion = info;
+            }
+        }
+        return built;
+    }
+
+    fn buildExprDispatch(self: *HirBuilder, expr: *const ast.Expr) anyerror!*const Expr {
         return switch (expr.*) {
             .int_literal => |v| try self.create(Expr, .{
                 .kind = .{ .int_lit = v.value },
