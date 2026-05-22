@@ -447,6 +447,34 @@ fn substituteInExpr(
             new_expr.* = .{ .raise_expr = .{ .meta = re.meta, .value = new_value } };
             return new_expr;
         },
+        .try_rescue => |tr| {
+            const new_body = try substituteInStmts(alloc, tr.body, func_attrs, mod_attrs, interner, errors);
+            var new_clauses: std.ArrayListUnmanaged(ast.CaseClause) = .empty;
+            var changed = !stmtsUnchanged(tr.body, new_body);
+            for (tr.rescue_clauses) |clause| {
+                const new_guard = if (clause.guard) |g|
+                    try substituteInExpr(alloc, g, func_attrs, mod_attrs, interner, errors)
+                else
+                    null;
+                const new_clause_body = try substituteInStmts(alloc, clause.body, func_attrs, mod_attrs, interner, errors);
+                if (new_guard != clause.guard or !stmtsUnchanged(clause.body, new_clause_body)) changed = true;
+                var new_clause = clause;
+                new_clause.guard = new_guard;
+                new_clause.body = new_clause_body;
+                try new_clauses.append(alloc, new_clause);
+            }
+            const new_after = if (tr.after_block) |cleanup|
+                try substituteInStmts(alloc, cleanup, func_attrs, mod_attrs, interner, errors)
+            else
+                null;
+            if (tr.after_block) |cleanup| {
+                if (!stmtsUnchanged(cleanup, new_after.?)) changed = true;
+            }
+            if (!changed) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .try_rescue = .{ .meta = tr.meta, .body = new_body, .rescue_clauses = try new_clauses.toOwnedSlice(alloc), .after_block = new_after } };
+            return new_expr;
+        },
         // Leaf expressions — no substitution needed
         .int_literal,
         .float_literal,

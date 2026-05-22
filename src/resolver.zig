@@ -386,6 +386,16 @@ pub const Resolver = struct {
                 }
             },
             .try_expr => |te| try self.resolveExpr(te.value),
+            .try_rescue => |tr| {
+                for (tr.body) |stmt| try self.resolveStmt(stmt);
+                for (tr.rescue_clauses) |clause| {
+                    if (clause.guard) |g| try self.resolveExpr(g);
+                    for (clause.body) |stmt| try self.resolveStmt(stmt);
+                }
+                if (tr.after_block) |cleanup| {
+                    for (cleanup) |stmt| try self.resolveStmt(stmt);
+                }
+            },
             .for_expr => |fe| {
                 try self.resolveExpr(fe.iterable);
                 if (fe.filter) |f| try self.resolveExpr(f);

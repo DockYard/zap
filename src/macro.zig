@@ -1270,6 +1270,45 @@ pub const MacroEngine = struct {
                 };
             },
 
+            .try_rescue => |tr| {
+                var changed = false;
+                const body_exp = try self.expandBlock(tr.body);
+                if (body_exp.changed) changed = true;
+
+                var new_clauses: std.ArrayList(ast.CaseClause) = .empty;
+                for (tr.rescue_clauses) |clause| {
+                    const clause_body_exp = try self.expandBlock(clause.body);
+                    if (clause_body_exp.changed) changed = true;
+                    try new_clauses.append(self.allocator, .{
+                        .meta = clause.meta,
+                        .pattern = clause.pattern,
+                        .type_annotation = clause.type_annotation,
+                        .guard = clause.guard,
+                        .body = clause_body_exp.stmts,
+                    });
+                }
+
+                var new_after: ?[]const ast.Stmt = null;
+                if (tr.after_block) |cleanup| {
+                    const after_exp = try self.expandBlock(cleanup);
+                    if (after_exp.changed) changed = true;
+                    new_after = after_exp.stmts;
+                }
+
+                if (!changed) return .{ .expr = expr, .changed = false };
+                return .{
+                    .expr = try self.create(ast.Expr, .{
+                        .try_rescue = .{
+                            .meta = tr.meta,
+                            .body = body_exp.stmts,
+                            .rescue_clauses = try new_clauses.toOwnedSlice(self.allocator),
+                            .after_block = new_after,
+                        },
+                    }),
+                    .changed = true,
+                };
+            },
+
             .raise_expr => |re| {
                 const inner = try self.expandExpr(re.value);
                 if (!inner.changed) return .{ .expr = expr, .changed = false };
@@ -3266,6 +3305,14 @@ fn stampExpansionOnExpr(expr: *const ast.Expr, info: *const ast.ExpansionInfo) v
         .try_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
             stampExpansionOnExpr(v.value, info);
+        },
+        .try_rescue => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.body) |stmt| stampExpansionOnStmt(stmt, info);
+            for (v.rescue_clauses) |*clause| stampExpansionOnCaseClause(clause, info);
+            if (v.after_block) |after_block| {
+                for (after_block) |stmt| stampExpansionOnStmt(stmt, info);
+            }
         },
         .if_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);

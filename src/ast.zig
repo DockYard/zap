@@ -759,6 +759,7 @@ pub const Expr = union(enum) {
     raise_expr: RaiseExpr,
     error_pipe: ErrorPipeExpr,
     try_expr: TryExpr,
+    try_rescue: TryRescueExpr,
 
     // Block
     block: BlockExpr,
@@ -815,6 +816,7 @@ pub const Expr = union(enum) {
             .raise_expr => |v| v.meta,
             .error_pipe => |v| v.meta,
             .try_expr => |v| v.meta,
+            .try_rescue => |v| v.meta,
             .block => |v| v.meta,
             .intrinsic => |v| v.meta,
             .attr_ref => |v| v.meta,
@@ -1134,6 +1136,31 @@ pub const PanicExpr = struct {
 pub const RaiseExpr = struct {
     meta: NodeMeta,
     value: *const Expr,
+};
+
+/// The `try { … } rescue { pat -> … } after { … }` recoverable-error
+/// handler (Phase 3.a).
+///
+/// `try` introduces a dynamic handler scope: a `raise` whose dynamic
+/// extent is enclosed by this expression unwinds to the `rescue` arms
+/// (the effect handler) instead of aborting via `crashReport`. The
+/// `rescue` arms are exhaustiveness-checked pattern→body clauses on the
+/// raised `Error` value — they reuse `CaseClause` so the `e :: IOError`
+/// type-binding, `%IOError{kind: :x}` struct-pattern, and `_` wildcard
+/// forms are parsed by the same machinery as `case`. `after` is optional
+/// finally-semantics: it runs unconditionally on the normal-completion,
+/// rescued, and re-raise/propagate edges (lowered through the Phase 2.d
+/// `defer_stack`, ARC-correct on every edge).
+///
+/// The expression's type is the join of the `try` body's success type
+/// and the `rescue` clause result types. Error types covered by a
+/// `rescue` arm are discharged from the enclosing function's `raises`
+/// row; uncovered raises propagate.
+pub const TryRescueExpr = struct {
+    meta: NodeMeta,
+    body: []const Stmt,
+    rescue_clauses: []const CaseClause,
+    after_block: ?[]const Stmt,
 };
 
 pub const BlockExpr = struct {

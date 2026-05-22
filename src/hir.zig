@@ -251,9 +251,42 @@ pub const ExprKind = union(enum) {
     /// where a `ret` terminator is legal.
     try_project: TryProjectHir,
 
+    /// The `try { body } rescue { pat -> … } after { … }` recoverable-error
+    /// handler (Phase 3.a). Lowered in the IR builder by reusing the
+    /// error-union/handler machinery: the `body` runs with a dynamic
+    /// handler scope active, so a `raise` inside it (or in a callee whose
+    /// raised error reaches here) is caught here instead of aborting. The
+    /// `arms` are the rescue handler — a pattern-match (`case`) on the
+    /// raised `Error` value. `after` is finally-semantics: it runs on every
+    /// edge (normal completion, rescued, re-raise) via the `defer_stack`.
+    try_rescue: TryRescueHir,
+
     // Special
     closure_create: ClosureCreate,
     never,
+};
+
+pub const TryRescueHir = struct {
+    /// The `try` body, lowered as a block. Its `raise` sites are
+    /// recoverable (they unwind to `arms`).
+    body: *const Block,
+    /// The rescue handler arms — a pattern-match on the raised `Error`
+    /// value. Reuses `CaseArm` so struct-pattern / type-binding / wildcard
+    /// rescue clauses lower identically to `case` arms.
+    arms: []const CaseArm,
+    /// Local that holds the raised `Error` value the arms match against.
+    /// The IR lowering binds the result of `take_raise_call` to this local
+    /// in the handler branch before dispatching to `arms`.
+    error_local: u32,
+    /// Pre-built `Kernel.raise_occurred()` call (lowered HIR). The IR tests
+    /// this after the body to choose the handler branch vs the body value.
+    raise_occurred_call: *const Expr,
+    /// Pre-built `Kernel.take_recoverable_raise()` call (lowered HIR). The
+    /// IR binds its result to `error_local` at the head of the handler
+    /// branch (reads + clears the runtime raise side-channel).
+    take_raise_call: *const Expr,
+    /// The optional `after` cleanup block (finally-semantics).
+    after_block: ?*const Block,
 };
 
 pub const UnionInitExpr = struct {
@@ -2464,6 +2497,13 @@ pub const HirBuilder = struct {
     /// first-class `Type`/`Function` values that name target-source structs
     /// before those sources are loaded.
     allow_external_static_references: bool = false,
+    /// Lexical nesting depth of enclosing `try { … } rescue { … }` bodies
+    /// (Phase 3.a). When `> 0`, a `raise %E{}` lowered inside the `try`
+    /// body takes the *recoverable* path — it unwinds to the enclosing
+    /// `rescue` handler via the error-union/handler mechanism — instead of
+    /// the Phase 1.4/2 `Kernel.do_raise` abort. Saved/restored around each
+    /// `try` body in `buildExpr`, mirroring the `defer_stack` discipline.
+    try_scope_depth: u32 = 0,
     /// Stack of expected types active around the *current* expression
     /// being lowered. Used for context-driven inference of parametric
     /// struct/union literals: when `%Box{...}` appears with no
@@ -5536,6 +5576,9 @@ pub const HirBuilder = struct {
             .try_expr => |te| {
                 return try self.buildTryProject(te);
             },
+            .try_rescue => |tr| {
+                return try self.buildTryRescue(tr);
+            },
             .panic_expr => |pe| try self.create(Expr, .{
                 .kind = .{ .panic = try self.buildExpr(pe.message) },
                 .type_id = types_mod.TypeStore.NEVER,
@@ -5552,6 +5595,22 @@ pub const HirBuilder = struct {
                 // call to a `Never` function is the diverging terminator —
                 // Zig sees it as noreturn, so no explicit unreachable is
                 // needed.
+                //
+                // Phase 3.a: when this `raise` is lexically inside a
+                // `try { … } rescue { … }` body (`try_scope_depth > 0`),
+                // route it to the *recoverable* sink `Kernel.recoverable_raise`
+                // instead of `do_raise`. That sink stashes the boxed `Error`
+                // value into the runtime's raise side-channel and unwinds to
+                // the nearest dynamically-enclosing `try` handler (the
+                // `setjmp`/`longjmp` landing pad the IR emits at the `try`
+                // site) rather than aborting via `crashReport`. Outside any
+                // handler scope the original `do_raise` abort path is kept,
+                // so an unhandled `raise` still produces the Phase 2 report.
+                if (self.try_scope_depth > 0) {
+                    if (try self.buildRecoverableRaise(re)) |recoverable| {
+                        return recoverable;
+                    }
+                }
                 return try self.buildExpr(re.value);
             },
             .tuple => |t| {
@@ -6068,6 +6127,143 @@ pub const HirBuilder = struct {
     /// The Ok/Error variant names are discovered structurally from the
     /// resolved tagged union rather than hardcoded, so the lowering does
     /// not bake any stdlib `Result` knowledge into the compiler.
+    /// Build a `try { body } rescue { pat -> … } after { … }` handler
+    /// (Phase 3.a). The `body` lowers with `try_scope_depth` incremented so
+    /// any `raise %E{}` inside it takes the recoverable path (unwinds to the
+    /// rescue handler) rather than aborting. The rescue arms reuse the
+    /// `case`-arm machinery, matching against `error_local` — the local that
+    /// the IR lowering binds the unwound `Error` value to.
+    fn buildTryRescue(self: *HirBuilder, tr: ast.TryRescueExpr) anyerror!*const Expr {
+        // Allocate the local that holds the raised Error value inside the
+        // rescue arms.
+        const error_local = self.next_local;
+        self.next_local += 1;
+
+        // Build the `try` body with the handler scope active.
+        self.try_scope_depth += 1;
+        const body = try self.buildBlock(tr.body);
+        self.try_scope_depth -= 1;
+
+        // Build the rescue arms. They pattern-match the raised Error value
+        // (bound to `error_local`). This mirrors the `case_expr` lowering:
+        // each arm gets its own pattern bindings, scoped guard+body, and a
+        // snapshot of just-this-arm's bindings.
+        var arms: std.ArrayList(CaseArm) = .empty;
+        for (tr.rescue_clauses) |clause| {
+            const start_idx = self.current_case_bindings.items.len;
+            const pattern = try self.compilePattern(clause.pattern);
+            if (pattern) |pat| {
+                try self.collectCasePatternBindings(pat, true);
+            }
+
+            const saved_clause_scope = self.current_clause_scope;
+            if (self.graph.resolveClauseScope(clause.meta)) |cs| {
+                self.current_clause_scope = cs;
+            }
+            const guard_expr = if (clause.guard) |g| try self.buildExpr(g) else null;
+            const arm_body = try self.buildBlock(clause.body);
+            self.current_clause_scope = saved_clause_scope;
+
+            const clause_slice = self.current_case_bindings.items[start_idx..];
+            const bindings = try self.allocator.dupe(CaseBinding, clause_slice);
+            try arms.append(self.allocator, .{
+                .pattern = pattern,
+                .guard = guard_expr,
+                .body = arm_body,
+                .bindings = bindings,
+            });
+            self.current_case_bindings.shrinkRetainingCapacity(start_idx);
+        }
+        const arm_slice = try arms.toOwnedSlice(self.allocator);
+
+        // Build the optional `after` (finally) block.
+        const after_block: ?*const Block = if (tr.after_block) |cleanup|
+            try self.buildBlock(cleanup)
+        else
+            null;
+
+        // Pre-build the runtime landing-pad calls: `Kernel.raise_occurred()`
+        // (the body-vs-handler discriminator) and `Kernel.take_recoverable_raise()`
+        // (recovers + clears the side-channel Error value for the arms).
+        const raise_occurred_call = try self.buildKernelZeroArgCall("raise_occurred", tr.meta);
+        const take_raise_call = try self.buildKernelZeroArgCall("take_recoverable_raise", tr.meta);
+
+        // The result type is the join of the body's success type and the
+        // rescue arms' result types (computed the same way `case` does).
+        var result_type: types_mod.TypeId = body.result_type;
+        for (arm_slice) |arm| {
+            const t = arm.body.result_type;
+            if (t == types_mod.TypeStore.UNKNOWN) continue;
+            if (result_type == types_mod.TypeStore.UNKNOWN) {
+                result_type = t;
+                continue;
+            }
+            if (result_type != t) {
+                result_type = types_mod.TypeStore.UNKNOWN;
+                break;
+            }
+        }
+
+        return try self.create(Expr, .{
+            .kind = .{ .try_rescue = .{
+                .body = body,
+                .arms = arm_slice,
+                .error_local = error_local,
+                .raise_occurred_call = raise_occurred_call,
+                .take_raise_call = take_raise_call,
+                .after_block = after_block,
+            } },
+            .type_id = result_type,
+            .span = tr.meta.span,
+        });
+    }
+
+    /// Build and lower a zero-argument `Kernel.<name>()` call to HIR. Used
+    /// to synthesize the `try`/`rescue` landing-pad helper calls
+    /// (`raise_occurred`, `take_recoverable_raise`) without re-running the
+    /// desugar pass.
+    fn buildKernelZeroArgCall(self: *HirBuilder, name: []const u8, meta: ast.NodeMeta) anyerror!*const Expr {
+        const interner_mut = @constCast(self.interner);
+        const kernel_name = try interner_mut.intern("Kernel");
+        const fn_name = try interner_mut.intern(name);
+        const kernel_parts = try self.allocator.dupe(ast.StringId, &.{kernel_name});
+        const kernel_ref = try self.create(ast.Expr, .{
+            .struct_ref = .{ .meta = meta, .name = .{ .parts = kernel_parts, .span = meta.span } },
+        });
+        const callee = try self.create(ast.Expr, .{
+            .field_access = .{ .meta = meta, .object = kernel_ref, .field = fn_name },
+        });
+        const call_expr = try self.create(ast.Expr, .{
+            .call = .{ .meta = meta, .callee = callee, .args = &.{} },
+        });
+        return try self.buildExpr(call_expr);
+    }
+
+    /// Rebuild a `raise`'s lowered `Kernel.do_raise(<error>)` call as the
+    /// recoverable sink `Kernel.recoverable_raise(<error>)` and lower it to
+    /// HIR. Used by the `raise_expr` arm when inside a `try` handler scope.
+    /// Returns `null` when the `raise_expr` value is not in the expected
+    /// `Kernel.do_raise(arg)` shape (defensive — the desugar always produces
+    /// it), so the caller falls back to the abort lowering.
+    fn buildRecoverableRaise(self: *HirBuilder, re: ast.RaiseExpr) anyerror!?*const Expr {
+        if (re.value.* != .call) return null;
+        const call = re.value.call;
+        if (call.callee.* != .field_access) return null;
+        const fa = call.callee.field_access;
+        if (call.args.len != 1) return null;
+
+        const interner_mut = @constCast(self.interner);
+        const recoverable_name = try interner_mut.intern("recoverable_raise");
+
+        const new_callee = try self.create(ast.Expr, .{
+            .field_access = .{ .meta = fa.meta, .object = fa.object, .field = recoverable_name },
+        });
+        const new_call = try self.create(ast.Expr, .{
+            .call = .{ .meta = call.meta, .callee = new_callee, .args = call.args },
+        });
+        return try self.buildExpr(new_call);
+    }
+
     fn buildTryProject(self: *HirBuilder, te: ast.TryExpr) anyerror!*const Expr {
         const operand = try self.buildExpr(te.value);
 

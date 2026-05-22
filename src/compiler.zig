@@ -5187,6 +5187,25 @@ fn findUndesugaredMacroFormInExpr(expr: *const ast.Expr) ?UndesugaredMacroForm {
         .anonymous_function => |anonymous| findUndesugaredMacroFormInFunction(anonymous.decl),
         .list_cons_expr => |list_cons| findUndesugaredMacroFormInExpr(list_cons.head) orelse findUndesugaredMacroFormInExpr(list_cons.tail),
         .error_pipe => |error_pipe| findUndesugaredMacroFormInErrorPipeChain(error_pipe.chain) orelse findUndesugaredMacroFormInErrorHandler(error_pipe.handler),
+        .try_rescue => |try_rescue| blk: {
+            for (try_rescue.body) |stmt| {
+                if (findUndesugaredMacroFormInStmt(stmt)) |form| break :blk form;
+            }
+            for (try_rescue.rescue_clauses) |clause| {
+                if (clause.guard) |guard| {
+                    if (findUndesugaredMacroFormInExpr(guard)) |form| break :blk form;
+                }
+                for (clause.body) |stmt| {
+                    if (findUndesugaredMacroFormInStmt(stmt)) |form| break :blk form;
+                }
+            }
+            if (try_rescue.after_block) |cleanup| {
+                for (cleanup) |stmt| {
+                    if (findUndesugaredMacroFormInStmt(stmt)) |form| break :blk form;
+                }
+            }
+            break :blk null;
+        },
         else => null,
     };
 }
@@ -10956,6 +10975,24 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
             mutable.* = te.value.*;
             try remapExpr(alloc, mutable, remap);
             te.value = mutable;
+        },
+        .try_rescue => |*tr| {
+            // Remap the body, every rescue clause (pattern + type_annotation +
+            // guard + body — `remapCaseClause` handles the StringId-bearing
+            // fields, the canonical multi-unit interner gotcha), and the
+            // optional `after` block.
+            try remapStmtSlice(alloc, &tr.body, remap);
+            if (tr.rescue_clauses.len > 0) {
+                const mutable_clauses = try alloc.alloc(ast.CaseClause, tr.rescue_clauses.len);
+                for (tr.rescue_clauses, 0..) |c, i| {
+                    mutable_clauses[i] = c;
+                    try remapCaseClause(alloc, &mutable_clauses[i], remap);
+                }
+                tr.rescue_clauses = mutable_clauses;
+            }
+            if (tr.after_block) |*cleanup| {
+                try remapStmtSlice(alloc, cleanup, remap);
+            }
         },
         .if_expr => |*ie| {
             const mutable_cond = try alloc.create(ast.Expr);

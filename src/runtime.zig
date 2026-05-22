@@ -846,6 +846,26 @@ pub const ProtocolBox = extern struct {
     }
 };
 
+/// Thread-local raise side-channel (Phase 3.a). `Kernel.recoverable_raise`
+/// stashes the raised `Error` value (a `ProtocolBox` fat pointer) here, then
+/// the IR `try_rescue` lowering emits an `error.ZapRaise` return that unwinds
+/// to the nearest enclosing `try` handler; that handler's landing pad calls
+/// `Kernel.take_recoverable_raise` to read the value back and pattern-match it
+/// against the `rescue` arms. Thread-local because each thread unwinds its own
+/// stack independently; one slot suffices because the effect is one-shot
+/// abortive — a single in-flight raise per thread between the `recoverable_raise`
+/// and the catching handler. Reset to `none` on take so a stale value never
+/// leaks into a sibling `try`.
+threadlocal var current_recoverable_raise: ProtocolBox = ProtocolBox.none;
+
+/// Companion pending-flag for `current_recoverable_raise` (Phase 3.a). Set by
+/// `Kernel.recoverable_raise` when a `raise` fires inside a `try` body, tested
+/// by the handler landing pad via `Kernel.raise_occurred`, and cleared by
+/// `Kernel.take_recoverable_raise`. A separate flag (rather than testing the
+/// box for `none`) keeps the "a raise happened" signal unambiguous even if a
+/// future error value is legitimately the absent box.
+threadlocal var current_recoverable_raise_pending: bool = false;
+
 comptime {
     // Layout invariants. The runtime ABI for protocol existentials
     // is a fat pointer — two opaque pointers, no padding, no
@@ -8744,6 +8764,49 @@ pub const Kernel = struct {
     /// nothing on the happy path — it runs only here, on the abort path.
     pub fn raise_with_kind(kind: []const u8, message: []const u8) noreturn {
         crashReport(kind, message);
+    }
+
+    /// Recoverable-raise sink backing `Kernel.recoverable_raise/1` (Phase
+    /// 3.a) — the catchable counterpart of `do_raise`/`raise_with_kind`.
+    ///
+    /// Stashes the raised `Error` value (a `ProtocolBox` fat pointer — the
+    /// boxed existential the monomorphizer passes for an `Error`-typed
+    /// argument) into the thread-local raise side-channel, where the
+    /// enclosing `try` handler's landing pad reads it back. It does NOT
+    /// abort: control transfers to the handler via the Zig error-union the
+    /// IR `try_rescue` lowering emits at the call site (a `ret_error` of
+    /// `error.ZapRaise` from the synthesized try-body region). This
+    /// function only performs the side-channel stash; the actual non-local
+    /// exit is the `ret_error` the IR emits immediately after the call.
+    ///
+    /// Returns `void` (not `noreturn`): unlike `do_raise`, the diverging
+    /// behavior lives in the IR-emitted error-return, not in this runtime
+    /// helper, so it can run, store the value, and let the emitted
+    /// `ret_error` perform the unwind.
+    pub fn recoverable_raise(error_box: ProtocolBox) void {
+        current_recoverable_raise = error_box;
+        current_recoverable_raise_pending = true;
+    }
+
+    /// True iff a `recoverable_raise` has fired in the dynamic extent of the
+    /// current `try` body and has not yet been consumed by a handler. The
+    /// `try` handler's landing pad (the `if` the HIR `try_rescue` lowering
+    /// emits right after the body) tests this to decide whether to run the
+    /// `rescue` arms (a raise occurred) or yield the body's normal value.
+    pub fn raise_occurred() bool {
+        return current_recoverable_raise_pending;
+    }
+
+    /// Read and clear the thread-local raise side-channel. Called from the
+    /// `try` handler's landing pad to recover the `Error` value an enclosed
+    /// `recoverable_raise` stashed, then pattern-match it against the
+    /// `rescue` arms. Clears both the value and the pending flag so a stale
+    /// raise never leaks into a sibling `try` or a subsequent handler.
+    pub fn take_recoverable_raise() ProtocolBox {
+        const box = current_recoverable_raise;
+        current_recoverable_raise = ProtocolBox.none;
+        current_recoverable_raise_pending = false;
+        return box;
     }
 
     // Operator primitives backing the generic `pub fn ==`/`!=`/`<`/`>`/

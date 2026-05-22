@@ -3087,6 +3087,16 @@ pub const Parser = struct {
                 if (self.current.isRaiseIdent(self.source) and tokenStartsRaiseValue(self.peekNext())) {
                     return self.parseRaiseExpr();
                 }
+                // `try` is a contextual keyword (Phase 3.a). It opens a
+                // recoverable-error handler scope only in the
+                // `try { … } rescue { … }` shape — i.e. when immediately
+                // followed by a `{` block. A bare `try` not followed by `{`
+                // (or `try.field`, `try(…)`) keeps its identifier reading so
+                // `try_parse`-style names and any local named `try` are
+                // unaffected.
+                if (self.current.isTryIdent(self.source) and self.peekNext() == .left_brace) {
+                    return self.parseTryRescueExpr();
+                }
                 return self.parseVarRef();
             },
             .type_identifier => return self.parseStructRefExpr(),
@@ -4108,6 +4118,90 @@ pub const Parser = struct {
             .cond_expr = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
                 .clauses = try clauses.toOwnedSlice(self.allocator),
+            },
+        });
+    }
+
+    /// Parse `try { <body> } rescue { <pat> -> <expr> … } after { <cleanup> }`
+    /// (Phase 3.a). The contextual-keyword dispatch in `parsePrimaryExpr` has
+    /// already confirmed the current token is the identifier `try` followed by
+    /// `{`. `rescue` is required; `after` is optional. Rescue arms reuse
+    /// `parseCaseClause`, so `e :: IOError`, `%IOError{kind: :x}`, and `_`
+    /// forms parse identically to `case` arms.
+    fn parseTryRescueExpr(self: *Parser) !*const ast.Expr {
+        const start = self.currentSpan();
+        _ = self.advance(); // consume the `try` identifier
+
+        // try body block
+        _ = try self.expect(.left_brace);
+        self.skipNewlines();
+        const body = try self.parseBlock();
+        self.skipNewlines();
+        _ = try self.expect(.right_brace);
+
+        // Required `rescue { <clauses> }`. The `rescue` reading is
+        // unambiguous here: it is the only construct that may immediately
+        // follow a `try` block.
+        self.skipNewlinesForContinuation(.identifier);
+        if (!(self.current.isRescueIdent(self.source))) {
+            try self.addRichError(
+                "`try` requires a `rescue` block",
+                self.currentSpan(),
+                "a `try { … }` block must be followed by `rescue { pattern -> … }`",
+                "add a `rescue { … }` handler after the `try` block",
+            );
+            return error.ParseError;
+        }
+        _ = self.advance(); // consume the `rescue` identifier
+        _ = try self.expect(.left_brace);
+        self.skipNewlines();
+
+        var rescue_clauses: std.ArrayList(ast.CaseClause) = .empty;
+        while (!self.check(.right_brace) and !self.check(.eof)) {
+            self.skipNewlines();
+            if (self.check(.right_brace)) break;
+            const clause = try self.parseCaseClause();
+            try rescue_clauses.append(self.allocator, clause);
+            self.skipNewlines();
+        }
+        self.skipNewlines();
+        _ = try self.expect(.right_brace);
+
+        // Optional `after { <cleanup> }` (finally semantics). Look across a
+        // newline continuation, but only commit if the identifier is exactly
+        // `after` followed by `{`. `skipNewlinesForContinuation` rewinds the
+        // lexer when no identifier follows; we additionally rewind by
+        // saving/restoring lexer state when the identifier is not `after {`,
+        // so an unrelated next-line statement is never consumed.
+        var after_block: ?[]const ast.Stmt = null;
+        {
+            const saved_lexer = self.lexer;
+            const saved_current = self.current;
+            const saved_previous = self.previous;
+            self.skipNewlinesForContinuation(.identifier);
+            if (self.current.isAfterIdent(self.source) and self.peekNext() == .left_brace) {
+                _ = self.advance(); // consume the `after` identifier
+                _ = try self.expect(.left_brace);
+                self.skipNewlines();
+                const cleanup = try self.parseBlock();
+                self.skipNewlines();
+                _ = try self.expect(.right_brace);
+                after_block = cleanup;
+            } else {
+                // Not an `after` block — restore so the following construct
+                // (a new statement on the next line) parses normally.
+                self.lexer = saved_lexer;
+                self.current = saved_current;
+                self.previous = saved_previous;
+            }
+        }
+
+        return self.create(ast.Expr, .{
+            .try_rescue = .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .body = body,
+                .rescue_clauses = try rescue_clauses.toOwnedSlice(self.allocator),
+                .after_block = after_block,
             },
         });
     }

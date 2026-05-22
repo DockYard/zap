@@ -185,6 +185,15 @@ const Linter = struct {
             .type_annotated => |ta| try self.lintExpr(ta.expr, is_public),
             .panic_expr => |pe| try self.lintExpr(pe.message, is_public),
             .try_expr => |te| try self.lintExpr(te.value, is_public),
+            .try_rescue => |tr| {
+                try self.lintBlock(tr.body, is_public);
+                for (tr.rescue_clauses) |clause| {
+                    try self.lintBlock(clause.body, is_public);
+                }
+                if (tr.after_block) |cleanup| {
+                    try self.lintBlock(cleanup, is_public);
+                }
+            },
             .tuple => |t| for (t.elements) |elem| try self.lintExpr(elem, is_public),
             .list => |l| for (l.elements) |elem| try self.lintExpr(elem, is_public),
             else => {},

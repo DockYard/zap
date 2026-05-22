@@ -184,6 +184,33 @@ pub const Token = struct {
         return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "errdefer");
     }
 
+    /// `try` is a contextual keyword (Phase 3.a), recognised only when it
+    /// leads an expression and is immediately followed by a `{` block —
+    /// `try { … } rescue { … }`. It opens a dynamic recoverable-error
+    /// handler scope. It is NOT a hard keyword so the existing
+    /// `try_parse`-style identifiers and any value named `try` keep
+    /// working; the parser confirms the contextual reading with a
+    /// lookahead at `parsePrimaryExpr`.
+    pub fn isTryIdent(self: Token, source: []const u8) bool {
+        return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "try");
+    }
+
+    /// `rescue` is a contextual keyword (Phase 3.a), recognised only in
+    /// the `rescue { … }` position immediately following a `try` block.
+    /// Outside that position an identifier named `rescue` keeps working.
+    pub fn isRescueIdent(self: Token, source: []const u8) bool {
+        return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "rescue");
+    }
+
+    /// `after` is a contextual keyword (Phase 3.a), recognised only in the
+    /// `after { … }` finally position immediately following a `try`/`rescue`
+    /// block. `after` is a common English word, so it is deliberately NOT a
+    /// hard keyword — an identifier named `after` outside the handler tail
+    /// keeps working; the parser confirms the contextual reading.
+    pub fn isAfterIdent(self: Token, source: []const u8) bool {
+        return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "after");
+    }
+
     pub const keywords = std.StaticStringMap(Tag).initComptime(.{
         .{ "pub", .keyword_pub },
         .{ "fn", .keyword_fn },

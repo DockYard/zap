@@ -1255,6 +1255,24 @@ const MonomorphContext = struct {
                     self.restoreLocalTypes(&local_type_snapshot);
                 }
             },
+            .try_rescue => |tr| {
+                try self.scanBlock(tr.body);
+                try self.scanExpr(tr.raise_occurred_call);
+                try self.scanExpr(tr.take_raise_call);
+                const error_type = self.effectiveExprType(tr.take_raise_call);
+                for (tr.arms) |arm| {
+                    var local_type_snapshot = try self.cloneLocalTypes();
+                    defer local_type_snapshot.deinit();
+                    if (arm.pattern) |pattern| {
+                        var binding_index: usize = 0;
+                        try self.recordCasePatternLocalTypes(pattern, error_type, arm.bindings, &binding_index);
+                    }
+                    if (arm.guard) |g| try self.scanExpr(g);
+                    try self.scanBlock(arm.body);
+                    self.restoreLocalTypes(&local_type_snapshot);
+                }
+                if (tr.after_block) |cleanup| try self.scanBlock(cleanup);
+            },
             .match => |m| try self.scanExpr(m.scrutinee),
             .closure_create => |cc| {
                 for (cc.captures) |cap| try self.scanExpr(cap.expr);
@@ -1672,6 +1690,25 @@ const MonomorphContext = struct {
                 .ok_variant_name = tp.ok_variant_name,
                 .error_variant_name = tp.error_variant_name,
             } },
+            .try_rescue => |tr| blk: {
+                var new_arms = try self.allocator.alloc(hir.CaseArm, tr.arms.len);
+                for (tr.arms, 0..) |arm, i| {
+                    new_arms[i] = .{
+                        .pattern = arm.pattern,
+                        .guard = if (arm.guard) |g| try self.cloneExpr(g) else null,
+                        .body = try self.cloneBlock(arm.body),
+                        .bindings = arm.bindings,
+                    };
+                }
+                break :blk .{ .try_rescue = .{
+                    .body = try self.cloneBlock(tr.body),
+                    .arms = new_arms,
+                    .error_local = tr.error_local,
+                    .raise_occurred_call = try self.cloneExpr(tr.raise_occurred_call),
+                    .take_raise_call = try self.cloneExpr(tr.take_raise_call),
+                    .after_block = if (tr.after_block) |cleanup| try self.cloneBlock(cleanup) else null,
+                } };
+            },
             .error_pipe => |ep| blk: {
                 var new_steps = try self.allocator.alloc(hir.ErrorPipeStep, ep.steps.len);
                 for (ep.steps, 0..) |step, i| {

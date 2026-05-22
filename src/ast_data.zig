@@ -308,6 +308,30 @@ pub fn exprToCtValue(
             const args = try makeList(alloc, store, &.{inner});
             return makeTuple3(alloc, store, .{ .atom = "?" }, try metaToList(alloc, store, v.meta, null), args);
         },
+        // {:try_rescue, meta, [do: body, rescue: [clauses...], after: cleanup_or_nil]}
+        // where each rescue clause is {:->, [], [[pattern], body]}, mirroring
+        // the `cond`/`case` arm serialization.
+        .try_rescue => |v| {
+            const body_val = try blockToCtValue(alloc, interner, store, v.body);
+            var clause_vals: std.ArrayListUnmanaged(CtValue) = .empty;
+            for (v.rescue_clauses) |clause| {
+                const pat = try patternToCtValue(alloc, interner, store, clause.pattern);
+                const clause_body = try blockToCtValue(alloc, interner, store, clause.body);
+                const pat_list = try makeList(alloc, store, &.{pat});
+                const clause_args = try makeList(alloc, store, &.{ pat_list, clause_body });
+                try clause_vals.append(alloc, try makeTuple3(alloc, store, .{ .atom = "->" }, try emptyList(alloc, store), clause_args));
+            }
+            const clauses_list = try makeListFromSlice(alloc, store, clause_vals.items);
+            const after_val: CtValue = if (v.after_block) |cleanup|
+                try blockToCtValue(alloc, interner, store, cleanup)
+            else
+                CtValue.nil;
+            const do_pair = try makeKeywordPair(alloc, store, "do", body_val);
+            const rescue_pair = try makeKeywordPair(alloc, store, "rescue", clauses_list);
+            const after_pair = try makeKeywordPair(alloc, store, "after", after_val);
+            const kw_list = try makeList(alloc, store, &.{ do_pair, rescue_pair, after_pair });
+            return makeTuple3(alloc, store, .{ .atom = "try_rescue" }, try metaToList(alloc, store, v.meta, null), kw_list);
+        },
         .cond_expr => |v| {
             // {:cond, meta, [do: [clauses...]]} where each clause is {:->, [], [[condition], body]}
             var clause_vals: std.ArrayListUnmanaged(CtValue) = .empty;

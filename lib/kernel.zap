@@ -388,6 +388,55 @@ pub struct Kernel {
   }
 
   @doc = """
+    Recoverable raise sink backing a `raise` lexically inside a
+    `try { … } rescue { … }` body (Phase 3.a).
+
+    Unlike `do_raise/1` — which renders the error and aborts via the
+    crash printer — this stashes the full `Error` value into the
+    runtime's raise side-channel and sets the pending flag. Control then
+    returns to the `try` body, which immediately hits the handler landing
+    pad the compiler emits after the body (`Kernel.raise_occurred()`):
+    seeing the flag set, it recovers the value and dispatches it through
+    the `rescue` arms. The compiler's HIR `raise` lowering
+    (`src/hir.zig`) selects this sink over `do_raise/1` whenever a `try`
+    scope is active; outside any handler the abort path is kept so an
+    unhandled `raise` still produces the Phase 2 crash report.
+
+    Returns `Nil` (not `Never`): the recoverable path's non-local exit is
+    realized by the compiler-emitted landing-pad branch, not by this
+    function diverging — so it must be allowed to return after stashing.
+    """
+
+  pub fn recoverable_raise(error_value :: Error) -> Nil {
+    :zig.Kernel.recoverable_raise(error_value)
+    nil
+  }
+
+  @doc = """
+    True when a `recoverable_raise` has fired in the current `try` body and
+    has not yet been consumed by a handler (Phase 3.a). The compiler emits
+    a test of this immediately after a `try` body to decide whether to run
+    the `rescue` arms or yield the body's normal value. Internal compiler
+    support for `try`/`rescue`; not intended for direct use.
+    """
+
+  pub fn raise_occurred() -> Bool {
+    :zig.Kernel.raise_occurred()
+  }
+
+  @doc = """
+    Read and clear the pending recoverable-raise `Error` value (Phase 3.a).
+    The compiler's `try`/`rescue` lowering calls this in the handler landing
+    pad to recover the raised value and pattern-match it against the `rescue`
+    arms. Internal compiler support for `try`/`rescue`; not intended for
+    direct use.
+    """
+
+  pub fn take_recoverable_raise() -> Error {
+    :zig.Kernel.take_recoverable_raise()
+  }
+
+  @doc = """
     Abort the process with an `%AssertionError{}` describing a failed
     contract. This is the runtime sink the three-tier contract macros
     (`assert`, `debug_assert`, `precondition`) expand to on the failure

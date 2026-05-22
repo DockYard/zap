@@ -4476,6 +4476,17 @@ pub const TypeChecker = struct {
             },
             .unwrap => |unwrap| try self.validateExprDoesNotCallUnderscoreFunctions(unwrap.expr),
             .try_expr => |try_expr| try self.validateExprDoesNotCallUnderscoreFunctions(try_expr.value),
+            .try_rescue => |try_rescue| {
+                for (try_rescue.body) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+                for (try_rescue.rescue_clauses) |clause| {
+                    if (clause.guard) |guard| try self.validateExprDoesNotCallUnderscoreFunctions(guard);
+                    try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(clause.pattern);
+                    for (clause.body) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+                }
+                if (try_rescue.after_block) |cleanup| {
+                    for (cleanup) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+                }
+            },
             .tuple => |tuple| for (tuple.elements) |element| try self.validateExprDoesNotCallUnderscoreFunctions(element),
             .list => |list| for (list.elements) |element| try self.validateExprDoesNotCallUnderscoreFunctions(element),
             .map => |map| {
@@ -5255,6 +5266,81 @@ pub const TypeChecker = struct {
         try self.current_raises.append(self.allocator, error_type);
     }
 
+    /// Resolve the concrete `Error` type a `rescue` clause matches, when it
+    /// names one: `e :: IOError` resolves the `:: IOError` annotation;
+    /// `%IOError{…}` resolves the struct-pattern's struct name. A bare
+    /// binding (`e`) or wildcard (`_`) is a catch-all and matches any error,
+    /// so this returns `null` for those. Used by the `try_rescue` inference
+    /// arm to decide which body-raised error types a clause discharges and
+    /// to run the private-error visibility check.
+    fn rescueClauseErrorType(self: *TypeChecker, clause: ast.CaseClause) !?TypeId {
+        if (clause.type_annotation) |type_expr| {
+            const resolved = try self.resolveTypeExpr(type_expr);
+            if (resolved == TypeStore.UNKNOWN or resolved == TypeStore.ERROR) return null;
+            return resolved;
+        }
+        switch (clause.pattern.*) {
+            .struct_pattern => |sp| {
+                // Resolve the struct name (its last dotted segment) as a
+                // named type. Errors desugar to structs, so this yields the
+                // nominal error type.
+                if (sp.struct_name.parts.len == 0) return null;
+                const last_part = sp.struct_name.parts[sp.struct_name.parts.len - 1];
+                const name_expr = ast.TypeExpr{ .name = .{
+                    .meta = .{ .span = sp.meta.span },
+                    .name = last_part,
+                    .args = &.{},
+                } };
+                const resolved = self.resolveTypeExpr(&name_expr) catch return null;
+                if (resolved == TypeStore.UNKNOWN or resolved == TypeStore.ERROR) return null;
+                return resolved;
+            },
+            else => return null,
+        }
+    }
+
+    /// The open `Error` existential type (`protocol_constraint(Error)`) — the
+    /// type of "any value implementing the `Error` protocol". Used as the
+    /// bind type for a catch-all rescue clause when the `try` body's raised
+    /// row is not a single concrete type.
+    fn errorExistentialType(self: *TypeChecker) !TypeId {
+        const interner_mut = @constCast(self.interner);
+        const error_name = try interner_mut.intern("Error");
+        return self.store.addType(.{ .protocol_constraint = .{
+            .protocol_name = error_name,
+            .type_params = &.{},
+        } });
+    }
+
+    /// Enforce public-vs-private error visibility on a `rescue` pattern
+    /// (Part V / non-negotiable #10). A `rescue` clause may pattern-match a
+    /// `pub error` type from anywhere, but a bare (non-`pub`) `error`
+    /// declared in *another* module is private API — rescuing it from
+    /// outside its declaring module is a type error. Errors desugar to
+    /// structs carrying `StructDecl.is_private`; the declaring scope is the
+    /// struct's registered scope, compared against the current struct scope
+    /// via the same cross-reference predicate the rest of the checker uses.
+    fn checkRescuePatternVisibility(self: *TypeChecker, error_type: TypeId, span: ast.SourceSpan) !void {
+        const struct_name = self.store.typeToStructName(error_type, self.interner) orelse return;
+        for (self.graph.structs.items) |entry| {
+            const entry_name = entry.name.joinedWith(self.allocator, self.interner, ".") catch continue;
+            if (!std.mem.eql(u8, entry_name, struct_name)) continue;
+            if (entry.decl.is_private and self.isCrossStructReference(entry.scope_id)) {
+                try self.addRichError(
+                    try std.fmt.allocPrint(
+                        self.allocator,
+                        "cannot rescue private error `{s}` from outside its declaring module",
+                        .{struct_name},
+                    ),
+                    span,
+                    "this `error` is not `pub`, so it is private API and callers cannot pattern-match on it",
+                    "declare it as `pub error` to make it part of the rescuable API surface",
+                );
+            }
+            return;
+        }
+    }
+
     /// Reconcile the body-inferred `raises` row (`self.current_raises`)
     /// with the clause's optional declared row, then record the resolved
     /// row on the function's stored signature (`store.inferred_raises`).
@@ -5921,6 +6007,127 @@ pub const TypeChecker = struct {
                         }
                     }
                 }
+                return result_type;
+            },
+
+            // `try { body } rescue { pat -> … } after { … }` (Phase 3.a).
+            //
+            // Type-checking strategy:
+            //   1. Infer the `try` body's type while capturing the error
+            //      types its `raise`/`?` sites contribute to the enclosing
+            //      `raises` row (the slice of `current_raises` accumulated
+            //      during the body). These are the errors the handler may
+            //      observe.
+            //   2. Truncate `current_raises` back to its pre-body length:
+            //      the `try`/`rescue` *discharges* the body's raises. Any
+            //      error type NOT covered by a rescue clause (and with no
+            //      catch-all present) is re-recorded so it keeps
+            //      propagating to the enclosing function's row.
+            //   3. Type each rescue clause: bind its pattern against the
+            //      matched error type, infer the clause body, and join all
+            //      clause result types with the body success type.
+            //   4. Exhaustiveness rule (documented): unrescued error types
+            //      propagate; a catch-all (`_` / bare `e` / `e :: Error`) is
+            //      only *required* when the body raises the open `Error`
+            //      existential (which cannot otherwise be discharged).
+            //   5. Private-error visibility: a rescue clause naming a bare
+            //      (non-`pub`) `error` declared in another module is a type
+            //      error — callers may only rescue the public API surface.
+            .try_rescue => |tr| {
+                const raises_mark = self.current_raises.items.len;
+
+                var body_type: TypeId = TypeStore.NIL;
+                for (tr.body) |stmt| {
+                    body_type = try self.checkStmt(stmt);
+                }
+
+                // Snapshot the body's contributed error row, then discharge
+                // it from the live accumulator.
+                var body_raises: std.ArrayListUnmanaged(TypeId) = .empty;
+                defer body_raises.deinit(self.allocator);
+                for (self.current_raises.items[raises_mark..]) |raised| {
+                    try body_raises.append(self.allocator, raised);
+                }
+                self.current_raises.shrinkRetainingCapacity(raises_mark);
+
+                // Type the rescue clauses; track which body-raised types each
+                // clause covers and whether a catch-all is present.
+                var result_type: TypeId = body_type;
+                var has_catch_all = false;
+                var covered: std.ArrayListUnmanaged(TypeId) = .empty;
+                defer covered.deinit(self.allocator);
+
+                for (tr.rescue_clauses) |clause| {
+                    const matched_error = try self.rescueClauseErrorType(clause);
+
+                    // Private-error visibility check on the named error type.
+                    if (matched_error) |err_type| {
+                        try self.checkRescuePatternVisibility(err_type, clause.meta.span);
+                        try covered.append(self.allocator, err_type);
+                    }
+
+                    const is_catch_all = (clause.type_annotation == null) and
+                        (clause.pattern.* == .wildcard or clause.pattern.* == .bind);
+                    if (is_catch_all) has_catch_all = true;
+
+                    // Bind the clause pattern. When the clause names a concrete
+                    // error type (via `:: E` or `%E{}`), bind against it so
+                    // field/struct destructuring type-checks; a catch-all binds
+                    // against the body's raised type when singular, else the
+                    // Error existential.
+                    const bind_type: TypeId = if (matched_error) |err_type|
+                        err_type
+                    else if (body_raises.items.len == 1)
+                        body_raises.items[0]
+                    else
+                        try self.errorExistentialType();
+
+                    const prev_scope = self.current_scope;
+                    defer self.current_scope = prev_scope;
+                    if (self.graph.resolveClauseScope(clause.meta)) |clause_scope| {
+                        self.current_scope = clause_scope;
+                    }
+                    if (bind_type != TypeStore.UNKNOWN) {
+                        try self.recordCasePatternBindingTypes(clause.pattern, bind_type, clause.meta.span);
+                    }
+                    if (clause.guard) |guard| {
+                        _ = try self.inferExpr(guard);
+                    }
+                    var clause_type: TypeId = TypeStore.NIL;
+                    for (clause.body) |stmt| {
+                        clause_type = try self.checkStmt(stmt);
+                    }
+                    if (result_type == TypeStore.NIL or result_type == TypeStore.UNKNOWN) {
+                        result_type = clause_type;
+                    }
+                }
+
+                // Re-record any body-raised error type not covered by a
+                // rescue clause (unless a catch-all discharged all of them):
+                // unrescued raises keep propagating to the enclosing row.
+                if (!has_catch_all) {
+                    for (body_raises.items) |raised| {
+                        var is_covered = false;
+                        for (covered.items) |c| {
+                            if (self.store.typeEquals(c, raised)) {
+                                is_covered = true;
+                                break;
+                            }
+                        }
+                        if (!is_covered) {
+                            try self.recordRaisedErrorType(raised, tr.meta.span);
+                        }
+                    }
+                }
+
+                // Type the `after` block for its effects (its value is
+                // discarded — `after` is finally-semantics, not a producer).
+                if (tr.after_block) |cleanup| {
+                    for (cleanup) |stmt| {
+                        _ = try self.checkStmt(stmt);
+                    }
+                }
+
                 return result_type;
             },
 

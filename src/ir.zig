@@ -6854,6 +6854,100 @@ pub const IrBuilder = struct {
     /// enclosing function's return-source set already covers it (every `ret`
     /// value is a return source). The Ok payload `v` becomes the expression
     /// result through `dest` like any other case-break value.
+    /// Lower a `try { body } rescue { … } after { … }` handler (Phase 3.a).
+    ///
+    /// Realized as: run the body (its recoverable `raise` sites stash the
+    /// `Error` value into the runtime side-channel and set the pending flag
+    /// via `Kernel.recoverable_raise`); then branch on
+    /// `Kernel.raise_occurred()`:
+    ///   - true  → recover the value (`Kernel.take_recoverable_raise()` →
+    ///             `error_local`) and dispatch it through the `rescue` arms
+    ///             (a `case` over `error_local`);
+    ///   - false → yield the body's normal result.
+    /// The `after` cleanup block runs unconditionally after the branch
+    /// (covering both the normal-completion and rescued edges). This is the
+    /// structured-control-flow realization of the one-shot abortive effect:
+    /// no `setjmp`, no per-body thunk — the body and handler live in the same
+    /// function, and the branch is the handler landing pad.
+    fn lowerTryRescue(self: *IrBuilder, tr: hir_mod.TryRescueHir, dest: LocalId) anyerror!void {
+        // 1. Run the body. Its tail value is captured for the no-raise edge.
+        var body_result: ?LocalId = null;
+        for (tr.body.stmts) |stmt| {
+            body_result = try self.lowerTryRescueBodyStmt(stmt);
+        }
+
+        // 2. Discriminator: did a recoverable raise fire in the body?
+        const flag_local = try self.lowerExpr(tr.raise_occurred_call);
+
+        // 3. Handler branch (raise occurred): recover the Error value and
+        //    dispatch through the rescue arms.
+        const saved_then = self.current_instrs;
+        self.current_instrs = .empty;
+        const error_local = tr.error_local;
+        if (self.next_local <= error_local) self.next_local = error_local + 1;
+        const taken = try self.lowerExpr(tr.take_raise_call);
+        try self.current_instrs.append(self.allocator, .{ .local_set = .{ .dest = error_local, .value = taken } });
+        // Propagate the side-channel's HIR type onto error_local so the
+        // rescue patterns (struct downcast / type-binding) see the Error
+        // existential type for ARC + dispatch decisions.
+        if (self.local_hir_types.get(taken)) |taken_type| {
+            try self.local_hir_types.put(error_local, taken_type);
+        }
+        const handler_dest = self.next_local;
+        self.next_local += 1;
+        try self.lowerCaseExprBody(handler_dest, error_local, .{ .scrutinee = tr.take_raise_call, .arms = tr.arms });
+        const then_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+        self.current_instrs = saved_then;
+
+        // 4. Normal branch (no raise): yield the body's value.
+        const else_result = body_result;
+
+        // 5. Emit the landing-pad `if`.
+        try self.current_instrs.append(self.allocator, .{
+            .if_expr = .{
+                .dest = dest,
+                .condition = flag_local,
+                .then_instrs = then_instrs,
+                .then_result = handler_dest,
+                .else_instrs = &.{},
+                .else_result = else_result,
+            },
+        });
+
+        // 6. `after` (finally): runs on every edge. Both `if` branches are
+        //    normal control flow that fall through to here, so emitting the
+        //    cleanup after the `if` covers the normal-completion and rescued
+        //    paths alike — ARC-correct because these are real IR instructions
+        //    walked by perceus/arc_liveness like any `defer` body.
+        if (tr.after_block) |cleanup| {
+            for (cleanup.stmts) |stmt| {
+                _ = try self.lowerTryRescueBodyStmt(stmt);
+            }
+        }
+    }
+
+    /// Lower one statement of a `try` body or `after` block, returning the
+    /// value local for an expression statement (used to capture the body's
+    /// tail value). Mirrors the per-statement handling in the `.block` arm
+    /// but scoped to the small set of statement shapes a `try`/`after` block
+    /// admits.
+    fn lowerTryRescueBodyStmt(self: *IrBuilder, stmt: hir_mod.Stmt) anyerror!?LocalId {
+        switch (stmt) {
+            .expr => |e| return try self.lowerExpr(e),
+            .local_set => |ls| {
+                const val = try self.lowerExpr(ls.value);
+                try self.current_instrs.append(self.allocator, .{ .local_set = .{ .dest = ls.index, .value = val } });
+                if (self.local_hir_types.get(val)) |t| try self.local_hir_types.put(ls.index, t);
+                return null;
+            },
+            .defer_stmt => |defer_node| {
+                try self.defer_stack.append(self.allocator, .{ .kind = defer_node.kind, .expr = defer_node.expr });
+                return null;
+            },
+            .function_group => return null,
+        }
+    }
+
     fn lowerTryProject(self: *IrBuilder, tp: hir_mod.TryProjectHir, dest: LocalId) anyerror!void {
         const scrutinee_local = try self.lowerExpr(tp.operand);
 
@@ -10900,6 +10994,7 @@ pub const IrBuilder = struct {
                     },
                 });
             },
+            .try_rescue => |tr| try self.lowerTryRescue(tr, dest),
             .try_project => |tp| try self.lowerTryProject(tp, dest),
             .field_get => |fg| {
                 // Check for enum variant access (object is nil_lit placeholder with enum type)

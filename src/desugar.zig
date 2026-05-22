@@ -1378,6 +1378,37 @@ pub const Desugarer = struct {
                     },
                 });
             },
+            // `try_rescue` survives desugar like `try_expr` and `case`: the
+            // node stays intact so the type-checker can compute its
+            // exhaustiveness, discharge the rescued error types from the
+            // enclosing `raises` row, and so HIR can perform the
+            // error-union/handler lowering (which needs `ret`/error-return
+            // terminators that surface AST cannot express). Only the
+            // sub-expressions/statements are desugared here.
+            .try_rescue => |tr| {
+                var new_clauses: std.ArrayList(ast.CaseClause) = .empty;
+                for (tr.rescue_clauses) |clause| {
+                    try new_clauses.append(self.allocator, .{
+                        .meta = clause.meta,
+                        .pattern = clause.pattern,
+                        .type_annotation = clause.type_annotation,
+                        .guard = if (clause.guard) |g| try self.desugarExpr(g) else null,
+                        .body = try self.desugarBlock(clause.body),
+                    });
+                }
+                const new_after: ?[]const ast.Stmt = if (tr.after_block) |cleanup|
+                    try self.desugarBlock(cleanup)
+                else
+                    null;
+                return try self.create(ast.Expr, .{
+                    .try_rescue = .{
+                        .meta = tr.meta,
+                        .body = try self.desugarBlock(tr.body),
+                        .rescue_clauses = try new_clauses.toOwnedSlice(self.allocator),
+                        .after_block = new_after,
+                    },
+                });
+            },
             .panic_expr => |pe| {
                 return try self.create(ast.Expr, .{
                     .panic_expr = .{
