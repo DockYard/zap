@@ -93,6 +93,13 @@ pub const FrontendOptimizeMode = enum(u8) {
     }
 };
 
+test "arithmeticOverflowTraps traps in safe modes, wraps in fast modes" {
+    try std.testing.expect(FrontendOptimizeMode.debug.arithmeticOverflowTraps());
+    try std.testing.expect(FrontendOptimizeMode.release_safe.arithmeticOverflowTraps());
+    try std.testing.expect(!FrontendOptimizeMode.release_fast.arithmeticOverflowTraps());
+    try std.testing.expect(!FrontendOptimizeMode.release_small.arithmeticOverflowTraps());
+}
+
 test "debug frontend policy disables optimization-only passes" {
     const policy = FrontendOptimizeMode.debug.passPolicy();
     try std.testing.expect(!policy.run_region_solver);

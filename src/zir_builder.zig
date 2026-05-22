@@ -9952,6 +9952,37 @@ pub fn buildAndInjectSelected(
     }
 }
 
+test "mapBinopTag: per-mode integer overflow policy (checked vs wrapping)" {
+    // Phase 1.5. In safe modes (overflow_traps == true) integer add/sub/mul
+    // use the checked tags; in fast modes they use the wrapping tags.
+    // Floats always use the plain tag regardless of mode.
+    const add_checked = mapBinopTag(.add, .i64, true).?;
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.add), add_checked);
+    const add_wrap = mapBinopTag(.add, .i64, false).?;
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.addwrap), add_wrap);
+
+    const sub_checked = mapBinopTag(.sub, .i64, true).?;
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.sub), sub_checked);
+    const sub_wrap = mapBinopTag(.sub, .i64, false).?;
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.subwrap), sub_wrap);
+
+    const mul_checked = mapBinopTag(.mul, .i64, true).?;
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.mul), mul_checked);
+    const mul_wrap = mapBinopTag(.mul, .i64, false).?;
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.mulwrap), mul_wrap);
+
+    // Floats use the plain tag in BOTH modes — the overflow policy is
+    // integer-only.
+    try std.testing.expectEqual(
+        @intFromEnum(Zir.Inst.Tag.add),
+        mapBinopTag(.add, .f64, true).?,
+    );
+    try std.testing.expectEqual(
+        @intFromEnum(Zir.Inst.Tag.add),
+        mapBinopTag(.add, .f64, false).?,
+    );
+}
+
 test "closure lowering helper distinguishes immediate and stack tiers" {
     const lattice = @import("escape_lattice.zig");
 
