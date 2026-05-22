@@ -7289,21 +7289,21 @@ pub const Kernel = struct {
     pub fn add(a: anytype, b: anytype) @TypeOf(a) {
         const T = @TypeOf(a);
         const info = @typeInfo(T);
-        if (comptime info == .int) return a +% b;
+        if (comptime info == .int) return addInteger(T, a, b);
         return a + b;
     }
 
     pub fn sub(a: anytype, b: anytype) @TypeOf(a) {
         const T = @TypeOf(a);
         const info = @typeInfo(T);
-        if (comptime info == .int) return a -% b;
+        if (comptime info == .int) return subInteger(T, a, b);
         return a - b;
     }
 
     pub fn mul(a: anytype, b: anytype) @TypeOf(a) {
         const T = @TypeOf(a);
         const info = @typeInfo(T);
-        if (comptime info == .int) return a *% b;
+        if (comptime info == .int) return mulInteger(T, a, b);
         return a * b;
     }
 
@@ -7594,35 +7594,100 @@ pub const Kernel = struct {
         return a >= b;
     }
 
+    /// Phase 1.5 — per-optimize-mode integer-overflow policy for the
+    /// user-level arithmetic operators (`+`, `-`, `*`) that the
+    /// `Arithmetic` protocol lowers to `:zig.Kernel.<op>_<type>`. Debug
+    /// and ReleaseSafe TRAP on overflow; ReleaseFast and ReleaseSmall
+    /// WRAP two's-complement. This mirrors
+    /// `frontend_policy.FrontendOptimizeMode.arithmeticOverflowTraps`
+    /// exactly — the same Debug/ReleaseSafe→trap, fast→wrap split — but
+    /// applied at the runtime arithmetic primitive, which is the single
+    /// chokepoint every user `+`/`-`/`*` actually flows through (the
+    /// `zir_builder.mapBinopTag` ZIR policy only governs the
+    /// compiler-internal `binary_op` path for range/index math, never
+    /// user arithmetic).
+    ///
+    /// `builtin.mode` here is the optimize mode of the whole Zap
+    /// compilation: the runtime source is injected into the same
+    /// `zir_compilation_create` as the user binary, so this comptime
+    /// branch resolves to the user's `-Doptimize` choice. In a trapping
+    /// mode an overflow is detected via `@addWithOverflow` and routed
+    /// through `Kernel.raise_with_kind("arithmetic_error", ...)`, the same
+    /// canonical-abort path an explicit `raise %ArithmeticError{}` uses.
+    const integer_overflow_traps: bool = switch (builtin.mode) {
+        .Debug, .ReleaseSafe => true,
+        .ReleaseFast, .ReleaseSmall => false,
+    };
+
+    /// Integer addition honoring the per-mode overflow policy. Both modes
+    /// compute the wrapping result and overflow bit via `@addWithOverflow`
+    /// (defined behavior in every optimize mode). In a trapping mode an
+    /// overflow routes through `raise_with_kind("arithmetic_error", ...)`
+    /// — the SAME canonical-abort path an explicit `raise %ArithmeticError{}`
+    /// takes — so a safe-mode overflow is observationally identical to
+    /// raising the stdlib error (`** (arithmetic_error) integer overflow`,
+    /// exit 1). In a wrapping mode the wrapped low bits are returned. This
+    /// keeps overflow routing entirely in the runtime primitive rather
+    /// than depending on Zig's checked-`+` panic, whose custom handler the
+    /// injected root ZIR does not currently carry.
+    fn addInteger(comptime IntType: type, left: IntType, right: IntType) IntType {
+        const wrapped = @addWithOverflow(left, right);
+        if (comptime integer_overflow_traps) {
+            if (wrapped[1] != 0) raise_with_kind("arithmetic_error", "integer overflow");
+        }
+        return wrapped[0];
+    }
+
+    /// Integer subtraction honoring the per-mode overflow policy. See
+    /// `addInteger` for the trap/wrap contract; underflow traps as an
+    /// `arithmetic_error` in Debug/ReleaseSafe and wraps otherwise.
+    fn subInteger(comptime IntType: type, left: IntType, right: IntType) IntType {
+        const wrapped = @subWithOverflow(left, right);
+        if (comptime integer_overflow_traps) {
+            if (wrapped[1] != 0) raise_with_kind("arithmetic_error", "integer overflow");
+        }
+        return wrapped[0];
+    }
+
+    /// Integer multiplication honoring the per-mode overflow policy. See
+    /// `addInteger` for the trap/wrap contract.
+    fn mulInteger(comptime IntType: type, left: IntType, right: IntType) IntType {
+        const wrapped = @mulWithOverflow(left, right);
+        if (comptime integer_overflow_traps) {
+            if (wrapped[1] != 0) raise_with_kind("arithmetic_error", "integer overflow");
+        }
+        return wrapped[0];
+    }
+
     pub fn add_i8(a: i8, b: i8) i8 {
-        return a +% b;
+        return addInteger(i8, a, b);
     }
     pub fn add_i16(a: i16, b: i16) i16 {
-        return a +% b;
+        return addInteger(i16, a, b);
     }
     pub fn add_i32(a: i32, b: i32) i32 {
-        return a +% b;
+        return addInteger(i32, a, b);
     }
     pub fn add_i64(a: i64, b: i64) i64 {
-        return a +% b;
+        return addInteger(i64, a, b);
     }
     pub fn add_i128(a: i128, b: i128) i128 {
-        return a +% b;
+        return addInteger(i128, a, b);
     }
     pub fn add_u8(a: u8, b: u8) u8 {
-        return a +% b;
+        return addInteger(u8, a, b);
     }
     pub fn add_u16(a: u16, b: u16) u16 {
-        return a +% b;
+        return addInteger(u16, a, b);
     }
     pub fn add_u32(a: u32, b: u32) u32 {
-        return a +% b;
+        return addInteger(u32, a, b);
     }
     pub fn add_u64(a: u64, b: u64) u64 {
-        return a +% b;
+        return addInteger(u64, a, b);
     }
     pub fn add_u128(a: u128, b: u128) u128 {
-        return a +% b;
+        return addInteger(u128, a, b);
     }
     pub fn add_f16(a: f16, b: f16) f16 {
         return a + b;
@@ -7641,34 +7706,34 @@ pub const Kernel = struct {
     }
 
     pub fn sub_i8(a: i8, b: i8) i8 {
-        return a -% b;
+        return subInteger(i8, a, b);
     }
     pub fn sub_i16(a: i16, b: i16) i16 {
-        return a -% b;
+        return subInteger(i16, a, b);
     }
     pub fn sub_i32(a: i32, b: i32) i32 {
-        return a -% b;
+        return subInteger(i32, a, b);
     }
     pub fn sub_i64(a: i64, b: i64) i64 {
-        return a -% b;
+        return subInteger(i64, a, b);
     }
     pub fn sub_i128(a: i128, b: i128) i128 {
-        return a -% b;
+        return subInteger(i128, a, b);
     }
     pub fn sub_u8(a: u8, b: u8) u8 {
-        return a -% b;
+        return subInteger(u8, a, b);
     }
     pub fn sub_u16(a: u16, b: u16) u16 {
-        return a -% b;
+        return subInteger(u16, a, b);
     }
     pub fn sub_u32(a: u32, b: u32) u32 {
-        return a -% b;
+        return subInteger(u32, a, b);
     }
     pub fn sub_u64(a: u64, b: u64) u64 {
-        return a -% b;
+        return subInteger(u64, a, b);
     }
     pub fn sub_u128(a: u128, b: u128) u128 {
-        return a -% b;
+        return subInteger(u128, a, b);
     }
     pub fn sub_f16(a: f16, b: f16) f16 {
         return a - b;
@@ -7687,34 +7752,34 @@ pub const Kernel = struct {
     }
 
     pub fn mul_i8(a: i8, b: i8) i8 {
-        return a *% b;
+        return mulInteger(i8, a, b);
     }
     pub fn mul_i16(a: i16, b: i16) i16 {
-        return a *% b;
+        return mulInteger(i16, a, b);
     }
     pub fn mul_i32(a: i32, b: i32) i32 {
-        return a *% b;
+        return mulInteger(i32, a, b);
     }
     pub fn mul_i64(a: i64, b: i64) i64 {
-        return a *% b;
+        return mulInteger(i64, a, b);
     }
     pub fn mul_i128(a: i128, b: i128) i128 {
-        return a *% b;
+        return mulInteger(i128, a, b);
     }
     pub fn mul_u8(a: u8, b: u8) u8 {
-        return a *% b;
+        return mulInteger(u8, a, b);
     }
     pub fn mul_u16(a: u16, b: u16) u16 {
-        return a *% b;
+        return mulInteger(u16, a, b);
     }
     pub fn mul_u32(a: u32, b: u32) u32 {
-        return a *% b;
+        return mulInteger(u32, a, b);
     }
     pub fn mul_u64(a: u64, b: u64) u64 {
-        return a *% b;
+        return mulInteger(u64, a, b);
     }
     pub fn mul_u128(a: u128, b: u128) u128 {
-        return a *% b;
+        return mulInteger(u128, a, b);
     }
     pub fn mul_f16(a: f16, b: f16) f16 {
         return a * b;
@@ -17584,4 +17649,38 @@ test "ProtocolBox.isPresent fires when data_ptr is non-null" {
     try std.testing.expect(present.isPresent());
     try std.testing.expect(present.data_ptr != null);
     try std.testing.expect(present.vtable != null);
+}
+
+test "Kernel integer arithmetic: non-overflowing results are exact in every optimize mode" {
+    // Phase 1.5. The per-mode overflow policy must never perturb a
+    // non-overflowing operation: regardless of trap-vs-wrap mode, an add/
+    // sub/mul whose true result fits the type returns that exact result.
+    // This exercises the `@addWithOverflow`/`@subWithOverflow`/
+    // `@mulWithOverflow` helper's value path (the `[0]` field) and the
+    // no-overflow branch without ever tripping the trap (which would call
+    // `std.process.exit` and abort the host test process in the Debug
+    // build, where `integer_overflow_traps` is true).
+    try std.testing.expectEqual(@as(i64, 2000000001), Kernel.add_i64(2000000000, 1));
+    // maxInt + minInt == -1 exactly (no overflow): the extremes sum within range.
+    try std.testing.expectEqual(@as(i64, -1), Kernel.add_i64(std.math.maxInt(i64), std.math.minInt(i64)));
+    try std.testing.expectEqual(@as(i64, -3), Kernel.add_i64(-5, 2));
+    try std.testing.expectEqual(@as(u8, 255), Kernel.add_u8(250, 5));
+    try std.testing.expectEqual(@as(i32, 6), Kernel.mul_i32(2, 3));
+    try std.testing.expectEqual(@as(i64, 41), Kernel.sub_i64(42, 1));
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), Kernel.sub_i64(std.math.minInt(i64) + 1, 1));
+}
+
+test "Kernel integer arithmetic: wrapping modes wrap on overflow (non-trapping only)" {
+    // In a non-trapping optimize mode (ReleaseFast/ReleaseSmall) overflow
+    // wraps two's-complement: i64 max + 1 == i64 min. This assertion is
+    // gated to non-trapping builds — in Debug/ReleaseSafe the same call
+    // intentionally aborts via `raise_with_kind("arithmetic_error", ...)`,
+    // which the end-to-end `phase_1_5_overflow_trap.zap` fixture covers.
+    switch (builtin.mode) {
+        .ReleaseFast, .ReleaseSmall => {
+            try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), Kernel.add_i64(std.math.maxInt(i64), 1));
+            try std.testing.expectEqual(@as(u8, 0), Kernel.add_u8(255, 1));
+        },
+        .Debug, .ReleaseSafe => {},
+    }
 }
