@@ -8560,7 +8560,52 @@ pub const IrBuilder = struct {
             }
         }
         defer self.current_expected_type = saved_expected_type;
-        return try self.lowerBlock(block);
+        const result = try self.lowerBlock(block);
+
+        // Return-position coercion for a protocol-existential return type
+        // (`-> Error`, ZigType `.protocol_box`), whose declaration the ZIR
+        // backend emits explicitly as `zap_runtime.ProtocolBox`. The body's
+        // tail value must therefore be a `ProtocolBox`. Two tail shapes need
+        // help:
+        //
+        //   * A concrete impl struct (a body that constructs `%E{}`): box it
+        //     via `maybeBoxAsProtocol` — the return-position counterpart of the
+        //     construction-site auto-boxing applied at call args / fields /
+        //     payloads. No-op unless it is a concrete struct with a registered
+        //     impl.
+        //
+        //   * A `Never`-typed divergent tail (e.g. a body whose last expression
+        //     is `contract_violation(...)`/`do_raise(...)`, a `Never`-returning
+        //     abort): the function never actually returns there, but the IR
+        //     still emits a `ret` of the divergent call's value, whose Zig type
+        //     is the abort's synthesized struct — clashing with the declared
+        //     `ProtocolBox` (`expected 'zap_runtime.ProtocolBox', found
+        //     'Kernel.contract_violation__…'`). Replace that dead ret value
+        //     with a `typed_undef` of the protocol box: a never-read
+        //     placeholder of the right peer type, exactly as the `try`/`rescue`
+        //     dead-edge coercion does. This keeps the explicit ProtocolBox
+        //     return type sound for both `take_recoverable_raise` (bridge
+        //     result already a box) and abort-tailed bodies.
+        if (result) |result_local| {
+            if (expected_type) |type_id| {
+                const expected_zig = typeIdToZigTypeWithStore(type_id, self.type_store);
+                if (expected_zig == .protocol_box) {
+                    const tail_hir = self.local_hir_types.get(result_local) orelse types_mod.TypeStore.UNKNOWN;
+                    if (tail_hir == types_mod.TypeStore.NEVER) {
+                        const placeholder = self.next_local;
+                        self.next_local += 1;
+                        try self.current_instrs.append(self.allocator, .{
+                            .typed_undef = .{ .dest = placeholder, .ty = expected_zig },
+                        });
+                        try self.local_hir_types.put(placeholder, type_id);
+                        try self.known_local_types.put(placeholder, expected_zig);
+                        return placeholder;
+                    }
+                    return try self.maybeBoxAsProtocol(result_local, expected_zig);
+                }
+            }
+        }
+        return result;
     }
 
     /// Phase H.1: kind of HIR-type relationship between a list local
