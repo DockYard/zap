@@ -32,17 +32,18 @@
 
 const std = @import("std");
 
-const repo_root = blk: {
-    // tools/ is one directory below the repo root.
-    const this_file = @src().file;
-    const dir = std.fs.path.dirname(this_file) orelse ".";
-    break :blk std.fs.path.dirname(dir) orelse ".";
-};
-
+/// Read a repo-relative source file. The Zig build system runs unit tests
+/// with the repository root as the working directory, so a path like
+/// `src/runtime.zig` resolves directly. Uses `std.Io.Dir.cwd()` for symmetry
+/// with the other `tools/*_drift_test.zig` cross-checks (this fork's `std.fs`
+/// has no `cwd`; filesystem access goes through `std.Io.Dir`).
 fn readRepoFile(allocator: std.mem.Allocator, rel_path: []const u8) ![]u8 {
-    const full = try std.fs.path.join(allocator, &.{ repo_root, rel_path });
-    defer allocator.free(full);
-    return std.fs.cwd().readFileAlloc(allocator, full, 8 * 1024 * 1024);
+    return std.Io.Dir.cwd().readFileAlloc(
+        std.Options.debug_io,
+        rel_path,
+        allocator,
+        .limited(8 * 1024 * 1024),
+    );
 }
 
 test "ZSYM format constants match between canonical table and runtime decoder" {
