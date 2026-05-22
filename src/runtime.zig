@@ -7835,6 +7835,84 @@ fn crashReportSourceLocation(loc: std.debug.SourceLocation) void {
     crashWriteUnsigned(loc.line);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2.e — double-fault containment.
+//
+// The crash printer is the last code that runs before the process dies, and
+// it does real work: it walks the stack, opens DWARF, and reads the
+// `.zap-symbols` sidecar. Any of that can itself fault — a wild frame pointer
+// during the unwind, a corrupt DWARF section, a stack-overflow SIGSEGV
+// re-tripped while we are already on the alternate stack. If a second fault
+// re-entered the full printer it could loop forever, deadlock on the
+// `SelfInfo` mutex the symbolizer takes, or smash what little stack remains.
+//
+// Rust's runtime handles the analogous "panic while panicking" by aborting
+// immediately (brief VI.B #5). Zap does the same: the first thread into the
+// crash path wins; any re-entrant caller takes the minimal `doubleFaultAbort`
+// path — a single `write(2)` of a fixed marker followed by `_exit` with a
+// distinct sentinel code — performing NO symbolization, NO backtrace, NO
+// allocation, NO locking. `SA_RESETHAND` (set at signal-handler install time)
+// only covers re-delivery of the *same* signal; this explicit flag is the
+// primary guard and also covers a *different* fatal signal arriving mid-print
+// and a panic raised from inside the printer.
+// ---------------------------------------------------------------------------
+
+/// Process exit status used when the crash path faults a second time and the
+/// double-fault guard fires. Distinct from the ordinary crash-report exit
+/// (`_exit(1)`) so a supervisor or post-mortem can tell a *contained* double
+/// fault (the crash printer itself faulted) apart from a normal unrecoverable
+/// crash. `137` is the `128 + 9` shell convention for a SIGKILL-terminated
+/// process — a deliberately alarming, unmistakable sentinel that matches the
+/// brief's suggested `137 + double-fault marker` (VI.B #5) and is paired with
+/// the printed marker below so the value is never ambiguous.
+const ZAP_DOUBLE_FAULT_EXIT_CODE: u8 = 137;
+
+/// The fixed marker the double-fault path writes before aborting. A single
+/// static byte slice — no formatting, no allocation — so the write is
+/// async-signal-safe even from a half-destroyed crash context.
+const ZAP_DOUBLE_FAULT_MARKER = "** double fault while reporting a crash — aborting\n";
+
+/// Process-wide re-entrancy flag for the crash path. `false` until the first
+/// fatal event reaches `emitCrashReportWithBacktrace` (or a signal handler);
+/// flipped to `true` there. Plain `bool` mutated only through `@atomicRmw`,
+/// never a `std.atomic.Value`, so the guard is a single lock-free instruction
+/// usable from an async-signal context.
+var crash_report_in_progress: bool = false;
+
+/// Atomically claim the crash path. Returns `true` for the FIRST caller
+/// (which then proceeds into the full report) and `false` for every
+/// subsequent caller (a re-entrant double fault, which must divert to
+/// `doubleFaultAbort`). Implemented as a single `@atomicRmw .Xchg` with
+/// `.seq_cst` ordering: lock-free, allocation-free, and async-signal-safe —
+/// the only primitive safe to run from inside a signal handler that may have
+/// interrupted arbitrary code holding arbitrary locks.
+fn enterCrashReport() bool {
+    const was_in_progress = @atomicRmw(bool, &crash_report_in_progress, .Xchg, true, .seq_cst);
+    return !was_in_progress;
+}
+
+/// The minimal, bulletproof second-fault sink. Writes the fixed marker
+/// straight to stderr via `write(2)` and terminates with the distinct
+/// double-fault exit code. Performs NO symbolization, NO backtrace capture,
+/// NO allocation, and takes NO locks — every one of those is a thing that may
+/// have just faulted, so re-attempting them is exactly what would loop or
+/// deadlock. `_exit` (not `std.process.exit`) runs no `atexit` handlers, so it
+/// is safe from a signal context. `noinline` + `noreturn`.
+noinline fn doubleFaultAbort() noreturn {
+    posixWrite(STDERR_FD, ZAP_DOUBLE_FAULT_MARKER);
+    std.c._exit(ZAP_DOUBLE_FAULT_EXIT_CODE);
+}
+
+/// Test-only: clear the crash-path re-entrancy flag so a unit test can drive
+/// `enterCrashReport` deterministically across independent "crashes". Never
+/// called in production — the flag is one-shot for the life of a real process
+/// (which dies in the crash path). Guarded to `is_test` builds so it cannot be
+/// referenced from shipping code.
+fn resetCrashReportGuardForTesting() void {
+    comptime std.debug.assert(builtin.is_test);
+    @atomicStore(bool, &crash_report_in_progress, false, .seq_cst);
+}
+
 /// Render the `** (<kind>) <message>` header followed by an
 /// already-captured symbolized Zap backtrace (subject to `ZAP_BACKTRACE`),
 /// then terminate the process via `_exit` (which, unlike
@@ -7849,11 +7927,23 @@ fn crashReportSourceLocation(loc: std.debug.SourceLocation) void {
 /// and a signal handler captures from the interrupted CPU context rather
 /// than its own stack — so the capture cannot live here.
 ///
+/// Double-fault contained (Phase 2.e): the very first statement claims the
+/// crash path via `enterCrashReport`. If a fault *inside* this function (the
+/// stack walk, DWARF read, or sidecar lookup) re-enters here — or a different
+/// fatal signal is delivered mid-report — the re-entrant call takes
+/// `doubleFaultAbort` instead of recursing, so the printer can never loop or
+/// deadlock on the symbolizer mutex.
+///
 /// Pure `write`(2) + `_exit`; no allocation beyond the per-frame DWARF
 /// arena (page-allocator-backed, never libc `malloc`), so it is
 /// async-signal-safe. `crash_reporter_config` MUST already be populated
 /// (via `zapCrashReporterInit`, forced at startup by `memoryStartupForEntry`).
 fn emitCrashReportWithBacktrace(kind: []const u8, message: []const u8, bt: Backtrace) noreturn {
+    // Double-fault guard FIRST: before any work that could itself fault. If
+    // this is a re-entrant call (a fault while we were already printing, or a
+    // second fatal signal), abort minimally instead of recursing.
+    if (!enterCrashReport()) doubleFaultAbort();
+
     // Make sure any buffered stdout is flushed before the error text so the
     // report does not race ahead of the program's own output. `flushStdoutBuf`
     // is a plain `write`(2) — no allocation, no atexit.
@@ -8164,8 +8254,11 @@ pub const ZapPanic = struct {
 // the same unified `** (<kind>) <message>` + Zap backtrace as every other
 // crash path. It is async-signal-safe: pure `write`(2) + `_exit`, the
 // page-allocator-backed DWARF arena, and `SA_RESETHAND` so a fault *inside*
-// the handler falls back to the default disposition instead of looping
-// (the minimal double-fault guard; full double-fault policy is Phase 2.e).
+// the handler falls back to the default disposition instead of looping.
+// `SA_RESETHAND` is defense-in-depth; the primary double-fault guard is the
+// explicit `crash_report_in_progress` flag (Phase 2.e) checked at handler
+// entry and at the top of `emitCrashReportWithBacktrace`, which also catches
+// a *different* fatal signal (or an in-printer panic) that RESETHAND misses.
 // ---------------------------------------------------------------------------
 
 /// True on targets where the fork's `captureCurrentStackTrace` can unwind
@@ -8220,8 +8313,27 @@ fn zapSignalMessage(sig: std.posix.SIG) []const u8 {
 /// `SA_RESETHAND` was set at install time, so if unwinding or printing
 /// itself faults, the *second* delivery of that signal uses the default
 /// disposition and the process dies immediately instead of recursing.
+///
+/// Double-fault contained (Phase 2.e): `SA_RESETHAND` only catches
+/// re-delivery of the *same* signal. A *different* fatal signal arriving
+/// while the crash printer runs (e.g. a SIGSEGV during the symbolizer, then a
+/// SIGBUS) would re-enter this handler with a fresh disposition. The explicit
+/// `crash_report_in_progress` check below catches that: if a report is
+/// already underway, this is a second fault, so we abort minimally *before*
+/// touching the (possibly corrupt) CPU context — the context extraction and
+/// stack walk are themselves things that can fault, so they must not run a
+/// second time. The non-re-entrant first delivery falls through and claims
+/// the guard inside `emitCrashReportWithBacktrace`.
 fn zapSignalHandler(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) noreturn {
     _ = info;
+
+    // A report is already in progress: this signal interrupted the crash
+    // printer (or a sibling fatal signal beat it here). Diverting to the
+    // minimal abort BEFORE the context read/unwind avoids re-running the very
+    // work that may have just faulted. `@atomicLoad` (not `enterCrashReport`)
+    // so we observe-without-claiming — the single claim stays in `emit`.
+    if (@atomicLoad(bool, &crash_report_in_progress, .seq_cst)) doubleFaultAbort();
+
     const kind = zapSignalKind(sig);
     const message = zapSignalMessage(sig);
 
@@ -8247,7 +8359,8 @@ fn zapSignalHandler(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_pt
 /// that cannot unwind a signal context. Uses `SA_ONSTACK` so a
 /// stack-overflow SIGSEGV can still be handled on the alternate signal
 /// stack (configured by the std library when `signal_stack_size` is set),
-/// and `SA_RESETHAND` for the minimal double-fault guard.
+/// and `SA_RESETHAND` as defense-in-depth behind the explicit Phase 2.e
+/// `crash_report_in_progress` double-fault guard.
 fn installZapSignalHandlers() void {
     if (comptime !zap_signal_handlers_supported) return;
     if (zap_signal_handlers_installed) return;
@@ -19177,4 +19290,53 @@ test "Backtrace.capture skip drops leading frames" {
         // identical between the two calls — same call site).
         try std.testing.expectEqual(full.len - 1, skipped.len);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.e — double-fault containment guard.
+//
+// `emitCrashReportWithBacktrace` and the signal handler call
+// `enterCrashReport()` first. The first caller wins (gets `true` and proceeds
+// into the full report); any concurrent or nested second caller — a fault
+// while the printer is symbolizing, or a different fatal signal delivered
+// during the report — gets `false` and must take the minimal
+// `doubleFaultAbort()` path instead of recursing. The flag is a process-wide
+// atomic; `enterCrashReport` is a single `@atomicRmw .Xchg` (lock-free,
+// async-signal-safe). These tests drive the flag directly so the re-entrancy
+// decision is verified inside `zig build test` without actually `_exit`-ing.
+// ---------------------------------------------------------------------------
+
+test "enterCrashReport admits the first caller and rejects re-entry" {
+    resetCrashReportGuardForTesting();
+    defer resetCrashReportGuardForTesting();
+
+    // First entry: this is the genuine crash, proceed into the full report.
+    try std.testing.expect(enterCrashReport());
+    // Any further entry (a fault inside the printer, or a second signal) is a
+    // double fault: it must NOT be admitted, so the caller diverts to the
+    // minimal abort path instead of recursing into the full printer.
+    try std.testing.expect(!enterCrashReport());
+    try std.testing.expect(!enterCrashReport());
+}
+
+test "crash-report guard resets cleanly for an independent crash" {
+    // The flag is sticky for the life of one crash, but a fresh program
+    // start (modeled here by the reset helper) admits a first caller again.
+    resetCrashReportGuardForTesting();
+    try std.testing.expect(enterCrashReport());
+
+    resetCrashReportGuardForTesting();
+    try std.testing.expect(enterCrashReport());
+    try std.testing.expect(!enterCrashReport());
+
+    resetCrashReportGuardForTesting();
+}
+
+test "double-fault exit code is a documented distinct sentinel" {
+    // Distinct from the normal crash-report exit (`_exit(1)`), so a
+    // post-mortem can tell a contained double fault apart from an ordinary
+    // unrecoverable crash. Brief VI.B #5 suggests a `137 + marker` style
+    // sentinel; we pin the exact value so the contract is stable.
+    try std.testing.expectEqual(@as(u8, 137), ZAP_DOUBLE_FAULT_EXIT_CODE);
+    try std.testing.expect(ZAP_DOUBLE_FAULT_EXIT_CODE != 1);
 }
