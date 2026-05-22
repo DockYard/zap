@@ -7587,6 +7587,54 @@ pub const ZirDriver = struct {
                 try self.setLocal(bu.dest, result_ref);
             },
 
+            // Runtime type-test guard for a `ProtocolBox` (Phase 3.a). The
+            // companion of `protocol_box_unbox`: lowers to a call of the
+            // synthetic per-impl helper
+            //
+            //   const matches = @import("<Protocol>VTable_for_<Target>")
+            //                      .vtable_eq(box);
+            //
+            // which pointer-compares `box.vtable` against this impl's vtable
+            // instance constant (emitted in
+            // `emitProtocolVTableInstanceSourceFile`) and returns `bool`. The
+            // `rescue`-arm dispatch (`lowerRescueDispatch`) uses the result as
+            // the condition of the arm's `if`, so a boxed `Error` is matched
+            // against a specific concrete error type at runtime.
+            .protocol_box_vtable_eq => |ve| {
+                const instance_name = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}VTable_for_{s}",
+                    .{ ve.protocol_name, ve.target_type_name },
+                );
+                defer self.allocator.free(instance_name);
+
+                const instance_import = zir_builder_emit_import(
+                    self.handle,
+                    instance_name.ptr,
+                    @intCast(instance_name.len),
+                );
+                if (instance_import == error_ref) return error.EmitFailed;
+
+                const vtable_eq_fn = zir_builder_emit_field_val(
+                    self.handle,
+                    instance_import,
+                    "vtable_eq",
+                    9,
+                );
+                if (vtable_eq_fn == error_ref) return error.EmitFailed;
+
+                const box_ref = self.refForLocal(ve.box) catch return;
+                const args = [_]u32{box_ref};
+                const result_ref = zir_builder_emit_call_ref(
+                    self.handle,
+                    vtable_eq_fn,
+                    &args,
+                    1,
+                );
+                if (result_ref == error_ref) return error.EmitFailed;
+                try self.setLocal(ve.dest, result_ref);
+            },
+
             // Pattern matching — compare atom IDs (u32)
             .match_atom => |ma| {
                 // Scrutinee is already a u32 atom ID (from atomIntern).
@@ -9366,6 +9414,7 @@ pub const ZirDriver = struct {
             .box_as_protocol => |value| value.dest,
             .protocol_dispatch => |value| value.dest,
             .protocol_box_unbox => |value| value.dest,
+            .protocol_box_vtable_eq => |value| value.dest,
             .enum_literal => |value| value.dest,
             .field_get => |value| value.dest,
             .index_get => |value| value.dest,

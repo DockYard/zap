@@ -1276,6 +1276,13 @@ fn recordInstructionUses(
             // heap cell.
             try summary.recordUse(allocator, bu.box, false);
         },
+        .protocol_box_vtable_eq => |ve| {
+            // The runtime type-test guard (Phase 3.a) reads the box's
+            // vtable slot without transferring ownership; the box stays
+            // owned by the surrounding scope (the rescue landing pad),
+            // whose scope-exit drop pairs against the recovery.
+            try summary.recordUse(allocator, ve.box, false);
+        },
         .field_get => |fg| try summary.recordUse(allocator, fg.object, false),
         .field_set => |fs| {
             try summary.recordUse(allocator, fs.object, false);

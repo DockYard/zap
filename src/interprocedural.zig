@@ -719,6 +719,10 @@ pub const InterproceduralAnalyzer = struct {
                         try fresh_locals.put(bu.dest, {});
                     }
                 },
+                // The Phase 3.a runtime type-test guard yields a `bool`
+                // derived from the box's vtable slot — not an alias of the
+                // box, and never escaping. Nothing to track.
+                .protocol_box_vtable_eq => {},
 
                 .field_set => |fs| {
                     markEscapeToHeap(aliases, fs.value, param_summaries);

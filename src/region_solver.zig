@@ -578,6 +578,12 @@ pub const UseDefInfo = struct {
                 try info.recordDef(bu.dest, block);
                 try info.recordUse(bu.box, block);
             },
+            // The Phase 3.a runtime type-test guard defines its `bool`
+            // dest and uses the box's vtable slot.
+            .protocol_box_vtable_eq => |ve| {
+                try info.recordDef(ve.dest, block);
+                try info.recordUse(ve.box, block);
+            },
             .enum_literal => |el| try info.recordDef(el.dest, block),
 
             // Field access.

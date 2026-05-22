@@ -719,6 +719,11 @@ pub const GeneralizedEscapeAnalyzer = struct {
                 const box_escape = self.ctx.getEscape(.{ .function = func_id, .local = bu.box });
                 try self.setEscapeAndEnqueue(func_id, bu.dest, box_escape);
             },
+            // The Phase 3.a runtime type-test guard reads only the box's
+            // vtable slot and yields a `bool`. It stashes no reference, so
+            // the box does not escape and the scalar `dest` has no escape
+            // relationship to propagate.
+            .protocol_box_vtable_eq => {},
         }
     }
 

@@ -894,6 +894,12 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(v.target_type_name);
             hashZigType(hasher, v.target_zig_type);
         },
+        .protocol_box_vtable_eq => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.box));
+            hasher.update(v.protocol_name);
+            hasher.update(v.target_type_name);
+        },
         .enum_literal => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(v.type_name);
@@ -2361,6 +2367,13 @@ pub const Interpreter = struct {
                 try self.emitError(
                     .unsupported_instruction,
                     "protocol existential downcast is a runtime operation; cannot evaluate at compile time",
+                );
+                return error.CtfeFailure;
+            },
+            .protocol_box_vtable_eq => {
+                try self.emitError(
+                    .unsupported_instruction,
+                    "protocol existential vtable test is a runtime operation; cannot evaluate at compile time",
                 );
                 return error.CtfeFailure;
             },

@@ -3671,6 +3671,7 @@ pub fn collectUses(instr: ir.Instruction, buf: *UseList) void {
             for (x.args) |arg_local| buf.append(allocator, arg_local) catch {};
         },
         .protocol_box_unbox => |x| buf.append(allocator, x.box) catch {},
+        .protocol_box_vtable_eq => |x| buf.append(allocator, x.box) catch {},
         .enum_literal => {},
         .field_get => |x| buf.append(allocator, x.object) catch {},
         .field_set => |x| {

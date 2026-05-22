@@ -880,6 +880,15 @@ pub const Instruction = union(enum) {
     /// value typed as that concrete struct. See `ProtocolBoxUnbox`
     /// for the contract and lowering shape.
     protocol_box_unbox: ProtocolBoxUnbox,
+    /// Runtime type test for a protocol existential (Phase 3.a). Pointer-
+    /// compares a `ProtocolBox`'s vtable slot against the named per-impl
+    /// vtable instance constant, yielding a `bool` `dest`. The companion
+    /// guard of `protocol_box_unbox`: the rescue-arm dispatch emits this
+    /// as the `if`/`guard_block` condition that decides whether a boxed
+    /// `Error` carries a specific concrete impl, then `protocol_box_unbox`
+    /// recovers the concrete value once the test passed. See
+    /// `ProtocolBoxVtableEq` for the contract and lowering shape.
+    protocol_box_vtable_eq: ProtocolBoxVtableEq,
     enum_literal: EnumLiteral,
     field_get: FieldGet,
     field_set: FieldSet,
@@ -1135,6 +1144,12 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
             .protocol_name = try cloneBytes(allocator, value.protocol_name),
             .target_type_name = try cloneBytes(allocator, value.target_type_name),
             .target_zig_type = try cloneZigType(allocator, value.target_zig_type),
+        } },
+        .protocol_box_vtable_eq => |value| .{ .protocol_box_vtable_eq = .{
+            .dest = value.dest,
+            .box = value.box,
+            .protocol_name = try cloneBytes(allocator, value.protocol_name),
+            .target_type_name = try cloneBytes(allocator, value.target_type_name),
         } },
         .enum_literal => |value| .{ .enum_literal = .{
             .dest = value.dest,
@@ -1743,6 +1758,41 @@ pub const ProtocolBoxUnbox = struct {
     /// in practice but recorded structurally to keep the
     /// invariant local.
     target_zig_type: ZigType,
+};
+
+/// Payload for the `.protocol_box_vtable_eq` instruction (Phase 3.a).
+/// The runtime type-test guard that gates a `protocol_box_unbox`
+/// downcast. Lowers to a call of the synthetic per-impl helper
+/// `@import("<Protocol>VTable_for_<Target>").vtable_eq(box)` (emitted in
+/// `emitProtocolVTableInstanceSourceFile` alongside `unbox`/`drop`),
+/// which pointer-compares `box.vtable` against the address of this
+/// impl's vtable instance constant and returns `bool`.
+///
+/// The `rescue`-arm dispatch (`lowerRescueDispatch`) emits one of these
+/// per type-discriminating arm and uses its `dest` as the condition of
+/// the arm's `if`/`guard_block`: when the box's runtime concrete type is
+/// `target_type_name`, the arm fires (and `protocol_box_unbox`, when
+/// needed, recovers the concrete value); otherwise control flows to the
+/// next arm. This is the runtime realization of matching a boxed `Error`
+/// existential against a concrete error type — exactly the test #185
+/// requires so multi-clause `rescue` discriminates on the raised error's
+/// real type instead of always taking the first arm.
+pub const ProtocolBoxVtableEq = struct {
+    /// Destination local that receives the `bool` test result.
+    dest: LocalId,
+    /// Local holding the `runtime.ProtocolBox` scrutinee. Typed
+    /// `.protocol_box(protocol_name)`.
+    box: LocalId,
+    /// Bare protocol name (e.g. `"Error"`). Drives the
+    /// `@import("<Protocol>VTable_for_<Target>")` lookup for the
+    /// `vtable_eq` helper.
+    protocol_name: []const u8,
+    /// Mangled target concrete type name as it appears on the vtable
+    /// instance constant's suffix. Same shape
+    /// `BoxAsProtocol.target_type_name` / `ProtocolBoxUnbox.target_type_name`
+    /// use, so the guard names the same instance the box's vtable points
+    /// at when it carries this concrete impl.
+    target_type_name: []const u8,
 };
 
 pub const StructFieldInit = struct {
@@ -15672,6 +15722,35 @@ test "protocol_box_unbox instruction round-trips through cloneInstruction" {
     // Independent backing storage.
     try std.testing.expect(source.protocol_box_unbox.protocol_name.ptr != bu.protocol_name.ptr);
     try std.testing.expect(source.protocol_box_unbox.target_type_name.ptr != bu.target_type_name.ptr);
+}
+
+test "protocol_box_vtable_eq instruction round-trips through cloneInstruction" {
+    // Phase 3.a runtime type-test guard. Same clone-independence
+    // contract as `protocol_box_unbox`: every owned byte-slice payload
+    // must get its own backing storage so monomorphizer clones never
+    // alias the original program's interned names.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source: Instruction = .{ .protocol_box_vtable_eq = .{
+        .dest = 7,
+        .box = 2,
+        .protocol_name = "Error",
+        .target_type_name = "NetError",
+    } };
+
+    const cloned = try cloneInstruction(alloc, source);
+    try std.testing.expect(cloned == .protocol_box_vtable_eq);
+    const ve = cloned.protocol_box_vtable_eq;
+    try std.testing.expectEqual(@as(LocalId, 7), ve.dest);
+    try std.testing.expectEqual(@as(LocalId, 2), ve.box);
+    try std.testing.expectEqualStrings("Error", ve.protocol_name);
+    try std.testing.expectEqualStrings("NetError", ve.target_type_name);
+
+    // Independent backing storage.
+    try std.testing.expect(source.protocol_box_vtable_eq.protocol_name.ptr != ve.protocol_name.ptr);
+    try std.testing.expect(source.protocol_box_vtable_eq.target_type_name.ptr != ve.target_type_name.ptr);
 }
 
 test "findProtocolImplVTable resolves concrete (protocol, target) pair" {
