@@ -362,6 +362,10 @@ pub const Collector = struct {
                     .filter = .all,
                     .imported_families = std.AutoHashMap(scope.FamilyKey, scope.FunctionFamilyId).init(self.allocator),
                     .imported_types = std.AutoHashMap(ast.StringId, scope.TypeId).init(self.allocator),
+                    // Implicit Elixir-style auto-import: explicit `use`/`import`
+                    // declarations in the struct body shadow it for same-named
+                    // macros/symbols (see ImportedScope.is_implicit).
+                    .is_implicit = true,
                 });
             }
         }

@@ -241,6 +241,16 @@ pub const ImportedScope = struct {
     filter: ImportFilter,
     imported_families: std.AutoHashMap(FamilyKey, FunctionFamilyId),
     imported_types: std.AutoHashMap(ast.StringId, TypeId),
+    /// True for the implicit Elixir-style `Kernel` auto-import that the
+    /// collector injects into every struct. Explicit `use`/`import`
+    /// declarations are NOT implicit. Macro/symbol resolution prefers
+    /// explicit imports over the implicit Kernel one so a struct that
+    /// `use`s a library defining a same-named macro (e.g. Zest.Case's
+    /// `assert`/`reject`, which must shadow Kernel's contract-based
+    /// `assert`) sees the explicit import win the tie. Without this, the
+    /// auto-import — appended first, at scope-collection time, before any
+    /// `use` in the struct body — would always out-rank explicit imports.
+    is_implicit: bool = false,
 };
 
 pub const ImportFilter = union(enum) {
@@ -973,15 +983,33 @@ pub const ScopeGraph = struct {
             if (s.macros.get(key)) |mid| {
                 return mid;
             }
-            for (s.imports.items) |imp| {
-                if (self.findStructScope(imp.source_struct)) |mod_scope_id| {
-                    const mod_scope = self.getScope(mod_scope_id);
-                    if (mod_scope.macros.get(key)) |mid| {
-                        if (self.passesImportFilter(imp.filter, key)) return mid;
-                    }
+            // Explicit `use`/`import` declarations take precedence over the
+            // implicit Kernel auto-import: scan explicit imports first, then
+            // the implicit one. This lets a struct that `use`s a library with
+            // a same-named macro (e.g. Zest.Case's recoverable `assert`)
+            // shadow Kernel's contract-based `assert`, even though the
+            // auto-import was appended to `s.imports` before the `use`.
+            if (self.resolveMacroFromImports(s, key, false)) |mid| return mid;
+            if (self.resolveMacroFromImports(s, key, true)) |mid| return mid;
+            current = s.parent;
+        }
+        return null;
+    }
+
+    /// Scan a scope's imports for a macro `key`, considering only imports
+    /// whose `is_implicit` matches `implicit`. Returns the first match that
+    /// passes the import filter. Splitting explicit (`implicit=false`) from
+    /// implicit (`implicit=true`) lets `resolveMacro` give explicit `use`/
+    /// `import` precedence over the Kernel auto-import.
+    fn resolveMacroFromImports(self: *const ScopeGraph, s: *const Scope, key: FamilyKey, implicit: bool) ?MacroFamilyId {
+        for (s.imports.items) |imp| {
+            if (imp.is_implicit != implicit) continue;
+            if (self.findStructScope(imp.source_struct)) |mod_scope_id| {
+                const mod_scope = self.getScope(mod_scope_id);
+                if (mod_scope.macros.get(key)) |mid| {
+                    if (self.passesImportFilter(imp.filter, key)) return mid;
                 }
             }
-            current = s.parent;
         }
         return null;
     }
