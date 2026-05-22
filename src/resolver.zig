@@ -383,6 +383,7 @@ pub const Resolver = struct {
                     .function => |func| try self.resolveExpr(func),
                 }
             },
+            .try_expr => |te| try self.resolveExpr(te.value),
             .for_expr => |fe| {
                 try self.resolveExpr(fe.iterable);
                 if (fe.filter) |f| try self.resolveExpr(f);
