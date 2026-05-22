@@ -9726,6 +9726,18 @@ pub const ZirDriver = struct {
     /// crossed the prong's AIR body boundary and produced a malformed
     /// coercion `ty_op` that tripped AIR Liveness whenever a prong body
     /// contained a call.)
+    ///
+    /// The prong body instruction list is collected through the builder's
+    /// `begin_capture`/`end_capture` mechanism rather than a naive contiguous
+    /// `inst_count` range. A `call` ZIR instruction emits nested arg
+    /// sub-bodies (`break_inline` per argument) that are NOT top-level body
+    /// instructions — they belong to the call's own arg bodies, referenced by
+    /// index from the `call` payload. The capture mechanism records only the
+    /// top-level (would-be-body) instruction indices, excluding those nested
+    /// sub-body insts; a contiguous range would wrongly fold them into the
+    /// prong body and desync Sema's switch-case body bounds, manifesting as a
+    /// wrong-active-union-field (`ty_op`) panic in AIR Liveness whenever a
+    /// prong body contained a call.
     fn emitSwitchProngBody(
         self: *ZirDriver,
         instrs: []const ir.Instruction,
@@ -9738,19 +9750,16 @@ pub const ZirDriver = struct {
         self.current_case_dest = case_dest;
         defer self.current_case_dest = saved_case_dest;
 
-        zir_builder_set_body_tracking(self.handle, false);
-        const body_start = zir_builder_get_inst_count(self.handle);
-
+        zir_builder_begin_capture(self.handle);
         for (instrs) |bi| {
             try self.emitInstruction(bi);
         }
+        var captured_len: u32 = 0;
+        const captured_ptr = zir_builder_end_capture(self.handle, &captured_len);
 
-        const body_end = zir_builder_get_inst_count(self.handle);
-        zir_builder_set_body_tracking(self.handle, true);
-
-        const body_len = body_end - body_start;
-        for (body_start..body_end) |inst_i| {
-            try out_insts.append(self.allocator, @intCast(inst_i));
+        const body_len = captured_len;
+        for (captured_ptr[0..captured_len]) |inst_i| {
+            try out_insts.append(self.allocator, inst_i);
         }
 
         const result_ref: u32 = if (explicit_result) |rv|
