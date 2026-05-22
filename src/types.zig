@@ -459,6 +459,16 @@ pub const TypeStore = struct {
         return switch (typ) {
             .struct_type => |s| interner.get(s.name),
             .tagged_union => |tu| interner.get(tu.name),
+            // A parametric instantiation `Foo(T)` carries the bare nominal
+            // name on its `base` declaration. Resolving to the base name
+            // is what lets a concrete instantiation (`DeserializeError(Atom)`)
+            // match a parametric `impl P for Foo(t)` whose registered
+            // target_type is the bare `Foo` — the protocol-dispatch
+            // satisfaction check (`implTargetForProtocolArgument`) compares
+            // this name against the impl target. Without it a parametric
+            // `pub error Foo(t)` value is rejected as "does not satisfy
+            // `Error`" (G2, round 2).
+            .applied => |applied_type| self.typeToStructName(applied_type.base, interner),
             .list => "List",
             .map => "Map",
             .string_type => "String",
