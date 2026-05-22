@@ -154,6 +154,8 @@ pub fn main(init: std.process.Init) !void {
         try cmdDoc(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "explain")) {
         try cmdExplain(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "addr2line")) {
+        try cmdAddr2line(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "__manifest-incremental-daemon")) {
         if (args.len != 3) {
             std.process.exit(2);
@@ -189,6 +191,9 @@ fn printUsage() void {
         \\  deps update       Re-resolve all dependencies and rewrite zap.lock
         \\  deps update <name> Re-resolve a single dependency
         \\  explain Zxxxx     Print the long-form explanation for a diagnostic code
+        \\  addr2line <bin> <addr>...  Symbolize crash-report addresses against a
+        \\                    (possibly stripped) binary + its .dSYM/split-debug
+        \\                    artifact and .zap-symbols sidecar
         \\
         \\Build flags (Zig build-system syntax; one shared pipeline for
         \\build + run, manifest + script — the CLI overrides the manifest):
@@ -2012,6 +2017,186 @@ fn printCatalogEntry(entry: zap.error_codes.CatalogEntry) void {
     if (entry.fix.len > 0) {
         std.debug.print("\nFix:\n  {s}\n", .{entry.fix});
     }
+}
+
+// ---------------------------------------------------------------------------
+// Command: addr2line
+//
+// Offline post-mortem symbolizer. Resolves machine addresses — typically the
+// `0x<addr>` frames a release crash report prints when the stripped binary
+// can't symbolize itself — against a (possibly stripped, possibly
+// cross-compiled) Zap binary plus its split-debug artifact (`.dSYM` /
+// embedded DWARF) and `.zap-symbols` sidecar, printing the same
+// `Struct.local/arity at file.zap:line` rendering as the in-process printer.
+//
+// All the debug-info machinery lives in `zap.addr2line.Resolver` (which
+// reuses the fork's `std.debug` DWARF reader + the in-repo `zap_symbol_table`
+// Reader); this command is the thin CLI wrapper, mirroring `cmdExplain`.
+// ---------------------------------------------------------------------------
+
+const Addr2LineUsage =
+    \\Usage: zap addr2line <binary> [<addr>...] [--load-address <addr>]
+    \\
+    \\Symbolize one or more addresses against a (possibly stripped) Zap binary
+    \\using its split-debug artifact (.dSYM / embedded DWARF) and .zap-symbols
+    \\sidecar. Addresses are STATIC image virtual addresses (the space a Zap
+    \\crash report's `0x<addr>` frames already use). With no addresses on the
+    \\command line, addresses are read one per line from stdin.
+    \\
+    \\Options:
+    \\  --load-address <addr>, -l <addr>
+    \\        Runtime load base of the binary's first text segment. When the
+    \\        input addresses are raw ASLR-slid runtime addresses (e.g. from a
+    \\        non-Zap tool), pass the segment's runtime base so the slide is
+    \\        subtracted before lookup. Omit for static addresses.
+    \\
+    \\Each address resolves to one of:
+    \\  0x<addr> Struct.local/arity at file.zap:line   (full Zap symbol)
+    \\  0x<addr> <mangled> at file.zap:line             (no sidecar entry)
+    \\  0x<addr> ?? at ??:0                             (no debug info)
+    \\
+;
+
+/// Parse a `0x`-prefixed hex or bare decimal address. Tolerates surrounding
+/// whitespace (so stdin lines and copy-pasted report fragments work).
+fn parseAddress(raw: []const u8) ?u64 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (std.mem.startsWith(u8, trimmed, "0x") or std.mem.startsWith(u8, trimmed, "0X")) {
+        return std.fmt.parseInt(u64, trimmed[2..], 16) catch null;
+    }
+    return std.fmt.parseInt(u64, trimmed, 10) catch null;
+}
+
+fn cmdAddr2line(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var binary_path: ?[]const u8 = null;
+    var load_address: ?u64 = null;
+    var address_args: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer address_args.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--load-address") or std.mem.eql(u8, arg, "-l")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("Error: {s} requires an address argument\n", .{arg});
+                std.process.exit(2);
+            }
+            i += 1;
+            load_address = parseAddress(args[i]) orelse {
+                std.debug.print("Error: `{s}` is not a valid address for {s}\n", .{ args[i], arg });
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            std.debug.print("{s}", .{Addr2LineUsage});
+            std.process.exit(0);
+        } else if (binary_path == null) {
+            binary_path = arg;
+        } else {
+            try address_args.append(allocator, arg);
+        }
+    }
+
+    const binary = binary_path orelse {
+        std.debug.print("{s}", .{Addr2LineUsage});
+        std.process.exit(2);
+    };
+
+    // Collect the address strings: from the command line, or — when none were
+    // given — one per line from stdin (so a captured report can be piped in).
+    var addresses: std.ArrayListUnmanaged(u64) = .empty;
+    defer addresses.deinit(allocator);
+    var stdin_buf: ?[]u8 = null;
+    defer if (stdin_buf) |b| allocator.free(b);
+
+    if (address_args.items.len > 0) {
+        for (address_args.items) |raw| {
+            const addr = parseAddress(raw) orelse {
+                std.debug.print("Error: `{s}` is not a valid address (use 0x<hex> or <decimal>)\n", .{raw});
+                std.process.exit(2);
+            };
+            try addresses.append(allocator, addr);
+        }
+    } else {
+        var stdin_read_buf: [4096]u8 = undefined;
+        // Streaming (not positional): stdin is typically a pipe/tty with no
+        // seek, so positional reads would fail.
+        var stdin_reader = std.Io.File.stdin().readerStreaming(global_io, &stdin_read_buf);
+        const data: []u8 = stdin_reader.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch &.{};
+        if (data.len > 0) stdin_buf = data;
+        var lines = std.mem.tokenizeAny(u8, data, "\r\n");
+        while (lines.next()) |line| {
+            if (parseAddress(line)) |addr| try addresses.append(allocator, addr);
+        }
+        if (addresses.items.len == 0) {
+            std.debug.print("Error: no addresses given (pass them as arguments or pipe them on stdin)\n\n{s}", .{Addr2LineUsage});
+            std.process.exit(2);
+        }
+    }
+
+    var resolver = zap.addr2line.Resolver.open(allocator, global_io, binary) catch |err| switch (err) {
+        error.InvalidBinary => {
+            std.debug.print("Error: could not open `{s}` as a debug-info-bearing binary.\n", .{binary});
+            std.process.exit(1);
+        },
+        error.UnsupportedObjectFormat => {
+            std.debug.print("Error: this build of `zap` cannot symbolize the object format of `{s}`.\n", .{binary});
+            std.process.exit(1);
+        },
+        error.OutOfMemory => return err,
+    };
+    defer resolver.deinit();
+
+    if (!resolver.hasSidecar()) {
+        std.debug.print(
+            "note: no `{s}.zap-symbols` sidecar found — reporting mangled linker names.\n",
+            .{binary},
+        );
+    }
+
+    // A per-call arena backs the DWARF source-path strings for each frame.
+    var text_arena = std.heap.ArenaAllocator.init(allocator);
+    defer text_arena.deinit();
+
+    for (addresses.items) |runtime_addr| {
+        // Translate a runtime (ASLR-slid) address to a static image address
+        // when a load base was supplied; otherwise the input is already
+        // static (a Zap report prints static addresses).
+        const static_addr = if (load_address) |base|
+            (if (runtime_addr >= base) runtime_addr - base else runtime_addr)
+        else
+            runtime_addr;
+
+        const frame = resolver.resolve(text_arena.allocator(), static_addr);
+        printAddr2LineFrame(frame);
+    }
+}
+
+/// Render one resolved frame in the crash-report style:
+/// `0x<addr> Struct.local/arity at file.zap:line`. Falls back to the mangled
+/// name when the sidecar has no entry, and to `??` markers when DWARF is
+/// unavailable, so every input address produces exactly one output line.
+fn printAddr2LineFrame(frame: zap.addr2line.Frame) void {
+    std.debug.print("0x{x} ", .{frame.address});
+
+    if (frame.zap) |z| {
+        if (z.zap_struct) |struct_name| {
+            std.debug.print("{s}.", .{struct_name});
+        }
+        std.debug.print("{s}/{d}", .{ z.zap_local, z.zap_arity });
+    } else if (frame.mangled) |mangled| {
+        std.debug.print("{s}", .{mangled});
+    } else {
+        std.debug.print("??", .{});
+    }
+
+    if (frame.source) |loc| {
+        const file_name = if (loc.file_name.len > 0) loc.file_name else "??";
+        std.debug.print(" at {s}:{d}", .{ file_name, loc.line });
+    } else {
+        std.debug.print(" at ??:0", .{});
+    }
+    std.debug.print("\n", .{});
 }
 
 fn cmdInit(allocator: std.mem.Allocator) !void {

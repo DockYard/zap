@@ -7579,6 +7579,13 @@ const CrashReporterConfig = struct {
     /// `null` until the side-table load has been attempted. After that,
     /// either a valid reader or `null` (absent/corrupt → mangled fallback).
     symbols: ?ZapSymbolReader = null,
+    /// The runtime ASLR slide of the main executable image, computed ONCE at
+    /// startup (`zapCrashReporterInit`). Subtracted from the runtime return
+    /// addresses before the `0x<addr>` fallback is printed, so the report
+    /// emits STATIC (file-relative) addresses: they do not leak the process's
+    /// load layout (brief VI.B #9) and `zap addr2line <bin> 0x<addr>` resolves
+    /// them directly offline against the binary's static symtab/DWARF.
+    image_slide: usize = 0,
 };
 
 var crash_reporter_config: CrashReporterConfig = .{};
@@ -7619,6 +7626,43 @@ fn loadZapSymbols() ?ZapSymbolReader {
     return ZapSymbolReader.init(bytes);
 }
 
+/// Compute the main executable's runtime ASLR slide ONCE, at startup — NOT
+/// from a signal context. The dyld / loader queries used here take loader
+/// locks and are not async-signal-safe, which is exactly why this is cached
+/// eagerly by `zapCrashReporterInit` (run before any user code) and the crash
+/// path only ever reads the cached `image_slide`.
+///
+/// macOS: image index 0 is always the main executable, and
+/// `_dyld_get_image_vmaddr_slide(0)` returns its slide (the same value `atos
+/// -s` / crash reporters use). Linux/ELF: the first object `dl_iterate_phdr`
+/// visits is the main program; its `dlpi_addr` is the load bias. Other targets
+/// (or a static no-PIE image): slide is 0, so static == runtime.
+fn mainImageSlide() usize {
+    switch (comptime builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => {
+            if (std.c._dyld_image_count() == 0) return 0;
+            return std.c._dyld_get_image_vmaddr_slide(0);
+        },
+        .linux => {
+            if (comptime builtin.object_format != .elf) return 0;
+            const Finder = struct {
+                /// `dl_iterate_phdr` visits the main program first; capture its
+                /// load bias and stop (returning non-zero ends iteration).
+                fn callback(info: *std.c.dl_phdr_info, size: usize, data: ?*anyopaque) callconv(.c) c_int {
+                    _ = size;
+                    const out: *usize = @ptrCast(@alignCast(data.?));
+                    out.* = @intCast(info.addr);
+                    return 1;
+                }
+            };
+            var slide: usize = 0;
+            _ = std.c.dl_iterate_phdr(Finder.callback, &slide);
+            return slide;
+        },
+        else => return 0,
+    }
+}
+
 /// Read `ZAP_BACKTRACE`, `NO_COLOR`, and the stderr-TTY state ONCE and cache
 /// them, then load the side-table once. Idempotent. Safe to call eagerly at
 /// program start (preferred — see the section comment) or lazily on the
@@ -7639,6 +7683,11 @@ pub fn zapCrashReporterInit() void {
     crash_reporter_config.use_color = !no_color_set and std.c.isatty(STDERR_FD) != 0;
 
     crash_reporter_config.symbols = loadZapSymbols();
+
+    // Cache the main-image ASLR slide now (startup, non-signal context) so the
+    // crash path can render static addresses without any async-signal-unsafe
+    // dyld/loader query.
+    crash_reporter_config.image_slide = mainImageSlide();
 }
 
 /// True when absolute paths must be stripped to their basename in crash
@@ -7753,11 +7802,14 @@ fn crashReportFrame(addr: usize) FrameAction {
     const source: ?std.debug.SourceLocation = if (info) |i| i.source else null;
 
     if (name == null or name.?.len == 0) {
-        // No symbol: emit the raw address as an offset so a post-mortem tool
-        // can still resolve it. Brief VI.B #9: prefer offsets when
-        // symbolication is unavailable.
+        // No symbol: emit the STATIC (de-slid) address so a post-mortem tool
+        // can resolve it offline against the binary's static symtab/DWARF, and
+        // so the report doesn't leak the process's ASLR layout. Brief VI.B #9:
+        // prefer offsets when symbolication is unavailable. `zap addr2line
+        // <bin> 0x<addr>` consumes exactly this value.
+        const static_addr = call_site_addr -% crash_reporter_config.image_slide;
         posixWrite(STDERR_FD, "  0x");
-        crashWriteUnsignedHex(call_site_addr);
+        crashWriteUnsignedHex(static_addr);
         // Still print a source location if DWARF had one.
         if (source) |loc| crashReportSourceLocation(loc);
         posixWrite(STDERR_FD, "\n");
