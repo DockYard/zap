@@ -967,6 +967,15 @@ pub const Instruction = union(enum) {
     int_widen: NumericWiden,
     float_widen: NumericWiden,
 
+    /// Typed-undefined placeholder: `@as(ty, undefined)`. Produces a value of
+    /// `ty` whose contents are `undefined`. Used to materialize a value for a
+    /// control-flow merge edge that is statically dead at runtime but must
+    /// still type-check at the merge's peer type — e.g. the normal-completion
+    /// (else) branch of a `try`/`rescue` landing pad whose `try` body
+    /// unconditionally raises (Phase 3.a). The value is never read on a live
+    /// path, so leaving it `undefined` is correct, not a hack.
+    typed_undef: TypedUndef,
+
     // Phi
     phi: Phi,
 
@@ -1341,6 +1350,10 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
             .dest = value.dest,
             .source = value.source,
             .dest_type = try cloneZigType(allocator, value.dest_type),
+        } },
+        .typed_undef => |value| .{ .typed_undef = .{
+            .dest = value.dest,
+            .ty = try cloneZigType(allocator, value.ty),
         } },
         .phi => |value| .{ .phi = .{
             .dest = value.dest,
@@ -2272,6 +2285,14 @@ pub const NumericWiden = struct {
     dest: LocalId,
     source: LocalId,
     dest_type: ZigType,
+};
+
+/// Payload for the `.typed_undef` instruction. Lowers to `@as(ty, undefined)`
+/// — a value of `ty` whose contents are `undefined`. The producing edge must
+/// be statically dead at runtime (the value is never read on a live path).
+pub const TypedUndef = struct {
+    dest: LocalId,
+    ty: ZigType,
 };
 
 pub const LiteralValue = union(enum) {
@@ -6870,6 +6891,11 @@ pub const IrBuilder = struct {
     /// no `setjmp`, no per-body thunk — the body and handler live in the same
     /// function, and the branch is the handler landing pad.
     fn lowerTryRescue(self: *IrBuilder, tr: hir_mod.TryRescueHir, dest: LocalId) anyerror!void {
+        // Instructions for the landing-pad `if`'s else (normal-completion)
+        // branch. Populated below only when the normal edge needs a typed
+        // placeholder (see step 4); otherwise it stays empty.
+        var else_branch_instrs: std.ArrayListUnmanaged(Instruction) = .empty;
+
         // 1. Run the body. Its tail value is captured for the no-raise edge.
         var body_result: ?LocalId = null;
         for (tr.body.stmts) |stmt| {
@@ -6899,17 +6925,64 @@ pub const IrBuilder = struct {
         const then_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
         self.current_instrs = saved_then;
 
-        // 4. Normal branch (no raise): yield the body's value.
-        const else_result = body_result;
+        // 4. Normal branch (no raise): yield the body's value, peer-typed to
+        //    the whole expression's joined result type.
+        //
+        //    The two `if` branches merge into one value (`dest`), so Sema
+        //    peer-resolves the then-ref (the rescue dispatch result, typed at
+        //    the joined result type) against the else-ref (the body's normal
+        //    completion value). When the body's tail value already has the
+        //    joined type, it flows straight through. But when the body
+        //    unconditionally raises, its tail is a `Never`-stamped recoverable
+        //    raise whose runtime value is `Nil` (the `recoverable_raise` stdlib
+        //    fn returns `Nil` and falls through to this landing pad) — typing
+        //    the else edge as `void`, which would clash with the rescue arms'
+        //    type (the original Blocker 1: `incompatible types '…' and 'void'`).
+        //    That normal-completion edge is statically dead in the
+        //    unconditional-raise case (a raise fired, so `raise_occurred()` is
+        //    true and the then-branch is taken), so we materialize a
+        //    `typed_undef` of the joined type for it: a never-read placeholder
+        //    that gives the merge a clean peer type. This is a real, general IR
+        //    primitive for a dead merge edge, not a special case.
+        const else_result: ?LocalId = blk: {
+            const joined = tr.result_type_id;
+            // No joined type to coerce toward (e.g. a `try` whose value is
+            // discarded): pass the body value through unchanged.
+            if (joined == types_mod.TypeStore.UNKNOWN or
+                joined == types_mod.TypeStore.NIL or
+                joined == types_mod.TypeStore.NEVER)
+            {
+                break :blk body_result;
+            }
+            // If the body produced a real tail value already typed at the
+            // joined type, use it directly — the normal edge is live and
+            // carries the value.
+            if (body_result) |br| {
+                const tail_type = self.local_hir_types.get(br) orelse types_mod.TypeStore.UNKNOWN;
+                if (tail_type == joined) break :blk br;
+            }
+            // Otherwise the normal-completion edge is statically dead (the body
+            // diverged via a recoverable raise, or its tail type does not match
+            // the join). Yield a typed-undefined placeholder of the joined type.
+            const placeholder = self.next_local;
+            self.next_local += 1;
+            const joined_zig = typeIdToZigTypeWithStore(joined, self.type_store);
+            try else_branch_instrs.append(self.allocator, .{
+                .typed_undef = .{ .dest = placeholder, .ty = joined_zig },
+            });
+            try self.local_hir_types.put(placeholder, joined);
+            break :blk placeholder;
+        };
 
         // 5. Emit the landing-pad `if`.
+        const else_instrs = try else_branch_instrs.toOwnedSlice(self.allocator);
         try self.current_instrs.append(self.allocator, .{
             .if_expr = .{
                 .dest = dest,
                 .condition = flag_local,
                 .then_instrs = then_instrs,
                 .then_result = handler_dest,
-                .else_instrs = &.{},
+                .else_instrs = else_instrs,
                 .else_result = else_result,
             },
         });

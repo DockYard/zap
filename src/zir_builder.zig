@@ -8620,6 +8620,19 @@ pub const ZirDriver = struct {
                 try self.setLocal(nw.dest, ref);
             },
 
+            // Typed-undefined placeholder — emit `@as(ty, undefined)`. The
+            // `undef` interned ref carries no type, so coerce it to `ty` via
+            // `as` to give the merge edge a peer-resolvable typed value. Use
+            // the full imported-type-ref path so the placeholder works for any
+            // joined type (String, struct, protocol_box, optional, …), not
+            // just primitives.
+            .typed_undef => |tu| {
+                const ty_ref = try self.emitImportedTypeRef(tu.ty);
+                const ref = zir_builder_emit_as(self.handle, ty_ref, @intFromEnum(Zir.Inst.Ref.undef));
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(tu.dest, ref);
+            },
+
             .phi => {},
         }
     }
@@ -9370,6 +9383,7 @@ pub const ZirDriver = struct {
             .bin_match_prefix => |value| value.dest,
             .int_widen => |value| value.dest,
             .float_widen => |value| value.dest,
+            .typed_undef => |value| value.dest,
             .phi => |value| value.dest,
             .reset => |value| value.dest,
             .reuse_alloc => |value| value.dest,

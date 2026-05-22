@@ -287,6 +287,15 @@ pub const TryRescueHir = struct {
     take_raise_call: *const Expr,
     /// The optional `after` cleanup block (finally-semantics).
     after_block: ?*const Block,
+    /// The joined result type of the whole `try`/`rescue` expression — the
+    /// peer type of the body's success value and every rescue arm's result
+    /// (computed by `buildTryRescue` the same way the type checker's
+    /// `.try_rescue` arm does). The IR lowering uses this to coerce the
+    /// normal-completion (else) branch of the landing-pad `if` so it shares
+    /// the rescue arms' Sema peer type even when the body unconditionally
+    /// raises (its tail value is then a `Never`-stamped recoverable raise,
+    /// which would otherwise type as `void` and clash with the arms).
+    result_type_id: types_mod.TypeId,
 };
 
 pub const UnionInitExpr = struct {
@@ -6189,12 +6198,25 @@ pub const HirBuilder = struct {
         const take_raise_call = try self.buildKernelZeroArgCall("take_recoverable_raise", tr.meta);
 
         // The result type is the join of the body's success type and the
-        // rescue arms' result types (computed the same way `case` does).
+        // rescue arms' result types (computed the same way the type checker's
+        // `.try_rescue` arm does in src/types.zig). A `NEVER` body type (the
+        // body unconditionally raises — its tail is a `Never`-stamped
+        // recoverable raise) or a `NIL`/`UNKNOWN` body type is *absorbable*:
+        // the join settles on the first concrete arm type. This mirrors the
+        // type checker's discharge rule (`result_type == NIL or UNKNOWN ->
+        // adopt clause type`) so HIR and the type checker agree, and — crucially
+        // — so `lowerTryRescue` receives the true joined type (e.g. `String`)
+        // rather than `UNKNOWN`, which it needs to coerce the normal-completion
+        // (else) branch of the landing-pad `if` to the same peer type as the
+        // rescue arms.
         var result_type: types_mod.TypeId = body.result_type;
         for (arm_slice) |arm| {
             const t = arm.body.result_type;
             if (t == types_mod.TypeStore.UNKNOWN) continue;
-            if (result_type == types_mod.TypeStore.UNKNOWN) {
+            if (result_type == types_mod.TypeStore.UNKNOWN or
+                result_type == types_mod.TypeStore.NIL or
+                result_type == types_mod.TypeStore.NEVER)
+            {
                 result_type = t;
                 continue;
             }
@@ -6212,6 +6234,7 @@ pub const HirBuilder = struct {
                 .raise_occurred_call = raise_occurred_call,
                 .take_raise_call = take_raise_call,
                 .after_block = after_block,
+                .result_type_id = result_type,
             } },
             .type_id = result_type,
             .span = tr.meta.span,

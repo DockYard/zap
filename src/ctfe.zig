@@ -1208,6 +1208,10 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(std.mem.asBytes(&v.source));
             hashZigType(hasher, v.dest_type);
         },
+        .typed_undef => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hashZigType(hasher, v.ty);
+        },
         .phi => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             for (v.sources) |src| {
@@ -2357,6 +2361,20 @@ pub const Interpreter = struct {
                 try self.emitError(
                     .unsupported_instruction,
                     "protocol existential downcast is a runtime operation; cannot evaluate at compile time",
+                );
+                return error.CtfeFailure;
+            },
+
+            // Phase 3.a: typed-undefined placeholder for the statically-dead
+            // normal-completion edge of a `try`/`rescue` landing pad. It only
+            // appears in IR-lowered runtime control flow (the IR builder emits
+            // it in `lowerTryRescue`), never in a comptime-evaluated function,
+            // so the pipeline never feeds it to the interpreter. Reject loudly
+            // if that invariant ever drifts rather than fabricating a value.
+            .typed_undef => {
+                try self.emitError(
+                    .unsupported_instruction,
+                    "typed-undefined placeholder is a runtime dead-edge value; cannot evaluate at compile time",
                 );
                 return error.CtfeFailure;
             },

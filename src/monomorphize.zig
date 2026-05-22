@@ -1707,6 +1707,10 @@ const MonomorphContext = struct {
                     .raise_occurred_call = try self.cloneExpr(tr.raise_occurred_call),
                     .take_raise_call = try self.cloneExpr(tr.take_raise_call),
                     .after_block = if (tr.after_block) |cleanup| try self.cloneBlock(cleanup) else null,
+                    .result_type_id = if (self.current_subs) |subs|
+                        try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, tr.result_type_id))
+                    else
+                        try self.applyActiveProtocolParamTypes(tr.result_type_id),
                 } };
             },
             .error_pipe => |ep| blk: {

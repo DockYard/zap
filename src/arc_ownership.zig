@@ -1366,6 +1366,9 @@ fn recordInstructionUses(
             if (ra.token) |t| try summary.recordUse(allocator, t, false);
         },
         .int_widen, .float_widen => |nw| try summary.recordUse(allocator, nw.source, false),
+        // Typed-undefined placeholder uses no locals — its operand is the
+        // interned `undef` value.
+        .typed_undef => {},
         .phi => |p| {
             for (p.sources) |src| try summary.recordUse(allocator, src.value, false);
         },

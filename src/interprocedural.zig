@@ -1119,6 +1119,11 @@ pub const InterproceduralAnalyzer = struct {
                     }
                     try fresh_locals.put(nw.dest, {});
                 },
+                // Typed-undefined placeholder produces a fresh local that
+                // aliases no parameter — its operand is the interned `undef`.
+                .typed_undef => |tu| {
+                    try fresh_locals.put(tu.dest, {});
+                },
                 .switch_tag => {},
                 .branch, .cond_branch, .jump, .case_break, .match_fail, .match_error_return => {},
                 .set_safety => {},

@@ -876,6 +876,11 @@ pub const UseDefInfo = struct {
                 try info.recordDef(nw.dest, block);
                 try info.recordUse(nw.source, block);
             },
+            // Typed-undefined placeholder defines a dest but uses no locals
+            // (its operand is the interned `undef`).
+            .typed_undef => |tu| {
+                try info.recordDef(tu.dest, block);
+            },
 
             // Non-data instructions.
             .branch, .jump, .match_fail, .match_error_return => {},

@@ -3830,6 +3830,9 @@ pub fn collectUses(instr: ir.Instruction, buf: *UseList) void {
             if (x.token) |t| buf.append(allocator, t) catch {};
         },
         .int_widen, .float_widen => |x| buf.append(allocator, x.source) catch {},
+        // Typed-undefined placeholder reads no locals — its operand is the
+        // interned `undef` value, not a Zap local.
+        .typed_undef => {},
         .phi => |x| for (x.sources) |src| buf.append(allocator, src.value) catch {},
         .optional_dispatch => |x| {
             // scrutinee_param is a param index (not a local); payload_local
@@ -3946,6 +3949,7 @@ pub fn collectDefs(instr: ir.Instruction) DefList {
         .reset => |x| out.append(x.dest),
         .reuse_alloc => |x| out.append(x.dest),
         .int_widen, .float_widen => |x| out.append(x.dest),
+        .typed_undef => |x| out.append(x.dest),
         .phi => |x| out.append(x.dest),
         .jump => |x| if (x.bind_dest) |d| out.append(d),
         .optional_dispatch => |x| out.append(x.payload_local),

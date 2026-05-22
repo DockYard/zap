@@ -647,6 +647,13 @@ pub const GeneralizedEscapeAnalyzer = struct {
                 try self.setEscapeAndEnqueue(func_id, nw.dest, source_escape);
             },
 
+            // Typed-undefined placeholder: a fresh `undefined` value that
+            // references nothing and is never read on a live path, so it
+            // cannot make anything escape.
+            .typed_undef => |tu| {
+                try self.setEscapeAndEnqueue(func_id, tu.dest, .no_escape);
+            },
+
             // Switch tag: no dest, just control flow.
             .switch_tag => {},
 
