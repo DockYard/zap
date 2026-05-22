@@ -209,6 +209,17 @@ pub const TypeStore = struct {
     next_var: TypeVarId,
     /// Inferred signatures for generated functions, keyed by function name StringId.
     inferred_signatures: std.AutoHashMap(ast.StringId, InferredSignature),
+    /// Inferred (or declared-and-verified) `raises` error row per function,
+    /// keyed by function name StringId. Populated by
+    /// `TypeChecker.checkFunctionClause` after the body is checked: the row
+    /// is the union of every `Error(E)` payload propagated through a `?` in
+    /// the body, deduplicated structurally. When a function declares an
+    /// explicit `raises` row that the body satisfies, the declared row is
+    /// stored verbatim. Phase 1.3 records this for soundness checking and
+    /// future consumers (ERT, Phase 3 effect rows); it is not yet threaded
+    /// across the call graph because every propagated error already flows
+    /// through a concrete `Result(T,E)` return type at each call site.
+    inferred_raises: std.AutoHashMap(ast.StringId, []const TypeId),
     /// Struct TypeIds whose `field :: Type = expr` defaults have
     /// already been validated by `TypeChecker.validateStructFieldDefaults`.
     /// Lives on the TypeStore (not the TypeChecker) because the
@@ -265,6 +276,7 @@ pub const TypeStore = struct {
             .name_to_type = std.AutoHashMap(ast.StringId, TypeId).init(allocator),
             .next_var = 0,
             .inferred_signatures = std.AutoHashMap(ast.StringId, InferredSignature).init(allocator),
+            .inferred_raises = std.AutoHashMap(ast.StringId, []const TypeId).init(allocator),
             .validated_default_struct_ids = std.AutoHashMap(TypeId, void).init(allocator),
             .revalidated_default_applied_ids = std.AutoHashMap(TypeId, void).init(allocator),
         };
@@ -276,6 +288,9 @@ pub const TypeStore = struct {
         self.types.deinit(self.allocator);
         self.name_to_type.deinit();
         self.inferred_signatures.deinit();
+        var raises_it = self.inferred_raises.valueIterator();
+        while (raises_it.next()) |row| self.allocator.free(row.*);
+        self.inferred_raises.deinit();
         self.validated_default_struct_ids.deinit();
         self.revalidated_default_applied_ids.deinit();
     }
@@ -5225,6 +5240,101 @@ pub const TypeChecker = struct {
         try self.current_raises.append(self.allocator, error_type);
     }
 
+    /// Reconcile the body-inferred `raises` row (`self.current_raises`)
+    /// with the clause's optional declared row, then record the resolved
+    /// row on the function's stored signature (`store.inferred_raises`).
+    ///
+    /// When `clause.raises == null` the function is undeclared: the
+    /// inferred row is attached verbatim. When a row is declared, every
+    /// inferred error type MUST be a member of the declared row (a subset
+    /// check) — otherwise the body can raise an error the signature does
+    /// not advertise, which is unsound. Each unlisted error produces a
+    /// rich diagnostic naming both the declared row and the offending
+    /// type. A satisfied declared row is recorded verbatim so downstream
+    /// consumers see exactly what the author promised.
+    fn reconcileRaisesRow(self: *TypeChecker, func: *const ast.FunctionDecl, clause: *const ast.FunctionClause) !void {
+        if (clause.raises) |declared_exprs| {
+            var declared_row: std.ArrayListUnmanaged(TypeId) = .empty;
+            defer declared_row.deinit(self.allocator);
+            for (declared_exprs) |type_expr| {
+                const declared_type = try self.resolveTypeExpr(type_expr);
+                if (declared_type == TypeStore.UNKNOWN or declared_type == TypeStore.ERROR) continue;
+                var already_present = false;
+                for (declared_row.items) |existing| {
+                    if (self.store.typeEquals(existing, declared_type)) {
+                        already_present = true;
+                        break;
+                    }
+                }
+                if (!already_present) try declared_row.append(self.allocator, declared_type);
+            }
+
+            // Subset check: every inferred error must appear in the row.
+            for (self.current_raises.items) |inferred_error| {
+                var covered = false;
+                for (declared_row.items) |declared_type| {
+                    if (self.store.typeEquals(declared_type, inferred_error)) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (!covered) {
+                    const declared_names = try self.formatRaisesRow(declared_row.items);
+                    const offending = self.typeToString(inferred_error);
+                    try self.addRichError(
+                        try std.fmt.allocPrint(
+                            self.allocator,
+                            "this function's body can raise an error its `raises` row does not declare",
+                            .{},
+                        ),
+                        clause.meta.span,
+                        try std.fmt.allocPrint(
+                            self.allocator,
+                            "declares `raises {s}` but the body can also raise `{s}` here",
+                            .{ declared_names, offending },
+                        ),
+                        try std.fmt.allocPrint(
+                            self.allocator,
+                            "add `{s}` to the `raises` row, or stop propagating it with `?`",
+                            .{offending},
+                        ),
+                    );
+                }
+            }
+
+            try self.storeRaisesRow(func.name, declared_row.items);
+        } else {
+            try self.storeRaisesRow(func.name, self.current_raises.items);
+        }
+    }
+
+    /// Persist a resolved `raises` row on the function's stored signature.
+    /// Copies the row into store-owned memory (freeing any prior row for
+    /// the same name) so it outlives the per-clause accumulator and the
+    /// per-struct TypeChecker that produced it.
+    fn storeRaisesRow(self: *TypeChecker, func_name: ast.StringId, row: []const TypeId) !void {
+        const owned = try self.store.allocator.dupe(TypeId, row);
+        if (self.store.inferred_raises.fetchRemove(func_name)) |prior| {
+            self.store.allocator.free(prior.value);
+        }
+        try self.store.inferred_raises.put(func_name, owned);
+    }
+
+    /// Render an error row as a `(A | B | ...)`-style string for
+    /// diagnostics. A single-element row renders without parentheses.
+    fn formatRaisesRow(self: *TypeChecker, row: []const TypeId) ![]const u8 {
+        if (row.len == 0) return "()";
+        if (row.len == 1) return self.typeToString(row[0]);
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        try buf.append(self.allocator, '(');
+        for (row, 0..) |type_id, index| {
+            if (index > 0) try buf.appendSlice(self.allocator, " | ");
+            try buf.appendSlice(self.allocator, self.typeToString(type_id));
+        }
+        try buf.append(self.allocator, ')');
+        return buf.toOwnedSlice(self.allocator);
+    }
+
     fn checkFunctionClause(self: *TypeChecker, func: *const ast.FunctionDecl, clause: *const ast.FunctionClause) !void {
         const prev_scope = self.current_scope;
         self.current_scope = self.graph.resolveClauseScope(clause.meta) orelse clause.meta.scope_id;
@@ -5421,6 +5531,15 @@ pub const TypeChecker = struct {
                 }
             }
         }
+
+        // `raises` row reconciliation. After the body is checked,
+        // `self.current_raises` holds the inferred error row (one entry per
+        // distinct `Error(E)` propagated through a `?`). Either verify it
+        // against an explicitly declared row, or attach the inferred row to
+        // the function's stored signature. Runs for bodyless declarations
+        // too: those contribute no `?` sites, so an explicit `raises ()`
+        // (or any declared row) is trivially satisfied and recorded.
+        try self.reconcileRaisesRow(func, clause);
 
         // Skip return type check for bodyless declarations (protocol sigs, forward decls).
         if (clause.body == null) return;

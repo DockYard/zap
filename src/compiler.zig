@@ -10557,6 +10557,22 @@ fn remapFunctionClause(alloc: std.mem.Allocator, clause: *ast.FunctionClause, re
         try remapTypeExpr(alloc, mutable_rt, remap);
         clause.return_type = mutable_rt;
     }
+    if (clause.raises) |declared_row| {
+        // Each error-type expression in the `raises` row carries
+        // StringIds from the parser's per-unit local interner. Remap them
+        // into the global interner exactly like `return_type` and param
+        // annotations — otherwise the type names decode against the wrong
+        // interner after the merge (e.g. `String` -> whatever lives at the
+        // same StringId globally).
+        const mutable_row = try alloc.alloc(*const ast.TypeExpr, declared_row.len);
+        for (declared_row, 0..) |error_type_expr, i| {
+            const mutable_error_type = try alloc.create(ast.TypeExpr);
+            mutable_error_type.* = error_type_expr.*;
+            try remapTypeExpr(alloc, mutable_error_type, remap);
+            mutable_row[i] = mutable_error_type;
+        }
+        clause.raises = mutable_row;
+    }
     if (clause.refinement) |ref| {
         const mutable_ref = try alloc.create(ast.Expr);
         mutable_ref.* = ref.*;

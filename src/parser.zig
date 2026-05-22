@@ -2012,6 +2012,11 @@ pub const Parser = struct {
             return_type = try self.parseTypeExpr();
         }
 
+        // Optional `raises` annotation declaring the function's error row.
+        // `raises` is a contextual keyword (a bare identifier) so existing
+        // identifiers named `raises` are unaffected outside this position.
+        const raises = try self.parseRaisesAnnotation();
+
         var refinement: ?*const ast.Expr = null;
         self.skipNewlinesForContinuation(.keyword_if);
         if (self.match(.keyword_if)) {
@@ -2027,6 +2032,7 @@ pub const Parser = struct {
                 .return_type = return_type,
                 .refinement = refinement,
                 .body = null,
+                .raises = raises,
             };
         }
         _ = self.advance();
@@ -2052,7 +2058,50 @@ pub const Parser = struct {
             .return_type = return_type,
             .refinement = refinement,
             .body = body,
+            .raises = raises,
         };
+    }
+
+    /// Parse an optional `raises` annotation following the return type.
+    ///
+    /// Grammar:
+    ///   * (absent)               -> `null` (row will be inferred)
+    ///   * `raises ErrType`       -> one-element row
+    ///   * `raises (E1 | E2 ...)` -> multi-element row
+    ///
+    /// `raises` is a contextual keyword: it is only recognized here, in
+    /// signature position, so an identifier named `raises` elsewhere is
+    /// unaffected (mirrors the `error`/`use`/`quote` precedent). The
+    /// parenthesized form reuses `|` as the row separator to read like a
+    /// union of error types.
+    fn parseRaisesAnnotation(self: *Parser) !?[]const *const ast.TypeExpr {
+        if (!self.checkIdentifier("raises")) return null;
+        _ = self.advance();
+
+        var error_types: std.ArrayList(*const ast.TypeExpr) = .empty;
+        if (self.match(.left_paren)) {
+            // Parenthesized row: `raises (E1 | E2 | ...)`.
+            if (!self.check(.right_paren)) {
+                try error_types.append(self.allocator, try self.parseTypeExpr());
+                while (self.match(.pipe)) {
+                    try error_types.append(self.allocator, try self.parseTypeExpr());
+                }
+            }
+            if (!self.check(.right_paren)) {
+                try self.addRichError(
+                    "this `raises (` row was never closed",
+                    self.currentSpan(),
+                    "the error-type row opened here",
+                    "add `)` to close the `raises` row",
+                );
+                return error.ParseError;
+            }
+            _ = self.advance();
+        } else {
+            // Bare single error type: `raises ParseError`.
+            try error_types.append(self.allocator, try self.parseTypeExpr());
+        }
+        return try error_types.toOwnedSlice(self.allocator);
     }
 
     fn parseParamList(self: *Parser) ![]const ast.Param {

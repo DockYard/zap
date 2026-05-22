@@ -888,6 +888,10 @@ pub const Desugarer = struct {
                 .return_type = clause.return_type,
                 .refinement = if (clause.refinement) |r| try self.desugarExpr(r) else null,
                 .body = if (clause.body) |body| try self.desugarBlock(body) else null,
+                // Carry the declared `raises` row through desugar unchanged:
+                // type expressions in the row are not rewritten by desugar
+                // (mirrors `return_type`), so pass the slice by reference.
+                .raises = clause.raises,
             });
         }
         return try self.create(ast.FunctionDecl, .{

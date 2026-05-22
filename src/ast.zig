@@ -495,6 +495,16 @@ pub const FunctionClause = struct {
     return_type: ?*const TypeExpr,
     refinement: ?*const Expr,
     body: ?[]const Stmt = null,
+    /// Declared error row from a `raises` annotation on the signature.
+    ///
+    /// `null` means the function carries no `raises` annotation — the
+    /// type-checker then *infers* the row from the `?` propagation sites
+    /// in the body and attaches it to the function's type. A non-null
+    /// slice is the explicitly declared row: each entry is one error type
+    /// expression (`raises ParseError` is a one-element slice; `raises
+    /// (ParseError | IOError)` is a two-element slice). An empty non-null
+    /// slice declares that the function raises nothing.
+    raises: ?[]const *const TypeExpr = null,
 };
 
 pub const Ownership = enum {

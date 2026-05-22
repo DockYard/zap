@@ -763,6 +763,7 @@ pub const MacroEngine = struct {
                     .return_type = clause.return_type,
                     .refinement = clause.refinement,
                     .body = expanded.stmts,
+                    .raises = clause.raises,
                 });
             } else {
                 // Bodyless clause (protocol signature, forward decl) — pass through unchanged
