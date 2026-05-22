@@ -2602,6 +2602,16 @@ fn zapMemoryStartup() void {
 /// idempotent so multiple generated entry surfaces in the same binary
 /// can share it without changing manager semantics.
 pub fn memoryStartupForEntry() void {
+    // Phase 2.b: arm the crash reporter (cache env + load the `.zap-symbols`
+    // sidecar) and install the hardware-fault signal handlers BEFORE the
+    // memory manager binds. Two reasons for the ordering: (1) the manager
+    // bind itself can `@panic` on a corrupt/absent vtable, and that panic
+    // must already route through the armed reporter; (2) any SIGSEGV/SIGTRAP
+    // during startup (the known startup-fault defect) must produce a
+    // symbolized Zap report. `installZapCrashHandlers` is idempotent and does
+    // the one-time non-signal-safe setup here so every later crash path stays
+    // async-signal-safe.
+    installZapCrashHandlers();
     zapMemoryStartup();
 }
 
@@ -7359,6 +7369,26 @@ noinline fn captureBacktraceInto(out: []usize, skip: usize) usize {
     return kept;
 }
 
+/// Capture the call stack of a *signal-interrupted* thread into `out[0..]`,
+/// unwinding from the CPU register state the kernel saved at the moment of
+/// the fault rather than from this handler's own stack. Returns the number
+/// of return addresses written.
+///
+/// Threads `cpu_context.Native` through the fork's
+/// `captureCurrentStackTrace` `.context` option — the exact mechanism the
+/// fork's own signal-based backtrace dumper uses. With a context, the
+/// fork's `StackIterator` seeds the first frame from the saved program
+/// counter (`context.getPc()`), so the trace begins at the instruction
+/// that faulted, not the kernel's signal-delivery trampoline. No `skip` is
+/// applied: every captured frame from the fault point down is genuine user
+/// or runtime code. Allocation-free; async-signal-safe.
+fn captureBacktraceFromContext(out: []usize, ctx: std.debug.CpuContextPtr) usize {
+    if (out.len == 0) return 0;
+    if (!std.options.allow_stack_tracing) return 0;
+    const trace = std.debug.captureCurrentStackTrace(.{ .context = ctx }, out);
+    return trace.return_addresses.len;
+}
+
 /// Resolve a single return address to its source symbol via the fork's
 /// `std.debug.SelfInfo.getSymbols` — the same DWARF reader Zig's own panic
 /// handler uses, so the line table is the Zap-keyed DWARF emitted in Phase
@@ -7406,6 +7436,17 @@ pub const Backtrace = extern struct {
     pub inline fn capture(skip: usize) Backtrace {
         var bt: Backtrace = .{ .addresses = undefined, .len = 0 };
         bt.len = captureBacktraceInto(&bt.addresses, skip);
+        return bt;
+    }
+
+    /// Capture the call stack of a signal-interrupted thread, unwinding
+    /// from the saved CPU context (whose program counter seeds the first
+    /// frame). Used by the hardware-fault signal handlers so the report
+    /// points at the faulting frame rather than the handler.
+    /// Allocation-free; signal-safe.
+    pub inline fn captureFromContext(ctx: std.debug.CpuContextPtr) Backtrace {
+        var bt: Backtrace = .{ .addresses = undefined, .len = 0 };
+        bt.len = captureBacktraceFromContext(&bt.addresses, ctx);
         return bt;
     }
 };
@@ -7777,28 +7818,29 @@ fn crashReportSourceLocation(loc: std.debug.SourceLocation) void {
     crashWriteUnsigned(loc.line);
 }
 
-/// The async-signal-safe crash report. Prints `** (<kind>) <message>`
-/// followed by the symbolized Zap backtrace (subject to `ZAP_BACKTRACE`),
-/// then terminates the process via `_exit` (which, unlike
+/// Render the `** (<kind>) <message>` header followed by an
+/// already-captured symbolized Zap backtrace (subject to `ZAP_BACKTRACE`),
+/// then terminate the process via `_exit` (which, unlike
 /// `std.process.exit`, runs no `atexit` handlers and is async-signal-safe).
 ///
-/// `skip_frames` is the number of leading runtime frames between the user's
-/// `raise` and the `Backtrace.capture` call inside this function, so the
-/// printed trace begins at the user code that raised.
+/// This is the single shared crash-report sink for all unrecoverable
+/// paths: the direct `raise`/`raise_with_kind` path (`crashReport`), the
+/// root `panic`-namespace handlers (`ZapPanic`), and the hardware-fault
+/// signal handlers (`zapSignalHandler`). Each caller is responsible for
+/// capturing the `Backtrace` from the right frame — they differ in how
+/// many runtime trampoline frames sit between the fault and the capture,
+/// and a signal handler captures from the interrupted CPU context rather
+/// than its own stack — so the capture cannot live here.
 ///
-/// This is `noinline` so its own frame is a stable, single frame the
-/// capture's `skip` accounting can rely on.
-noinline fn crashReport(kind: []const u8, message: []const u8) noreturn {
+/// Pure `write`(2) + `_exit`; no allocation beyond the per-frame DWARF
+/// arena (page-allocator-backed, never libc `malloc`), so it is
+/// async-signal-safe. `crash_reporter_config` MUST already be populated
+/// (via `zapCrashReporterInit`, forced at startup by `memoryStartupForEntry`).
+fn emitCrashReportWithBacktrace(kind: []const u8, message: []const u8, bt: Backtrace) noreturn {
     // Make sure any buffered stdout is flushed before the error text so the
     // report does not race ahead of the program's own output. `flushStdoutBuf`
     // is a plain `write`(2) — no allocation, no atexit.
     flushStdoutBuf();
-
-    // Cache env/TTY/side-table once. On the direct-`raise` path this is a
-    // normal call (not yet a signal context), so the non-async-signal-safe
-    // `getenv`/file-read here is fine; Phase 2.b's signal handlers will have
-    // already forced this via `zapCrashReporterInit` at startup.
-    zapCrashReporterInit();
 
     // Header: ** (<kind>) <message>\n
     posixWrite(STDERR_FD, "** (");
@@ -7808,18 +7850,6 @@ noinline fn crashReport(kind: []const u8, message: []const u8) noreturn {
     posixWrite(STDERR_FD, "\n");
 
     if (crash_reporter_config.verbosity != .off) {
-        // Skip frames: (0) `captureBacktraceInto` itself (frame 0 of the
-        // walk, since `Backtrace.capture` is `inline`), (1) this
-        // `crashReport` frame, (2) the `raise_with_kind`/`raise` runtime
-        // entry that called us. The user's raising frame is next, at index
-        // 3. (`crashReport` is `noinline`; `raise`/`raise_with_kind` cross
-        // the `:zig.` FFI boundary so they are real, non-inlined frames.)
-        // The Zap-level `Kernel.do_raise`/`Kernel.raise` plumbing frame that
-        // sits just above the user frame is suppressed by name inside
-        // `crashReportFrame` (it varies by raise form, so it cannot be a
-        // fixed skip count).
-        const skip: usize = 3;
-        const bt = Backtrace.capture(skip);
         const max_shown: usize = switch (crash_reporter_config.verbosity) {
             .off => 0,
             .short => CRASH_SHORT_FRAME_LIMIT,
@@ -7839,6 +7869,388 @@ noinline fn crashReport(kind: []const u8, message: []const u8) noreturn {
     }
 
     std.c._exit(1);
+}
+
+/// The async-signal-safe crash report for the direct `raise` path. Prints
+/// `** (<kind>) <message>` followed by the symbolized Zap backtrace, then
+/// terminates the process. Captures the backtrace at this site with the
+/// fixed `skip` accounting for the `raise_with_kind`/`raise` runtime
+/// trampoline, so the printed trace begins at the user code that raised.
+///
+/// `pub` so the root `panic`-namespace bridge (`ZapPanic`) and the
+/// signal handlers (which capture their own backtrace and call
+/// `emitCrashReportWithBacktrace` directly) share the same canonical
+/// abort line. This is the building block Phase 2.b's panic/fault routing
+/// funnels into.
+///
+/// This is `noinline` so its own frame is a stable, single frame the
+/// capture's `skip` accounting can rely on.
+pub noinline fn crashReport(kind: []const u8, message: []const u8) noreturn {
+    // Cache env/TTY/side-table once. On the direct-`raise` path this is a
+    // normal call (not yet a signal context), so the non-async-signal-safe
+    // `getenv`/file-read here is fine; the signal handlers will have
+    // already forced this via `zapCrashReporterInit` at startup.
+    zapCrashReporterInit();
+
+    // Skip frames: (0) `captureBacktraceInto` itself (frame 0 of the
+    // walk, since `Backtrace.capture` is `inline`), (1) this
+    // `crashReport` frame, (2) the `raise_with_kind`/`raise` runtime
+    // entry that called us. The user's raising frame is next, at index
+    // 3. (`crashReport` is `noinline`; `raise`/`raise_with_kind` cross
+    // the `:zig.` FFI boundary so they are real, non-inlined frames.)
+    // The Zap-level `Kernel.do_raise`/`Kernel.raise` plumbing frame that
+    // sits just above the user frame is suppressed by name inside
+    // `crashReportFrame` (it varies by raise form, so it cannot be a
+    // fixed skip count).
+    const skip: usize = 3;
+    const bt = Backtrace.capture(skip);
+    emitCrashReportWithBacktrace(kind, message, bt);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.b — root `panic` namespace bridge.
+//
+// `ZapPanic` is the namespace Zap's root-ZIR builder injects as the root
+// file's `pub const panic = @import("zap_runtime").ZapPanic;`. Zig's panic
+// interface (`std.builtin.panic = if (@hasDecl(root, "panic")) root.panic
+// else FullPanic(defaultPanic)`) consults the *root module's* resolved
+// namespace — which, for a Zap binary, is the injected ZIR's root struct,
+// NOT the on-disk stub source. Before Phase 2.b that root carried no
+// `panic` decl, so every Zig-level safety check (integer div-by-zero,
+// `unreachable`, null-unwrap, non-Zap slice bounds, `@panic`, …) fell
+// through to Zig's default panic handler, printing Zig's text + a Zig
+// stdlib backtrace instead of the unified Zap crash report.
+//
+// `ZapPanic` mirrors the shape of `std.debug.FullPanic`: a `call` entry
+// (`fn ([]const u8, ?usize) noreturn`) plus the full set of safety
+// handlers Zig's `std.builtin.Panic` interface requires. Every handler
+// routes to the Phase 2.a `crashReport` with the Zap error *kind* that
+// matches the cause (the cause→kind mapping — the only policy here).
+//
+// This namespace is a genuine runtime/codegen primitive (it is the bridge
+// from Zig's panic interface to the Zap crash printer), so it lives in
+// `runtime.zig`. The kind/message table below is intentionally thin.
+// ---------------------------------------------------------------------------
+
+/// The number of frames between a `ZapPanic` handler's `Backtrace.capture`
+/// call and the user code that triggered the fault. The call chain is:
+/// (0) `captureBacktraceInto` (frame 0, since `Backtrace.capture` is
+/// `inline`), (1) the `ZapPanic.<handler>`/`zapPanicCall` frame. The
+/// faulting user frame is next, at index 2. Zig safety handlers are
+/// `@branchHint(.cold)` but not guaranteed inlined; `zapPanicCall` is
+/// `noinline` to pin frame (1) as a single, stable frame.
+const ZAP_PANIC_SKIP_FRAMES: usize = 2;
+
+/// The shared sink every `ZapPanic` handler funnels into. Captures the
+/// backtrace from the panic site (skipping the runtime trampoline frames)
+/// and emits the unified crash report. `noinline` so its frame is the
+/// single stable frame `ZAP_PANIC_SKIP_FRAMES` accounts for.
+///
+/// `_first_trace_addr` is the return address Zig threads through the panic
+/// interface (`@returnAddress()` at the safety-check site). We capture a
+/// full frame-pointer backtrace instead of relying on that single address,
+/// because the Zap report wants the whole call chain, not just one frame;
+/// the parameter is accepted to satisfy the `FullPanic` `call` signature.
+noinline fn zapPanicReport(kind: []const u8, message: []const u8, _first_trace_addr: ?usize) noreturn {
+    _ = _first_trace_addr;
+    zapCrashReporterInit();
+    const bt = Backtrace.capture(ZAP_PANIC_SKIP_FRAMES);
+    emitCrashReportWithBacktrace(kind, message, bt);
+}
+
+/// `FullPanic`-shaped namespace bridging Zig's panic interface to the Zap
+/// crash printer. Injected as the root file's `pub const panic` by the
+/// ZIR builder. Each safety handler maps its cause to a Zap error kind:
+///
+///   * arithmetic faults (overflow, divide-by-zero, shift overflow,
+///     exact-division remainder) → `arithmetic_error`
+///   * indexing / slice-bounds faults → `index_error`
+///   * everything else (reached `unreachable`, explicit `@panic`,
+///     null-unwrap, bad cast, corrupt switch, invalid enum, …) →
+///     `runtime_error`, carrying the cause's descriptive message.
+///
+/// The kinds match the snake-case `Error.kind` atoms the stdlib `pub
+/// error` types expose (`ArithmeticError` → `arithmetic_error`, etc.), so
+/// a safe-mode trap is observationally identical to raising the
+/// corresponding stdlib error — header, kind, and symbolized backtrace.
+pub const ZapPanic = struct {
+    /// Generic panic entry: explicit `@panic(msg)` and the `call(msg, ra)`
+    /// every other `FullPanic` handler delegates to. An explicit panic has
+    /// no more specific cause, so it is a `runtime_error` carrying `msg`.
+    pub fn call(message: []const u8, first_trace_addr: ?usize) noreturn {
+        @branchHint(.cold);
+        zapPanicReport("runtime_error", message, first_trace_addr);
+    }
+
+    pub fn sentinelMismatch(_expected: anytype, _found: anytype) noreturn {
+        @branchHint(.cold);
+        _ = _expected;
+        _ = _found;
+        zapPanicReport("runtime_error", "sentinel mismatch", @returnAddress());
+    }
+
+    pub fn unwrapError(_err: anyerror) noreturn {
+        @branchHint(.cold);
+        _ = _err;
+        zapPanicReport("runtime_error", "attempt to unwrap error", @returnAddress());
+    }
+
+    pub fn outOfBounds(_index: usize, _len: usize) noreturn {
+        @branchHint(.cold);
+        _ = _index;
+        _ = _len;
+        zapPanicReport("index_error", "index out of bounds", @returnAddress());
+    }
+
+    pub fn startGreaterThanEnd(_start: usize, _end: usize) noreturn {
+        @branchHint(.cold);
+        _ = _start;
+        _ = _end;
+        zapPanicReport("index_error", "slice start exceeds end", @returnAddress());
+    }
+
+    pub fn inactiveUnionField(_active: anytype, _accessed: anytype) noreturn {
+        @branchHint(.cold);
+        _ = _active;
+        _ = _accessed;
+        zapPanicReport("runtime_error", "access of inactive union field", @returnAddress());
+    }
+
+    pub fn sliceCastLenRemainder(_src_len: usize) noreturn {
+        @branchHint(.cold);
+        _ = _src_len;
+        zapPanicReport("runtime_error", "slice length does not divide exactly into destination elements", @returnAddress());
+    }
+
+    pub fn reachedUnreachable() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("runtime_error", "reached unreachable code", @returnAddress());
+    }
+
+    pub fn unwrapNull() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("runtime_error", "attempt to use null value", @returnAddress());
+    }
+
+    pub fn castToNull() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("runtime_error", "cast causes pointer to be null", @returnAddress());
+    }
+
+    pub fn incorrectAlignment() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("runtime_error", "incorrect alignment", @returnAddress());
+    }
+
+    pub fn invalidErrorCode() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("runtime_error", "invalid error code", @returnAddress());
+    }
+
+    pub fn integerOutOfBounds() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("index_error", "integer index out of bounds", @returnAddress());
+    }
+
+    pub fn integerOverflow() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("arithmetic_error", "integer overflow", @returnAddress());
+    }
+
+    pub fn shlOverflow() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("arithmetic_error", "left shift overflow", @returnAddress());
+    }
+
+    pub fn shrOverflow() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("arithmetic_error", "right shift overflow", @returnAddress());
+    }
+
+    pub fn divideByZero() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("arithmetic_error", "division by zero", @returnAddress());
+    }
+
+    pub fn exactDivisionRemainder() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("arithmetic_error", "exact division had a remainder", @returnAddress());
+    }
+
+    pub fn integerPartOutOfBounds() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("arithmetic_error", "integer part of floating point value out of bounds", @returnAddress());
+    }
+
+    pub fn corruptSwitch() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("runtime_error", "switch on corrupt value", @returnAddress());
+    }
+
+    pub fn shiftRhsTooBig() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("arithmetic_error", "shift amount exceeds bit width", @returnAddress());
+    }
+
+    pub fn invalidEnumValue() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("runtime_error", "invalid enum value", @returnAddress());
+    }
+
+    pub fn forLenMismatch() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("runtime_error", "for loop over objects with non-equal lengths", @returnAddress());
+    }
+
+    pub fn copyLenMismatch() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("runtime_error", "source and destination have non-equal lengths", @returnAddress());
+    }
+
+    pub fn memcpyAlias() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("runtime_error", "@memcpy arguments alias", @returnAddress());
+    }
+
+    pub fn noreturnReturned() noreturn {
+        @branchHint(.cold);
+        zapPanicReport("runtime_error", "'noreturn' function returned", @returnAddress());
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Phase 2.b — hardware-fault signal handlers.
+//
+// The root `panic` namespace (`ZapPanic`) routes Zig-level *software*
+// safety checks to the Zap crash printer. But a raw hardware fault —
+// dereferencing a wild pointer (SIGSEGV), a misaligned/cache fault
+// (SIGBUS), a CPU divide trap that bypassed the software check (SIGFPE),
+// an illegal opcode (SIGILL), or a breakpoint/`@trap` (SIGTRAP) — is
+// delivered as a POSIX signal, not through Zig's panic interface. Without
+// a handler the kernel prints nothing and the process dies with a bare
+// signal, which is exactly the unsymbolized "startup SIGTRAP" defect the
+// error-system plan targets.
+//
+// `installZapSignalHandlers` registers an `SA_SIGINFO` handler for each of
+// these signals. The handler unwinds from the *interrupted* CPU context
+// (so the report points at the faulting frame, not the handler) and emits
+// the same unified `** (<kind>) <message>` + Zap backtrace as every other
+// crash path. It is async-signal-safe: pure `write`(2) + `_exit`, the
+// page-allocator-backed DWARF arena, and `SA_RESETHAND` so a fault *inside*
+// the handler falls back to the default disposition instead of looping
+// (the minimal double-fault guard; full double-fault policy is Phase 2.e).
+// ---------------------------------------------------------------------------
+
+/// True on targets where the fork's `captureCurrentStackTrace` can unwind
+/// from a POSIX signal's saved CPU context. `cpu_context.Native` is
+/// `noreturn` on unsupported targets (and `CpuContextPtr` follows), so this
+/// gates the whole signal-handler subsystem at comptime; on an unsupported
+/// target `installZapSignalHandlers` is a no-op and the default signal
+/// disposition stands.
+const zap_signal_handlers_supported =
+    std.debug.have_segfault_handling_support and
+    builtin.os.tag != .windows and
+    std.debug.cpu_context.Native != noreturn;
+
+/// Map a fault signal to its Zap crash-report kind atom. SIGFPE is an
+/// `arithmetic_error` (it is the hardware sibling of the software
+/// divide-by-zero/overflow checks `ZapPanic` already maps there); the
+/// memory/instruction faults each get a dedicated kind so the report names
+/// the fault precisely. Kinds are snake-case to match the `Error.kind`
+/// convention used everywhere else in the crash report.
+fn zapSignalKind(sig: std.posix.SIG) []const u8 {
+    return switch (sig) {
+        .SEGV => "segmentation_fault",
+        .BUS => "bus_error",
+        .FPE => "arithmetic_error",
+        .ILL => "illegal_instruction",
+        .TRAP => "trap",
+        else => "fatal_signal",
+    };
+}
+
+/// A human-readable description of the fault for the report's message
+/// slot. Mirrors the fork's own signal names so a Zap report and a Zig
+/// report describe the same fault identically.
+fn zapSignalMessage(sig: std.posix.SIG) []const u8 {
+    return switch (sig) {
+        .SEGV => "segmentation fault (invalid memory access)",
+        .BUS => "bus error (misaligned or non-existent memory access)",
+        .FPE => "arithmetic exception",
+        .ILL => "illegal instruction",
+        .TRAP => "trace/breakpoint trap",
+        else => "fatal signal",
+    };
+}
+
+/// The `SA_SIGINFO` handler installed for every hardware-fault signal.
+/// Async-signal-safe: it reads the saved CPU context, captures a backtrace
+/// from the faulting frame, and routes to the shared crash-report sink,
+/// which terminates via `_exit`. `crash_reporter_config` was populated at
+/// startup by `installZapCrashHandlers`, so this path performs no
+/// `getenv`/file IO.
+///
+/// `SA_RESETHAND` was set at install time, so if unwinding or printing
+/// itself faults, the *second* delivery of that signal uses the default
+/// disposition and the process dies immediately instead of recursing.
+fn zapSignalHandler(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) noreturn {
+    _ = info;
+    const kind = zapSignalKind(sig);
+    const message = zapSignalMessage(sig);
+
+    if (comptime zap_signal_handlers_supported) {
+        if (std.debug.cpu_context.fromPosixSignalContext(ctx_ptr)) |cpu_ctx| {
+            // `fromPosixSignalContext` returns a by-value `cpu_context.Native`;
+            // bind it to a local so the unwinder can take its address.
+            const ctx_local = cpu_ctx;
+            const bt = Backtrace.captureFromContext(&ctx_local);
+            emitCrashReportWithBacktrace(kind, message, bt);
+        }
+    }
+
+    // No usable CPU context (unsupported target or extraction failed):
+    // still emit the unified header so the fault is reported in the Zap
+    // format, just without a symbolized backtrace.
+    emitCrashReportWithBacktrace(kind, message, .{ .addresses = undefined, .len = 0 });
+}
+
+/// Install the `SA_SIGINFO` Zap crash handler for the hardware-fault
+/// signals (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP). Idempotent — guarded
+/// by `zap_signal_handlers_installed` — and a comptime no-op on targets
+/// that cannot unwind a signal context. Uses `SA_ONSTACK` so a
+/// stack-overflow SIGSEGV can still be handled on the alternate signal
+/// stack (configured by the std library when `signal_stack_size` is set),
+/// and `SA_RESETHAND` for the minimal double-fault guard.
+fn installZapSignalHandlers() void {
+    if (comptime !zap_signal_handlers_supported) return;
+    if (zap_signal_handlers_installed) return;
+    zap_signal_handlers_installed = true;
+
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .sigaction = zapSignalHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.SIGINFO | std.posix.SA.RESETHAND | std.posix.SA.ONSTACK,
+    };
+    std.posix.sigaction(.SEGV, &act, null);
+    std.posix.sigaction(.BUS, &act, null);
+    std.posix.sigaction(.FPE, &act, null);
+    std.posix.sigaction(.ILL, &act, null);
+    std.posix.sigaction(.TRAP, &act, null);
+}
+
+var zap_signal_handlers_installed: bool = false;
+
+/// One-time program-startup setup for the entire crash-reporting
+/// subsystem. Called from the entry-point prologue (`memoryStartupForEntry`)
+/// before any user code, the memory manager bind, or any faulting
+/// operation can run. Does the non-async-signal-safe work up front —
+/// caching `ZAP_BACKTRACE`/`NO_COLOR`/TTY state and loading the
+/// `.zap-symbols` sidecar via `zapCrashReporterInit` — so the per-crash
+/// path (panic handler or signal handler) stays signal-safe, then installs
+/// the hardware-fault signal handlers. Idempotent.
+pub fn installZapCrashHandlers() void {
+    zapCrashReporterInit();
+    installZapSignalHandlers();
 }
 
 // ============================================================

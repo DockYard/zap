@@ -150,6 +150,13 @@ extern "c" fn zir_builder_set_root_fields(handle: ?*ZirBuilderHandle, name_ptrs:
 extern "c" fn zir_builder_set_root_field_static(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, type_ref: u32) i32;
 extern "c" fn zir_builder_begin_root_field_body(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_end_root_field_body(handle: ?*ZirBuilderHandle, final_ref: u32) i32;
+/// Phase 2.b — record a `pub const <name> = <expr>;` namespace declaration
+/// in the current struct scope. Between the begin/end pair, the usual
+/// `zir_builder_emit_*` calls build the initializer expression; `end`
+/// closes the declaration's value body with `break_inline value_ref` and
+/// lists it under the struct_decl's `decls`.
+extern "c" fn zir_builder_begin_const_decl(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
+extern "c" fn zir_builder_end_const_decl(handle: ?*ZirBuilderHandle, value_ref: u32) i32;
 extern "c" fn zir_builder_set_decl_val_return_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_emit_param_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
 extern "c" fn zir_builder_emit_param_optional_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
@@ -685,6 +692,13 @@ pub const ZirDriver = struct {
     allocator: Allocator,
     program: ?ir.Program,
     lib_mode: bool = false,
+    /// Phase 2.b — set true once a root `main` entry point has been
+    /// emitted (executable output). Gates the injection of the root
+    /// `pub const panic = @import("zap_runtime").ZapPanic;` declaration so
+    /// it is emitted exactly for executables (which own the program-wide
+    /// panic handler), never for library/object outputs or struct-only
+    /// emission. See `emitRootPanicNamespace`.
+    emitted_main_entry: bool = false,
     /// Phase 1.5 — per-optimize-mode arithmetic-overflow policy. When
     /// true (Debug / ReleaseSafe), integer arithmetic lowers to Zig's
     /// safety-checked tags (`add`/`sub`/`mul`) so overflow traps and
@@ -1204,6 +1218,53 @@ pub const ZirDriver = struct {
         const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
         if (rt_import == error_ref) return error.EmitFailed;
         try self.emitMemoryStartupForEntryFromRuntime(rt_import);
+    }
+
+    /// Phase 2.b — inject `pub const panic = @import("zap_runtime").ZapPanic;`
+    /// into the root struct's namespace.
+    ///
+    /// Zig's panic interface is `std.builtin.panic = if (@hasDecl(root,
+    /// "panic")) root.panic else FullPanic(defaultPanic)`, and `@hasDecl`
+    /// resolves against the *injected* root ZIR's struct namespace (the
+    /// on-disk stub source's ZIR is discarded). Without this declaration the
+    /// root carries no `panic`, so every Zig-level safety check (integer
+    /// divide-by-zero, `unreachable`, null-unwrap, non-Zap slice bounds,
+    /// `@panic`, …) falls through to Zig's default panic handler — printing
+    /// Zig's text and a Zig stdlib backtrace instead of the unified Zap
+    /// crash report.
+    ///
+    /// `runtime.ZapPanic` is a `FullPanic`-shaped namespace whose handlers
+    /// route to `Runtime.crashReport`, mapping each cause to a Zap error
+    /// kind (`arithmetic_error` / `index_error` / `runtime_error`). The
+    /// declaration's value body is `@import("zap_runtime").ZapPanic`,
+    /// recorded between `begin_const_decl` / `end_const_decl` so it lands in
+    /// the root struct_decl's `decls`.
+    ///
+    /// Only meaningful for executable outputs: the panic namespace governs
+    /// the program-wide panic handler, which a library/object output does
+    /// not own. `emitFunction` always closes its function body, so
+    /// `active_body` is null here (the const-decl recorder requires that).
+    fn emitRootPanicNamespace(self: *ZirDriver) BuildError!void {
+        const decl_name = "panic";
+        if (zir_builder_begin_const_decl(self.handle, decl_name.ptr, @intCast(decl_name.len)) != 0) {
+            return error.EmitFailed;
+        }
+
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+
+        const zap_panic_field = "ZapPanic";
+        const zap_panic_ref = zir_builder_emit_field_val(
+            self.handle,
+            rt_import,
+            zap_panic_field.ptr,
+            @intCast(zap_panic_field.len),
+        );
+        if (zap_panic_ref == error_ref) return error.EmitFailed;
+
+        if (zir_builder_end_const_decl(self.handle, zap_panic_ref) != 0) {
+            return error.EmitFailed;
+        }
     }
 
     fn emitAllocatorRef(self: *ZirDriver) BuildError!u32 {
@@ -3274,6 +3335,20 @@ pub const ZirDriver = struct {
                     return error.EndFuncFailed;
                 }
             }
+
+            // Phase 2.b — inject the root `pub const panic` namespace so
+            // Zig's panic interface routes Zig-level safety panics (integer
+            // divide-by-zero, `unreachable`, null-unwrap, non-Zap slice
+            // bounds, `@panic`, …) through the Zap crash printer. Emitted
+            // only when this compilation produced a real program entry (a
+            // root `main`, or builder-mode `manifest`): an executable owns
+            // the program-wide panic handler, whereas a library/object
+            // output must not impose one on its consumer. Emitted after all
+            // root functions so no function body is active (the const-decl
+            // recorder requires `active_body == null`).
+            if (!self.lib_mode and (self.emitted_main_entry or self.builder_entry != null)) {
+                try self.emitRootPanicNamespace();
+            }
         }
     }
 
@@ -4603,6 +4678,11 @@ pub const ZirDriver = struct {
             // no guaranteed executable artifact entry boundary, so
             // their runtime source keeps the marker false.
             try self.emitMemoryStartupForEntry();
+
+            // Phase 2.b: record that this compilation produced a real
+            // program entry, so `buildProgram` injects the root `panic`
+            // namespace (the program-wide panic handler) for it.
+            self.emitted_main_entry = true;
         }
 
         // __try variants return optionals: ?ReturnType.
