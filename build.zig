@@ -227,6 +227,24 @@ pub fn build(b: *std.Build) void {
         else
             detectBuildZigLibDir(b));
 
+    // Phase 2.f GP3 — the `zap` exe (and the CLI/addr2line test binaries that
+    // exercise the same code) MUST be COMPILED against the fork's `std`, not
+    // whatever Zig happens to be building Zap. `zap addr2line` and any
+    // `std.debug`-using CLI path link the *building* Zig's `std` by default,
+    // which lacks the fork's `std.debug.MachOFile` sibling-dSYM fallback +
+    // linkage-name reporting — so a stripped-binary symbolization round-trip
+    // only worked when `--zig-lib-dir ~/projects/zig/lib` was passed by hand.
+    // Threading the fork lib dir as the compile-time `zig_lib_dir` makes the
+    // installed `zap` binary carry the fix unconditionally. This is the same
+    // tree already embedded for *user* binaries (Phase 2.a); GP3 extends it to
+    // the `zap` exe's own `std`. Null when the fork tree is absent (CI prebuilt
+    // archive without the fork checkout) — then the building Zig's std is used.
+    const fork_zig_lib_dir_lazy: ?std.Build.LazyPath =
+        if (pathExists(b, b.pathJoin(&.{ zig_lib_dir, "std", "std.zig" })))
+            .{ .cwd_relative = zig_lib_dir }
+        else
+            null;
+
     const tar_step = b.addSystemCommand(&.{ "tar", "-cf" });
     const tar_output = tar_step.addOutputFileArg("zig_lib.tar");
     tar_step.addArg("-C");
@@ -261,6 +279,9 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "zap",
         .root_module = exe_module,
+        // GP3: compile the `zap` exe's own `std` from the fork lib dir so the
+        // installed binary's `std.debug` carries the dSYM fallback fix.
+        .zig_lib_dir = fork_zig_lib_dir_lazy,
     });
 
     exe.root_module.addAnonymousImport("zig_lib_archive", .{
@@ -297,6 +318,9 @@ pub fn build(b: *std.Build) void {
     applyNativeCompilerLinkage(main_tests_module, llvm_lib_path, zig_compiler_lib_path);
     const main_tests = b.addTest(.{
         .root_module = main_tests_module,
+        // GP3: mirror the exe — the CLI unit tests exercise the same
+        // `std.debug`/addr2line paths, so they too compile against the fork std.
+        .zig_lib_dir = fork_zig_lib_dir_lazy,
     });
     const run_main_tests = b.addRunArtifact(main_tests);
     test_step.dependOn(&run_main_tests.step);
