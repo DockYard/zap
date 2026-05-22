@@ -2055,6 +2055,15 @@ const Addr2LineUsage =
     \\  0x<addr> <mangled> at file.zap:line             (no sidecar entry)
     \\  0x<addr> ?? at ??:0                             (no debug info)
     \\
+    \\Line granularity: file:line is statement-level — the dSYM/DWARF line
+    \\program carries a row per statement, so a crash-frame address resolves to
+    \\the exact raising statement, not just the enclosing function's decl line.
+    \\This relies on feeding the STATIC CALL-SITE address the crash report emits
+    \\(the report already biases each return address one byte back into the
+    \\calling statement before de-sliding it). Passing a function's symbol-table
+    \\ENTRY address instead (e.g. straight from `nm`) resolves to the function
+    \\prologue's line — correct DWARF, but the prologue, not a call site.
+    \\
 ;
 
 /// Parse a `0x`-prefixed hex or bare decimal address. Tolerates surrounding
