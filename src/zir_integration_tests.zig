@@ -8388,6 +8388,55 @@ test "Phase2d block scope: defer inside an inner if-body runs at that block's ex
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "Phase2d ARC: deferred cleanup over an ARC value is leak/double-free clean on both paths" {
+    // An ARC-managed value (a String built by String.concat) is read by
+    // the `defer` cleanup. The defer fires on BOTH the normal-return path
+    // (process(2)) and the `?` Error early-return path (process(0)). Under
+    // default ARC (Memory.Tracking) the value must be retained/released in
+    // balance: no leak (releases >= retains — every retain matched, plus
+    // intermediates released at scope exit) and no double-free (the run
+    // exits 0 instead of aborting on a refcount underflow).
+    var result = try compileAndRunWithArcStatsEnv(
+        \\pub struct TestProg {
+        \\  pub fn step(n :: i64) -> Result(i64, String) {
+        \\    case n > 0 {
+        \\      true -> Result(i64, String).Ok(n - 1)
+        \\      false -> Result(i64, String).Error("stopped")
+        \\    }
+        \\  }
+        \\
+        \\  pub fn process(n :: i64) -> Result(i64, String) {
+        \\    label = String.concat("resource-", "X")
+        \\    defer IO.puts(label)
+        \\    next = TestProg.step(n)?
+        \\    Result(i64, String).Ok(next)
+        \\  }
+        \\
+        \\  pub fn main() -> u8 {
+        \\    _ok = TestProg.process(2)
+        \\    case TestProg.process(0) {
+        \\      Result.Ok(_v) -> IO.puts("ok")
+        \\      Result.Error(reason) -> IO.puts(reason)
+        \\    }
+        \\    0
+        \\  }
+        \\}
+    ,
+        &.{.{ .name = "ZAP_ARC_STATS", .value = "1" }},
+    );
+    defer result.deinit();
+    // success-path defer, error-path defer, then the Error reason.
+    try std.testing.expectEqualStrings("resource-X\nresource-X\nstopped\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    // ARC soundness: no leak (every retain has a matching release; the
+    // deferred read keeps the value alive to its release point) and no
+    // double-free (a refcount underflow would abort non-zero, not reach
+    // exit 0 above).
+    const retains = parseArcStatCounter(result.stderr, "retains_total") orelse return error.RunFailed;
+    const releases = parseArcStatCounter(result.stderr, "releases_total") orelse return error.RunFailed;
+    try std.testing.expect(releases >= retains);
+}
+
 test "Phase2d raise: deferred cleanup does NOT run on the unrecoverable abort path" {
     // raise/panic/contract abort `_exit` without unwinding, so the
     // `defer` here intentionally never fires. The process aborts
