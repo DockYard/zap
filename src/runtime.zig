@@ -1412,6 +1412,10 @@ pub const AbiV1 = struct {
         use_after_free_or_oob = 1,
         invalid_free = 2,
         dealloc_mismatch = 3,
+        /// Phase 4.d — a member of a detected reference cycle. See the
+        /// manager-side mirror; the aggregate retain-path report is built
+        /// runtime-side from the trial-deletion result.
+        cycle = 4,
     };
 
     /// Render-ready description of one memory fault. All pointers are
@@ -8414,6 +8418,10 @@ fn leakReportSink(sink_ctx: ?*anyopaque, record: *const AbiV1.ZapLeakRecord) cal
         .invalid_free,
         .dealloc_mismatch,
         => renderMemoryFaultImmediate(record),
+        // Cycles are never pushed through the per-fault sink: the
+        // trial-deletion detector assembles the aggregate `domain=cycle`
+        // report runtime-side (see `renderCycleReport`).
+        .cycle => unreachable,
     }
 }
 
@@ -8544,7 +8552,7 @@ fn renderMemoryFaultImmediate(record: *const AbiV1.ZapLeakRecord) void {
         .use_after_free_or_oob => posixWrite(STDERR_FD, "error: use-after-free or out-of-bounds write: "),
         .invalid_free => posixWrite(STDERR_FD, "error: invalid free: "),
         .dealloc_mismatch => posixWrite(STDERR_FD, "error: deallocation size/alignment mismatch: "),
-        .leak => unreachable,
+        .leak, .cycle => unreachable,
     }
     if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
 
@@ -8575,7 +8583,7 @@ fn renderMemoryFaultImmediate(record: *const AbiV1.ZapLeakRecord) void {
             crashWriteUnsigned(record.supplied_alignment);
             posixWrite(STDERR_FD, "; the allocation is intentionally leaked for forensics");
         },
-        .leak => unreachable,
+        .leak, .cycle => unreachable,
     }
     posixWrite(STDERR_FD, "\n");
 
@@ -8779,6 +8787,9 @@ fn renderRecordJson(record: *const AbiV1.ZapLeakRecord, leak_index: ?usize) void
         .use_after_free_or_oob => posixWrite(STDERR_FD, "use_after_free_or_oob"),
         .invalid_free => posixWrite(STDERR_FD, "invalid_free"),
         .dealloc_mismatch => posixWrite(STDERR_FD, "dealloc_mismatch"),
+        // `renderRecordJson` renders single leak/fault records only; the
+        // cycle report has its own aggregate shape (`renderCycleReport`).
+        .cycle => unreachable,
     }
     posixWrite(STDERR_FD, "\",\"trace_policy\":\"allocation\",\"message\":\"");
     switch (kind) {
@@ -8794,6 +8805,7 @@ fn renderRecordJson(record: *const AbiV1.ZapLeakRecord, leak_index: ?usize) void
         .use_after_free_or_oob => posixWrite(STDERR_FD, "use-after-free or out-of-bounds write"),
         .invalid_free => posixWrite(STDERR_FD, "invalid free"),
         .dealloc_mismatch => posixWrite(STDERR_FD, "deallocation size/alignment mismatch"),
+        .cycle => unreachable,
     }
     posixWrite(STDERR_FD, "\",\"machine_data\":{\"type\":\"");
     writeJsonStringBody(type_name);

@@ -228,6 +228,240 @@ pub const CycleMember = struct {
     }
 };
 
+// ===========================================================================
+// Report model + renderer (`domain=cycle`).
+//
+// The renderer is writer-generic and side-effect-free so the EXACT bytes are
+// unit-testable here (against a fixed buffer) while the runtime drives it
+// through an async-signal-safe `write(2)` adapter. Symbolization (address →
+// file:line) is the runtime's job (it owns DWARF); the renderer consumes
+// already-resolved data via `RenderMember.source`, identical in spirit to how
+// the leak renderer resolves the alloc site before writing.
+// ===========================================================================
+
+/// Visual-language glyph + SGR vocabulary, mirroring `RuntimeFormat` in
+/// `src/runtime.zig` so a `domain=cycle` runtime report reads identically to
+/// the compile renderer's cycle diagnostic and to the leak report. The
+/// drift guard in `tools/error_format_drift_test.zig` covers the runtime
+/// mirror; these are re-stated here (the only consumer that cannot import
+/// `runtime.zig`) and pinned by the render tests below.
+pub const Format = struct {
+    pub const frame_indent = "  ";
+    pub const source_line_separator = ":";
+    pub const gutter_bar = "\u{2502}";
+    pub const footer_corner = "\u{2514}\u{2500}";
+    pub const retain_arrow = " \u{2192} "; // " → "
+    pub const sgr_reset = "\x1b[0m";
+    pub const sgr_bold = "\x1b[1m";
+    pub const sgr_bold_yellow = "\x1b[1;33m";
+    pub const sgr_cyan = "\x1b[36m";
+};
+
+/// Output format selector — text (human) or JSON (machine / LSP / CI),
+/// matching the leak report's `LeakReportFormat`.
+pub const ReportFormat = enum { text, json };
+
+/// A resolved source location for a member's allocation site. Borrowed for
+/// the render call only.
+pub const SourceLocation = struct {
+    file: []const u8,
+    line: u32,
+};
+
+/// One member as the renderer sees it: its Zap type label, bytes held, and
+/// (optionally) its resolved allocation site. The runtime fills `source`
+/// from the symbolized backtrace; a unit test supplies it directly.
+pub const RenderMember = struct {
+    type_name: []const u8,
+    size: usize,
+    source: ?SourceLocation = null,
+};
+
+/// The full renderable cycle: the participating members in deterministic
+/// (engine) order plus the aggregate bytes. The retain path is rendered as
+/// `%A{} → %B{} → %A{}` (closing back to the first member to make the cycle
+/// visually explicit).
+pub const RenderView = struct {
+    members: []const RenderMember,
+    total_bytes: usize,
+};
+
+/// Write a Zap type label: `` `%Name{}` `` when named, or a neutral
+/// `an allocation` when the type was not attributed (so the line still
+/// reads naturally — identical to the leak renderer's `writeLeakTypeLabel`).
+fn writeTypeLabel(writer: anytype, type_name: []const u8) !void {
+    if (type_name.len == 0) {
+        try writer.writeAll("an allocation");
+        return;
+    }
+    try writer.writeAll("`%");
+    try writer.writeAll(type_name);
+    try writer.writeAll("{}`");
+}
+
+/// Bare `%Name{}` (no backticks) for the inline retain path, or `?` when the
+/// type was not attributed.
+fn writePathNode(writer: anytype, type_name: []const u8) !void {
+    if (type_name.len == 0) {
+        try writer.writeAll("?");
+        return;
+    }
+    try writer.writeAll("%");
+    try writer.writeAll(type_name);
+    try writer.writeAll("{}");
+}
+
+fn writeJsonStringBody(writer: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => try writer.writeByte(c),
+        }
+    }
+}
+
+/// Write an unsigned integer as base-10 ASCII through the minimal
+/// `writeAll`-only writer interface. Kept here (rather than relying on a
+/// writer `.print`) so the renderer works equally over a `std.Io.Writer`
+/// fixed buffer (the unit tests) and the runtime's async-signal-safe
+/// `write(2)` adapter, neither of which need a `print` implementation.
+fn writeUnsigned(writer: anytype, value: usize) !void {
+    var tmp: [20]u8 = undefined; // u64 max is 20 digits
+    var i: usize = tmp.len;
+    var v = value;
+    if (v == 0) {
+        try writer.writeAll("0");
+        return;
+    }
+    while (v != 0) {
+        i -= 1;
+        tmp[i] = '0' + @as(u8, @intCast(v % 10));
+        v /= 10;
+    }
+    try writer.writeAll(tmp[i..]);
+}
+
+/// Render one detected cycle as a unified `domain=cycle` diagnostic.
+///
+/// Text shape (unified visual language — header, gutter, retain path,
+/// per-member alloc sites, footer corner):
+///
+///   warning: reference cycle: 2 objects (80 B) held alive by a cycle
+///     │  retain path: %A{} → %B{} → %A{}
+///     │
+///     %A{} (40 B), allocated at app.zap:12
+///     %B{} (40 B), allocated at app.zap:18
+///     └─ reference cycle (no owner outside the cycle)
+///
+/// JSON shape mirrors the canonical Error IR `domain=cycle` projection:
+/// `domain`/`severity`/`sub_kind`/`trace_policy`/`message` + a `machine_data`
+/// object carrying `object_count`/`bytes`/`participants[]` (each with `type`
+/// and optional `allocated_at`).
+pub fn renderReport(
+    writer: anytype,
+    view: RenderView,
+    format: ReportFormat,
+    color: bool,
+) !void {
+    switch (format) {
+        .text => try renderReportText(writer, view, color),
+        .json => try renderReportJson(writer, view),
+    }
+}
+
+fn renderReportText(writer: anytype, view: RenderView, color: bool) !void {
+    // Header.
+    if (color) try writer.writeAll(Format.sgr_bold_yellow);
+    try writer.writeAll("warning: ");
+    if (color) try writer.writeAll(Format.sgr_reset);
+    if (color) try writer.writeAll(Format.sgr_bold);
+    try writer.writeAll("reference cycle: ");
+    try writeUnsigned(writer, view.members.len);
+    try writer.writeAll(if (view.members.len == 1) " object (" else " objects (");
+    try writeUnsigned(writer, view.total_bytes);
+    try writer.writeAll(" B) held alive by a cycle");
+    if (color) try writer.writeAll(Format.sgr_reset);
+    try writer.writeAll("\n");
+
+    // Gutter + retain path line.
+    try writer.writeAll(Format.frame_indent);
+    if (color) try writer.writeAll(Format.sgr_cyan);
+    try writer.writeAll(Format.gutter_bar);
+    if (color) try writer.writeAll(Format.sgr_reset);
+    try writer.writeAll("  retain path: ");
+    for (view.members, 0..) |m, i| {
+        if (i != 0) try writer.writeAll(Format.retain_arrow);
+        try writePathNode(writer, m.type_name);
+    }
+    // Close the cycle back to the first member so the loop is explicit.
+    if (view.members.len > 0) {
+        try writer.writeAll(Format.retain_arrow);
+        try writePathNode(writer, view.members[0].type_name);
+    }
+    try writer.writeAll("\n");
+
+    // Blank gutter line.
+    try writer.writeAll(Format.frame_indent);
+    if (color) try writer.writeAll(Format.sgr_cyan);
+    try writer.writeAll(Format.gutter_bar);
+    if (color) try writer.writeAll(Format.sgr_reset);
+    try writer.writeAll("\n");
+
+    // Per-member detail lines.
+    for (view.members) |m| {
+        try writer.writeAll(Format.frame_indent);
+        try writeTypeLabel(writer, m.type_name);
+        try writer.writeAll(" (");
+        try writeUnsigned(writer, m.size);
+        try writer.writeAll(" B)");
+        if (m.source) |loc| {
+            try writer.writeAll(", allocated at ");
+            try writer.writeAll(loc.file);
+            try writer.writeAll(Format.source_line_separator);
+            try writeUnsigned(writer, loc.line);
+        }
+        try writer.writeAll("\n");
+    }
+
+    // Footer corner.
+    try writer.writeAll(Format.frame_indent);
+    if (color) try writer.writeAll(Format.sgr_cyan);
+    try writer.writeAll(Format.footer_corner);
+    if (color) try writer.writeAll(Format.sgr_reset);
+    try writer.writeAll(" reference cycle (no owner outside the cycle)\n");
+}
+
+fn renderReportJson(writer: anytype, view: RenderView) !void {
+    try writer.writeAll("{\"domain\":\"cycle\",\"severity\":\"warning\",\"sub_kind\":\"reference_cycle\",\"trace_policy\":\"allocation\",\"message\":\"reference cycle: ");
+    try writeUnsigned(writer, view.members.len);
+    try writer.writeAll(if (view.members.len == 1) " object held alive by a cycle" else " objects held alive by a cycle");
+    try writer.writeAll("\",\"machine_data\":{\"object_count\":");
+    try writeUnsigned(writer, view.members.len);
+    try writer.writeAll(",\"bytes\":");
+    try writeUnsigned(writer, view.total_bytes);
+    try writer.writeAll(",\"participants\":[");
+    for (view.members, 0..) |m, i| {
+        if (i != 0) try writer.writeAll(",");
+        try writer.writeAll("{\"type\":\"");
+        try writeJsonStringBody(writer, m.type_name);
+        try writer.writeAll("\",\"bytes\":");
+        try writeUnsigned(writer, m.size);
+        if (m.source) |loc| {
+            try writer.writeAll(",\"allocated_at\":{\"file\":\"");
+            try writeJsonStringBody(writer, loc.file);
+            try writer.writeAll("\",\"line\":");
+            try writeUnsigned(writer, loc.line);
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]}}\n");
+}
+
 /// The trial-deletion engine. Allocates its scratch table from the
 /// supplied allocator (the runtime passes `page_allocator`, matching the
 /// tracking manager — no libc dependency). One `Engine` drives one
@@ -728,4 +962,97 @@ test "flat candidate with no children is never garbage" {
     const candidates = [_]Candidate{cand};
     const garbage = try engine.detect(&candidates);
     try testing.expectEqual(@as(usize, 0), garbage.len);
+}
+
+// ----- Report-rendering shape tests -----------------------------------------
+
+test "render: text shape of a 2-node cycle (deterministic, no color)" {
+    const members = [_]RenderMember{
+        .{ .type_name = "A", .size = 40, .source = .{ .file = "app.zap", .line = 12 } },
+        .{ .type_name = "B", .size = 40, .source = .{ .file = "app.zap", .line = 18 } },
+    };
+    const view: RenderView = .{ .members = &members, .total_bytes = 80 };
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderReport(&w, view, .text, false);
+    const out = w.buffered();
+
+    const expected =
+        "warning: reference cycle: 2 objects (80 B) held alive by a cycle\n" ++
+        "  \u{2502}  retain path: %A{} \u{2192} %B{} \u{2192} %A{}\n" ++
+        "  \u{2502}\n" ++
+        "  `%A{}` (40 B), allocated at app.zap:12\n" ++
+        "  `%B{}` (40 B), allocated at app.zap:18\n" ++
+        "  \u{2514}\u{2500} reference cycle (no owner outside the cycle)\n";
+    try testing.expectEqualStrings(expected, out);
+}
+
+test "render: JSON shape of a 2-node cycle mirrors canonical domain=cycle" {
+    const members = [_]RenderMember{
+        .{ .type_name = "A", .size = 40, .source = .{ .file = "app.zap", .line = 12 } },
+        .{ .type_name = "B", .size = 40, .source = null },
+    };
+    const view: RenderView = .{ .members = &members, .total_bytes = 80 };
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderReport(&w, view, .json, false);
+    const out = w.buffered();
+
+    const expected =
+        "{\"domain\":\"cycle\",\"severity\":\"warning\",\"sub_kind\":\"reference_cycle\"," ++
+        "\"trace_policy\":\"allocation\",\"message\":\"reference cycle: 2 objects held alive by a cycle\"," ++
+        "\"machine_data\":{\"object_count\":2,\"bytes\":80,\"participants\":[" ++
+        "{\"type\":\"A\",\"bytes\":40,\"allocated_at\":{\"file\":\"app.zap\",\"line\":12}}," ++
+        "{\"type\":\"B\",\"bytes\":40}]}}\n";
+    try testing.expectEqualStrings(expected, out);
+}
+
+test "render: end-to-end — detect a cycle then render its participants" {
+    // Build a 2-node cycle, run the engine, then assemble a RenderView from
+    // the white set + per-node info and render it. Proves the engine result
+    // feeds the renderer (the runtime does exactly this, plus symbolization).
+    var a: TestNode = .{ .rc = 1 };
+    var b: TestNode = .{ .rc = 1 };
+    a.edges[0] = &b;
+    b.edges[0] = &a;
+    // Attribute the two nodes with borrowed type labels.
+    const name_a = "Parent";
+    const name_b = "Child";
+
+    var engine = Engine.init(testing.allocator);
+    defer engine.deinit();
+
+    var cand_a = testCandidate(&a);
+    cand_a.type_name_ptr = name_a.ptr;
+    cand_a.type_name_len = name_a.len;
+    var cand_b = testCandidate(&b);
+    cand_b.type_name_ptr = name_b.ptr;
+    cand_b.type_name_len = name_b.len;
+
+    const candidates = [_]Candidate{ cand_a, cand_b };
+    const garbage = try engine.detect(&candidates);
+    try testing.expectEqual(@as(usize, 2), garbage.len);
+
+    // Assemble the render view from the engine output.
+    var render_members: [8]RenderMember = undefined;
+    var total: usize = 0;
+    for (garbage, 0..) |ptr, i| {
+        const info = engine.nodeInfo(@ptrFromInt(ptr)).?;
+        render_members[i] = .{ .type_name = info.typeName(), .size = info.size };
+        total += info.size;
+    }
+    const view: RenderView = .{ .members = render_members[0..garbage.len], .total_bytes = total };
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderReport(&w, view, .text, false);
+    const out = w.buffered();
+
+    // Both type names appear in the retain path + detail; total bytes is sum.
+    try testing.expect(std.mem.indexOf(u8, out, "Parent") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Child") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "2 objects (") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "retain path:") != null);
 }

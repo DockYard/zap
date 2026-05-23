@@ -212,6 +212,13 @@ const ZapLeakKind = enum(u32) {
     invalid_free = 2,
     /// The runtime-supplied size/alignment disagreed with the record.
     dealloc_mismatch = 3,
+    /// Phase 4.d — one member of a detected reference cycle. The runtime's
+    /// Bacon–Rajan trial-deletion detector identifies cyclic garbage; this
+    /// kind tags a `ZapLeakRecord` rendered for a participating object so the
+    /// renderer selects the `domain=cycle` diagnostic. The aggregate
+    /// retain-path report is assembled runtime-side from the detector's
+    /// result set (the manager does not push cycle records over this ABI).
+    cycle = 4,
 };
 
 /// Structured, render-ready description of one memory fault, handed from
