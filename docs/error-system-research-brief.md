@@ -677,6 +677,77 @@ acceptance test (Part VIII).
 > dispatch failures should become recoverable raises — a language-semantics question, not a
 > mechanical macro rewrite.
 
+> **Phase 3.d implementation note (acceptance + effect-polymorphism e2e + ERT-display gap).**
+> Phase 3.d closed the Phase 3.b effect-polymorphism gaps and root-caused a fork-level
+> error-union limitation. Delivered:
+>
+> - **GAP 2a — function-ref → callable closure (eta-expansion).** A named function reference
+>   (`&Struct.fn/n` / bare `&fn/n`) in **argument position** is a callable value, not the reflective
+>   first-class `Function` struct (`{struct, name, arity}` from `lib/function.zap`). The desugar pass
+>   (`src/desugar.zig` `etaExpandFunctionRefArg`) now rewrites it into a forwarding anonymous function
+>   `fn(a..) { Struct.fn(a..) }`, copying the referenced clause's declared param/return type
+>   annotations resolved through the scope graph the desugarer holds. The synthetic closure
+>   type-checks against a `(a -> b)` callback parameter and lowers through the proven anonymous-
+>   function/`closure_create` path; a `raises` row on the referenced function flows through the
+>   forwarded call. Reflective uses (a reference returned where `Function` is expected) are not call
+>   arguments and keep the struct shape. `Enum.map([1,2,3], &Doubler.double/1)` now type-checks and
+>   runs (`test/fixtures/raise_cross_fn/funcref_combinator.zap`).
+>
+> - **Monomorphizer `try_rescue` call-site rewrite.** `MonomorphContext.rewriteExpr` was missing a
+>   `.try_rescue` arm (and the destructuring-projection / `ret_raise` arms) that the scan and clone
+>   passes already traversed, so a generic call inside a `try`/`rescue` body kept its generic
+>   `call_named` target and the ZIR backend referenced an unmangled symbol (`Enum__map__2`) that was
+>   never emitted. `rewriteExpr` now mirrors the scan/clone traversal.
+>
+> - **Fork: error-union return composes with complex payloads.** `FuncBody.setErrorUnionReturnType`
+>   (`~/projects/zig/src/zir_builder.zig`) snapshotted only the scalar `ret_type` Ref (and cleared
+>   state first), so `error{ZapRaise}!T` silently dropped a complex payload return type
+>   (`List`/`Map`/struct/union/tuple/optional). A raising function declared `-> [T] raises E` emitted
+>   `error{ZapRaise}!<default>`. It now resolves the established payload to a single Ref (reusing the
+>   payload's own ret_ty body instructions) and re-expresses `error_union_type{anyerror, payload}`
+>   through the general custom-return-type body. The Zap ZIR driver reorders the error-union wrap
+>   AFTER `emitComplexReturnType`. This unblocked **GAP 2b** (effect-polymorphism through the
+>   for-comprehension iteration combinator: a `for x <- xs { raising(x) }` body propagates the
+>   callee's `raises` row through the lifted `__for_N` helper — which returns
+>   `error{ZapRaise}![mapped]` — and is caught by an enclosing `try`/`rescue`;
+>   `test/fixtures/raise_cross_fn/effect_poly.zap`, `raises_complex_return.zap`). A pure body leaves
+>   the helper pure.
+>
+> **GAP 3 — ERT chain in the unhandled-raise crash report (root-caused; deferred).** The goal:
+> surface `@errorReturnTrace()` so a 3-deep unhandled `a→b→c` raise shows the propagation chain, not
+> just the `Kernel.abort_recoverable_raise` terminus the fresh abort-site backtrace captures. The
+> display path is fully designed and was prototyped (a fork `zir_builder_emit_error_return_trace`
+> C-ABI emitting the `error_return_trace` extended instruction; a `zap_stash_error_return_trace`
+> runtime thread-local sink emitted at the unhandled-recoverable-raise catch site; an
+> `emitErrorReturnTraceSection` in `runtime.zig`'s crash printer reusing `crashReportFrame`). The
+> **blocker is upstream of display:** the ERT is never populated. `@errorReturnTrace()` returns a
+> real cap-20 buffer but with `index == 0`. Root cause: Zap's `FuncBody.addReturnError` emits a plain
+> `error_value` + `ret_node` for `return error.ZapRaise`, whereas Zig's `return error.X` emits
+> `ret_err_value` — the only return form whose Sema/codegen records an error-return-trace frame.
+> Switching to `ret_err_value` is correct but **still left `index == 0`**: the per-frame push also
+> needs the AIR/codegen error-trace-frame recording to fire on the injected-ZIR path (the
+> function-entry `restore_err_ret_index_unconditional` prologue is emitted, but frames do not
+> accumulate). The prototype was reverted to avoid shipping an always-empty `raised, propagated
+> through:` section. **What's needed:** verify the script Compilation actually enables error tracing
+> for the injected ZIR (the `error_tracing`/`any_error_tracing` module flags), switch
+> `addReturnError` to `ret_err_value`, and confirm the fork's self-hosted/LLVM backend emits the
+> error-return-trace frame push for `ret_err_value` AIR — then the already-designed display path
+> drops in. This is a fork backend/codegen task, tracked for the Phase 4 unified-renderer work (which
+> generalizes the renderer across compile/runtime/**ERT**/leak anyway).
+>
+> **Remaining effect-polymorphism sub-layer (documented): `Enum.map` with a raising *closure*.**
+> GAP 2b demonstrates effect-polymorphism through the for-comprehension (whose `__for_N` helper
+> invokes the raising callee via a **direct** call, which the existing direct-call propagation
+> handles). The literal `Enum.map(list, &raising/1)` routes the callback through `map_next`'s
+> `call_closure` (the callback is a polymorphic parameter — a runtime closure value). The closure
+> correctly emits `error{ZapRaise}!T`, but `ir.CallClosure` / `ir.ZigType` have **no error-union
+> representation**, so the combinator neither propagates nor unwraps the closure result
+> (`expected i64, found anyerror!i64`). Closing this needs the closure's effect modeled through the
+> IR: an effect bit on `Type.FunctionType` threaded by the monomorphizer onto the concrete callback
+> param, an error-union-aware `call_closure.return_type`, and a propagating unwrap at the
+> `call_closure` site (mark the combinator specialization raising). This is a deeper IR-type-system
+> change than the stated 2a/2b and is the natural next increment.
+
 ### Phase 4 — Unified diagnostic renderer + leak/cycle subsystem
 
 - Generalize `src/diagnostics.zig` into the canonical Error IR (Part IV §4) — one renderer for
