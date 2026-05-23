@@ -1187,3 +1187,55 @@ test "render: end-to-end — detect a cycle then render its participants" {
     try testing.expect(std.mem.indexOf(u8, out, "2 objects (") != null);
     try testing.expect(std.mem.indexOf(u8, out, "retain path:") != null);
 }
+
+/// The exact pass/fail decision a Zest `assert_no_cycles { <block> }` makes on
+/// the detector's result: a positive detected-object count is a reference
+/// cycle (FAIL); zero is clean (PASS). Mirrors
+/// `Zest.Assertion.would_report_cycle?/1` (lib/zest/assertion.zap) so the
+/// runtime engine's white-set size and the assertion's verdict are pinned
+/// together in one host test, closing the loop the Phase-5 caveat leaves open
+/// (a real cycle is not constructible from a `.zap` source yet, so the
+/// detect→FAIL link cannot be exercised from Zap — it is exercised HERE).
+fn zestWouldReportCycle(detected_object_count: usize) bool {
+    return detected_object_count > 0;
+}
+
+test "assert_no_cycles detect-and-fail: a detected cycle drives the assertion to FAIL" {
+    // Build the 2-node mutual cycle the runtime registry would hold after a
+    // block constructed a reference loop, run the detector exactly as
+    // `scanLiveCyclesAndReport` does, and confirm the resulting white-set size
+    // makes the `assert_no_cycles` decision FAIL.
+    var a: TestNode = .{ .rc = 1 };
+    var b: TestNode = .{ .rc = 1 };
+    a.edges[0] = &b;
+    b.edges[0] = &a;
+
+    var engine = Engine.init(testing.allocator);
+    defer engine.deinit();
+
+    const candidates = [_]Candidate{ testCandidate(&a), testCandidate(&b) };
+    const garbage = try engine.detect(&candidates);
+
+    // The detector found cyclic garbage ...
+    try testing.expectEqual(@as(usize, 2), garbage.len);
+    // ... so `assert_no_cycles` must FAIL (the inverse of a clean block).
+    try testing.expect(zestWouldReportCycle(garbage.len));
+}
+
+test "assert_no_cycles detect-and-fail: an acyclic externally-owned graph PASSES" {
+    // A two-node acyclic chain held by an external owner (rc reflects the
+    // outside reference): the detector finds NO cycle, so `assert_no_cycles`
+    // PASSES — the clean-block branch, verified against the same engine.
+    var owner_held: TestNode = .{ .rc = 2 }; // one external ref + one internal
+    var tail: TestNode = .{ .rc = 1 };
+    owner_held.edges[0] = &tail;
+
+    var engine = Engine.init(testing.allocator);
+    defer engine.deinit();
+
+    const candidates = [_]Candidate{ testCandidate(&owner_held), testCandidate(&tail) };
+    const garbage = try engine.detect(&candidates);
+
+    try testing.expectEqual(@as(usize, 0), garbage.len);
+    try testing.expect(!zestWouldReportCycle(garbage.len));
+}

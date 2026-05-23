@@ -104,14 +104,26 @@ pub struct Zest.Assertion {
       leaked_count = after_count - before_count
       leaked_bytes = after_bytes - before_bytes
 
-      if leaked_count <= 0 {
-        :zig.Zest.pass_assertion()
-        "."
-      } else {
+      if would_report_leak?(leaked_count) {
         :zig.Zest.fail_assertion_with_message(format_leak_failure(leaked_count, leaked_bytes, code, location))
         "F"
+      } else {
+        :zig.Zest.pass_assertion()
+        "."
       }
     }
+  }
+
+  @doc = """
+    Pure decision: would an `assert_no_leaks` block with the given net live-
+    allocation delta be reported as a leak? `true` for a positive delta (the
+    block left allocations live), `false` otherwise. Side-effect-free — the
+    recording in `no_leaks_result` delegates to this so the polarity is unit-
+    testable without touching the live test tracker.
+    """
+
+  pub fn would_report_leak?(leaked_count :: i64) -> Bool {
+    leaked_count > 0
   }
 
   @doc = """
@@ -166,14 +178,28 @@ pub struct Zest.Assertion {
       :zig.Zest.pass_assertion()
       "."
     } else {
-      if cycle_object_count <= 0 {
-        :zig.Zest.pass_assertion()
-        "."
-      } else {
+      if would_report_cycle?(cycle_object_count) {
         :zig.Zest.fail_assertion_with_message(format_cycle_failure(cycle_object_count, cycle_bytes, code, location))
         "F"
+      } else {
+        :zig.Zest.pass_assertion()
+        "."
       }
     }
+  }
+
+  @doc = """
+    Pure decision: would an `assert_no_cycles` block with the given detected-
+    cycle object count be reported as a reference cycle? `true` for a positive
+    count (the trial-deletion detector found cyclic garbage), `false` otherwise.
+    Side-effect-free — the recording in `no_cycles_result` delegates to this so
+    the detect-and-fail polarity is unit-testable without touching the live test
+    tracker, and the runtime detector engine that PRODUCES the count is
+    independently verified in `src/memory/cycle_detector.zig`.
+    """
+
+  pub fn would_report_cycle?(cycle_object_count :: i64) -> Bool {
+    cycle_object_count > 0
   }
 
   fn format_leak_failure(leaked_count :: i64, leaked_bytes :: i64, code :: String, location :: String) -> String {
