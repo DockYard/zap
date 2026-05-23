@@ -3230,6 +3230,19 @@ pub fn collectAllFromUnits(
         zap.lints.runPhase14Lints(parsed_program, interner, &diag_engine) catch {};
     }
 
+    // Phase 3.b — mandatory-`raises` lint mode (opt-in via ZAP_LINT_RAISES),
+    // scoped to the stdlib (`lib/*`). Warn-only: it flags `pub fn`s whose
+    // body can `raise`/propagate but omit a `raises` row, so the stdlib's
+    // participation in the nominal abortive effect is auditable. Off by
+    // default to keep ordinary builds quiet; `ZAP_LINT_RAISES=1 zap build`
+    // confirms `lib/*` is consistent under mandatory annotation.
+    if (std.c.getenv("ZAP_LINT_RAISES") != null) {
+        for (parsed_programs, 0..) |*parsed_program, i| {
+            if (!isStdlibUnitPath(all_source_units[i].file_path)) continue;
+            zap.lints.runMandatoryRaisesLint(parsed_program, interner, &diag_engine) catch {};
+        }
+    }
+
     // Phase 1.5 — error-code collision check. `@code Zxxxx` values are
     // stable public API and must be globally unique across every unit
     // (stdlib + user). This runs over ALL parsed programs (stdlib units
