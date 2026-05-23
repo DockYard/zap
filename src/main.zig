@@ -725,6 +725,12 @@ const BuildOverrides = struct {
     /// `DebugInfoPolicyResolution` returned by
     /// `resolveDebugInfoPolicy`.
     frame_pointers: ?bool = null,
+    /// Phase 4.a — unified diagnostics: `-Derror-format=text|json`
+    /// (also accepted as the `--error-format=<...>` long flag). `text`
+    /// is the human renderer; `json` emits the stable LSP-projectable
+    /// canonical Error IR schema on stdout for LSP / CI / `zap fix`.
+    /// Null leaves the default (`text`).
+    error_format: ?zap.diagnostics.OutputFormat = null,
 };
 
 /// Phase 0 — DWARF foundation: parsed `-Ddebug-info` flag value.
@@ -932,6 +938,7 @@ const BUILD_FLAG_KEYS = [_][]const u8{
     "cpu",
     "debug-info",
     "frame-pointers",
+    "error-format",
 };
 
 /// Format the supported-keys list for diagnostics straight from
@@ -1060,6 +1067,19 @@ fn parseBuildOverrides(
                     "unknown -Dframe-pointers value '{s}' (valid: on, off)",
                     .{value},
                 ) };
+        } else if (std.mem.eql(u8, key, "error-format")) {
+            // Phase 4.a — unified diagnostics: select the human text renderer
+            // or the stable LSP-projectable JSON schema.
+            overrides.error_format = if (std.mem.eql(u8, value, "text"))
+                .text
+            else if (std.mem.eql(u8, value, "json"))
+                .json
+            else
+                return .{ .err = try std.fmt.allocPrint(
+                    alloc,
+                    "unknown -Derror-format value '{s}' (valid: text, json)",
+                    .{value},
+                ) };
         } else {
             return .{ .err = try std.fmt.allocPrint(
                 alloc,
@@ -1105,6 +1125,34 @@ fn applyBuildOverrides(config: *zap.builder.BuildConfig, overrides: BuildOverrid
         };
     }
     if (overrides.frame_pointers) |fp| config.frame_pointers = fp;
+
+    // Phase 4.a — unified diagnostics: install the process-wide
+    // diagnostic-output policy as a single source of truth read by the
+    // central `compiler.emitDiagnostics` funnel. The format comes from
+    // `-Derror-format`; the security tier (brief VI.B #9) is derived from the
+    // FINAL optimize mode so a release build strips absolute paths to basename
+    // and suppresses internal-only detail, while Debug/ReleaseSafe stay
+    // developer-facing.
+    installDiagnosticOutputPolicy(config, overrides);
+}
+
+/// Map the resolved build config + overrides onto the process-wide
+/// diagnostic-output policy. Factored out so both the manifest and script
+/// override paths install an identical policy. The tier is derived from the
+/// optimize mode via the shared `error_format.defaultTierForMode`, which is
+/// the same dev-vs-release fold the runtime crash printer's path-stripping
+/// policy uses — one tier vocabulary across compile-time and runtime.
+fn installDiagnosticOutputPolicy(config: *const zap.builder.BuildConfig, overrides: BuildOverrides) void {
+    const optimize_mode: std.builtin.OptimizeMode = switch (config.optimize) {
+        .debug => .Debug,
+        .release_safe => .ReleaseSafe,
+        .release_fast => .ReleaseFast,
+        .release_small => .ReleaseSmall,
+    };
+    zap.diagnostics.setOutputPolicy(.{
+        .format = overrides.error_format orelse .text,
+        .tier = zap.error_format.defaultTierForMode(optimize_mode),
+    });
 }
 
 /// Pure parser for the script-mode `--zap-lib-dir <dir>` leading flag

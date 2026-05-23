@@ -1,17 +1,43 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const env = @import("env.zig");
+const error_ir = @import("error_ir.zig");
+const error_format = @import("error_format.zig");
+
+pub const Domain = error_ir.Domain;
+pub const Applicability = error_ir.Applicability;
+pub const TracePolicy = error_ir.TracePolicy;
+pub const Visibility = error_ir.Visibility;
+pub const RelatedSpan = error_ir.RelatedSpan;
+pub const FixIt = error_ir.FixIt;
+pub const Cause = error_ir.Cause;
+pub const MachineDatum = error_ir.MachineDatum;
+pub const SecurityTier = error_format.SecurityTier;
 
 // ============================================================
-// Diagnostics Engine
+// Diagnostics Engine — the ONE renderer (Phase 4.a)
+//
+// Renders ANY diagnostic from the canonical Error IR (`src/error_ir.zig`):
+// compile errors, runtime panics, ERT traces, and leak/cycle reports all
+// lower into the same `Diagnostic` shape and render with ONE visual language.
 //
 // Rich error reporting with:
 //   - Caret underlines (^^^ primary, ~~~ secondary)
 //   - Box-drawing format (│, └─)
-//   - Color support (respects NO_COLOR)
-//   - Contextual labels, help text, and suggestions
-//   - Error codes (Z0001-style)
+//   - Color support (respects NO_COLOR), ONE TTY/NO_COLOR policy
+//   - Contextual labels, help text, fixits (with applicability), and notes
+//   - Error codes (Zxxxx) + domain classification
+//   - Cause chains (`caused by:`) for wrapped errors
+//   - Security tiers (dev-local / CI-internal / user-safe): release strips
+//     absolute paths to basename; never emits heap contents
+//   - Deterministic sort/dedup ordering (source_id, line, col, code)
 //   - Multi-error support with configurable limit
+//
+// The visual constants (header sigil, frame prefix, box glyphs, SGR colors)
+// live in `src/error_format.zig` and are SHARED with the async-signal-safe
+// runtime crash printer (`src/runtime.zig`) so the two surfaces never drift.
+// The runtime path cannot share this allocating renderer — it writes the same
+// constants via write(2) — but it draws from the same format spec.
 // ============================================================
 
 pub const Severity = enum {
@@ -41,18 +67,54 @@ pub const Suggestion = struct {
     description: []const u8,
 };
 
+/// The canonical Error IR record (Phase 4.a). Every diagnostic surface lowers
+/// into this single shape; the renderer, the JSON serializer, and (later) LSP
+/// all read it. The classic span-centric fields (`severity`, `message`,
+/// `span`, `notes`, `label`, `secondary_spans`, `help`, `suggestion`, `code`)
+/// are the compile-time frontend's ergonomic constructors; the canonical-IR
+/// fields below (`domain`, `related_spans`, `fixits`, `cause_chain`,
+/// `trace_policy`, `machine_data`, `visibility`) are the cross-surface
+/// superset the brief mandates. All new fields default, so every existing
+/// construction site is unchanged (backward-compatible generalization).
+///
+/// `span` is the brief's `primary_span`; `message` is the rendered form of the
+/// brief's `message_template`. `secondary_spans` (legacy, tilde-underlined,
+/// rendered inline under the source) and `related_spans` (canonical,
+/// LSP `relatedInformation`, rendered as separate `note:`-style lines) coexist:
+/// the frontend's two-sided type errors (4.b) populate `related_spans`, while
+/// the existing "did you mean" suggestions keep using `secondary_spans`.
 pub const Diagnostic = struct {
     severity: Severity,
     message: []const u8,
+    /// The brief's `primary_span` — where the diagnostic points.
     span: ast.SourceSpan,
     notes: []const Note = &.{},
 
-    // Rich fields
+    // Rich (legacy compile-time) fields — unchanged shape.
     label: ?[]const u8 = null,
     secondary_spans: []const SecondarySpan = &.{},
     help: ?[]const u8 = null,
     suggestion: ?Suggestion = null,
     code: ?[]const u8 = null,
+
+    // ── Canonical Error IR superset (Phase 4.a) ──
+    /// Which subsystem produced this report. Drives JSON's `domain` field and
+    /// future grouping; the visual language does not change per domain.
+    domain: Domain = .typecheck,
+    /// Labeled secondary locations — LSP `relatedInformation`. 4.b's two-sided
+    /// `TypeProvenance` populates these.
+    related_spans: []const RelatedSpan = &.{},
+    /// Machine-applicable code edits with applicability tags. Projected into
+    /// JSON `suggestions[]` and LSP `CodeAction`s.
+    fixits: []const FixIt = &.{},
+    /// Wrapped underlying causes, rendered as `caused by:` lines.
+    cause_chain: []const Cause = &.{},
+    /// How much trace context rides along (none for compile errors).
+    trace_policy: TracePolicy = .none,
+    /// Structured machine-only payload (never in the human text; rides in JSON).
+    machine_data: []const MachineDatum = &.{},
+    /// Public-API vs internal surface — gated by the security tier.
+    visibility: Visibility = .public,
 
     pub const Note = struct {
         message: []const u8,
@@ -67,15 +129,18 @@ pub const Diagnostic = struct {
 const Color = struct {
     enabled: bool,
 
-    const RESET = "\x1b[0m";
-    const BOLD = "\x1b[1m";
-    const RED = "\x1b[31m";
-    const YELLOW = "\x1b[33m";
-    const CYAN = "\x1b[36m";
-    const BOLD_RED = "\x1b[1;31m";
-    const BOLD_YELLOW = "\x1b[1;33m";
-    const BOLD_CYAN = "\x1b[1;36m";
-    const BOLD_BLUE = "\x1b[1;34m";
+    // The SGR vocabulary is the SHARED palette in `error_format.sgr`, so the
+    // compile renderer and the runtime crash printer emit identical color
+    // bytes. These aliases keep the existing call sites readable.
+    const RESET = error_format.sgr.reset;
+    const BOLD = error_format.sgr.bold;
+    const RED = error_format.sgr.red;
+    const YELLOW = error_format.sgr.yellow;
+    const CYAN = error_format.sgr.cyan;
+    const BOLD_RED = error_format.sgr.bold_red;
+    const BOLD_YELLOW = error_format.sgr.bold_yellow;
+    const BOLD_CYAN = error_format.sgr.bold_cyan;
+    const BOLD_BLUE = error_format.sgr.bold_blue;
 
     fn severityStyle(self: Color, severity: Severity) struct { start: []const u8, end: []const u8 } {
         if (!self.enabled) return .{ .start = "", .end = "" };
@@ -113,6 +178,39 @@ pub fn detectColor() bool {
 }
 
 // ============================================================
+// Diagnostic output policy (process-wide, set once at CLI parse)
+// ============================================================
+
+/// How rendered diagnostics are formatted at the CLI boundary. `text` is the
+/// human-facing renderer (the default); `json` emits the stable
+/// LSP-projectable schema (`src/error_json.zig`) for LSP / CI / `zap fix`.
+pub const OutputFormat = enum { text, json };
+
+/// The process-wide diagnostic-output policy. Set ONCE at CLI argument
+/// parsing (`--error-format=json`, release tier) — the same one-shot,
+/// cache-at-startup discipline the runtime crash printer uses — and read by
+/// the central `compiler.emitDiagnostics` funnel. A single source of truth so
+/// every diagnostic emit site (parse errors, type errors, lints) honors the
+/// flag without threading it through every call.
+pub const OutputPolicy = struct {
+    format: OutputFormat = .text,
+    tier: SecurityTier = .dev_local,
+};
+
+var output_policy: OutputPolicy = .{};
+
+/// Install the process-wide diagnostic-output policy. Idempotent-by-overwrite;
+/// the CLI calls it once after parsing arguments and before any compile begins.
+pub fn setOutputPolicy(policy: OutputPolicy) void {
+    output_policy = policy;
+}
+
+/// The current process-wide diagnostic-output policy.
+pub fn outputPolicy() OutputPolicy {
+    return output_policy;
+}
+
+// ============================================================
 // Diagnostic Engine
 // ============================================================
 
@@ -130,6 +228,12 @@ pub const DiagnosticEngine = struct {
     line_offset: u32,
     max_errors: u32,
     use_color: bool,
+    /// Security tier (brief VI.B #9). `dev_local` by default — full paths and
+    /// internal detail; the CLI sets `user_safe` for a release build so the
+    /// renderer strips absolute paths to basename and suppresses internal-only
+    /// detail. The compile renderer and the runtime crash printer share this
+    /// tier vocabulary (`error_format.SecurityTier`).
+    tier: SecurityTier = .dev_local,
     mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator) DiagnosticEngine {
@@ -142,6 +246,7 @@ pub const DiagnosticEngine = struct {
             .line_offset = 0,
             .max_errors = 20,
             .use_color = false,
+            .tier = .dev_local,
         };
     }
 
@@ -300,6 +405,51 @@ pub const DiagnosticEngine = struct {
         return null;
     }
 
+    /// Public accessor for the display line of a span (applies the stdlib
+    /// `line_offset`). Used by the JSON serializer (`error_json.zig`) so it
+    /// resolves coordinates identically to the text renderer.
+    pub fn displaySpanLinePub(self: *const DiagnosticEngine, span: ast.SourceSpan) u32 {
+        return self.displaySpanLine(span);
+    }
+
+    /// Public accessor for the source file backing a span. Used by the JSON
+    /// serializer so it resolves the file path (and applies the tier's path
+    /// policy) identically to the text renderer's footer.
+    pub fn sourceForSpanPub(self: *const DiagnosticEngine, span: ast.SourceSpan) ?SourceFile {
+        return self.sourceForSpan(span);
+    }
+
+    // ============================================================
+    // Deterministic ordering (brief VI.B #11)
+    // ============================================================
+
+    /// Return a freshly-allocated, deterministically-ordered, de-duplicated
+    /// copy of the diagnostics for rendering. Sorted by the canonical key
+    /// (source_id, then line, then column, then code, then message) so the
+    /// same set of diagnostics always renders byte-identically — a hard
+    /// requirement for snapshot tests across all four surfaces (brief VI.B
+    /// #11). Exact duplicates (same key AND same severity) are dropped, since
+    /// the same error reported twice by two passes should appear once. Caller
+    /// owns and frees the returned slice.
+    pub fn orderedDiagnostics(self: *const DiagnosticEngine, allocator: std.mem.Allocator) ![]Diagnostic {
+        const copy = try allocator.alloc(Diagnostic, self.diagnostics.items.len);
+        errdefer allocator.free(copy);
+        @memcpy(copy, self.diagnostics.items);
+
+        std.sort.block(Diagnostic, copy, {}, diagnosticOrderLess);
+
+        // Drop adjacent exact duplicates (post-sort, equal keys are adjacent).
+        var write_index: usize = 0;
+        for (copy, 0..) |diag, read_index| {
+            if (read_index > 0 and diagnosticsEqualForDedup(copy[write_index - 1], diag)) {
+                continue;
+            }
+            copy[write_index] = diag;
+            write_index += 1;
+        }
+        return try allocator.realloc(copy, write_index);
+    }
+
     // ============================================================
     // Formatting
     // ============================================================
@@ -334,10 +484,18 @@ pub const DiagnosticEngine = struct {
         const writer = Writer{ .list = &buf, .alloc = allocator };
         const color = Color{ .enabled = self.use_color };
 
+        // Deterministic ordering (brief VI.B #11): the same set of diagnostics
+        // must render identically across runs regardless of insertion order
+        // (parallel AstGen workers, hash-map iteration, etc. can vary it).
+        // Sort a COPY by (source_id, line, col, code, message) and drop exact
+        // duplicates so snapshots are stable.
+        const ordered = try self.orderedDiagnostics(allocator);
+        defer allocator.free(ordered);
+
         var errors_shown: usize = 0;
         var total_errors: usize = 0;
 
-        for (self.diagnostics.items) |diag| {
+        for (ordered) |diag| {
             if (diag.severity == .@"error") {
                 total_errors += 1;
                 if (errors_shown >= self.max_errors) continue;
@@ -516,6 +674,93 @@ pub const DiagnosticEngine = struct {
             }
         }
 
+        // ── Related spans (canonical IR; LSP relatedInformation) ──
+        // Each labeled secondary location renders as its own `= note:` line
+        // carrying the location, so a two-sided type error (4.b) reads as
+        // "expected i64 from here (foo.zap:3)" etc. The tier strips the path.
+        for (diag.related_spans) |related| {
+            if (has_source) {
+                try writeGutterEmpty(writer, gutter, color);
+            }
+            try writer.writeByteNTimes(' ', gutter + 1);
+            const related_c = color.severityStyle(.note);
+            try writer.writeAll(related_c.start);
+            try writer.writeAll("= note: ");
+            try writer.writeAll(related_c.end);
+            try writer.writeAll(related.message);
+            const related_source = self.sourceForSpan(related.span);
+            if (related_source) |rs| {
+                const related_line = self.displaySpanLine(related.span);
+                if (related_line > 0) {
+                    try writer.writeAll(" (");
+                    try writer.writeAll(error_format.applyPathPolicy(self.tier, rs.file_path));
+                    try writer.print(":{d}:{d})", .{ related_line, related.span.col });
+                }
+            }
+            try writer.writeByte('\n');
+        }
+
+        // ── Fixits (canonical IR; rustc suggestions / LSP CodeAction) ──
+        // A fixit renders like the legacy suggestion: a `= help:` description
+        // line followed by the replacement code block in the gutter. The
+        // applicability tag is machine-only (JSON) — the human text stays
+        // clean — except that a non-machine-applicable fixit is hedged with
+        // "(may be incorrect)" so a reader does not paste a guess verbatim.
+        for (diag.fixits) |fixit| {
+            if (has_source) {
+                try writeGutterEmpty(writer, gutter, color);
+            }
+            try writer.writeByteNTimes(' ', gutter + 1);
+            if (color.enabled) try writer.writeAll(Color.BOLD);
+            try writer.writeAll("= help: ");
+            if (color.enabled) try writer.writeAll(Color.RESET);
+            try writer.writeAll(fixit.description);
+            switch (fixit.applicability) {
+                .machine_applicable => {},
+                .maybe_incorrect => try writer.writeAll(" (may be incorrect)"),
+                .has_placeholders => try writer.writeAll(" (contains placeholders)"),
+                .unspecified => {},
+            }
+            try writer.writeByte('\n');
+            if (fixit.replacement.len > 0) {
+                if (has_source) {
+                    try writeGutterEmpty(writer, gutter, color);
+                }
+                const gs = color.gutterStyle();
+                var fixit_lines = std.mem.splitScalar(u8, fixit.replacement, '\n');
+                while (fixit_lines.next()) |fixit_line| {
+                    try writer.writeByteNTimes(' ', gutter + 1);
+                    try writer.writeAll(gs.start);
+                    try writer.writeAll(error_format.gutter_bar);
+                    try writer.writeAll(gs.end);
+                    try writer.writeByte(' ');
+                    try writer.writeAll(fixit_line);
+                    try writer.writeByte('\n');
+                }
+            }
+        }
+
+        // ── Cause chain (`caused by:` lines) ──
+        // Each wrapped underlying cause renders as a `caused by: <code> message`
+        // line, mirroring the `Error` protocol's `cause` field / Elixir-Go
+        // error wrapping, so a user sees the full provenance of a re-raised
+        // error.
+        for (diag.cause_chain) |cause| {
+            if (has_source) {
+                try writeGutterEmpty(writer, gutter, color);
+            }
+            try writer.writeByteNTimes(' ', gutter + 1);
+            const cause_c = color.severityStyle(.note);
+            try writer.writeAll(cause_c.start);
+            try writer.writeAll(error_format.cause_prefix);
+            try writer.writeAll(cause_c.end);
+            if (cause.code) |cause_code| {
+                try writer.print("[{s}] ", .{cause_code});
+            }
+            try writer.writeAll(cause.message);
+            try writer.writeByte('\n');
+        }
+
         // ── Footer: └─ file:line:col ──
         if ((source_file != null and source_file.?.file_path.len > 0) or display_line > 0) {
             if (has_source) {
@@ -526,7 +771,10 @@ pub const DiagnosticEngine = struct {
             try writer.writeAll(loc.start);
             try writer.writeAll("\u{2514}\u{2500} ");
             if (source_file) |sf| {
-                try writer.writeAll(sf.file_path);
+                // Security tier (brief VI.B #9): release (`user_safe`) strips
+                // absolute paths to basename so a shipped binary never leaks
+                // filesystem layout; dev/CI keep the full path for navigation.
+                try writer.writeAll(error_format.applyPathPolicy(self.tier, sf.file_path));
             }
             if (display_line > 0) {
                 try writer.print(":{d}:{d}", .{ display_line, diag.span.col });
@@ -612,6 +860,48 @@ fn digitCount(n: u32) u32 {
         count += 1;
     }
     return count;
+}
+
+/// Canonical total order over diagnostics for deterministic rendering (brief
+/// VI.B #11). Orders by, in priority: source file (`source_id`, null sorts
+/// first as "the single implicit source"), then line, then column, then code
+/// (lexicographic; absent code sorts after any present code so coded errors
+/// lead), then message (final tiebreak). A stable, run-independent key so the
+/// renderer's output is snapshot-stable across parallel-worker insertion
+/// orders and hash-map iteration.
+pub fn diagnosticOrderLess(_: void, a: Diagnostic, b: Diagnostic) bool {
+    const a_src = a.span.source_id orelse 0;
+    const b_src = b.span.source_id orelse 0;
+    if (a_src != b_src) return a_src < b_src;
+    if (a.span.line != b.span.line) return a.span.line < b.span.line;
+    if (a.span.col != b.span.col) return a.span.col < b.span.col;
+
+    // Coded diagnostics lead uncoded ones at the same position; among coded,
+    // order by code text.
+    const a_code = a.code orelse "";
+    const b_code = b.code orelse "";
+    const code_order = std.mem.order(u8, a_code, b_code);
+    if (code_order != .eq) {
+        // Empty (absent) code sorts LAST so a coded diagnostic precedes an
+        // uncoded one sharing a position.
+        if (a_code.len == 0) return false;
+        if (b_code.len == 0) return true;
+        return code_order == .lt;
+    }
+
+    return std.mem.order(u8, a.message, b.message) == .lt;
+}
+
+/// True when two diagnostics are exact duplicates for dedup purposes: same
+/// position, same severity, same code, same message. Two passes reporting the
+/// identical error collapse to one rendered diagnostic.
+fn diagnosticsEqualForDedup(a: Diagnostic, b: Diagnostic) bool {
+    if (a.severity != b.severity) return false;
+    if ((a.span.source_id orelse 0) != (b.span.source_id orelse 0)) return false;
+    if (a.span.line != b.span.line) return false;
+    if (a.span.col != b.span.col) return false;
+    if (!std.mem.eql(u8, a.code orelse "", b.code orelse "")) return false;
+    return std.mem.eql(u8, a.message, b.message);
 }
 
 pub fn getSourceLine(source: []const u8, line_number: u32) ?[]const u8 {
@@ -790,10 +1080,14 @@ test "max error limit" {
     defer engine.deinit();
     engine.max_errors = 3;
 
-    // Add 5 errors
+    // Add 5 DISTINCT errors (distinct positions). Distinctness matters: the
+    // renderer now de-duplicates byte-identical diagnostics (brief VI.B #11),
+    // so the cap must be exercised with genuinely different errors, not the
+    // same error reported five times (which correctly collapses to one).
     var i: u32 = 0;
     while (i < 5) : (i += 1) {
-        try engine.err("an error", .{ .start = 0, .end = 1 });
+        const msg = try std.fmt.allocPrint(alloc, "error number {d}", .{i});
+        try engine.err(msg, .{ .start = i, .end = i + 1, .line = i + 1, .col = 1 });
     }
 
     const output = try engine.format(alloc);
@@ -879,4 +1173,252 @@ test "diagnostic engine selects source by span source_id" {
     const output = try engine.format(alloc);
     try std.testing.expect(std.mem.find(u8, output, "second.zap:2:1") != null);
     try std.testing.expect(std.mem.find(u8, output, "third") != null);
+}
+
+// ============================================================
+// Phase 4.a — canonical Error IR / unified renderer tests
+// ============================================================
+
+test "deterministic ordering: same diagnostics render identically across runs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.setSource("a\nb\nc\nd\ne\n", "ord.zap");
+
+    // Insert in a deliberately scrambled order.
+    try engine.err("on line three", .{ .start = 4, .end = 5, .line = 3, .col = 1 });
+    try engine.err("on line one", .{ .start = 0, .end = 1, .line = 1, .col = 1 });
+    try engine.err("on line five", .{ .start = 8, .end = 9, .line = 5, .col = 1 });
+    try engine.err("on line two", .{ .start = 2, .end = 3, .line = 2, .col = 1 });
+
+    const first = try engine.format(alloc);
+    const second = try engine.format(alloc);
+    try std.testing.expectEqualStrings(first, second);
+
+    // Canonical order is by line: one, two, three, five.
+    const idx_one = std.mem.find(u8, first, "on line one").?;
+    const idx_two = std.mem.find(u8, first, "on line two").?;
+    const idx_three = std.mem.find(u8, first, "on line three").?;
+    const idx_five = std.mem.find(u8, first, "on line five").?;
+    try std.testing.expect(idx_one < idx_two);
+    try std.testing.expect(idx_two < idx_three);
+    try std.testing.expect(idx_three < idx_five);
+}
+
+test "deterministic dedup: byte-identical diagnostics collapse to one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.setSource("x = 1\n", "dup.zap");
+
+    // The same error reported three times by three passes.
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        try engine.reportDiagnostic(.{
+            .severity = .@"error",
+            .message = "redefinition of `x`",
+            .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 },
+            .code = "Z0101",
+        });
+    }
+
+    const ordered = try engine.orderedDiagnostics(alloc);
+    defer alloc.free(ordered);
+    try std.testing.expectEqual(@as(usize, 1), ordered.len);
+
+    // But two errors that DIFFER (different code) at the same spot are kept.
+    try engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .message = "different error",
+        .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 },
+        .code = "Z0102",
+    });
+    const ordered2 = try engine.orderedDiagnostics(alloc);
+    defer alloc.free(ordered2);
+    try std.testing.expectEqual(@as(usize, 2), ordered2.len);
+}
+
+test "security tier user_safe strips absolute path to basename" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.setSource("x = 1\n", "/Users/dev/project/src/secret_path.zap");
+
+    try engine.err("boom", .{ .start = 0, .end = 1, .line = 1, .col = 1 });
+
+    // dev_local: full path visible.
+    engine.tier = .dev_local;
+    const dev_output = try engine.format(alloc);
+    try std.testing.expect(std.mem.find(u8, dev_output, "/Users/dev/project/src/secret_path.zap") != null);
+
+    // user_safe: only the basename, no leading directories.
+    engine.tier = .user_safe;
+    const safe_output = try engine.format(alloc);
+    try std.testing.expect(std.mem.find(u8, safe_output, "secret_path.zap") != null);
+    try std.testing.expect(std.mem.find(u8, safe_output, "/Users/dev/project") == null);
+}
+
+test "cause chain renders caused-by lines with codes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.setSource("call_thing()\n", "c.zap");
+
+    try engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .domain = .runtime,
+        .message = "request failed",
+        .span = .{ .start = 0, .end = 10, .line = 1, .col = 1 },
+        .code = "Z1001",
+        .cause_chain = &.{
+            .{ .code = "Z1002", .message = "ArgumentError: invalid host" },
+            .{ .message = "connection refused" },
+        },
+    });
+
+    const output = try engine.format(alloc);
+    try std.testing.expect(std.mem.find(u8, output, "caused by: [Z1002] ArgumentError: invalid host") != null);
+    try std.testing.expect(std.mem.find(u8, output, "caused by: connection refused") != null);
+}
+
+test "fixit renders help line plus replacement block and hedges non-machine-applicable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.setSource("naem + 1\n", "fx.zap");
+
+    try engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .domain = .name,
+        .message = "cannot find `naem`",
+        .span = .{ .start = 0, .end = 4, .line = 1, .col = 1 },
+        .fixits = &.{
+            .{
+                .span = .{ .start = 0, .end = 4, .line = 1, .col = 1 },
+                .replacement = "name",
+                .description = "did you mean `name`?",
+                .applicability = .maybe_incorrect,
+            },
+        },
+    });
+
+    const output = try engine.format(alloc);
+    try std.testing.expect(std.mem.find(u8, output, "= help: did you mean `name`? (may be incorrect)") != null);
+    // Replacement appears in a gutter code block.
+    try std.testing.expect(std.mem.find(u8, output, "name") != null);
+}
+
+test "unified renderer: a runtime panic uses the SAME visual language as a compile error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // A compile error.
+    var compile_engine = DiagnosticEngine.init(alloc);
+    defer compile_engine.deinit();
+    compile_engine.setSource("pub fn foo() {\n  bar()\n}\n", "app.zap");
+    try compile_engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .domain = .name,
+        .message = "undefined function `bar/0`",
+        .span = .{ .start = 17, .end = 20, .line = 2, .col = 3 },
+        .code = "Z0100",
+        .label = "not found in this scope",
+    });
+    const compile_output = try compile_engine.format(alloc);
+
+    // A runtime panic lowered into the SAME canonical IR + SAME renderer.
+    var runtime_engine = DiagnosticEngine.init(alloc);
+    defer runtime_engine.deinit();
+    runtime_engine.setSource("def main() do\n  raise \"boom\"\nend\n", "app.zap");
+    try runtime_engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .domain = .runtime,
+        .message = "boom",
+        .span = .{ .start = 16, .end = 21, .line = 2, .col = 3 },
+        .code = "Z1001",
+        .trace_policy = .full,
+    });
+    const runtime_output = try runtime_engine.format(alloc);
+
+    // Both share the visual language: the `error[Zxxxx]:` header, the box
+    // gutter glyph, and the footer corner.
+    try std.testing.expect(std.mem.find(u8, compile_output, "error[Z0100]:") != null);
+    try std.testing.expect(std.mem.find(u8, runtime_output, "error[Z1001]:") != null);
+    for ([_][]const u8{ compile_output, runtime_output }) |out| {
+        try std.testing.expect(std.mem.find(u8, out, "\u{2502}") != null); // gutter bar
+        try std.testing.expect(std.mem.find(u8, out, "\u{2514}\u{2500}") != null); // footer corner
+        try std.testing.expect(std.mem.find(u8, out, "app.zap:2:3") != null);
+    }
+}
+
+test "unified renderer: a synthetic leak report uses the SAME visual language" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // A leak report (Phase 4.c will populate `domain=leak`; the renderer must
+    // already render it with the one visual language).
+    var leak_engine = DiagnosticEngine.init(alloc);
+    defer leak_engine.deinit();
+    leak_engine.setSource("def build() do\n  alloc_thing()\nend\n", "leaky.zap");
+    try leak_engine.reportDiagnostic(.{
+        .severity = .warning,
+        .domain = .leak,
+        .message = "memory leak: 1 object (48 bytes) never released",
+        .span = .{ .start = 17, .end = 28, .line = 2, .col = 3 },
+        .label = "allocated here, never freed",
+        .trace_policy = .allocation,
+        .machine_data = &.{
+            .{ .key = "bytes", .value = "48" },
+            .{ .key = "count", .value = "1" },
+        },
+    });
+
+    const leak_output = try leak_engine.format(alloc);
+    try std.testing.expect(std.mem.find(u8, leak_output, "warning: memory leak") != null);
+    try std.testing.expect(std.mem.find(u8, leak_output, "\u{2502}") != null);
+    try std.testing.expect(std.mem.find(u8, leak_output, "\u{2514}\u{2500}") != null);
+    try std.testing.expect(std.mem.find(u8, leak_output, "allocated here, never freed") != null);
+    try std.testing.expect(std.mem.find(u8, leak_output, "leaky.zap:2:3") != null);
+}
+
+test "related spans render as note lines with location" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.setSource("let x: i64 = get()\nx = \"hello\"\n", "prov.zap");
+
+    // Two-sided type error (the shape 4.b's TypeProvenance produces).
+    try engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .domain = .typecheck,
+        .message = "type mismatch: expected `i64`, got `String`",
+        .span = .{ .start = 23, .end = 30, .line = 2, .col = 5 },
+        .label = "this is a `String`",
+        .related_spans = &.{
+            .{ .span = .{ .start = 7, .end = 10, .line = 1, .col = 8 }, .message = "expected `i64` because of this annotation" },
+        },
+    });
+
+    const output = try engine.format(alloc);
+    try std.testing.expect(std.mem.find(u8, output, "= note: expected `i64` because of this annotation (prov.zap:1:8)") != null);
 }

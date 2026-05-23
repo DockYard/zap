@@ -9589,9 +9589,47 @@ fn lookupStructProgram(ctx: *const CompilationContext, mod_name: []const u8) ?*c
 /// Compile a Zap source file through the frontend and ZIR backend to produce
 /// a native binary.
 fn emitDiagnostics(diag_engine: *zap.DiagnosticEngine, alloc: std.mem.Allocator) void {
-    const rendered = diag_engine.format(alloc) catch return;
-    // stderr writer: use debug.print in 0.16
-    std.debug.print("{s}", .{rendered});
+    // Honor the process-wide diagnostic-output policy (set once at CLI parse):
+    // the security tier governs path stripping, and the format selects the
+    // human text renderer or the stable LSP-projectable JSON schema.
+    const policy = zap.diagnostics.outputPolicy();
+    diag_engine.tier = policy.tier;
+
+    switch (policy.format) {
+        .text => {
+            const rendered = diag_engine.format(alloc) catch return;
+            // stderr writer: use debug.print in 0.16
+            std.debug.print("{s}", .{rendered});
+        },
+        .json => {
+            // `--error-format=json`: emit the canonical Error IR as a single
+            // JSON document on STDOUT (the machine channel), so a tool can
+            // consume it cleanly while human progress stays on stderr.
+            const json_text = zap.error_json.serialize(diag_engine, alloc) catch return;
+            writeStdoutAll(json_text);
+            writeStdoutAll("\n");
+        },
+    }
+}
+
+/// Write `bytes` to STDOUT (fd 1) with a partial-write loop. Used by the
+/// `--error-format=json` path so the machine-readable document goes to the
+/// stdout channel (human progress stays on stderr). Best-effort: a write
+/// failure is swallowed because diagnostics are already a terminal report.
+fn writeStdoutAll(bytes: []const u8) void {
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const rc = std.posix.system.write(std.posix.STDOUT_FILENO, bytes[index..].ptr, bytes.len - index);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                const written: usize = @intCast(rc);
+                if (written == 0) return;
+                index += written;
+            },
+            .INTR => {},
+            else => return,
+        }
+    }
 }
 
 const testing = std.testing;
