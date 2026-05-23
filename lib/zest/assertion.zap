@@ -137,19 +137,18 @@ pub struct Zest.Assertion {
     assertion passes as a no-op (the expectation cannot be checked here).
     """
 
-  pub fn expect_leak_result(tracking_active :: Bool, before_count :: i64, after_count :: i64, before_bytes :: i64, after_bytes :: i64, code :: String, location :: String) -> String {
+  pub fn expect_leak_result(tracking_active :: Bool, before_count :: i64, after_count :: i64, _before_bytes :: i64, _after_bytes :: i64, code :: String, location :: String) -> String {
     if not tracking_active {
       :zig.Zest.pass_assertion()
       "."
     } else {
       leaked_count = after_count - before_count
-      leaked_bytes = after_bytes - before_bytes
 
       if leaked_count > 0 {
         :zig.Zest.pass_assertion()
         "."
       } else {
-        :zig.Zest.fail_assertion_with_message(format_expected_leak_failure(leaked_bytes, code, location))
+        :zig.Zest.fail_assertion_with_message(format_expected_leak_failure(code, location))
         "F"
       }
     }
@@ -206,7 +205,7 @@ pub struct Zest.Assertion {
     "memory leak assertion failed" <> location_block(location) <> "\nblock: " <> display_text(code, "block") <> "\nleaked: " <> Kernel.to_string(leaked_count) <> " allocation(s), " <> Kernel.to_string(leaked_bytes) <> " bytes\nexpected: 0 net live allocations after the block"
   }
 
-  fn format_expected_leak_failure(leaked_bytes :: i64, code :: String, location :: String) -> String {
+  fn format_expected_leak_failure(code :: String, location :: String) -> String {
     "@expect_leak assertion failed" <> location_block(location) <> "\nblock: " <> display_text(code, "block") <> "\nresult: the block did not leak, but it was marked @expect_leak\nexpected: at least one net live allocation to remain"
   }
 
