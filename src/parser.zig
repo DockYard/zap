@@ -7124,6 +7124,86 @@ test "parse error pipe ~> with function handler" {
     try std.testing.expect(body[0].expr.* == .error_pipe);
 }
 
+test "parse with expression: multi-step + else (Phase 3.c)" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn run() -> String {
+        \\    with Result.Ok(a) <- step1(),
+        \\         Result.Ok(b) <- step2(a) {
+        \\      combine(a, b)
+        \\    } else {
+        \\      Result.Error(e) -> e
+        \\    }
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.structs[0].items[0].function;
+    const body = func.clauses[0].body.?;
+    try std.testing.expect(body.len > 0);
+    try std.testing.expect(body[0].expr.* == .with_expr);
+    const we = body[0].expr.with_expr;
+    try std.testing.expectEqual(@as(usize, 2), we.steps.len);
+    try std.testing.expect(we.else_clauses != null);
+    try std.testing.expectEqual(@as(usize, 1), we.else_clauses.?.len);
+}
+
+test "parse with expression: else-less form (Phase 3.c)" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn run() -> String {
+        \\    with Result.Ok(a) <- step1() {
+        \\      a
+        \\    }
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.structs[0].items[0].function;
+    const body = func.clauses[0].body.?;
+    try std.testing.expect(body[0].expr.* == .with_expr);
+    const we = body[0].expr.with_expr;
+    try std.testing.expectEqual(@as(usize, 1), we.steps.len);
+    try std.testing.expect(we.else_clauses == null);
+}
+
+test "parse with: bare `with` identifier is not hijacked (Phase 3.c)" {
+    // `with` followed by `=`/an operator keeps its identifier reading, so a
+    // local named `with` still parses as an ordinary binding/read, not as
+    // the `with` keyword form (the next token cannot begin a pattern).
+    const source =
+        \\pub struct Test {
+        \\  pub fn run() -> i64 {
+        \\    with = compute()
+        \\    with + 1
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.structs[0].items[0].function;
+    const body = func.clauses[0].body.?;
+    // No statement in the body is a `with_expr`: the first is an
+    // assignment to a local named `with`, the second a `with + 1` read.
+    for (body) |stmt| {
+        if (stmt == .expr) try std.testing.expect(stmt.expr.* != .with_expr);
+    }
+}
+
 test "parse keyword list expression desugars to tuples" {
     const source = "[name: \"Brian\", age: 42]";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

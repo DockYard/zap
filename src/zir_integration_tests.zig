@@ -1414,6 +1414,197 @@ test "ZIR: cond with comparisons (nested captured bodies)" {
 }
 
 // ============================================================
+// `with` macro (Phase 3.c) — Elixir-style multi-step Result
+// composition. Desugars to nested `case`; these tests pin the
+// runtime behavior of each path (all-match, first-step mismatch
+// to else, else-less verbatim, multi-step binding).
+// ============================================================
+
+test "ZIR: with all steps match runs the do body" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn parse_ten(s :: String) -> Result(i64, String) {
+        \\    case s {
+        \\      "ten" -> Result(i64, String).Ok(10)
+        \\      _ -> Result(i64, String).Error("not ten")
+        \\    }
+        \\  }
+        \\  pub fn parse_twenty(s :: String) -> Result(i64, String) {
+        \\    case s {
+        \\      "twenty" -> Result(i64, String).Ok(20)
+        \\      _ -> Result(i64, String).Error("not twenty")
+        \\    }
+        \\  }
+        \\  pub fn add(a :: String, b :: String) -> Result(i64, String) {
+        \\    with Result.Ok(x) <- parse_ten(a),
+        \\         Result.Ok(y) <- parse_twenty(b) {
+        \\      Result(i64, String).Ok(x + y)
+        \\    } else {
+        \\      Result.Error(m) -> Result(i64, String).Error(m)
+        \\    }
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    case add("ten", "twenty") {
+        \\      Result.Ok(n) -> IO.puts(Integer.to_string(n))
+        \\      Result.Error(e) -> IO.puts(e)
+        \\    }
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("30\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: with first-step mismatch routes to else clause" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn parse_ten(s :: String) -> Result(i64, String) {
+        \\    case s {
+        \\      "ten" -> Result(i64, String).Ok(10)
+        \\      _ -> Result(i64, String).Error("not ten")
+        \\    }
+        \\  }
+        \\  pub fn parse_twenty(s :: String) -> Result(i64, String) {
+        \\    case s {
+        \\      "twenty" -> Result(i64, String).Ok(20)
+        \\      _ -> Result(i64, String).Error("not twenty")
+        \\    }
+        \\  }
+        \\  pub fn add(a :: String, b :: String) -> Result(i64, String) {
+        \\    with Result.Ok(x) <- parse_ten(a),
+        \\         Result.Ok(y) <- parse_twenty(b) {
+        \\      Result(i64, String).Ok(x + y)
+        \\    } else {
+        \\      Result.Error(m) -> Result(i64, String).Error("wrapped: " <> m)
+        \\    }
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    case add("nope", "twenty") {
+        \\      Result.Ok(n) -> IO.puts(Integer.to_string(n))
+        \\      Result.Error(e) -> IO.puts(e)
+        \\    }
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("wrapped: not ten\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: with else-less form returns the non-matching value verbatim" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn parse_ten(s :: String) -> Result(i64, String) {
+        \\    case s {
+        \\      "ten" -> Result(i64, String).Ok(10)
+        \\      _ -> Result(i64, String).Error("not ten")
+        \\    }
+        \\  }
+        \\  pub fn parse_twenty(s :: String) -> Result(i64, String) {
+        \\    case s {
+        \\      "twenty" -> Result(i64, String).Ok(20)
+        \\      _ -> Result(i64, String).Error("not twenty")
+        \\    }
+        \\  }
+        \\  pub fn add(a :: String, b :: String) -> Result(i64, String) {
+        \\    with Result.Ok(x) <- parse_ten(a),
+        \\         Result.Ok(y) <- parse_twenty(b) {
+        \\      Result(i64, String).Ok(x + y)
+        \\    }
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    case add("ten", "nope") {
+        \\      Result.Ok(n) -> IO.puts(Integer.to_string(n))
+        \\      Result.Error(e) -> IO.puts("raw: " <> e)
+        \\    }
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("raw: not twenty\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: with single-step else-less mismatch yields the value" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn p(s :: String) -> Result(i64, String) {
+        \\    case s {
+        \\      "x" -> Result(i64, String).Ok(7)
+        \\      _ -> Result(i64, String).Error("nomatch")
+        \\    }
+        \\  }
+        \\  pub fn run(s :: String) -> Result(i64, String) {
+        \\    with Result.Ok(v) <- p(s) {
+        \\      Result(i64, String).Ok(v * 100)
+        \\    }
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    case run("zzz") {
+        \\      Result.Ok(n) -> IO.puts(Integer.to_string(n))
+        \\      Result.Error(e) -> IO.puts("got: " <> e)
+        \\    }
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("got: nomatch\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: with composes a parse-then-validate chain (success and failure)" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn parse_age(raw :: String) -> Result(i64, String) {
+        \\    case raw {
+        \\      "30" -> Result(i64, String).Ok(30)
+        \\      "200" -> Result(i64, String).Ok(200)
+        \\      _ -> Result(i64, String).Error("not a number")
+        \\    }
+        \\  }
+        \\  pub fn check_range(age :: i64) -> Result(i64, String) {
+        \\    case age < 150 {
+        \\      true -> Result(i64, String).Ok(age)
+        \\      false -> Result(i64, String).Error("out of range")
+        \\    }
+        \\  }
+        \\  pub fn register(raw :: String) -> Result(String, String) {
+        \\    with Result.Ok(age) <- parse_age(raw),
+        \\         Result.Ok(ok_age) <- check_range(age) {
+        \\      Result(String, String).Ok("age " <> Integer.to_string(ok_age))
+        \\    } else {
+        \\      Result.Error(r) -> Result(String, String).Error("rejected: " <> r)
+        \\    }
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    case register("30") {
+        \\      Result.Ok(m) -> IO.puts(m)
+        \\      Result.Error(e) -> IO.puts(e)
+        \\    }
+        \\    case register("200") {
+        \\      Result.Ok(m) -> IO.puts(m)
+        \\      Result.Error(e) -> IO.puts(e)
+        \\    }
+        \\    "done"
+        \\    0
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("age 30\nrejected: out of range\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// ============================================================
 // Catch basin (error pipe)
 // ============================================================
 

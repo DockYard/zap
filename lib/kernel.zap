@@ -6,6 +6,27 @@
   (`and`, `or`), the pipe operator (`|>`), sigils (`~s`, `~S`,
   `~w`, `~W`), and declaration macros (`fn`, `struct`, `union`).
 
+  Kernel also provides the multi-step pattern-match composition
+  `with` (Elixir-style):
+
+      with Result.Ok(a) <- step1(),
+           Result.Ok(b) <- step2(a) {
+        Result.Ok(use(a, b))
+      } else {
+        Result.Error(e) -> Result.Error(wrap(e))
+      }
+
+  Each `pattern <- expr` step evaluates `expr` and matches it; on the
+  first non-matching step the whole `with` short-circuits to the
+  `else` clauses (or, with no `else`, to the non-matching value). The
+  `do` body runs only when every step matched. Like the
+  `cond`/`for`/`try` block forms, `with` is a variadic construct, so —
+  unlike the fixed-arity `if` macro — it is not expressible as a
+  single Kernel macro; it is a contextual keyword desugared to nested
+  `case` expressions in the same bootstrap layer that lowers
+  `if`/`cond`. It introduces no new runtime mechanism — pure sugar
+  over `case`.
+
   You don't need to `import Kernel` — its macros are available
   everywhere automatically.
   """
