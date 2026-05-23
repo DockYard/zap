@@ -87,6 +87,24 @@ fn buildCrasherAndGetBinary(
     _ = env.swapRemove("ZAP_LIB_DIR");
     try env.put("ZAP_LIB_DIR", repo_lib);
 
+    // Publish into a PER-TEST-ISOLATED script cache, not the shared
+    // `~/.cache/zap/scripts`. Other test steps (the golden corpus, the Zest
+    // corpus, the mod-test harness) `rm -rf ~/.cache/zap/scripts` to defeat a
+    // stale cache; running concurrently with this test, such a wipe could
+    // delete THIS test's just-published crasher between the publish run and the
+    // `nm`/`addr2line` read — turning the second run into a cache MISS (no
+    // `[script-cache hit]` marker) and forcing a spurious skip. Pointing
+    // `ZAP_SCRIPT_CACHE_DIR` at the script's own (unique `tmpDir`) parent
+    // isolates this test's cache so no sibling can wipe it. This is the same
+    // isolation `src/zir_integration_tests.zig` already uses. The script path
+    // is absolute, so its dirname is the test's unique tmp directory.
+    const cache_dir = blk: {
+        const dir_end = std.mem.lastIndexOfScalar(u8, script_path, '/') orelse break :blk null;
+        break :blk try std.fmt.allocPrint(allocator, "{s}/script-cache", .{script_path[0..dir_end]});
+    };
+    defer if (cache_dir) |c| allocator.free(c);
+    if (cache_dir) |c| try env.put("ZAP_SCRIPT_CACHE_DIR", c);
+
     const opt_flag = try std.fmt.allocPrint(allocator, "-Doptimize={s}", .{optimize});
     defer allocator.free(opt_flag);
 
@@ -199,8 +217,17 @@ test "zap addr2line resolves a stripped ReleaseFast binary from its dSYM + sidec
     };
     defer allocator.free(binary);
 
-    const addr = (try staticAddressOf(allocator, binary, "Crasher.deeper__0")) orelse {
-        std.debug.print("skip: nm unavailable or symbol absent (binary={s})\n", .{binary});
+    // Resolve `Crasher.blow_up/0`, NOT `Crasher.deeper/0`: in ReleaseFast the
+    // optimizer inlines the tiny `raise`-only `deeper/0` leaf into its caller,
+    // so `deeper__0` has no symtab entry for `nm` to hand us an address for
+    // (that absence used to force a spurious skip and was misread as a
+    // `zap addr2line` gap). `blow_up/0` is the surviving outer frame — exactly
+    // the kind of stripped-but-present symbol whose static address `nm` finds
+    // and whose Zap name + `file:line` `zap addr2line` recovers from the
+    // sibling sidecar + dSYM. A null here now means `nm` is genuinely
+    // unavailable (an exotic host), which stays a skip.
+    const addr = (try staticAddressOf(allocator, binary, "Crasher.blow_up__0")) orelse {
+        std.debug.print("skip: nm unavailable (binary={s})\n", .{binary});
         return error.SkipZigTest;
     };
     defer allocator.free(addr);
@@ -209,7 +236,7 @@ test "zap addr2line resolves a stripped ReleaseFast binary from its dSYM + sidec
     defer result.deinit();
 
     // Full Zap symbol recovered from the sidecar; file:line from the dSYM.
-    try expectResolves(result, &.{ "Crasher.deeper/0", "crasher.zap:" });
+    try expectResolves(result, &.{ "Crasher.blow_up/0", "crasher.zap:" });
 }
 
 test "zap addr2line resolves a Debug binary from embedded DWARF" {
