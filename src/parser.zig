@@ -2699,6 +2699,16 @@ pub const Parser = struct {
         return left;
     }
 
+    // The `~>` catch-basin stays on its bespoke `error_pipe` lowering
+    // (HIR `buildErrorPipe` → IR `lowerErrorPipeTryStep` / `try_call_named`
+    // / `error_catch` / `match_error_return`). Phase 3.c evaluated migrating
+    // it to a `rescue` macro over the Phase 3.a `try`/`rescue` machinery and
+    // DEFERRED it: `~>` recovers a call-site *dispatch failure* and binds the
+    // original *input value* to the handler, whereas `try`/`rescue` catches a
+    // *raised Error* and binds the Error — semantically distinct models that
+    // cannot be unified without changing `~>`'s observable behavior (which
+    // must stay byte-identical). See the Phase 3.c note in
+    // docs/error-system-research-brief.md (Phase 3 section).
     fn parseErrorPipeHandler(self: *Parser, chain: *const ast.Expr) !*const ast.Expr {
         const start = chain.getMeta().span;
 

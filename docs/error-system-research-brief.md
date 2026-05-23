@@ -639,6 +639,44 @@ acceptance test (Part VIII).
 - **Acceptance:** round-tripping Elixir-shaped pipelines is identical to today; effect-polymorphic
   combinators compose without explicit annotation; mandatory-`raises` lint mode passes on `lib/*`.
 
+> **Phase 3.c implementation note (the `~>`→`rescue` migration is intentionally deferred).**
+> Phase 3.c delivered the `with` macro (Elixir-style multi-step `Result` composition, desugared to
+> nested `case` — see `ast.WithExpr` and `src/macro.zig:withToNestedCase`). The companion goal,
+> "migrate `~>` to a `rescue` macro," was **deferred** after a rigorous reconciliation that found the
+> two constructs are **not semantically equivalent**, so a migration cannot preserve `~>`'s exact
+> behavior (the overriding acceptance criterion above: "round-tripping … is identical to today").
+>
+> The mismatch is in the *failure model*:
+>
+> - **`~>` (the catch-basin) is a call-site _dispatch-failure_ recovery.** A pipe step that is a
+>   multi-clause function is compiled to a `__try` variant returning `error{NoMatchingClause}!T`
+>   (`src/ir.zig` `lowerErrorPipeTryStep` / `try_call_named` / `error_catch` / `match_error_return`).
+>   On a clause-match failure the catch basin runs the handler **with the original input value
+>   bound** — and the handler may pattern-match that value's domain (e.g. `"fail" -> …`, `val -> …`).
+>   The handler never sees an `Error` struct; no `raise` occurs.
+>
+> - **`try`/`rescue` (Phase 3.a) is a _raised-Error_ effect handler.** It catches a `raise %E{}`
+>   (an error-union/ERT return carrying the boxed `Error` via the thread-local side-channel) and the
+>   `rescue` arms pattern-match the **`Error` value** (`e :: IOError`, `%KeyError{…}`).
+>
+> Empirically (verified at the Phase 3.c tip): a multi-clause **dispatch failure is _unrecoverable_**
+> — `T.parse("nope")` aborts with `** (match_error) no matching clause` (the Phase 2 crash path) and
+> is **not** caught by an enclosing `try`/`rescue`. So `~>` cannot be expressed as `try`/`rescue`
+> without (a) making every dispatch failure a *recoverable* `raise %MatchError{value}` — a
+> program-wide behavior change well outside this phase — and (b) having `rescue` expose the *input
+> value* (not the `Error`) to handler patterns matching the input's domain. Both are observable
+> behavior changes that would break the byte-identical guarantee. The brief's "the Phase-1 `match`
+> desugar is intermediate" framing assumed the two models would converge; they do not.
+>
+> **Decision:** keep `~>` on its proven bespoke lowering (byte-identical, zero regression — every
+> existing consumer verified: `script_fixtures/phase_1_4_error_pipe.zap`,
+> `examples/error_pipe/error_pipe.zap`, `test/catch_basin_test.zap`, and the 7 catch-basin
+> integration tests in `src/zir_integration_tests.zig`). The `try_call_named`/`error_catch`/
+> `match_error_return` infrastructure is **retained, not retired** (it is not replaced). A true
+> unification belongs in the Phase 3 gap loop (#179) and would require first deciding whether
+> dispatch failures should become recoverable raises — a language-semantics question, not a
+> mechanical macro rewrite.
+
 ### Phase 4 — Unified diagnostic renderer + leak/cycle subsystem
 
 - Generalize `src/diagnostics.zig` into the canonical Error IR (Part IV §4) — one renderer for
