@@ -1,0 +1,4 @@
+[script-cache hit] <STAGING>
+done
+[{"domain":"leak","severity":"warning","sub_kind":"leak","trace_policy":"allocation","message":"memory leak: %Inner{} never released","machine_data":{"type":"Inner","bytes":40,"alignment":8,"refcount":1,"address":"0xADDR","index":0}}
+]

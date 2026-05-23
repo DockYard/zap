@@ -1,0 +1,5 @@
+** (assertion_error) assertion failed: value (at <FIXTURE>:9)
+  Kernel.contract_violation/3
+  AssertionError.check/1
+  script.main
+  __ZapScriptMain.main/1

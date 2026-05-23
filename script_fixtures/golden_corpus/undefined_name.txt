@@ -1,0 +1,17 @@
+error: I cannot find a function named `greetng/0`
+  │
+6 │   pub fn greet() -> String {
+7 │     greetng()
+  │     ^^^^^^^^^ not found in this scope
+  │
+  = help: did you mean `greeting/0`?
+  │
+  └─ <FIXTURE>:7:5
+
+
+=== 1 compilation error(s) ===
+[0] <STAGING> error: use of undeclared identifier 'UndefinedName__greet__0'
+=== end errors ===
+zir_api: error count: 1
+<STAGING> error: use of undeclared identifier 'UndefinedName__greet__0'
+Error: compilation failed: CompilationFailed

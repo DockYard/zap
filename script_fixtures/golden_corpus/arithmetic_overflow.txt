@@ -1,0 +1,7 @@
+** (arithmetic_error) integer overflow
+  zap_runtime.Kernel.addInteger__anon_N
+  zap_runtime.Kernel.add_i64
+  Integer._plus__2__clause_3/2
+  ArithmeticOverflow.boom/1
+  script.main
+  __ZapScriptMain.main/1

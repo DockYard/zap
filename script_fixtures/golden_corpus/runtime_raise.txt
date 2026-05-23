@@ -1,0 +1,10 @@
+** (kaboom_error) kaboom from the deepest frame
+  Kernel.abort_recoverable_raise/0
+  script.main
+  __ZapScriptMain.main/1
+error return trace:
+  Chain.deepest/0
+  Chain.middle/0
+  Chain.outermost/0
+  script.main
+  __ZapScriptMain.main/1

@@ -1,0 +1,10 @@
+done
+warning: memory leak: Leaked 1 `%Inner{}` (40 B), refcount 1
+  │
+  allocated here:
+  script.main
+  __ZapScriptMain.main/1
+  └─ 0xADDR
+
+leak summary: 1 allocation, 40 bytes total
+  1 x `%Inner{}` (40 B)

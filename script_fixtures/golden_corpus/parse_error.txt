@@ -1,0 +1,9 @@
+error: I was not expecting a newline here
+  │
+7 │     value =
+8 │   }
+  │ ^ not a valid expression
+  │
+  = help: expressions start with a value (number, string, variable), an operator, or a keyword like `if` or `case`
+  │
+  └─ <FIXTURE>:8:1

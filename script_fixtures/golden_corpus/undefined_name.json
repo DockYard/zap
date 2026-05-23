@@ -1,0 +1,8 @@
+{"schema_version":1,"diagnostics":[{"domain":"typecheck","severity":"error","lsp_severity":1,"message":"I cannot find a function named `greetng/0`","trace_policy":"none","visibility":"public","primary_span":{"file":"<FIXTURE>","range":{"start":{"line":6,"character":4},"end":{"line":6,"character":13}},"line":7,"column":5,"byte_start":296,"byte_end":305,"label":"not found in this scope"},"related_information":[],"notes":[],"help":"did you mean `greeting/0`?","suggestions":[],"cause_chain":[],"machine_data":{},"rendered":"error: I cannot find a function named `greetng/0`\n  │\n6 │   pub fn greet() -> String {\n7 │     greetng()\n  │     ^^^^^^^^^ not found in this scope\n  │\n  = help: did you mean `greeting/0`?\n  │\n  └─ <FIXTURE>:7:5\n\n"}]}
+
+=== 1 compilation error(s) ===
+[0] <STAGING> error: use of undeclared identifier 'UndefinedName__greet__0'
+=== end errors ===
+zir_api: error count: 1
+<STAGING> error: use of undeclared identifier 'UndefinedName__greet__0'
+Error: compilation failed: CompilationFailed

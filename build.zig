@@ -434,6 +434,20 @@ pub fn build(b: *std.Build) void {
     }
 
     // -----------------------------------------------------------------------
+    // Golden diagnostic corpus step (Phase 4.e): re-run every curated
+    // diagnostic fixture through the freshly-built `zap` and diff the
+    // normalized text + JSON render against the committed golden snapshots.
+    // This is the primary regression benchmark for the whole error system; a
+    // drift fails the step. Kept separate from `zig build test` because it
+    // shells out to the script-mode CLI (the snapshots exercise the end-to-end
+    // `zap run` diagnostic path, not the in-process unit harness).
+    // -----------------------------------------------------------------------
+    const golden_corpus_step = b.step("golden-corpus", "Run the Zap-native golden diagnostic corpus and diff against snapshots");
+    const golden_corpus_cmd = b.addSystemCommand(&.{ "bash", "script_fixtures/run_golden_corpus.sh" });
+    golden_corpus_cmd.step.dependOn(b.getInstallStep());
+    golden_corpus_step.dependOn(&golden_corpus_cmd.step);
+
+    // -----------------------------------------------------------------------
     // ZIR integration tests (need the built binary)
     // -----------------------------------------------------------------------
     const zir_tests = b.addTest(.{

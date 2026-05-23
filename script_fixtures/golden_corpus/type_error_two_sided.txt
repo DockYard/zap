@@ -1,0 +1,38 @@
+error: this function returns the wrong type
+  │
+6 │ pub struct TypeErrorTwoSided {
+7 │   pub fn wrong() -> i64 {
+  │               ^^^^^^^^^^^ expected `i64`, got `String`
+  │                     ~~~ return type `i64` declared here
+  │
+  = help: the function is declared to return `i64` but the body produces `String`
+  │
+  = note: expected `i64` because of this return type annotation (<FIXTURE>:7:21)
+  │
+  └─ <FIXTURE>:7:15
+
+error: this function returns the wrong type
+   │
+12 │ fn main(_args :: [String]) -> u8 {
+   │        ^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `u8`, got `i64`
+   │                               ~~ return type `u8` declared here
+   │
+   = help: the function is declared to return `u8` but the body produces `i64`
+   │
+   = note: expected `u8` because of this return type annotation (<FIXTURE>:12:31)
+   │
+   └─ <FIXTURE>:12:8
+
+
+=== 1 compilation error(s) ===
+[0] <STAGING> error: root source file struct 'script' has no member named 'main'
+       <STAGING> note: struct declared here
+       <STAGING> note: called inline here
+       <STAGING> note: called inline here
+=== end errors ===
+zir_api: error count: 1
+<STAGING> error: root source file struct 'script' has no member named 'main'
+<STAGING> note: struct declared here
+<STAGING> note: called inline here
+<STAGING> note: called inline here
+Error: compilation failed: CompilationFailed
