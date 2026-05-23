@@ -648,6 +648,16 @@ pub const Function = struct {
     return_type: ZigType,
     /// Original TypeStore TypeId for the return type, preserved for list type detection.
     return_type_id: ?types_mod.TypeId = null,
+    /// Phase 3.b — true when this function's inferred/declared `raises` row
+    /// is non-empty (the nominal one-shot abortive effect is present). The
+    /// ZIR backend lowers such a function to return a Zig error union
+    /// (`error{ZapRaise}!T` via `set_error_union_return_type`): `raise`
+    /// sites emit `recoverable_raise(box)` + `ret_error`, and call sites that
+    /// reach a raising callee propagate via `try` (native ERT) or, inside a
+    /// `try` body, route the error to the `rescue` landing pad. A pure
+    /// function (empty row) is unchanged. Set in `buildFunctionGroup` from
+    /// the type store's `inferred_raises` via the stable qualified key.
+    raises: bool = false,
     body: []const Block,
     is_closure: bool,
     captures: []const Capture,
@@ -729,6 +739,7 @@ fn cloneFunction(allocator: std.mem.Allocator, function: Function) CloneError!Fu
         .params = try cloneParams(allocator, function.params),
         .return_type = try cloneZigType(allocator, function.return_type),
         .return_type_id = function.return_type_id,
+        .raises = function.raises,
         .body = try cloneBlocks(allocator, function.body),
         .is_closure = function.is_closure,
         .captures = try cloneCaptures(allocator, function.captures),
@@ -957,6 +968,16 @@ pub const Instruction = union(enum) {
     match_type: MatchType,
     match_fail: MatchFail,
     match_error_return: MatchErrorReturn,
+    /// Phase 3.b — a propagating `raise` terminator in an error-union-
+    /// returning function: stash the boxed `Error` existential into the
+    /// thread-local side-channel, then `return error.ZapRaise`. The ZIR
+    /// backend emits `Kernel.recoverable_raise(box)` followed by
+    /// `emit_ret_error("ZapRaise")`. Like `match_error_return`/`ret`, this
+    /// is an unconditional no-return terminator; unlike `match_error_return`
+    /// (which `ret`s `null` for the `~>` optional path) it `ret`s an error
+    /// value, so Zig's `try`/`catch` at call sites unwinds it and the error
+    /// return trace records the propagation chain.
+    ret_raise: RetRaise,
     ret: Return,
     cond_return: CondReturn,
     case_break: CaseBreak,
@@ -1064,6 +1085,7 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
         .match_int,
         .match_float,
         .match_error_return,
+        .ret_raise,
         .ret,
         .cond_return,
         .case_break,
@@ -2452,6 +2474,14 @@ pub const MatchFail = struct {
 pub const MatchErrorReturn = struct {
     scrutinee: LocalId, // the unmatched value
 };
+
+/// Phase 3.b — a propagating `raise` terminator: `return error.ZapRaise`.
+/// Carries no operands — the boxed `Error` existential is stashed into the
+/// thread-local side-channel by the PRECEDING `Kernel.recoverable_raise`
+/// call instruction (lowered from the HIR `ret_raise` node's stash call),
+/// which owns the box's use/escape lifecycle. This terminator only emits the
+/// error-return control signal that Zig's `try`/`catch` propagates.
+pub const RetRaise = struct {};
 
 pub const Return = struct {
     value: ?LocalId,
@@ -4784,6 +4814,14 @@ pub const IrBuilder = struct {
         const local_ownership = try self.computeLocalOwnership(self.next_local);
         const result_convention = self.computeResultConvention(first_clause.return_type);
         const debug_span = group.debug_span;
+        // Phase 3.b: does this function carry the `raises` effect? Queried
+        // from the type store's `inferred_raises` via the stable qualified
+        // key (struct prefix + method name + arity). A non-empty row means
+        // the function lowers to a Zig error-union return.
+        const function_raises = if (self.type_store) |ts|
+            ts.functionRaises(self.current_struct_prefix, self.interner.get(group.name), group.arity)
+        else
+            false;
         try self.functions.append(self.allocator, .{
             .id = func_id,
             .name = name_str,
@@ -4797,6 +4835,7 @@ pub const IrBuilder = struct {
             .params = final_params,
             .return_type = return_type,
             .return_type_id = first_clause.return_type,
+            .raises = function_raises,
             .body = try self.allocSlice(Block, &.{entry_block}),
             .is_closure = group.captures.len > 0,
             .captures = try captures.toOwnedSlice(self.allocator),
@@ -5745,7 +5784,7 @@ pub const IrBuilder = struct {
         // appended — the appended instruction would be unreachable.
         if (body.len > 0) {
             switch (body[body.len - 1]) {
-                .ret, .match_fail, .match_error_return, .tail_call, .switch_return, .union_switch_return => return body,
+                .ret, .match_fail, .match_error_return, .ret_raise, .tail_call, .switch_return, .union_switch_return => return body,
                 else => {},
             }
         }
@@ -11414,6 +11453,17 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{
                     .match_fail = .{ .message = "panic", .message_local = msg_local, .kind = .panic },
                 });
+            },
+            .ret_raise => |rr| {
+                // Phase 3.b: a propagating `raise`. First lower the stash call
+                // (`Kernel.recoverable_raise(<box>)`) for its effect — it
+                // evaluates and boxes the error and stores it into the
+                // thread-local side-channel. Then emit the `ret_raise`
+                // terminator (`return error.ZapRaise`), the cross-function
+                // control signal. The box's use/escape is fully accounted for
+                // by the stash call; `ret_raise` carries no operands.
+                _ = try self.lowerExpr(rr.stash_call);
+                try self.current_instrs.append(self.allocator, .{ .ret_raise = .{} });
             },
             .never => {
                 try self.current_instrs.append(self.allocator, .{

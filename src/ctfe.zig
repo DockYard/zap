@@ -1132,7 +1132,7 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(std.mem.asBytes(&v.scrutinee));
             hashZigType(hasher, v.expected_type);
         },
-        .match_fail, .match_error_return => {},
+        .match_fail, .match_error_return, .ret_raise => {},
         .ret => |v| if (v.value) |value| hasher.update(std.mem.asBytes(&value)),
         .cond_return => |v| {
             hasher.update(std.mem.asBytes(&v.condition));
@@ -2033,6 +2033,13 @@ pub const Interpreter = struct {
             },
             .match_error_return => {
                 try self.emitError(.match_failure, "no matching clause at compile time (try variant)");
+                return error.CtfeFailure;
+            },
+            // Phase 3.b: a propagating `raise` cannot be evaluated at compile
+            // time — a comptime raise is a compile error, mirroring the
+            // match-error-return CTFE rejection above.
+            .ret_raise => {
+                try self.emitError(.match_failure, "`raise` cannot propagate at compile time");
                 return error.CtfeFailure;
             },
 

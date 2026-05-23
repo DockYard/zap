@@ -1410,6 +1410,11 @@ fn recordInstructionUses(
         .match_fail,
         .match_error_return,
         => {},
+        // Phase 3.b: a propagating raise is a pure error-return terminator.
+        // The boxed error's ownership flow (out through the side-channel to
+        // the recovering handler) is accounted for by the preceding
+        // recoverable_raise call instruction, exactly like Phase 3.a.
+        .ret_raise => {},
         // Debug-info markers do not affect ownership analysis. Treat
         // `.dbg_var` as a non-consuming use of its named local so the
         // ownership classifier does not promote the operand into an

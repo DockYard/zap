@@ -410,6 +410,44 @@ pub const TypeStore = struct {
         return self.types.items[id];
     }
 
+    /// Phase 3.b — the canonical `inferred_raises` key for a function
+    /// identified by its owning struct prefix (null for a top-level
+    /// function), method name, and arity: the stable string
+    /// `"<Struct>.<method>/<arity>"` (or `"<method>/<arity>"` when no
+    /// struct). Interned to a `StringId`. SINGLE source of truth for the
+    /// key format so the type checker (which stores the row) and the IR
+    /// backend (which queries it) cannot drift. Returns null only on OOM.
+    pub fn raisesRowKeyString(
+        self: *const TypeStore,
+        struct_prefix: ?[]const u8,
+        method_name: []const u8,
+        arity: u32,
+    ) ?ast.StringId {
+        const key_text = if (struct_prefix) |prefix|
+            std.fmt.allocPrint(self.allocator, "{s}.{s}/{d}", .{ prefix, method_name, arity }) catch return null
+        else
+            std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ method_name, arity }) catch return null;
+        defer self.allocator.free(key_text);
+        const interner_mut: *ast.StringInterner = @constCast(self.interner);
+        return interner_mut.intern(key_text) catch null;
+    }
+
+    /// Phase 3.b — true when the function identified by `struct_prefix` /
+    /// `method_name` / `arity` has a non-empty inferred/declared `raises`
+    /// row, i.e. the nominal abortive effect is present and the function
+    /// must lower to a Zig error-union return. Queried by the IR backend
+    /// to set `ir.Function.raises`.
+    pub fn functionRaises(
+        self: *const TypeStore,
+        struct_prefix: ?[]const u8,
+        method_name: []const u8,
+        arity: u32,
+    ) bool {
+        const key = self.raisesRowKeyString(struct_prefix, method_name, arity) orelse return false;
+        const row = self.inferred_raises.get(key) orelse return false;
+        return row.len > 0;
+    }
+
     pub fn freshVar(self: *TypeStore) !TypeId {
         const var_id = self.next_var;
         self.next_var += 1;
@@ -5455,14 +5493,9 @@ pub const TypeChecker = struct {
             scope_cursor = self.graph.getScope(sid).parent;
         }
 
-        const key_text = if (struct_prefix) |prefix|
-            std.fmt.allocPrint(self.allocator, "{s}.{s}/{d}", .{ prefix, method_name, family.arity }) catch return null
-        else
-            std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ method_name, family.arity }) catch return null;
-        defer self.allocator.free(key_text);
-
-        const interner_mut: *ast.StringInterner = @constCast(self.interner);
-        return interner_mut.intern(key_text) catch null;
+        // Delegate the final string format to the TypeStore so producer and
+        // the IR-backend consumer share one definition of the key.
+        return self.store.raisesRowKeyString(struct_prefix, method_name, family.arity);
     }
 
     /// Resolve the stable `inferred_raises` key for `func`/`clause` by first

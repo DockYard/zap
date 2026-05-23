@@ -236,6 +236,19 @@ pub const ExprKind = union(enum) {
     // Error handling
     panic: *const Expr,
     unwrap: *const Expr, // optional force-unwrap (expr!)
+    /// Phase 3.b — a PROPAGATING `raise` in a function carrying the `raises`
+    /// effect that is NOT lexically inside a `try` body. Lowers to: stash the
+    /// boxed `Error` existential into the thread-local side-channel
+    /// (`Kernel.recoverable_raise`), then `return error.ZapRaise` from the
+    /// (error-union-returning) enclosing function. The `error.ZapRaise` tag
+    /// is the cross-function control signal Zig propagates (building the
+    /// error return trace); the boxed payload rides the side-channel and is
+    /// recovered by the nearest dynamically-enclosing `try`/`rescue` (or, if
+    /// none, surfaces at top level via the unhandled-error abort). Distinct
+    /// from the Phase 3.a recoverable raise (`try_scope_depth > 0`), which
+    /// only stashes and falls through to the SAME function's landing pad, and
+    /// from the Phase 2 `do_raise` abort used by non-raising-row functions.
+    ret_raise: RetRaiseHir,
 
     // Union
     union_init: UnionInitExpr,
@@ -264,6 +277,17 @@ pub const ExprKind = union(enum) {
     // Special
     closure_create: ClosureCreate,
     never,
+};
+
+/// Phase 3.b — payload for a propagating `raise` (`ret_raise`). Carries the
+/// pre-built `Kernel.recoverable_raise(<box>)` call (which stashes the boxed
+/// `Error` existential into the thread-local side-channel) as a lowered HIR
+/// expression. The IR lowers this to: evaluate the stash call, then a
+/// `ret_raise` terminator that emits `return error.ZapRaise`.
+pub const RetRaiseHir = struct {
+    /// The lowered `Kernel.recoverable_raise(<box>)` call (the side-channel
+    /// stash). Evaluated for its effect before the error-return.
+    stash_call: *const Expr,
 };
 
 pub const TryRescueHir = struct {
@@ -2523,6 +2547,16 @@ pub const HirBuilder = struct {
     current_function_root_scope: ?scope_mod.ScopeId,
     current_function_name: ?[]const u8,
     current_function_name_id: ?ast.StringId,
+    /// Phase 3.b — true while building the body of a function whose
+    /// inferred/declared `raises` row is non-empty, i.e. one that will lower
+    /// to a Zig error-union return. A PROPAGATING `raise` (one not lexically
+    /// inside a `try` body, `try_scope_depth == 0`) in such a function lowers
+    /// to a `ret_raise` (stash + `return error.ZapRaise`) instead of the
+    /// Phase 2 `do_raise` abort, so the error crosses the call boundary to an
+    /// enclosing `try`/`rescue`. Set per-clause in `buildFunctionGroup` from
+    /// the type store's `inferred_raises` (the same stable qualified key the
+    /// IR backend uses), saved/restored around nested groups.
+    current_function_emits_error_union: bool = false,
     /// Variable names already bound in the current clause's parameters.
     /// When a bind pattern reuses a name from this set, it becomes a pin
     /// (equality check) instead of a fresh binding — Elixir-style variable
@@ -4032,6 +4066,12 @@ pub const HirBuilder = struct {
         const saved_function_name_id = self.current_function_name_id;
         self.current_function_name = self.interner.get(func.name);
         self.current_function_name_id = func.name;
+        // Phase 3.b: does this function carry the `raises` effect (non-empty
+        // inferred/declared row)? If so, a propagating `raise` in its body
+        // lowers to `ret_raise`. Resolved from the type store via the stable
+        // qualified key built from the owning struct prefix + name + arity.
+        const saved_emits_error_union = self.current_function_emits_error_union;
+        self.current_function_emits_error_union = self.functionEmitsErrorUnion(func, scope_id, arity);
         const saved_hir_type_var_scope = self.hir_type_var_scope;
         self.hir_type_var_scope = std.StringHashMap(types_mod.TypeId).init(self.allocator);
         defer {
@@ -4132,6 +4172,7 @@ pub const HirBuilder = struct {
         self.next_local = saved_next_local;
         self.current_function_name = saved_function_name;
         self.current_function_name_id = saved_function_name_id;
+        self.current_function_emits_error_union = saved_emits_error_union;
         self.current_param_names = saved_param_names;
         self.current_param_types = saved_param_types;
         self.current_assignment_bindings = saved_assignment_bindings;
@@ -5653,6 +5694,20 @@ pub const HirBuilder = struct {
                         return recoverable;
                     }
                 }
+                // Phase 3.b — PROPAGATING raise: not lexically inside a `try`
+                // body, but in a function that carries the `raises` effect
+                // (its row is non-empty, so it returns an error union). Stash
+                // the boxed error into the side-channel and `return
+                // error.ZapRaise`, so the error crosses the call boundary to
+                // an enclosing `try`/`rescue` rather than aborting here. The
+                // lexical case above is unchanged (it falls through to the
+                // same function's landing pad); only a raise that must leave
+                // the function takes this path.
+                if (self.try_scope_depth == 0 and self.current_function_emits_error_union) {
+                    if (try self.buildRetRaise(re)) |propagating| {
+                        return propagating;
+                    }
+                }
                 // Abort path (`Kernel.do_raise(<value>)`): a `raise` is a
                 // diverging terminator, so stamp the lowered expression
                 // `Never` regardless of the inner `do_raise` call's surface
@@ -6494,6 +6549,56 @@ pub const HirBuilder = struct {
             .call = .{ .meta = meta, .callee = callee, .args = &.{} },
         });
         return try self.buildExpr(call_expr);
+    }
+
+    /// Phase 3.b — does the function `func` (declared in `scope_id` with
+    /// `arity`) carry the `raises` effect? Resolves the owning struct prefix
+    /// by walking up parent scopes from the family's scope to a registered
+    /// struct, then queries the type store's `inferred_raises` via the same
+    /// stable qualified key the type checker stored under and the IR backend
+    /// reads. A top-level `main` (no struct) uses the bare `"<name>/<arity>"`.
+    fn functionEmitsErrorUnion(
+        self: *HirBuilder,
+        func: *const ast.FunctionDecl,
+        scope_id: scope_mod.ScopeId,
+        arity: u32,
+    ) bool {
+        const method_name = self.interner.get(func.name);
+        var struct_prefix: ?[]const u8 = null;
+        var struct_prefix_buf: ?[]const u8 = null;
+        defer if (struct_prefix_buf) |buf| self.allocator.free(buf);
+        var scope_cursor: ?scope_mod.ScopeId = scope_id;
+        outer: while (scope_cursor) |sid| {
+            // `self.graph` is `*const`, so iterate `structs.items` directly
+            // rather than `findStructByScope` (which returns a mutable ptr).
+            for (self.graph.structs.items) |entry| {
+                if (entry.scope_id != sid) continue;
+                const joined = entry.name.joinedWith(self.allocator, self.interner, ".") catch break :outer;
+                struct_prefix_buf = joined;
+                struct_prefix = joined;
+                break :outer;
+            }
+            scope_cursor = self.graph.getScope(sid).parent;
+        }
+        return self.type_store.functionRaises(struct_prefix, method_name, arity);
+    }
+
+    /// Phase 3.b — build a propagating `raise` (`ret_raise`) HIR node from a
+    /// `raise_expr`. Reuses `buildRecoverableRaise` to construct the
+    /// `Kernel.recoverable_raise(<box>)` stash call (which boxes the error and
+    /// stores it into the thread-local side-channel), then wraps it in a
+    /// `ret_raise` node whose IR lowering appends `return error.ZapRaise`.
+    /// `Never`-typed so a propagating raise in tail position coerces to any
+    /// expected merge type, exactly like the abort and lexical-recoverable
+    /// raises. Returns `null` (so the caller falls back to the abort path)
+    /// when the value is not in the expected `Kernel.do_raise(arg)` shape.
+    fn buildRetRaise(self: *HirBuilder, re: ast.RaiseExpr) anyerror!?*const Expr {
+        const stash_call = (try self.buildRecoverableRaise(re)) orelse return null;
+        return try self.create(Expr, .{
+            .kind = .{ .ret_raise = .{ .stash_call = stash_call } },
+            .type_id = types_mod.TypeStore.NEVER,
+            .span = re.meta.span,
+        });
     }
 
     /// Rebuild a `raise`'s lowered `Kernel.do_raise(<error>)` call as the

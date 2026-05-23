@@ -677,6 +677,10 @@ pub const GeneralizedEscapeAnalyzer = struct {
             .jump => {},
             .case_break => {},
             .match_fail, .match_error_return => {},
+            // Phase 3.b: the propagating raise's pure error-return terminator
+            // has no operands; the boxed error's global escape (into the
+            // side-channel) is seeded by the preceding recoverable_raise call.
+            .ret_raise => {},
             .set_safety => {},
             // Debug-info markers: no escape behavior — they are metadata
             // that maps Zap source positions / local names into DWARF.

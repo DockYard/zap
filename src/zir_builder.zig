@@ -131,6 +131,19 @@ extern "c" fn zir_builder_emit_set_runtime_safety(handle: ?*ZirBuilderHandle, en
 extern "c" fn zir_builder_set_optional_return_type(handle: ?*ZirBuilderHandle) i32;
 extern "c" fn zir_builder_emit_ret_null(handle: ?*ZirBuilderHandle) i32;
 
+// Error-union support (Phase 3.b cross-function `raise` propagation).
+// A function whose `raises` row is non-empty returns `error{...}!T`; a
+// `raise` site emits `recoverable_raise(box)` (TLS stash) then
+// `emit_ret_error` (the control signal). Call sites propagate the error
+// union via `emit_try` (native `try` — builds the error return trace) or
+// route it to a `try`/`rescue` landing pad via `emit_catch`.
+extern "c" fn zir_builder_set_error_union_return_type(handle: ?*ZirBuilderHandle, error_name_ptr: [*]const u8, error_name_len: u32) i32;
+extern "c" fn zir_builder_emit_ret_error(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
+extern "c" fn zir_builder_emit_try(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_catch(handle: ?*ZirBuilderHandle, operand: u32, catch_value: u32) u32;
+extern "c" fn zir_builder_emit_is_non_err(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_err_union_payload_unsafe(handle: ?*ZirBuilderHandle, operand: u32) u32;
+
 // Struct type declarations
 extern "c" fn zir_builder_add_struct_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, field_names_ptrs: [*]const [*]const u8, field_names_lens: [*]const u32, field_type_refs: [*]const u32, field_default_refs: ?[*]const u32, fields_len: u32) i32;
 
@@ -4716,6 +4729,22 @@ pub const ZirDriver = struct {
                 return error.EmitFailed;
         }
 
+        // Phase 3.b: a function carrying the `raises` effect returns a Zig
+        // error union `error{ZapRaise}!T` (inferred error set, `anyerror!T`
+        // at the ZIR level). The `error.ZapRaise` tag is the cross-function
+        // control signal; the boxed `Error` existential payload rides the
+        // thread-local side-channel. `main` is excluded — Zig's entry point
+        // must return `void`/`u8`, and a top-level `raise` is the unhandled
+        // case that aborts via `crashReport` rather than propagating. The
+        // declared inner return type is already established above
+        // (`begin_func` + `emitComplexReturnType`), so this only wraps it.
+        const emits_error_union = func.raises and !is_main and !is_try_variant;
+        if (emits_error_union) {
+            const err_name = "ZapRaise";
+            if (zir_builder_set_error_union_return_type(self.handle, err_name.ptr, @intCast(err_name.len)) != 0)
+                return error.EmitFailed;
+        }
+
         // Declare the return type. Primitives are handled by mapReturnType
         // above (well-known ZIR refs). Complex types need dedicated ZIR
         // instructions emitted into the declaration body. Any type not
@@ -7819,6 +7848,21 @@ pub const ZirDriver = struct {
                 if (zir_builder_emit_ret_null(self.handle) != 0)
                     return error.EmitFailed;
             },
+            .ret_raise => {
+                // Phase 3.b: a propagating `raise`. The preceding instruction
+                // (lowered from the HIR `stash_call`) already emitted
+                // `Kernel.recoverable_raise(box)`, stashing the boxed `Error`
+                // existential into the thread-local side-channel. Now emit
+                // `return error.ZapRaise` — the cross-function control signal.
+                // Zig's `try`/`catch` at the call site unwinds it (building
+                // the error return trace), and the nearest dynamically-
+                // enclosing `try`/`rescue` recovers the boxed payload from the
+                // side-channel. The function's return type was set to
+                // `error{ZapRaise}!T` in `emitFunction`.
+                const err_name = "ZapRaise";
+                if (zir_builder_emit_ret_error(self.handle, err_name.ptr, @intCast(err_name.len)) != 0)
+                    return error.EmitFailed;
+            },
 
             .call_dispatch => |cd| {
                 // Resolve the dispatch group to the actual function and call it.
@@ -9478,6 +9522,7 @@ pub const ZirDriver = struct {
             .optional_dispatch,
             .match_fail,
             .match_error_return,
+            .ret_raise,
             .cond_return,
             .case_break,
             .jump,

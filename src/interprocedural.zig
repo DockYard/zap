@@ -1129,7 +1129,7 @@ pub const InterproceduralAnalyzer = struct {
                     try fresh_locals.put(tu.dest, {});
                 },
                 .switch_tag => {},
-                .branch, .cond_branch, .jump, .case_break, .match_fail, .match_error_return => {},
+                .branch, .cond_branch, .jump, .case_break, .match_fail, .match_error_return, .ret_raise => {},
                 .set_safety => {},
                 // Debug-info markers: no alias or escape effect — pure
                 // metadata consumed by the ZIR debug-info wiring.

@@ -889,7 +889,7 @@ pub const UseDefInfo = struct {
             },
 
             // Non-data instructions.
-            .branch, .jump, .match_fail, .match_error_return => {},
+            .branch, .jump, .match_fail, .match_error_return, .ret_raise => {},
             .set_safety => {},
             // Debug-info markers: `.dbg_stmt` has no operands;
             // `.dbg_var` references its named local as a debug-info

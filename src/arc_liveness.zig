@@ -3562,6 +3562,7 @@ fn streamFallsThrough(stream: []const ir.Instruction) bool {
 pub fn isTerminator(instr: ir.Instruction) bool {
     return switch (instr) {
         .ret,
+        .ret_raise,
         .tail_call,
         .match_fail,
         .match_error_return,
@@ -3772,6 +3773,10 @@ pub fn collectUses(instr: ir.Instruction, buf: *UseList) void {
             if (x.message_local) |l| buf.append(allocator, l) catch {};
         },
         .match_error_return => |x| buf.append(allocator, x.scrutinee) catch {},
+        // Phase 3.b: a propagating raise is a pure error-return terminator;
+        // the boxed error's use is accounted for by the preceding
+        // recoverable_raise call instruction, not here.
+        .ret_raise => {},
         .ret => |x| {
             if (x.value) |l| buf.append(allocator, l) catch {};
         },

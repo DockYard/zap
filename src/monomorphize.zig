@@ -1231,6 +1231,7 @@ const MonomorphContext = struct {
             .block => |b| try self.scanBlock(&b),
             .panic => |e| try self.scanExpr(e),
             .unwrap => |e| try self.scanExpr(e),
+            .ret_raise => |rr| try self.scanExpr(rr.stash_call),
             .union_init => |ui| try self.scanExpr(ui.value),
             .try_project => |tp| try self.scanExpr(tp.operand),
             .error_pipe => |ep| {
@@ -1673,6 +1674,7 @@ const MonomorphContext = struct {
             .block => |b| .{ .block = (try self.cloneBlock(&b)).* },
             .panic => |e| .{ .panic = try self.cloneExpr(e) },
             .unwrap => |e| .{ .unwrap = try self.cloneExpr(e) },
+            .ret_raise => |rr| .{ .ret_raise = .{ .stash_call = try self.cloneExpr(rr.stash_call) } },
             .union_init => |ui| .{ .union_init = .{
                 .union_type_id = if (self.current_subs) |subs|
                     try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, ui.union_type_id))
