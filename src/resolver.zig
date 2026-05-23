@@ -401,6 +401,23 @@ pub const Resolver = struct {
                 if (fe.filter) |f| try self.resolveExpr(f);
                 try self.resolveExpr(fe.body);
             },
+            .with_expr => |we| {
+                // `with` is desugared to nested `case` during macro
+                // expansion; this conservative resolution (mirroring the
+                // `try_rescue` arm) keeps the switch total and resolves the
+                // step exprs, do-body, and else-clause bodies/guards on any
+                // pre-expansion path. Step-pattern bindings are introduced
+                // by the desugared `case` (and the type-checker), so — like
+                // `try_rescue`'s rescue clauses — no scope is created here.
+                for (we.steps) |step| try self.resolveExpr(step.expr);
+                for (we.do_body) |stmt| try self.resolveStmt(stmt);
+                if (we.else_clauses) |clauses| {
+                    for (clauses) |clause| {
+                        if (clause.guard) |g| try self.resolveExpr(g);
+                        for (clause.body) |stmt| try self.resolveStmt(stmt);
+                    }
+                }
+            },
             .list_cons_expr => |lc| {
                 try self.resolveExpr(lc.head);
                 try self.resolveExpr(lc.tail);

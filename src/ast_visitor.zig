@@ -276,6 +276,19 @@ pub fn AstVisitor(comptime Context: type) type {
                     if (fe.filter) |f| try visitExpr(ctx, f);
                     try visitExpr(ctx, fe.body);
                 },
+                .with_expr => |we| {
+                    for (we.steps) |step| {
+                        try visitPattern(ctx, step.pattern);
+                        try visitExpr(ctx, step.expr);
+                    }
+                    try visitBlock(ctx, we.do_body);
+                    if (we.else_clauses) |clauses| {
+                        for (clauses) |clause| {
+                            try visitPattern(ctx, clause.pattern);
+                            try visitBlock(ctx, clause.body);
+                        }
+                    }
+                },
                 .list_cons_expr => |lce| {
                     try visitExpr(ctx, lce.head);
                     try visitExpr(ctx, lce.tail);
