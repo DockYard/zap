@@ -7571,6 +7571,44 @@ const ZapSymbolReader = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Shared diagnostic visual-format spec — runtime MIRROR (Phase 4.a)
+//
+// The compile-time renderer (`src/diagnostics.zig`) and this async-signal-safe
+// crash printer MUST share ONE visual language (brief Part IV §4): the same
+// header sigil, frame prefix, source separator, box glyphs, and SGR color
+// palette, so a crash report and a compile error look like the same tool.
+//
+// They cannot share a literal `@import`: `runtime.zig` is injected into Zap
+// binaries as STANDALONE source with no sibling files in the emission cache
+// (the same constraint that forces `envGetRuntime` to duplicate `env.zig`).
+// So the canonical spec lives in `src/error_format.zig` (compile side) and the
+// runtime MIRRORS it here. `tools/error_format_drift_test.zig` asserts the two
+// are byte-identical at build time, so neither side can drift unilaterally —
+// the same blessed pattern used for the slab-pool and zap-symbol ABI mirrors.
+//
+// The crash printer writes these via `posixWrite` (write(2)); it never
+// allocates, so the visual consistency is achieved without the signal path
+// taking on the allocating renderer's dependencies.
+// ---------------------------------------------------------------------------
+
+/// Runtime mirror of `error_format`'s visual constants. Keep byte-identical to
+/// `src/error_format.zig`; the drift test enforces it.
+const RuntimeFormat = struct {
+    const header_sigil_open = "** (";
+    const header_sigil_close = ") ";
+    const frame_indent = "  ";
+    const frame_source_separator = " at ";
+    const source_line_separator = ":";
+    const ert_section_header = "error return trace:";
+    const cause_prefix = "caused by: ";
+
+    const sgr_reset = "\x1b[0m";
+    const sgr_bold = "\x1b[1m";
+    const sgr_bold_red = "\x1b[1;31m";
+    const sgr_cyan = "\x1b[36m";
+};
+
+// ---------------------------------------------------------------------------
 // Crash-reporter configuration — cached once at first use
 // ---------------------------------------------------------------------------
 
@@ -7710,13 +7748,30 @@ pub fn zapCrashReporterInit() void {
     crash_reporter_config.image_slide = mainImageSlide();
 }
 
-/// True when absolute paths must be stripped to their basename in crash
-/// reports. Per the brief's diagnostic security tiers (VI.B #9), release
-/// builds (`ReleaseFast`/`ReleaseSmall`) must not leak filesystem layout;
-/// `Debug`/`ReleaseSafe` keep full paths for developer ergonomics.
-const crash_report_strip_paths: bool = switch (builtin.mode) {
-    .Debug, .ReleaseSafe => false,
-    .ReleaseFast, .ReleaseSmall => true,
+/// The diagnostic security tier (brief VI.B #9) — runtime MIRROR of
+/// `error_format.SecurityTier`. Cached as a comptime fold of the build mode:
+/// Debug / ReleaseSafe are developer-facing (`dev_local`, full paths);
+/// ReleaseFast / ReleaseSmall are shipped binaries (`user_safe`, basename-only
+/// paths, no heap contents, ASLR-relative offsets when symbolication is
+/// unavailable). This is the SAME dev-vs-release fold the compile renderer
+/// uses via `error_format.defaultTierForMode`; the drift test pins the tier
+/// vocabulary across the two surfaces.
+///
+/// Comptime-resolved (not env-driven) because the runtime crash path is
+/// async-signal-safe — it must NOT consult the environment from a signal
+/// context. The tier is baked into the binary at build time.
+const RuntimeSecurityTier = enum {
+    dev_local,
+    user_safe,
+
+    fn stripsAbsolutePaths(self: RuntimeSecurityTier) bool {
+        return self == .user_safe;
+    }
+};
+
+const crash_report_security_tier: RuntimeSecurityTier = switch (builtin.mode) {
+    .Debug, .ReleaseSafe => .dev_local,
+    .ReleaseFast, .ReleaseSmall => .user_safe,
 };
 
 /// Return the basename of `path` (the segment after the last `/`). Used to
@@ -7833,7 +7888,8 @@ fn crashReportFrame(addr: usize) FrameAction {
         // prefer offsets when symbolication is unavailable. `zap addr2line
         // <bin> 0x<addr>` consumes exactly this value.
         const static_addr = call_site_addr -% crash_reporter_config.image_slide;
-        posixWrite(STDERR_FD, "  0x");
+        posixWrite(STDERR_FD, RuntimeFormat.frame_indent);
+        posixWrite(STDERR_FD, "0x");
         crashWriteUnsignedHex(static_addr);
         // Still print a source location if DWARF had one.
         if (source) |loc| crashReportSourceLocation(loc);
@@ -7854,7 +7910,7 @@ fn crashReportFrame(addr: usize) FrameAction {
     // frames are not Zap code and only add noise to the report.
     if (isBelowUserEntrySymbol(mangled)) return .stop;
 
-    posixWrite(STDERR_FD, "  ");
+    posixWrite(STDERR_FD, RuntimeFormat.frame_indent);
 
     // Map the mangled name back to the authoritative Zap name via the
     // side-table. On a hit, print `Struct.local/arity` (or `local/arity`
@@ -7905,10 +7961,10 @@ fn crashWriteUnsignedHex(value: usize) void {
 /// empty file names (a source location with no file is not useful).
 fn crashReportSourceLocation(loc: std.debug.SourceLocation) void {
     if (loc.file_name.len == 0) return;
-    const shown = if (crash_report_strip_paths) pathBasename(loc.file_name) else loc.file_name;
-    posixWrite(STDERR_FD, " at ");
+    const shown = if (crash_report_security_tier.stripsAbsolutePaths()) pathBasename(loc.file_name) else loc.file_name;
+    posixWrite(STDERR_FD, RuntimeFormat.frame_source_separator);
     posixWrite(STDERR_FD, shown);
-    posixWrite(STDERR_FD, ":");
+    posixWrite(STDERR_FD, RuntimeFormat.source_line_separator);
     crashWriteUnsigned(loc.line);
 }
 
@@ -8026,11 +8082,20 @@ fn emitCrashReportWithBacktrace(kind: []const u8, message: []const u8, bt: Backt
     // is a plain `write`(2) — no allocation, no atexit.
     flushStdoutBuf();
 
-    // Header: ** (<kind>) <message>\n
-    posixWrite(STDERR_FD, "** (");
+    // Header: ** (<kind>) <message>\n — using the SHARED visual-format
+    // constants (mirrored from `error_format.zig`) and the SHARED SGR palette
+    // when stderr is a color TTY, so a runtime crash header and a compile
+    // error header are visually the same tool. The kind renders at error
+    // intensity (bold red) to match the compile renderer's `error:` styling.
+    const color_on = crash_reporter_config.use_color;
+    posixWrite(STDERR_FD, RuntimeFormat.header_sigil_open);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_bold_red);
     posixWrite(STDERR_FD, kind);
-    posixWrite(STDERR_FD, ") ");
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+    posixWrite(STDERR_FD, RuntimeFormat.header_sigil_close);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_bold);
     posixWrite(STDERR_FD, message);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
     posixWrite(STDERR_FD, "\n");
 
     if (crash_reporter_config.verbosity != .off) {

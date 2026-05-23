@@ -132,6 +132,23 @@ pub fn build(b: *std.Build) void {
     const run_zap_symbol_abi_drift_tests = b.addRunArtifact(zap_symbol_abi_drift_tests);
     test_step.dependOn(&run_zap_symbol_abi_drift_tests.step);
 
+    // Phase 4.a unified diagnostics: the shared visual-format spec
+    // (`src/error_format.zig`) and its runtime mirror (`RuntimeFormat` in
+    // `src/runtime.zig`) cannot share a Zig `@import` (runtime.zig is injected
+    // standalone). This test reads both as text and fails the build if any
+    // mirrored format constant, SGR escape, or the security-tier fold drifts,
+    // so the compile renderer and the async-signal-safe crash printer keep one
+    // visual language.
+    const error_format_drift_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/error_format_drift_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_error_format_drift_tests = b.addRunArtifact(error_format_drift_tests);
+    test_step.dependOn(&run_error_format_drift_tests.step);
+
     // -----------------------------------------------------------------------
     // Dependency paths
     // -----------------------------------------------------------------------
