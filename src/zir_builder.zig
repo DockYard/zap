@@ -82,7 +82,7 @@ extern "c" fn zir_builder_set_body_tracking(handle: ?*ZirBuilderHandle, enabled:
 extern "c" fn zir_builder_get_inst_count(handle: ?*ZirBuilderHandle) u32;
 extern "c" fn zir_builder_begin_capture(handle: ?*ZirBuilderHandle) void;
 extern "c" fn zir_builder_end_capture(handle: ?*ZirBuilderHandle, out_len: *u32) [*]const u32;
-extern "c" fn zir_builder_emit_if_else_bodies(handle: ?*ZirBuilderHandle, condition: u32, then_insts_ptr: [*]const u32, then_insts_len: u32, then_result: u32, else_insts_ptr: [*]const u32, else_insts_len: u32, else_result: u32) u32;
+extern "c" fn zir_builder_emit_if_else_bodies(handle: ?*ZirBuilderHandle, condition: u32, then_insts_ptr: [*]const u32, then_insts_len: u32, then_result: u32, else_insts_ptr: [*]const u32, else_insts_len: u32, else_result: u32, then_is_noreturn: u32, else_is_noreturn: u32) u32;
 extern "c" fn zir_builder_emit_cond_branch_with_bodies(handle: ?*ZirBuilderHandle, condition: u32, then_insts_ptr: [*]const u32, then_insts_len: u32, else_insts_ptr: [*]const u32, else_insts_len: u32) i32;
 extern "c" fn zir_builder_emit_int_typed(handle: ?*ZirBuilderHandle, value: i64, dest_type: u32) u32;
 
@@ -5381,6 +5381,8 @@ pub const ZirDriver = struct {
                 current_else_insts.ptr,
                 @intCast(current_else_insts.len),
                 current_else_result,
+                0,
+                0,
             );
 
             self.allocator.free(then_insts);
@@ -6099,6 +6101,8 @@ pub const ZirDriver = struct {
                     else_ptr,
                     else_len,
                     handler_result_ref,
+                    0,
+                    0,
                 );
                 self.allocator.free(then_insts);
                 if (result == error_ref) return error.EmitFailed;
@@ -8353,6 +8357,8 @@ pub const ZirDriver = struct {
                     else_ptr,
                     else_len,
                     panic_call,
+                    0,
+                    0,
                 );
                 if (result == error_ref) return error.EmitFailed;
                 try self.setLocal(ou.dest, result);
@@ -8824,6 +8830,23 @@ pub const ZirDriver = struct {
     /// These captured indices are placed inside the condbr_inline's then/else
     /// bodies so that Sema only analyzes the taken branch.
     fn emitIfExpr(self: *ZirDriver, ie: ir.IfExpr) BuildError!void {
+        // A branch is noreturn when the IR builder explicitly flagged it
+        // (`then_is_noreturn`/`else_is_noreturn` — set for a rescue arm whose
+        // body ends in a `Never`-returning re-raise `do_raise`, which carries
+        // no trailing `local_set`), OR — the pre-existing tail-call/early-
+        // return case — when the branch yields no value (`*_result == null`)
+        // and its captured body ends in a recognized noreturn terminator
+        // (`ret`/`match_fail`/musttail `tail_call`). Both must suppress the
+        // synthesized trailing break: the body is already terminal, so an
+        // appended `break` would dangle after the noreturn instruction and
+        // trip AIR Liveness. A noreturn branch's result ref is
+        // `unreachable_value`, which Sema peer-merges with any value-producing
+        // sibling branch's type.
+        const then_is_noreturn = ie.then_is_noreturn or
+            (ie.then_result == null and self.instructionsEndNoReturnFor(ie.then_instrs));
+        const else_is_noreturn = ie.else_is_noreturn or
+            (ie.else_result == null and self.instructionsEndNoReturnFor(ie.else_instrs));
+
         // --- then branch: capture top-level body instructions ---
         self.beginCapture();
         for (ie.then_instrs) |ti| {
@@ -8840,10 +8863,10 @@ pub const ZirDriver = struct {
         // emit `unreachable_value` so Sema does not treat the merge
         // as reachable. The loopify case is fall-through; `void_value`
         // is correct.
-        const then_ref: u32 = if (ie.then_result) |tr|
-            try self.refForLocal(tr)
-        else if (self.instructionsEndNoReturnFor(ie.then_instrs))
+        const then_ref: u32 = if (then_is_noreturn)
             @intFromEnum(Zir.Inst.Ref.unreachable_value)
+        else if (ie.then_result) |tr|
+            try self.refForLocal(tr)
         else
             @intFromEnum(Zir.Inst.Ref.void_value);
 
@@ -8860,10 +8883,10 @@ pub const ZirDriver = struct {
         var else_len: u32 = 0;
         const else_insts_ptr = self.endCapture(&else_len);
 
-        const else_ref: u32 = if (ie.else_result) |er|
-            try self.refForLocal(er)
-        else if (self.instructionsEndNoReturnFor(ie.else_instrs))
+        const else_ref: u32 = if (else_is_noreturn)
             @intFromEnum(Zir.Inst.Ref.unreachable_value)
+        else if (ie.else_result) |er|
+            try self.refForLocal(er)
         else
             @intFromEnum(Zir.Inst.Ref.void_value);
 
@@ -8878,6 +8901,8 @@ pub const ZirDriver = struct {
             else_insts_ptr,
             else_len,
             else_ref,
+            @intFromBool(then_is_noreturn),
+            @intFromBool(else_is_noreturn),
         );
         if (ref == error_ref) return error.EmitFailed;
         try self.setLocal(ie.dest, ref);
@@ -8988,6 +9013,8 @@ pub const ZirDriver = struct {
                 current_else_insts.ptr,
                 @intCast(current_else_insts.len),
                 current_else_result,
+                0,
+                0,
             );
 
             self.allocator.free(body_insts);
@@ -9059,6 +9086,8 @@ pub const ZirDriver = struct {
                 &empty,
                 0,
                 void_ref,
+                0,
+                0,
             );
         }
     }
@@ -9205,6 +9234,8 @@ pub const ZirDriver = struct {
             else_insts.ptr,
             @intCast(else_insts.len),
             else_value,
+            0,
+            0,
         );
         if (result == error_ref) return error.EmitFailed;
         return result;
@@ -9355,6 +9386,8 @@ pub const ZirDriver = struct {
                 current_else_insts.ptr,
                 @intCast(current_else_insts.len),
                 current_else_result,
+                0,
+                0,
             );
 
             self.allocator.free(case_insts);
@@ -9462,6 +9495,8 @@ pub const ZirDriver = struct {
                 current_else_insts.ptr,
                 @intCast(current_else_insts.len),
                 current_else_result,
+                0,
+                0,
             );
 
             self.allocator.free(arm_insts);
@@ -9794,6 +9829,8 @@ pub const ZirDriver = struct {
                 current_else_insts.ptr,
                 @intCast(current_else_insts.len),
                 current_else_result,
+                0,
+                0,
             );
 
             self.allocator.free(body_insts);
@@ -9902,6 +9939,8 @@ pub const ZirDriver = struct {
                 current_else_insts.ptr,
                 @intCast(current_else_insts.len),
                 current_else_result,
+                0,
+                0,
             );
 
             self.allocator.free(case_insts);
@@ -10032,6 +10071,8 @@ pub const ZirDriver = struct {
                 current_else_insts.ptr,
                 @intCast(current_else_insts.len),
                 current_else_result,
+                0,
+                0,
             );
 
             self.allocator.free(case_insts);
@@ -10135,6 +10176,8 @@ pub const ZirDriver = struct {
             else_insts.ptr,
             @intCast(else_insts.len),
             void_ref,
+            0,
+            0,
         );
         if (result == error_ref) return error.EmitFailed;
     }

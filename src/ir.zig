@@ -2061,6 +2061,22 @@ pub const IfExpr = struct {
     then_result: ?LocalId,
     else_instrs: []const Instruction,
     else_result: ?LocalId,
+    /// True when the then-branch body unconditionally diverges (its tail is
+    /// a `Never`-returning call — e.g. a `do_raise` re-raise — so control
+    /// never reaches the branch's merge point). A diverging branch
+    /// contributes no value to the merge and the ZIR backend must NOT
+    /// synthesize a trailing `break` for it: the body is already terminal,
+    /// so an appended `break` would dangle after the noreturn call and trip
+    /// AIR Liveness (`block_scopes.get(...).?` null-unwrap in
+    /// `analyzeInstBr`). This mirrors `addSwitchBlock`'s per-prong
+    /// `body_is_noreturn` flag for the `if`/`condbr` form. Detection in the
+    /// IR builder uses the body's HIR type (`NEVER`), not the lowered
+    /// result local's tracked type, because the `do_raise` call's result
+    /// local may carry the runtime return type rather than `Never`.
+    then_is_noreturn: bool = false,
+    /// True when the else-branch body unconditionally diverges; see
+    /// `then_is_noreturn`.
+    else_is_noreturn: bool = false,
 };
 
 pub const BinaryOp = struct {
@@ -7153,6 +7169,74 @@ pub const IrBuilder = struct {
         }
         self.in_try_body = saved_in_try_body;
 
+        // Fast path — the try BODY unconditionally raises (its tail is a
+        // `Never`-stamped recoverable raise; see `hir.buildRecoverableRaise`).
+        // Then `Kernel.raise_occurred()` is provably true after the body and
+        // the normal-completion edge is statically unreachable, so there is NO
+        // value-producing merge: the whole `try`/`rescue` is itself `Never`
+        // when every reachable rescue arm also diverges.
+        //
+        // Emitting the usual value-producing landing-pad `if` here is what
+        // breaks the `reraise_propagates` shape: the recovered `Error` box
+        // (`take_recoverable_raise` → `error_local`) is then defined inside the
+        // handler (then) branch but consumed (as a `do_raise` / ARC argument)
+        // ONLY inside the nested fully-noreturn rescue dispatch. AIR Liveness
+        // cannot retire a value that is live solely inside a fully-`noreturn`
+        // nested `cond_br` region whose enclosing block is not itself noreturn,
+        // so the box leaks to function entry and trips the self-hosted backend
+        // `runCodegen` assertion (`assert(live_set.count() == 0)`).
+        //
+        // Avoid the nested-noreturn region entirely: recover the box and run
+        // the rescue dispatch as STRAIGHT-LINE code in the body's own stream
+        // (no `raise_occurred()` branch — the body provably set the
+        // side-channel). The box's uses then live in straight-line noreturn
+        // code (`x = recover(); dispatch(x); <diverge>`), which Liveness
+        // retires exactly like any value used before an `unreachable`. The
+        // `after`/finally block, if present, still runs on the (always-taken)
+        // dispatch path. This mirrors how a bare unconditional `raise` lowers —
+        // straight-line to the noreturn sink — rather than wrapping it in a
+        // dead value merge.
+        if (tr.body.result_type == types_mod.TypeStore.NEVER) {
+            const error_local_fast = tr.error_local;
+            if (self.next_local <= error_local_fast) self.next_local = error_local_fast + 1;
+            const taken_fast = try self.lowerExpr(tr.take_raise_call);
+            try self.current_instrs.append(self.allocator, .{ .local_set = .{ .dest = error_local_fast, .value = taken_fast } });
+            if (self.local_hir_types.get(taken_fast)) |taken_type| {
+                try self.local_hir_types.put(error_local_fast, taken_type);
+            }
+            const handler_dest_fast = self.next_local;
+            self.next_local += 1;
+            const handler_joined_fast = tr.result_type_id;
+            if (handler_joined_fast != types_mod.TypeStore.UNKNOWN and
+                handler_joined_fast != types_mod.TypeStore.NIL and
+                handler_joined_fast != types_mod.TypeStore.NEVER)
+            {
+                try self.local_hir_types.put(handler_dest_fast, handler_joined_fast);
+                const handler_joined_zig = typeIdToZigTypeWithStore(handler_joined_fast, self.type_store);
+                if (handler_joined_zig != .any and handler_joined_zig != .void) {
+                    try self.known_local_types.put(handler_dest_fast, handler_joined_zig);
+                }
+            }
+            const fast_outcome = try self.lowerRescueDispatch(handler_dest_fast, error_local_fast, tr.arms, tr.arm_discriminators, tr.result_type_id);
+            // When EVERY reachable arm diverges (the `reraise_propagates`
+            // shape), the dispatch is noreturn and `handler_dest_fast` is never
+            // assigned — so we emit NOTHING after it: no `local_set dest = …`
+            // (which would read an unwritten local) and no `after` block (it is
+            // unreachable; a divergent handler aborts/propagates before any
+            // finally would run). When at least one arm yields a value, forward
+            // it to the whole expression's `dest` and run the `after` cleanup on
+            // that (reachable) path.
+            if (!fast_outcome.diverges) {
+                try self.current_instrs.append(self.allocator, .{ .local_set = .{ .dest = dest, .value = handler_dest_fast } });
+                if (tr.after_block) |cleanup| {
+                    for (cleanup.stmts) |stmt| {
+                        _ = try self.lowerTryRescueBodyStmt(stmt);
+                    }
+                }
+            }
+            return;
+        }
+
         // 2. Discriminator: did a recoverable raise fire in the body?
         const flag_local = try self.lowerExpr(tr.raise_occurred_call);
 
@@ -7200,7 +7284,7 @@ pub const IrBuilder = struct {
         // gated behind a `protocol_box_vtable_eq` test; the terminal arm is
         // a catch-all (the synthesized re-raise when the user omitted one),
         // so an unmatched error re-raises instead of being swallowed.
-        try self.lowerRescueDispatch(handler_dest, error_local, tr.arms, tr.arm_discriminators, tr.result_type_id);
+        const dispatch_outcome = try self.lowerRescueDispatch(handler_dest, error_local, tr.arms, tr.arm_discriminators, tr.result_type_id);
         const then_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
         self.current_instrs = saved_then;
 
@@ -7211,49 +7295,111 @@ pub const IrBuilder = struct {
         //    peer-resolves the then-ref (the rescue dispatch result, typed at
         //    the joined result type) against the else-ref (the body's normal
         //    completion value). When the body's tail value already has the
-        //    joined type, it flows straight through. But when the body
-        //    unconditionally raises, its tail is a `Never`-stamped recoverable
-        //    raise whose runtime value is `Nil` (the `recoverable_raise` stdlib
-        //    fn returns `Nil` and falls through to this landing pad) — typing
-        //    the else edge as `void`, which would clash with the rescue arms'
-        //    type (the original Blocker 1: `incompatible types '…' and 'void'`).
-        //    That normal-completion edge is statically dead in the
-        //    unconditional-raise case (a raise fired, so `raise_occurred()` is
-        //    true and the then-branch is taken), so we materialize a
-        //    `typed_undef` of the joined type for it: a never-read placeholder
-        //    that gives the merge a clean peer type. This is a real, general IR
-        //    primitive for a dead merge edge, not a special case.
+        //    joined type, it flows straight through.
+        //
+        //    Does the try BODY unconditionally diverge? Its tail is `Never`
+        //    when the body's last statement is a `raise` (lowered to a
+        //    `Never`-stamped `Kernel.recoverable_raise` — see
+        //    `hir.buildRecoverableRaise`) or when it produced no tail value at
+        //    all. The divergence verdict comes from the HIR body's tail type
+        //    (`tr.body.result_type`), which the type-checker /
+        //    `buildRecoverableRaise` stamps `NEVER`. This is authoritative
+        //    regardless of the lowered tail local's tracked type:
+        //    `trackCallResultType` filters `NEVER` out of `local_hir_types` (it
+        //    is not a "usable context type"), so the recoverable-raise call's
+        //    result local carries no type entry and cannot be probed for
+        //    `NEVER` here.
+        //
+        //    A divergent body makes this normal-completion (else) edge
+        //    STATICALLY DEAD (a raise fired, so `raise_occurred()` is true and
+        //    the handler/then branch is always taken). The dead edge must NOT
+        //    break with the body's `Never`-stamped tail value: that value is a
+        //    divergent call (`recoverable_raise`) defined in the body BEFORE
+        //    this `if`, and feeding it through the else break produces a
+        //    cross-branch / clobbered AIR reference that AIR Liveness leaves
+        //    alive at function entry, tripping the self-hosted `runCodegen`
+        //    assertion (`assert(live_set.count()==0)`).
+        //
+        //    The else branch is NOT itself noreturn — it is empty (the body's
+        //    divergence happened earlier, outside the `if`), so we cannot
+        //    suppress its break (an empty branch with no terminator is invalid
+        //    ZIR). Instead the dead edge breaks normally with a `typed_undef`
+        //    placeholder: a never-read value of a clean peer type. This is the
+        //    canonical dead-merge-edge primitive, applied uniformly whether the
+        //    join is a concrete type OR `Nil`/`Never`/unknown (the discarded-
+        //    value `try` shape). Only a LIVE body tail value flows through
+        //    unchanged.
+        const body_diverges = tr.body.result_type == types_mod.TypeStore.NEVER or body_result == null;
+
         const else_result: ?LocalId = blk: {
             const joined = tr.result_type_id;
-            // No joined type to coerce toward (e.g. a `try` whose value is
-            // discarded): pass the body value through unchanged.
+
+            // Live normal-completion edge: the body produced a real tail value.
+            // When there is no joined type to coerce toward (a `try` whose
+            // value is discarded), pass it through unchanged; when it already
+            // carries the joined type, likewise use it directly.
+            if (!body_diverges) {
+                if (joined == types_mod.TypeStore.UNKNOWN or
+                    joined == types_mod.TypeStore.NIL or
+                    joined == types_mod.TypeStore.NEVER)
+                {
+                    break :blk body_result;
+                }
+                if (body_result) |br| {
+                    const tail_type = self.local_hir_types.get(br) orelse types_mod.TypeStore.UNKNOWN;
+                    if (tail_type == joined) break :blk br;
+                }
+            }
+
+            // Dead edge (body diverged, or its tail type does not match the
+            // join): the else break must NOT carry the divergent body tail.
+            //
+            // When there is no concrete joined type to peer against — a `try`
+            // whose value is discarded (`Nil`/`Never`/unknown join) — yield
+            // `null` so the backend breaks with `void_value`. The merge then
+            // peer-resolves the noreturn handler edge (`unreachable_value`)
+            // against `void`, giving a `void` block; emitting a `typed_undef`
+            // of `Nil`/`void`/`Never` here would instead fail (`@as` rejects
+            // those as target types).
             if (joined == types_mod.TypeStore.UNKNOWN or
                 joined == types_mod.TypeStore.NIL or
                 joined == types_mod.TypeStore.NEVER)
             {
-                break :blk body_result;
+                break :blk null;
             }
-            // If the body produced a real tail value already typed at the
-            // joined type, use it directly — the normal edge is live and
-            // carries the value.
-            if (body_result) |br| {
-                const tail_type = self.local_hir_types.get(br) orelse types_mod.TypeStore.UNKNOWN;
-                if (tail_type == joined) break :blk br;
-            }
-            // Otherwise the normal-completion edge is statically dead (the body
-            // diverged via a recoverable raise, or its tail type does not match
-            // the join). Yield a typed-undefined placeholder of the joined type.
+
+            // Concrete joined type: break with a `typed_undef` placeholder of
+            // that type — a never-read value giving the merge a clean peer type.
             const placeholder = self.next_local;
             self.next_local += 1;
-            const joined_zig = typeIdToZigTypeWithStore(joined, self.type_store);
+            const placeholder_zig = typeIdToZigTypeWithStore(joined, self.type_store);
             try else_branch_instrs.append(self.allocator, .{
-                .typed_undef = .{ .dest = placeholder, .ty = joined_zig },
+                .typed_undef = .{ .dest = placeholder, .ty = placeholder_zig },
             });
             try self.local_hir_types.put(placeholder, joined);
             break :blk placeholder;
         };
 
         // 5. Emit the landing-pad `if`.
+        //
+        //    Only the HANDLER (then) edge is flagged noreturn, and only when
+        //    the rescue dispatch unconditionally diverges (every reachable arm
+        //    re-raises, e.g. a single `e :: IOError -> raise e` arm plus the
+        //    synthesized re-raise catch-all, all `Never`). A noreturn then-edge
+        //    is already terminated by its divergent `do_raise`; flagging it
+        //    makes the ZIR backend suppress the dead trailing break and emit
+        //    `unreachable_value`.
+        //
+        //    The else (normal-completion) edge is NEVER flagged noreturn here:
+        //    even when the body diverged, the else branch body is empty (the
+        //    divergence happened earlier, outside this `if`) and so has no
+        //    noreturn terminator of its own — suppressing its break would leave
+        //    an empty, terminatorless branch (invalid ZIR). It instead breaks
+        //    normally with the `typed_undef` dead-edge placeholder computed
+        //    above. For the `reraise_propagates` shape (body raises AND the
+        //    only arm re-raises) the then-edge is noreturn and the else-edge
+        //    yields a never-read placeholder, so the whole `if` peer-resolves
+        //    cleanly and contributes a (dead) value to the enclosing merge.
         const else_instrs = try else_branch_instrs.toOwnedSlice(self.allocator);
         try self.current_instrs.append(self.allocator, .{
             .if_expr = .{
@@ -7263,6 +7409,7 @@ pub const IrBuilder = struct {
                 .then_result = handler_dest,
                 .else_instrs = else_instrs,
                 .else_result = else_result,
+                .then_is_noreturn = dispatch_outcome.diverges,
             },
         });
 
@@ -7303,8 +7450,8 @@ pub const IrBuilder = struct {
         arms: []const hir_mod.CaseArm,
         discriminators: []const hir_mod.RescueDiscriminator,
         joined_type: types_mod.TypeId,
-    ) anyerror!void {
-        _ = try self.lowerRescueDispatchFrom(handler_dest, error_local, arms, discriminators, joined_type, 0);
+    ) anyerror!RescueArmOutcome {
+        return try self.lowerRescueDispatchFrom(handler_dest, error_local, arms, discriminators, joined_type, 0);
     }
 
     /// Recursive worker for `lowerRescueDispatch`: emit the dispatch chain
@@ -7321,7 +7468,7 @@ pub const IrBuilder = struct {
         discriminators: []const hir_mod.RescueDiscriminator,
         joined_type: types_mod.TypeId,
         index: usize,
-    ) anyerror!?LocalId {
+    ) anyerror!RescueArmOutcome {
         const arm = arms[index];
         const discriminator = discriminators[index];
 
@@ -7330,7 +7477,7 @@ pub const IrBuilder = struct {
                 // Terminal arm: bind any whole-scrutinee binding to the box
                 // and lower the body straight into the current stream,
                 // yielding its value to `handler_dest`.
-                return try self.emitRescueArmBody(handler_dest, error_local, arm, null, joined_type);
+                return try self.emitRescueArmBody(handler_dest, error_local, arm, null);
             },
             .concrete => |concrete| {
                 // Resolve the protocol the recovered box carries from
@@ -7365,7 +7512,7 @@ pub const IrBuilder = struct {
                 if (concrete.needs_unbox) {
                     unboxed_local = try self.emitRescueUnbox(error_local, protocol_name, concrete.target_type_name);
                 }
-                const then_result = try self.emitRescueArmBody(handler_dest, error_local, arm, unboxed_local, joined_type);
+                const then_outcome = try self.emitRescueArmBody(handler_dest, error_local, arm, unboxed_local);
                 const then_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved_then;
 
@@ -7373,7 +7520,7 @@ pub const IrBuilder = struct {
                 // arm is a catch-all, so this bottoms out.
                 const saved_else = self.current_instrs;
                 self.current_instrs = .empty;
-                const else_result = try self.lowerRescueDispatchFrom(handler_dest, error_local, arms, discriminators, joined_type, index + 1);
+                const else_outcome = try self.lowerRescueDispatchFrom(handler_dest, error_local, arms, discriminators, joined_type, index + 1);
                 const else_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved_else;
 
@@ -7382,18 +7529,54 @@ pub const IrBuilder = struct {
                         .dest = handler_dest,
                         .condition = guard_local,
                         .then_instrs = then_instrs,
-                        .then_result = then_result,
+                        .then_result = then_outcome.result,
                         .else_instrs = else_instrs,
-                        .else_result = else_result,
+                        .else_result = else_outcome.result,
+                        // A branch that diverges (its body ends in a noreturn
+                        // re-raise) gets no synthesized trailing break — the
+                        // ZIR backend honors these flags exactly as
+                        // `addSwitchBlock` honors per-prong `body_is_noreturn`.
+                        .then_is_noreturn = then_outcome.diverges,
+                        .else_is_noreturn = else_outcome.diverges,
                     },
                 });
                 // The merge yields `handler_dest` when at least one edge
-                // produced a value; if both edges diverged it yields null
-                // (the whole subtree diverges).
-                return if (then_result != null or else_result != null) handler_dest else null;
+                // produced a value; if BOTH edges diverge, the whole subtree
+                // diverges — propagate that verdict (result null, diverges
+                // true) so an enclosing `if_expr` flags THIS branch noreturn
+                // too. This is the recursive generalization that makes a
+                // chain of all-re-raising arms (e.g. `reraise_propagates`:
+                // `e :: IOError -> raise e` + synthesized re-raise) lower to
+                // an `if_expr` whose both branches are noreturn — itself
+                // noreturn — instead of dangling a dead break.
+                const subtree_diverges = then_outcome.diverges and else_outcome.diverges;
+                const subtree_result: ?LocalId = if (then_outcome.result != null or else_outcome.result != null)
+                    handler_dest
+                else
+                    null;
+                return .{ .result = subtree_result, .diverges = subtree_diverges };
             },
         }
     }
+
+    /// Outcome of lowering one rescue arm (or a dispatch subtree).
+    ///
+    /// `result` is the local the arm yields to `handler_dest`, or null when
+    /// the arm produced no value (it diverged). `diverges` is true when the
+    /// arm body unconditionally diverges — its tail is a `Never`-returning
+    /// call (a `do_raise` re-raise at top level, or a `recoverable_raise`
+    /// that unwinds). A divergent arm emits NO trailing `local_set`/break:
+    /// the body is already terminal at the ZIR level, so the enclosing
+    /// `if_expr`'s `then_is_noreturn`/`else_is_noreturn` flag is set from
+    /// this verdict and the ZIR backend suppresses the dead trailing break
+    /// (which would otherwise dangle after the noreturn call and trip AIR
+    /// Liveness). `diverges` is a stronger statement than `result == null`:
+    /// a non-divergent arm whose body legitimately yields no value (rare)
+    /// still has `diverges == false`.
+    const RescueArmOutcome = struct {
+        result: ?LocalId,
+        diverges: bool,
+    };
 
     /// Lower one rescue arm's bindings + body into the current instruction
     /// stream, assigning the body's value to `handler_dest`.
@@ -7412,8 +7595,14 @@ pub const IrBuilder = struct {
         error_local: LocalId,
         arm: hir_mod.CaseArm,
         unboxed_local: ?LocalId,
-        joined_type: types_mod.TypeId,
-    ) anyerror!?LocalId {
+    ) anyerror!RescueArmOutcome {
+        // Divergence verdict: the HIR stamps a `raise`-tailed arm body
+        // `NEVER` (`buildHir`'s `.raise_expr` arm). This is authoritative
+        // regardless of struct-pattern unboxing or the lowered result
+        // local's tracked runtime type (`do_raise`/`recoverable_raise`
+        // return `Nil`/a synth struct, not `Never`).
+        const body_diverges = arm.body.result_type == types_mod.TypeStore.NEVER;
+
         if (unboxed_local) |concrete_local| {
             // Struct-pattern arm: match the (single-arm) pattern against the
             // unboxed concrete value via the general case-body lowering so
@@ -7437,8 +7626,12 @@ pub const IrBuilder = struct {
             });
             // `lowerCaseExprBody` emits a `case_block` whose own internal
             // `case_break`s yield to `handler_dest`, so the merge edge's
-            // result is `handler_dest`.
-            return handler_dest;
+            // result is `handler_dest`. A divergent struct-pattern arm body
+            // (e.g. `e :: IOError{..} -> raise e`) ends in the noreturn
+            // `do_raise`; the inner `case_block`'s own noreturn detection
+            // already terminates it cleanly, so we still report `diverges`
+            // so the enclosing `if_expr` branch is flagged noreturn.
+            return .{ .result = handler_dest, .diverges = body_diverges };
         }
 
         // Catch-all or type-binding arm: bind any whole-scrutinee binding to
@@ -7450,52 +7643,33 @@ pub const IrBuilder = struct {
                 try self.emitLocalGet(binding.local_index, error_local);
             }
         }
-        const body_result = try self.lowerBlock(arm.body) orelse return null;
+        const body_result = try self.lowerBlock(arm.body) orelse
+            return .{ .result = null, .diverges = body_diverges };
 
         // A divergent arm body (e.g. the synthesized re-raise, whose tail is
-        // a `Never`-stamped `raise`) must not feed its actual runtime tail
-        // value into the merge: at top level the re-raise's `do_raise` is
-        // `noreturn`, but a recoverable re-raise's `recoverable_raise`
-        // returns `Nil`, which would clash with a value-producing sibling
-        // arm. Mirror `lowerBlockExpecting`'s dead-edge rule: when the body
-        // type is `Never`, the edge is statically dead, so yield a
-        // `typed_undef` of the joined type — a never-read placeholder with
-        // the right peer type. Codegen still emits the divergent call.
-        //
-        // The divergence verdict comes from the HIR `arm.body.result_type`
-        // (the `raise_expr` arm stamps its tail `NEVER`), not the lowered
-        // result local's tracked type — the `do_raise`/`recoverable_raise`
-        // call's result local may carry the runtime return type (`Nil`)
-        // rather than `Never`.
-        const body_hir_type = if (arm.body.result_type == types_mod.TypeStore.NEVER)
-            types_mod.TypeStore.NEVER
-        else
-            self.local_hir_types.get(body_result) orelse types_mod.TypeStore.UNKNOWN;
-        if (body_hir_type == types_mod.TypeStore.NEVER and
-            joined_type != types_mod.TypeStore.UNKNOWN and
-            joined_type != types_mod.TypeStore.NIL and
-            joined_type != types_mod.TypeStore.NEVER)
-        {
-            const placeholder = self.next_local;
-            self.next_local += 1;
-            const joined_zig = typeIdToZigTypeWithStore(joined_type, self.type_store);
-            try self.current_instrs.append(self.allocator, .{
-                .typed_undef = .{ .dest = placeholder, .ty = joined_zig },
-            });
-            try self.local_hir_types.put(placeholder, joined_type);
-            if (joined_zig != .any and joined_zig != .void) {
-                try self.known_local_types.put(placeholder, joined_zig);
-            }
-            try self.current_instrs.append(self.allocator, .{
-                .local_set = .{ .dest = handler_dest, .value = placeholder },
-            });
-            return handler_dest;
+        // a `Never`-stamped `raise`) ends in a `Never`-returning call: at top
+        // level a re-raise's `do_raise` is `noreturn` and aborts; a
+        // recoverable re-raise's `recoverable_raise` unwinds via the
+        // side-channel. Either way control never reaches the branch's merge
+        // point, so we must NOT emit a trailing `local_set handler_dest = …`
+        // (it would be dead code after the noreturn call) and must NOT feed a
+        // value into the merge. We report `diverges = true` and `result =
+        // null`; the enclosing `if_expr` sets `then_is_noreturn`/
+        // `else_is_noreturn` from this verdict, the ZIR backend emits
+        // `unreachable_value` for the branch result and suppresses the dead
+        // trailing break. The merge peer-types against `unreachable_value`,
+        // which unifies with any value-producing sibling arm's type — so this
+        // replaces the previous `typed_undef` dead-edge placeholder for a
+        // divergent arm with the canonical noreturn-branch lowering. The
+        // divergent call itself is still emitted by `lowerBlock` above.
+        if (body_diverges) {
+            return .{ .result = null, .diverges = true };
         }
 
         try self.current_instrs.append(self.allocator, .{
             .local_set = .{ .dest = handler_dest, .value = body_result },
         });
-        return handler_dest;
+        return .{ .result = handler_dest, .diverges = false };
     }
 
     /// Emit a `protocol_box_unbox` recovering the concrete `target_type_name`
