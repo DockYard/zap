@@ -371,6 +371,9 @@ pub const Resolver = struct {
             .function_ref,
             .intrinsic,
             .attr_ref,
+            // Poison sentinel (Phase 4.b): a parse-error placeholder binds and
+            // references nothing — no name resolution needed.
+            .poison,
             => {},
             .error_pipe => |ep| {
                 try self.resolveExpr(ep.chain);

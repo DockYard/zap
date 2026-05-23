@@ -4651,6 +4651,9 @@ pub const TypeChecker = struct {
             .struct_ref,
             .attr_ref,
             .function_ref,
+            // Poison sentinel (Phase 4.b): nothing to validate inside a
+            // parse-error placeholder.
+            .poison,
             => {},
         }
     }
@@ -5938,6 +5941,12 @@ pub const TypeChecker = struct {
 
     fn inferExprUncached(self: *TypeChecker, expr: *const ast.Expr) anyerror!TypeId {
         return switch (expr.*) {
+            // Poison sentinel (Phase 4.b): a parse error already produced a
+            // diagnostic here. Its type is ERROR — the existing
+            // cascade-suppression (the many `!= TypeStore.ERROR` guards) treats
+            // ERROR as "already reported", so type-checking the rest of the
+            // poisoned program emits no spurious follow-on diagnostics.
+            .poison => TypeStore.ERROR,
             .int_literal => TypeStore.I64,
             .float_literal => TypeStore.F64,
             .string_literal => TypeStore.STRING,

@@ -530,6 +530,9 @@ fn substituteInExpr(
         .unquote_splicing_expr,
         .panic_expr,
         .error_pipe,
+        // Poison sentinel (Phase 4.b): a parse-error placeholder has no
+        // `@attr` to substitute — return it unchanged.
+        .poison,
         => return expr,
     }
 }

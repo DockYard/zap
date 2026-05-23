@@ -783,6 +783,19 @@ pub const Expr = union(enum) {
     // Type annotation on expression: expr :: Type
     type_annotated: TypeAnnotatedExpr,
 
+    /// Poison sentinel (Phase 4.b error-tolerant parsing). Stands in for a
+    /// sub-expression the parser could not build because it hit a syntax
+    /// error there. The parser records a rich diagnostic at the error site,
+    /// recovers to a synchronization point, and substitutes this node so the
+    /// surrounding AST stays well-formed and later passes can continue —
+    /// surfacing *all* errors in one compile instead of bailing on the first.
+    /// Every pass that walks an `Expr` treats `poison` as "an error already
+    /// reported here": its inferred type is the ERROR/poison type, which the
+    /// type-checker's existing cascade-suppression silences, so no spurious
+    /// downstream diagnostic is emitted about the poisoned region. This is the
+    /// Rust `ExprKind::Err` / Roslyn "skipped-tokens trivia" model.
+    poison: PoisonExpr,
+
     pub fn getMeta(self: *const Expr) NodeMeta {
         return switch (self.*) {
             .int_literal => |v| v.meta,
@@ -826,8 +839,24 @@ pub const Expr = union(enum) {
             .function_ref => |v| v.meta,
             .anonymous_function => |v| v.meta,
             .type_annotated => |v| v.meta,
+            .poison => |v| v.meta,
         };
     }
+
+    /// True when this expression is the parse-error poison sentinel. Passes
+    /// that want to short-circuit cleanly on poisoned subtrees test this.
+    pub fn isPoison(self: *const Expr) bool {
+        return self.* == .poison;
+    }
+};
+
+/// The poison sentinel payload (Phase 4.b). Carries only its source span via
+/// `meta` — there is no recovered sub-content because, by definition, the
+/// parser could not build a valid node here. The span points at the token
+/// where parsing failed so a later pass can attribute follow-on context to the
+/// right location.
+pub const PoisonExpr = struct {
+    meta: NodeMeta,
 };
 
 pub const IntLiteral = struct {
@@ -1562,7 +1591,12 @@ pub const TypeParenExpr = struct {
 // visitors. Adding a variant always warrants a `git grep` for the
 // nearby variants to find any pass-specific handlers.
 
-const expected_expr_variants: usize = 41;
+// 42 includes the Phase 4.b `poison` parse-error sentinel (the universal
+// error-recovery placeholder). Its visitors are the exhaustive `Expr` switches
+// the compiler enforces: getMeta/inferExpr/desugarExpr/expandExpr/resolveExpr/
+// validateExpr…/walkExpr (capability)/substituteInExpr (attr)/exprToCtValue/
+// stampExpansionOnExpr, plus the StringId-free `remapExpr` no-op arm.
+const expected_expr_variants: usize = 42;
 const expected_pattern_variants: usize = 12;
 const expected_type_expr_variants: usize = 11;
 const expected_top_item_variants: usize = 16;

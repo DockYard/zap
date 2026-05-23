@@ -915,6 +915,10 @@ pub const MacroEngine = struct {
 
     fn expandExpr(self: *MacroEngine, expr: *const ast.Expr) anyerror!ExpandedExpr {
         switch (expr.*) {
+            // Poison sentinel (Phase 4.b): a parse-error placeholder has no
+            // macro to expand — leave it unchanged.
+            .poison => return .{ .expr = expr, .changed = false },
+
             // Quote expressions produce AST data — leave them as-is
             // (unquote inside quote is handled at expansion time)
             .quote_expr => return .{ .expr = expr, .changed = false },
@@ -3554,6 +3558,10 @@ fn stampExpansionOnExpr(expr: *const ast.Expr, info: *const ast.ExpansionInfo) v
             stampExpansionOnExpr(v.expr, info);
             stampExpansionOnTypeExpr(v.type_expr, info);
         },
+        // Poison sentinel (Phase 4.b): stamp the expansion provenance like any
+        // other node so a diagnostic on a poisoned node produced inside a macro
+        // expansion still carries its macro-backtrace frame.
+        .poison => |*v| stampMetaIfUnset(&v.meta, info),
     }
 }
 

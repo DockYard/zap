@@ -436,6 +436,12 @@ pub fn exprToCtValue(
             const args = try makeList(alloc, store, &.{ head, tail });
             return makeTuple3(alloc, store, .{ .atom = "cons" }, try metaToList(alloc, store, v.meta, null), args);
         },
+
+        // Poison sentinel (Phase 4.b): a parse-error placeholder. Reflected as
+        // `{:__poison__, meta, nil}` so a `quote`/macro round-trip stays
+        // well-formed; it never reaches a real compile (the program already
+        // failed parsing).
+        .poison => |v| return makeTuple3(alloc, store, .{ .atom = "__poison__" }, try metaToList(alloc, store, v.meta, null), .nil),
     };
 }
 

@@ -2424,13 +2424,77 @@ pub const Parser = struct {
             if (self.check(.right_brace) or self.check(.keyword_else) or
                 self.check(.eof)) break;
 
-            const stmt = try self.parseStmt();
+            // Phase 4.b error-tolerant parsing: on a statement-level parse
+            // error the rich diagnostic has already been recorded by the
+            // failing sub-parser. Rather than propagate `error.ParseError`
+            // out of the whole function body (which would discard every
+            // later statement and surface only the first error), recover to
+            // the next statement boundary INSIDE this block, substitute a
+            // poison sentinel for the statement we could not build, and keep
+            // going — so independent errors in the same body all surface in
+            // one compile. The error count is still non-zero, so the compile
+            // aborts before any later pass acts on the poison node.
+            const before_errors = self.errors.items.len;
+            const stmt = self.parseStmt() catch |err| switch (err) {
+                error.ParseError => {
+                    // Defensive: a sub-parser returned ParseError without
+                    // recording a diagnostic. Synthesize one so the contract
+                    // "every parse error has a diagnostic" holds.
+                    if (self.errors.items.len == before_errors) {
+                        try self.addError("I could not parse this statement", self.currentSpan());
+                    }
+                    const poison_span = self.currentSpan();
+                    self.synchronizeStatement();
+                    try stmts.append(self.allocator, self.makePoisonStmt(poison_span) catch {
+                        // Allocation failure during recovery — propagate the
+                        // original parse failure rather than masking it.
+                        return error.ParseError;
+                    });
+                    self.skipNewlines();
+                    continue;
+                },
+                else => return err,
+            };
             try stmts.append(self.allocator, stmt);
 
             self.skipNewlines();
         }
 
         return stmts.toOwnedSlice(self.allocator);
+    }
+
+    /// Build a poison statement (`Stmt{ .expr = &Expr.poison }`) anchored at
+    /// `span` (Phase 4.b). A poison statement is the recovery placeholder for a
+    /// statement the parser could not build after a syntax error. Wrapping a
+    /// poison `Expr` keeps the blast radius to the single `Expr.poison` variant
+    /// (no new `Stmt` arm needed) — every `Stmt` switch routes through `.expr`.
+    fn makePoisonStmt(self: *Parser, span: ast.SourceSpan) !ast.Stmt {
+        const poison = try self.create(ast.Expr, .{ .poison = .{ .meta = .{ .span = span } } });
+        return .{ .expr = poison };
+    }
+
+    /// Recover to the next statement boundary WITHIN a block body (Phase 4.b).
+    /// Distinct from the top-level `synchronize()` (which stops at declaration
+    /// keywords): inside a body, the natural boundary is a newline or the
+    /// block-closing `}`/`else`. Consumes tokens up to — but not including —
+    /// the next statement start, the closing `}`, `else`, or EOF, so the
+    /// enclosing `parseBlock` loop can resume cleanly. Never consumes the
+    /// boundary `}`/`else` itself (the caller's loop condition needs to see it).
+    fn synchronizeStatement(self: *Parser) void {
+        while (!self.check(.eof)) {
+            switch (self.peek()) {
+                // Block / clause boundaries — stop WITHOUT consuming so the
+                // enclosing parseBlock loop can observe and terminate.
+                .right_brace, .keyword_else => return,
+                .newline => {
+                    // A newline ends the broken statement. Consume it (and any
+                    // following blank lines) and resume on the next statement.
+                    self.skipNewlines();
+                    return;
+                },
+                else => _ = self.advance(),
+            }
+        }
     }
 
     fn parseStmt(self: *Parser) !ast.Stmt {
@@ -9035,4 +9099,72 @@ test "parser rejects nested structs inside a pub error body" {
 
     _ = parser.parseProgram() catch return;
     return error.TestExpectedParseError;
+}
+
+// ============================================================
+// Phase 4.b — error-tolerant parsing (poisoned AST node)
+// ============================================================
+
+test "error-tolerant parsing surfaces all three statement errors in one body" {
+    // Three INDEPENDENT statement-level syntax errors inside ONE function
+    // body. The pre-4.b parser bailed on the first; 4.b recovers at each
+    // statement boundary (producing a poison node) and continues, so all
+    // three are reported in a single compile.
+    const source =
+        \\pub struct Triple {
+        \\  pub fn run() -> i64 {
+        \\    a = @
+        \\    b = @
+        \\    c = @
+        \\    0
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const result = parser.parseProgram();
+    try std.testing.expectError(error.ParseError, result);
+    // All three independent statement errors surface, not just the first.
+    try std.testing.expectEqual(@as(usize, 3), parser.errors.items.len);
+}
+
+test "error-tolerant parsing recovers and keeps later valid declarations" {
+    // A broken statement in the first function must not poison the SECOND
+    // function: recovery resynchronizes to the declaration boundary so the
+    // good function still parses.
+    const source =
+        \\pub struct Mixed {
+        \\  pub fn broken() -> i64 {
+        \\    x = @
+        \\    0
+        \\  }
+        \\
+        \\  pub fn good() -> i64 {
+        \\    42
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    _ = parser.parseProgram() catch {};
+    // Exactly the one broken statement is reported.
+    try std.testing.expectEqual(@as(usize, 1), parser.errors.items.len);
+}
+
+test "poison expression node reports as a poison sentinel" {
+    // The recovery path produces an `Expr.poison` sentinel that downstream
+    // passes recognise and short-circuit on (poison type = ERROR, no
+    // cascade). This test asserts the variant exists and round-trips.
+    const poison_span = ast.SourceSpan{ .start = 0, .end = 1, .line = 1, .col = 1 };
+    const poison_expr = ast.Expr{ .poison = .{ .meta = .{ .span = poison_span } } };
+    try std.testing.expect(poison_expr == .poison);
+    try std.testing.expectEqual(@as(u32, 1), poison_expr.getMeta().span.line);
 }

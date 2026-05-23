@@ -201,14 +201,50 @@ fn serializeDiagnostic(
     try out.raw("]");
 
     // ── machine_data{} (object of string->string) ──
+    // The failing-pass name of an ICE (carried in the dedicated `ice_pass`
+    // field) is surfaced here under the stable `ice_pass` key so a tool reads
+    // it from one well-known place alongside any other machine data.
     try out.raw(",\"machine_data\":{");
-    for (diag.machine_data, 0..) |datum, datum_index| {
-        if (datum_index > 0) try out.raw(",");
+    var datum_count: usize = 0;
+    if (diag.ice_pass) |pass| {
+        try out.jsonString("ice_pass");
+        try out.raw(":");
+        try out.jsonString(pass);
+        datum_count += 1;
+    }
+    for (diag.machine_data) |datum| {
+        if (datum_count > 0) try out.raw(",");
         try out.jsonString(datum.key);
         try out.raw(":");
         try out.jsonString(datum.value);
+        datum_count += 1;
     }
     try out.raw("}");
+
+    // ── expansion_backtrace[] (Phase 4.b) ──
+    // The macro-expansion chain from the innermost frame out to user source,
+    // each entry a `{ macro, call_site }`. A tool can render the same
+    // Rust/Elixir macro backtrace the text renderer prints. Empty/absent for
+    // ordinary source-level diagnostics.
+    if (diag.expansion) |innermost| {
+        try out.raw(",\"expansion_backtrace\":[");
+        var frame: ?*const ast.ExpansionInfo = innermost;
+        var frame_index: usize = 0;
+        while (frame) |current| : (frame = current.parent) {
+            if (frame_index > 0) try out.raw(",");
+            try out.raw("{\"macro\":");
+            if (engine.interner) |interner| {
+                try out.jsonString(interner.get(current.macro_name));
+            } else {
+                try out.raw("null");
+            }
+            try out.raw(",\"call_site\":");
+            try serializeSpan(engine, out, current.call_site, null);
+            try out.raw("}");
+            frame_index += 1;
+        }
+        try out.raw("]");
+    }
 
     // ── rendered: the human text for THIS diagnostic ──
     const rendered = try renderSingle(engine, out.alloc, diag);
@@ -554,4 +590,27 @@ test "json string escaping handles quotes, backslashes, control chars" {
     defer parsed.deinit();
     const msg = parsed.value.object.get("diagnostics").?.array.items[0].object.get("message").?.string;
     try std.testing.expectEqualStrings("weird \"quote\" and \\ slash and \n newline", msg);
+}
+
+test "serialize projects an ICE diagnostic with domain=ice and the failing pass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = diagnostics.DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+
+    var diag = diagnostics.iceDiagnostic("monomorphize", "Z9002", "internal failure in monomorphize");
+    diag.span = .{ .start = 0, .end = 1 };
+    try engine.reportDiagnostic(diag);
+
+    const json_text = try serialize(&engine, alloc);
+    const parsed = try parseDocument(alloc, json_text);
+    defer parsed.deinit();
+
+    const first = parsed.value.object.get("diagnostics").?.array.items[0].object;
+    try std.testing.expectEqualStrings("ice", first.get("domain").?.string);
+    try std.testing.expectEqualStrings("Z9002", first.get("code").?.string);
+    const machine = first.get("machine_data").?.object;
+    try std.testing.expectEqualStrings("monomorphize", machine.get("ice_pass").?.string);
 }

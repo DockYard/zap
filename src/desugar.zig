@@ -1534,6 +1534,9 @@ pub const Desugarer = struct {
             .attr_ref,
             .binary_literal,
             .function_ref,
+            // Poison sentinel (Phase 4.b): a leaf parse-error placeholder —
+            // pass it through untouched (the compile is already failing).
+            .poison,
             => return expr,
 
             // ----- Macro-internal AST nodes — these are placeholders

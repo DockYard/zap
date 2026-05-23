@@ -115,12 +115,52 @@ pub const Diagnostic = struct {
     machine_data: []const MachineDatum = &.{},
     /// Public-API vs internal surface — gated by the security tier.
     visibility: Visibility = .public,
+    /// Macro-expansion provenance (Phase 4.b). When this diagnostic points at a
+    /// node produced by a macro expansion, `expansion` is the innermost
+    /// `ExpansionInfo` frame; following its `parent` chain walks back out to
+    /// user source. The renderer prints an "in expansion of macro `X`" frame
+    /// list (Rust/Elixir macro backtrace) so the reader sees the chain from the
+    /// error site out to the call they actually wrote. Null for ordinary
+    /// source-level diagnostics (the common case).
+    expansion: ?*const ast.ExpansionInfo = null,
+    /// The failing compiler pass/phase for a `domain=ice` diagnostic (Phase
+    /// 4.b) — e.g. `"zir_api.update"`, `"monomorphize"`, `"sema"`. Drives the
+    /// ICE footer ("internal compiler error in <pass>, please report") and the
+    /// JSON `ice_pass` field. Null for non-ICE diagnostics.
+    ice_pass: ?[]const u8 = null,
 
     pub const Note = struct {
         message: []const u8,
         span: ?ast.SourceSpan,
     };
 };
+
+/// Stable internal-code prefix for an internal compiler error (Phase 4.b). The
+/// `Z9xxx` band is reserved for ICEs so a user can tell a compiler bug from a
+/// language error at a glance, and so `zap explain Z9xxx` routes to the ICE
+/// catalog entry.
+pub const ICE_CODE_PREFIX = "Z9";
+
+/// Build a structured internal-compiler-error diagnostic (Phase 4.b). Nothing
+/// internal ever escapes as a bare string: an OOM in a pass, a Sema failure,
+/// the `zir_api: update failed` path, or any unreachable compiler state lowers
+/// into THIS shape — `domain=ice`, the failing `pass` name, a stable `code`,
+/// and a "this is a compiler bug, please report" footer (the Rust ICE-hook
+/// model). The failing `pass` rides in the dedicated `ice_pass` field (surfaced
+/// in JSON's `machine_data.ice_pass` and the renderer's footer). The span
+/// defaults to "no location" (an ICE often has no user span); callers that have
+/// one set `.span` after constructing.
+pub fn iceDiagnostic(pass: []const u8, code: []const u8, message: []const u8) Diagnostic {
+    return .{
+        .severity = .@"error",
+        .domain = .ice,
+        .code = code,
+        .message = message,
+        .span = .{ .start = 0, .end = 0, .line = 0, .col = 0 },
+        .visibility = .internal,
+        .ice_pass = pass,
+    };
+}
 
 // ============================================================
 // Color support
@@ -234,6 +274,12 @@ pub const DiagnosticEngine = struct {
     /// detail. The compile renderer and the runtime crash printer share this
     /// tier vocabulary (`error_format.SecurityTier`).
     tier: SecurityTier = .dev_local,
+    /// Optional string interner (Phase 4.b). When set, the renderer can resolve
+    /// interned `StringId`s — specifically the `macro_name` on an
+    /// `ExpansionInfo` frame — into their text for the macro-expansion
+    /// backtrace. Null when no interner is available (e.g. a runtime/leak
+    /// engine), in which case the backtrace falls back to a generic label.
+    interner: ?*const ast.StringInterner = null,
     mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator) DiagnosticEngine {
@@ -248,6 +294,12 @@ pub const DiagnosticEngine = struct {
             .use_color = false,
             .tier = .dev_local,
         };
+    }
+
+    /// Attach a string interner so the renderer can resolve interned names
+    /// (the macro-expansion backtrace's `macro_name`). Idempotent-by-overwrite.
+    pub fn setInterner(self: *DiagnosticEngine, interner: *const ast.StringInterner) void {
+        self.interner = interner;
     }
 
     pub fn deinit(self: *DiagnosticEngine) void {
@@ -759,6 +811,78 @@ pub const DiagnosticEngine = struct {
             }
             try writer.writeAll(cause.message);
             try writer.writeByte('\n');
+        }
+
+        // ── Macro-expansion backtrace (Phase 4.b) ──
+        // When the diagnostic points at a node produced by a macro expansion,
+        // render the expansion chain from the innermost frame out to user
+        // source as a list of "in expansion of macro `X`" lines, each carrying
+        // the call site's `file:line:col`. This is the Rust/Elixir macro
+        // backtrace: the primary span points at the error inside the expanded
+        // code, and the frame list tells the reader which macro call (that they
+        // actually wrote) produced it. Reuses the shared `= note:` styling so it
+        // reads as context, not a second error.
+        if (diag.expansion) |innermost_frame| {
+            var frame: ?*const ast.ExpansionInfo = innermost_frame;
+            while (frame) |current| : (frame = current.parent) {
+                if (has_source) {
+                    try writeGutterEmpty(writer, gutter, color);
+                }
+                try writer.writeByteNTimes(' ', gutter + 1);
+                const frame_c = color.severityStyle(.note);
+                try writer.writeAll(frame_c.start);
+                try writer.writeAll("= note: in expansion of macro `");
+                if (self.interner) |interner| {
+                    try writer.writeAll(interner.get(current.macro_name));
+                } else {
+                    try writer.writeAll("?");
+                }
+                try writer.writeAll("`");
+                try writer.writeAll(frame_c.end);
+                const call_source = self.sourceForSpan(current.call_site);
+                if (call_source) |cs| {
+                    const call_line = self.displaySpanLine(current.call_site);
+                    if (call_line > 0) {
+                        try writer.writeAll(" (");
+                        try writer.writeAll(error_format.applyPathPolicy(self.tier, cs.file_path));
+                        try writer.print(":{d}:{d})", .{ call_line, current.call_site.col });
+                    }
+                }
+                try writer.writeByte('\n');
+            }
+        }
+
+        // ── ICE footer (Phase 4.b) ──
+        // An internal compiler error renders the canonical Rust-style "this is
+        // a compiler bug" notice naming the failing pass, so nothing internal
+        // ever reaches the user as a bare unexplained string and the user knows
+        // to file a report (with this repro) rather than fix their own code.
+        if (diag.domain == .ice) {
+            if (has_source) {
+                try writeGutterEmpty(writer, gutter, color);
+            }
+            try writer.writeByteNTimes(' ', gutter + 1);
+            const ice_c = color.severityStyle(.note);
+            try writer.writeAll(ice_c.start);
+            try writer.writeAll("= note: ");
+            try writer.writeAll(ice_c.end);
+            if (diag.ice_pass) |pass| {
+                try writer.print("internal compiler error in pass `{s}` \u{2014} this is a compiler bug, please report it", .{pass});
+            } else {
+                try writer.writeAll("internal compiler error \u{2014} this is a compiler bug, please report it");
+            }
+            try writer.writeByte('\n');
+            if (diag.code) |code| {
+                if (has_source) {
+                    try writeGutterEmpty(writer, gutter, color);
+                }
+                try writer.writeByteNTimes(' ', gutter + 1);
+                try writer.writeAll(ice_c.start);
+                try writer.writeAll("= note: ");
+                try writer.writeAll(ice_c.end);
+                try writer.print("include this repro and the code `{s}` at https://github.com/trycog/cog-cli/issues", .{code});
+                try writer.writeByte('\n');
+            }
         }
 
         // ── Footer: └─ file:line:col ──
@@ -1421,4 +1545,63 @@ test "related spans render as note lines with location" {
 
     const output = try engine.format(alloc);
     try std.testing.expect(std.mem.find(u8, output, "= note: expected `i64` because of this annotation (prov.zap:1:8)") != null);
+}
+
+// ============================================================
+// Phase 4.b — ICE class + macro-expansion backtrace rendering
+// ============================================================
+
+test "ICE diagnostic renders a compiler-bug footer with the failing pass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+
+    // An internal failure surfaced as a structured ICE — never a bare string.
+    var diag = iceDiagnostic("zir_api.update", "Z9001", "ZIR lowering failed: OutOfMemory");
+    diag.span = .{ .start = 0, .end = 1, .line = 0, .col = 0 };
+    try engine.reportDiagnostic(diag);
+
+    const output = try engine.format(alloc);
+    // Header carries the message; footer carries the canonical ICE notice.
+    try std.testing.expect(std.mem.find(u8, output, "ZIR lowering failed: OutOfMemory") != null);
+    try std.testing.expect(std.mem.find(u8, output, "internal compiler error") != null);
+    try std.testing.expect(std.mem.find(u8, output, "zir_api.update") != null);
+    try std.testing.expect(std.mem.find(u8, output, "please report") != null);
+}
+
+test "macro-expansion backtrace renders the expansion chain as frame lines" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.setSource("pub fn run() {\n  unless cond { go() }\n}\n", "m.zap");
+
+    // Interned macro name id is opaque to the renderer; it resolves names via
+    // the engine's interner. Build a one-level expansion frame.
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const unless_id = try interner.intern("unless");
+    engine.setInterner(&interner);
+
+    const frame = ast.ExpansionInfo{
+        .call_site = .{ .start = 17, .end = 23, .line = 2, .col = 3 },
+        .macro_name = unless_id,
+    };
+
+    try engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .domain = .typecheck,
+        .message = "undefined function `go/0`",
+        .span = .{ .start = 30, .end = 34, .line = 2, .col = 16 },
+        .expansion = &frame,
+    });
+
+    const output = try engine.format(alloc);
+    try std.testing.expect(std.mem.find(u8, output, "in expansion of macro `unless`") != null);
+    try std.testing.expect(std.mem.find(u8, output, "m.zap:2:3") != null);
 }

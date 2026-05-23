@@ -11322,8 +11322,10 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
             try remapTypeExpr(alloc, mutable_te, remap);
             ta.type_expr = mutable_te;
         },
-        // These have no StringId fields — only meta and numeric/bool values
-        .int_literal, .float_literal, .bool_literal, .nil_literal => {},
+        // These have no StringId fields — only meta and numeric/bool values.
+        // `poison` (Phase 4.b parse-error sentinel) likewise carries only its
+        // span, so the StringId remap is a no-op for it.
+        .int_literal, .float_literal, .bool_literal, .nil_literal, .poison => {},
     }
 }
 

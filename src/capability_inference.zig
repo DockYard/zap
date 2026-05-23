@@ -168,6 +168,9 @@ fn walkExpr(
         .attr_ref,
         .binary_literal,
         .function_ref,
+        // Poison sentinel (Phase 4.b): a parse-error placeholder calls
+        // nothing, so it contributes no capability requirement.
+        .poison,
         => {},
 
         .string_interpolation => |si| {
