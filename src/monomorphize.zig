@@ -1971,6 +1971,43 @@ const MonomorphContext = struct {
             .closure_create => |cc| {
                 for (cc.captures) |cap| self.rewriteExpr(cap.expr);
             },
+            // Destructuring projections and the propagating-raise/`?` lowerings
+            // each wrap a sub-expression that may itself be a generic call
+            // (e.g. `(Enum.map(list, &f/1))[0]`, or `Worker.run()?` whose
+            // `ret_raise` stash call forwards a specialized result). Mirror the
+            // `scanExpr` traversal so their call sites are rewired too.
+            .tuple_index_get => |tig| self.rewriteExpr(tig.object),
+            .list_index_get => |lig| self.rewriteExpr(lig.list),
+            .list_head_get => |lhg| self.rewriteExpr(lhg.list),
+            .list_tail_get => |ltg| self.rewriteExpr(ltg.list),
+            .map_value_get => |mvg| {
+                self.rewriteExpr(mvg.map);
+                self.rewriteExpr(mvg.key);
+            },
+            .ret_raise => |rr| self.rewriteExpr(rr.stash_call),
+            .try_project => |tp| self.rewriteExpr(tp.operand),
+            .try_rescue => |tr| {
+                // Mirror the scan-phase traversal (`scanBlock` over the same
+                // sub-expressions): a generic call inside a `try` body, a
+                // rescue arm guard/body, or the `after` cleanup must have its
+                // call site rewired to the monomorphized specialization just
+                // like a call anywhere else. Without this arm, a combinator
+                // call such as `Enum.map(list, &raising/1)` written inside a
+                // `try { … } rescue { … }` keeps its generic `call_named`
+                // target and the ZIR backend then references an unmangled
+                // symbol (`Enum__map__2`) that was never emitted — the
+                // specialization exists under its mangled name but the call
+                // site never points at it. This is the rewrite-path analogue
+                // of the `.try_rescue` arm in `scanExpr`/`cloneExpr`.
+                self.rewriteBlock(tr.body);
+                for (tr.arms) |arm| {
+                    if (arm.guard) |g| self.rewriteExpr(g);
+                    self.rewriteBlock(arm.body);
+                }
+                self.rewriteExpr(tr.raise_occurred_call);
+                self.rewriteExpr(tr.take_raise_call);
+                if (tr.after_block) |cleanup| self.rewriteBlock(cleanup);
+            },
             else => {},
         }
     }
