@@ -3986,6 +3986,8 @@ const Pipeline = struct {
                 .label = type_err.label,
                 .help = type_err.help,
                 .secondary_spans = type_err.secondary_spans,
+                .related_spans = type_err.related_spans,
+                .machine_data = type_err.machine_data,
             }) catch {};
         }
     }
@@ -5078,6 +5080,8 @@ fn compileStagedStructHir(
             .label = type_err.label,
             .help = type_err.help,
             .secondary_spans = type_err.secondary_spans,
+            .related_spans = type_err.related_spans,
+            .machine_data = type_err.machine_data,
         }) catch {};
     }
     if (diag_engine.errorCount() > error_baseline) return error.TypeCheckFailed;

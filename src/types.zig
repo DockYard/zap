@@ -4,6 +4,7 @@ const scope_mod = @import("scope.zig");
 const escape_lattice = @import("escape_lattice.zig");
 const ir = @import("ir.zig");
 const similarity = @import("similarity.zig");
+const diagnostics_mod = @import("diagnostics.zig");
 
 // ============================================================
 // Type representation
@@ -1523,6 +1524,13 @@ pub const TypeChecker = struct {
         /// `.@"error"` at the pipeline. Used by checks that intentionally
         /// emit at a different severity (e.g. lints).
         severity: ?@import("diagnostics.zig").Severity = null,
+        /// Phase 4.b two-sided projection: the expected-type ORIGIN(s), carried
+        /// to the canonical `diagnostics.Diagnostic.related_spans` (LSP
+        /// relatedInformation). Empty for one-sided errors.
+        related_spans: []const diagnostics_mod.RelatedSpan = &.{},
+        /// Phase 4.b structured machine payload (e.g. `expected_type`/`got_type`)
+        /// carried to `diagnostics.Diagnostic.machine_data`. Empty by default.
+        machine_data: []const diagnostics_mod.MachineDatum = &.{},
     };
 
     const ResolvedCallSignature = struct {
@@ -3423,6 +3431,39 @@ pub const TypeChecker = struct {
             .label = label_text,
             .help = help_text,
         });
+    }
+
+    /// The two halves a 4.b two-sided type error needs: the canonical
+    /// `related_spans` (the expected-type ORIGIN, an LSP relatedInformation
+    /// entry) and `machine_data` (structured `expected_type`/`got_type` for
+    /// tools / `zap fix`). The primary diagnostic span stays on the got-side
+    /// (the mismatching expression); this builds the "↓ from here" side from a
+    /// `TypeProvenance`-style origin span. When no origin span is known
+    /// (`origin_span == null`) only `machine_data` is produced so the structured
+    /// types are still emitted. Allocations live on the checker arena.
+    const TwoSidedTypeData = struct {
+        related_spans: []const diagnostics_mod.RelatedSpan,
+        machine_data: []const diagnostics_mod.MachineDatum,
+    };
+
+    fn twoSidedTypeData(
+        self: *TypeChecker,
+        expected: []const u8,
+        got: []const u8,
+        origin_span: ?ast.SourceSpan,
+        origin_message: []const u8,
+    ) !TwoSidedTypeData {
+        const machine = try self.allocator.alloc(diagnostics_mod.MachineDatum, 2);
+        machine[0] = .{ .key = "expected_type", .value = expected };
+        machine[1] = .{ .key = "got_type", .value = got };
+
+        const related = if (origin_span) |span| blk: {
+            const spans = try self.allocator.alloc(diagnostics_mod.RelatedSpan, 1);
+            spans[0] = .{ .span = span, .message = origin_message };
+            break :blk spans;
+        } else &[_]diagnostics_mod.RelatedSpan{};
+
+        return .{ .related_spans = related, .machine_data = machine };
     }
 
     fn addHardError(self: *TypeChecker, message: []const u8, span: ast.SourceSpan, label_text: ?[]const u8, help_text: ?[]const u8) !void {
@@ -5841,17 +5882,29 @@ pub const TypeChecker = struct {
             if (!return_matches_declared) {
                 const expected = self.typeToString(declared_return);
                 const got = self.typeToString(body_type);
-                const diagnostics = @import("diagnostics.zig");
 
-                // Build secondary span pointing to the return type annotation
+                // Build the secondary span pointing to the return type
+                // annotation (inline `~~~` underline). This is the legacy
+                // two-sided affordance and stays for the source-line marker.
                 const secondary = if (clause.return_type) |rt| blk: {
-                    const spans = try self.allocator.alloc(diagnostics.SecondarySpan, 1);
+                    const spans = try self.allocator.alloc(diagnostics_mod.SecondarySpan, 1);
                     spans[0] = .{
                         .span = rt.getMeta().span,
                         .label = try std.fmt.allocPrint(self.allocator, "return type `{s}` declared here", .{expected}),
                     };
                     break :blk spans;
-                } else &[_]diagnostics.SecondarySpan{};
+                } else &[_]diagnostics_mod.SecondarySpan{};
+
+                // Phase 4.b: the canonical two-sided projection. The expected
+                // type's ORIGIN (the return annotation, when present) becomes a
+                // `related_span` ("↓ from here" via LSP relatedInformation) and
+                // the structured types ride in `machine_data`.
+                const two_sided = try self.twoSidedTypeData(
+                    expected,
+                    got,
+                    if (clause.return_type) |rt| rt.getMeta().span else null,
+                    try std.fmt.allocPrint(self.allocator, "expected `{s}` because of this return type annotation", .{expected}),
+                );
 
                 try self.errors.append(self.allocator, .{
                     .message = try std.fmt.allocPrint(self.allocator, "this function returns the wrong type", .{}),
@@ -5859,6 +5912,8 @@ pub const TypeChecker = struct {
                     .label = try std.fmt.allocPrint(self.allocator, "expected `{s}`, got `{s}`", .{ expected, got }),
                     .help = try std.fmt.allocPrint(self.allocator, "the function is declared to return `{s}` but the body produces `{s}`", .{ expected, got }),
                     .secondary_spans = secondary,
+                    .related_spans = two_sided.related_spans,
+                    .machine_data = two_sided.machine_data,
                     .severity = .@"error",
                 });
             }
@@ -6885,14 +6940,42 @@ pub const TypeChecker = struct {
     }
 
     fn reportArgumentTypeMismatch(self: *TypeChecker, arg: *const ast.Expr, arg_index: usize, expected: TypeId, got: TypeId) !void {
+        return self.reportArgumentTypeMismatchProvenance(arg, arg_index, expected, got, null);
+    }
+
+    /// As `reportArgumentTypeMismatch`, but with the parameter's declared-type
+    /// ORIGIN span (Phase 4.b two-sided). `param_origin_span` is the span of the
+    /// callee parameter's `:: Type` annotation — supplied by the call site that
+    /// resolved the callee clause. The primary span stays on the argument (the
+    /// got-side); the origin renders as a `related_span` ("expected `i64`
+    /// because the parameter is declared here") and the structured types ride in
+    /// `machine_data`. When the origin is unknown (`null`) only `machine_data`
+    /// is attached so a tool still gets the structured types.
+    fn reportArgumentTypeMismatchProvenance(
+        self: *TypeChecker,
+        arg: *const ast.Expr,
+        arg_index: usize,
+        expected: TypeId,
+        got: TypeId,
+        param_origin_span: ?ast.SourceSpan,
+    ) !void {
         const expected_type = self.store.getType(expected);
         const got_type = self.store.getType(got);
+        const expected_str = self.typeToString(expected);
+        const got_str = self.typeToString(got);
+
+        const two_sided = try self.twoSidedTypeData(
+            expected_str,
+            got_str,
+            param_origin_span,
+            try std.fmt.allocPrint(self.allocator, "expected `{s}` because the parameter is declared with this type", .{expected_str}),
+        );
 
         if (expected_type == .function) {
             const message = if (got_type == .function)
-                try std.fmt.allocPrint(self.allocator, "argument {d} expects callable `{s}`, got callable `{s}`", .{ arg_index + 1, self.typeToString(expected), self.typeToString(got) })
+                try std.fmt.allocPrint(self.allocator, "argument {d} expects callable `{s}`, got callable `{s}`", .{ arg_index + 1, expected_str, got_str })
             else
-                try std.fmt.allocPrint(self.allocator, "argument {d} expects callable `{s}`, got `{s}`", .{ arg_index + 1, self.typeToString(expected), self.typeToString(got) });
+                try std.fmt.allocPrint(self.allocator, "argument {d} expects callable `{s}`, got `{s}`", .{ arg_index + 1, expected_str, got_str });
 
             const help = if (arg.* == .anonymous_function)
                 "change the anonymous function signature to match the expected callable type"
@@ -6901,21 +6984,52 @@ pub const TypeChecker = struct {
             else
                 "pass a callable value whose signature matches the expected function type";
 
-            try self.addRichError(
-                message,
-                arg.getMeta().span,
-                "callable signature mismatch",
-                help,
-            );
+            try self.errors.append(self.allocator, .{
+                .message = message,
+                .span = arg.getMeta().span,
+                .label = "callable signature mismatch",
+                .help = help,
+                .related_spans = two_sided.related_spans,
+                .machine_data = two_sided.machine_data,
+            });
             return;
         }
 
-        try self.addRichError(
-            try std.fmt.allocPrint(self.allocator, "argument {d} expects `{s}`, got `{s}`", .{ arg_index + 1, self.typeToString(expected), self.typeToString(got) }),
-            arg.getMeta().span,
-            "argument type mismatch",
-            null,
-        );
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(self.allocator, "argument {d} expects `{s}`, got `{s}`", .{ arg_index + 1, expected_str, got_str }),
+            .span = arg.getMeta().span,
+            .label = "argument type mismatch",
+            .related_spans = two_sided.related_spans,
+            .machine_data = two_sided.machine_data,
+        });
+    }
+
+    /// The declared-type annotation span of clause parameter `index`, or null
+    /// when the clause has fewer params or that param is unannotated. Feeds the
+    /// two-sided argument-mismatch's expected-type origin (Phase 4.b).
+    fn clauseParamOriginSpan(clause: *const ast.FunctionClause, index: usize) ?ast.SourceSpan {
+        if (index >= clause.params.len) return null;
+        const annotation = clause.params[index].type_annotation orelse return null;
+        return annotation.getMeta().span;
+    }
+
+    /// As `clauseParamOriginSpan`, but resolves the clause from a family +
+    /// clause-index pair (the shape a struct-qualified `Mod.f(...)` call site
+    /// holds). Returns null if the family is empty or the index is out of range.
+    fn familyParamOriginSpan(
+        self: *TypeChecker,
+        family_id: scope_mod.FunctionFamilyId,
+        clause_index: u32,
+        param_index: usize,
+    ) ?ast.SourceSpan {
+        const family = self.graph.getFamily(family_id);
+        if (family.clauses.items.len == 0) return null;
+        const clause_ref = if (clause_index < family.clauses.items.len)
+            family.clauses.items[clause_index]
+        else
+            family.clauses.items[0];
+        if (clause_ref.clause_index >= clause_ref.decl.clauses.len) return null;
+        return clauseParamOriginSpan(&clause_ref.decl.clauses[clause_ref.clause_index], param_index);
     }
 
     /// Check if a field_access chain roots at an atom_literal (`:zig` bridge call).
@@ -6970,7 +7084,17 @@ pub const TypeChecker = struct {
             if (idx < signature.params.len) {
                 const expected = signature.params[idx];
                 if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.callMatchCost(arg_type, expected) == null) {
-                    try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
+                    // Phase 4.b two-sided: hand the resolved clause's parameter
+                    // annotation span so the diagnostic points at where the
+                    // expected type came from. The clause ref resolves to its
+                    // owning FunctionDecl's clause; guard the clause_index in
+                    // case the family shape ever drifts.
+                    const clause_ref = family.clauses.items[0];
+                    const origin_span = if (clause_ref.clause_index < clause_ref.decl.clauses.len)
+                        clauseParamOriginSpan(&clause_ref.decl.clauses[clause_ref.clause_index], idx)
+                    else
+                        null;
+                    try self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin_span);
                 }
             }
         }
@@ -7344,14 +7468,15 @@ pub const TypeChecker = struct {
                                         if (idx < signature.params.len) {
                                             const expected = signature.params[idx];
                                             if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR) {
+                                                const origin = self.familyParamOriginSpan(resolved_call.family_id, resolved_call.clause_index, idx);
                                                 if (self.callMatchCost(arg_type, expected) == null) {
-                                                    self.reportArgumentTypeMismatch(arg, idx, expected, arg_type) catch {};
+                                                    self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin) catch {};
                                                     mod_unification_failed = true;
                                                     continue;
                                                 }
                                                 const unified = self.store.unify(expected, arg_type, &mod_subs) catch false;
                                                 if (!unified) {
-                                                    self.reportArgumentTypeMismatch(arg, idx, expected, arg_type) catch {};
+                                                    self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin) catch {};
                                                     mod_unification_failed = true;
                                                 }
                                             }
@@ -7380,7 +7505,11 @@ pub const TypeChecker = struct {
                                     if (idx < signature.params.len) {
                                         const expected = signature.params[idx];
                                         if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.callMatchCost(arg_type, expected) == null) {
-                                            self.reportArgumentTypeMismatch(arg, idx, expected, arg_type) catch {};
+                                            // Phase 4.b two-sided: point at the
+                                            // resolved callee parameter's declared
+                                            // type as the expected-type origin.
+                                            const origin = self.familyParamOriginSpan(resolved_call.family_id, resolved_call.clause_index, idx);
+                                            self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin) catch {};
                                         }
                                     }
                                 }
@@ -10284,6 +10413,64 @@ test "return type mismatch has secondary span" {
     const ss_label = err.secondary_spans[0].label;
     try std.testing.expect(std.mem.find(u8, ss_label, "return type") != null);
     try std.testing.expect(std.mem.find(u8, ss_label, "i64") != null);
+
+    // Phase 4.b two-sided upgrade: the canonical IR's related_spans carries the
+    // expected-type origin (LSP relatedInformation), and machine_data carries
+    // the structured expected/got types for tools.
+    try std.testing.expect(err.related_spans.len > 0);
+    try std.testing.expect(std.mem.find(u8, err.related_spans[0].message, "i64") != null);
+    var saw_expected = false;
+    var saw_got = false;
+    for (err.machine_data) |datum| {
+        if (std.mem.eql(u8, datum.key, "expected_type") and std.mem.eql(u8, datum.value, "i64")) saw_expected = true;
+        if (std.mem.eql(u8, datum.key, "got_type") and std.mem.eql(u8, datum.value, "String")) saw_got = true;
+    }
+    try std.testing.expect(saw_expected);
+    try std.testing.expect(saw_got);
+}
+
+test "two-sided argument type mismatch points at the parameter declaration" {
+    // The got-type origin is the argument expression (primary span); the
+    // expected-type origin is the parameter's declared annotation, surfaced as
+    // a related_span ("expected `i64` because parameter `x` is declared here").
+    const source =
+        \\pub struct Test {
+        \\  pub fn takes_int(x :: i64) -> i64 {
+        \\    x
+        \\  }
+        \\  pub fn caller() -> i64 {
+        \\    Test.takes_int("hello")
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expect(checker.errors.items.len > 0);
+    // Find the argument-mismatch diagnostic.
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "argument") != null and err.related_spans.len > 0) {
+            found = true;
+            // The related span names the expected type and points at the param.
+            try std.testing.expect(std.mem.find(u8, err.related_spans[0].message, "i64") != null);
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "undefined function suggests similar name" {
