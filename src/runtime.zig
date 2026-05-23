@@ -866,6 +866,34 @@ threadlocal var current_recoverable_raise: ProtocolBox = ProtocolBox.none;
 /// future error value is legitimately the absent box.
 threadlocal var current_recoverable_raise_pending: bool = false;
 
+/// Thread-local error-return-trace buffer (Phase 4.a, ERT display / #201).
+///
+/// Captured at the RAISE ORIGIN — inside `Kernel.recoverable_raise`, when the
+/// raising thread's stack is at full depth (`main → a → b → c →
+/// recoverable_raise`). That is the only moment the c→b→a propagation chain is
+/// live on the stack: by the time the propagated `error.ZapRaise` reaches the
+/// top-level abort terminus (`Kernel.abort_recoverable_raise`), every
+/// intervening frame has already returned, so a backtrace captured there shows
+/// only `abort_recoverable_raise → main` (the bug #201 documented).
+///
+/// This is the genuine error-return trace — recorded where the error is born,
+/// rendered where it aborts — and it is a Zap/runtime-native solution: it does
+/// NOT depend on `@errorReturnTrace()` or the fork's AIR error-trace-frame
+/// push (which the injected-ZIR path does not wire). The error value already
+/// flows through the `current_recoverable_raise` side-channel; this captures
+/// the *trace* through the same side-channel at the same instant.
+///
+/// Thread-local for the same reason as the value side-channel: each thread
+/// unwinds independently. One slot suffices (one in-flight raise per thread).
+/// Reset when the raise is consumed by a handler (`take_recoverable_raise`) so
+/// a rescued raise leaves no stale trace for a later unrelated abort.
+threadlocal var current_error_return_trace: Backtrace = .{ .addresses = undefined, .len = 0 };
+
+/// Companion pending-flag for `current_error_return_trace`. True between the
+/// raise-origin capture and either the abort (rendered) or a `rescue`
+/// (cleared). A separate flag keeps "an ERT was captured" unambiguous.
+threadlocal var current_error_return_trace_pending: bool = false;
+
 comptime {
     // Layout invariants. The runtime ABI for protocol existentials
     // is a fat pointer — two opaque pointers, no padding, no
@@ -7825,7 +7853,16 @@ fn isRaisePlumbingSymbol(stripped_mangled: []const u8) bool {
         std.mem.eql(u8, stripped_mangled, "Kernel.raise__1") or
         std.mem.eql(u8, stripped_mangled, "Kernel.match_fail__1") or
         std.mem.eql(u8, stripped_mangled, "Kernel.nil_access__1") or
-        std.mem.eql(u8, stripped_mangled, "Kernel.panic__1");
+        std.mem.eql(u8, stripped_mangled, "Kernel.panic__1") or
+        // Phase 4.a: the recoverable-raise sink sits between the user's
+        // raising frame and the ERT capture point; suppress BOTH the Zap
+        // wrapper (`Kernel.recoverable_raise__1`) and the runtime Zig sink it
+        // tail-calls (`zap_runtime.Kernel.recoverable_raise`, the actual
+        // capture frame) so the error-return trace begins at the user frame
+        // that raised (e.g. `Chain.c`), not the Zap/runtime plumbing. Matched
+        // as a substring so the `zap_runtime.` module prefix is tolerated.
+        std.mem.eql(u8, stripped_mangled, "Kernel.recoverable_raise__1") or
+        std.mem.indexOf(u8, stripped_mangled, "Kernel.recoverable_raise") != null;
 }
 
 /// True when a (underscore-stripped) linkage name belongs to the Phase 2.b
@@ -7966,6 +8003,44 @@ fn crashReportSourceLocation(loc: std.debug.SourceLocation) void {
     posixWrite(STDERR_FD, shown);
     posixWrite(STDERR_FD, RuntimeFormat.source_line_separator);
     crashWriteUnsigned(loc.line);
+}
+
+/// Render the error-return-trace section (Phase 4.a, #201): the propagation
+/// chain captured at the raise origin in `Kernel.recoverable_raise`, shown
+/// under the `error return trace:` header so the reader sees WHERE the error
+/// was raised and HOW it propagated (the c→b→a chain) — distinct from the
+/// backtrace, which shows the call stack at the abort terminus.
+///
+/// No-op when no ERT was captured (a direct unrecoverable `raise`/panic/signal
+/// fault, where the abort-site backtrace already shows the full chain because
+/// nothing unwound). Reuses `crashReportFrame` so an ERT frame and a backtrace
+/// frame render with the IDENTICAL symbol + `file:line` format — one visual
+/// language. Pure `write`(2); allocation-free; async-signal-safe.
+fn emitErrorReturnTraceSection() void {
+    if (!current_error_return_trace_pending) return;
+    if (current_error_return_trace.len == 0) return;
+    if (crash_reporter_config.verbosity == .off) return;
+
+    const color_on = crash_reporter_config.use_color;
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_cyan);
+    posixWrite(STDERR_FD, RuntimeFormat.ert_section_header);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+    posixWrite(STDERR_FD, "\n");
+
+    const max_shown: usize = switch (crash_reporter_config.verbosity) {
+        .off => 0,
+        .short => CRASH_SHORT_FRAME_LIMIT,
+        .full => current_error_return_trace.len,
+    };
+    var shown: usize = 0;
+    var i: usize = 0;
+    while (i < current_error_return_trace.len and shown < max_shown) : (i += 1) {
+        switch (crashReportFrame(current_error_return_trace.addresses[i])) {
+            .emitted => shown += 1,
+            .skipped => {},
+            .stop => break,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8116,6 +8191,13 @@ fn emitCrashReportWithBacktrace(kind: []const u8, message: []const u8, bt: Backt
             }
         }
     }
+
+    // Phase 4.a (#201): after the abort-site backtrace, render the
+    // error-return trace — the propagation chain captured at the raise origin.
+    // For a cross-function recoverable raise that reached the top unrescued,
+    // this is the c→b→a chain the abort-site backtrace cannot show (those
+    // frames already unwound). No-op for a direct abort (no ERT captured).
+    emitErrorReturnTraceSection();
 
     std.c._exit(1);
 }
@@ -8851,6 +8933,24 @@ pub const Kernel = struct {
     pub fn recoverable_raise(error_box: ProtocolBox) void {
         current_recoverable_raise = error_box;
         current_recoverable_raise_pending = true;
+
+        // Phase 4.a (ERT display / #201): capture the error-return trace HERE,
+        // at the raise origin, while the full c→b→a propagation chain is still
+        // live on the stack. If this raise is later rescued, the handler clears
+        // it (`take_recoverable_raise`); if it propagates unrescued to the
+        // top-level abort, the crash report renders it as the `error return
+        // trace:` section. Allocation-free (fixed-capacity `Backtrace`), so it
+        // adds only a frame-pointer walk on the raise path.
+        //
+        // `skip = 1` drops `captureBacktraceInto` (frame 0 of the walk); the
+        // `Kernel.recoverable_raise` Zap-plumbing frame just below the user's
+        // raising frame is suppressed by NAME in `crashReportFrame`
+        // (`isRaisePlumbingSymbol`), so the rendered trace begins at the user
+        // frame that raised (the `c` in `a→b→c`). Cache the reporter config so
+        // the trace can be symbolized later even though capture is here.
+        zapCrashReporterInit();
+        current_error_return_trace = Backtrace.capture(1);
+        current_error_return_trace_pending = true;
     }
 
     /// True iff a `recoverable_raise` has fired in the dynamic extent of the
@@ -8871,7 +8971,24 @@ pub const Kernel = struct {
         const box = current_recoverable_raise;
         current_recoverable_raise = ProtocolBox.none;
         current_recoverable_raise_pending = false;
+        // Phase 4.a: a rescued raise must NOT leave its error-return trace
+        // behind — a later, unrelated abort would otherwise render this stale
+        // chain. Clear it when the handler consumes the raise.
+        current_error_return_trace_pending = false;
+        current_error_return_trace.len = 0;
         return box;
+    }
+
+    /// Read the pending recoverable-raise `Error` value WITHOUT clearing the
+    /// side-channel or the error-return trace (Phase 4.a). Used ONLY by the
+    /// top-level abort terminus (`Kernel.abort_recoverable_raise`): it needs
+    /// the boxed value for the crash header BUT must leave the ERT intact so
+    /// the crash printer can still render the propagation chain captured at the
+    /// raise origin. The process aborts immediately after, so there is no
+    /// stale-trace concern that would require clearing (the rescue path uses
+    /// `take_recoverable_raise`, which DOES clear).
+    pub fn peek_recoverable_raise() ProtocolBox {
+        return current_recoverable_raise;
     }
 
     // Operator primitives backing the generic `pub fn ==`/`!=`/`<`/`>`/
@@ -19554,4 +19671,64 @@ test "double-fault exit code is a documented distinct sentinel" {
     // sentinel; we pin the exact value so the contract is stable.
     try std.testing.expectEqual(@as(u8, 137), ZAP_DOUBLE_FAULT_EXIT_CODE);
     try std.testing.expect(ZAP_DOUBLE_FAULT_EXIT_CODE != 1);
+}
+
+test "ERT state machine: recoverable_raise captures a trace at the raise origin" {
+    // Reset the side-channel + ERT thread-locals for a deterministic start.
+    current_recoverable_raise = ProtocolBox.none;
+    current_recoverable_raise_pending = false;
+    current_error_return_trace_pending = false;
+    current_error_return_trace.len = 0;
+    defer {
+        current_recoverable_raise = ProtocolBox.none;
+        current_recoverable_raise_pending = false;
+        current_error_return_trace_pending = false;
+        current_error_return_trace.len = 0;
+    }
+
+    // A raise fires: the error box is stashed AND an error-return trace is
+    // captured at this (raise-origin) call site.
+    Kernel.recoverable_raise(ProtocolBox.none);
+    try std.testing.expect(current_recoverable_raise_pending);
+    try std.testing.expect(current_error_return_trace_pending);
+    // The capture must have recorded at least this test frame (allocation-free,
+    // fixed-capacity). Stack tracing is enabled in the test build.
+    if (std.options.allow_stack_tracing) {
+        try std.testing.expect(current_error_return_trace.len > 0);
+    }
+}
+
+test "ERT state machine: a rescued raise (take) clears the trace, peek does not" {
+    current_recoverable_raise = ProtocolBox.none;
+    current_recoverable_raise_pending = false;
+    current_error_return_trace_pending = false;
+    current_error_return_trace.len = 0;
+    defer {
+        current_recoverable_raise = ProtocolBox.none;
+        current_recoverable_raise_pending = false;
+        current_error_return_trace_pending = false;
+        current_error_return_trace.len = 0;
+    }
+
+    // Raise, then PEEK (the abort-terminus path): the ERT must survive so the
+    // crash report can still render the propagation chain.
+    Kernel.recoverable_raise(ProtocolBox.none);
+    _ = Kernel.peek_recoverable_raise();
+    try std.testing.expect(current_error_return_trace_pending);
+
+    // Raise again, then TAKE (the rescue-landing-pad path): the ERT must be
+    // cleared so a later unrelated abort does not render this stale chain.
+    Kernel.recoverable_raise(ProtocolBox.none);
+    try std.testing.expect(current_error_return_trace_pending);
+    _ = Kernel.take_recoverable_raise();
+    try std.testing.expect(!current_error_return_trace_pending);
+    try std.testing.expectEqual(@as(usize, 0), current_error_return_trace.len);
+}
+
+test "ERT plumbing-symbol suppression includes recoverable_raise" {
+    // The error-return trace must begin at the USER frame that raised, not the
+    // `Kernel.recoverable_raise` plumbing frame just below it.
+    try std.testing.expect(isRaisePlumbingSymbol("Kernel.recoverable_raise__1"));
+    // A genuine user frame is NOT suppressed.
+    try std.testing.expect(!isRaisePlumbingSymbol("Chain.c__0"));
 }

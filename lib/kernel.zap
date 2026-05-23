@@ -423,7 +423,7 @@ pub struct Kernel {
     """
 
   pub fn abort_recoverable_raise() -> Never {
-    do_raise(take_recoverable_raise())
+    do_raise(peek_recoverable_raise())
   }
 
   @doc = """
@@ -475,6 +475,23 @@ pub struct Kernel {
 
   pub fn take_recoverable_raise() -> Error {
     :zig.Kernel.take_recoverable_raise()
+  }
+
+  @doc = """
+    Read the pending recoverable-raise `Error` value WITHOUT clearing the
+    side-channel or the captured error-return trace (Phase 4.a, ERT display).
+
+    Used only by `abort_recoverable_raise/0`: the unhandled-`raise` terminus
+    needs the boxed value to render the `** (kind) message` crash header, but
+    must leave the error-return trace — captured at the raise origin in
+    `recoverable_raise/1` — intact so the crash printer can render the c→b→a
+    propagation chain. The process aborts immediately after, so not clearing
+    is safe (the rescue path uses `take_recoverable_raise/0`, which clears).
+    Internal compiler support; not intended for direct use.
+    """
+
+  pub fn peek_recoverable_raise() -> Error {
+    :zig.Kernel.peek_recoverable_raise()
   }
 
   @doc = """
