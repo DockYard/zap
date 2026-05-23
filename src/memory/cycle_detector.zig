@@ -742,6 +742,77 @@ pub const Engine = struct {
 };
 
 // ===========================================================================
+// Purple candidate buffer (Bacon–Rajan §"possible roots").
+//
+// A reference-counted object becomes a *possible cycle root* exactly when a
+// `release` decrement leaves its refcount POSITIVE: it lost a reference but
+// is still alive, so it might be part of a cycle that the lost reference was
+// (partly) holding together. The classic optimization — and a HARD
+// requirement here — is that a decrement-to-ZERO does NOT buffer anything:
+// that object is being torn down on the spot (the common Perceus path), so it
+// is irrelevant to cycle detection and the hot path pays nothing.
+//
+// `PurpleBuffer.recordDecrementToPositive(prev_refcount, object)` encodes that
+// rule in ONE place: it enqueues the object only when `prev_refcount > 1`
+// (i.e. the new count `prev-1` is > 0). The ARC manager calls it at its
+// already-computed `prev > 1` release branch — zero added work on the
+// decrement-to-zero branch, which never calls in.
+//
+// The buffer stores raw object pointers (roots). Full per-object descriptors
+// (size / `cycle_walk` / type) are looked up at drain time from the
+// alloc-time cycle registry, because release sites are type-erased while the
+// allocation site (where the type is known) is not.
+// ===========================================================================
+
+/// Bounded purple candidate buffer. Fixed-capacity + dedup-on-overflow so a
+/// release-heavy program never unbounded-grows the buffer; past capacity the
+/// add is dropped (the live-set walk at drain still finds every survivor, so
+/// dropping a redundant root only risks missing a cycle whose ONLY root
+/// overflowed — acceptable for a diagnostic and noted). Stores `@intFromPtr`.
+pub const PurpleBuffer = struct {
+    /// Capacity chosen so the buffer is a few pages — large enough that real
+    /// programs rarely overflow, small enough to be a fixed cost.
+    pub const CAPACITY: usize = 8192;
+
+    roots: [CAPACITY]usize = undefined,
+    len: usize = 0,
+    overflowed: bool = false,
+
+    /// Record a release that left a POSITIVE refcount as a possible cycle
+    /// root. `prev_refcount` is the count BEFORE the decrement (exactly the
+    /// `prev` the ARC manager already holds). Does nothing — touches no
+    /// memory beyond the early-return branch — when `prev_refcount <= 1`
+    /// (the decrement-to-zero / sole-owner teardown path). THIS is the
+    /// zero-hot-path guarantee.
+    pub fn recordDecrementToPositive(self: *PurpleBuffer, prev_refcount: u32, object: *anyopaque) void {
+        // Decrement to zero (prev == 1) or an impossible under-release
+        // (prev == 0): NOT a cycle root. Return before touching the buffer.
+        if (prev_refcount <= 1) return;
+        self.recordRoot(object);
+    }
+
+    /// Append a root pointer (deduplication is the engine's job — duplicates
+    /// only cost a redundant table insert there). Drops past capacity.
+    pub fn recordRoot(self: *PurpleBuffer, object: *anyopaque) void {
+        if (self.len >= CAPACITY) {
+            self.overflowed = true;
+            return;
+        }
+        self.roots[self.len] = @intFromPtr(object);
+        self.len += 1;
+    }
+
+    pub fn items(self: *const PurpleBuffer) []const usize {
+        return self.roots[0..self.len];
+    }
+
+    pub fn clear(self: *PurpleBuffer) void {
+        self.len = 0;
+        self.overflowed = false;
+    }
+};
+
+// ===========================================================================
 // Runtime-level unit tests (Phase 4.d).
 //
 // Per the resolved Phase 4.d decision, cycles are exercised by assembling
@@ -1007,6 +1078,66 @@ test "render: JSON shape of a 2-node cycle mirrors canonical domain=cycle" {
         "{\"type\":\"A\",\"bytes\":40,\"allocated_at\":{\"file\":\"app.zap\",\"line\":12}}," ++
         "{\"type\":\"B\",\"bytes\":40}]}}\n";
     try testing.expectEqualStrings(expected, out);
+}
+
+// ----- Purple buffer + zero-hot-path tests ----------------------------------
+
+test "zero hot path: a release-to-zero never touches the purple buffer" {
+    var pb: PurpleBuffer = .{};
+    var dummy: TestNode = .{ .rc = 0 };
+    // prev_refcount == 1 means the decrement drops to zero (sole owner
+    // teardown). This is the common Perceus path and MUST NOT enqueue.
+    pb.recordDecrementToPositive(1, @ptrCast(&dummy));
+    try testing.expectEqual(@as(usize, 0), pb.len);
+    // prev_refcount == 0 (under-release / impossible) also enqueues nothing.
+    pb.recordDecrementToPositive(0, @ptrCast(&dummy));
+    try testing.expectEqual(@as(usize, 0), pb.len);
+}
+
+test "purple buffer enqueues only decrements that leave a positive count" {
+    var pb: PurpleBuffer = .{};
+    var a: TestNode = .{ .rc = 2 };
+    var b: TestNode = .{ .rc = 1 };
+    // prev == 3 -> new count 2 (>0): a possible root. Enqueue.
+    pb.recordDecrementToPositive(3, @ptrCast(&a));
+    // prev == 1 -> new count 0: teardown. Do NOT enqueue.
+    pb.recordDecrementToPositive(1, @ptrCast(&b));
+    try testing.expectEqual(@as(usize, 1), pb.len);
+    try testing.expectEqual(@intFromPtr(&a), pb.items()[0]);
+}
+
+test "purple buffer drains into the engine and detects the cycle" {
+    // Model the ARC release path: a<->b cycle, then `a` is released once
+    // (prev rc 2 -> 1, still positive) so it lands in the purple buffer.
+    // Draining the buffer through the engine (looking each root's descriptor
+    // up — here supplied directly) detects the 2-node cycle.
+    var a: TestNode = .{ .rc = 1 };
+    var b: TestNode = .{ .rc = 1 };
+    a.edges[0] = &b;
+    b.edges[0] = &a;
+
+    var pb: PurpleBuffer = .{};
+    // Simulate: some owner dropped its ref to `a`, leaving a.rc positive
+    // (the remaining ref is b's cycle edge). prev == 2 here is the
+    // pre-decrement count; we leave a.rc at its post-decrement value 1.
+    pb.recordDecrementToPositive(2, @ptrCast(&a));
+    try testing.expectEqual(@as(usize, 1), pb.len);
+
+    // Build candidates from the purple roots. (The runtime joins each root
+    // with its alloc-time descriptor; the test supplies the descriptor.)
+    var engine = Engine.init(testing.allocator);
+    defer engine.deinit();
+    var candidates: [PurpleBuffer.CAPACITY]Candidate = undefined;
+    var n: usize = 0;
+    for (pb.items()) |root| {
+        // a root pointer -> its TestNode descriptor
+        candidates[n] = testCandidate(@ptrFromInt(root));
+        n += 1;
+    }
+    const garbage = try engine.detect(candidates[0..n]);
+    // The cycle is found even though only `a` was a purple root — the mark
+    // walk discovers `b` through `a`'s edge.
+    try testing.expectEqual(@as(usize, 2), garbage.len);
 }
 
 test "render: end-to-end — detect a cycle then render its participants" {

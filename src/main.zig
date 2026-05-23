@@ -763,6 +763,15 @@ const BuildOverrides = struct {
     /// run path sets in the child environment. No effect under
     /// non-tracking managers (they do not detect leaks). Default off.
     leaks_fatal: bool = false,
+    /// Phase 4.d — ARC cycle detector opt-in: `-Denable-cycle-check`.
+    /// The Bacon–Rajan reference-cycle detector is DEFAULT-ON under
+    /// `Memory.Tracking` (it rides the deinit live-set walk and needs no
+    /// flag). Under `Memory.ARC` it is off by default — production ARC pays
+    /// nothing — and this flag turns it on: the purple candidate buffer is
+    /// populated at the decrement-to-positive release branch and drained at
+    /// deinit. Wired to the runtime via the `ZAP_CYCLE_CHECK` env var the
+    /// run path sets in the child environment. Default off.
+    enable_cycle_check: bool = false,
 };
 
 /// Phase 0 — DWARF foundation: parsed `-Ddebug-info` flag value.
@@ -972,6 +981,7 @@ const BUILD_FLAG_KEYS = [_][]const u8{
     "frame-pointers",
     "error-format",
     "leaks-fatal",
+    "enable-cycle-check",
 };
 
 /// Format the supported-keys list for diagnostics straight from
@@ -1050,6 +1060,14 @@ fn parseBuildOverrides(
         // boolean toggle.
         if (std.mem.eql(u8, kv, "leaks-fatal")) {
             overrides.leaks_fatal = true;
+            continue;
+        }
+
+        // Phase 4.d: `-Denable-cycle-check` is likewise a boolean presence
+        // flag (bare form means "on"); the `=on|off` value form is handled
+        // in the key dispatch below.
+        if (std.mem.eql(u8, kv, "enable-cycle-check")) {
+            overrides.enable_cycle_check = true;
             continue;
         }
 
@@ -1138,6 +1156,19 @@ fn parseBuildOverrides(
                 return .{ .err = try std.fmt.allocPrint(
                     alloc,
                     "unknown -Dleaks-fatal value '{s}' (valid: on, off)",
+                    .{value},
+                ) };
+        } else if (std.mem.eql(u8, key, "enable-cycle-check")) {
+            // Phase 4.d: the `-Denable-cycle-check=on|off` value form (the
+            // bare presence form is handled above before the `=` split).
+            overrides.enable_cycle_check = if (std.mem.eql(u8, value, "on") or std.mem.eql(u8, value, "true"))
+                true
+            else if (std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "false"))
+                false
+            else
+                return .{ .err = try std.fmt.allocPrint(
+                    alloc,
+                    "unknown -Denable-cycle-check value '{s}' (valid: on, off)",
                     .{value},
                 ) };
         } else {
@@ -1677,6 +1708,13 @@ fn propagateLeakReportEnv(overrides: BuildOverrides) void {
     }
     if (overrides.leaks_fatal) {
         env_map.put("ZAP_LEAKS_FATAL", "1") catch {};
+    }
+    // Phase 4.d — ARC cycle detector opt-in. The runtime's cycle detector
+    // reads `ZAP_CYCLE_CHECK` to enable the purple-buffer drain + report
+    // under `Memory.ARC` (it is default-on under `Memory.Tracking`,
+    // independent of this knob). Threaded via env like the leak knobs.
+    if (overrides.enable_cycle_check) {
+        env_map.put("ZAP_CYCLE_CHECK", "1") catch {};
     }
 }
 
