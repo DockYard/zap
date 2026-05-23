@@ -1033,7 +1033,15 @@ pub const Desugarer = struct {
             .call => |call| {
                 var new_args: std.ArrayList(*const ast.Expr) = .empty;
                 for (call.args) |arg| {
-                    try new_args.append(self.allocator, try self.desugarExpr(arg));
+                    // A function reference passed as a call argument is a
+                    // callable value: eta-expand it into a forwarding
+                    // anonymous function (see `etaExpandFunctionRefArg`).
+                    // Every other argument desugars normally.
+                    if (arg.* == .function_ref) {
+                        try new_args.append(self.allocator, try self.etaExpandFunctionRefArg(arg.function_ref));
+                    } else {
+                        try new_args.append(self.allocator, try self.desugarExpr(arg));
+                    }
                 }
                 const desugared_args = try new_args.toOwnedSlice(self.allocator);
 
@@ -2135,6 +2143,177 @@ pub const Desugarer = struct {
         const args = try self.allocSlice(*const ast.Expr, &.{error_value});
         return try self.create(ast.Expr, .{
             .call = .{ .meta = meta, .callee = callee, .args = args },
+        });
+    }
+
+    // ============================================================
+    // Function-reference → callable closure (eta-expansion)
+    //
+    // A named function reference (`&Struct.fn/n` or bare `&fn/n`) passed as
+    // a call argument denotes a *callable value* — `Enum.map(list, &parse/1)`
+    // is `Enum.map(list, fn(x) { parse(x) })`. Without this rewrite the
+    // reference lowers to the reflective first-class `Function` struct
+    // (`{struct, name, arity}` from `lib/function.zap`), which carries no
+    // function pointer and so cannot be invoked through the `call_closure`
+    // path the higher-order callee uses. Worse, its struct type fails to
+    // unify with the callback's `(a -> b)` parameter ("expects callable,
+    // got Function").
+    //
+    // The fix eta-expands the reference into an anonymous function whose
+    // body forwards to the referenced function:
+    //
+    //   &Struct.fn/2  →  fn(__fnref_arg_0 :: P0, __fnref_arg_1 :: P1) -> R {
+    //                       Struct.fn(__fnref_arg_0, __fnref_arg_1)
+    //                    }
+    //
+    // The synthetic parameter and return type annotations are copied
+    // verbatim from the referenced function's declared clause signature
+    // (resolved through the scope graph the desugarer already holds), so
+    // the closure type-checks exactly like a hand-written one, the
+    // monomorphizer specialises the forwarded call normally, and — crucially
+    // for effect-polymorphism — a `raises` row on the referenced function
+    // flows through the forwarded call into the enclosing function's row,
+    // catchable by a surrounding `try`/`rescue` with NO per-error-type
+    // specialisation of the combinator.
+    //
+    // This rewrite fires only in argument position (a `function_ref` that is
+    // a direct element of a `CallExpr.args`). A reference used reflectively
+    // — returned where the `Function` struct is expected, bound to a
+    // `Function`-typed name — is not a call argument and keeps the struct
+    // shape (the `.function_ref` passthrough below and in `inferExpr`).
+    // ============================================================
+
+    /// Locate the declared `FunctionClause` a function reference resolves to,
+    /// using the scope graph. Mirrors the resolution the type checker and
+    /// HIR builder perform: an explicit `&Struct.fn/n` resolves in the named
+    /// struct's scope; a bare `&fn/n` resolves in the current struct scope
+    /// and then through its imports (auto-imported Kernel included). Returns
+    /// `null` when the target cannot be resolved here (e.g. an external or
+    /// not-yet-collected function) — the caller then leaves the reference
+    /// untouched so the normal pipeline reports any genuine error.
+    fn resolveFunctionRefClause(self: *const Desugarer, fr: ast.FunctionRefExpr) ?ast.FunctionClause {
+        const graph = self.graph orelse return null;
+        const lookup_arity: u32 = fr.arity;
+        const key = scope_mod.FamilyKey{ .name = fr.function, .arity = lookup_arity };
+
+        if (fr.struct_name) |struct_name| {
+            const struct_scope_id = graph.findStructScope(struct_name) orelse return null;
+            const struct_scope = graph.getScope(struct_scope_id);
+            const family_id = struct_scope.function_families.get(key) orelse return null;
+            return clauseFromFamily(graph, family_id);
+        }
+
+        const current_scope_id = self.current_struct_scope orelse return null;
+        const current_scope = graph.getScope(current_scope_id);
+        if (current_scope.function_families.get(key)) |family_id| {
+            return clauseFromFamily(graph, family_id);
+        }
+        for (current_scope.imports.items) |imp| {
+            if (graph.findStructScope(imp.source_struct)) |imp_scope_id| {
+                const imp_scope = graph.getScope(imp_scope_id);
+                if (imp_scope.function_families.get(key)) |family_id| {
+                    if (graph.passesImportFilter(imp.filter, key)) {
+                        return clauseFromFamily(graph, family_id);
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    fn clauseFromFamily(graph: *const scope_mod.ScopeGraph, family_id: scope_mod.FunctionFamilyId) ?ast.FunctionClause {
+        const family = graph.getFamily(family_id);
+        if (family.clauses.items.len == 0) return null;
+        const clause_ref = family.clauses.items[0];
+        if (clause_ref.clause_index >= clause_ref.decl.clauses.len) return null;
+        return clause_ref.decl.clauses[clause_ref.clause_index];
+    }
+
+    /// Eta-expand a function reference used in argument position into an
+    /// anonymous function that forwards to the referenced function. Returns
+    /// the original `function_ref` expression untouched when the referenced
+    /// clause cannot be resolved here (external/uncollected) so the rest of
+    /// the pipeline still sees a well-formed reference.
+    fn etaExpandFunctionRefArg(self: *Desugarer, fr: ast.FunctionRefExpr) !*const ast.Expr {
+        const clause = self.resolveFunctionRefClause(fr) orelse
+            return self.create(ast.Expr, .{ .function_ref = fr });
+
+        const arity: usize = fr.arity;
+        if (clause.params.len < arity) {
+            return self.create(ast.Expr, .{ .function_ref = fr });
+        }
+
+        const meta = fr.meta;
+
+        // Build the synthetic parameter list and the forwarding call's
+        // argument list in lockstep: param `__fnref_arg_i :: <declared Pi>`
+        // and argument `var_ref(__fnref_arg_i)`.
+        const params = try self.allocator.alloc(ast.Param, arity);
+        const forward_args = try self.allocator.alloc(*const ast.Expr, arity);
+        for (0..arity) |idx| {
+            const param_name_text = try std.fmt.allocPrint(self.allocator, "__fnref_arg_{d}", .{idx});
+            const param_name = try self.interner.intern(param_name_text);
+            const bind_pattern = try self.create(ast.Pattern, .{
+                .bind = .{ .meta = meta, .name = param_name },
+            });
+            params[idx] = .{
+                .meta = meta,
+                .pattern = bind_pattern,
+                .type_annotation = clause.params[idx].type_annotation,
+                .ownership = clause.params[idx].ownership,
+                .ownership_explicit = clause.params[idx].ownership_explicit,
+                .default = null,
+            };
+            forward_args[idx] = try self.create(ast.Expr, .{
+                .var_ref = .{ .meta = meta, .name = param_name },
+            });
+        }
+
+        // Reconstruct the forwarding callee exactly as the reference named
+        // it: an explicit struct qualifier becomes
+        // `field_access(struct_ref(Struct), fn)`; a bare reference becomes
+        // `var_ref(fn)` so the `.call` desugar arm's import resolution
+        // qualifies it the same way a hand-written bare call would.
+        const forward_callee = if (fr.struct_name) |struct_name| blk: {
+            const struct_ref = try self.create(ast.Expr, .{
+                .struct_ref = .{ .meta = meta, .name = struct_name },
+            });
+            break :blk try self.create(ast.Expr, .{
+                .field_access = .{ .meta = meta, .object = struct_ref, .field = fr.function },
+            });
+        } else try self.create(ast.Expr, .{
+            .var_ref = .{ .meta = meta, .name = fr.function },
+        });
+
+        const forward_call = try self.create(ast.Expr, .{
+            .call = .{ .meta = meta, .callee = forward_callee, .args = forward_args },
+        });
+
+        const body_stmts = try self.allocSlice(ast.Stmt, &.{.{ .expr = forward_call }});
+        const synthetic_clause = ast.FunctionClause{
+            .meta = meta,
+            .params = params,
+            .return_type = clause.return_type,
+            .refinement = null,
+            .body = body_stmts,
+            .raises = clause.raises,
+        };
+        const decl = try self.create(ast.FunctionDecl, .{
+            .meta = meta,
+            .name = try self.interner.intern("__fnref_eta"),
+            .clauses = try self.allocSlice(ast.FunctionClause, &.{synthetic_clause}),
+            .visibility = .private,
+        });
+
+        // The forwarding body still needs its own desugaring (e.g. bare-call
+        // import qualification). Route it through `desugarFunctionDecl` so
+        // the synthetic anonymous function is indistinguishable from a
+        // user-written one downstream.
+        return self.create(ast.Expr, .{
+            .anonymous_function = .{
+                .meta = meta,
+                .decl = try self.desugarFunctionDecl(decl),
+            },
         });
     }
 
