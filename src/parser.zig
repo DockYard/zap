@@ -3120,10 +3120,46 @@ pub const Parser = struct {
                         .field = field_name,
                     },
                 });
+            } else if (self.check(.left_brace) and !self.disable_trailing_block and calleeAcceptsBareTrailingBlock(expr)) {
+                // Paren-less trailing block: `name { body }` desugars to a
+                // single-argument call `name({ body })`. This is the general
+                // block-passing form (Ruby/Elixir style) that lets a macro
+                // take a block as its sole argument without an empty `()` — it
+                // is what makes Zest's `assert_no_leaks { ... }` /
+                // `assert_no_cycles { ... }` first-class block primitives read
+                // naturally, but it is entirely name-agnostic: ANY bare
+                // identifier or field-access callee in expression position
+                // accepts it. Restricted to identifier-like callees so a
+                // value followed by a block on the next line (e.g. a struct
+                // body) is never silently swallowed, and disabled in guard /
+                // `if`-condition contexts via `disable_trailing_block` exactly
+                // like the parenthesized trailing block above.
+                const block_expr = try self.parseBlockExpr();
+                var block_args: std.ArrayList(*const ast.Expr) = .empty;
+                try block_args.append(self.allocator, block_expr);
+                expr = try self.create(ast.Expr, .{
+                    .call = .{
+                        .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, block_expr.getMeta().span) },
+                        .callee = expr,
+                        .args = try block_args.toOwnedSlice(self.allocator),
+                    },
+                });
             } else break;
         }
 
         return expr;
+    }
+
+    /// Whether `callee` is an identifier-like expression that may take a
+    /// paren-less trailing block (`name { body }`). Only a bare local
+    /// identifier reference or a field-access / struct-ref chain qualifies —
+    /// never a literal, call result, or other value — so a non-callee value
+    /// that happens to be followed by `{` is never misread as a block call.
+    fn calleeAcceptsBareTrailingBlock(callee: *const ast.Expr) bool {
+        return switch (callee.*) {
+            .var_ref, .field_access, .struct_ref => true,
+            else => false,
+        };
     }
 
     fn parsePrimaryExpr(self: *Parser) !*const ast.Expr {

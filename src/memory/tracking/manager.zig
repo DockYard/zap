@@ -606,6 +606,34 @@ fn trackingIsPointerLive(ctx: *anyopaque, user_ptr: usize) callconv(.c) bool {
     return tctx.live.contains(user_ptr);
 }
 
+/// Phase 4.e — report the manager's CURRENT live-allocation totals: the
+/// number of un-freed allocations it is tracking and the sum of their
+/// user-visible sizes in bytes. This is the IN-PROCESS leak signal a Zest
+/// `assert_no_leaks { <block> }` assertion checkpoints before and after a
+/// block: the net rise in `out_count` across the block is exactly the set of
+/// allocations the block made and abandoned (a leak), and `out_bytes` gives
+/// the bytes for the failure detail. Distinct from the deinit-time leak
+/// report (which only fires at `core.deinit`): this is queryable at any point
+/// during execution.
+///
+/// Both totals are written through out-pointers (rather than returned) so the
+/// single C-ABI call yields both halves of the checkpoint atomically under one
+/// lock acquisition — the count and bytes are guaranteed to describe the same
+/// instant of the live map. `callconv(.c)` to match the optional
+/// `liveAllocationStats` interface slot the runtime looks up by name.
+fn trackingLiveAllocationStats(ctx: *anyopaque, out_count: *u64, out_bytes: *u64) callconv(.c) void {
+    const tctx: *TrackingContext = @ptrCast(@alignCast(ctx));
+    spinLock(&tctx.spinlock);
+    defer spinUnlock(&tctx.spinlock);
+    var total_bytes: u64 = 0;
+    var iter = tctx.live.valueIterator();
+    while (iter.next()) |record| {
+        total_bytes += record.size;
+    }
+    out_count.* = @intCast(tctx.live.count());
+    out_bytes.* = total_bytes;
+}
+
 /// Install the runtime's leak-report sink (Phase 4.c). Called once at
 /// memory-startup, before any allocation, so every survivor at
 /// `core.deinit` and every canary/invalid-free/mismatch fault routes
@@ -1396,6 +1424,9 @@ pub const getCapabilityDesc = trackingGetCapabilityDesc;
 pub const annotateAllocation = trackingAnnotateAllocation;
 pub const setLeakReportSink = trackingSetLeakReportSink;
 pub const isPointerLive = trackingIsPointerLive;
+// Phase 4.e — the in-process live-allocation checkpoint signal a Zest
+// `assert_no_leaks { <block> }` reads before/after a block.
+pub const liveAllocationStats = trackingLiveAllocationStats;
 
 // ---------------------------------------------------------------------------
 // Uniform-interface alias signature lock

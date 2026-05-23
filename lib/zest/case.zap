@@ -617,6 +617,78 @@ pub struct Zest.Case {
     }
   }
 
+  @doc = """
+    Asserts that a block leaks no memory.
+
+    `assert_no_leaks { <block> }` runs `<block>` and asserts the net number of
+    live (un-freed) heap allocations attributable to it is zero. It samples the
+    active memory manager's live-allocation count immediately before and after
+    the block; a positive delta means the block allocated and abandoned memory,
+    which fails the assertion with the leaked allocation count + bytes as the
+    failure detail (alongside the deinit-time attributed report).
+
+    Requires the test target to select `Memory.Tracking` (the manager that
+    exposes the live-allocation checkpoint). Under any other manager the live
+    set is not observable, so the assertion is a documented no-op that passes.
+
+    ## Examples
+
+        case("builder frees its scratch buffer") {
+          assert_no_leaks {
+            result = Builder.run(input)
+            assert(result == expected)
+          }
+        }
+    """
+
+  pub macro assert_no_leaks(block :: Expr) -> Expr {
+    code = source_text(block)
+    location = source_location(block)
+
+    quote {
+      zest_leak_tracking_active = :zig.Memory.leak_tracking_active()
+      zest_leak_before_count = :zig.Memory.live_allocation_count()
+      zest_leak_before_bytes = :zig.Memory.live_allocation_bytes()
+      unquote(block)
+      zest_leak_after_count = :zig.Memory.live_allocation_count()
+      zest_leak_after_bytes = :zig.Memory.live_allocation_bytes()
+      Zest.Assertion.no_leaks_result(zest_leak_tracking_active, zest_leak_before_count, zest_leak_after_count, zest_leak_before_bytes, zest_leak_after_bytes, unquote(code), unquote(location))
+    }
+  }
+
+  @doc = """
+    Asserts that a block creates no reference cycle.
+
+    `assert_no_cycles { <block> }` runs `<block>`, then drives the runtime
+    Bacon–Rajan trial-deletion cycle detector over the allocations the block
+    left live and asserts none are held alive only by a reference cycle. A
+    detected cycle fails the assertion with the participating-object count +
+    bytes; the full `domain=cycle` retain-path report is rendered alongside.
+
+    Requires `Memory.Tracking` with cycle checking enabled (the runtime cycle
+    scan). Under any other configuration the assertion is a documented no-op
+    that passes.
+
+    Phase-5 caveat: a reference cycle is not constructible from today's fully
+    immutable Zap surface (no field mutation, no `Ref`/`weak`), so on real Zap
+    code this assertion always passes. It is wired to the detector signal now
+    and the detect-and-fail path is unit-verified at the runtime level, ready to
+    catch cycles the moment Phase 5 lands mutation.
+    """
+
+  pub macro assert_no_cycles(block :: Expr) -> Expr {
+    code = source_text(block)
+    location = source_location(block)
+
+    quote {
+      zest_cycle_check_active = :zig.Memory.cycle_check_active()
+      unquote(block)
+      zest_cycle_object_count = :zig.Memory.scan_live_cycles()
+      zest_cycle_bytes = :zig.Memory.last_cycle_scan_bytes()
+      Zest.Assertion.no_cycles_result(zest_cycle_check_active, zest_cycle_object_count, zest_cycle_bytes, unquote(code), unquote(location))
+    }
+  }
+
   macro comparison_operator?(operator_name :: Expr) -> Expr {
     if operator_name == "==" {
       true

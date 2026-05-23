@@ -1156,6 +1156,42 @@ pub const leak_attribution_active: bool = active_manager_source_available and
     @hasDecl(active_manager, "annotateAllocation") and
     @hasDecl(active_manager, "setLeakReportSink");
 
+/// Phase 4.e — comptime-true when the active manager exposes the
+/// `liveAllocationStats` optional interface (the in-process live-allocation
+/// checkpoint). `Memory.Tracking` does; the others do not. Gates the
+/// `:zig.Memory.live_allocation_*` primitives a Zest `assert_no_leaks`
+/// assertion reads, so under a non-tracking manager the whole query folds away
+/// and the assertion becomes a documented no-op (it cannot observe a leak with
+/// no live-set to checkpoint).
+pub const live_allocation_stats_active: bool = leak_attribution_active and
+    @hasDecl(active_manager, "liveAllocationStats");
+
+/// One live-allocation checkpoint: the manager's current count of un-freed
+/// allocations and the sum of their sizes, plus whether the active manager
+/// could answer at all. A Zest `assert_no_leaks` takes one before a block and
+/// one after; the net rise in `count` is the block's leaked-allocation set.
+pub const LiveAllocationStats = struct {
+    count: u64,
+    bytes: u64,
+    /// False under a non-tracking manager (no live-set exists to query): the
+    /// assertion treats this as "leak checking unavailable here" and passes.
+    available: bool,
+};
+
+/// Read the active manager's current live-allocation totals through the
+/// optional `liveAllocationStats` interface. Folds to an unavailable result
+/// under any manager that does not implement it (so a Zest leak assertion
+/// no-ops cleanly off `Memory.Tracking`).
+pub fn liveAllocationStats() LiveAllocationStats {
+    if (comptime !live_allocation_stats_active) {
+        return .{ .count = 0, .bytes = 0, .available = false };
+    }
+    var count: u64 = 0;
+    var bytes: u64 = 0;
+    active_manager.liveAllocationStats(active_manager_state.context.?, &count, &bytes);
+    return .{ .count = count, .bytes = bytes, .available = true };
+}
+
 /// Derive a stable, Zap-facing display name for a heap-allocated type `T`
 /// from its Zig type name, evaluated at comptime so the result is a
 /// `.rodata` string the leak record can borrow for the process lifetime.
@@ -9550,6 +9586,66 @@ fn runCycleDetectionAndReport() void {
     renderCycleReport(&engine, garbage);
 }
 
+// ===========================================================================
+// Phase 4.e — on-demand cycle scan for the Zest `assert_no_cycles { <block> }`
+// primitive.
+//
+// `runCycleDetectionAndReport` above runs ONCE at `core.deinit` and is gated on
+// `ZAP_CYCLE_CHECK` because the deinit-time live-set walk has a deref hazard on
+// partially-torn-down cells (see its doc comment). `scanLiveCyclesAndReport`
+// is the test-time sibling: it runs DURING execution, when every registered
+// cell is fully intact, so the hazard does not apply and it activates whenever
+// the cycle subsystem is compiled in (`cycle_detection_active`, i.e. under
+// `Memory.Tracking`) — no `ZAP_CYCLE_CHECK` opt-in required, because an
+// `assert_no_cycles` block is an explicit request to scan now. It renders the
+// `domain=cycle` report (text or JSON, honoring `ZAP_ERROR_FORMAT`) when a
+// cycle is found — exactly the deinit-time report — and returns the white-set
+// size, caching the matching byte total so the Zest macro reads both halves of
+// one scan.
+// ===========================================================================
+
+/// Bytes held alive by a cycle in the most recent `scanLiveCyclesAndReport`
+/// call (the white-set's total size). Read back by `:zig.Memory`'s
+/// `last_cycle_scan_bytes` so the Zest macro pairs the count and bytes from a
+/// SINGLE scan (re-running detection per getter would double-render the
+/// report).
+var last_live_cycle_scan_bytes: u64 = 0;
+
+/// Run the trial-deletion cycle detector over the CURRENT live registry,
+/// render a `domain=cycle` report for any detected cyclic garbage, and return
+/// the number of objects held alive only by a cycle. Caches the matching byte
+/// total in `last_cycle_scan_bytes`. Returns 0 (and caches 0 bytes) when the
+/// subsystem is not compiled in, nothing is registered, or no cycle is found.
+fn scanLiveCyclesAndReport() u64 {
+    last_live_cycle_scan_bytes = 0;
+    if (comptime !cycle_detection_active) return 0;
+
+    var candidates: std.ArrayListUnmanaged(usize) = .empty;
+    defer candidates.deinit(std.heap.page_allocator);
+    {
+        cycleRegistryLock();
+        defer cycleRegistryUnlock();
+        var it = cycle_registry.map.keyIterator();
+        while (it.next()) |k| candidates.append(std.heap.page_allocator, k.*) catch return 0;
+    }
+    if (candidates.items.len == 0) return 0;
+    std.mem.sort(usize, candidates.items, {}, std.sort.asc(usize));
+
+    var engine: CycleEngine = .{};
+    defer engine.deinit();
+    const garbage = engine.detect(candidates.items);
+    if (engine.oom) return 0;
+    if (garbage.len == 0) return 0;
+
+    var total_bytes: u64 = 0;
+    for (garbage) |key| {
+        if (engine.nodes.get(key)) |st| total_bytes += st.node.size;
+    }
+    last_live_cycle_scan_bytes = total_bytes;
+    renderCycleReport(&engine, garbage);
+    return @intCast(garbage.len);
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2.e — double-fault containment.
 //
@@ -17335,6 +17431,60 @@ pub const Prim = struct {
 pub const Memory = struct {
     pub fn backend(_: anytype) bool {
         return true;
+    }
+
+    /// Phase 4.e — whether the active manager can answer live-allocation
+    /// queries (i.e. is `Memory.Tracking` or another manager that implements
+    /// the `liveAllocationStats` interface). Zest's `assert_no_leaks` reads
+    /// this to decide whether it can observe leaks at all: under a non-tracking
+    /// manager there is no live-set to checkpoint, so the assertion no-ops.
+    pub fn leak_tracking_active() bool {
+        return liveAllocationStats().available;
+    }
+
+    /// Phase 4.e — the active manager's CURRENT count of un-freed allocations.
+    /// A Zest `assert_no_leaks { <block> }` samples this immediately before and
+    /// after the block; the difference is the number of allocations the block
+    /// made and abandoned. Returns 0 under a non-tracking manager (paired with
+    /// `leak_tracking_active() == false`, which tells the assertion to no-op).
+    pub fn live_allocation_count() i64 {
+        return @intCast(liveAllocationStats().count);
+    }
+
+    /// Phase 4.e — the sum of the sizes (bytes) of all currently-live
+    /// allocations. Sampled before/after a block by `assert_no_leaks` so the
+    /// failure report can state how many bytes leaked. Returns 0 under a
+    /// non-tracking manager.
+    pub fn live_allocation_bytes() i64 {
+        return @intCast(liveAllocationStats().bytes);
+    }
+
+    /// Phase 4.e — whether the reference-cycle detector is compiled into this
+    /// binary (true under `Memory.Tracking`). Zest's `assert_no_cycles` reads
+    /// this to decide whether it can observe cycles; under any other manager
+    /// the assertion no-ops. Unlike the deinit-time auto-scan, the on-demand
+    /// `assert_no_cycles` scan needs no `ZAP_CYCLE_CHECK` opt-in — it runs while
+    /// cells are intact — so this reflects only the comptime subsystem gate.
+    pub fn cycle_check_active() bool {
+        return cycle_detection_active;
+    }
+
+    /// Phase 4.e — run the trial-deletion cycle detector over the CURRENT live
+    /// allocations, render a `domain=cycle` report for any detected cyclic
+    /// garbage, and return the number of objects held alive only by a cycle.
+    /// Called by `assert_no_cycles { <block> }` right after the block. Pairs
+    /// with `last_cycle_scan_bytes` (which reads the byte total from this same
+    /// scan). Returns 0 when nothing is registered or no cycle exists.
+    pub fn scan_live_cycles() i64 {
+        return @intCast(scanLiveCyclesAndReport());
+    }
+
+    /// Phase 4.e — the bytes held alive by a cycle in the most recent
+    /// `scan_live_cycles` call. Read by `assert_no_cycles` so the count and
+    /// bytes come from ONE scan (re-running detection per getter would
+    /// double-render the report).
+    pub fn last_cycle_scan_bytes() i64 {
+        return @intCast(last_live_cycle_scan_bytes);
     }
 };
 
