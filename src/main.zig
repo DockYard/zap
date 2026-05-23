@@ -12,6 +12,16 @@ const env = zap.env;
 
 /// Global Io instance for main thread operations.
 var global_io: Io = std.Options.debug_io;
+
+/// The live process environment map, captured from `std.process.Init` at
+/// startup. Phase 4.c uses it as the seam to thread the runtime leak-report
+/// knobs (`ZAP_ERROR_FORMAT` / `ZAP_LEAKS_FATAL`) into a child binary `zap
+/// run` spawns: `propagateLeakReportEnv` `.put()`s into this map and
+/// `runBinary` passes it as the child's `environ_map`. Null until `main`
+/// binds it (host tests that call helpers without going through `main` keep
+/// the inherited-environment behavior).
+var global_env_map: ?*std.process.Environ.Map = null;
+
 var manifest_daemon_request_counter: u64 = 0;
 
 extern "c" fn mkfifo(pathname: [*:0]const u8, mode: std.c.mode_t) c_int;
@@ -95,6 +105,10 @@ extern "c" fn zap_fork_run_subtool(
 pub fn main(init: std.process.Init) !void {
     // Use Io and allocator from Init — no manual setup needed.
     global_io = init.io;
+    // Phase 4.c: capture the live env map so `zap run` can thread the
+    // leak-report knobs into the child binary it spawns (see
+    // `propagateLeakReportEnv` / `runBinary`).
+    global_env_map = init.environ_map;
     const allocator = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
@@ -388,6 +402,11 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var parsed = try parseTargetArgs(allocator, args);
     defer parsed.deinit(allocator);
 
+    // Phase 4.c: thread the leak-report knobs to the runtime of the program
+    // we will run (same seam as the script path) — the spawned binary
+    // inherits this process's `ZAP_ERROR_FORMAT` / `ZAP_LEAKS_FATAL`.
+    propagateLeakReportEnv(parsed.build_overrides);
+
     const target = parsed.target orelse "default";
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
@@ -423,7 +442,7 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     // Normal run: build, run, exit with the binary's exit code
-    const exit_code = compiler.runBinary(allocator, global_io, artifact.path, parsed.run_args) catch |err| {
+    const exit_code = compiler.runBinaryWithEnv(allocator, global_io, artifact.path, parsed.run_args, global_env_map) catch |err| {
         std.debug.print("Error running program: {}\n", .{err});
         std.process.exit(1);
     };
@@ -730,7 +749,20 @@ const BuildOverrides = struct {
     /// is the human renderer; `json` emits the stable LSP-projectable
     /// canonical Error IR schema on stdout for LSP / CI / `zap fix`.
     /// Null leaves the default (`text`).
+    ///
+    /// Phase 4.c also threads this to the RUNTIME leak reporter: when a
+    /// run target uses `Memory.Tracking`, `-Derror-format=json` makes the
+    /// deinit-time leak report emit its machine-readable projection
+    /// (the runtime reads `ZAP_ERROR_FORMAT`, which the run path sets in
+    /// the child environment from this field).
     error_format: ?zap.diagnostics.OutputFormat = null,
+    /// Phase 4.c — leak subsystem CI mode: `-Dleaks-fatal`. Under
+    /// `Memory.Tracking`, any surviving leak at program exit forces a
+    /// non-zero process exit (distinct code `7`) so a CI run fails on a
+    /// leak. Wired to the runtime via the `ZAP_LEAKS_FATAL` env var the
+    /// run path sets in the child environment. No effect under
+    /// non-tracking managers (they do not detect leaks). Default off.
+    leaks_fatal: bool = false,
 };
 
 /// Phase 0 — DWARF foundation: parsed `-Ddebug-info` flag value.
@@ -939,6 +971,7 @@ const BUILD_FLAG_KEYS = [_][]const u8{
     "debug-info",
     "frame-pointers",
     "error-format",
+    "leaks-fatal",
 };
 
 /// Format the supported-keys list for diagnostics straight from
@@ -1007,6 +1040,19 @@ fn parseBuildOverrides(
         i += 1;
 
         const kv = a[2..];
+
+        // Phase 4.c: `-Dleaks-fatal` is a boolean *presence* flag — the CI
+        // spelling the brief calls `--leaks-fatal`. A bare `-Dleaks-fatal`
+        // (no `=value`) means "on"; the `-Dleaks-fatal=on|off|true|false`
+        // value form is also accepted (handled in the key dispatch below).
+        // Allowing the valueless form is the one deliberate exception to the
+        // otherwise-mandatory `-D<key>=<value>` syntax, and only for this
+        // boolean toggle.
+        if (std.mem.eql(u8, kv, "leaks-fatal")) {
+            overrides.leaks_fatal = true;
+            continue;
+        }
+
         const eq = std.mem.indexOfScalar(u8, kv, '=') orelse {
             return .{ .err = try std.fmt.allocPrint(
                 alloc,
@@ -1078,6 +1124,20 @@ fn parseBuildOverrides(
                 return .{ .err = try std.fmt.allocPrint(
                     alloc,
                     "unknown -Derror-format value '{s}' (valid: text, json)",
+                    .{value},
+                ) };
+        } else if (std.mem.eql(u8, key, "leaks-fatal")) {
+            // Phase 4.c: the `-Dleaks-fatal=on|off` value form (the bare
+            // `-Dleaks-fatal` presence form is handled above before the
+            // `=` split).
+            overrides.leaks_fatal = if (std.mem.eql(u8, value, "on") or std.mem.eql(u8, value, "true"))
+                true
+            else if (std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "false"))
+                false
+            else
+                return .{ .err = try std.fmt.allocPrint(
+                    alloc,
+                    "unknown -Dleaks-fatal value '{s}' (valid: on, off)",
                     .{value},
                 ) };
         } else {
@@ -1269,6 +1329,14 @@ fn cmdRunScript(
         .format = overrides.error_format orelse .text,
         .tier = zap.error_format.defaultTierForMode(optimizeModeForOverride(overrides.optimize)),
     });
+
+    // Phase 4.c: thread the leak-report knobs to the RUNTIME of the program
+    // we are about to compile + run. The runtime's deinit-time leak reporter
+    // (active under `Memory.Tracking`) reads `ZAP_ERROR_FORMAT` /
+    // `ZAP_LEAKS_FATAL`; set them in THIS process's environment now so the
+    // child binary `runBinary` spawns inherits them. Set before any compile
+    // or run work so the eventual spawn always sees them.
+    propagateLeakReportEnv(overrides);
 
     // Script mode is single-file with no dependency graph, so a
     // `-Dmemory=` value MUST be a stdlib manager — reject third-party
@@ -1584,6 +1652,34 @@ fn cmdRunScript(
 /// ⇒ runnable; a foreign `arch-os-abi` triple ⇒ report + exit 0,
 /// exactly as `zap build -Dtarget=<foreign>` and Phase 4 established —
 /// unchanged whether the artifact was just built or served from cache).
+/// Phase 4.c — propagate the leak-report knobs (`-Derror-format=json`,
+/// `-Dleaks-fatal`) into THIS process's environment so the child binary that
+/// `runBinary` spawns inherits them. The runtime's deinit-time leak reporter
+/// (active only under `Memory.Tracking`) reads `ZAP_ERROR_FORMAT` /
+/// `ZAP_LEAKS_FATAL`; threading them via env is the seam that does not
+/// require widening `runBinary`'s signature (it inherits the parent
+/// environment). A no-op when neither knob is set, so a normal run touches
+/// no environment. `setenv` failures are non-fatal — the report simply falls
+/// back to its text/non-fatal default.
+fn propagateLeakReportEnv(overrides: BuildOverrides) void {
+    // Put the knobs into the live process env map captured at startup; the
+    // child binary `runBinary` spawns is given this exact map as its
+    // `environ_map`, so it observes the keys. Mutating the `std`-managed env
+    // map (rather than libc `setenv`) is portable and is the same map the
+    // spawn path consumes — no reliance on a captured `std.os.environ`
+    // snapshot. `.put` failures are non-fatal: the report falls back to its
+    // text / non-fatal default.
+    const env_map = global_env_map orelse return;
+    if (overrides.error_format) |fmt| {
+        if (fmt == .json) {
+            env_map.put("ZAP_ERROR_FORMAT", "json") catch {};
+        }
+    }
+    if (overrides.leaks_fatal) {
+        env_map.put("ZAP_LEAKS_FATAL", "1") catch {};
+    }
+}
+
 fn runScriptArtifactAndExit(
     allocator: std.mem.Allocator,
     target: ?[]const u8,
@@ -1611,7 +1707,7 @@ fn runScriptArtifactAndExit(
     // Run the produced binary, forwarding the script's args to
     // `main/1` (OS argv → `[String]`), and propagate its exit code —
     // mirrors the manifest run path exactly (reuses `runBinary`).
-    const exit_code = compiler.runBinary(allocator, global_io, binary_path, forwarded_args) catch |err| {
+    const exit_code = compiler.runBinaryWithEnv(allocator, global_io, binary_path, forwarded_args, global_env_map) catch |err| {
         std.debug.print("Error running script: {}\n", .{err});
         std.process.exit(1);
     };
@@ -1700,7 +1796,7 @@ fn runPipelineArtifactAndExit(
     switch (mode) {
         .tests => std.debug.print("Running tests\n", .{}),
     }
-    const exit_code = compiler.runBinary(allocator, global_io, artifact.path, run_args) catch |err| {
+    const exit_code = compiler.runBinaryWithEnv(allocator, global_io, artifact.path, run_args, global_env_map) catch |err| {
         switch (mode) {
             .tests => std.debug.print("Error running tests: {}\n", .{err}),
         }
@@ -1862,7 +1958,7 @@ fn cmdDoc(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     }
 
-    const exit_code = compiler.runBinary(allocator, global_io, artifact.path, parsed.run_args) catch |err| {
+    const exit_code = compiler.runBinaryWithEnv(allocator, global_io, artifact.path, parsed.run_args, global_env_map) catch |err| {
         std.debug.print("Error running doc generator: {}\n", .{err});
         std.process.exit(1);
     };
@@ -7409,7 +7505,7 @@ fn runWatchBuiltArtifact(
         std.debug.print("Running tests\n", .{});
     }
 
-    const exit_code = compiler.runBinary(allocator, global_io, artifact_path, run_args) catch |err| {
+    const exit_code = compiler.runBinaryWithEnv(allocator, global_io, artifact_path, run_args, global_env_map) catch |err| {
         switch (run_mode) {
             .tests => std.debug.print("Error running tests: {}\n", .{err}),
             .program => std.debug.print("Error running program: {}\n", .{err}),

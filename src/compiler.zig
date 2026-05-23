@@ -9770,6 +9770,20 @@ test "incremental frontend invalidates cached state when policy identity changes
 
 /// Run a compiled binary by name from zap-out/bin/.
 pub fn runBinary(allocator: std.mem.Allocator, pio: std.Io, bin_path: []const u8, program_args: []const []const u8) !u8 {
+    return runBinaryWithEnv(allocator, pio, bin_path, program_args, null);
+}
+
+/// `runBinary` variant that lets the caller replace the child's environment.
+/// Phase 4.c: `zap run` passes the (mutated) process env map so the leak-
+/// report knobs (`ZAP_ERROR_FORMAT` / `ZAP_LEAKS_FATAL`) reach the child;
+/// `null` inherits the parent environment unchanged (every other caller).
+pub fn runBinaryWithEnv(
+    allocator: std.mem.Allocator,
+    pio: std.Io,
+    bin_path: []const u8,
+    program_args: []const []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+) !u8 {
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, bin_path);
@@ -9782,6 +9796,7 @@ pub fn runBinary(allocator: std.mem.Allocator, pio: std.Io, bin_path: []const u8
         .stderr = .inherit,
         .stdout = .inherit,
         .stdin = .inherit,
+        .environ_map = environ_map,
     });
     const term = try child.wait(pio);
 
