@@ -774,6 +774,40 @@ acceptance test (Part VIII).
 - Optional `on_panic(report)` hook for OpenTelemetry/Sentry-style crash upload.
 - WASM exception-handling integration when the upstream proposal stabilizes.
 
+#### Phase 5 ↔ Phase 4.d — reference cycles are not user-constructible yet; the detector is preemptive infra
+
+The Bacon–Rajan synchronous trial-deletion **cycle DETECTOR** shipped in Phase 4.d
+(`src/memory/cycle_detector.zig` — the algorithm + `domain=cycle` report reference, with the
+production integration mirrored in `src/runtime.zig`). It is **diagnostic-only**: it REPORTS a
+detected cycle and does NOT free it — freeing requires breaking an edge, which is the
+`weak`/`unowned` **FIX** owned by this Phase 5.
+
+Crucially, **a reference cycle CANNOT be constructed from today's fully-immutable Zap.** There is
+no field-mutation operator, no `Ref`/`Cell`/`Atom` mutable primitive, and functional update
+(`%R{r | f: v}`) always creates a NEW value — so every `%Node{next: Some(other)}` requires `other`
+to already exist, and allocations only ever point at strictly-older allocations. The back-edge that
+would close a loop can never be formed. (The `CycleA`/`CycleB` types in `test/struct_test.zap` are a
+*type-level* mutually-referencing SCC, constructed acyclically with `back: nil`.)
+
+Consequences, and what Phase 5 unblocks:
+
+- The detector is therefore **preemptive infrastructure**, built and tested NOW via runtime-level
+  Zig unit tests that assemble cyclic `ArcHeader`-style object graphs directly (no throwaway
+  language primitive) — `src/memory/cycle_detector.zig` pins 2-node/self/3-node detection, the
+  acyclic / externally-referenced / mixed false-positive controls, the zero-hot-path purple-buffer
+  rule, and the exact `domain=cycle` text + JSON shape.
+- **Phase 5 must add: (a)** the mutation / `Ref` / recursive-binding capability that lets a user
+  build a cycle in the first place, and **(b)** `weak`/`unowned` as the cycle FIX (break the strong
+  edge so the cycle reclaims). Once (a) lands, the detector immediately has real cycles to find;
+  once (b) lands, the report can graduate from diagnostic to a reclamation hint.
+- **Activation today:** the detector is DEFAULT-OFF under `Memory.ARC` (production pays nothing) and
+  opt-in via `-Denable-cycle-check` / `ZAP_CYCLE_CHECK` even under `Memory.Tracking`. The Tracking
+  deinit-time auto-walk over the live-set is the remaining surface to mature in Phase 5: a *safe*
+  universal heap walk wants the compiler to mark which allocations are cycle-capable Zap aggregates
+  (the same type machinery the mutation/`weak` work introduces), and the walk must follow a
+  `ProtocolBox`'s vtable-typed inner only once typed back-edges exist. Until then the walk treats a
+  `ProtocolBox` as a cycle leaf and dereferences only manager-confirmed-live cells.
+
 ### Must-not-skip-for-production
 
 Error-source chaining; numeric error codes from day one; async-signal-safe crash printer;
