@@ -4569,6 +4569,26 @@ pub const ArcRuntime = struct {
             }
             return;
         }
+        // Phase 4.c box-in-struct fix — deep-walk owned ARC children
+        // BEFORE freeing the cell. The matching `allocAny` heap-promoted
+        // this `T` through `core.allocate`, and `T` may transitively OWN
+        // further heap-promoted children (a `ProtocolBox` in an
+        // `Option(Error)` field, an indirect-storage recursive field).
+        // Under REFCOUNT_V1 those children are reclaimed by the manager's
+        // `release_sized` deep-walk callback (`DeepWalkFnFor(T)`); under
+        // no-REFCOUNT_V1 there is no such callback, so the runtime must
+        // run the SAME comptime field-walk here. Without it the children
+        // are orphaned — the box-in-struct leak under `Memory.Tracking`
+        // (a `%Outer{cause: Some(%Inner{})}` frees the `Outer` cell but
+        // leaks the boxed `%Inner{}`). The walk recurses through
+        // `releaseChildrenAny` → `releaseProtocolBoxValue` → the box's
+        // `drop` adapter → `releaseAny(inner)` → this same path, so the
+        // entire owned subtree is reclaimed exactly once. Children are
+        // released first (spec §8.2 ordering: they observe a still-valid
+        // parent). Elided at comptime for types with no ARC children.
+        if (comptime typeHasArcChildren(T)) {
+            releaseChildrenAny(T, allocator, @constCast(ptr).*);
+        }
         // Generic Arc(T) raw allocation: the matching `allocAny` call
         // routed through `core.allocate(size, alignment)`; mirror that
         // through `core.deallocate(ptr, size, alignment)` so tracking

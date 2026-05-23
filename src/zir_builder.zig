@@ -1033,6 +1033,12 @@ pub const ZirDriver = struct {
         // (spec §8.5). The skip is unconditional in that mode — escape
         // analysis and the ARC-managed-locals invariant only matter
         // when refcount ops are being emitted in the first place.
+        //
+        // Phase 4.c box-in-struct fix: the `.release` ZIR handler makes a
+        // SEPARATE, type-aware decision for the no-REFCOUNT_V1 deep-walk
+        // case (via `ir.Release.deep_walk_owned_heap_child`); see the
+        // handler. This predicate stays unconditional so retain sites and
+        // the rest of the elision logic are unaffected.
         if (!elision.shouldEmitRefcountOps(self.declared_caps)) return true;
 
         // ARC-managed types live on heap pools and must always
@@ -8741,7 +8747,31 @@ pub const ZirDriver = struct {
                     return;
                 }
 
-                if (!self.shouldSkipArc(rel.value)) {
+                // Phase 4.c box-in-struct fix: under a no-REFCOUNT_V1
+                // manager (`Memory.Tracking`), `shouldSkipArc` elides ALL
+                // refcount releases — correct for a refcount decrement,
+                // but a by-VALUE aggregate that transitively OWNS a heap-
+                // promoted ARC child (a `ProtocolBox` in an `Option(Error)`
+                // / struct field, an indirect-storage recursive field)
+                // still needs its scope-exit release EMITTED so the
+                // runtime's `releaseAny` → `releaseChildrenAny` deep-walk
+                // reclaims that child via `core.deallocate` (the child went
+                // through `core.allocate` on the no-REFCOUNT_V1 `allocAny`
+                // path). Without it the child leaks under `Memory.Tracking`
+                // even though it is correctly freed under `Memory.ARC`
+                // (whose release is not elided). This is EXACTLY the release
+                // ARC would emit — the IR is cap-independent, only the ZIR
+                // elision differs — so it cannot introduce a double-free
+                // that ARC does not already have: a box consumed into the
+                // container had its own `.protocol_box_drop` suppressed by
+                // the ownership-transfer analysis (the container is the sole
+                // owner at scope exit). For the aggregate the runtime takes
+                // the `isByValueAggregate` deep-walk branch (frees owned
+                // children, never the stack value), so emitting it is safe.
+                const emit_deep_walk_under_no_refcount = !self.shouldEmitRefcountOps() and
+                    rel.kind == .release and
+                    self.arc_managed_locals.contains(rel.value);
+                if (!self.shouldSkipArc(rel.value) or emit_deep_walk_under_no_refcount) {
                     // Phase 2 Class B: dispatch on the IR-level kind
                     // enum so callers control deep vs shallow free
                     // semantics rather than every release-emission
