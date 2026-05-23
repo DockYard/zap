@@ -17,7 +17,10 @@
 
   * `Z1xxx` — runtime / general failures (this band is the stdlib's).
   * `Z2xxx` — type-system / contract failures (reserved for the stdlib).
-  * `Z3xxx` and up — available for user-defined `pub error` types.
+  * `Z3xxx`..`Z8xxx` — available for user-defined `pub error` types.
+  * `Z9xxx` — internal compiler errors (ICE). Reserved for the compiler:
+    a `Z9xxx` code always means a compiler bug, never a fault in the
+    user's program. See `src/diagnostics.zig` `ICE_CODE_PREFIX`.
 
   Codes are append-only public API: once assigned, a code keeps its
   meaning forever and is never reused for a different error. The compiler
@@ -84,6 +87,49 @@
     items[5]
   fix: Check the index against the collection length first, or use a
     safe accessor that returns `Option(t)` instead of trapping.
+
+  [Z2001]
+  title: Type mismatch — two-sided expected/got
+  explanation: A value's type does not match the type required at its use
+    site. Zap renders BOTH sides: the primary caret marks the offending
+    expression (the "got" type), and a `= note:` line points at where the
+    EXPECTED type came from — a return-type annotation or a parameter
+    declaration. The structured `expected_type` / `got_type` ride in the
+    JSON `machine_data` for tooling. This is the two-sided type error from
+    the error-system design (TypeProvenance): you see not just what was
+    wrong but why the compiler expected what it did.
+  repro: pub struct Demo {
+      pub fn takes_int(x :: i64) -> i64 { x }
+      pub fn caller() -> i64 { Demo.takes_int("hello") }
+    }
+  fix: Convert the value to the expected type, or change the annotation
+    that establishes the expectation (the one the `= note:` line points
+    at) if the call site is the intended contract.
+
+  [Z9100]
+  title: Internal compiler error — script code-generation / link failed
+  explanation: An INTERNAL failure (not a fault in your program) occurred
+    while generating code or linking the binary for a `zap run` script.
+    Nothing internal escapes as a bare string: the compiler reports this
+    structured ICE with the failing pass and a stable code. A `Z9xxx`
+    code always means a compiler bug — your source is not at fault.
+  repro: # Not user-reproducible by design — this fires only on an
+    # internal failure such as an out-of-memory condition or an
+    # unexpected backend state during a `zap run <script>` compile.
+  fix: This is a compiler bug. Please file a report with the smallest
+    `.zap` script that triggers it and the full diagnostic (including the
+    `Z9100` code) so the failing pass can be reproduced and fixed.
+
+  [Z9101]
+  title: Internal compiler error — project code-generation / link failed
+  explanation: As `Z9100`, but for a manifest/project build (`zap build`)
+    rather than a single-file script. An internal failure occurred while
+    generating code or linking the project's binary. The user's program
+    is not at fault; the structured ICE names the failing pass.
+  repro: # Not user-reproducible by design — fires on an internal failure
+    # during a `zap build` code-generation / link step.
+  fix: This is a compiler bug. File a report with a minimal project that
+    reproduces it and the full diagnostic (including the `Z9101` code).
   """
 
 @doc = """

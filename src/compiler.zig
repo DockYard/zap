@@ -3988,6 +3988,7 @@ const Pipeline = struct {
                 .secondary_spans = type_err.secondary_spans,
                 .related_spans = type_err.related_spans,
                 .machine_data = type_err.machine_data,
+                .fixits = type_err.fixits,
             }) catch {};
         }
     }
@@ -5082,6 +5083,7 @@ fn compileStagedStructHir(
             .secondary_spans = type_err.secondary_spans,
             .related_spans = type_err.related_spans,
             .machine_data = type_err.machine_data,
+            .fixits = type_err.fixits,
         }) catch {};
     }
     if (diag_engine.errorCount() > error_baseline) return error.TypeCheckFailed;
@@ -9528,6 +9530,7 @@ fn emitParseErrorsFromUnits(
     for (parse_errors) |parse_err| {
         engine.reportDiagnostic(.{
             .severity = .@"error",
+            .domain = .parse,
             .message = parse_err.message,
             .span = parse_err.span,
             .label = parse_err.label,
@@ -9535,6 +9538,23 @@ fn emitParseErrorsFromUnits(
         }) catch {};
     }
     emitDiagnostics(&engine, alloc);
+}
+
+/// Route a single-file's parser errors through the UNIFIED diagnostic path
+/// (Phase 4.b). The script-mode entry point parsed its file with its own
+/// `Parser` and previously printed the errors with a bare `std.debug.print`
+/// minimal printer that bypassed the renderer and `--error-format=json`. This
+/// public wrapper lets that path emit through the same renderer / JSON every
+/// other compile diagnostic uses, with `domain=parse`. `file_path` + `source`
+/// give the renderer the source context for carets and the footer location.
+pub fn emitScriptParseErrors(
+    alloc: std.mem.Allocator,
+    parse_errors: []const zap.Parser.Error,
+    file_path: []const u8,
+    source: []const u8,
+) void {
+    const units = [_]SourceUnit{.{ .file_path = file_path, .source = source }};
+    emitParseErrorsFromUnits(alloc, parse_errors, &units, zap.diagnostics.detectColor());
 }
 
 fn setDiagnosticSources(engine: *zap.DiagnosticEngine, source_units: []const SourceUnit) void {
@@ -9614,6 +9634,40 @@ fn emitDiagnostics(diag_engine: *zap.DiagnosticEngine, alloc: std.mem.Allocator)
             writeStdoutAll("\n");
         },
     }
+}
+
+/// Route an internal compiler error (ICE) through the unified diagnostic path
+/// (Phase 4.b). Nothing internal ever escapes as a bare string: a backend
+/// failure, an OOM in a pass, or an unreachable compiler state is lowered into
+/// a structured `domain=ice` diagnostic — failing `pass` + stable `code` +
+/// "this is a compiler bug, please report" footer — and rendered through the
+/// SAME text/JSON path every other diagnostic uses, honoring `--error-format`.
+/// The caller decides what to do next (typically `std.process.exit(1)`); this
+/// only emits. `code` is a stable `Z9xxx` band identifier (see
+/// `diagnostics.ICE_CODE_PREFIX`).
+pub fn emitIce(alloc: std.mem.Allocator, pass: []const u8, code: []const u8, message: []const u8) void {
+    var engine = zap.DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.use_color = zap.diagnostics.detectColor();
+    engine.reportDiagnostic(zap.diagnostics.iceDiagnostic(pass, code, message)) catch return;
+    emitDiagnostics(&engine, alloc);
+}
+
+/// Map an internal error value to a structured ICE and emit it (Phase 4.b).
+/// Convenience wrapper over `emitIce` that derives the message from
+/// `@errorName(err)`, so a `catch |err| compiler.emitIceFromError(alloc, pass,
+/// code, err)` site replaces a bare `std.debug.print("...: {}", .{err})` escape
+/// with the canonical ICE report. The error is preserved in the message so the
+/// repro carries the exact failure kind (e.g. `OutOfMemory`).
+pub fn emitIceFromError(
+    alloc: std.mem.Allocator,
+    pass: []const u8,
+    code: []const u8,
+    context: []const u8,
+    err: anyerror,
+) void {
+    const message = std.fmt.allocPrint(alloc, "{s}: {s}", .{ context, @errorName(err) }) catch context;
+    emitIce(alloc, pass, code, message);
 }
 
 /// Write `bytes` to STDOUT (fd 1) with a partial-write loop. Used by the

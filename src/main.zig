@@ -1287,11 +1287,11 @@ fn cmdRunScript(
         var contract_parser = zap.Parser.initScript(alloc, script_source);
         defer contract_parser.deinit();
         const program = contract_parser.parseProgram() catch {
-            // Surface the parser's own rich diagnostics.
-            for (contract_parser.errors.items) |e| {
-                std.debug.print("Error: {s}\n", .{e.message});
-                if (e.help) |h| std.debug.print("  help: {s}\n", .{h});
-            }
+            // Phase 4.b: route the script's parser errors through the UNIFIED
+            // renderer / `--error-format=json` path (was a bare-string minimal
+            // printer that bypassed both). Same visual language as every other
+            // compile diagnostic; JSON consumers see parser errors too.
+            compiler.emitScriptParseErrors(alloc, contract_parser.errors.items, script_path, script_source);
             std.process.exit(1);
         };
         _ = program;
@@ -1475,7 +1475,7 @@ fn cmdRunScript(
     // directly. The script's own module is exempt from
     // one-struct-per-file validation by never running that loop here
     // (D1).
-    const artifact = try compileAndLink(allocator, alloc, .{
+    const artifact = try compileAndLinkOrIce(allocator, alloc, "Z9100", .{
         .config = config,
         .source_roots = source_roots.items,
         .source_units = source_units.items,
@@ -4882,7 +4882,7 @@ fn buildTarget(
 
     var compile_tail_node = ScopedProgressNode.start(progress_reporter, progress_root, "Compile/link");
     defer compile_tail_node.deinit();
-    const artifact = try compileAndLink(allocator, alloc, .{
+    const artifact = try compileAndLinkOrIce(allocator, alloc, "Z9101", .{
         .config = config,
         .source_roots = manifest_sources.source_roots,
         .source_units = manifest_sources.source_units,
@@ -5031,6 +5031,49 @@ fn writeManifestCacheMetadata(
 /// exact cwd-relative `zap-out/`+`.zap-cache/` behavior. The script
 /// path passes `.layout = .{ .script = .{ .base_dir = <tmp> } }` so
 /// nothing is ever written next to the user's file.
+/// True when `err` is a front-end compile failure that ALREADY emitted a
+/// user-facing diagnostic (parse / collect / macro / desugar / typecheck / HIR
+/// / IR). Such errors are the user's code being wrong — NOT a compiler bug — so
+/// they must propagate as-is (the diagnostic is already on screen) and never be
+/// re-reported as an ICE. Every OTHER error (`OutOfMemory`, link/system
+/// failures, the incremental-graph internal-invariant violations, any
+/// unexpected error) is a genuine internal failure that `compileAndLinkOrIce`
+/// routes through the structured ICE path.
+fn isUserDiagnosedCompileError(err: anyerror) bool {
+    return switch (err) {
+        error.ParseFailed,
+        error.CollectFailed,
+        error.MacroExpansionFailed,
+        error.DesugarFailed,
+        error.TypeCheckFailed,
+        error.HirFailed,
+        error.IrFailed,
+        error.FrontendError,
+        => true,
+        else => false,
+    };
+}
+
+/// `compileAndLink`, but any INTERNAL failure (anything that is not a
+/// user-diagnosed front-end error per `isUserDiagnosedCompileError`) is lowered
+/// into a structured `domain=ice` diagnostic and the process exits — instead of
+/// a bare `error: OutOfMemory` + Zig stack trace escaping `main` (Phase 4.b:
+/// "nothing internal ever reaches the user as a bare string"). A user-diagnosed
+/// error propagates unchanged (its diagnostic is already shown). `ice_code` is
+/// the stable `Z9xxx` band code identifying the call site.
+fn compileAndLinkOrIce(
+    allocator: std.mem.Allocator,
+    alloc: std.mem.Allocator,
+    ice_code: []const u8,
+    inputs: CompileAndLinkInputs,
+) !BuildArtifact {
+    return compileAndLink(allocator, alloc, inputs) catch |err| {
+        if (isUserDiagnosedCompileError(err)) return err;
+        compiler.emitIceFromError(alloc, "compile_and_link", ice_code, "code generation / link failed", err);
+        std.process.exit(1);
+    };
+}
+
 fn compileAndLink(
     allocator: std.mem.Allocator,
     alloc: std.mem.Allocator,

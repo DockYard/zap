@@ -1531,6 +1531,10 @@ pub const TypeChecker = struct {
         /// Phase 4.b structured machine payload (e.g. `expected_type`/`got_type`)
         /// carried to `diagnostics.Diagnostic.machine_data`. Empty by default.
         machine_data: []const diagnostics_mod.MachineDatum = &.{},
+        /// Phase 4.b machine-applicable fix-its (e.g. a did-you-mean spelling
+        /// correction tagged `machine_applicable`) carried to
+        /// `diagnostics.Diagnostic.fixits`. Feeds `zap fix` / LSP code actions.
+        fixits: []const diagnostics_mod.FixIt = &.{},
     };
 
     const ResolvedCallSignature = struct {
@@ -3464,6 +3468,36 @@ pub const TypeChecker = struct {
         } else &[_]diagnostics_mod.RelatedSpan{};
 
         return .{ .related_spans = related, .machine_data = machine };
+    }
+
+    /// Emit a "did you mean `X`?" diagnostic carrying a `machine_applicable`
+    /// fix-it (Phase 4.b). A spelling correction is a safe auto-fix: the fixit
+    /// replaces `replace_span` (the misspelled identifier) with `suggestion`, so
+    /// `zap fix` / an LSP code action can apply it without review. The same
+    /// suggestion also rides in the human-facing `help` line for readers who
+    /// don't have an applying tool.
+    fn addDidYouMeanFixit(
+        self: *TypeChecker,
+        message: []const u8,
+        span: ast.SourceSpan,
+        label_text: ?[]const u8,
+        replace_span: ast.SourceSpan,
+        suggestion: []const u8,
+    ) !void {
+        const fixits = try self.allocator.alloc(diagnostics_mod.FixIt, 1);
+        fixits[0] = .{
+            .span = replace_span,
+            .replacement = suggestion,
+            .description = try std.fmt.allocPrint(self.allocator, "did you mean `{s}`?", .{suggestion}),
+            .applicability = .machine_applicable,
+        };
+        try self.errors.append(self.allocator, .{
+            .message = message,
+            .span = span,
+            .label = label_text,
+            .help = try std.fmt.allocPrint(self.allocator, "did you mean `{s}`?", .{suggestion}),
+            .fixits = fixits,
+        });
     }
 
     fn addHardError(self: *TypeChecker, message: []const u8, span: ast.SourceSpan, label_text: ?[]const u8, help_text: ?[]const u8) !void {
@@ -6057,11 +6091,13 @@ pub const TypeChecker = struct {
                     }
                     const candidate_slice = candidates.items;
                     if (similarity.findBestMatch(var_name, candidate_slice, similarity.SUGGESTION_THRESHOLD)) |suggestion| {
-                        try self.addRichError(
+                        // Phase 4.b: a spelling correction is machine-applicable.
+                        try self.addDidYouMeanFixit(
                             try std.fmt.allocPrint(self.allocator, "I cannot find a variable named `{s}`", .{var_name}),
                             vr.meta.span,
                             "not found in this scope",
-                            try std.fmt.allocPrint(self.allocator, "did you mean `{s}`?", .{suggestion}),
+                            vr.meta.span,
+                            suggestion,
                         );
                     }
 
@@ -10427,6 +10463,46 @@ test "return type mismatch has secondary span" {
     }
     try std.testing.expect(saw_expected);
     try std.testing.expect(saw_got);
+}
+
+test "did-you-mean suggestion is a MachineApplicable fixit" {
+    // A spelling correction for an undefined variable is a safe auto-fix: the
+    // diagnostic carries a fixit replacing the misspelled identifier span with
+    // the suggestion, tagged `machine_applicable` (feeds `zap fix` / LSP).
+    const source =
+        \\pub struct Test {
+        \\  pub fn run() -> i64 {
+        \\    value = 1
+        \\    valeu
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found_fixit = false;
+    for (checker.errors.items) |err| {
+        for (err.fixits) |fixit| {
+            if (std.mem.eql(u8, fixit.replacement, "value") and fixit.applicability == .machine_applicable) {
+                found_fixit = true;
+            }
+        }
+    }
+    try std.testing.expect(found_fixit);
 }
 
 test "two-sided argument type mismatch points at the parameter declaration" {
