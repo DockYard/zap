@@ -1067,6 +1067,46 @@ fn arcGetCapabilityDesc(
 // mutation / `Ref` / `weak`), so this buffer has nothing to capture until Phase
 // 5. It is preemptive infrastructure placed at the architecturally-correct hook
 // site; the engine that consumes it is fully unit-tested (cycle_detector.zig).
+//
+// ## Phase-4 gap #231 — the two remaining pieces (deliberately routed to Phase 5)
+//
+// For `-Denable-cycle-check` to actually run trial-deletion over THIS buffer at
+// deinit (as opposed to the Tracking live-set, which the runtime already
+// drains via `runCycleDetectionAndReport`), exactly two pieces remain:
+//
+//   1. BUILD-LITERAL REWRITE. The build pipeline must rewrite the
+//      `CYCLE_CHECK_DEFAULT` literal below to `true` under `-Denable-cycle-check`,
+//      mirroring how `build_options.instrument_map` is threaded for the runtime.
+//      This self-contained manager TU (std + builtin only) has no
+//      `build_options` import, so the gate cannot read the flag directly — it
+//      must be a source-literal rewrite at build time, like the `instrument_map`
+//      marker pattern.
+//
+//   2. RUNTIME DRAIN SINK. A deinit-time consumer in `src/runtime.zig` must read
+//      `cycle_candidate_buffer.roots[0..len]` and feed those raw pointers as the
+//      candidate roots of the runtime `CycleEngine` (looking each up in
+//      `cycle_registry` for its size/walk/type, exactly as the Tracking path
+//      does). Because the manager cannot import the runtime, this is a
+//      manager→runtime channel: either an exported accessor the runtime calls by
+//      name (the `setLeakReportSink`/`annotateAllocation` optional-interface
+//      pattern Phase 4.c already uses) or a runtime-installed drain callback.
+//
+// WHY PHASE 5, NOT NOW (the #231 decision):
+//   * Nothing to detect. A reference cycle is STRUCTURALLY impossible to build
+//     from today's immutable surface — every `%Node{next: Some(other)}` needs
+//     `other` to pre-exist, so allocations only point at strictly-older
+//     allocations and the loop can never close. The buffer is provably empty at
+//     deinit, so the drain would be an unfireable, untestable code path (no
+//     `.zap` fixture can exercise it).
+//   * Not low-risk. The drain dereferences each candidate's ARC-child fields via
+//     the deep-walk at deinit — the SAME deref hazard the runtime's Tracking
+//     auto-walk is gated behind (a boxed `cause :: Option(Error)` subtree may be
+//     partially torn down at deinit; see `runtime.zig` `resolveCycleCheckRuntime`).
+//     Adding it now buys nothing and inherits that hazard.
+//   * It pairs naturally with Phase 5. Mutation + `weak`/`unowned` + the
+//     ARC-cycle FIX make cycles real, the drain testable, and the deref provably
+//     safe — all at once. Wiring the drain only when there is something to drain,
+//     a way to test it, and a safety guarantee is the correct sequencing.
 
 /// Source-level default for the ARC cycle-check gate. The build pipeline
 /// rewrites this literal (marker: `CYCLE_CHECK_DEFAULT`) when the toolchain is
