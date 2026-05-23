@@ -906,6 +906,15 @@ pub const InterproceduralAnalyzer = struct {
                     }
                 },
 
+                .unwrap_error_union => |ueu| {
+                    // Phase 3.b: the unwrapped payload inherits the source's
+                    // alias/fresh state (the call result it unwraps).
+                    if (aliases.get(ueu.source)) |ps| {
+                        try aliases.put(ueu.dest, ps);
+                    } else if (fresh_locals.get(ueu.source) != null) {
+                        try fresh_locals.put(ueu.dest, {});
+                    }
+                },
                 .error_catch => |ec| {
                     // dest may come from source or catch_value; merge both alias sets.
                     var merged = ParamSet.empty();

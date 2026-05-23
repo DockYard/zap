@@ -4017,6 +4017,13 @@ pub const HirBuilder = struct {
 
         self.current_function_name = self.interner.get(decls[0].name);
         self.current_function_name_id = decls[0].name;
+        // Phase 3.b: set the error-union effect flag for THIS merged group
+        // (struct methods are built here, not in `buildFunctionGroup`), so a
+        // propagating `raise` in the body lowers to `ret_raise`. Saved and
+        // restored around the clause builds.
+        const saved_emits_error_union = self.current_function_emits_error_union;
+        self.current_function_emits_error_union = self.functionEmitsErrorUnion(decls[0], scope_id, arity);
+        defer self.current_function_emits_error_union = saved_emits_error_union;
 
         const saved_hir_type_var_scope = self.hir_type_var_scope;
         self.hir_type_var_scope = std.StringHashMap(types_mod.TypeId).init(self.allocator);
@@ -6580,7 +6587,7 @@ pub const HirBuilder = struct {
             }
             scope_cursor = self.graph.getScope(sid).parent;
         }
-        return self.type_store.functionRaises(struct_prefix, method_name, arity);
+        const result = self.type_store.functionRaises(struct_prefix, method_name, arity);        return result;
     }
 
     /// Phase 3.b — build a propagating `raise` (`ret_raise`) HIR node from a

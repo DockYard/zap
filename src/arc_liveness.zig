@@ -3717,6 +3717,9 @@ pub fn collectUses(instr: ir.Instruction, buf: *UseList) void {
             buf.append(allocator, x.source) catch {};
             buf.append(allocator, x.catch_value) catch {};
         },
+        // Phase 3.b: error-union unwrap reads its source (the call's error
+        // union); the payload it produces is the dest.
+        .unwrap_error_union => |x| buf.append(allocator, x.source) catch {},
         .set_safety => {},
         .if_expr => |x| {
             buf.append(allocator, x.condition) catch {};
@@ -3929,6 +3932,7 @@ pub fn collectDefs(instr: ir.Instruction) DefList {
             if (x.payload_local) |payload_local| out.append(payload_local);
         },
         .error_catch => |x| out.append(x.dest),
+        .unwrap_error_union => |x| out.append(x.dest),
         .if_expr => |x| out.append(x.dest),
         .case_block => |x| out.append(x.dest),
         .switch_literal => |x| out.append(x.dest),

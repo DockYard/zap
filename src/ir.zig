@@ -943,6 +943,19 @@ pub const Instruction = union(enum) {
     /// On success: dest = unwrapped value.
     /// On error: dest = catch_value (handler result applied to the input that failed).
     error_catch: ErrorCatch,
+    /// Phase 3.b — unwrap the `error{ZapRaise}!T` returned by a call to a
+    /// function carrying the `raises` effect. Emitted immediately after such
+    /// a call, replacing the raw error-union local with its payload `T`.
+    /// `mode` selects how the error case is handled:
+    ///   - `.propagate`: emit Zig `try` — re-raise the error out of the
+    ///     enclosing (also-error-union) function, building the error return
+    ///     trace. Used when the call is NOT lexically inside a `try` body.
+    ///   - `.route_to_handler`: emit Zig `catch` yielding a typed-undef — on
+    ///     error, control falls through (the boxed payload is already in the
+    ///     thread-local side-channel) to the enclosing `try`'s landing pad,
+    ///     which tests `raise_occurred()` and dispatches the `rescue` arms.
+    ///     Used when the call IS lexically inside a `try` body.
+    unwrap_error_union: UnwrapErrorUnion,
 
     // Safety control
     set_safety: bool, // true = enable, false = disable
@@ -1064,6 +1077,12 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
         .const_string => |value| .{ .const_string = .{
             .dest = value.dest,
             .value = try cloneBytes(allocator, value.value),
+        } },
+        .unwrap_error_union => |value| .{ .unwrap_error_union = .{
+            .dest = value.dest,
+            .source = value.source,
+            .mode = value.mode,
+            .payload_type = try cloneZigType(allocator, value.payload_type),
         } },
         .const_bool,
         .const_nil,
@@ -2171,6 +2190,33 @@ pub const ErrorCatch = struct {
     catch_value: LocalId, // value to use on error (handler result for the failed input)
 };
 
+/// Phase 3.b — how a raising callee's `error{ZapRaise}!T` is unwrapped at
+/// the call site.
+pub const ErrorUnionUnwrapMode = enum {
+    /// `try callee()` — propagate the error out of the enclosing error-union
+    /// function (the implicit `?`); Zig records the error return trace.
+    propagate,
+    /// `callee() catch undefined` — on error, fall through to the enclosing
+    /// `try`'s landing pad (the boxed payload is in the side-channel).
+    route_to_handler,
+    /// `callee() catch { do_raise(take_recoverable_raise()) }` — the call is
+    /// in a function that neither handles nor propagates the effect (the
+    /// top-level entry `main`, which cannot return an error union). On error,
+    /// recover the stashed box and abort through the Phase 2 crash report —
+    /// the unhandled-raise terminus of the propagation chain.
+    abort_unhandled,
+};
+
+/// Phase 3.b — unwrap a raising callee's error union into its payload.
+pub const UnwrapErrorUnion = struct {
+    dest: LocalId, // holds the unwrapped payload T
+    source: LocalId, // the error union local (the call result)
+    mode: ErrorUnionUnwrapMode,
+    /// The payload type, used to materialize a typed-undef for the dead
+    /// error edge of a `route_to_handler` catch.
+    payload_type: ZigType = .any,
+};
+
 pub const Branch = struct {
     target: LabelId,
 };
@@ -3120,6 +3166,18 @@ pub const IrBuilder = struct {
     next_local: LocalId,
     current_blocks: std.ArrayList(Block),
     current_instrs: std.ArrayList(Instruction),
+    /// Phase 3.b — true while lowering the statements of a `try { … }` body
+    /// (set around `lowerTryRescueBodyStmt`). A call to a raising callee
+    /// lowered with this flag set unwraps its error union via `catch`
+    /// (route to the enclosing landing pad) rather than `try` (propagate).
+    /// Saved/restored so nested `try` bodies and post-body lowering are
+    /// scoped correctly.
+    in_try_body: bool = false,
+    /// Phase 3.b — true while lowering the body of a function that itself
+    /// carries the `raises` effect (returns `error{ZapRaise}!T`). A raising
+    /// call NOT inside a `try` body in such a function propagates via `try`;
+    /// in a non-raising function (e.g. `main`) it aborts via the crash report.
+    current_function_raises: bool = false,
     interner: *const ast.StringInterner,
     type_store: ?*const types_mod.TypeStore,
     /// Optional scope graph reference. Used to consult the native-type
@@ -3463,6 +3521,40 @@ pub const IrBuilder = struct {
 
         if (group.clauses.len == 0) return null;
         return &group.clauses[0];
+    }
+
+    /// Phase 3.b — does the call `target` resolve to a function carrying the
+    /// `raises` effect (so it returns `error{ZapRaise}!T` and its result must
+    /// be unwrapped at the call site via `try`/`catch`)? Resolves the callee
+    /// HIR group, derives its owning struct prefix by walking up parent
+    /// scopes from the group's scope, and queries the type store's
+    /// `inferred_raises` via the shared stable qualified key. Builtins and
+    /// closures never carry an inferred row, so they return false.
+    fn calleeRaises(self: *const IrBuilder, target: hir_mod.CallTarget, arg_count: usize) bool {
+        const store = self.type_store orelse return false;
+        const graph = self.scope_graph orelse return false;
+        const group: *const hir_mod.FunctionGroup = switch (target) {
+            .direct => |direct| self.hirFunctionGroupById(direct.function_group_id) orelse return false,
+            .dispatch => |dispatch| self.hirFunctionGroupById(dispatch.function_group_id) orelse return false,
+            .named => |named| self.resolveNamedHirGroup(named, @intCast(arg_count)) orelse return false,
+            else => return false,
+        };
+        const method_name = self.interner.get(group.name);
+        var struct_prefix: ?[]const u8 = null;
+        var struct_prefix_buf: ?[]const u8 = null;
+        defer if (struct_prefix_buf) |buf| self.allocator.free(buf);
+        var scope_cursor: ?scope_mod.ScopeId = group.scope_id;
+        outer: while (scope_cursor) |sid| {
+            for (graph.structs.items) |entry| {
+                if (entry.scope_id != sid) continue;
+                const joined = entry.name.joinedWith(self.allocator, self.interner, ".") catch break :outer;
+                struct_prefix_buf = joined;
+                struct_prefix = joined;
+                break :outer;
+            }
+            scope_cursor = graph.getScope(sid).parent;
+        }
+        return store.functionRaises(struct_prefix, method_name, group.arity);
     }
 
     fn resolvedCallReturnType(
@@ -4330,7 +4422,12 @@ pub const IrBuilder = struct {
         try self.emitBinaryBindings(clause);
         try self.emitMapBindings(clause);
         const result_local = try self.lowerBlockExpecting(clause.body, clause.return_type);
-        try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
+        // Phase 3.b: skip the implicit trailing `ret` when the body already
+        // diverges (e.g. its tail is a propagating `raise` lowered to
+        // `ret_raise`), so no unreachable `ret` follows the error-return.
+        if (!self.currentInstrsEndInTerminator()) {
+            try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
+        }
         const entry_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
 
         const raw_name = if (group.name < self.interner.strings.items.len)
@@ -4408,6 +4505,17 @@ pub const IrBuilder = struct {
         self.defer_stack.clearRetainingCapacity();
         self.current_param_types = .empty;
         self.current_param_hir_types = .empty;
+
+        // Phase 3.b: does THIS function carry the `raises` effect (returns an
+        // error union)? Computed up front so it is set before the body is
+        // lowered — a propagating raising call in the body consults it to
+        // decide `try` (propagate) vs the top-level abort. Also reused for the
+        // emitted `ir.Function.raises` flag below.
+        const function_raises = if (self.type_store) |ts|
+            ts.functionRaises(self.current_struct_prefix, self.interner.get(group.name), group.arity)
+        else
+            false;
+        self.current_function_raises = function_raises;
 
         // Use first clause for arity and return type
         const first_clause = &group.clauses[0];
@@ -4492,7 +4600,11 @@ pub const IrBuilder = struct {
             try self.emitBinaryBindings(first_clause);
             try self.emitMapBindings(first_clause);
             const result_local = try self.lowerBlockExpecting(first_clause.body, first_clause.return_type);
-            try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
+            // Phase 3.b: skip the trailing `ret` when the body already
+            // diverges (its tail is a propagating `raise` -> `ret_raise`).
+            if (!self.currentInstrsEndInTerminator()) {
+                try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
+            }
         } else if (self.canSwitchDispatch(group)) |switch_param| {
             // Emit switch_return for integer literal dispatch
             var return_cases: std.ArrayList(ReturnCase) = .empty;
@@ -4814,14 +4926,9 @@ pub const IrBuilder = struct {
         const local_ownership = try self.computeLocalOwnership(self.next_local);
         const result_convention = self.computeResultConvention(first_clause.return_type);
         const debug_span = group.debug_span;
-        // Phase 3.b: does this function carry the `raises` effect? Queried
-        // from the type store's `inferred_raises` via the stable qualified
-        // key (struct prefix + method name + arity). A non-empty row means
-        // the function lowers to a Zig error-union return.
-        const function_raises = if (self.type_store) |ts|
-            ts.functionRaises(self.current_struct_prefix, self.interner.get(group.name), group.arity)
-        else
-            false;
+        // `function_raises` (computed at the top of this function, before the
+        // body was lowered) is the `raises`-effect verdict; a non-empty row
+        // means the function lowers to a Zig error-union return.
         try self.functions.append(self.allocator, .{
             .id = func_id,
             .name = name_str,
@@ -5772,6 +5879,29 @@ pub const IrBuilder = struct {
     /// arm is already noreturn (e.g., it ends in `match_fail`) and
     /// adding a `ret` would emit an unreachable instruction after a
     /// noreturn terminator.
+    /// True when `current_instrs` already ends in an unconditional no-return
+    /// terminator (`ret`, `match_fail`, `match_error_return`, `ret_raise`, a
+    /// tail call, or a switch-return). The function-body finalizers consult
+    /// this before appending the implicit trailing `ret`, so a body whose
+    /// tail diverges — e.g. a Phase 3.b propagating `raise` lowered to
+    /// `ret_raise` (which emits `return error.ZapRaise`) — does not get an
+    /// unreachable `ret` appended after it (which the ZIR backend rejects).
+    fn currentInstrsEndInTerminator(self: *const IrBuilder) bool {
+        if (self.current_instrs.items.len == 0) return false;
+        // Narrow to the terminators that the function-body finalizer must NOT
+        // append a trailing `ret` after. `ret_raise` (Phase 3.b propagating
+        // raise -> `return error.ZapRaise`) and an explicit `ret` already
+        // return; a `ret` appended after them is unreachable and the ZIR
+        // backend rejects it. Other terminators (`match_fail`, switch returns,
+        // tail calls) are intentionally NOT included here: the pre-existing
+        // ZIR-backend no-return detection elides the appended `ret` for those,
+        // and widening this guard regressed a re-raising `main`'s codegen.
+        return switch (self.current_instrs.items[self.current_instrs.items.len - 1]) {
+            .ret, .ret_raise => true,
+            else => false,
+        };
+    }
+
     fn appendRetToBody(
         self: *IrBuilder,
         body: []const Instruction,
@@ -7011,10 +7141,17 @@ pub const IrBuilder = struct {
         var else_branch_instrs: std.ArrayListUnmanaged(Instruction) = .empty;
 
         // 1. Run the body. Its tail value is captured for the no-raise edge.
+        //    Phase 3.b: mark `in_try_body` so a call to a raising callee in
+        //    the body unwraps its error union via `catch` (routing the error
+        //    to this landing pad) rather than `try` (which would propagate
+        //    out of the enclosing function, bypassing the handler).
+        const saved_in_try_body = self.in_try_body;
+        self.in_try_body = true;
         var body_result: ?LocalId = null;
         for (tr.body.stmts) |stmt| {
             body_result = try self.lowerTryRescueBodyStmt(stmt);
         }
+        self.in_try_body = saved_in_try_body;
 
         // 2. Discriminator: did a recoverable raise fire in the body?
         const flag_local = try self.lowerExpr(tr.raise_occurred_call);
@@ -11368,6 +11505,33 @@ pub const IrBuilder = struct {
                             try self.known_local_types.put(dest, call_result_type);
                         }
                     },
+                }
+                // Phase 3.b: when the callee carries the `raises` effect it
+                // returned `error{ZapRaise}!T` in `dest`. Unwrap it in place
+                // to the payload `T` so the surrounding code sees the value,
+                // and route the error case per the call's lexical context:
+                //   - inside a `try` body  → `catch` (fall through to the
+                //     enclosing landing pad; the boxed payload is in the TLS
+                //     side-channel),
+                //   - in an error-union fn → `try` (propagate; ERT chain),
+                //   - otherwise (e.g. `main`) → abort via the unhandled-raise
+                //     crash report (re-raise the stashed box).
+                if (self.calleeRaises(call.target, call.args.len)) {
+                    const mode: ErrorUnionUnwrapMode = if (self.in_try_body)
+                        .route_to_handler
+                    else if (self.current_function_raises)
+                        .propagate
+                    else
+                        .abort_unhandled;
+                    const payload_zig = typeIdToZigTypeWithStore(tracked_hir_type, self.type_store);
+                    try self.current_instrs.append(self.allocator, .{
+                        .unwrap_error_union = .{
+                            .dest = dest,
+                            .source = dest,
+                            .mode = mode,
+                            .payload_type = payload_zig,
+                        },
+                    });
                 }
                 for (shared_release_locals.items) |shared_local| {
                     try self.current_instrs.append(self.allocator, .{ .release = .{ .value = shared_local } });

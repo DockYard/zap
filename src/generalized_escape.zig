@@ -626,6 +626,12 @@ pub const GeneralizedEscapeAnalyzer = struct {
                 const catch_escape = self.ctx.getEscape(.{ .function = func_id, .local = ec.catch_value });
                 try self.setEscapeAndEnqueue(func_id, ec.dest, EscapeState.join(src_escape, catch_escape));
             },
+            // Phase 3.b: the unwrapped payload inherits the source error
+            // union's escape state.
+            .unwrap_error_union => |ueu| {
+                const src_escape = self.ctx.getEscape(.{ .function = func_id, .local = ueu.source });
+                try self.setEscapeAndEnqueue(func_id, ueu.dest, src_escape);
+            },
 
             // Enum literal: no_escape (small value).
             .enum_literal => |el| try self.setEscapeAndEnqueue(func_id, el.dest, .no_escape),

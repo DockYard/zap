@@ -1005,6 +1005,10 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(std.mem.asBytes(&v.source));
             hasher.update(std.mem.asBytes(&v.catch_value));
         },
+        .unwrap_error_union => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.source));
+        },
         .if_expr => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(std.mem.asBytes(&v.condition));
@@ -1914,6 +1918,14 @@ pub const Interpreter = struct {
                 // error handling is structural — catch_value is the fallback.
                 const source_val = try self.readLocal(frame, ec.source);
                 frame.setLocal(ec.dest, source_val);
+                return .continued;
+            },
+            .unwrap_error_union => |ueu| {
+                // Phase 3.b: at CTFE a raising call cannot have produced an
+                // error (a comptime raise is rejected at the call), so the
+                // source already holds the payload — pass it through.
+                const source_val = try self.readLocal(frame, ueu.source);
+                frame.setLocal(ueu.dest, source_val);
                 return .continued;
             },
             .call_builtin => |cb| {

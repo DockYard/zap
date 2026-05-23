@@ -1337,6 +1337,8 @@ fn recordInstructionUses(
             try summary.recordUse(allocator, ec.source, false);
             try summary.recordUse(allocator, ec.catch_value, false);
         },
+        // Phase 3.b: error-union unwrap reads its source (the call result).
+        .unwrap_error_union => |ueu| try summary.recordUse(allocator, ueu.source, false),
         .if_expr => |ie| try summary.recordUse(allocator, ie.condition, false),
         .cond_branch => |cb| try summary.recordUse(allocator, cb.condition, false),
         .switch_tag => |st| try summary.recordUse(allocator, st.scrutinee, false),

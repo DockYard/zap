@@ -388,6 +388,24 @@ pub struct Kernel {
   }
 
   @doc = """
+    Unhandled-`raise` terminus (Phase 3.b cross-function propagation).
+
+    When a `raise` propagates across function boundaries — as the
+    `error.ZapRaise` tag the compiler returns from a `raises`-row function,
+    with the boxed `Error` riding the thread-local side-channel — and
+    reaches a frame that neither rescues nor further propagates it (the
+    top-level `main`, which cannot return an error union), the compiler
+    routes the call-site `catch` here. It recovers the stashed `Error` from
+    the side-channel and aborts through `do_raise/1`, producing the same
+    Phase 2 crash report (`** (kind) message` + backtrace) an unrecovered
+    `raise` would. Diverges (`Never`).
+    """
+
+  pub fn abort_recoverable_raise() -> Never {
+    do_raise(take_recoverable_raise())
+  }
+
+  @doc = """
     Recoverable raise sink backing a `raise` lexically inside a
     `try { … } rescue { … }` body (Phase 3.a).
 

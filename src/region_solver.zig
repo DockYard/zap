@@ -793,6 +793,11 @@ pub const UseDefInfo = struct {
                 try info.recordUse(ec.source, block);
                 try info.recordUse(ec.catch_value, block);
             },
+            // Phase 3.b: error-union unwrap defines the payload, uses source.
+            .unwrap_error_union => |ueu| {
+                try info.recordDef(ueu.dest, block);
+                try info.recordUse(ueu.source, block);
+            },
 
             // Pattern matching.
             .match_atom => |ma| {

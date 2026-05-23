@@ -693,7 +693,7 @@ fn mapParamType(zig_type: ir.ZigType) u32 {
 fn instructionsEndNoReturn(instructions: []const ir.Instruction) bool {
     if (instructions.len == 0) return false;
     return switch (instructions[instructions.len - 1]) {
-        .match_fail, .match_error_return, .ret => true,
+        .match_fail, .match_error_return, .ret_raise, .ret => true,
         else => false,
     };
 }
@@ -1187,7 +1187,7 @@ pub const ZirDriver = struct {
     fn instructionsEndNoReturnFor(self: *const ZirDriver, instructions: []const ir.Instruction) bool {
         if (instructions.len == 0) return false;
         return switch (instructions[instructions.len - 1]) {
-            .match_fail, .match_error_return, .ret => true,
+            .match_fail, .match_error_return, .ret_raise, .ret => true,
             .tail_call => self.loopify_slots == null,
             else => false,
         };
@@ -1351,6 +1351,34 @@ pub const ZirDriver = struct {
     /// Resolve any Zap type to a ZIR type ref for use inside compound type
     /// declarations (e.g., tuple element types). Emits import instructions
     /// for complex types that need runtime type resolution.
+    /// Phase 3.b — emit `@as(T, undefined)` and return its Ref. Used as the
+    /// never-read catch value on the dead error edge of a `route_to_handler`
+    /// error-union unwrap (the enclosing `try` landing pad takes the error
+    /// path; this value only gives the `catch` block a clean peer type).
+    fn emitTypedUndefRef(self: *ZirDriver, payload_type: ir.ZigType) BuildError!u32 {
+        const ty_ref = try self.emitImportedTypeRef(payload_type);
+        const ref = zir_builder_emit_as(self.handle, ty_ref, @intFromEnum(Zir.Inst.Ref.undef));
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
+    /// Phase 3.b — emit a call to `Kernel.abort_recoverable_raise()` and
+    /// return its Ref. The unhandled-raise terminus: recovers the boxed
+    /// `Error` stashed in the thread-local side-channel and aborts through
+    /// the Phase 2 crash report (`** (kind) message` + backtrace). The
+    /// function is `noreturn`, so Zig accepts its result as the catch value
+    /// of any payload type. `payload_type` is currently unused (the call
+    /// diverges) but kept for symmetry with `emitTypedUndefRef`.
+    fn emitAbortRecoverableRaise(self: *ZirDriver, payload_type: ir.ZigType) BuildError!u32 {
+        _ = payload_type;
+        // `Kernel.abort_recoverable_raise/0` is a Zap stdlib function (it
+        // extracts the boxed error's kind/message through the `Error`
+        // protocol, a Zap-level concern, then aborts via `do_raise`). Emit a
+        // cross-struct call to its monomorphized symbol rather than a Zig
+        // runtime sink, so the protocol dispatch stays in Zap.
+        return try self.emitCrossStructCall("Kernel", "abort_recoverable_raise__0", &[_]u32{});
+    }
+
     fn emitImportedTypeRef(self: *ZirDriver, zig_type: ir.ZigType) BuildError!u32 {
         // Try primitive mapping first
         const simple = mapReturnType(zig_type);
@@ -6081,6 +6109,42 @@ pub const ZirDriver = struct {
                 const source_ref = self.refForValueLocal(ec.source) catch @intFromEnum(Zir.Inst.Ref.void_value);
                 try self.setLocal(ec.dest, source_ref);
             },
+            .unwrap_error_union => |ueu| {
+                // Phase 3.b: the source local holds a raising callee's
+                // `error{ZapRaise}!T`. Unwrap it to the payload `T`, rebinding
+                // the dest local's ref; the error case is dispatched by mode.
+                const source_ref = self.refForValueLocal(ueu.source) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                switch (ueu.mode) {
+                    .propagate => {
+                        // `try source` — propagate `error.ZapRaise` out of the
+                        // enclosing error-union function; Zig records the ERT.
+                        const unwrapped = zir_builder_emit_try(self.handle, source_ref);
+                        if (unwrapped == error_ref) return error.EmitFailed;
+                        try self.setLocal(ueu.dest, unwrapped);
+                    },
+                    .route_to_handler => {
+                        // `source catch <typed_undef>` — on error the boxed
+                        // payload is already in the TLS side-channel and the
+                        // enclosing `try`'s landing pad (the following
+                        // `raise_occurred()` check) takes over, so the catch
+                        // value is a never-read placeholder of the payload type.
+                        const catch_value = try self.emitTypedUndefRef(ueu.payload_type);
+                        const unwrapped = zir_builder_emit_catch(self.handle, source_ref, catch_value);
+                        if (unwrapped == error_ref) return error.EmitFailed;
+                        try self.setLocal(ueu.dest, unwrapped);
+                    },
+                    .abort_unhandled => {
+                        // `source catch Kernel.abort_recoverable_raise(...)` —
+                        // top-level terminus: recover the stashed box and abort
+                        // through the Phase 2 crash report. The catch value is
+                        // the `noreturn` abort call's result.
+                        const abort_ref = try self.emitAbortRecoverableRaise(ueu.payload_type);
+                        const unwrapped = zir_builder_emit_catch(self.handle, source_ref, abort_ref);
+                        if (unwrapped == error_ref) return error.EmitFailed;
+                        try self.setLocal(ueu.dest, unwrapped);
+                    },
+                }
+            },
 
             // Builtin calls — emit @import("zap_runtime").Struct.function(args)
             .call_builtin => |cb| {
@@ -8970,7 +9034,7 @@ pub const ZirDriver = struct {
 
         const body_returns = gb.body.len > 0 and blk: {
             const last = gb.body[gb.body.len - 1];
-            break :blk (last == .ret or last == .match_fail or last == .match_error_return);
+            break :blk (last == .ret or last == .match_fail or last == .match_error_return or last == .ret_raise);
         };
 
         if (body_returns) {
@@ -9478,6 +9542,7 @@ pub const ZirDriver = struct {
             .call_builtin => |value| value.dest,
             .try_call_named => |value| value.dest,
             .error_catch => |value| value.dest,
+            .unwrap_error_union => |value| value.dest,
             .if_expr => |value| value.dest,
             .case_block => |value| value.dest,
             .switch_literal => |value| value.dest,

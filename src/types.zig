@@ -443,6 +443,13 @@ pub const TypeStore = struct {
         method_name: []const u8,
         arity: u32,
     ) bool {
+        // The program/script entry point (`main/1`) can never lower to an
+        // error-union return — Zig's entry ABI requires `void`/`u8`. A
+        // `raise` that reaches `main` unhandled is the top-level abort
+        // terminus (Phase 2 crash report), realized by the `do_raise` path,
+        // not by `main` returning `error.ZapRaise`. So `main` never carries
+        // the error-union effect regardless of its inferred row.
+        if (arity == 1 and std.mem.eql(u8, method_name, "main")) return false;
         const key = self.raisesRowKeyString(struct_prefix, method_name, arity) orelse return false;
         const row = self.inferred_raises.get(key) orelse return false;
         return row.len > 0;
