@@ -1178,6 +1178,12 @@ pub const leak_attribution_active: bool = active_manager_source_available and
 /// notation) so the report reads "Leaked 1 `%Inner{}` (40 B), …".
 fn zapTypeDisplayName(comptime T: type) []const u8 {
     comptime {
+        // The std string scans below (`indexOf`, `lastIndexOfScalar`,
+        // `startsWith`) iterate per byte of the type name; a long module-
+        // qualified name plus the `ProtocolBox(` search can exceed the
+        // default 1000-branch comptime budget. Lift it — this runs once
+        // per distinct `T` at comptime and emits no runtime code.
+        @setEvalBranchQuota(10_000);
         var name: []const u8 = @typeName(T);
         // Strip pointer prefixes (`*`, `*const `, `?*`, etc.) — the heap
         // slot is named `*T`, but we want the pointee's type.
@@ -20423,6 +20429,40 @@ test "parseBacktraceVerbosity honors ZAP_BACKTRACE conventions" {
     try std.testing.expectEqual(BacktraceVerbosity.full, parseBacktraceVerbosity("full"));
     try std.testing.expectEqual(BacktraceVerbosity.full, parseBacktraceVerbosity("all"));
 }
+
+test "zapTypeDisplayName derives a clean Zap type name from @typeName" {
+    // Phase 4.c: the leak report shows the Zap type the compiler chose,
+    // normalized from the module-qualified Zig type name. Nothing is
+    // hardcoded — these expectations only assert the NORMALIZATION rules
+    // (strip module prefix, strip pointer, unwrap one ProtocolBox layer).
+    @setEvalBranchQuota(20_000);
+    const User = struct { name_len: usize };
+    const Node = struct { value: i64 };
+
+    // Bare struct: keep the segment after the last '.'.
+    try std.testing.expectEqualStrings("User", comptime zapTypeDisplayName(User));
+    // Pointer-to-struct: strip the leading '*', then the module prefix.
+    try std.testing.expectEqualStrings("Node", comptime zapTypeDisplayName(*Node));
+    // A `…ProtocolBox(Inner)` shape unwraps to the boxed inner type. The
+    // generic helper below names the type `…ProtocolBox(<module>.Node)`, so
+    // `@typeName` carries the `ProtocolBox(` marker the deriver keys on.
+    try std.testing.expectEqualStrings("Node", comptime zapTypeDisplayName(ProtocolBoxTestNs.ProtocolBox(Node)));
+    // Optional-pointer: strip `?*`, keep the bare name.
+    try std.testing.expectEqualStrings("User", comptime zapTypeDisplayName(?*User));
+}
+
+/// Test-only namespace holding a GENERIC `ProtocolBox` so its `@typeName`
+/// is `…ProtocolBoxTestNs.ProtocolBox(<module>.Inner)` — which contains the
+/// literal `ProtocolBox(` marker `zapTypeDisplayName` unwraps, exercising
+/// the inner-type-extraction branch. (The real `ProtocolBox` is a
+/// non-generic `extern struct`, so its own `@typeName` has no parens; the
+/// unwrap is the defensive path for any future generic box rendering. It is
+/// nested in a namespace so it does not shadow the real `ProtocolBox`.)
+const ProtocolBoxTestNs = struct {
+    fn ProtocolBox(comptime Inner: type) type {
+        return struct { data: *Inner };
+    }
+};
 
 test "pathBasename strips directories" {
     try std.testing.expectEqualStrings("demo.zap", pathBasename("/abs/path/to/demo.zap"));

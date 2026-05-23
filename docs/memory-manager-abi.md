@@ -2029,6 +2029,25 @@ Two non-user-facing managers ship with the Zap source tree as part of the test i
 
 These managers are not part of the public ABI surface in the sense that users do not select them via `memory:` in production builds. They are used by the Zap test runner to validate ABI-conformance properties (e.g., "every retain has a matching release") on every CI run. Their implementation follows the same ABI as `Memory.ARC` and `Memory.Arena`; no special compiler accommodation is needed.
 
+### 16.1 Leak attribution + the unified leak report (Phase 4.c)
+
+`Memory.Tracking` records, per live allocation, a **captured allocation-site backtrace + the Zap type + size + refcount**, and at `core.deinit` reports each survivor (and at `core.deallocate` each canary / invalid-free / size-mismatch fault) through the **unified diagnostic renderer** — the same visual language as compile errors and the runtime crash printer (`docs/error-system-research-brief.md` Part V). The wiring crosses two layering boundaries and is worth pinning here.
+
+**Why the report is rendered by the runtime, not the manager.** The unified renderer needs the symbolizer (`std.debug.SelfInfo` DWARF), the `.zap-symbols` side-table (mangled→Zap), and the shared visual-format spec — all of which live in `src/runtime.zig`. The Tracking manager (`src/memory/tracking/manager.zig`) is a self-contained object-mode TU (`std` + `builtin` only, `link_libc = false`) and cannot import any of that. So the manager owns the authoritative **live-allocation set** + canary state + attribution, and hands each fault to a runtime-installed **report sink** as a `ZapLeakRecord`; the sink (in `runtime.zig`) symbolizes the backtrace and renders the `domain=leak` diagnostic. This is the "manager emits structured data, a thin runtime reporting layer renders it" split.
+
+**The optional leak-attribution interface.** It is NOT a `.zapmem` capability. The channel is private to the runtime↔manager pair compiled into one binary, and under the source-registered build (every user binary; see §10) the runtime imports the active manager module directly and calls these decls by name, gated on `@hasDecl`:
+
+| Decl (on the manager) | Called by the runtime | When |
+|---|---|---|
+| `annotateAllocation(ctx, ptr, type_name_ptr, type_name_len, bt_addrs, bt_len)` | after `core.allocate` in `ArcRuntime.allocAny` | per heap allocation — records the comptime Zap type name + the `Backtrace.capture` the runtime took at the alloc site (the bare `core.allocate(size, alignment)` slot carries neither) |
+| `setLeakReportSink(ctx, sink, finish, sink_ctx)` | once at `zapMemoryStartup` | installs the runtime's `leakReportSink` + `finishLeakReport` |
+
+A manager that does not implement these decls (every manager except `Memory.Tracking`) pays nothing: the runtime's `leak_attribution_active` comptime flag folds the whole subsystem away. `ZapLeakRecord` / `ZapLeakReportSink` are redeclared in `runtime.zig`'s `AbiV1` block under the self-contained-manager convention, with a `comptime` size/offset drift assert against the manager-side copy.
+
+**Determinism, JSON, and CI.** The runtime sink accumulates survivors, then `finishLeakReport` sorts them deterministically (Zap type, then size, then alloc-site, then pointer) and renders a per-leak detail list + a summary table (count, total bytes, per-type rollup). `-Derror-format=json` (env `ZAP_ERROR_FORMAT=json`, set in the child environment by `zap run`) emits the machine-readable projection (`domain`/`sub_kind`/`trace_policy`/`machine_data`); `-Dleaks-fatal` (env `ZAP_LEAKS_FATAL=1`) forces a non-zero exit (code `7`) on any surviving leak — the CI mode.
+
+**Box-in-struct deep-release under no-REFCOUNT_V1.** A `ProtocolBox` (or any heap-promoted child) owned by a struct/union field is reclaimed by the container's scope-exit release deep-walking into the field. Under a no-REFCOUNT_V1 manager (`Memory.Tracking`) that release was elided two ways, both fixed in Phase 4.c: (1) the ZIR `.release` lowering now emits `releaseAny` for an arc-managed by-value aggregate even when refcount ops are elided (the deep-walk frees the child via `core.deallocate`; the box's own drop is suppressed by the ownership-transfer analysis, so no double-free), and (2) the runtime's no-REFCOUNT_V1 free path (`freeAnyNonRefcountedImpl`) now runs the same comptime field-walk (`releaseChildrenAny`) before deallocating that the REFCOUNT_V1 path runs via its `release_sized` deep-walk callback. Net: a box-in-struct is leak-free under `Memory.Tracking`, matching `Memory.ARC`.
+
 ---
 
 ## 17. Future work — explicitly out of scope for v1
