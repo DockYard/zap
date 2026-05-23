@@ -76,18 +76,45 @@ const std = @import("std");
 /// count of `1` is synthesized. Returns the live count at call time.
 pub const RefcountReadFn = *const fn (object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32;
 
-/// Per-child visitor invoked by a `CycleWalkFn`. `child_object` is the
-/// pointer to one ARC-managed child cell of the object being walked. The
-/// visitor is the engine's mark / scan / restore action; it is the seam
-/// that lets the SAME comptime child-enumeration drive every phase of the
-/// algorithm without the enumeration knowing which phase is running.
-pub const CycleChildVisitor = *const fn (visitor_ctx: ?*anyopaque, child_object: *anyopaque) callconv(.c) void;
+/// A fully-described ARC child edge yielded by a `CycleWalkFn`. Because the
+/// destructive deep-walk knows each child field's CONCRETE static type at
+/// comptime (the `.pointer(.one)` case in `releaseFieldChildAny` has
+/// `p.child`), the non-destructive cycle walk can — at that same comptime
+/// site — synthesize the child's own refcount reader, child enumerator, and
+/// type label and hand them to the visitor. This is what makes the engine
+/// self-sufficient: it discovers reachable non-candidate nodes (cycle
+/// members that were never independently buffered) through the walk WITH
+/// full metadata, instead of needing them pre-registered as candidates.
+pub const ChildRef = struct {
+    /// The child cell pointer.
+    object: *anyopaque,
+    /// The child's user-visible size / alignment (its own static type's),
+    /// for the refcount read and the bytes-held report.
+    size: usize,
+    alignment: u32,
+    /// The child's refcount reader (its manager's — same as the parent's in
+    /// a single-manager binary).
+    refcount_read: RefcountReadFn,
+    /// The child's own non-destructive child enumerator, or `null` if the
+    /// child type is flat.
+    cycle_walk: ?CycleWalkFn,
+    /// Borrowed `.rodata` type label for the child, or empty.
+    type_name_ptr: ?[*]const u8 = null,
+    type_name_len: usize = 0,
+};
+
+/// Per-child visitor invoked by a `CycleWalkFn`, once per ARC-managed child
+/// edge with a fully-populated `ChildRef`. The visitor is the engine's mark
+/// / scan / restore action; it is the seam that lets the SAME comptime
+/// child-enumeration drive every phase of the algorithm without the
+/// enumeration knowing which phase is running.
+pub const CycleChildVisitor = *const fn (visitor_ctx: ?*anyopaque, child: *const ChildRef) callconv(.c) void;
 
 /// Non-destructive per-type child enumeration. Mirrors the runtime's
 /// `DeepWalkFnFor(T)` child set EXACTLY — every `.pointer(.one)` /
 /// `ProtocolBox` / nested-aggregate / active-union-variant ARC child the
 /// destructive deep-walk would release — but instead of releasing each
-/// child it invokes `visitor(visitor_ctx, child_object)`. Produced at the
+/// child it invokes `visitor(visitor_ctx, &child_ref)`. Produced at the
 /// allocation site (where `T` is known) and stored type-erased on the
 /// candidate. `null` for flat types with no ARC children.
 pub const CycleWalkFn = *const fn (object: *anyopaque, visitor_ctx: ?*anyopaque, visitor: CycleChildVisitor) callconv(.c) void;
@@ -205,13 +232,27 @@ pub const CycleMember = struct {
 /// supplied allocator (the runtime passes `page_allocator`, matching the
 /// tracking manager — no libc dependency). One `Engine` drives one
 /// detection pass over a candidate set and collects the cyclic components.
+///
+/// ## Why a scratch table keyed by object pointer
+///
+/// Trial deletion must NOT mutate the real objects (this is a diagnostic
+/// pass — the objects are still live and may keep being used). The signed
+/// `trial_rc` per node lives entirely in this side table; the only thing
+/// read from the real object is its refcount (once, on first visit) and its
+/// children (via the type-erased `cycle_walk`). The table also lets the
+/// recursive scan / restore terminate on revisit (the `color` / `scanned`
+/// flags), which a naive recursion over a cyclic graph could not.
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     /// Scratch node table for the current pass, keyed by `@intFromPtr`.
     nodes: std.AutoHashMapUnmanaged(usize, NodeState) = .empty,
     /// Object pointers of nodes that ended the scan white (cycle garbage),
-    /// accumulated by `collect`.
+    /// accumulated by `collect`, in deterministic (pointer-sorted) order.
     white_set: std.ArrayListUnmanaged(usize) = .empty,
+    /// Deferred allocation failure from inside a `callconv(.c)` visitor
+    /// (which cannot itself return an error). Checked after each walk; a
+    /// set flag aborts the pass cleanly without swallowing OOM.
+    oom: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Engine {
         return .{ .allocator = allocator };
@@ -222,15 +263,247 @@ pub const Engine = struct {
         self.white_set.deinit(self.allocator);
     }
 
-    /// Run trial deletion over `candidates` and return the set of object
-    /// pointers that form cyclic garbage (the white set after scan).
+    /// Run trial deletion over `candidates` and return the object pointers
+    /// that form cyclic garbage (the white set after scan), sorted
+    /// ascending so the result — and any report derived from it — is
+    /// deterministic across runs regardless of candidate / hash-map order.
     ///
-    /// NOTE: deliberately incomplete in this first TDD step — it builds the
-    /// node table but performs no mark/scan/collect, so it reports NO cycle.
-    /// The failing test below pins the contract; the engine body lands next.
+    /// The candidate set need not be closed under reachability: the mark
+    /// walk discovers reachable non-candidate children (with full metadata
+    /// via `ChildRef`) and adds them to the table. Returns an empty slice
+    /// when no cycle is present (the common, cycle-free case).
     pub fn detect(self: *Engine, candidates: []const Candidate) error{OutOfMemory}![]const usize {
-        _ = candidates;
+        self.nodes.clearRetainingCapacity();
+        self.white_set.clearRetainingCapacity();
+        self.oom = false;
+
+        // Phase 1 — seed the table with every candidate, then mark: walk
+        // each node's children once and trial-decrement every internal edge.
+        try self.seedCandidates(candidates);
+        try self.markAll();
+
+        // Phase 2 — scan: a candidate whose trial count survived > 0 is
+        // externally referenced; restore it and its subgraph (black). The
+        // rest go white (tentative garbage).
+        try self.scanAll();
+
+        // Phase 3 — collect: nodes still white are cyclic garbage.
+        try self.collectWhite();
+
         return self.white_set.items;
+    }
+
+    /// Insert a node into the scratch table if absent, sampling its real
+    /// refcount once. Returns a pointer to the (new or existing) state.
+    fn ensureNode(self: *Engine, info: Candidate, candidate_index: ?usize) error{OutOfMemory}!*NodeState {
+        const key = @intFromPtr(info.object);
+        const gop = try self.nodes.getOrPut(self.allocator, key);
+        if (!gop.found_existing) {
+            const rc = info.refcount_read(info.object, info.size, info.alignment);
+            gop.value_ptr.* = .{
+                .candidate_index = candidate_index,
+                .real_rc = rc,
+                .trial_rc = @intCast(rc),
+                .color = .gray,
+                .scanned = false,
+                .info = info,
+            };
+        } else if (candidate_index != null and gop.value_ptr.candidate_index == null) {
+            // A node first discovered as a child is later found to also be a
+            // candidate root — record its candidate index + carry the richer
+            // attribution (type/backtrace) from the candidate record.
+            gop.value_ptr.candidate_index = candidate_index;
+            gop.value_ptr.info = info;
+        }
+        return gop.value_ptr;
+    }
+
+    fn seedCandidates(self: *Engine, candidates: []const Candidate) error{OutOfMemory}!void {
+        for (candidates, 0..) |cand, i| {
+            _ = try self.ensureNode(cand, i);
+        }
+    }
+
+    // ----- Mark -----------------------------------------------------------
+    //
+    // For every node in the table, walk its children ONCE and trial-
+    // decrement each child that is a tracked node. A child not yet in the
+    // table is added (a reachable non-candidate) and then decremented. The
+    // single-visit guard is the `gray`+marked flag: Bacon–Rajan marks each
+    // node gray exactly once.
+
+    const MarkCtx = struct { engine: *Engine };
+
+    fn markVisitor(visitor_ctx: ?*anyopaque, child: *const ChildRef) callconv(.c) void {
+        const ctx: *MarkCtx = @ptrCast(@alignCast(visitor_ctx.?));
+        const self = ctx.engine;
+        if (self.oom) return;
+        const child_info: Candidate = .{
+            .object = child.object,
+            .size = child.size,
+            .alignment = child.alignment,
+            .refcount_read = child.refcount_read,
+            .cycle_walk = child.cycle_walk,
+            .type_name_ptr = child.type_name_ptr,
+            .type_name_len = child.type_name_len,
+        };
+        const state = self.ensureNode(child_info, null) catch {
+            self.oom = true;
+            return;
+        };
+        // Trial-decrement: this edge is internal to the candidate-reachable
+        // subgraph, so "delete" it.
+        state.trial_rc -= 1;
+    }
+
+    fn markAll(self: *Engine) error{OutOfMemory}!void {
+        // The mark walk may add new (child) nodes to the table mid-iteration,
+        // which would invalidate a live iterator. Work over a worklist of
+        // object keys, draining newly-discovered nodes until fixpoint.
+        var worklist: std.ArrayListUnmanaged(usize) = .empty;
+        defer worklist.deinit(self.allocator);
+
+        var it = self.nodes.keyIterator();
+        while (it.next()) |k| try worklist.append(self.allocator, k.*);
+
+        var marked: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        defer marked.deinit(self.allocator);
+
+        var ctx: MarkCtx = .{ .engine = self };
+        var head: usize = 0;
+        while (head < worklist.items.len) : (head += 1) {
+            const key = worklist.items[head];
+            if (marked.contains(key)) continue;
+            try marked.put(self.allocator, key, {});
+
+            const before_count = self.nodes.count();
+            const state = self.nodes.getPtr(key).?;
+            if (state.info.cycle_walk) |walk| {
+                walk(state.info.object, &ctx, markVisitor);
+                if (self.oom) return error.OutOfMemory;
+            }
+            // If the walk discovered new nodes, enqueue them so their own
+            // children get marked too.
+            if (self.nodes.count() != before_count) {
+                var new_it = self.nodes.keyIterator();
+                while (new_it.next()) |nk| {
+                    if (!marked.contains(nk.*)) {
+                        var already_queued = false;
+                        for (worklist.items[head + 1 ..]) |q| {
+                            if (q == nk.*) {
+                                already_queued = true;
+                                break;
+                            }
+                        }
+                        if (!already_queued) try worklist.append(self.allocator, nk.*);
+                    }
+                }
+            }
+        }
+    }
+
+    // ----- Scan -----------------------------------------------------------
+    //
+    // For each node: if its trial count is > 0 it is held by an external
+    // reference → ScanBlack (restore it and re-increment every child,
+    // recursively restoring the reachable subgraph). Otherwise it is
+    // tentatively white. Scanning is idempotent via the `scanned` flag.
+
+    const ScanCtx = struct { engine: *Engine, mode: enum { scan, black } };
+
+    fn scanAll(self: *Engine) error{OutOfMemory}!void {
+        // Deterministic scan order: by object pointer. (The set of white
+        // nodes is order-independent, but a fixed order keeps any future
+        // order-sensitive instrumentation stable.)
+        var keys: std.ArrayListUnmanaged(usize) = .empty;
+        defer keys.deinit(self.allocator);
+        var it = self.nodes.keyIterator();
+        while (it.next()) |k| try keys.append(self.allocator, k.*);
+        std.mem.sort(usize, keys.items, {}, std.sort.asc(usize));
+
+        for (keys.items) |key| {
+            try self.scanNode(key);
+            if (self.oom) return error.OutOfMemory;
+        }
+    }
+
+    fn scanNode(self: *Engine, key: usize) error{OutOfMemory}!void {
+        const state = self.nodes.getPtr(key) orelse return;
+        if (state.scanned) return;
+        if (state.trial_rc > 0) {
+            try self.scanBlack(key);
+        } else {
+            state.color = .white;
+            state.scanned = true;
+            // Recurse into children so they also get scanned.
+            var ctx: ScanCtx = .{ .engine = self, .mode = .scan };
+            if (state.info.cycle_walk) |walk| {
+                walk(state.info.object, &ctx, scanVisitor);
+                if (self.oom) return error.OutOfMemory;
+            }
+        }
+    }
+
+    fn scanBlack(self: *Engine, key: usize) error{OutOfMemory}!void {
+        const state = self.nodes.getPtr(key) orelse return;
+        // Restoring a node: paint it black and mark scanned. Re-incrementing
+        // its children's trial counts + recursively blackening them undoes
+        // the trial deletion for the externally-referenced subgraph.
+        state.color = .black;
+        state.scanned = true;
+        var ctx: ScanCtx = .{ .engine = self, .mode = .black };
+        if (state.info.cycle_walk) |walk| {
+            walk(state.info.object, &ctx, scanVisitor);
+            if (self.oom) return error.OutOfMemory;
+        }
+    }
+
+    fn scanVisitor(visitor_ctx: ?*anyopaque, child: *const ChildRef) callconv(.c) void {
+        const ctx: *ScanCtx = @ptrCast(@alignCast(visitor_ctx.?));
+        const self = ctx.engine;
+        if (self.oom) return;
+        const key = @intFromPtr(child.object);
+        const state = self.nodes.getPtr(key) orelse return;
+        switch (ctx.mode) {
+            .scan => {
+                // Plain scan recursion: scan the child (black if it itself
+                // survived, white otherwise).
+                self.scanNode(key) catch {
+                    self.oom = true;
+                };
+            },
+            .black => {
+                // Restore the edge we trial-deleted, then ensure the child
+                // is black (it is reachable from an externally-referenced
+                // node, so it is live too).
+                state.trial_rc += 1;
+                if (state.color != .black) {
+                    self.scanBlack(key) catch {
+                        self.oom = true;
+                    };
+                }
+            },
+        }
+    }
+
+    // ----- Collect --------------------------------------------------------
+
+    fn collectWhite(self: *Engine) error{OutOfMemory}!void {
+        var it = self.nodes.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.color == .white) {
+                try self.white_set.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+        std.mem.sort(usize, self.white_set.items, {}, std.sort.asc(usize));
+    }
+
+    /// Look up the scratch state for an object pointer (the report builder
+    /// reads `info`/`size`/`type_name` for each white member). Returns null
+    /// for a pointer that was not part of this pass.
+    pub fn nodeInfo(self: *const Engine, object: *anyopaque) ?Candidate {
+        const state = self.nodes.get(@intFromPtr(object)) orelse return null;
+        return state.info;
     }
 };
 
@@ -266,7 +539,19 @@ fn testRefcountRead(object: *anyopaque, size: usize, alignment: u32) callconv(.c
 fn testCycleWalk(object: *anyopaque, visitor_ctx: ?*anyopaque, visitor: CycleChildVisitor) callconv(.c) void {
     const node: *TestNode = @ptrCast(@alignCast(object));
     for (node.edges) |maybe_edge| {
-        if (maybe_edge) |edge| visitor(visitor_ctx, @ptrCast(edge));
+        if (maybe_edge) |edge| {
+            // Every edge target is itself a `TestNode`, so its child
+            // descriptor uses the same size/alignment/walk/reader. This is
+            // the comptime-known-child-type case from `releaseFieldChildAny`.
+            const child_ref: ChildRef = .{
+                .object = @ptrCast(edge),
+                .size = @sizeOf(TestNode),
+                .alignment = @alignOf(TestNode),
+                .refcount_read = testRefcountRead,
+                .cycle_walk = testCycleWalk,
+            };
+            visitor(visitor_ctx, &child_ref);
+        }
     }
 }
 
@@ -298,4 +583,149 @@ test "trial deletion detects a 2-node mutual reference cycle" {
 
     // Both nodes are cyclic garbage.
     try testing.expectEqual(@as(usize, 2), garbage.len);
+    try testing.expect(containsPtr(garbage, &a));
+    try testing.expect(containsPtr(garbage, &b));
+}
+
+fn containsPtr(set: []const usize, node: anytype) bool {
+    const want = @intFromPtr(node);
+    for (set) |p| if (p == want) return true;
+    return false;
+}
+
+test "trial deletion detects a self-cycle (node pointing at itself)" {
+    // A single node holding a reference to itself: rc == 1, the one
+    // reference being the self-edge. Pure garbage with no external owner.
+    var a: TestNode = .{ .rc = 1 };
+    a.edges[0] = &a;
+
+    var engine = Engine.init(testing.allocator);
+    defer engine.deinit();
+
+    const candidates = [_]Candidate{testCandidate(&a)};
+    const garbage = try engine.detect(&candidates);
+
+    try testing.expectEqual(@as(usize, 1), garbage.len);
+    try testing.expect(containsPtr(garbage, &a));
+}
+
+test "trial deletion detects a 3-node ring" {
+    // a -> b -> c -> a, each rc == 1 from its single incoming ring edge.
+    var a: TestNode = .{ .rc = 1 };
+    var b: TestNode = .{ .rc = 1 };
+    var c: TestNode = .{ .rc = 1 };
+    a.edges[0] = &b;
+    b.edges[0] = &c;
+    c.edges[0] = &a;
+
+    var engine = Engine.init(testing.allocator);
+    defer engine.deinit();
+
+    const candidates = [_]Candidate{ testCandidate(&a), testCandidate(&b), testCandidate(&c) };
+    const garbage = try engine.detect(&candidates);
+
+    try testing.expectEqual(@as(usize, 3), garbage.len);
+    try testing.expect(containsPtr(garbage, &a));
+    try testing.expect(containsPtr(garbage, &b));
+    try testing.expect(containsPtr(garbage, &c));
+}
+
+test "no false positive: externally-referenced acyclic graph is NOT collected" {
+    // a -> b -> c, a chain held by an EXTERNAL owner (a.rc == 2: one from
+    // the outside world, one would-be from a parent — here just the extra
+    // external count). b.rc == 1 (from a), c.rc == 1 (from b). No cycle.
+    // Trial deletion must leave nothing white.
+    var a: TestNode = .{ .rc = 2 }; // +1 external reference
+    var b: TestNode = .{ .rc = 1 };
+    var c: TestNode = .{ .rc = 1 };
+    a.edges[0] = &b;
+    b.edges[0] = &c;
+
+    var engine = Engine.init(testing.allocator);
+    defer engine.deinit();
+
+    const candidates = [_]Candidate{ testCandidate(&a), testCandidate(&b), testCandidate(&c) };
+    const garbage = try engine.detect(&candidates);
+
+    try testing.expectEqual(@as(usize, 0), garbage.len);
+}
+
+test "no false positive: a cycle reachable from a live external owner is NOT collected" {
+    // root -> a,  a <-> b  (a and b form a cycle, but `a` ALSO has an
+    // external reference via root). a.rc == 2 (b's edge + root's edge),
+    // b.rc == 1 (a's edge), root.rc == 1 (external). Because the cycle is
+    // kept alive from outside, it is live — NOT garbage.
+    var root: TestNode = .{ .rc = 1 };
+    var a: TestNode = .{ .rc = 2 };
+    var b: TestNode = .{ .rc = 1 };
+    root.edges[0] = &a;
+    a.edges[0] = &b;
+    b.edges[0] = &a;
+
+    var engine = Engine.init(testing.allocator);
+    defer engine.deinit();
+
+    // root is the candidate (it was released-to-positive); a and b are
+    // discovered through the walk. None should be collected.
+    const candidates = [_]Candidate{ testCandidate(&root), testCandidate(&a), testCandidate(&b) };
+    const garbage = try engine.detect(&candidates);
+
+    try testing.expectEqual(@as(usize, 0), garbage.len);
+}
+
+test "mixed graph: isolated cycle collected, external acyclic subtree spared" {
+    // Cycle: x <-> y (x.rc==1, y.rc==1) — pure garbage.
+    // Separate live chain: p -> q held externally (p.rc==2, q.rc==1).
+    // Only x and y are collected.
+    var x: TestNode = .{ .rc = 1 };
+    var y: TestNode = .{ .rc = 1 };
+    x.edges[0] = &y;
+    y.edges[0] = &x;
+
+    var p: TestNode = .{ .rc = 2 }; // +1 external
+    var q: TestNode = .{ .rc = 1 };
+    p.edges[0] = &q;
+
+    var engine = Engine.init(testing.allocator);
+    defer engine.deinit();
+
+    const candidates = [_]Candidate{
+        testCandidate(&x), testCandidate(&y),
+        testCandidate(&p), testCandidate(&q),
+    };
+    const garbage = try engine.detect(&candidates);
+
+    try testing.expectEqual(@as(usize, 2), garbage.len);
+    try testing.expect(containsPtr(garbage, &x));
+    try testing.expect(containsPtr(garbage, &y));
+    try testing.expect(!containsPtr(garbage, &p));
+    try testing.expect(!containsPtr(garbage, &q));
+}
+
+test "result is deterministic: white set is pointer-sorted ascending" {
+    var a: TestNode = .{ .rc = 1 };
+    var b: TestNode = .{ .rc = 1 };
+    a.edges[0] = &b;
+    b.edges[0] = &a;
+
+    var engine = Engine.init(testing.allocator);
+    defer engine.deinit();
+
+    const candidates = [_]Candidate{ testCandidate(&a), testCandidate(&b) };
+    const garbage = try engine.detect(&candidates);
+    try testing.expectEqual(@as(usize, 2), garbage.len);
+    // Sorted ascending regardless of candidate order.
+    try testing.expect(garbage[0] < garbage[1]);
+}
+
+test "flat candidate with no children is never garbage" {
+    // A node with no cycle_walk (flat type) cannot participate in a cycle.
+    var a: TestNode = .{ .rc = 1 };
+    var engine = Engine.init(testing.allocator);
+    defer engine.deinit();
+    var cand = testCandidate(&a);
+    cand.cycle_walk = null;
+    const candidates = [_]Candidate{cand};
+    const garbage = try engine.detect(&candidates);
+    try testing.expectEqual(@as(usize, 0), garbage.len);
 }
