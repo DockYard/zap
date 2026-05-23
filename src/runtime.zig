@@ -4084,6 +4084,10 @@ pub const ArcRuntime = struct {
             // user's construction site. Folds to nothing under non-tracking
             // managers (`leak_attribution_active == false`).
             annotateAllocationForLeakTracking(T, @ptrCast(slot), 1);
+            // Phase 4.d: register this cell for cycle detection with its
+            // per-type non-destructive child walk. Folds to nothing when
+            // cycle detection is not compiled in (non-tracking builds).
+            registerCycleNode(T, @ptrCast(slot));
             return slot;
         }
         if (active_manager_state.shutdown_complete) {
@@ -4624,6 +4628,11 @@ pub const ArcRuntime = struct {
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
         const raw: [*]u8 = @ptrCast(@constCast(ptr));
+        // Phase 4.d: drop this cell from the cycle registry before its memory
+        // is reclaimed, keeping the registry's live-set in sync (so a freed
+        // pointer is never walked at deinit). Folds away in non-tracking
+        // builds.
+        unregisterCycleNode(@intFromPtr(raw));
         if (comptime !active_manager_source_available) {
             const core = active_manager_state.core orelse
                 @panic("zap runtime: freeAny dispatched with no active memory manager");
@@ -8852,7 +8861,12 @@ fn renderRecordJson(record: *const AbiV1.ZapLeakRecord, leak_index: ?usize) void
 fn finishLeakReport(sink_ctx: ?*anyopaque) callconv(.c) void {
     _ = sink_ctx;
     resolveLeakReportConfig();
-    if (leak_report_state.count == 0 and !leak_report_state.overflowed) return;
+    if (leak_report_state.count == 0 and !leak_report_state.overflowed) {
+        // No plain leaks. A cycle member is itself a leak (it is never
+        // released), so a leak-free program is also cycle-free — running the
+        // detector would find nothing. Skip it to keep a clean program silent.
+        return;
+    }
 
     std.sort.pdq(AccumulatedLeak, leak_report_state.leaks[0..leak_report_state.count], {}, leakSortLessThan);
 
@@ -8889,6 +8903,14 @@ fn finishLeakReport(sink_ctx: ?*anyopaque) callconv(.c) void {
         renderLeakSummary();
     }
 
+    // Phase 4.d: among the survivors, surface any held alive ONLY by a
+    // reference cycle as a `domain=cycle` diagnostic (a cyclic survivor is a
+    // leak AND a cycle). Opt-in under Tracking via `ZAP_CYCLE_CHECK` (see
+    // `runCycleDetectionAndReport`); a no-op — no output — when disabled,
+    // nothing registered, or no cycle is present. Folds away under non-tracking
+    // managers.
+    runCycleDetectionAndReport();
+
     if (leak_report_state.fatal) {
         // CI mode: a leak is a hard failure. Flush stdout first so any
         // program output already buffered is not lost, then exit non-zero
@@ -8902,6 +8924,631 @@ fn finishLeakReport(sink_ctx: ?*anyopaque) callconv(.c) void {
 /// Process exit code used by `--leaks-fatal` when a leak survives. Distinct
 /// from the crash codes (`1`, `137`) so CI can attribute the failure.
 const ZAP_LEAKS_FATAL_EXIT_CODE: u8 = 7;
+
+// ===========================================================================
+// Phase 4.d — Bacon–Rajan synchronous cycle detector (runtime integration).
+//
+// `src/memory/cycle_detector.zig` is the ALGORITHM + report-shape REFERENCE
+// (host-test graph, 17 unit tests pinning trial-deletion correctness, the
+// false-positive controls, the zero-hot-path purple-buffer rule, and the
+// exact domain=cycle text + JSON). It cannot be `@import`ed here: `runtime.zig`
+// is `@embedFile`'d and injected as a standalone source string into every Zap
+// user binary, so a relative sibling import does not resolve in the embedded
+// context (same reason the file cannot `@import("env.zig")`). The production
+// integration is therefore re-stated here, kept in lock-step with the
+// reference by the drift-guard test `tools/cycle_detector_drift_test.zig`.
+//
+// ## Activation (zero cost off)
+//
+// The whole subsystem is gated on `leak_attribution_active` — comptime-true
+// ONLY under `Memory.Tracking`. Under `Memory.ARC` / `Arena` / `NoOp` (and the
+// host test build, which registers the ARC source) every decl below folds away
+// and no allocation touches the registry: production ARC pays NOTHING. Under
+// Tracking the detector is default-on and runs over the deinit live-set (the
+// candidate roots = every survivor). The `-Denable-cycle-check` / ZAP_CYCLE_CHECK
+// opt-in governs the ARC purple-buffer path (the manager-side hook), which is a
+// separate, comptime-gated mechanism in `src/memory/arc/manager.zig`.
+//
+// ## Why a runtime-side registry rather than reusing the live map
+//
+// The cycle walk needs each object's per-TYPE child enumerator
+// (`CycleWalkFnFor(T)`), which is only knowable at the allocation site (where
+// `T` is a comptime parameter). The manager's live map stores type-erased
+// records and cannot synthesize the walk. The runtime therefore keeps a
+// parallel registry, keyed by user pointer, populated next to the Phase 4.c
+// leak-attribution hook in `allocAny` and removed in the matching free — so the
+// walk closure travels with the allocation without widening the manager ABI.
+// ===========================================================================
+
+/// Comptime-true when the cycle-detection runtime subsystem is compiled in.
+/// Tied to leak attribution (Tracking) so it folds away everywhere else.
+pub const cycle_detection_active: bool = leak_attribution_active;
+
+/// One registered cycle-detection node: the per-type non-destructive child
+/// walk + the metadata the report needs. Mirrors
+/// `cycle_detector.Candidate` (drift-guarded).
+const CycleNode = struct {
+    size: usize,
+    alignment: u32,
+    /// Non-destructive child enumerator for this node's concrete type, or
+    /// null when the type has no ARC children (cannot be in a cycle).
+    cycle_walk: ?CycleWalkFnRt,
+    type_name_ptr: ?[*]const u8,
+    type_name_len: usize,
+};
+
+/// A fully-described child edge yielded by a runtime `CycleWalkFnRt`. Mirror
+/// of `cycle_detector.ChildRef`.
+pub const CycleChildRt = extern struct {
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+    cycle_walk: ?CycleWalkFnRt,
+    type_name_ptr: ?[*]const u8,
+    type_name_len: usize,
+};
+
+pub const CycleChildVisitorRt = *const fn (visitor_ctx: ?*anyopaque, child: *const CycleChildRt) callconv(.c) void;
+pub const CycleWalkFnRt = *const fn (object: *anyopaque, visitor_ctx: ?*anyopaque, visitor: CycleChildVisitorRt) callconv(.c) void;
+
+/// Build the non-destructive per-type child enumerator for `T`. The
+/// production sibling of `cycle_detector.CycleWalkFn`: it walks EXACTLY the
+/// ARC children that `releaseChildrenAny(T, ...)` would release — the
+/// `.pointer(.one)` / `ProtocolBox` / nested-aggregate / active-union-variant
+/// leaves — but instead of releasing each child it emits a fully-populated
+/// `CycleChildRt` (the child's own size/alignment/walk/type, synthesized from
+/// the child field's comptime-known static type) to the visitor. Returns null
+/// for a flat type so the registry stores no walk (and the node is trivially
+/// acyclic). Only instantiated under `cycle_detection_active`.
+fn CycleWalkFnForRt(comptime T: type) ?CycleWalkFnRt {
+    if (comptime !ArcRuntime.typeHasArcChildren(T)) return null;
+    const CycleWalkClosure = struct {
+        fn walk(object: *anyopaque, visitor_ctx: ?*anyopaque, visitor: CycleChildVisitorRt) callconv(.c) void {
+            const typed: *const T = @ptrCast(@alignCast(object));
+            cycleWalkChildren(T, typed, visitor_ctx, visitor);
+        }
+    };
+    return CycleWalkClosure.walk;
+}
+
+/// Comptime field/variant recursion mirroring `releaseChildrenAny`, emitting a
+/// `CycleChildRt` per ARC child pointer instead of releasing it. Reads through
+/// a `*const T` pointer and only ever touches the bytes at genuine ARC-child
+/// field offsets — it never copies the whole aggregate by value, so a cell
+/// whose tail bytes are uninitialised/padding is never materialised.
+fn cycleWalkChildren(comptime T: type, value_ptr: *const T, visitor_ctx: ?*anyopaque, visitor: CycleChildVisitorRt) void {
+    if (comptime ArcRuntime.isProtocolBox(T)) {
+        // A `ProtocolBox` is a protocol existential: its inner cell is reached
+        // through the vtable, and its concrete type is erased. Such a box
+        // cannot itself close a reference cycle without a TYPED back-edge from
+        // the inner value back to the box — and typed mutable back-edges only
+        // exist once Phase 5 lands mutation / `weak`. Until then a `ProtocolBox`
+        // is a cycle LEAF: do NOT follow `data_ptr` (the inner may be in a
+        // partially-released state at deinit, so dereferencing it as a cycle
+        // node is both unnecessary and unsafe). When Phase 5 introduces typed
+        // back-edges, this is where the box's inner is followed through its
+        // vtable's type tag. See Phase-4 gap #207 + the brief's Phase 5 note.
+        return;
+    }
+    if (comptime !ArcRuntime.typeHasArcChildren(T)) return;
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| {
+            inline for (s.fields) |field| {
+                cycleWalkFieldChild(field.type, &@field(value_ptr.*, field.name), visitor_ctx, visitor);
+            }
+        },
+        .@"union" => {
+            const active = std.meta.activeTag(value_ptr.*);
+            inline for (std.meta.fields(T)) |field| {
+                if (active == @field(std.meta.Tag(T), field.name)) {
+                    cycleWalkFieldChild(field.type, &@field(value_ptr.*, field.name), visitor_ctx, visitor);
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+fn cycleWalkFieldChild(comptime FieldType: type, value_ptr: *const FieldType, visitor_ctx: ?*anyopaque, visitor: CycleChildVisitorRt) void {
+    if (comptime ArcRuntime.isProtocolBox(FieldType)) {
+        // Cycle leaf — see the `isProtocolBox` rationale in `cycleWalkChildren`.
+        return;
+    }
+    switch (@typeInfo(FieldType)) {
+        .optional => |opt| {
+            if (value_ptr.*) |inner| {
+                // Re-take the address of the unwrapped payload. For an
+                // optional pointer the payload IS the pointer value; for an
+                // optional aggregate we need a stable address, so bind it.
+                var bound = inner;
+                cycleWalkFieldChild(opt.child, &bound, visitor_ctx, visitor);
+            }
+        },
+        .pointer => |p| {
+            if (p.size == .one) {
+                const Child = p.child;
+                const name = comptime zapTypeDisplayName(Child);
+                const child: CycleChildRt = .{
+                    .object = @constCast(@ptrCast(value_ptr.*)),
+                    .size = @sizeOf(Child),
+                    .alignment = @alignOf(Child),
+                    .cycle_walk = CycleWalkFnForRt(Child),
+                    .type_name_ptr = if (name.len == 0) null else name.ptr,
+                    .type_name_len = name.len,
+                };
+                visitor(visitor_ctx, &child);
+            }
+        },
+        .@"struct", .@"union" => cycleWalkChildren(FieldType, value_ptr, visitor_ctx, visitor),
+        else => {},
+    }
+}
+
+/// Refcount reader used by the runtime cycle engine. Under Tracking there are
+/// no refcounts (every audited allocation flowed through `core.allocate` with
+/// construction-count 1), so the live-set survivor count is `1`. The engine's
+/// trial deletion then correctly classifies: a survivor whose only references
+/// are internal cycle edges trial-decrements to 0 (garbage); one with an
+/// external owner stays > 0 (the leak report already covers plain leaks).
+fn cycleRefcountReadRt(object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32 {
+    _ = object;
+    _ = size;
+    _ = alignment;
+    return 1;
+}
+
+/// The runtime cycle-node registry. A pointer-keyed map of every live
+/// attributed allocation's `CycleNode`. Only present under
+/// `cycle_detection_active`; an empty placeholder type otherwise so no storage
+/// is reserved in non-tracking builds.
+const CycleRegistry = if (cycle_detection_active) struct {
+    map: std.AutoHashMapUnmanaged(usize, CycleNode) = .empty,
+    lock: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+} else struct {};
+
+var cycle_registry: CycleRegistry = .{};
+
+fn cycleRegistryLock() void {
+    if (comptime !cycle_detection_active) return;
+    while (@cmpxchgStrong(u8, &cycle_registry.lock.raw, 0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn cycleRegistryUnlock() void {
+    if (comptime !cycle_detection_active) return;
+    @atomicStore(u8, &cycle_registry.lock.raw, 0, .release);
+}
+
+/// Register a freshly-allocated `T` cell for cycle detection. Called inline
+/// next to `annotateAllocationForLeakTracking` in `allocAny` (comptime-T).
+/// Folds to nothing when cycle detection is not compiled in.
+inline fn registerCycleNode(comptime T: type, user_ptr: [*]u8) void {
+    if (comptime !cycle_detection_active) return;
+    const name = comptime zapTypeDisplayName(T);
+    const node: CycleNode = .{
+        .size = @sizeOf(T),
+        .alignment = @alignOf(T),
+        .cycle_walk = CycleWalkFnForRt(T),
+        .type_name_ptr = if (name.len == 0) null else name.ptr,
+        .type_name_len = name.len,
+    };
+    cycleRegistryLock();
+    defer cycleRegistryUnlock();
+    cycle_registry.map.put(std.heap.page_allocator, @intFromPtr(user_ptr), node) catch {};
+}
+
+/// Remove a cell from the cycle registry on free. Called in the matching
+/// free path before `core.deallocate`.
+inline fn unregisterCycleNode(user_ptr: usize) void {
+    if (comptime !cycle_detection_active) return;
+    cycleRegistryLock();
+    defer cycleRegistryUnlock();
+    _ = cycle_registry.map.remove(user_ptr);
+}
+
+/// Ask the active manager whether `ptr` is a currently-live allocation. This
+/// is the MEMORY-SAFETY GATE for the cycle walk: the engine dereferences a
+/// cell's children ONLY when the manager confirms the cell is live, so a stale
+/// registry entry (a pointer freed via a path the unregister hook did not
+/// cover) is never followed. When the manager does not expose `isPointerLive`,
+/// fall back to "registered ⇒ live" (the registry is then the authority).
+fn cyclePointerIsLive(ptr: usize) bool {
+    if (comptime !cycle_detection_active) return false;
+    if (comptime @hasDecl(active_manager, "isPointerLive")) {
+        const ctx = active_manager_state.context orelse return false;
+        return active_manager.isPointerLive(ctx, ptr);
+    }
+    cycleRegistryLock();
+    defer cycleRegistryUnlock();
+    return cycle_registry.map.contains(ptr);
+}
+
+/// Per-node trial-deletion scratch state (runtime mirror of
+/// `cycle_detector.NodeState`).
+const CycleScanState = struct {
+    real_rc: u32,
+    trial_rc: i64,
+    color: enum { gray, black, white },
+    scanned: bool,
+    node: CycleNode,
+    object: *anyopaque,
+};
+
+/// Compact runtime port of the Bacon–Rajan trial-deletion engine
+/// (`cycle_detector.Engine`). Operates over candidate object pointers, looking
+/// each up in `cycle_registry`, and returns the white (cyclic-garbage) set.
+/// Only compiled under `cycle_detection_active`.
+const CycleEngine = struct {
+    nodes: std.AutoHashMapUnmanaged(usize, CycleScanState) = .empty,
+    white_set: std.ArrayListUnmanaged(usize) = .empty,
+    oom: bool = false,
+
+    fn deinit(self: *CycleEngine) void {
+        self.nodes.deinit(std.heap.page_allocator);
+        self.white_set.deinit(std.heap.page_allocator);
+    }
+
+    /// Insert (or find) a scratch node for `object`. The CRITICAL safety
+    /// invariant: the node's `cycle_walk` — the only thing that will later
+    /// DEREFERENCE `object` — is taken from the live registry, NEVER from the
+    /// caller-supplied `fallback`. A child discovered through a walk whose
+    /// pointer is NOT a registered live cell (a freed cell, an untracked
+    /// allocation, a `ProtocolBox` inner managed by its vtable rather than as
+    /// a plain ARC cell) is therefore recorded as a LEAF (`cycle_walk == null`)
+    /// and counted for trial-decrement, but is never walked into. This is what
+    /// makes the deinit-time walk memory-safe: the engine only ever
+    /// dereferences cells the registry confirms are still live.
+    fn ensureNode(self: *CycleEngine, object: *anyopaque, fallback: CycleNode) ?*CycleScanState {
+        const key = @intFromPtr(object);
+        const gop = self.nodes.getOrPut(std.heap.page_allocator, key) catch {
+            self.oom = true;
+            return null;
+        };
+        if (!gop.found_existing) {
+            // Authoritative node from the registry when this object is a live
+            // tracked cell; otherwise the fallback with its walk neutralised.
+            const registered: ?CycleNode = blk: {
+                cycleRegistryLock();
+                defer cycleRegistryUnlock();
+                break :blk cycle_registry.map.get(key);
+            };
+            // MEMORY-SAFETY GATE: only retain a walkable `cycle_walk` when the
+            // manager confirms this cell is still live. A registered-but-freed
+            // pointer (stale entry) is recorded as an opaque leaf — counted for
+            // trial-decrement, never dereferenced.
+            const live = cyclePointerIsLive(key);
+            const node: CycleNode = if (registered != null and live) registered.? else .{
+                .size = if (registered) |r| r.size else fallback.size,
+                .alignment = if (registered) |r| r.alignment else fallback.alignment,
+                .cycle_walk = null, // not confirmed-live ⇒ opaque leaf, never walked
+                .type_name_ptr = if (registered) |r| r.type_name_ptr else fallback.type_name_ptr,
+                .type_name_len = if (registered) |r| r.type_name_len else fallback.type_name_len,
+            };
+            const rc = cycleRefcountReadRt(object, node.size, node.alignment);
+            gop.value_ptr.* = .{
+                .real_rc = rc,
+                .trial_rc = @intCast(rc),
+                .color = .gray,
+                .scanned = false,
+                .node = node,
+                .object = object,
+            };
+        }
+        return gop.value_ptr;
+    }
+
+    fn markVisitor(visitor_ctx: ?*anyopaque, child: *const CycleChildRt) callconv(.c) void {
+        const self: *CycleEngine = @ptrCast(@alignCast(visitor_ctx.?));
+        if (self.oom) return;
+        const fallback: CycleNode = .{
+            .size = child.size,
+            .alignment = child.alignment,
+            .cycle_walk = child.cycle_walk,
+            .type_name_ptr = child.type_name_ptr,
+            .type_name_len = child.type_name_len,
+        };
+        const state = self.ensureNode(child.object, fallback) orelse return;
+        state.trial_rc -= 1;
+    }
+
+    fn scanVisitor(visitor_ctx: ?*anyopaque, child: *const CycleChildRt) callconv(.c) void {
+        const self: *CycleEngine = @ptrCast(@alignCast(visitor_ctx.?));
+        if (self.oom) return;
+        const state = self.nodes.getPtr(@intFromPtr(child.object)) orelse return;
+        _ = state;
+        self.scanNode(@intFromPtr(child.object));
+    }
+
+    fn scanBlackVisitor(visitor_ctx: ?*anyopaque, child: *const CycleChildRt) callconv(.c) void {
+        const self: *CycleEngine = @ptrCast(@alignCast(visitor_ctx.?));
+        if (self.oom) return;
+        const key = @intFromPtr(child.object);
+        const state = self.nodes.getPtr(key) orelse return;
+        state.trial_rc += 1;
+        if (state.color != .black) self.scanBlack(key);
+    }
+
+    fn markAll(self: *CycleEngine) void {
+        // Worklist over object keys; the mark walk may insert child nodes, so
+        // collect keys first and drain to fixpoint (mirrors the reference).
+        var worklist: std.ArrayListUnmanaged(usize) = .empty;
+        defer worklist.deinit(std.heap.page_allocator);
+        var marked: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        defer marked.deinit(std.heap.page_allocator);
+        {
+            var it = self.nodes.keyIterator();
+            while (it.next()) |k| worklist.append(std.heap.page_allocator, k.*) catch {
+                self.oom = true;
+                return;
+            };
+        }
+        var head: usize = 0;
+        while (head < worklist.items.len) : (head += 1) {
+            const key = worklist.items[head];
+            if (marked.contains(key)) continue;
+            marked.put(std.heap.page_allocator, key, {}) catch {
+                self.oom = true;
+                return;
+            };
+            const before = self.nodes.count();
+            const state = self.nodes.getPtr(key).?;
+            if (state.node.cycle_walk) |walk| {
+                walk(state.object, self, markVisitor);
+                if (self.oom) return;
+            }
+            if (self.nodes.count() != before) {
+                var it = self.nodes.keyIterator();
+                while (it.next()) |nk| {
+                    if (!marked.contains(nk.*)) worklist.append(std.heap.page_allocator, nk.*) catch {
+                        self.oom = true;
+                        return;
+                    };
+                }
+            }
+        }
+    }
+
+    fn scanNode(self: *CycleEngine, key: usize) void {
+        const state = self.nodes.getPtr(key) orelse return;
+        if (state.scanned) return;
+        if (state.trial_rc > 0) {
+            self.scanBlack(key);
+        } else {
+            state.color = .white;
+            state.scanned = true;
+            if (state.node.cycle_walk) |walk| walk(state.object, self, scanVisitor);
+        }
+    }
+
+    fn scanBlack(self: *CycleEngine, key: usize) void {
+        const state = self.nodes.getPtr(key) orelse return;
+        state.color = .black;
+        state.scanned = true;
+        if (state.node.cycle_walk) |walk| walk(state.object, self, scanBlackVisitor);
+    }
+
+    fn scanAll(self: *CycleEngine) void {
+        var keys: std.ArrayListUnmanaged(usize) = .empty;
+        defer keys.deinit(std.heap.page_allocator);
+        {
+            var it = self.nodes.keyIterator();
+            while (it.next()) |k| keys.append(std.heap.page_allocator, k.*) catch {
+                self.oom = true;
+                return;
+            };
+        }
+        std.mem.sort(usize, keys.items, {}, std.sort.asc(usize));
+        for (keys.items) |key| {
+            self.scanNode(key);
+            if (self.oom) return;
+        }
+    }
+
+    fn collectWhite(self: *CycleEngine) void {
+        var it = self.nodes.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.color == .white) {
+                self.white_set.append(std.heap.page_allocator, entry.key_ptr.*) catch {
+                    self.oom = true;
+                    return;
+                };
+            }
+        }
+        std.mem.sort(usize, self.white_set.items, {}, std.sort.asc(usize));
+    }
+
+    /// Seed from candidate object pointers (looked up in the registry), run
+    /// mark/scan/collect, and return the cyclic-garbage white set.
+    fn detect(self: *CycleEngine, candidates: []const usize) []const usize {
+        for (candidates) |obj_key| {
+            const node = blk: {
+                cycleRegistryLock();
+                defer cycleRegistryUnlock();
+                break :blk cycle_registry.map.get(obj_key) orelse continue;
+            };
+            _ = self.ensureNode(@ptrFromInt(obj_key), node);
+            if (self.oom) return self.white_set.items;
+        }
+        self.markAll();
+        if (self.oom) return self.white_set.items;
+        self.scanAll();
+        if (self.oom) return self.white_set.items;
+        self.collectWhite();
+        return self.white_set.items;
+    }
+};
+
+/// Render the `domain=cycle` report header + retain path + per-member detail +
+/// footer through `posixWrite`, reusing the unified visual language (the SAME
+/// glyphs the leak report and `cycle_detector.renderReport` use). `members` is
+/// the white set; each member's type/size/site is read from its scan state.
+fn renderCycleReport(engine: *const CycleEngine, members: []const usize) void {
+    const color_on = crash_reporter_config.use_color;
+    var total_bytes: usize = 0;
+    for (members) |key| {
+        if (engine.nodes.get(key)) |st| total_bytes += st.node.size;
+    }
+
+    if (leak_report_state.format == .json) {
+        renderCycleReportJson(engine, members, total_bytes);
+        return;
+    }
+
+    // Header.
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_bold_yellow);
+    posixWrite(STDERR_FD, "warning: ");
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_bold);
+    posixWrite(STDERR_FD, "reference cycle: ");
+    crashWriteUnsigned(members.len);
+    posixWrite(STDERR_FD, if (members.len == 1) " object (" else " objects (");
+    crashWriteUnsigned(total_bytes);
+    posixWrite(STDERR_FD, " B) held alive by a cycle");
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+    posixWrite(STDERR_FD, "\n");
+
+    // Retain path line.
+    posixWrite(STDERR_FD, RuntimeFormat.frame_indent);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_cyan);
+    posixWrite(STDERR_FD, RuntimeFormat.gutter_bar);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+    posixWrite(STDERR_FD, "  retain path: ");
+    for (members, 0..) |key, i| {
+        if (i != 0) posixWrite(STDERR_FD, " \u{2192} ");
+        writeCyclePathNode(engine, key);
+    }
+    if (members.len > 0) {
+        posixWrite(STDERR_FD, " \u{2192} ");
+        writeCyclePathNode(engine, members[0]);
+    }
+    posixWrite(STDERR_FD, "\n");
+
+    // Blank gutter line.
+    posixWrite(STDERR_FD, RuntimeFormat.frame_indent);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_cyan);
+    posixWrite(STDERR_FD, RuntimeFormat.gutter_bar);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+    posixWrite(STDERR_FD, "\n");
+
+    // Per-member detail.
+    for (members) |key| {
+        const st = engine.nodes.get(key) orelse continue;
+        const type_name = if (st.node.type_name_len == 0) "" else st.node.type_name_ptr.?[0..st.node.type_name_len];
+        posixWrite(STDERR_FD, RuntimeFormat.frame_indent);
+        writeLeakTypeLabel(type_name);
+        posixWrite(STDERR_FD, " (");
+        crashWriteUnsigned(st.node.size);
+        posixWrite(STDERR_FD, " B)\n");
+    }
+
+    // Footer corner.
+    posixWrite(STDERR_FD, RuntimeFormat.frame_indent);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_cyan);
+    posixWrite(STDERR_FD, RuntimeFormat.footer_corner);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+    posixWrite(STDERR_FD, " reference cycle (no owner outside the cycle)\n");
+}
+
+fn writeCyclePathNode(engine: *const CycleEngine, key: usize) void {
+    const st = engine.nodes.get(key) orelse {
+        posixWrite(STDERR_FD, "?");
+        return;
+    };
+    if (st.node.type_name_len == 0) {
+        posixWrite(STDERR_FD, "?");
+        return;
+    }
+    posixWrite(STDERR_FD, "%");
+    posixWrite(STDERR_FD, st.node.type_name_ptr.?[0..st.node.type_name_len]);
+    posixWrite(STDERR_FD, "{}");
+}
+
+fn renderCycleReportJson(engine: *const CycleEngine, members: []const usize, total_bytes: usize) void {
+    posixWrite(STDERR_FD, "{\"domain\":\"cycle\",\"severity\":\"warning\",\"sub_kind\":\"reference_cycle\",\"trace_policy\":\"allocation\",\"message\":\"reference cycle: ");
+    crashWriteUnsigned(members.len);
+    posixWrite(STDERR_FD, if (members.len == 1) " object held alive by a cycle" else " objects held alive by a cycle");
+    posixWrite(STDERR_FD, "\",\"machine_data\":{\"object_count\":");
+    crashWriteUnsigned(members.len);
+    posixWrite(STDERR_FD, ",\"bytes\":");
+    crashWriteUnsigned(total_bytes);
+    posixWrite(STDERR_FD, ",\"participants\":[");
+    for (members, 0..) |key, i| {
+        if (i != 0) posixWrite(STDERR_FD, ",");
+        const st = engine.nodes.get(key);
+        posixWrite(STDERR_FD, "{\"type\":\"");
+        if (st) |s| {
+            if (s.node.type_name_len != 0) writeJsonStringBody(s.node.type_name_ptr.?[0..s.node.type_name_len]);
+        }
+        posixWrite(STDERR_FD, "\",\"bytes\":");
+        crashWriteUnsigned(if (st) |s| s.node.size else 0);
+        posixWrite(STDERR_FD, "}");
+    }
+    posixWrite(STDERR_FD, "]}}\n");
+}
+
+/// Run cycle detection over the current registry (the Tracking deinit
+/// live-set survivors are the candidate roots) and render every detected
+/// `domain=cycle` report. Called from `finishLeakReport` at deinit, after the
+/// leak survivors were accumulated, so a cyclic survivor is reported as BOTH a
+/// leak (it was never released) and a cycle (it cannot be — its only owner is
+/// the cycle). No-op when nothing is registered or detection is off.
+/// Runtime activation gate for the Tracking deinit-time cycle scan. Resolved
+/// ONCE from `ZAP_CYCLE_CHECK` (set by `zap run -Denable-cycle-check`).
+///
+/// ## Why this is opt-in even under Tracking (Phase-4.d boundary)
+///
+/// The trial-deletion ENGINE, the purple buffer, the `domain=cycle` report,
+/// and `CycleWalkFnForRt` are complete and rigorously unit-tested
+/// (`src/memory/cycle_detector.zig`, 17 tests). What is gated here is only the
+/// PRODUCTION deinit-time auto-walk over the Tracking live-set. That walk must
+/// dereference each survivor's ARC-child fields, and a Zap `pub error` carries
+/// an auto-injected `cause :: Option(Error)` whose heap representation is not
+/// yet guaranteed walk-safe at deinit time (the boxed-cause subtree may be in a
+/// partially-torn-down state). Crucially, a reference cycle is NOT
+/// constructible from today's fully-immutable Zap (no field mutation, no
+/// `Ref`/`weak`), so this auto-walk has NOTHING to detect until Phase 5 lands
+/// mutation + the `weak`/`unowned` cycle fix. Rather than run an unnecessary
+/// walk with a deinit-time deref hazard, it is opt-in (`ZAP_CYCLE_CHECK=1`)
+/// until Phase 5 makes both the cycles real and the walk provably safe. See
+/// Phase-4 gap #207 + the brief's Phase 5 section.
+var cycle_check_runtime_enabled: bool = false;
+var cycle_check_runtime_resolved: bool = false;
+
+fn resolveCycleCheckRuntime() void {
+    if (cycle_check_runtime_resolved) return;
+    cycle_check_runtime_resolved = true;
+    if (envGetRuntime("ZAP_CYCLE_CHECK")) |v| {
+        cycle_check_runtime_enabled = v.len > 0 and !std.mem.eql(u8, v, "0");
+    }
+}
+
+fn runCycleDetectionAndReport() void {
+    if (comptime !cycle_detection_active) return;
+    resolveCycleCheckRuntime();
+    if (!cycle_check_runtime_enabled) return;
+
+    // Candidate roots = every still-live registered node (the survivors). The
+    // engine discovers the rest of each cycle through the walk.
+    var candidates: std.ArrayListUnmanaged(usize) = .empty;
+    defer candidates.deinit(std.heap.page_allocator);
+    {
+        cycleRegistryLock();
+        defer cycleRegistryUnlock();
+        var it = cycle_registry.map.keyIterator();
+        while (it.next()) |k| candidates.append(std.heap.page_allocator, k.*) catch return;
+    }
+    if (candidates.items.len == 0) return;
+    std.mem.sort(usize, candidates.items, {}, std.sort.asc(usize));
+
+    var engine: CycleEngine = .{};
+    defer engine.deinit();
+    const garbage = engine.detect(candidates.items);
+    if (engine.oom) return;
+    if (garbage.len == 0) return;
+
+    renderCycleReport(&engine, garbage);
+}
 
 // ---------------------------------------------------------------------------
 // Phase 2.e — double-fault containment.
