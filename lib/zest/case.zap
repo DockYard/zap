@@ -158,7 +158,33 @@ pub struct Zest.Case {
     }
   }
 
-  macro build_case_decl(test_name :: Expr, test_slug :: Expr, setup_expr :: Expr, teardown_expr :: Expr, case_expr :: Expr) -> Expr {
+  macro expect_leak_marker?(stmt :: Expr) -> Expr {
+    if elem(stmt, 0) == intern_atom("@") {
+      marker_args = elem(stmt, 2)
+      if list_length(marker_args) >= 1 {
+        list_at(marker_args, 0) == :expect_leak
+      } else {
+        false
+      }
+    } else {
+      false
+    }
+  }
+
+  macro wrap_expect_leak(user_body :: Expr, case_label :: Expr) -> Expr {
+    quote {
+      zest_expect_leak_tracking_active = :zig.Memory.leak_tracking_active()
+      zest_expect_leak_before_count = :zig.Memory.live_allocation_count()
+      zest_expect_leak_before_bytes = :zig.Memory.live_allocation_bytes()
+      unquote(user_body)
+      zest_expect_leak_after_count = :zig.Memory.live_allocation_count()
+      zest_expect_leak_after_bytes = :zig.Memory.live_allocation_bytes()
+      Zest.Assertion.expect_leak_result(zest_expect_leak_tracking_active, zest_expect_leak_before_count, zest_expect_leak_after_count, zest_expect_leak_before_bytes, zest_expect_leak_after_bytes, unquote(case_label), "")
+      "ok"
+    }
+  }
+
+  macro build_case_decl(test_name :: Expr, test_slug :: Expr, setup_expr :: Expr, teardown_expr :: Expr, case_expr :: Expr, expect_leak_marker :: Expr) -> Expr {
     case_args = elem(case_expr, 2)
     case_name = list_at(case_args, 0)
     case_body = list_at(case_args, -1)
@@ -174,7 +200,12 @@ pub struct Zest.Case {
     }
     case_body_statements = if elem(case_body, 0) == :__block__ { elem(case_body, 2) } else { [case_body] }
     teardown_statements = if teardown_expr != nil { [teardown_expr] } else { [] }
-    generated_body = make_call("__block__", list_concat(list_concat(list_concat(context_setup, case_body_statements), teardown_statements), ["ok"]))
+    user_body = make_call("__block__", list_concat(list_concat(context_setup, case_body_statements), teardown_statements))
+    generated_body = if expect_leak_marker == :expect_leak {
+      wrap_expect_leak(user_body, case_label)
+    } else {
+      make_call("__block__", [user_body, "ok"])
+    }
 
     quote {
       @doc = """
@@ -184,6 +215,26 @@ pub struct Zest.Case {
       pub fn unquote(generated_function_name)() -> String {
         unquote(generated_body)
       }
+    }
+  }
+
+  @doc = """
+    The `@expect_leak` flag atom for a test group: `:expect_leak` when the
+    group's body contains at least one bare `@expect_leak` marker, else
+    `:normal`. `@expect_leak` is a TEST-GROUP-level marker (it applies to every
+    case in the group it appears in) — this granularity matches the spec's
+    "marks a test as expected-to-leak" and keeps detection to a single
+    comprehension over the body statements (no recursive macro, which perturbs
+    the compile topo-order inside a `before_compile` struct).
+    """
+
+  macro group_expect_leak_flag(stmts :: Expr) -> Expr {
+    markers = for stmt <- stmts, expect_leak_marker?(stmt) { stmt }
+
+    if list_length(markers) > 0 {
+      :expect_leak
+    } else {
+      :normal
     }
   }
 
@@ -233,9 +284,10 @@ pub struct Zest.Case {
       teardown_expr = list_at(teardown_matches, 0)
       test_slug = slugify(name)
 
-      per_case = for case_expr <- case_stmts { build_case_decl(name, test_slug, setup_expr, teardown_expr, case_expr) }
+      group_flag = group_expect_leak_flag(stmts)
+      per_case = for case_expr <- case_stmts { build_case_decl(name, test_slug, setup_expr, teardown_expr, case_expr, group_flag) }
 
-      passthrough = for stmt <- stmts, elem(stmt, 0) != :case and elem(stmt, 0) != :setup and elem(stmt, 0) != :teardown { stmt }
+      passthrough = for stmt <- stmts, elem(stmt, 0) != :case and elem(stmt, 0) != :setup and elem(stmt, 0) != :teardown and not expect_leak_marker?(stmt) { stmt }
       all_stmts = list_concat(per_case, passthrough)
 
       quote { unquote_splicing(all_stmts) }
@@ -282,9 +334,10 @@ pub struct Zest.Case {
     test_slug = slugify(name)
 
     test_stmts = for stmt <- stmts, elem(stmt, 0) == :test { stmt }
-    per_case = for test_expr <- test_stmts { build_case_decl(name, test_slug, setup_expr, teardown_expr, test_expr) }
+    group_flag = group_expect_leak_flag(stmts)
+    per_case = for test_expr <- test_stmts { build_case_decl(name, test_slug, setup_expr, teardown_expr, test_expr, group_flag) }
 
-    passthrough = for stmt <- stmts, elem(stmt, 0) != :test and elem(stmt, 0) != :setup and elem(stmt, 0) != :teardown { stmt }
+    passthrough = for stmt <- stmts, elem(stmt, 0) != :test and elem(stmt, 0) != :setup and elem(stmt, 0) != :teardown and not expect_leak_marker?(stmt) { stmt }
     all_stmts = list_concat(per_case, passthrough)
 
     quote { unquote_splicing(all_stmts) }
