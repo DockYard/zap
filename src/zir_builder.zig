@@ -4757,22 +4757,6 @@ pub const ZirDriver = struct {
                 return error.EmitFailed;
         }
 
-        // Phase 3.b: a function carrying the `raises` effect returns a Zig
-        // error union `error{ZapRaise}!T` (inferred error set, `anyerror!T`
-        // at the ZIR level). The `error.ZapRaise` tag is the cross-function
-        // control signal; the boxed `Error` existential payload rides the
-        // thread-local side-channel. `main` is excluded — Zig's entry point
-        // must return `void`/`u8`, and a top-level `raise` is the unhandled
-        // case that aborts via `crashReport` rather than propagating. The
-        // declared inner return type is already established above
-        // (`begin_func` + `emitComplexReturnType`), so this only wraps it.
-        const emits_error_union = func.raises and !is_main and !is_try_variant;
-        if (emits_error_union) {
-            const err_name = "ZapRaise";
-            if (zir_builder_set_error_union_return_type(self.handle, err_name.ptr, @intCast(err_name.len)) != 0)
-                return error.EmitFailed;
-        }
-
         // Declare the return type. Primitives are handled by mapReturnType
         // above (well-known ZIR refs). Complex types need dedicated ZIR
         // instructions emitted into the declaration body. Any type not
@@ -4782,6 +4766,31 @@ pub const ZirDriver = struct {
         // Skip for main — Zig requires main to return void or u8.
         if (!is_main and ret_type == 0 and func.return_type != .void and func.return_type != .nil) {
             try self.emitComplexReturnType(func.return_type);
+        }
+
+        // Phase 3.b: a function carrying the `raises` effect returns a Zig
+        // error union `error{ZapRaise}!T` (inferred error set, `anyerror!T`
+        // at the ZIR level). The `error.ZapRaise` tag is the cross-function
+        // control signal; the boxed `Error` existential payload rides the
+        // thread-local side-channel. `main` is excluded — Zig's entry point
+        // must return `void`/`u8`, and a top-level `raise` is the unhandled
+        // case that aborts via `crashReport` rather than propagating.
+        //
+        // This wrap runs AFTER the payload return type is fully established
+        // (scalar via `mapReturnType`/`begin_func`, or complex via the
+        // `emitComplexReturnType` immediately above), because the fork's
+        // `setErrorUnionReturnType` now composes `error{ZapRaise}!<payload>`
+        // from the resolved payload return-type instruction. Wrapping BEFORE
+        // a complex payload was set previously yielded
+        // `error{ZapRaise}!<default>` and silently dropped a `[T]`/`Map`/
+        // struct payload — the bug that blocked effect-polymorphism through
+        // for-comprehensions (`__for_N -> [mapped]`) and combinators whose
+        // result type is a container.
+        const emits_error_union = func.raises and !is_main and !is_try_variant;
+        if (emits_error_union) {
+            const err_name = "ZapRaise";
+            if (zir_builder_set_error_union_return_type(self.handle, err_name.ptr, @intCast(err_name.len)) != 0)
+                return error.EmitFailed;
         }
 
         self.tuple_init_count = 0;
