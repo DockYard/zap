@@ -3989,6 +3989,7 @@ const Pipeline = struct {
                 .related_spans = type_err.related_spans,
                 .machine_data = type_err.machine_data,
                 .fixits = type_err.fixits,
+                .expansion = type_err.expansion,
             }) catch {};
         }
     }
@@ -5084,6 +5085,7 @@ fn compileStagedStructHir(
             .related_spans = type_err.related_spans,
             .machine_data = type_err.machine_data,
             .fixits = type_err.fixits,
+            .expansion = type_err.expansion,
         }) catch {};
     }
     if (diag_engine.errorCount() > error_baseline) return error.TypeCheckFailed;
@@ -9592,7 +9594,11 @@ fn emitDiagnosticsFromUnits(
 }
 
 fn emitContextDiagnostics(ctx: *const CompilationContext, alloc: std.mem.Allocator) void {
-    emitDiagnostics(@constCast(&ctx.diag_engine), alloc);
+    const engine = @constCast(&ctx.diag_engine);
+    // Phase 4.b: give the renderer the interner so a diagnostic's macro-
+    // expansion backtrace can resolve interned `macro_name`s to their text.
+    engine.setInterner(ctx.interner);
+    emitDiagnostics(engine, alloc);
 }
 
 fn structNameToOwnedString(

@@ -1535,6 +1535,10 @@ pub const TypeChecker = struct {
         /// correction tagged `machine_applicable`) carried to
         /// `diagnostics.Diagnostic.fixits`. Feeds `zap fix` / LSP code actions.
         fixits: []const diagnostics_mod.FixIt = &.{},
+        /// Phase 4.b macro-expansion provenance for the erroring node, carried
+        /// to `diagnostics.Diagnostic.expansion`. When set, the renderer prints
+        /// the "in expansion of macro X" backtrace. Null for source-level nodes.
+        expansion: ?*const ast.ExpansionInfo = null,
     };
 
     const ResolvedCallSignature = struct {
@@ -7027,6 +7031,7 @@ pub const TypeChecker = struct {
                 .help = help,
                 .related_spans = two_sided.related_spans,
                 .machine_data = two_sided.machine_data,
+                .expansion = arg.getMeta().expansion,
             });
             return;
         }
@@ -7037,6 +7042,7 @@ pub const TypeChecker = struct {
             .label = "argument type mismatch",
             .related_spans = two_sided.related_spans,
             .machine_data = two_sided.machine_data,
+            .expansion = arg.getMeta().expansion,
         });
     }
 

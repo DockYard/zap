@@ -1142,6 +1142,19 @@ fn applyBuildOverrides(config: *zap.builder.BuildConfig, overrides: BuildOverrid
 /// optimize mode via the shared `error_format.defaultTierForMode`, which is
 /// the same dev-vs-release fold the runtime crash printer's path-stripping
 /// policy uses — one tier vocabulary across compile-time and runtime.
+/// Map an optional `-Doptimize` override to a Zig `OptimizeMode`, defaulting to
+/// Debug when unset (Phase 4.b). Used by the early diagnostic-policy install in
+/// `cmdRunScript` — before the full `BuildConfig` exists — so the parse-error
+/// path's security tier matches what the later config-based install computes.
+fn optimizeModeForOverride(optimize: ?zap.builder.BuildConfig.Optimize) std.builtin.OptimizeMode {
+    return switch (optimize orelse .debug) {
+        .debug => .Debug,
+        .release_safe => .ReleaseSafe,
+        .release_fast => .ReleaseFast,
+        .release_small => .ReleaseSmall,
+    };
+}
+
 fn installDiagnosticOutputPolicy(config: *const zap.builder.BuildConfig, overrides: BuildOverrides) void {
     const optimize_mode: std.builtin.OptimizeMode = switch (config.optimize) {
         .debug => .Debug,
@@ -1244,6 +1257,19 @@ fn cmdRunScript(
         },
         .ok => |ov| ov,
     };
+
+    // Phase 4.b: install the diagnostic output policy EARLY — before the
+    // script contract-parse below — so a `-Derror-format=json` on a script
+    // with a SYNTAX error still emits JSON. The contract parse runs before the
+    // full `BuildConfig` exists (which the later `installDiagnosticOutputPolicy`
+    // needs for the tier), so derive the tier from the parsed `-Doptimize`
+    // override directly. The later full install overwrites this idempotently
+    // for the success path; the parse-error path exits before reaching it.
+    zap.diagnostics.setOutputPolicy(.{
+        .format = overrides.error_format orelse .text,
+        .tier = zap.error_format.defaultTierForMode(optimizeModeForOverride(overrides.optimize)),
+    });
+
     // Script mode is single-file with no dependency graph, so a
     // `-Dmemory=` value MUST be a stdlib manager — reject third-party
     // names here (manifest mode keeps third-party support). Same
