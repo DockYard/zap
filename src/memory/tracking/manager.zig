@@ -181,6 +181,88 @@ comptime {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4.c — leak-attribution boundary types (ABI between the runtime and
+// any manager that records allocation-site attribution).
+//
+// The leak report is rendered by the RUNTIME, not this manager: the
+// unified renderer needs the symbolizer, the `.zap-symbols` side-table,
+// and the shared visual-format spec — all of which live in `runtime.zig`,
+// which this self-contained manager (std + builtin only, `link_libc =
+// false`) cannot import. So the manager owns the authoritative live-
+// allocation set and the canary state, and hands each survivor / violation
+// to a runtime-installed *report sink* as a `ZapLeakRecord`; the sink
+// symbolizes the backtrace and renders the unified `domain=leak`
+// diagnostic. This is the "emit structured data, thin reporting layer
+// renders it" wiring the Phase 4.c spec calls for.
+//
+// `ZapLeakRecord` is redeclared (with a `comptime` size/offset assert)
+// in `runtime.zig`'s `AbiV1` block under the self-contained-manager
+// convention; the two must stay byte-identical.
+// ---------------------------------------------------------------------------
+
+/// Which kind of memory fault a `ZapLeakRecord` describes. Drives the
+/// renderer's domain/sub-kind selection (`leak` vs the `uaf` /
+/// `invalid_free` / `mismatch` sub-kinds of a memory diagnostic).
+const ZapLeakKind = enum(u32) {
+    /// A live allocation that survived to `core.deinit` — a leak.
+    leak = 0,
+    /// A canary byte was tampered (use-after-free or out-of-bounds write).
+    use_after_free_or_oob = 1,
+    /// `core.deallocate` for a pointer this manager never handed out.
+    invalid_free = 2,
+    /// The runtime-supplied size/alignment disagreed with the record.
+    dealloc_mismatch = 3,
+};
+
+/// Structured, render-ready description of one memory fault, handed from
+/// the manager to the runtime's report sink. All slices/arrays are
+/// borrowed or inline (no ownership crosses the boundary): `type_name`
+/// points into the user binary's `.rodata`, and `backtrace` is read
+/// in-place from the manager's record. The sink must not retain any
+/// pointer past the call.
+const ZapLeakRecord = extern struct {
+    /// The fault kind (`ZapLeakKind` value).
+    kind: u32,
+    /// The user pointer the runtime observed (the leaked / freed object).
+    user_ptr: usize,
+    /// The user-visible allocation size in bytes.
+    size: usize,
+    /// The user-visible allocation alignment.
+    alignment: u32,
+    /// The object's refcount at report time. Tracking declares no
+    /// REFCOUNT_V1 capability, so every allocation it audits flows
+    /// through `core.allocate` (no side-table refcount); the manager
+    /// reports `1` — the construction-site ownership count — which is
+    /// what the renderer prints as `refcount 1`.
+    refcount: u32,
+    /// Borrowed `.rodata` slice naming the Zap type, or null/0 when the
+    /// allocation was never annotated.
+    type_name_ptr: ?[*]const u8,
+    type_name_len: usize,
+    /// Allocation-site return addresses (borrowed from the record), or
+    /// null/0 when the allocation was never annotated.
+    backtrace_ptr: ?[*]const usize,
+    backtrace_len: usize,
+    /// Canary sub-detail (only meaningful for `use_after_free_or_oob`):
+    /// the index of the first tampered byte and the canary width. Zero
+    /// for the other kinds.
+    canary_offset: usize,
+    canary_size: usize,
+    /// Mismatch sub-detail (only meaningful for `dealloc_mismatch`): the
+    /// size/alignment the runtime supplied to `core.deallocate`. Zero for
+    /// the other kinds.
+    supplied_size: usize,
+    supplied_alignment: u32,
+};
+
+/// The runtime-installed leak-report sink. Invoked once per surviving
+/// allocation at `core.deinit` and once per canary/invalid-free/mismatch
+/// fault at `core.deallocate`. `sink_ctx` is an opaque cookie the runtime
+/// passed to `setLeakReportSink` (it threads the runtime's own renderer
+/// state); the manager passes it back unchanged.
+const ZapLeakReportSink = *const fn (sink_ctx: ?*anyopaque, record: *const ZapLeakRecord) callconv(.c) void;
+
+// ---------------------------------------------------------------------------
 // Manager constants
 // ---------------------------------------------------------------------------
 
@@ -219,6 +301,18 @@ const CANARY_SIZE: usize = 16;
 // Allocation record + manager context
 // ---------------------------------------------------------------------------
 
+/// Maximum number of allocation-site return addresses stored per live
+/// allocation. The runtime captures a backtrace at the `core.allocate`
+/// call site (via `ArcRuntime.allocAny`'s `Backtrace.capture`) and hands
+/// it to `annotateAllocation`; the manager keeps the first
+/// `ALLOC_BACKTRACE_MAX_FRAMES` so the deinit-time leak report can name
+/// the allocation site without holding a heap-backed slice (which would
+/// itself perturb the live-allocation set this manager is auditing).
+/// 16 frames is deep enough to reach the user's `main` through the
+/// runtime's heap-promotion trampoline for every realistic Zap program;
+/// the report renderer caps what it shows via `ZAP_BACKTRACE` anyway.
+const ALLOC_BACKTRACE_MAX_FRAMES: usize = 16;
+
 /// Per-allocation metadata kept in the tracking hash map.
 ///
 /// `base_ptr` is the inner-allocation pointer (start of the leading
@@ -229,11 +323,42 @@ const CANARY_SIZE: usize = 16;
 /// `trackingDeallocate` from `alignment` so we don't have to store it,
 /// but we keep it in the record anyway for diagnostic clarity (and to
 /// guard against future scheme changes).
+///
+/// Phase 4.c leak attribution: `type_name` / `backtrace` are populated
+/// out-of-band by `annotateAllocation`, which the runtime calls
+/// immediately after the `core.allocate` that produced `user_ptr`. They
+/// stay empty (`type_name_len == 0`, `backtrace_len == 0`) for any
+/// allocation the runtime did not annotate (e.g. a manager-internal
+/// allocation, or a build whose runtime predates the attribution hook),
+/// in which case the leak report degrades cleanly to the
+/// pointer/size/alignment it has always carried.
+///
+///   * `type_name` is a borrowed slice into the user binary's `.rodata`
+///     (a comptime `@typeName`-derived string the runtime owns for the
+///     process lifetime) — never freed by the manager.
+///   * `backtrace` is a fixed-capacity inline array (no heap) so storing
+///     attribution never itself allocates.
 const AllocRecord = struct {
     base_ptr: [*]u8,
     size: usize,
     alignment: u32,
     leading_canary_size: usize,
+
+    /// Borrowed `.rodata` slice naming the Zap type of the allocation
+    /// (e.g. `%User{}`), or empty when the allocation was not annotated.
+    type_name_ptr: [*]const u8 = undefined,
+    type_name_len: usize = 0,
+
+    /// Allocation-site return addresses captured by the runtime at the
+    /// `core.allocate` call site. `backtrace_len` is `0` when the
+    /// allocation was not annotated.
+    backtrace: [ALLOC_BACKTRACE_MAX_FRAMES]usize = undefined,
+    backtrace_len: usize = 0,
+
+    fn typeName(self: *const AllocRecord) []const u8 {
+        if (self.type_name_len == 0) return "";
+        return self.type_name_ptr[0..self.type_name_len];
+    }
 };
 
 /// Spinlock state. Two-value `cmpxchg`/`atomicStore` pair, identical to
@@ -265,6 +390,19 @@ const TrackingContext = struct {
     /// sufficient because the manager is a diagnostic tool — raw
     /// throughput is not a goal.
     spinlock: SpinLockState = .unlocked,
+
+    /// Phase 4.c: the runtime-installed leak-report sink. Set once at
+    /// startup via `setLeakReportSink` (the runtime threads its unified
+    /// renderer through here). `null` when no sink was installed — e.g.
+    /// the in-process behavioural tests below, or a host that links the
+    /// manager without the attribution-aware runtime — in which case the
+    /// manager falls back to the legacy raw `printDiagnostic` lines so a
+    /// leak is never silently dropped.
+    report_sink: ?ZapLeakReportSink = null,
+
+    /// Opaque cookie passed back to `report_sink` unchanged. Carries the
+    /// runtime's renderer state across the C-ABI boundary.
+    report_sink_ctx: ?*anyopaque = null,
 };
 
 /// Acquire the spinlock. Busy-waits via `@cmpxchgStrong`; on a busy
@@ -387,6 +525,132 @@ fn printDiagnostic(comptime fmt: []const u8, args: anytype) void {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4.c — leak-attribution recording + report dispatch
+// ---------------------------------------------------------------------------
+
+/// Record the Zap type + allocation-site backtrace for a live allocation
+/// (Phase 4.c). The runtime calls this from `ArcRuntime.allocAny` (and the
+/// other heap-promotion paths) immediately after the `core.allocate` that
+/// produced `user_ptr`, passing the comptime-derived Zap type name and the
+/// `Backtrace.capture` it took at the allocation site — neither of which is
+/// visible to the bare `core.allocate(size, alignment)` slot.
+///
+/// The attribution is stored on the existing `AllocRecord` (no second
+/// hash map): `core.allocate` inserted the record under `user_ptr` a
+/// moment ago, so this looks it up and fills `type_name` / `backtrace`.
+/// `type_name` is a borrowed `.rodata` slice (the runtime owns it for the
+/// process lifetime); the backtrace is copied into the record's inline,
+/// fixed-capacity array (no heap, so attribution never perturbs the
+/// live-allocation set being audited). Annotating a pointer that is not
+/// in the live map is a no-op — the allocation may have already been
+/// freed, or come from a path the manager does not track.
+///
+/// `callconv(.c)` and the exploded slice arguments (ptr+len rather than a
+/// Zig slice) keep this callable across the runtime↔manager C-ABI
+/// boundary uniformly for first-party and object-linked builds.
+fn trackingAnnotateAllocation(
+    ctx: *anyopaque,
+    user_ptr: [*]u8,
+    type_name_ptr: [*]const u8,
+    type_name_len: usize,
+    backtrace_ptr: [*]const usize,
+    backtrace_len: usize,
+) callconv(.c) void {
+    const tctx: *TrackingContext = @ptrCast(@alignCast(ctx));
+    const user_ptr_value = @intFromPtr(user_ptr);
+
+    spinLock(&tctx.spinlock);
+    defer spinUnlock(&tctx.spinlock);
+
+    const rec_ptr = tctx.live.getPtr(user_ptr_value) orelse return;
+    rec_ptr.type_name_ptr = type_name_ptr;
+    rec_ptr.type_name_len = type_name_len;
+    const copy_len = @min(backtrace_len, ALLOC_BACKTRACE_MAX_FRAMES);
+    var i: usize = 0;
+    while (i < copy_len) : (i += 1) rec_ptr.backtrace[i] = backtrace_ptr[i];
+    rec_ptr.backtrace_len = copy_len;
+}
+
+/// Install the runtime's leak-report sink (Phase 4.c). Called once at
+/// memory-startup, before any allocation, so every survivor at
+/// `core.deinit` and every canary/invalid-free/mismatch fault routes
+/// through the unified renderer rather than the legacy raw lines. Passing
+/// a null sink restores the raw-line fallback (used by nothing in
+/// production; defensive).
+fn trackingSetLeakReportSink(
+    ctx: *anyopaque,
+    sink: ?ZapLeakReportSink,
+    sink_ctx: ?*anyopaque,
+) callconv(.c) void {
+    const tctx: *TrackingContext = @ptrCast(@alignCast(ctx));
+    spinLock(&tctx.spinlock);
+    defer spinUnlock(&tctx.spinlock);
+    tctx.report_sink = sink;
+    tctx.report_sink_ctx = sink_ctx;
+}
+
+/// Dispatch one fault record to the runtime sink when installed, else
+/// fall back to the legacy raw `printDiagnostic` line so a leak / fault
+/// is never silently dropped. The `fallback` closure formats the legacy
+/// message; it runs only when no sink is installed.
+///
+/// Both the sink call and the fallback run OUTSIDE the manager spinlock
+/// (the caller releases it first): the sink symbolizes + renders + may
+/// allocate (it is the non-signal deinit path), and the fallback's
+/// `std.debug.print` takes the stderr mutex — neither must be held under
+/// the manager's lock (the lock-inversion rationale already documented on
+/// `trackingDeallocate`). The `report_sink` / `report_sink_ctx` reads are
+/// plain pointer loads; the sink is installed once at startup and never
+/// mutated concurrently with a fault dispatch.
+/// Build a `ZapLeakRecord` for a `core.deallocate` fault (canary
+/// corruption or size/alignment mismatch) from the staged
+/// `FaultAttribution`. The attribution's inline backtrace array is
+/// referenced by pointer; the record is consumed synchronously by
+/// `dispatchLeakRecord` in the same scope, so the borrow is sound.
+fn faultRecord(
+    kind: ZapLeakKind,
+    user_ptr_value: usize,
+    size: usize,
+    alignment: u32,
+    attribution: *const FaultAttribution,
+    canary_offset: usize,
+    canary_size: usize,
+    supplied_size: usize,
+    supplied_alignment: u32,
+) ZapLeakRecord {
+    return .{
+        .kind = @intFromEnum(kind),
+        .user_ptr = user_ptr_value,
+        .size = size,
+        .alignment = alignment,
+        // A faulting allocation is still live (preserved for forensics);
+        // its construction-site ownership count is 1.
+        .refcount = 1,
+        .type_name_ptr = if (attribution.type_name_len == 0) null else attribution.type_name_ptr,
+        .type_name_len = attribution.type_name_len,
+        .backtrace_ptr = if (attribution.backtrace_len == 0) null else &attribution.backtrace,
+        .backtrace_len = attribution.backtrace_len,
+        .canary_offset = canary_offset,
+        .canary_size = canary_size,
+        .supplied_size = supplied_size,
+        .supplied_alignment = supplied_alignment,
+    };
+}
+
+fn dispatchLeakRecord(
+    tctx: *const TrackingContext,
+    record: *const ZapLeakRecord,
+    comptime fallback_fmt: []const u8,
+    fallback_args: anytype,
+) void {
+    if (tctx.report_sink) |sink| {
+        sink(tctx.report_sink_ctx, record);
+    } else {
+        printDiagnostic(fallback_fmt, fallback_args);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Vtable functions
 // ---------------------------------------------------------------------------
 
@@ -437,9 +701,40 @@ fn trackingDeinit(ctx: *anyopaque) callconv(.c) void {
     while (iter.next()) |entry| {
         const user_ptr_value = entry.key_ptr.*;
         const rec = entry.value_ptr.*;
-        printDiagnostic(
-            "LEAK: ptr=0x{x}, size={d}, alignment={d}\n",
-            .{ user_ptr_value, rec.size, rec.alignment },
+        // Phase 4.c: report the survivor through the runtime's unified
+        // renderer (sink) when installed — attributed with the Zap type
+        // and the symbolized allocation site — else the legacy raw
+        // `LEAK:` line. Tracking declares no REFCOUNT_V1 capability, so
+        // every audited allocation flows through `core.allocate` with no
+        // side-table refcount; the construction-site ownership count is
+        // `1`, which is what the report prints as `refcount 1`.
+        const type_name = rec.typeName();
+        const record: ZapLeakRecord = .{
+            .kind = @intFromEnum(ZapLeakKind.leak),
+            .user_ptr = user_ptr_value,
+            .size = rec.size,
+            .alignment = rec.alignment,
+            .refcount = 1,
+            .type_name_ptr = if (rec.type_name_len == 0) null else rec.type_name_ptr,
+            .type_name_len = rec.type_name_len,
+            .backtrace_ptr = if (rec.backtrace_len == 0) null else &rec.backtrace,
+            .backtrace_len = rec.backtrace_len,
+            .canary_offset = 0,
+            .canary_size = 0,
+            .supplied_size = 0,
+            .supplied_alignment = 0,
+        };
+        dispatchLeakRecord(
+            tctx,
+            &record,
+            "LEAK: ptr=0x{x}, size={d}, alignment={d}{s}{s}\n",
+            .{
+                user_ptr_value,
+                rec.size,
+                rec.alignment,
+                if (type_name.len == 0) "" else ", type=",
+                type_name,
+            },
         );
         // Return the inner allocation to page_allocator. The total
         // inner-allocation size is `leading + size + CANARY_SIZE`.
@@ -536,6 +831,29 @@ fn trackingAllocate(ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?
 ///      than recycle the memory back through `page_allocator`. The
 ///      outcome variant tells the post-critical-section block exactly
 ///      what to do.
+/// Phase 4.c: the Zap type + allocation-site backtrace copied OUT of the
+/// `AllocRecord` inside the critical section so the post-lock dispatch can
+/// build a `ZapLeakRecord` without re-acquiring the spinlock. The backtrace
+/// is copied by value (a fixed inline array) so no pointer into the live
+/// map outlives the lock. Empty when the allocation was never annotated.
+const FaultAttribution = struct {
+    type_name_ptr: [*]const u8 = undefined,
+    type_name_len: usize = 0,
+    backtrace: [ALLOC_BACKTRACE_MAX_FRAMES]usize = undefined,
+    backtrace_len: usize = 0,
+
+    fn fromRecord(rec: AllocRecord) FaultAttribution {
+        var attribution: FaultAttribution = .{
+            .type_name_ptr = rec.type_name_ptr,
+            .type_name_len = rec.type_name_len,
+            .backtrace_len = rec.backtrace_len,
+        };
+        var i: usize = 0;
+        while (i < rec.backtrace_len) : (i += 1) attribution.backtrace[i] = rec.backtrace[i];
+        return attribution;
+    }
+};
+
 const DeallocateOutcome = union(enum) {
     /// Pointer was not in the live map. The record was never present —
     /// nothing to remove, nothing to free. Diagnostic carries only the
@@ -555,6 +873,7 @@ const DeallocateOutcome = union(enum) {
         recorded_alignment: u32,
         supplied_size: usize,
         supplied_alignment: u32,
+        attribution: FaultAttribution,
     },
     /// Leading canary was tampered. The record has been LEFT in the
     /// live map and the inner allocation has NOT been freed — the
@@ -565,6 +884,9 @@ const DeallocateOutcome = union(enum) {
         user_ptr_value: usize,
         offset: usize,
         canary_size: usize,
+        recorded_size: usize,
+        recorded_alignment: u32,
+        attribution: FaultAttribution,
     },
     /// Trailing canary was tampered. Same forensic preservation policy
     /// as `leading_canary_corrupt` — the record is left in the live
@@ -573,6 +895,9 @@ const DeallocateOutcome = union(enum) {
         user_ptr_value: usize,
         offset: usize,
         canary_size: usize,
+        recorded_size: usize,
+        recorded_alignment: u32,
+        attribution: FaultAttribution,
     },
     /// Canaries intact and size/alignment matched. The record was
     /// removed from the live map and `total_bytes` / `inner_alignment`
@@ -665,6 +990,7 @@ fn trackingDeallocate(
                 .recorded_alignment = rec.alignment,
                 .supplied_size = size,
                 .supplied_alignment = alignment,
+                .attribution = FaultAttribution.fromRecord(rec),
             } };
         }
 
@@ -678,6 +1004,9 @@ fn trackingDeallocate(
                 .user_ptr_value = user_ptr_value,
                 .offset = off,
                 .canary_size = rec.leading_canary_size,
+                .recorded_size = rec.size,
+                .recorded_alignment = rec.alignment,
+                .attribution = FaultAttribution.fromRecord(rec),
             } };
         }
 
@@ -689,6 +1018,9 @@ fn trackingDeallocate(
                 .user_ptr_value = user_ptr_value,
                 .offset = off,
                 .canary_size = CANARY_SIZE,
+                .recorded_size = rec.size,
+                .recorded_alignment = rec.alignment,
+                .attribution = FaultAttribution.fromRecord(rec),
             } };
         }
 
@@ -719,28 +1051,95 @@ fn trackingDeallocate(
     // operation needs the spinlock, and both could otherwise contend for
     // unrelated kernel-side locks while we held it.
     switch (outcome) {
-        .invalid_free => |info| printDiagnostic(
-            "INVALID FREE: ptr=0x{x} not allocated by this manager\n",
-            .{info.user_ptr_value},
-        ),
-        .mismatch => |info| printDiagnostic(
-            "DEALLOC SIZE/ALIGN MISMATCH: ptr=0x{x} recorded size={d}/align={d}, runtime supplied size={d}/align={d}; inner allocation intentionally leaked for forensics\n",
-            .{
+        .invalid_free => |info| {
+            // An invalid free has no `AllocRecord` (the pointer was never
+            // ours), so there is no Zap type / allocation-site backtrace
+            // to attribute — the pointer is the only datum.
+            const record: ZapLeakRecord = .{
+                .kind = @intFromEnum(ZapLeakKind.invalid_free),
+                .user_ptr = info.user_ptr_value,
+                .size = 0,
+                .alignment = 0,
+                .refcount = 0,
+                .type_name_ptr = null,
+                .type_name_len = 0,
+                .backtrace_ptr = null,
+                .backtrace_len = 0,
+                .canary_offset = 0,
+                .canary_size = 0,
+                .supplied_size = 0,
+                .supplied_alignment = 0,
+            };
+            dispatchLeakRecord(
+                tctx,
+                &record,
+                "INVALID FREE: ptr=0x{x} not allocated by this manager\n",
+                .{info.user_ptr_value},
+            );
+        },
+        .mismatch => |info| {
+            const record = faultRecord(
+                ZapLeakKind.dealloc_mismatch,
                 info.user_ptr_value,
                 info.recorded_size,
                 info.recorded_alignment,
+                &info.attribution,
+                0,
+                0,
                 info.supplied_size,
                 info.supplied_alignment,
-            },
-        ),
-        .leading_canary_corrupt => |info| printDiagnostic(
-            "USE-AFTER-FREE or OOB: leading canary corrupted at ptr=0x{x} (byte {d}/{d}); inner allocation intentionally leaked for forensics\n",
-            .{ info.user_ptr_value, info.offset, info.canary_size },
-        ),
-        .trailing_canary_corrupt => |info| printDiagnostic(
-            "USE-AFTER-FREE or OOB: trailing canary corrupted at ptr=0x{x} (byte {d}/{d}); inner allocation intentionally leaked for forensics\n",
-            .{ info.user_ptr_value, info.offset, info.canary_size },
-        ),
+            );
+            dispatchLeakRecord(
+                tctx,
+                &record,
+                "DEALLOC SIZE/ALIGN MISMATCH: ptr=0x{x} recorded size={d}/align={d}, runtime supplied size={d}/align={d}; inner allocation intentionally leaked for forensics\n",
+                .{
+                    info.user_ptr_value,
+                    info.recorded_size,
+                    info.recorded_alignment,
+                    info.supplied_size,
+                    info.supplied_alignment,
+                },
+            );
+        },
+        .leading_canary_corrupt => |info| {
+            const record = faultRecord(
+                ZapLeakKind.use_after_free_or_oob,
+                info.user_ptr_value,
+                info.recorded_size,
+                info.recorded_alignment,
+                &info.attribution,
+                info.offset,
+                info.canary_size,
+                0,
+                0,
+            );
+            dispatchLeakRecord(
+                tctx,
+                &record,
+                "USE-AFTER-FREE or OOB: leading canary corrupted at ptr=0x{x} (byte {d}/{d}); inner allocation intentionally leaked for forensics\n",
+                .{ info.user_ptr_value, info.offset, info.canary_size },
+            );
+        },
+        .trailing_canary_corrupt => |info| {
+            const record = faultRecord(
+                ZapLeakKind.use_after_free_or_oob,
+                info.user_ptr_value,
+                info.recorded_size,
+                info.recorded_alignment,
+                &info.attribution,
+                info.offset,
+                info.canary_size,
+                0,
+                0,
+            );
+            dispatchLeakRecord(
+                tctx,
+                &record,
+                "USE-AFTER-FREE or OOB: trailing canary corrupted at ptr=0x{x} (byte {d}/{d}); inner allocation intentionally leaked for forensics\n",
+                .{ info.user_ptr_value, info.offset, info.canary_size },
+            );
+        },
         .clean => |info| std.heap.page_allocator.rawFree(
             info.base_ptr[0..info.total_bytes],
             info.inner_alignment,
@@ -928,6 +1327,17 @@ pub const retainSized = trackingRetainSizedStub;
 pub const releaseSized = trackingReleaseSizedStub;
 pub const refcountSized = trackingRefcountSizedStub;
 pub const getCapabilityDesc = trackingGetCapabilityDesc;
+
+// Phase 4.c — optional leak-attribution interface. The runtime calls
+// these by name through the source-registered `active_manager` import
+// (gated by `@hasDecl`), so they need no `.zapmem` capability descriptor:
+// the attribution channel is private to the runtime↔manager pair compiled
+// into one binary. `annotateAllocation` records the Zap type + alloc-site
+// backtrace the runtime captured at the `core.allocate` call site;
+// `setLeakReportSink` installs the runtime's unified renderer as the
+// deinit-time report sink.
+pub const annotateAllocation = trackingAnnotateAllocation;
+pub const setLeakReportSink = trackingSetLeakReportSink;
 
 // ---------------------------------------------------------------------------
 // Uniform-interface alias signature lock
