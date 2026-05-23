@@ -1,8 +1,2 @@
 [script-cache hit] <STAGING>
-** (arithmetic_error) integer overflow
-  zap_runtime.Kernel.addInteger__anon_N
-  zap_runtime.Kernel.add_i64
-  Integer._plus__2__clause_3/2
-  ArithmeticOverflow.boom/1
-  script.main
-  __ZapScriptMain.main/1
+{"domain":"runtime","severity":"error","sub_kind":"arithmetic_error","trace_policy":"backtrace","message":"integer overflow","machine_data":{"kind":"arithmetic_error","backtrace":[{"symbol":"zap_runtime.Kernel.addInteger__anon_N"},{"symbol":"zap_runtime.Kernel.add_i64"},{"symbol":"Integer._plus__2__clause_3/2"},{"symbol":"ArithmeticOverflow.boom/1"},{"symbol":"script.main"},{"symbol":"__ZapScriptMain.main/1"}],"error_return_trace":[]}}

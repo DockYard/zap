@@ -1,6 +1,2 @@
 [script-cache hit] <STAGING>
-** (assertion_error) assertion failed: value (at <FIXTURE>:9)
-  Kernel.contract_violation/3
-  AssertionError.check/1
-  script.main
-  __ZapScriptMain.main/1
+{"domain":"runtime","severity":"error","sub_kind":"assertion_error","trace_policy":"backtrace","message":"assertion failed: value (at <FIXTURE>:11)","machine_data":{"kind":"assertion_error","backtrace":[{"symbol":"Kernel.contract_violation/3"},{"symbol":"AssertionError.check/1"},{"symbol":"script.main"},{"symbol":"__ZapScriptMain.main/1"}],"error_return_trace":[]}}

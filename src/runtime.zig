@@ -8065,6 +8065,12 @@ pub fn zapCrashReporterInit() void {
 
     crash_reporter_config.verbosity = parseBacktraceVerbosity(envGetRuntime("ZAP_BACKTRACE"));
 
+    // Resolve `--error-format` now, in startup (non-signal) context, so the
+    // async-signal-safe signal-handler abort path (which must not call
+    // `getenv`) sees a format already decided. The `raise`/panic entry points
+    // also call `resolveCrashReportFormat` directly — idempotent either way.
+    resolveCrashReportFormat();
+
     // Color when stderr is a TTY and NO_COLOR is unset/empty (the de-facto
     // https://no-color.org convention). Reserved for the colored renderer;
     // Phase 2.a keeps the report monochrome, but the state is cached now so
@@ -8204,6 +8210,61 @@ const FrameAction = enum {
     /// Reached the Zig runtime entry below the user's `main`; stop the trace.
     stop,
 };
+
+/// How an unrecoverable abort report should be formatted. `text` is the
+/// default human `** (<kind>) <message>` crash report; `json` emits the
+/// schema-v1 record so the abort surface round-trips through the SAME
+/// machine-readable schema as the compile-error and leak/cycle surfaces
+/// (Phase 4 acceptance criterion #1: one renderer + one JSON schema across
+/// every diagnostic surface).
+const CrashReportFormat = enum { text, json };
+
+/// The canonical Error-IR `Domain` for an unrecoverable abort. The crash
+/// printer is fed by exactly two structural entry points, and the kind atom
+/// alone CANNOT disambiguate them (by design, a safe-mode arithmetic trap and
+/// a user `raise ArithmeticError` are observationally identical — same kind,
+/// same header — per `ZapPanic`'s contract), so the domain is threaded
+/// explicitly:
+///   * `.runtime` — a recoverable-model abort: a `raise` (or contract failure
+///     lowered to a raise) that reached the top with no `rescue`. The ERT
+///     chain, captured at the raise origin, rides in this report.
+///   * `.panic` — a language-level safety failure: a Zig safety check
+///     (overflow, OOB, null-unwrap, …), `unreachable`, an explicit `@panic`,
+///     or a hardware-fault signal (SIGSEGV/SIGBUS/SIGFPE/…).
+/// These map 1:1 onto `error_ir.Domain.runtime` / `error_ir.Domain.panic`; the
+/// wire strings here are kept byte-identical to `Domain.wireName()`.
+const CrashDomain = enum {
+    runtime,
+    panic,
+
+    /// Stable lowercase wire name for JSON's `domain` field — must match
+    /// `error_ir.Domain.wireName()` for the corresponding variant.
+    fn wireName(self: CrashDomain) []const u8 {
+        return switch (self) {
+            .runtime => "runtime",
+            .panic => "panic",
+        };
+    }
+};
+
+/// Lazily-resolved abort-report format, read ONCE from `ZAP_ERROR_FORMAT`
+/// (the env var the CLI threads in from `-Derror-format=json`), mirroring the
+/// leak path's `resolveLeakReportConfig`. Resolution happens in `crashReport`
+/// / `zapPanicReport` / the signal handler entry — all non-signal or
+/// already-init contexts where `getenv` is safe; the value is cached so a
+/// re-entrant signal-context caller never reads the environment.
+var crash_report_format: CrashReportFormat = .text;
+var crash_report_format_resolved: bool = false;
+
+/// Resolve `crash_report_format` from `ZAP_ERROR_FORMAT` exactly once. Cheap
+/// and idempotent; safe to call from every abort entry point.
+fn resolveCrashReportFormat() void {
+    if (crash_report_format_resolved) return;
+    crash_report_format_resolved = true;
+    if (envGetRuntime("ZAP_ERROR_FORMAT")) |fmt| {
+        if (std.mem.eql(u8, fmt, "json")) crash_report_format = .json;
+    }
+}
 
 /// Render a single backtrace frame line to stderr. `addr` is the raw return
 /// address; we subtract one byte before symbolizing so the line points
@@ -8346,6 +8407,180 @@ fn emitErrorReturnTraceSection() void {
             .stop => break,
         }
     }
+}
+
+// ===========================================================================
+// Phase 4.f — JSON projection of an unrecoverable abort report.
+//
+// The abort surface (a `raise` that reached the top unrescued, a safety-trap
+// panic, an explicit `@panic`, or a hardware-fault signal) round-trips through
+// the SAME schema-v1 record the leak/cycle surfaces emit and the compile-error
+// `error_json.zig` serializer produces:
+//
+//   {"domain":"<runtime|panic>","severity":"error","sub_kind":"<kind>",
+//    "trace_policy":"backtrace","message":"<msg>",
+//    "machine_data":{"backtrace":[<frame>,...],
+//                    "error_return_trace":[<frame>,...]}}
+//
+// where each <frame> is `{"symbol":"Struct.local/arity","file":"…","line":N}`
+// (symbol-only when no source location resolves; address-only when no symbol
+// resolves). The backtrace + ERT live under `machine_data` — the canonical
+// Error-IR's structured-payload home — so the record envelope stays identical
+// across every surface and a consumer reads frames from one well-known place.
+//
+// These run on the SAME async-signal-safe path as the text report: pure
+// `posixWrite`(2) + the page-allocator-backed DWARF arena, no libc `malloc`,
+// no env reads (the format was resolved earlier, in non-signal context). They
+// reuse the EXACT symbol + source resolution and frame-filtering that
+// `crashReportFrame` uses, so the JSON and text surfaces can never drift apart
+// in which frames they show or how a symbol resolves.
+// ===========================================================================
+
+/// Emit one backtrace frame as a JSON object element, reusing the text path's
+/// symbolization + frame-filtering verbatim. Returns the same `FrameAction` as
+/// `crashReportFrame` so the caller applies the identical
+/// skip/stop/count accounting. `needs_comma` controls the leading separator so
+/// the caller need not track whether a prior element was emitted.
+fn crashReportFrameJson(addr: usize, needs_comma: bool) FrameAction {
+    const call_site_addr = if (addr != 0) addr - 1 else addr;
+    const info = symbolizeAddress(call_site_addr);
+
+    const name: ?[]const u8 = if (info) |resolved| resolved.name else null;
+    const source: ?std.debug.SourceLocation = if (info) |resolved| resolved.source else null;
+
+    if (name == null or name.?.len == 0) {
+        // No symbol: emit the STATIC (de-slid) address, matching the text path
+        // (so a post-mortem tool resolves it offline and the report does not
+        // leak the ASLR layout). Shape: {"address":"0x…"[,"file":…,"line":N]}.
+        const static_addr = call_site_addr -% crash_reporter_config.image_slide;
+        if (needs_comma) posixWrite(STDERR_FD, ",");
+        posixWrite(STDERR_FD, "{\"address\":\"0x");
+        crashWriteUnsignedHex(static_addr);
+        posixWrite(STDERR_FD, "\"");
+        if (source) |loc| crashReportSourceLocationJson(loc);
+        posixWrite(STDERR_FD, "}");
+        return .emitted;
+    }
+
+    const mangled = stripSymbolUnderscore(name.?);
+
+    // Identical frame-filtering to the text path: suppress the runtime `raise`
+    // plumbing and the `panic`-namespace trampoline, and stop at the Zig
+    // startup glue below the user's entry. This keeps the JSON frame set
+    // byte-for-byte equivalent (in membership) to the text frame set.
+    if (isRaisePlumbingSymbol(mangled)) return .skipped;
+    if (isPanicPlumbingSymbol(mangled)) return .skipped;
+    if (isBelowUserEntrySymbol(mangled)) return .stop;
+
+    if (needs_comma) posixWrite(STDERR_FD, ",");
+    posixWrite(STDERR_FD, "{\"symbol\":\"");
+    if (crash_reporter_config.symbols) |reader| {
+        if (reader.findByMangled(mangled)) |sym| {
+            if (sym.zap_struct) |struct_name| {
+                writeJsonStringBody(struct_name);
+                posixWrite(STDERR_FD, ".");
+            }
+            writeJsonStringBody(sym.zap_local);
+            posixWrite(STDERR_FD, "/");
+            crashWriteUnsigned(sym.zap_arity);
+        } else {
+            writeJsonStringBody(mangled);
+        }
+    } else {
+        writeJsonStringBody(mangled);
+    }
+    posixWrite(STDERR_FD, "\"");
+    if (source) |loc| crashReportSourceLocationJson(loc);
+    posixWrite(STDERR_FD, "}");
+    return .emitted;
+}
+
+/// Append the `,"file":"…","line":N` members for a resolved frame's source
+/// location (JSON sibling of `crashReportSourceLocation`). Honors the security
+/// tier's path stripping just like the text path. No-op for a location with no
+/// file name.
+fn crashReportSourceLocationJson(loc: std.debug.SourceLocation) void {
+    if (loc.file_name.len == 0) return;
+    const shown = if (crash_report_security_tier.stripsAbsolutePaths())
+        pathBasename(loc.file_name)
+    else
+        loc.file_name;
+    posixWrite(STDERR_FD, ",\"file\":\"");
+    writeJsonStringBody(shown);
+    posixWrite(STDERR_FD, "\",\"line\":");
+    crashWriteUnsigned(loc.line);
+}
+
+/// Emit a backtrace array (the abort-site call stack) honoring the same
+/// `verbosity` frame budget the text report uses. Writes `[<frame>,...]`.
+fn emitBacktraceArrayJson(bt: Backtrace) void {
+    posixWrite(STDERR_FD, "[");
+    if (crash_reporter_config.verbosity != .off) {
+        const max_shown: usize = switch (crash_reporter_config.verbosity) {
+            .off => 0,
+            .short => CRASH_SHORT_FRAME_LIMIT,
+            .full => bt.len,
+        };
+        var shown: usize = 0;
+        var i: usize = 0;
+        while (i < bt.len and shown < max_shown) : (i += 1) {
+            switch (crashReportFrameJson(bt.addresses[i], shown > 0)) {
+                .emitted => shown += 1,
+                .skipped => {},
+                .stop => break,
+            }
+        }
+    }
+    posixWrite(STDERR_FD, "]");
+}
+
+/// Emit the error-return-trace array (JSON sibling of
+/// `emitErrorReturnTraceSection`): the propagation chain captured at the raise
+/// origin. Empty `[]` when no ERT was captured (a direct panic / signal fault),
+/// so the key is always present and a consumer never special-cases its
+/// absence.
+fn emitErrorReturnTraceArrayJson() void {
+    posixWrite(STDERR_FD, "[");
+    if (current_error_return_trace_pending and
+        current_error_return_trace.len != 0 and
+        crash_reporter_config.verbosity != .off)
+    {
+        const max_shown: usize = switch (crash_reporter_config.verbosity) {
+            .off => 0,
+            .short => CRASH_SHORT_FRAME_LIMIT,
+            .full => current_error_return_trace.len,
+        };
+        var shown: usize = 0;
+        var i: usize = 0;
+        while (i < current_error_return_trace.len and shown < max_shown) : (i += 1) {
+            switch (crashReportFrameJson(current_error_return_trace.addresses[i], shown > 0)) {
+                .emitted => shown += 1,
+                .skipped => {},
+                .stop => break,
+            }
+        }
+    }
+    posixWrite(STDERR_FD, "]");
+}
+
+/// Render the whole abort report as a single schema-v1 JSON record. The
+/// `domain` distinguishes a recoverable-model `raise` abort (`.runtime`) from a
+/// language-level safety failure (`.panic`); `kind` is the snake_case abort
+/// kind (doubling as `sub_kind`). Pure `posixWrite`(2); async-signal-safe.
+fn emitCrashReportJson(domain: CrashDomain, kind: []const u8, message: []const u8, bt: Backtrace) void {
+    posixWrite(STDERR_FD, "{\"domain\":\"");
+    posixWrite(STDERR_FD, domain.wireName());
+    posixWrite(STDERR_FD, "\",\"severity\":\"error\",\"sub_kind\":\"");
+    writeJsonStringBody(kind);
+    posixWrite(STDERR_FD, "\",\"trace_policy\":\"backtrace\",\"message\":\"");
+    writeJsonStringBody(message);
+    posixWrite(STDERR_FD, "\",\"machine_data\":{\"kind\":\"");
+    writeJsonStringBody(kind);
+    posixWrite(STDERR_FD, "\",\"backtrace\":");
+    emitBacktraceArrayJson(bt);
+    posixWrite(STDERR_FD, ",\"error_return_trace\":");
+    emitErrorReturnTraceArrayJson();
+    posixWrite(STDERR_FD, "}}\n");
 }
 
 // ===========================================================================
@@ -9749,7 +9984,7 @@ fn resetCrashReportGuardForTesting() void {
 /// arena (page-allocator-backed, never libc `malloc`), so it is
 /// async-signal-safe. `crash_reporter_config` MUST already be populated
 /// (via `zapCrashReporterInit`, forced at startup by `memoryStartupForEntry`).
-fn emitCrashReportWithBacktrace(kind: []const u8, message: []const u8, bt: Backtrace) noreturn {
+fn emitCrashReportWithBacktrace(domain: CrashDomain, kind: []const u8, message: []const u8, bt: Backtrace) noreturn {
     // Double-fault guard FIRST: before any work that could itself fault. If
     // this is a re-entrant call (a fault while we were already printing, or a
     // second fatal signal), abort minimally instead of recursing.
@@ -9759,6 +9994,18 @@ fn emitCrashReportWithBacktrace(kind: []const u8, message: []const u8, bt: Backt
     // report does not race ahead of the program's own output. `flushStdoutBuf`
     // is a plain `write`(2) — no allocation, no atexit.
     flushStdoutBuf();
+
+    // Phase 4.f: under `--error-format=json` the abort surface emits the
+    // schema-v1 record instead of the human report, so a runtime panic / raise
+    // / signal fault round-trips through the SAME machine-readable schema as
+    // the compile-error and leak/cycle surfaces. The format was resolved
+    // earlier (in `crashReport` / `zapPanicReport` / the signal handler entry,
+    // all non-signal or already-init contexts where `getenv` is safe); reading
+    // the cached flag here is async-signal-safe.
+    if (crash_report_format == .json) {
+        emitCrashReportJson(domain, kind, message, bt);
+        std.c._exit(1);
+    }
 
     // Header: ** (<kind>) <message>\n — using the SHARED visual-format
     // constants (mirrored from `error_format.zig`) and the SHARED SGR palette
@@ -9825,6 +10072,9 @@ pub noinline fn crashReport(kind: []const u8, message: []const u8) noreturn {
     // `getenv`/file-read here is fine; the signal handlers will have
     // already forced this via `zapCrashReporterInit` at startup.
     zapCrashReporterInit();
+    // Resolve `--error-format` here too (also a normal-context `getenv`), so
+    // the abort surface honors `--error-format=json` like every other surface.
+    resolveCrashReportFormat();
 
     // Skip frames: (0) `captureBacktraceInto` itself (frame 0 of the
     // walk, since `Backtrace.capture` is `inline`), (1) this
@@ -9838,7 +10088,11 @@ pub noinline fn crashReport(kind: []const u8, message: []const u8) noreturn {
     // fixed skip count).
     const skip: usize = 3;
     const bt = Backtrace.capture(skip);
-    emitCrashReportWithBacktrace(kind, message, bt);
+    // A `crashReport` caller is a recoverable-model abort terminus (a `raise`
+    // — or a contract failure / `panic()` sink lowered to one — that reached
+    // the top unrescued), so the canonical domain is `.runtime`. The ERT chain
+    // captured at the raise origin rides in the report.
+    emitCrashReportWithBacktrace(.runtime, kind, message, bt);
 }
 
 // ---------------------------------------------------------------------------
@@ -9888,8 +10142,13 @@ const ZAP_PANIC_SKIP_FRAMES: usize = 2;
 noinline fn zapPanicReport(kind: []const u8, message: []const u8, _first_trace_addr: ?usize) noreturn {
     _ = _first_trace_addr;
     zapCrashReporterInit();
+    resolveCrashReportFormat();
     const bt = Backtrace.capture(ZAP_PANIC_SKIP_FRAMES);
-    emitCrashReportWithBacktrace(kind, message, bt);
+    // Every `ZapPanic` handler is a language-level safety failure (overflow,
+    // OOB, null-unwrap, `unreachable`, explicit `@panic`, …): canonical
+    // domain `.panic`. No ERT is captured on this path (a safety trap is not a
+    // propagated raise), so the JSON `error_return_trace` is `[]`.
+    emitCrashReportWithBacktrace(.panic, kind, message, bt);
 }
 
 /// `FullPanic`-shaped namespace bridging Zig's panic interface to the Zap
@@ -10170,14 +10429,17 @@ fn zapSignalHandler(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_pt
             // bind it to a local so the unwinder can take its address.
             const ctx_local = cpu_ctx;
             const bt = Backtrace.captureFromContext(&ctx_local);
-            emitCrashReportWithBacktrace(kind, message, bt);
+            // A hardware-fault signal (SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGTRAP) is
+            // a language-level failure: domain `.panic`. The format was
+            // resolved at startup (`zapCrashReporterInit`), so no `getenv` here.
+            emitCrashReportWithBacktrace(.panic, kind, message, bt);
         }
     }
 
     // No usable CPU context (unsupported target or extraction failed):
     // still emit the unified header so the fault is reported in the Zap
     // format, just without a symbolized backtrace.
-    emitCrashReportWithBacktrace(kind, message, .{ .addresses = undefined, .len = 0 });
+    emitCrashReportWithBacktrace(.panic, kind, message, .{ .addresses = undefined, .len = 0 });
 }
 
 /// Install the `SA_SIGINFO` Zap crash handler for the hardware-fault

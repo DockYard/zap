@@ -1,4 +1,4 @@
-** (assertion_error) assertion failed: value (at <FIXTURE>:9)
+** (assertion_error) assertion failed: value (at <FIXTURE>:11)
   Kernel.contract_violation/3
   AssertionError.check/1
   script.main

@@ -447,6 +447,17 @@ pub fn build(b: *std.Build) void {
     golden_corpus_cmd.step.dependOn(b.getInstallStep());
     golden_corpus_step.dependOn(&golden_corpus_cmd.step);
 
+    // Phase 4.f abort-surface JSON acceptance: a SEMANTIC guard (distinct from
+    // the byte-snapshot corpus) asserting each unrecoverable abort surface
+    // (raise / safe-mode contract+arithmetic+index trap) emits a schema-v1
+    // JSON record of the CORRECT `domain` under `--error-format=json`. A
+    // snapshot alone would silently bless a regressed domain on the next
+    // `--update`; this names the invariant.
+    const abort_json_step = b.step("abort-json-acceptance", "Assert abort surfaces emit schema-v1 JSON with the correct domain under --error-format=json");
+    const abort_json_cmd = b.addSystemCommand(&.{ "bash", "script_fixtures/run_phase_4f_panic_json.sh" });
+    abort_json_cmd.step.dependOn(b.getInstallStep());
+    abort_json_step.dependOn(&abort_json_cmd.step);
+
     // -----------------------------------------------------------------------
     // ZIR integration tests (need the built binary)
     // -----------------------------------------------------------------------

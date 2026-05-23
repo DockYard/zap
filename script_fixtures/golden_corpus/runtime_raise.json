@@ -1,11 +1,2 @@
 [script-cache hit] <STAGING>
-** (kaboom_error) kaboom from the deepest frame
-  Kernel.abort_recoverable_raise/0
-  script.main
-  __ZapScriptMain.main/1
-error return trace:
-  Chain.deepest/0
-  Chain.middle/0
-  Chain.outermost/0
-  script.main
-  __ZapScriptMain.main/1
+{"domain":"runtime","severity":"error","sub_kind":"kaboom_error","trace_policy":"backtrace","message":"kaboom from the deepest frame","machine_data":{"kind":"kaboom_error","backtrace":[{"symbol":"Kernel.abort_recoverable_raise/0"},{"symbol":"script.main"},{"symbol":"__ZapScriptMain.main/1"}],"error_return_trace":[{"symbol":"Chain.deepest/0"},{"symbol":"Chain.middle/0"},{"symbol":"Chain.outermost/0"},{"symbol":"script.main"},{"symbol":"__ZapScriptMain.main/1"}]}}
