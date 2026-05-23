@@ -59,6 +59,8 @@ const mirrored_constants = [_]MirroredConstant{
     .{ .name = "source_line_separator", .canonical_decl = "pub const source_line_separator = ", .mirror_decl = "const source_line_separator = " },
     .{ .name = "ert_section_header", .canonical_decl = "pub const ert_section_header = ", .mirror_decl = "const ert_section_header = " },
     .{ .name = "cause_prefix", .canonical_decl = "pub const cause_prefix = ", .mirror_decl = "const cause_prefix = " },
+    .{ .name = "gutter_bar", .canonical_decl = "pub const gutter_bar = ", .mirror_decl = "const gutter_bar = " },
+    .{ .name = "footer_corner", .canonical_decl = "pub const footer_corner = ", .mirror_decl = "const footer_corner = " },
 };
 
 /// One SGR escape that must match between `error_format.sgr` and
@@ -73,6 +75,7 @@ const mirrored_sgr = [_]MirroredSgr{
     .{ .canonical_decl = "pub const reset = ", .mirror_decl = "const sgr_reset = " },
     .{ .canonical_decl = "pub const bold = ", .mirror_decl = "const sgr_bold = " },
     .{ .canonical_decl = "pub const bold_red = ", .mirror_decl = "const sgr_bold_red = " },
+    .{ .canonical_decl = "pub const bold_yellow = ", .mirror_decl = "const sgr_bold_yellow = " },
     .{ .canonical_decl = "pub const cyan = ", .mirror_decl = "const sgr_cyan = " },
 };
 

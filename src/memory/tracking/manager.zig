@@ -262,6 +262,14 @@ const ZapLeakRecord = extern struct {
 /// state); the manager passes it back unchanged.
 const ZapLeakReportSink = *const fn (sink_ctx: ?*anyopaque, record: *const ZapLeakRecord) callconv(.c) void;
 
+/// The runtime-installed "report complete" callback. Invoked once at the END
+/// of `core.deinit`, after every survivor has been handed to the sink and
+/// BEFORE the live map is torn down. Lets the runtime renderer sort the
+/// accumulated survivors deterministically, print the summary table, and
+/// apply `--leaks-fatal` (which may terminate the process). `null` when the
+/// host did not install a finish callback (the raw-line fallback needs none).
+const ZapLeakReportFinish = *const fn (sink_ctx: ?*anyopaque) callconv(.c) void;
+
 // ---------------------------------------------------------------------------
 // Manager constants
 // ---------------------------------------------------------------------------
@@ -400,8 +408,14 @@ const TrackingContext = struct {
     /// leak is never silently dropped.
     report_sink: ?ZapLeakReportSink = null,
 
-    /// Opaque cookie passed back to `report_sink` unchanged. Carries the
-    /// runtime's renderer state across the C-ABI boundary.
+    /// The runtime-installed "report complete" callback (Phase 4.c). Called
+    /// at the end of `deinit` so the runtime can render the deterministic
+    /// summary + apply `--leaks-fatal`. `null` under the raw-line fallback.
+    report_finish: ?ZapLeakReportFinish = null,
+
+    /// Opaque cookie passed back to `report_sink` / `report_finish`
+    /// unchanged. Carries the runtime's renderer state across the C-ABI
+    /// boundary.
     report_sink_ctx: ?*anyopaque = null,
 };
 
@@ -580,12 +594,14 @@ fn trackingAnnotateAllocation(
 fn trackingSetLeakReportSink(
     ctx: *anyopaque,
     sink: ?ZapLeakReportSink,
+    finish: ?ZapLeakReportFinish,
     sink_ctx: ?*anyopaque,
 ) callconv(.c) void {
     const tctx: *TrackingContext = @ptrCast(@alignCast(ctx));
     spinLock(&tctx.spinlock);
     defer spinUnlock(&tctx.spinlock);
     tctx.report_sink = sink;
+    tctx.report_finish = finish;
     tctx.report_sink_ctx = sink_ctx;
 }
 
@@ -741,6 +757,15 @@ fn trackingDeinit(ctx: *anyopaque) callconv(.c) void {
         const total = rec.leading_canary_size + rec.size + CANARY_SIZE;
         const inner_alignment: std.mem.Alignment = .fromByteUnits(@max(rec.alignment, @as(u32, @intCast(CANARY_SIZE))));
         std.heap.page_allocator.rawFree(rec.base_ptr[0..total], inner_alignment, @returnAddress());
+    }
+    // Phase 4.c: signal report completion so the runtime renderer can sort
+    // the survivors deterministically, print the summary table, and apply
+    // `--leaks-fatal` (which may terminate the process). Runs while the live
+    // map is still intact in case the renderer wants to re-walk it; the
+    // records it rendered borrowed only `.rodata` type names and copied the
+    // backtrace by value, so tearing the map down next is safe.
+    if (tctx.report_finish) |finish| {
+        finish(tctx.report_sink_ctx);
     }
     tctx.live.deinit(std.heap.page_allocator);
     std.heap.page_allocator.destroy(tctx);

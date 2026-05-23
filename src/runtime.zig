@@ -1140,6 +1140,74 @@ const RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT: bool = true;
 
 pub const refcount_sized_extension_active: bool = RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT;
 
+/// Phase 4.c — comptime-true when the active manager source is registered
+/// AND implements the optional leak-attribution interface
+/// (`annotateAllocation` + `setLeakReportSink`). `Memory.Tracking` does;
+/// `Memory.ARC` / `Memory.Arena` / `Memory.NoOp` do not. Every leak-
+/// attribution call site (`annotateAllocationForLeakTracking`, the startup
+/// sink install) gates on this so a non-tracking build folds the entire
+/// subsystem away — zero hot-path cost, no symbol references.
+///
+/// Test builds register the ARC source (no attribution decls), so the flag
+/// is false under `zig build test` — the host suite never exercises the
+/// attribution path, exactly as it never exercises the user-binary startup
+/// rewrite.
+pub const leak_attribution_active: bool = active_manager_source_available and
+    @hasDecl(active_manager, "annotateAllocation") and
+    @hasDecl(active_manager, "setLeakReportSink");
+
+/// Derive a stable, Zap-facing display name for a heap-allocated type `T`
+/// from its Zig type name, evaluated at comptime so the result is a
+/// `.rodata` string the leak record can borrow for the process lifetime.
+///
+/// `@typeName(T)` is the compiler-chosen, module-qualified Zig name
+/// (`user_module.User`, `zap_runtime.ProtocolBox(user_module.Inner)`,
+/// `*user_module.Node`). This is NOT a hardcoded type table — the name
+/// flows from the type the compiler actually instantiated; we only
+/// normalize its presentation:
+///
+///   * strip a leading `*` (the heap slot's pointer-to-T name);
+///   * unwrap one `ProtocolBox(<Inner>)` layer to the boxed inner type —
+///     a leaked `cause: Option(Error)` box should read as the concrete
+///     error it carries, not as the transport shape;
+///   * drop the module-qualifier prefix (everything up to and including
+///     the last `.` of the relevant segment), leaving the bare Zap type
+///     identifier the user wrote.
+///
+/// The renderer wraps the result as `` `%Name{}` `` (Zap struct-literal
+/// notation) so the report reads "Leaked 1 `%Inner{}` (40 B), …".
+fn zapTypeDisplayName(comptime T: type) []const u8 {
+    comptime {
+        var name: []const u8 = @typeName(T);
+        // Strip pointer prefixes (`*`, `*const `, `?*`, etc.) — the heap
+        // slot is named `*T`, but we want the pointee's type.
+        while (name.len > 0 and (name[0] == '*' or name[0] == '?')) {
+            name = name[1..];
+            if (std.mem.startsWith(u8, name, "const ")) name = name["const ".len..];
+        }
+        // Unwrap a single `ProtocolBox(<Inner>)` layer to the inner type.
+        // `@typeName` renders the parametric box as
+        // `…ProtocolBox(<inner-type-name>)`; find the `ProtocolBox(`
+        // opener anywhere in the (possibly module-qualified) head and
+        // take the parenthesized inner, dropping the trailing `)`.
+        const box_marker = "ProtocolBox(";
+        if (std.mem.indexOf(u8, name, box_marker)) |idx| {
+            const inner_start = idx + box_marker.len;
+            if (name.len > inner_start and name[name.len - 1] == ')') {
+                name = name[inner_start .. name.len - 1];
+            }
+        }
+        // Drop the module qualifier: keep the segment after the last '.'.
+        if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
+            name = name[dot + 1 ..];
+        }
+        // Defensive: an empty result (pathological type name) degrades to
+        // the raw Zig type name so the report is never blank.
+        if (name.len == 0) return @typeName(T);
+        return name;
+    }
+}
+
 pub const AbiV1 = struct {
     /// `REFC` capability tag (spec section 7.1) read at the target's
     /// native endianness. Derived via `std.mem.readInt(u32, "REFC", endian)`
@@ -1314,6 +1382,74 @@ pub const AbiV1 = struct {
         );
         if (REFCOUNT_V1_SIZE_V1_1 != @sizeOf(ZapRefcountCapabilityV1)) @compileError(
             "runtime.AbiV1: REFCOUNT_V1_SIZE_V1_1 must match the current ZapRefcountCapabilityV1 size",
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 4.c — leak-attribution boundary types.
+    //
+    // A leak-tracking manager (`Memory.Tracking`) records a Zap type +
+    // allocation-site backtrace per live allocation and hands every
+    // survivor / canary-fault to a runtime-installed report sink as a
+    // `ZapLeakRecord`. The sink (in this file) symbolizes the backtrace
+    // and renders the unified `domain=leak` diagnostic. These shapes are
+    // the C-ABI contract between the two; they are redeclared (with the
+    // matching `comptime` asserts below) in
+    // `src/memory/tracking/manager.zig` under the self-contained-manager
+    // convention, and the two MUST stay byte-identical.
+    // ----------------------------------------------------------------
+
+    /// Which kind of memory fault a `ZapLeakRecord` describes. Mirrors
+    /// the manager-side enum.
+    pub const ZapLeakKind = enum(u32) {
+        leak = 0,
+        use_after_free_or_oob = 1,
+        invalid_free = 2,
+        dealloc_mismatch = 3,
+    };
+
+    /// Render-ready description of one memory fault. All pointers are
+    /// borrowed for the duration of the sink call only.
+    pub const ZapLeakRecord = extern struct {
+        kind: u32,
+        user_ptr: usize,
+        size: usize,
+        alignment: u32,
+        refcount: u32,
+        type_name_ptr: ?[*]const u8,
+        type_name_len: usize,
+        backtrace_ptr: ?[*]const usize,
+        backtrace_len: usize,
+        canary_offset: usize,
+        canary_size: usize,
+        supplied_size: usize,
+        supplied_alignment: u32,
+    };
+
+    /// The runtime-installed report sink the manager calls per fault.
+    pub const ZapLeakReportSink = *const fn (sink_ctx: ?*anyopaque, record: *const ZapLeakRecord) callconv(.c) void;
+
+    comptime {
+        // Drift tripwire against the manager-side redeclaration. The
+        // struct is `extern` so its layout is the ABI; a field reorder
+        // or size change on either side must be matched here.
+        if (@sizeOf(ZapLeakRecord) != @sizeOf(extern struct {
+            kind: u32,
+            user_ptr: usize,
+            size: usize,
+            alignment: u32,
+            refcount: u32,
+            type_name_ptr: ?[*]const u8,
+            type_name_len: usize,
+            backtrace_ptr: ?[*]const usize,
+            backtrace_len: usize,
+            canary_offset: usize,
+            canary_size: usize,
+            supplied_size: usize,
+            supplied_alignment: u32,
+        })) @compileError("runtime.AbiV1: ZapLeakRecord layout drifted");
+        if (@offsetOf(ZapLeakRecord, "kind") != 0) @compileError(
+            "runtime.AbiV1: ZapLeakRecord.kind must be at offset 0",
         );
     }
 };
@@ -2574,6 +2710,33 @@ fn zapMemoryStartup() void {
     };
     active_manager_state.context = ctx;
 
+    // Phase 4.c: install the unified leak-report renderer as the active
+    // manager's report sink, when the manager implements the attribution
+    // interface (`Memory.Tracking`). Done before any allocation so every
+    // survivor at `core.deinit` and every canary/invalid-free/mismatch
+    // fault routes through the unified renderer rather than the legacy raw
+    // line. Also caches the crash-reporter config (symbol side-table,
+    // image slide, security tier) the renderer reuses for symbolization —
+    // idempotent, and `zapMemoryStartup` is the earliest non-signal point
+    // guaranteed to run before any leak can be reported. Folds away under
+    // non-tracking managers.
+    if (comptime leak_attribution_active) {
+        zapCrashReporterInit();
+        // The manager declares its OWN (byte-identical, drift-asserted)
+        // `ZapLeakRecord` / sink / finish types under the self-contained-
+        // manager convention, so the runtime's `AbiV1`-typed function
+        // pointers are a distinct nominal type at this boundary. `@ptrCast`
+        // bridges them — the ABI is identical by construction (the drift
+        // assert on `ZapLeakRecord` is the guarantee), and the result type
+        // is inferred from each `setLeakReportSink` parameter.
+        active_manager.setLeakReportSink(
+            ctx,
+            @ptrCast(&leakReportSink),
+            @ptrCast(&finishLeakReport),
+            null,
+        );
+    }
+
     if ((core.declared_caps & AbiV1.REFCOUNT_V1_BIT) != 0) {
         const desc = core.get_capability_desc(ctx, AbiV1.REFC_TAG) orelse {
             @panic("zap runtime: active manager declares REFCOUNT_V1 but get_capability_desc(REFC) returned null");
@@ -3765,6 +3928,62 @@ pub const ArcRuntime = struct {
         incrementRuntimeStatCounter(&arc_return_elisions_total);
     }
 
+    /// Phase 4.c — record the Zap type + allocation-site backtrace for a
+    /// freshly-allocated heap slot, when the active manager implements the
+    /// optional leak-attribution interface (`Memory.Tracking` does;
+    /// `Memory.ARC` / `Memory.Arena` / `Memory.NoOp` do not).
+    ///
+    /// The bare `core.allocate(size, alignment)` slot carries no type and
+    /// no call-stack — but at THIS call site the runtime knows the comptime
+    /// `T` (so the Zap display name is a comptime constant in `.rodata`)
+    /// and can capture a `Backtrace` cheaply. We hand both to the manager's
+    /// `annotateAllocation`, which stamps them onto the live-allocation
+    /// record it just created in `core.allocate`. At `core.deinit` the
+    /// manager replays each survivor through the runtime's unified leak
+    /// renderer (installed via `setLeakReportSink`).
+    ///
+    /// Comptime-gated three ways so a non-tracking build pays exactly
+    /// nothing: the whole body folds away unless the active manager source
+    /// is registered AND declares `annotateAllocation`. Capturing the
+    /// backtrace here (rather than inside the manager) is also what keeps
+    /// the manager self-contained — the fork's frame-pointer walk lives in
+    /// the LLVM-compiled runtime, not the object-mode manager.
+    ///
+    /// `skip` drops the runtime trampoline frames between this helper and
+    /// the user's construction site so the reported allocation site is the
+    /// user's `Builder.make/1`, not `ArcRuntime.allocAny`.
+    inline fn annotateAllocationForLeakTracking(
+        comptime T: type,
+        user_ptr: [*]u8,
+        comptime skip: usize,
+    ) void {
+        if (comptime !leak_attribution_active) return;
+        const type_name = comptime zapTypeDisplayName(T);
+        var bt = Backtrace.capture(skip);
+        if (bt.len == 0) {
+            // Even with no frames, annotate the type so the leak report
+            // still names what leaked (the backtrace simply renders as
+            // "allocation site unavailable").
+            active_manager.annotateAllocation(
+                active_manager_state.context.?,
+                user_ptr,
+                type_name.ptr,
+                type_name.len,
+                &bt.addresses,
+                0,
+            );
+            return;
+        }
+        active_manager.annotateAllocation(
+            active_manager_state.context.?,
+            user_ptr,
+            type_name.ptr,
+            type_name.len,
+            &bt.addresses,
+            bt.len,
+        );
+    }
+
     /// Allocate and wrap a value in an Arc. Returns a pointer directly
     /// to the slab slot holding `value`; the slot's side-table refcount
     /// is initialised to 1 by the pool's `create`.
@@ -3847,6 +4066,14 @@ pub const ArcRuntime = struct {
             };
             const slot: *T = @ptrCast(@alignCast(raw));
             slot.* = value;
+            // Phase 4.c: attribute this allocation (Zap type + capture the
+            // allocation-site backtrace) when the active manager tracks
+            // leaks. `skip = 1` drops only the `noinline captureBacktraceInto`
+            // frame — `Backtrace.capture`, `annotateAllocationForLeakTracking`,
+            // and `allocAny` are all `inline`, so the next frame up is the
+            // user's construction site. Folds to nothing under non-tracking
+            // managers (`leak_attribution_active == false`).
+            annotateAllocationForLeakTracking(T, @ptrCast(slot), 1);
             return slot;
         }
         if (active_manager_state.shutdown_complete) {
@@ -7629,10 +7856,13 @@ const RuntimeFormat = struct {
     const source_line_separator = ":";
     const ert_section_header = "error return trace:";
     const cause_prefix = "caused by: ";
+    const gutter_bar = "\u{2502}";
+    const footer_corner = "\u{2514}\u{2500}";
 
     const sgr_reset = "\x1b[0m";
     const sgr_bold = "\x1b[1m";
     const sgr_bold_red = "\x1b[1;31m";
+    const sgr_bold_yellow = "\x1b[1;33m";
     const sgr_cyan = "\x1b[36m";
 };
 
@@ -8042,6 +8272,598 @@ fn emitErrorReturnTraceSection() void {
         }
     }
 }
+
+// ===========================================================================
+// Phase 4.c — unified leak / memory-fault report renderer (the runtime side
+// of the leak-attribution subsystem).
+//
+// `Memory.Tracking`'s manager backend (`src/memory/tracking/manager.zig`) is
+// the authority on the live-allocation set, the canary state, and the per-
+// allocation attribution (Zap type + alloc-site backtrace, stamped via
+// `annotateAllocation`). But it is a self-contained object-mode TU (std +
+// builtin only) — it cannot symbolize a backtrace or speak the unified visual
+// language. So at `core.deinit` it replays each survivor (and, at
+// `core.deallocate`, each canary/invalid-free/mismatch fault) through the
+// runtime-installed sink below as a `ZapLeakRecord`.
+//
+// This renderer runs on the normal main-return path, NOT the async-signal
+// crash path, so it MAY allocate, read the environment, and symbolize. It
+// renders the SAME visual language as the crash printer and the compile-time
+// `diagnostics.zig` renderer — `RuntimeFormat`'s shared constants, the
+// `domain=leak` canonical-IR vocabulary, the gutter/footer glyphs — so a leak
+// report and a type error look like the same tool (the brief's one-visual-
+// language mandate). The synthetic-leak render test in `src/diagnostics.zig`
+// pins the byte shape this mirrors (`warning: memory leak: …`, the gutter
+// bar, the footer corner, `allocated here`, `file:line`).
+//
+// A `--error-format=json` mode (env `ZAP_ERROR_FORMAT=json`, set by the CLI
+// flag) emits the machine-readable projection instead; `--leaks-fatal` (env
+// `ZAP_LEAKS_FATAL=1`) makes any surviving leak force a non-zero process exit
+// (the CI mode). Both knobs are read once, lazily, on the first report.
+// ===========================================================================
+
+/// Maximum number of distinct leaked allocations the report aggregates for
+/// the deterministic detail list + summary table. A leak report past this
+/// many survivors prints the first `MAX_TRACKED_LEAKS` and a truncation
+/// note — the cap bounds the renderer's fixed inline storage so the report
+/// itself never allocates per-leak (the leaking program is already in a bad
+/// state; the renderer must stay robust). 4096 distinct survivors is far
+/// beyond any realistic attributed-leak scenario.
+const MAX_TRACKED_LEAKS: usize = 4096;
+
+/// One accumulated leak survivor, copied OUT of the manager's transient
+/// record (whose inline backtrace array does not outlive the manager's
+/// deinit iteration). The `type_name` slice borrows `.rodata` (stable for
+/// the process lifetime); the backtrace addresses are copied by value.
+const AccumulatedLeak = struct {
+    user_ptr: usize,
+    size: usize,
+    alignment: u32,
+    refcount: u32,
+    type_name_ptr: ?[*]const u8,
+    type_name_len: usize,
+    backtrace: [16]usize,
+    backtrace_len: usize,
+
+    fn typeName(self: *const AccumulatedLeak) []const u8 {
+        const p = self.type_name_ptr orelse return "";
+        return p[0..self.type_name_len];
+    }
+};
+
+/// How a leak report should be formatted.
+const LeakReportFormat = enum { text, json };
+
+/// Accumulator + configuration for the leak report. The sink appends each
+/// `kind == leak` record here; `finishLeakReport` sorts deterministically,
+/// renders the detail list + summary table (or JSON), and applies
+/// `--leaks-fatal`. Canary / invalid-free / mismatch faults are rendered
+/// immediately by the sink (they are isolated `core.deallocate`-time events,
+/// not part of the deinit survivor batch).
+const LeakReportState = struct {
+    leaks: [MAX_TRACKED_LEAKS]AccumulatedLeak = undefined,
+    count: usize = 0,
+    /// True once `count` hit the cap and further survivors were dropped from
+    /// the detail list (still counted in `overflow_count` / `overflow_bytes`).
+    overflowed: bool = false,
+    overflow_count: usize = 0,
+    overflow_bytes: usize = 0,
+
+    /// Lazily-resolved config (read once on first report).
+    config_resolved: bool = false,
+    format: LeakReportFormat = .text,
+    fatal: bool = false,
+};
+
+var leak_report_state: LeakReportState = .{};
+
+/// Resolve the `--error-format` / `--leaks-fatal` knobs once, from the
+/// environment the CLI threads in (`ZAP_ERROR_FORMAT`, `ZAP_LEAKS_FATAL`).
+/// Env-driven (not comptime) because they are per-invocation CI/tooling
+/// choices, and this path is not async-signal-constrained.
+fn resolveLeakReportConfig() void {
+    if (leak_report_state.config_resolved) return;
+    leak_report_state.config_resolved = true;
+    if (envGetRuntime("ZAP_ERROR_FORMAT")) |fmt| {
+        if (std.mem.eql(u8, fmt, "json")) leak_report_state.format = .json;
+    }
+    if (envGetRuntime("ZAP_LEAKS_FATAL")) |v| {
+        leak_report_state.fatal = v.len > 0 and !std.mem.eql(u8, v, "0");
+    }
+}
+
+/// The leak-report sink installed into the active manager at startup
+/// (Phase 4.c). Invoked once per surviving allocation at `core.deinit`
+/// (`kind == leak`, accumulated for the deterministic batch report) and
+/// once per canary / invalid-free / mismatch fault at `core.deallocate`
+/// (rendered immediately). `callconv(.c)` to match the manager's
+/// `ZapLeakReportSink` slot.
+fn leakReportSink(sink_ctx: ?*anyopaque, record: *const AbiV1.ZapLeakRecord) callconv(.c) void {
+    _ = sink_ctx;
+    resolveLeakReportConfig();
+    const kind: AbiV1.ZapLeakKind = @enumFromInt(record.kind);
+    switch (kind) {
+        .leak => accumulateLeak(record),
+        .use_after_free_or_oob,
+        .invalid_free,
+        .dealloc_mismatch,
+        => renderMemoryFaultImmediate(record),
+    }
+}
+
+/// Append a surviving-allocation record to the accumulator, copying the
+/// borrowed backtrace by value (the manager's record does not outlive its
+/// deinit iteration). Past the cap, fold the survivor into the overflow
+/// counters so the summary total stays accurate.
+fn accumulateLeak(record: *const AbiV1.ZapLeakRecord) void {
+    if (leak_report_state.count >= MAX_TRACKED_LEAKS) {
+        leak_report_state.overflowed = true;
+        leak_report_state.overflow_count += 1;
+        leak_report_state.overflow_bytes += record.size;
+        return;
+    }
+    var entry: AccumulatedLeak = .{
+        .user_ptr = record.user_ptr,
+        .size = record.size,
+        .alignment = record.alignment,
+        .refcount = record.refcount,
+        .type_name_ptr = record.type_name_ptr,
+        .type_name_len = record.type_name_len,
+        .backtrace = undefined,
+        .backtrace_len = 0,
+    };
+    if (record.backtrace_ptr) |bt| {
+        const n = @min(record.backtrace_len, entry.backtrace.len);
+        var i: usize = 0;
+        while (i < n) : (i += 1) entry.backtrace[i] = bt[i];
+        entry.backtrace_len = n;
+    }
+    leak_report_state.leaks[leak_report_state.count] = entry;
+    leak_report_state.count += 1;
+}
+
+/// Write a Zap-facing type label for a leaked allocation: `` `%Name{}` ``
+/// when the type was attributed, or a neutral `an allocation` when it was
+/// not (so the line still reads naturally). Pure `write(2)`.
+fn writeLeakTypeLabel(type_name: []const u8) void {
+    if (type_name.len == 0) {
+        posixWrite(STDERR_FD, "an allocation");
+        return;
+    }
+    posixWrite(STDERR_FD, "`%");
+    posixWrite(STDERR_FD, type_name);
+    posixWrite(STDERR_FD, "{}`");
+}
+
+/// Render the allocation-site backtrace for one leak/fault, reusing the
+/// crash printer's `crashReportFrame` so a leak's allocation site and a
+/// crash backtrace frame are byte-identical (`  Struct.fn/arity at
+/// file.zap:line`). Honors `ZAP_BACKTRACE` for depth, exactly like the
+/// crash report. Prints an `allocated here:` lead-in (the leak analog of
+/// the crash `error return trace:` header). No-op when no frames were
+/// captured.
+fn renderAllocationSite(backtrace: []const usize) void {
+    if (backtrace.len == 0) {
+        posixWrite(STDERR_FD, RuntimeFormat.frame_indent);
+        posixWrite(STDERR_FD, "(allocation site unavailable)\n");
+        return;
+    }
+    const max_shown: usize = switch (crash_reporter_config.verbosity) {
+        .off => 1, // even in `off` mode show the single origin frame
+        .short => CRASH_SHORT_FRAME_LIMIT,
+        .full => backtrace.len,
+    };
+    var shown: usize = 0;
+    var i: usize = 0;
+    while (i < backtrace.len and shown < max_shown) : (i += 1) {
+        switch (crashReportFrame(backtrace[i])) {
+            .emitted => shown += 1,
+            .skipped => {},
+            .stop => break,
+        }
+    }
+}
+
+/// Resolve the first user-frame source location of a backtrace to its
+/// `file:line` for the one-line headline (`allocated at app.zap:88`). Walks
+/// frames the way `crashReportFrame` does — skipping runtime plumbing — and
+/// returns the first frame that maps to a real source location. Returns null
+/// when none resolves (stripped binary etc.), in which case the headline
+/// omits the `, allocated at …` clause and the detail backtrace carries the
+/// (static-address) site instead.
+fn firstSourceLocation(backtrace: []const usize) ?std.debug.SourceLocation {
+    for (backtrace) |addr| {
+        const call_site = if (addr != 0) addr - 1 else addr;
+        const info = symbolizeAddress(call_site) orelse continue;
+        const name = info.name orelse continue;
+        if (name.len == 0) continue;
+        const mangled = stripSymbolUnderscore(name);
+        if (isRaisePlumbingSymbol(mangled)) continue;
+        if (isPanicPlumbingSymbol(mangled)) continue;
+        if (isBelowUserEntrySymbol(mangled)) return null;
+        if (info.source) |loc| {
+            if (loc.file_name.len != 0) return loc;
+        }
+    }
+    return null;
+}
+
+/// Write a resolved source location (`app.zap:88`) honoring the security
+/// tier's path policy. Pure `write(2)`.
+fn writeSourceLocationInline(loc: std.debug.SourceLocation) void {
+    const shown = if (crash_report_security_tier.stripsAbsolutePaths())
+        pathBasename(loc.file_name)
+    else
+        loc.file_name;
+    posixWrite(STDERR_FD, shown);
+    posixWrite(STDERR_FD, RuntimeFormat.source_line_separator);
+    crashWriteUnsigned(loc.line);
+}
+
+/// Render an immediate memory-fault report (canary corruption, invalid free,
+/// or dealloc size/alignment mismatch) in the unified visual language. These
+/// are isolated `core.deallocate`-time events; unlike leaks they are not
+/// batched. Uses the same header/gutter/frame vocabulary as the leak and
+/// crash reports so every memory diagnostic reads identically.
+fn renderMemoryFaultImmediate(record: *const AbiV1.ZapLeakRecord) void {
+    if (leak_report_state.format == .json) {
+        renderRecordJson(record, null);
+        return;
+    }
+    const kind: AbiV1.ZapLeakKind = @enumFromInt(record.kind);
+    const color_on = crash_reporter_config.use_color;
+
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_bold_red);
+    switch (kind) {
+        .use_after_free_or_oob => posixWrite(STDERR_FD, "error: use-after-free or out-of-bounds write: "),
+        .invalid_free => posixWrite(STDERR_FD, "error: invalid free: "),
+        .dealloc_mismatch => posixWrite(STDERR_FD, "error: deallocation size/alignment mismatch: "),
+        .leak => unreachable,
+    }
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+
+    const type_name = if (record.type_name_ptr) |p| p[0..record.type_name_len] else "";
+    switch (kind) {
+        .use_after_free_or_oob => {
+            writeLeakTypeLabel(type_name);
+            posixWrite(STDERR_FD, " corrupted at byte ");
+            crashWriteUnsigned(record.canary_offset);
+            posixWrite(STDERR_FD, " (canary width ");
+            crashWriteUnsigned(record.canary_size);
+            posixWrite(STDERR_FD, "); the poisoned region is intentionally leaked for forensics");
+        },
+        .invalid_free => {
+            posixWrite(STDERR_FD, "pointer 0x");
+            crashWriteUnsignedHex(record.user_ptr);
+            posixWrite(STDERR_FD, " was not allocated by this manager");
+        },
+        .dealloc_mismatch => {
+            writeLeakTypeLabel(type_name);
+            posixWrite(STDERR_FD, ": recorded size ");
+            crashWriteUnsigned(record.size);
+            posixWrite(STDERR_FD, "/align ");
+            crashWriteUnsigned(record.alignment);
+            posixWrite(STDERR_FD, ", runtime supplied size ");
+            crashWriteUnsigned(record.supplied_size);
+            posixWrite(STDERR_FD, "/align ");
+            crashWriteUnsigned(record.supplied_alignment);
+            posixWrite(STDERR_FD, "; the allocation is intentionally leaked for forensics");
+        },
+        .leak => unreachable,
+    }
+    posixWrite(STDERR_FD, "\n");
+
+    // Allocation-site backtrace under the unified gutter glyph, when
+    // attributed.
+    if (record.backtrace_ptr) |bt| {
+        posixWrite(STDERR_FD, RuntimeFormat.frame_indent);
+        if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_cyan);
+        posixWrite(STDERR_FD, "allocated here:");
+        if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+        posixWrite(STDERR_FD, "\n");
+        renderAllocationSite(bt[0..record.backtrace_len]);
+    }
+}
+
+/// Deterministic ordering for the accumulated leak list (so the SAME leaks
+/// produce a byte-identical report across runs — the manager's hash-map
+/// iteration order is NOT stable). Sort key, in order: Zap type name, then
+/// size, then the first backtrace address, then the user pointer (a final
+/// total-order tiebreak). The user pointer varies with ASLR, so it is the
+/// LAST key only — two otherwise-identical leaks at different addresses sort
+/// by address, which is unavoidable and only affects ties.
+fn leakSortLessThan(_: void, a: AccumulatedLeak, b: AccumulatedLeak) bool {
+    const an = a.typeName();
+    const bn = b.typeName();
+    switch (std.mem.order(u8, an, bn)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    if (a.size != b.size) return a.size < b.size;
+    const a_addr: usize = if (a.backtrace_len > 0) a.backtrace[0] else 0;
+    const b_addr: usize = if (b.backtrace_len > 0) b.backtrace[0] else 0;
+    if (a_addr != b_addr) return a_addr < b_addr;
+    return a.user_ptr < b.user_ptr;
+}
+
+/// Render one accumulated leak as a unified `domain=leak` diagnostic:
+///
+///   warning: memory leak: Leaked 1 `%Inner{}` (40 B), allocated at app.zap:88, refcount 1
+///     │
+///     allocated here:
+///       Demo.make/1 at app.zap:88
+///       App.main/1 at app.zap:5
+///     └─ app.zap:88
+///
+/// The header line, the gutter bar, the `allocated here` lead-in, and the
+/// footer corner are the SAME glyphs the compile renderer uses for a
+/// `domain=leak` diagnostic (the synthetic-leak render test pins them).
+fn renderLeakDetail(leak: *const AccumulatedLeak) void {
+    const color_on = crash_reporter_config.use_color;
+    const type_name = leak.typeName();
+    const bt = leak.backtrace[0..leak.backtrace_len];
+    const loc = firstSourceLocation(bt);
+
+    // Header.
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_bold_yellow);
+    posixWrite(STDERR_FD, "warning: ");
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_bold);
+    posixWrite(STDERR_FD, "memory leak: Leaked 1 ");
+    writeLeakTypeLabel(type_name);
+    posixWrite(STDERR_FD, " (");
+    crashWriteUnsigned(leak.size);
+    posixWrite(STDERR_FD, " B)");
+    if (loc) |l| {
+        posixWrite(STDERR_FD, ", allocated at ");
+        writeSourceLocationInline(l);
+    }
+    posixWrite(STDERR_FD, ", refcount ");
+    crashWriteUnsigned(leak.refcount);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+    posixWrite(STDERR_FD, "\n");
+
+    // Gutter + allocation-site backtrace.
+    posixWrite(STDERR_FD, RuntimeFormat.frame_indent);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_cyan);
+    posixWrite(STDERR_FD, RuntimeFormat.gutter_bar);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+    posixWrite(STDERR_FD, "\n");
+
+    posixWrite(STDERR_FD, RuntimeFormat.frame_indent);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_cyan);
+    posixWrite(STDERR_FD, "allocated here:");
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+    posixWrite(STDERR_FD, "\n");
+    renderAllocationSite(bt);
+
+    // Footer corner with the resolved source location (mirrors the compile
+    // renderer's `└─ file:line:col`). Falls back to the user pointer's
+    // static address when no source location resolved.
+    posixWrite(STDERR_FD, RuntimeFormat.frame_indent);
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_cyan);
+    posixWrite(STDERR_FD, RuntimeFormat.footer_corner);
+    posixWrite(STDERR_FD, " ");
+    if (loc) |l| {
+        writeSourceLocationInline(l);
+    } else {
+        posixWrite(STDERR_FD, "0x");
+        crashWriteUnsignedHex(leak.user_ptr -% crash_reporter_config.image_slide);
+    }
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+    posixWrite(STDERR_FD, "\n");
+}
+
+/// Render the deterministic summary table that follows the per-leak detail:
+/// a total line plus a per-type breakdown (count + total bytes), sorted by
+/// the same key as the detail list so the table is stable across runs. The
+/// table is the "deterministic summary table" the spec calls for; the
+/// per-type grouping is the "top allocation sites" rollup at type
+/// granularity (the alloc-site frame is in each detail entry above).
+fn renderLeakSummary() void {
+    const color_on = crash_reporter_config.use_color;
+    var total_bytes: usize = leak_report_state.overflow_bytes;
+    {
+        var i: usize = 0;
+        while (i < leak_report_state.count) : (i += 1) total_bytes += leak_report_state.leaks[i].size;
+    }
+    const total_count = leak_report_state.count + leak_report_state.overflow_count;
+
+    posixWrite(STDERR_FD, "\n");
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_bold);
+    posixWrite(STDERR_FD, "leak summary: ");
+    crashWriteUnsigned(total_count);
+    posixWrite(STDERR_FD, if (total_count == 1) " allocation, " else " allocations, ");
+    crashWriteUnsigned(total_bytes);
+    posixWrite(STDERR_FD, " bytes total");
+    if (color_on) posixWrite(STDERR_FD, RuntimeFormat.sgr_reset);
+    posixWrite(STDERR_FD, "\n");
+
+    // Per-type rollup. The list is already sorted by type name (then size),
+    // so equal type names are contiguous — walk runs and sum.
+    var i: usize = 0;
+    while (i < leak_report_state.count) {
+        const type_name = leak_report_state.leaks[i].typeName();
+        var run_count: usize = 0;
+        var run_bytes: usize = 0;
+        var j: usize = i;
+        while (j < leak_report_state.count and std.mem.eql(u8, leak_report_state.leaks[j].typeName(), type_name)) : (j += 1) {
+            run_count += 1;
+            run_bytes += leak_report_state.leaks[j].size;
+        }
+        posixWrite(STDERR_FD, RuntimeFormat.frame_indent);
+        crashWriteUnsigned(run_count);
+        posixWrite(STDERR_FD, " x ");
+        writeLeakTypeLabel(type_name);
+        posixWrite(STDERR_FD, " (");
+        crashWriteUnsigned(run_bytes);
+        posixWrite(STDERR_FD, " B)\n");
+        i = j;
+    }
+
+    if (leak_report_state.overflowed) {
+        posixWrite(STDERR_FD, RuntimeFormat.frame_indent);
+        posixWrite(STDERR_FD, "... and ");
+        crashWriteUnsigned(leak_report_state.overflow_count);
+        posixWrite(STDERR_FD, " more (detail list capped at ");
+        crashWriteUnsigned(MAX_TRACKED_LEAKS);
+        posixWrite(STDERR_FD, ")\n");
+    }
+}
+
+/// Escape a string into a JSON string body (no surrounding quotes) via
+/// `write(2)`. Handles the control + quote/backslash cases the leak fields
+/// can contain (type names and file paths are otherwise printable ASCII).
+fn writeJsonStringBody(s: []const u8) void {
+    for (s) |c| {
+        switch (c) {
+            '"' => posixWrite(STDERR_FD, "\\\""),
+            '\\' => posixWrite(STDERR_FD, "\\\\"),
+            '\n' => posixWrite(STDERR_FD, "\\n"),
+            '\r' => posixWrite(STDERR_FD, "\\r"),
+            '\t' => posixWrite(STDERR_FD, "\\t"),
+            else => {
+                const one = [_]u8{c};
+                posixWrite(STDERR_FD, &one);
+            },
+        }
+    }
+}
+
+/// JSON projection of a single record (a leak survivor or an immediate
+/// fault). Emitted under `--error-format=json`. The shape mirrors the
+/// canonical Error IR's `domain=leak` + `machine_data` projection
+/// (`diagnostics.zig` / `error_ir.zig`): a `domain`, a `severity`, a
+/// human `message`, a `trace_policy`, and a `machine_data` object with the
+/// structured `bytes` / `count` / `type` / `refcount` / `address` payload.
+/// `leak_index` (when non-null) numbers a survivor within the batch.
+fn renderRecordJson(record: *const AbiV1.ZapLeakRecord, leak_index: ?usize) void {
+    const kind: AbiV1.ZapLeakKind = @enumFromInt(record.kind);
+    const type_name = if (record.type_name_ptr) |p| p[0..record.type_name_len] else "";
+
+    posixWrite(STDERR_FD, "{\"domain\":\"leak\",\"severity\":\"");
+    switch (kind) {
+        .leak => posixWrite(STDERR_FD, "warning"),
+        else => posixWrite(STDERR_FD, "error"),
+    }
+    posixWrite(STDERR_FD, "\",\"sub_kind\":\"");
+    switch (kind) {
+        .leak => posixWrite(STDERR_FD, "leak"),
+        .use_after_free_or_oob => posixWrite(STDERR_FD, "use_after_free_or_oob"),
+        .invalid_free => posixWrite(STDERR_FD, "invalid_free"),
+        .dealloc_mismatch => posixWrite(STDERR_FD, "dealloc_mismatch"),
+    }
+    posixWrite(STDERR_FD, "\",\"trace_policy\":\"allocation\",\"message\":\"");
+    switch (kind) {
+        .leak => {
+            posixWrite(STDERR_FD, "memory leak: ");
+            if (type_name.len != 0) {
+                posixWrite(STDERR_FD, "%");
+                writeJsonStringBody(type_name);
+                posixWrite(STDERR_FD, "{} ");
+            }
+            posixWrite(STDERR_FD, "never released");
+        },
+        .use_after_free_or_oob => posixWrite(STDERR_FD, "use-after-free or out-of-bounds write"),
+        .invalid_free => posixWrite(STDERR_FD, "invalid free"),
+        .dealloc_mismatch => posixWrite(STDERR_FD, "deallocation size/alignment mismatch"),
+    }
+    posixWrite(STDERR_FD, "\",\"machine_data\":{\"type\":\"");
+    writeJsonStringBody(type_name);
+    posixWrite(STDERR_FD, "\",\"bytes\":");
+    crashWriteUnsigned(record.size);
+    posixWrite(STDERR_FD, ",\"alignment\":");
+    crashWriteUnsigned(record.alignment);
+    posixWrite(STDERR_FD, ",\"refcount\":");
+    crashWriteUnsigned(record.refcount);
+    posixWrite(STDERR_FD, ",\"address\":\"0x");
+    crashWriteUnsignedHex(record.user_ptr -% crash_reporter_config.image_slide);
+    posixWrite(STDERR_FD, "\"");
+    if (leak_index) |idx| {
+        posixWrite(STDERR_FD, ",\"index\":");
+        crashWriteUnsigned(idx);
+    }
+    // Allocation-site source location, when resolvable.
+    if (record.backtrace_ptr) |bt| {
+        if (firstSourceLocation(bt[0..record.backtrace_len])) |loc| {
+            const shown = if (crash_report_security_tier.stripsAbsolutePaths())
+                pathBasename(loc.file_name)
+            else
+                loc.file_name;
+            posixWrite(STDERR_FD, ",\"allocated_at\":{\"file\":\"");
+            writeJsonStringBody(shown);
+            posixWrite(STDERR_FD, "\",\"line\":");
+            crashWriteUnsigned(loc.line);
+            posixWrite(STDERR_FD, "}");
+        }
+    }
+    posixWrite(STDERR_FD, "}}\n");
+}
+
+/// Finish the leak report (Phase 4.c). Called once by the manager at the END
+/// of `core.deinit`, after every survivor has been handed to the sink and
+/// BEFORE the manager tears down its live map. Sorts the accumulated leaks
+/// deterministically, renders the detail list + summary table (or the JSON
+/// array), and — under `--leaks-fatal` — forces a non-zero process exit so a
+/// CI run fails on any leak.
+///
+/// `callconv(.c)` to match the manager's `finishLeakReport` slot. A no-op
+/// when no leaks accumulated (a clean program prints nothing and the process
+/// exits normally).
+fn finishLeakReport(sink_ctx: ?*anyopaque) callconv(.c) void {
+    _ = sink_ctx;
+    resolveLeakReportConfig();
+    if (leak_report_state.count == 0 and !leak_report_state.overflowed) return;
+
+    std.sort.pdq(AccumulatedLeak, leak_report_state.leaks[0..leak_report_state.count], {}, leakSortLessThan);
+
+    if (leak_report_state.format == .json) {
+        posixWrite(STDERR_FD, "[");
+        var i: usize = 0;
+        while (i < leak_report_state.count) : (i += 1) {
+            if (i != 0) posixWrite(STDERR_FD, ",");
+            const leak = &leak_report_state.leaks[i];
+            const record: AbiV1.ZapLeakRecord = .{
+                .kind = @intFromEnum(AbiV1.ZapLeakKind.leak),
+                .user_ptr = leak.user_ptr,
+                .size = leak.size,
+                .alignment = leak.alignment,
+                .refcount = leak.refcount,
+                .type_name_ptr = leak.type_name_ptr,
+                .type_name_len = leak.type_name_len,
+                .backtrace_ptr = if (leak.backtrace_len == 0) null else &leak.backtrace,
+                .backtrace_len = leak.backtrace_len,
+                .canary_offset = 0,
+                .canary_size = 0,
+                .supplied_size = 0,
+                .supplied_alignment = 0,
+            };
+            renderRecordJson(&record, i);
+        }
+        posixWrite(STDERR_FD, "]\n");
+    } else {
+        var i: usize = 0;
+        while (i < leak_report_state.count) : (i += 1) {
+            if (i != 0) posixWrite(STDERR_FD, "\n");
+            renderLeakDetail(&leak_report_state.leaks[i]);
+        }
+        renderLeakSummary();
+    }
+
+    if (leak_report_state.fatal) {
+        // CI mode: a leak is a hard failure. Flush stdout first so any
+        // program output already buffered is not lost, then exit non-zero
+        // with a distinct code so a supervisor can tell a leak-fatal exit
+        // apart from a normal failure.
+        flushStdoutBuf();
+        std.process.exit(ZAP_LEAKS_FATAL_EXIT_CODE);
+    }
+}
+
+/// Process exit code used by `--leaks-fatal` when a leak survives. Distinct
+/// from the crash codes (`1`, `137`) so CI can attribute the failure.
+const ZAP_LEAKS_FATAL_EXIT_CODE: u8 = 7;
 
 // ---------------------------------------------------------------------------
 // Phase 2.e — double-fault containment.
