@@ -3097,6 +3097,16 @@ pub const Parser = struct {
                 if (self.current.isTryIdent(self.source) and self.peekNext() == .left_brace) {
                     return self.parseTryRescueExpr();
                 }
+                // `with` is a contextual keyword (Phase 3.c). It opens an
+                // Elixir-style multi-step Result composition only when it
+                // leads a `with <pattern> <- …` form — confirmed by the
+                // next token being able to begin a step pattern. A bare
+                // `with` used as a value (`with.x`, `with(…)`, `with + 1`,
+                // a local named `with`) keeps its identifier reading
+                // because those next tokens cannot start a pattern.
+                if (self.current.isWithIdent(self.source) and tokenStartsWithPattern(self.peekNext())) {
+                    return self.parseWithExpr();
+                }
                 return self.parseVarRef();
             },
             .type_identifier => return self.parseStructRefExpr(),
@@ -4206,6 +4216,121 @@ pub const Parser = struct {
         });
     }
 
+    /// Parse `with <pat> [:: Type] <- <expr>, … { <do-body> } [else { <pat>
+    /// -> <expr> … }]` (Phase 3.c, Elixir-style). The contextual-keyword
+    /// dispatch in `parsePrimaryExpr` has already confirmed the current
+    /// token is the identifier `with` followed by a pattern-starting token.
+    ///
+    /// Each comma-separated step reuses `parsePattern` (so qualified
+    /// variant patterns `Result.Ok(x)`, tuples, struct patterns, and bare
+    /// binds all parse identically to `case` arms / `for` generators) with
+    /// an optional `:: Type` annotation, then a `<-` (`.back_arrow`, the
+    /// same token `for x <- list` uses) and the step expression. Step
+    /// expressions parse with trailing blocks disabled so the `{` that
+    /// opens the `do`-body is never swallowed as a call's trailing block.
+    /// The optional `else` block reuses `parseCaseClause`, identical to
+    /// `try`/`rescue` arms.
+    fn parseWithExpr(self: *Parser) !*const ast.Expr {
+        const start = self.currentSpan();
+        _ = self.advance(); // consume the `with` identifier
+
+        var steps: std.ArrayList(ast.WithStep) = .empty;
+        while (true) {
+            const step_start = self.currentSpan();
+            const pattern = try self.parsePattern();
+
+            var type_annotation: ?*const ast.TypeExpr = null;
+            if (self.match(.double_colon)) {
+                type_annotation = try self.parseTypeExpr();
+            }
+
+            _ = try self.expect(.back_arrow); // <-
+
+            const step_expr = blk: {
+                const saved = self.disable_trailing_block;
+                self.disable_trailing_block = true;
+                defer self.disable_trailing_block = saved;
+                break :blk try self.parseExpr();
+            };
+
+            try steps.append(self.allocator, .{
+                .meta = .{ .span = ast.SourceSpan.merge(step_start, self.previousSpan()) },
+                .pattern = pattern,
+                .type_annotation = type_annotation,
+                .expr = step_expr,
+            });
+
+            // Steps are comma-separated. A trailing comma before the
+            // `{` do-body is tolerated (skip newlines, then either parse
+            // another step or fall through to the body).
+            self.skipNewlinesForContinuation(.comma);
+            if (!self.match(.comma)) break;
+            self.skipNewlines();
+            if (self.check(.left_brace)) break; // trailing comma
+        }
+
+        if (steps.items.len == 0) {
+            try self.addRichError(
+                "`with` requires at least one `pattern <- expr` step",
+                self.currentSpan(),
+                "a `with` expression sequences one or more pattern-match steps",
+                "add a step like `with Result.Ok(x) <- compute() { … }`",
+            );
+            return error.ParseError;
+        }
+
+        // `{ <do-body> }`
+        self.skipNewlines();
+        _ = try self.expect(.left_brace);
+        self.skipNewlines();
+        const do_body = try self.parseBlock();
+        self.skipNewlines();
+        _ = try self.expect(.right_brace);
+
+        // Optional `else { <clauses> }`. `else` is a hard keyword
+        // (`.keyword_else`), so the lookahead across a newline
+        // continuation is unambiguous. Save/restore lexer state so an
+        // unrelated next-line statement is never consumed when there is
+        // no `else`.
+        var else_clauses: ?[]const ast.CaseClause = null;
+        {
+            const saved_lexer = self.lexer;
+            const saved_current = self.current;
+            const saved_previous = self.previous;
+            self.skipNewlinesForContinuation(.keyword_else);
+            if (self.check(.keyword_else)) {
+                _ = self.advance(); // consume `else`
+                _ = try self.expect(.left_brace);
+                self.skipNewlines();
+
+                var clauses: std.ArrayList(ast.CaseClause) = .empty;
+                while (!self.check(.right_brace) and !self.check(.eof)) {
+                    self.skipNewlines();
+                    if (self.check(.right_brace)) break;
+                    const clause = try self.parseCaseClause();
+                    try clauses.append(self.allocator, clause);
+                    self.skipNewlines();
+                }
+                self.skipNewlines();
+                _ = try self.expect(.right_brace);
+                else_clauses = try clauses.toOwnedSlice(self.allocator);
+            } else {
+                self.lexer = saved_lexer;
+                self.current = saved_current;
+                self.previous = saved_previous;
+            }
+        }
+
+        return self.create(ast.Expr, .{
+            .with_expr = .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .steps = try steps.toOwnedSlice(self.allocator),
+                .do_body = do_body,
+                .else_clauses = else_clauses,
+            },
+        });
+    }
+
     fn parseQuoteExpr(self: *Parser) !*const ast.Expr {
         // The contextual-keyword dispatch in `parsePrimaryExpr` has already
         // confirmed the current token is the identifier `quote` followed by
@@ -4304,6 +4429,34 @@ pub const Parser = struct {
             .percent_brace,
             .percent,
             .left_angle_angle,
+            => true,
+            else => false,
+        };
+    }
+
+    /// True when `tag` can begin a `with`-step pattern, gating the `with`
+    /// contextual-keyword dispatch (Phase 3.c). Mirrors the pattern
+    /// grammar entry points `parsePattern` handles: bind/wildcard
+    /// identifiers, qualified variant patterns (`Result.Ok(x)`), tuple
+    /// `{…}`, list `[…]`, struct `%Name{…}`, and the literal forms. A
+    /// `with` followed by `.`/`(`/an operator is NOT a pattern start, so
+    /// it keeps its plain-identifier reading.
+    fn tokenStartsWithPattern(tag: Token.Tag) bool {
+        return switch (tag) {
+            .identifier,
+            .type_identifier,
+            .left_brace,
+            .left_bracket,
+            .percent,
+            .int_literal,
+            .char_literal,
+            .float_literal,
+            .string_literal,
+            .string_literal_start,
+            .atom_literal,
+            .keyword_true,
+            .keyword_false,
+            .keyword_nil,
             => true,
             else => false,
         };

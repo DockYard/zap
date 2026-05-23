@@ -4590,6 +4590,24 @@ pub const TypeChecker = struct {
                 if (for_expr.filter) |filter| try self.validateExprDoesNotCallUnderscoreFunctions(filter);
                 try self.validateExprDoesNotCallUnderscoreFunctions(for_expr.body);
             },
+            .with_expr => |with_expr| {
+                // `with` is desugared to nested `case` before type-check,
+                // so this is normally unreachable; recurse anyway to keep
+                // the validation total and correct on any pre-expansion
+                // path.
+                for (with_expr.steps) |step| {
+                    try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(step.pattern);
+                    try self.validateExprDoesNotCallUnderscoreFunctions(step.expr);
+                }
+                for (with_expr.do_body) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+                if (with_expr.else_clauses) |clauses| {
+                    for (clauses) |clause| {
+                        if (clause.guard) |guard| try self.validateExprDoesNotCallUnderscoreFunctions(guard);
+                        try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(clause.pattern);
+                        for (clause.body) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+                    }
+                }
+            },
             .list_cons_expr => |list_cons| {
                 try self.validateExprDoesNotCallUnderscoreFunctions(list_cons.head);
                 try self.validateExprDoesNotCallUnderscoreFunctions(list_cons.tail);
@@ -6144,6 +6162,38 @@ pub const TypeChecker = struct {
                                     "add the missing variants or a wildcard `_` pattern",
                                 );
                             }
+                        }
+                    }
+                }
+                return result_type;
+            },
+
+            // `with pat <- expr, … { do } else { … }` (Phase 3.c).
+            //
+            // `with` is desugared to nested `case` during macro expansion,
+            // so it is normally gone before type inference. This arm keeps
+            // the switch total and stays type-correct on any pre-expansion
+            // path: infer each step expr (so the bindings' types are
+            // recorded and any raises contribute to the `raises` row), then
+            // infer the do-body block type as the all-match result, joining
+            // in the else-clause body types so the inferred type covers both
+            // edges — matching what the desugared nested `case` would yield.
+            .with_expr => |we| {
+                for (we.steps) |step| {
+                    _ = try self.inferExpr(step.expr);
+                }
+                var result_type: TypeId = TypeStore.NIL;
+                for (we.do_body) |stmt| {
+                    result_type = try self.checkStmt(stmt);
+                }
+                if (we.else_clauses) |clauses| {
+                    for (clauses) |clause| {
+                        var clause_type: TypeId = TypeStore.NIL;
+                        for (clause.body) |stmt| {
+                            clause_type = try self.checkStmt(stmt);
+                        }
+                        if (result_type == TypeStore.NIL or result_type == TypeStore.UNKNOWN) {
+                            result_type = clause_type;
                         }
                     }
                 }

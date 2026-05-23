@@ -745,6 +745,7 @@ pub const Expr = union(enum) {
     case_expr: CaseExpr,
     cond_expr: CondExpr,
     for_expr: ForExpr,
+    with_expr: WithExpr,
 
     // List construction
     list_cons_expr: ListConsExpr,
@@ -808,6 +809,7 @@ pub const Expr = union(enum) {
             .case_expr => |v| v.meta,
             .cond_expr => |v| v.meta,
             .for_expr => |v| v.meta,
+            .with_expr => |v| v.meta,
             .list_cons_expr => |v| v.meta,
             .quote_expr => |v| v.meta,
             .unquote_expr => |v| v.meta,
@@ -1094,6 +1096,46 @@ pub const ForExpr = struct {
     iterable: *const Expr,
     filter: ?*const Expr,
     body: *const Expr,
+};
+
+/// The `with` multi-step Result/pattern-match composition (Phase 3.c,
+/// Elixir-style).
+///
+/// `with pat1 <- expr1, pat2 <- expr2 { do_body } else { clauses }`
+/// sequences a series of pattern-match steps. Each step evaluates its
+/// `expr` and matches it against `pattern`: on a match the binding is
+/// introduced and the next step runs; on the first non-matching step
+/// the whole `with` short-circuits. With an `else`, the non-matching
+/// value is dispatched through the `else` clauses; without an `else`,
+/// the non-matching value is the result verbatim. The `do_body` runs
+/// only when every step matched.
+///
+/// This is pure sugar over nested `case` expressions — it is desugared
+/// in `src/macro.zig` (the same bootstrap layer that lowers `if`/`cond`/
+/// `and`/`or` to `case_expr`) and introduces no new HIR/IR primitive.
+/// `Kernel.with` in `lib/kernel.zap` documents the surface and is the
+/// user-overridable hook, mirroring how `Kernel.if` coexists with the
+/// `if_expr` desugar. The `<-` step arrow reuses the `.back_arrow` token
+/// already used by `for x <- list` comprehensions.
+pub const WithExpr = struct {
+    meta: NodeMeta,
+    steps: []const WithStep,
+    do_body: []const Stmt,
+    /// `null` selects the else-less form (the non-matching value is the
+    /// result). A non-null (possibly empty) slice selects the else form:
+    /// the non-matching value is matched against these clauses.
+    else_clauses: ?[]const CaseClause,
+};
+
+/// One `pattern <- expr` step of a `with` expression. The `pattern`
+/// accepts the full pattern grammar (reusing `parsePattern`, like a
+/// `case` arm or a `for` generator), with an optional `:: Type`
+/// annotation mirroring `ForExpr.var_type_annotation`.
+pub const WithStep = struct {
+    meta: NodeMeta,
+    pattern: *const Pattern,
+    type_annotation: ?*const TypeExpr = null,
+    expr: *const Expr,
 };
 
 pub const ListConsExpr = struct {

@@ -260,6 +260,19 @@ fn walkExpr(
             if (fe.filter) |f| try walkExpr(allocator, record, f, interner);
             try walkExpr(allocator, record, fe.body, interner);
         },
+        .with_expr => |we| {
+            // `with` is desugared before capability inference normally
+            // runs; walk the step exprs, the do-body, and the else-clause
+            // bodies/guards so any effectful call inside is recorded.
+            for (we.steps) |step| try walkExpr(allocator, record, step.expr, interner);
+            for (we.do_body) |s| try walkStmt(allocator, record, s, interner);
+            if (we.else_clauses) |clauses| {
+                for (clauses) |clause| {
+                    if (clause.guard) |g| try walkExpr(allocator, record, g, interner);
+                    for (clause.body) |s| try walkStmt(allocator, record, s, interner);
+                }
+            }
+        },
 
         .list_cons_expr => |lc| {
             try walkExpr(allocator, record, lc.head, interner);

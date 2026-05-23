@@ -332,6 +332,41 @@ pub fn exprToCtValue(
             const kw_list = try makeList(alloc, store, &.{ do_pair, rescue_pair, after_pair });
             return makeTuple3(alloc, store, .{ .atom = "try_rescue" }, try metaToList(alloc, store, v.meta, null), kw_list);
         },
+        .with_expr => |v| {
+            // {:with, meta, [steps: [steps...], do: do_body, else: clauses_or_nil]}
+            // where each step is {:<-, meta, [[pattern], expr]} (mirroring
+            // the `->` clause encoding but tagged `<-` to denote a bind
+            // step) and each else clause is {:->, [], [[pattern], body]}.
+            // `with` is desugared to nested `case` during macro expansion,
+            // so this round-trip only matters for `with` appearing inside a
+            // quoted macro body.
+            var step_vals: std.ArrayListUnmanaged(CtValue) = .empty;
+            for (v.steps) |step| {
+                const pat = try patternToCtValue(alloc, interner, store, step.pattern);
+                const step_expr = try exprToCtValue(alloc, interner, store, step.expr);
+                const pat_list = try makeList(alloc, store, &.{pat});
+                const step_args = try makeList(alloc, store, &.{ pat_list, step_expr });
+                try step_vals.append(alloc, try makeTuple3(alloc, store, .{ .atom = "<-" }, try metaToList(alloc, store, step.meta, null), step_args));
+            }
+            const steps_list = try makeListFromSlice(alloc, store, step_vals.items);
+            const do_val = try blockToCtValue(alloc, interner, store, v.do_body);
+            const else_val: CtValue = if (v.else_clauses) |clauses| blk: {
+                var clause_vals: std.ArrayListUnmanaged(CtValue) = .empty;
+                for (clauses) |clause| {
+                    const pat = try patternToCtValue(alloc, interner, store, clause.pattern);
+                    const clause_body = try blockToCtValue(alloc, interner, store, clause.body);
+                    const pat_list = try makeList(alloc, store, &.{pat});
+                    const clause_args = try makeList(alloc, store, &.{ pat_list, clause_body });
+                    try clause_vals.append(alloc, try makeTuple3(alloc, store, .{ .atom = "->" }, try emptyList(alloc, store), clause_args));
+                }
+                break :blk try makeListFromSlice(alloc, store, clause_vals.items);
+            } else CtValue.nil;
+            const steps_pair = try makeKeywordPair(alloc, store, "steps", steps_list);
+            const do_pair = try makeKeywordPair(alloc, store, "do", do_val);
+            const else_pair = try makeKeywordPair(alloc, store, "else", else_val);
+            const kw_list = try makeList(alloc, store, &.{ steps_pair, do_pair, else_pair });
+            return makeTuple3(alloc, store, .{ .atom = "with" }, try metaToList(alloc, store, v.meta, null), kw_list);
+        },
         .cond_expr => |v| {
             // {:cond, meta, [do: [clauses...]]} where each clause is {:->, [], [[condition], body]}
             var clause_vals: std.ArrayListUnmanaged(CtValue) = .empty;

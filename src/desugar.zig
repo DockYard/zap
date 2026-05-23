@@ -1409,6 +1409,45 @@ pub const Desugarer = struct {
                     },
                 });
             },
+            .with_expr => |we| {
+                // `with` is fully desugared to nested `case` during macro
+                // expansion (src/macro.zig `withToNestedCase`), so it
+                // normally never reaches the desugarer. This arm keeps the
+                // exhaustive switch total and stays correct if the
+                // desugarer is ever run on un-expanded AST: recurse into
+                // the step exprs, the do-body, and the else-clause bodies,
+                // rebuilding a well-formed `with_expr`.
+                var new_steps: std.ArrayList(ast.WithStep) = .empty;
+                for (we.steps) |step| {
+                    try new_steps.append(self.allocator, .{
+                        .meta = step.meta,
+                        .pattern = step.pattern,
+                        .type_annotation = step.type_annotation,
+                        .expr = try self.desugarExpr(step.expr),
+                    });
+                }
+                const new_else: ?[]const ast.CaseClause = if (we.else_clauses) |clauses| blk: {
+                    var new_clauses: std.ArrayList(ast.CaseClause) = .empty;
+                    for (clauses) |clause| {
+                        try new_clauses.append(self.allocator, .{
+                            .meta = clause.meta,
+                            .pattern = clause.pattern,
+                            .type_annotation = clause.type_annotation,
+                            .guard = if (clause.guard) |g| try self.desugarExpr(g) else null,
+                            .body = try self.desugarBlock(clause.body),
+                        });
+                    }
+                    break :blk try new_clauses.toOwnedSlice(self.allocator);
+                } else null;
+                return try self.create(ast.Expr, .{
+                    .with_expr = .{
+                        .meta = we.meta,
+                        .steps = try new_steps.toOwnedSlice(self.allocator),
+                        .do_body = try self.desugarBlock(we.do_body),
+                        .else_clauses = new_else,
+                    },
+                });
+            },
             .panic_expr => |pe| {
                 return try self.create(ast.Expr, .{
                     .panic_expr = .{

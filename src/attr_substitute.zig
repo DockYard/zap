@@ -447,6 +447,43 @@ fn substituteInExpr(
             new_expr.* = .{ .raise_expr = .{ .meta = re.meta, .value = new_value } };
             return new_expr;
         },
+        .with_expr => |we| {
+            // `with` is desugared to nested `case` during macro expansion,
+            // so attribute substitution rarely sees it; recurse into the
+            // step exprs, the do-body, and the else-clause bodies/guards so
+            // any `@attr` inside is substituted before the desugar runs.
+            var new_steps: std.ArrayListUnmanaged(ast.WithStep) = .empty;
+            var changed = false;
+            for (we.steps) |step| {
+                const new_step_expr = try substituteInExpr(alloc, step.expr, func_attrs, mod_attrs, interner, errors);
+                if (new_step_expr != step.expr) changed = true;
+                var new_step = step;
+                new_step.expr = new_step_expr;
+                try new_steps.append(alloc, new_step);
+            }
+            const new_do = try substituteInStmts(alloc, we.do_body, func_attrs, mod_attrs, interner, errors);
+            if (!stmtsUnchanged(we.do_body, new_do)) changed = true;
+            const new_else: ?[]const ast.CaseClause = if (we.else_clauses) |clauses| blk: {
+                var new_clauses: std.ArrayListUnmanaged(ast.CaseClause) = .empty;
+                for (clauses) |clause| {
+                    const new_guard = if (clause.guard) |g|
+                        try substituteInExpr(alloc, g, func_attrs, mod_attrs, interner, errors)
+                    else
+                        null;
+                    const new_clause_body = try substituteInStmts(alloc, clause.body, func_attrs, mod_attrs, interner, errors);
+                    if (new_guard != clause.guard or !stmtsUnchanged(clause.body, new_clause_body)) changed = true;
+                    var new_clause = clause;
+                    new_clause.guard = new_guard;
+                    new_clause.body = new_clause_body;
+                    try new_clauses.append(alloc, new_clause);
+                }
+                break :blk try new_clauses.toOwnedSlice(alloc);
+            } else null;
+            if (!changed) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .with_expr = .{ .meta = we.meta, .steps = try new_steps.toOwnedSlice(alloc), .do_body = new_do, .else_clauses = new_else } };
+            return new_expr;
+        },
         .try_rescue => |tr| {
             const new_body = try substituteInStmts(alloc, tr.body, func_attrs, mod_attrs, interner, errors);
             var new_clauses: std.ArrayListUnmanaged(ast.CaseClause) = .empty;

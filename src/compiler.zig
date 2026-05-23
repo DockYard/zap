@@ -11056,6 +11056,47 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
                 try remapStmtSlice(alloc, cleanup, remap);
             }
         },
+        .with_expr => |*we| {
+            // Remap every step (pattern + optional `:: Type` + expr), the
+            // do-body, and the optional else clauses. `with` is desugared
+            // to nested `case` during macro expansion, but multi-unit
+            // StringId-remap (`remapProgram`) runs on the parsed AST before
+            // expansion, so the `with_expr` must rewrite its StringIds here
+            // — the same canonical multi-unit interner gotcha `try_rescue`
+            // and `for_expr` handle above.
+            if (we.steps.len > 0) {
+                const mutable_steps = try alloc.alloc(ast.WithStep, we.steps.len);
+                for (we.steps, 0..) |step, i| {
+                    mutable_steps[i] = step;
+                    const mutable_pattern = try alloc.create(ast.Pattern);
+                    mutable_pattern.* = step.pattern.*;
+                    try remapPattern(alloc, mutable_pattern, remap);
+                    mutable_steps[i].pattern = mutable_pattern;
+                    if (step.type_annotation) |ta| {
+                        const mutable_ta = try alloc.create(ast.TypeExpr);
+                        mutable_ta.* = ta.*;
+                        try remapTypeExpr(alloc, mutable_ta, remap);
+                        mutable_steps[i].type_annotation = mutable_ta;
+                    }
+                    const mutable_step_expr = try alloc.create(ast.Expr);
+                    mutable_step_expr.* = step.expr.*;
+                    try remapExpr(alloc, mutable_step_expr, remap);
+                    mutable_steps[i].expr = mutable_step_expr;
+                }
+                we.steps = mutable_steps;
+            }
+            try remapStmtSlice(alloc, &we.do_body, remap);
+            if (we.else_clauses) |clauses| {
+                if (clauses.len > 0) {
+                    const mutable_clauses = try alloc.alloc(ast.CaseClause, clauses.len);
+                    for (clauses, 0..) |c, i| {
+                        mutable_clauses[i] = c;
+                        try remapCaseClause(alloc, &mutable_clauses[i], remap);
+                    }
+                    we.else_clauses = mutable_clauses;
+                }
+            }
+        },
         .if_expr => |*ie| {
             const mutable_cond = try alloc.create(ast.Expr);
             mutable_cond.* = ie.condition.*;

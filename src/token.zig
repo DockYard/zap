@@ -211,6 +211,18 @@ pub const Token = struct {
         return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "after");
     }
 
+    /// `with` is a contextual keyword (Phase 3.c). It opens an
+    /// Elixir-style multi-step Result composition only when it leads a
+    /// `with <pattern> <- <expr> …` form — i.e. when the immediately
+    /// following token can begin a step pattern (the parser additionally
+    /// confirms the `<-` arrow). A bare `with` used as a plain identifier
+    /// (e.g. `with.field`, `with(args)`, `with + 1`, or a local named
+    /// `with`) keeps its identifier reading because those next tokens
+    /// (`.`, `(`, operators) cannot begin a pattern.
+    pub fn isWithIdent(self: Token, source: []const u8) bool {
+        return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "with");
+    }
+
     pub const keywords = std.StaticStringMap(Tag).initComptime(.{
         .{ "pub", .keyword_pub },
         .{ "fn", .keyword_fn },
