@@ -324,14 +324,23 @@ Add one standard error-aware sum type at the language level, or at least privile
 Result(T, E)
 ```
 
-And propagation syntax:
+And composition syntax. Zap's idiom for chaining fallible steps is the Elixir-style `with` macro,
+which binds each happy-path value with `<-` and diverts the first non-matching value to an `else`
+arm (there is no postfix `?` operator):
 
 ```zap
 pub fn load_config(path :: String) -> Result(Config, IOError) {
-  contents = File.read(path)?
-  parse_config(contents)?
+  with Result.Ok(contents) <- File.read(path),
+       Result.Ok(config) <- parse_config(contents) {
+    Result(Config, IOError).Ok(config)
+  } else {
+    Result.Error(reason) -> Result(Config, IOError).Error(reason)
+  }
 }
 ```
+
+Abortive propagation (when a function should fail its whole computation) is `raise`/`raises` with
+`try`/`rescue`/`after`; recoverable composition is `with` over `Result`/`Option`.
 
 ### Why Explicit Results Over Exceptions
 

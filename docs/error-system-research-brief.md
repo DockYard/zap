@@ -383,27 +383,39 @@ A first-class system is **one model with four surfaces and one renderer**, not f
   `after` is finally-semantics and must be ARC-correct on the unwinding path — it interacts with
   drop insertion and the restricted retain/release emission sites.
 
-- **`errdefer`** (Zig's error-only cleanup) as a distinct construct — `defer` runs always, `errdefer`
-  runs only on error return. Both registered in the ARC retain/release allow-list with explicit tests.
+- **No `defer` / `errdefer`** (rejected as misaligned). Imperative Zig/Go-style scope-cleanup
+  statements are unnecessary in an immutable functional language: deterministic resource release is
+  handled by ARC (drop glue at refcount-zero, including on the unwinding path), and explicit cleanup
+  that must run on every exit is `after` (try/rescue/after, finally-semantics). An earlier iteration
+  shipped `defer`/`errdefer` as ARC-integrated cleanup primitives; they were removed once `after` +
+  ARC were recognised as covering the space without a second, imperative mechanism.
 
 - **`Result(t,e)`** as the canonical recoverable type (`union { Ok(t), Error(e) }`). Bare tuple
   sugar retained for Elixir familiarity, with a `tuple_to_result/1` stdlib shim for migration.
 
-- **`?`-propagation operator** (Rust/Swift/Zig style): early-returns the `Error` variant. Desugar:
-  `expr?` → `case expr { Ok(v) -> v; Error(e) -> return Error(e) }`. Critically, ERT recording is a
-  **guarded out-of-line call** so `tail-return foo()?` remains a tail call (Zig's choice — Kelley
-  2018).
+- **No `?`-propagation operator** (rejected as redundant). Rust/Swift/Zig-style `expr?` postfix
+  early-return was misaligned with Elixir-aligned Zap: multi-step `Result` composition is `with`,
+  and abortive propagation is `raise`/`raises`. An earlier iteration shipped `?`; it was removed
+  because `with` (happy-path binding + an `else` for the `Error` branch) and the
+  `raise`/`raises`/`rescue` surface already cover every case `?` did, without a third propagation
+  spelling. The tail-call ERT concern (a propagating return must stay a tail call) is preserved for
+  cross-function `raise` propagation: ERT recording is a **guarded out-of-line call** (Zig's choice —
+  Kelley 2018).
 
-- **`with` macro** (Elixir-style multi-step Result composition) — sugar over chained `?`.
+- **`with` macro** (Elixir-style multi-step `Result`/`Option` composition) — the canonical idiom for
+  chaining fallible steps: `with Ok(a) <- step1(), Ok(b) <- step2(a) { … } else { Error(e) -> … }`.
+  Each `<-` binds the happy-path value or diverts the first non-matching value to the `else` arm.
 
 - **Effect-row typing**: `fn parse(...) -> i64 raises ParseError` declares the row.
-  **Inferred-by-default, optional-but-checked when written.** A function whose body uses `?` or
-  `raise` infers the appropriate `raises` row. Stdlib leaf functions get explicit rows from day
-  one to anchor inference.
+  **Inferred-by-default, optional-but-checked when written.** A function whose body `raise`s (or calls
+  a `raises` callee whose error it does not rescue) infers the appropriate `raises` row. Stdlib leaf
+  functions get explicit rows from day one to anchor inference.
 
-- **The `TryProject(value, ok_var, err_var)` IR node** is the strictly-additive fix for the
-  payload-insensitive `~>` IR landmine. The existing `~>` becomes a degenerate case where both
-  bindings are `_`. Mirrors Rust RFC 3058's `ControlFlow` with distinct residual types.
+- **The `~>` catch-basin** recovers a call-site *dispatch failure* and binds the recovered value to
+  a handler arm. It keeps its bespoke `error_pipe` lowering. (An earlier iteration added a
+  `TryProject(value, ok_var, err_var)` IR node as a payload-aware generalization shared with the
+  `?` operator; it was removed together with `?` in the deflation pass — with `?` gone there is no
+  second consumer to share the node, and `~>` is sound on its own lowering.)
 
 - **`raise` as defect / `Result` as recoverable.** Unrescued `raise` → formatted crash report +
   nonzero exit now, → per-process termination once a process model lands (same renderer either way).
@@ -503,14 +515,14 @@ flag each independently.
 | 2 | **Stable numeric error codes from day one** | Codes are API surface (rustc precedent); never reuse a retired code. Force every diagnostic to declare a code so the catalog grows monotonically. |
 | 3 | **OOM under ARC = abandonment, not recoverable** | Infallible allocation by default in `Memory.ARC`; an explicit `try_alloc` builder for fallible code (CI runners, embedded). Aligns with Midori; both Roc and Koka punt on this and pay later. |
 | 4 | **Async-signal-safe crash printer** | Must be reachable from a SIGTRAP/SIGSEGV handler. **No `malloc`, only `write`/`_exit`** and other POSIX async-signal-safe calls. Reuse the fork's `std.debug` paths which are already signal-aware. Required to reach the known startup SIGTRAP defect from its signal handler. |
-| 5 | **Panic-in-`defer` / double-fault containment** | Second panic during unwind → immediate `abort` with a distinct exit code (e.g. `137 + double-fault marker`), no further user code. Rust precedent. |
+| 5 | **Panic-during-unwind / double-fault containment** | A second panic during unwind (e.g. inside an `after` cleanup or drop glue) → immediate `abort` with a distinct exit code (e.g. `137 + double-fault marker`), no further user code. Rust precedent. |
 | 6 | ~~**Three-tier contracts** — `assert` (always-on), `debug_assert` (debug-only), `precondition` (release-elided)~~ **REMOVED in deflation pass.** Originally drawn from Eiffel/Ada/SPARK/Swift precedent, but misaligned with an Elixir-influenced functional language: Elixir has no language-level `assert` (assertions are a test-framework concern). Zest (`assert`/`reject`) is the assertion surface; production invariants use `raise` or a failing `case`. |
 | 7 | **Per-optimize-mode arithmetic overflow / bounds policy** | Trap in Debug/ReleaseSafe; wrap in ReleaseFast (Zig's model). Document explicitly that traps `raise %ArithmeticError`. |
-| 8 | **Tail-call + `?` interaction** | ERT recording is a guarded out-of-line call so `tail-return foo()?` stays a tail call. Kelley 2018. |
+| 8 | **Tail-call + propagating-`raise` interaction** | ERT recording is a guarded out-of-line call so a propagating `raise` in tail position (`tail-return foo()` where `foo` propagates) stays a tail call. Kelley 2018. |
 | 9 | **Diagnostic security tiers** — developer-local / CI-internal / user-safe | Strip absolute paths in release reports; never include heap contents in the default report; emit ASLR-relative offsets when symbolication is unavailable. Sanitizer runtimes are **never** linked into production builds. |
 | 10 | **Public-vs-private error visibility via the `pub` keyword** | `pub error X` = matchable API surface; bare `error X` = renderable-only/private. Same `pub` convention as the rest of Zap — no new mechanism. Go wrapping precedent. |
 | 11 | **Deterministic diagnostic snapshots** | Golden-test the renderer (rustc UI-test pattern). All four surfaces — compile, runtime, ERT, leak — produce snapshot-stable output. |
-| 12 | **Restricted ARC retain/release emission sites are an enforced allow-list** | Every new lowering primitive (`?`, `rescue` handler entry, `errdefer`, `after`) registers in the allow-list or fails CI. |
+| 12 | **Restricted ARC retain/release emission sites are an enforced allow-list** | Every lowering primitive that can move ownership (`rescue` handler entry, `after` cleanup — including the re-raise splice, propagating `raise`) registers in the allow-list or fails CI. |
 | 13 | **Split-debug + frame-pointer per-mode policy** | Debug/ReleaseSafe: full DWARF, FP on. ReleaseFast/Small: split-debug shipped separately, FP off optionally. Build-ID keyed symbol service for CI/crash analysis. |
 
 ---
@@ -576,9 +588,11 @@ collector becomes relevant again — and only then. It is not owed today.
 ### Decision 4 — Scope/sequencing: **approve and iterate phase-by-phase**
 
 The design surface (effect-typed errors, ERT plumbing, diagnostic-engine generalization, leak
-reports, three-tier contracts) is too large to land atomically without freezing the
-language. Phase boundaries also align with what can be *measured*: each phase has a concrete
-acceptance test (Part VIII).
+reports) is too large to land atomically without freezing the language. Phase boundaries also align
+with what can be *measured*: each phase has a concrete acceptance test (Part VIII). (Several
+originally-planned surfaces — three-tier contracts, the `?` operator, `defer`/`errdefer`, and the
+ARC cycle detector — were built then removed in a later deflation pass as misaligned with immutable,
+Elixir-aligned Zap; see Part II and decisions #3 and #6.)
 
 ---
 
@@ -592,7 +606,11 @@ acceptance test (Part VIII).
 - **Acceptance:** lldb/gdb/perf/samply show Zap file:line at every existing crash site. The fork's
   panic handler prints Zap symbols.
 
-### Phase 1 *(highest-leverage first step)* — `Result(t,e)` + `?` + inferred `raises` + `TryProject` IR + `pub error`
+### Phase 1 *(highest-leverage first step)* — `Result(t,e)` + inferred `raises` + `pub error`
+
+> *(As originally sequenced this phase also shipped the `?` operator and its `TryProject` IR node;
+> both were removed in the later deflation pass — `with` is the `Result` composition idiom. See the
+> surface list in Part II.)*
 
 - **`pub error` declaration form** (front-end-only desugar to `pub struct + pub impl Error`) with
   auto-injected `message :: String = "<TypeName>"` and `cause :: ?Error = nil` fields, optional
@@ -604,10 +622,11 @@ acceptance test (Part VIII).
 - **`raise "string"` shorthand** kept; desugars to `raise %RuntimeError{message: "string"}` via the
   stdlib's `pub error RuntimeError {}`. CI lint flags string-`raise` on `pub` API surfaces.
 - Stdlib `Result(t,e) = union { Ok(t), Error(e) }`.
-- `?` operator desugar to `match` with early return (via the additive `TryProject(value, ok_var,
-  err_var)` IR node — strictly additive; the existing `~>` is a degenerate case).
+- ~~`?` operator desugar to `match` with early return (via the additive `TryProject` IR node).~~
+  **Removed in the deflation pass** — `with` is the `Result` composition idiom; the `TryProject`
+  node went with it.
 - `~>` rewritten as a macro over `match` on `Result` so the payload-insensitive IR landmine is
-  retired in place.
+  retired in place. (`~>` is kept; it later moved to its own bespoke `error_pipe` lowering.)
 - `raises` annotation parsed; inferred by default; checked when written. Stdlib leaf functions
   annotate explicitly.
 - `tuple_to_result/1` migration shim for `{:ok,_}`/`{:error,_}` users; deprecation lint window.
@@ -618,7 +637,7 @@ acceptance test (Part VIII).
   for unhandled `Result`; `~>` is a thin macro; `TryProject` is wired and tested; `pub error`
   desugar produces well-typed structs and protocol impls across the test corpus.
 
-### Phase 2 — Unrecoverable model + crash reports + three-tier contracts
+### Phase 2 — Unrecoverable model + crash reports
 
 - Stdlib `pub error` types in `lib/`: `RuntimeError`, `ArgumentError`, `ArithmeticError`, `KeyError`,
   `MatchError`, `IndexError`, `OutOfMemoryError`. Each gets a `@code Zxxxx` so the
@@ -627,13 +646,15 @@ acceptance test (Part VIII).
   Captures a backtrace via the Phase-0 DWARF + a new `zap_capture_backtrace` C-ABI in the fork.
 - Crash printer: **async-signal-safe**, reuses fork's `std.debug.dumpStackTraceFromBase`, prints
   exception + caret'd Zap source line at raise site + symbolized stack trace + ERT.
-- Panic-in-`defer` / double-fault: second panic → distinct exit code + immediate abort, no further
-  user code.
+- Panic-during-unwind / double-fault: a second panic during unwinding (inside an `after` cleanup or
+  drop glue) → distinct exit code + immediate abort, no further user code.
 - ~~Three-tier contracts: `assert` (always-on), `debug_assert` (debug-only), `precondition`
   (release-elided).~~ **REMOVED in deflation pass** (see decision #6 above). Assertions are a
   test-framework concern: Zest provides `assert`/`reject`; production invariants use `raise` or a
   failing `case`. No language-level contract macros and no `AssertionError` type remain.
-- `defer` and `errdefer` lowering wired into the ARC retain/release allow-list with tests.
+- ~~`defer` / `errdefer` lowering wired into the ARC retain/release allow-list.~~ **REMOVED in
+  deflation pass** (see the surface list above). Deterministic release is ARC's job; explicit
+  always-run cleanup is `after`. No imperative scope-cleanup statement remains.
 - `ZAP_BACKTRACE=full|short|0` convention.
 - **Acceptance:** the known startup SIGTRAP defect produces a symbolicated report; a double-fault
   is contained; release builds strip per the per-mode policy and `zap-addr2line` symbolizes from
@@ -645,7 +666,8 @@ acceptance test (Part VIII).
 - `rescue` is the effect handler that handles that effect abortively (exhaustiveness-checked
   pattern matching on `Error` values).
 - `try { } rescue { } after { }` surface syntax.
-- `with` macro: sugar for sequencing `?`-bearing expressions (Elixir-style).
+- `with` macro: Elixir-style sequencing of fallible `<-` bindings with an `else` arm — the canonical
+  multi-step `Result`/`Option` composition idiom (no `?` operator; `with` is the spelling).
 - Migrate `~>` to a `rescue` macro (the Phase-1 `match` desugar is intermediate).
 - Effect inference handles higher-order combinators (`map`, `fold`, `pipe`) effect-polymorphically
   without monomorphization blow-up.
@@ -987,14 +1009,16 @@ A Fast Address Sanity Checker." *USENIX ATC 2012.* — The leak-detector design 
   the pure happy path direct-style.
 - **Catch-basin (`~>`)** — Zap operator: handle an unmatched piped value and skip remaining pipe
   steps. Today's `~>` IR is payload-insensitive (a known landmine).
-- **`TryProject(value, ok_var, err_var)`** — *proposed* additive IR node that supplies the
-  payload-binding shape the existing `~>` IR lacks. The existing `~>` becomes a degenerate case
-  where both bindings are `_`.
+- **`TryProject(value, ok_var, err_var)`** — additive IR node, shipped then **removed in the
+  deflation pass** together with the `?` operator that consumed it. `~>` keeps its own bespoke
+  `error_pipe` lowering; with `?` gone there was no second consumer to justify the shared node.
 - **ERT / error-return trace** — Zig feature: a trace of where an error value was first returned
   and each propagation point. Distinct from a call stack. The fork supports it; Zap currently only
   has the `pop_error_return_trace` Call-flag hook wired.
-- **`errdefer`** — Zig's error-only cleanup: runs only when the enclosing function returns an
-  error. Distinct from `defer`, which always runs.
+- **`errdefer`** — Zig's error-only cleanup (prior art): runs only when the enclosing function
+  returns an error; distinct from Zig's `defer`, which always runs. Zap shipped `defer`/`errdefer`
+  then **rejected them in the deflation pass** — ARC handles deterministic release and `after` is
+  the explicit always-run cleanup, so an imperative scope-cleanup statement is redundant.
 - **Infallible allocation** — allocator API contract that allocation either succeeds or the program
   is abandoned (vs. fallible allocation that returns an error). Zap's `Memory.ARC` is infallible
   by default; `try_alloc` opts into fallible code paths.
