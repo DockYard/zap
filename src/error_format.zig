@@ -57,6 +57,14 @@ pub const frame_source_separator = " at ";
 /// The `:` between file and line in a source location.
 pub const source_line_separator = ":";
 
+/// The trailing marker on a backtrace frame that was produced by DWARF
+/// inline-frame expansion rather than a distinct physical return address
+/// (`  Struct.fn/1 at file.zap:7 (inlined)`). The leak alloc-site backtrace
+/// expands a fully-inlined leaf allocation's single PC into its inline chain;
+/// this marks the inlined source frames so they read distinctly from the
+/// physical frame, the conventional way DWARF inline frames are rendered.
+pub const inlined_frame_suffix = " (inlined)";
+
 /// Box-drawing glyphs for the gutter / footer. U+2502 BOX DRAWINGS LIGHT
 /// VERTICAL is the gutter bar; U+2514 U+2500 (└─) is the footer corner that
 /// introduces the `file:line:col` location line. Shared so the compile

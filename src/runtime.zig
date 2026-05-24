@@ -7753,6 +7753,52 @@ fn symbolizeAddress(addr: usize) ?ZapSymbolInfo {
     return .{ .name = sym.name, .source = sym.source_location };
 }
 
+/// Maximum number of inlined source frames a single physical return address
+/// can expand into on the leak cold path. A fully-inlined leaf allocation
+/// (`allocAny` → `annotateAllocationForLeakTracking` → `Backtrace.capture` →
+/// `captureBacktraceInto`, all folded into the user's construction PC) nests a
+/// handful of runtime frames inside the one user frame; 32 is generous
+/// headroom and bounds the on-stack scratch buffer.
+const INLINE_CHAIN_MAX_FRAMES: usize = 32;
+
+/// Resolve one physical return address into its full DWARF inline-frame chain,
+/// innermost (deepest inlined body) first, ending at the concrete function.
+/// Fills `out[0..]` and returns the number of frames written.
+///
+/// This is the COLD-PATH symbolizer used by the leak report. Unlike
+/// `symbolizeAddress` (which deliberately resolves only the physical frame for
+/// the side-table-keyed crash backtrace), this requests the fork DWARF reader's
+/// inline-caller expansion (`resolve_inline_callers = true`), so a fully-inlined
+/// leaf allocation expands into [<runtime plumbing frames…>, <user frame>]
+/// rather than collapsing to just the innermost (plumbing) frame. The leak
+/// renderer then suppresses the runtime-plumbing inline frames and reports the
+/// genuine user allocation frame(s). Reaching for the full reader is sound here
+/// because the leak report runs at `core.deinit` / normal program exit — NOT a
+/// signal context — so it is unconstrained by async-signal-safety. Allocates
+/// through the process-lifetime debug-info arena (never libc `malloc`); the
+/// returned slices live in that arena.
+fn symbolizeAddressInlineChain(addr: usize, out: []ZapSymbolInfo) usize {
+    if (out.len == 0) return 0;
+    if (std.debug.SelfInfo == void) return 0;
+    if (!std.options.allow_stack_tracing) return 0;
+
+    const di = std.debug.getSelfDebugInfo() catch return 0;
+    const io = std.Options.debug_io;
+    const arena = std.debug.getDebugInfoAllocator();
+
+    var symbols: std.ArrayList(std.debug.Symbol) = .empty;
+    di.getSymbols(io, arena, arena, addr, true, &symbols) catch return 0;
+    if (symbols.items.len == 0) return 0;
+
+    const count = @min(symbols.items.len, out.len);
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const sym = symbols.items[i];
+        out[i] = .{ .name = sym.name, .source = sym.source_location };
+    }
+    return count;
+}
+
 /// A captured call stack: a fixed-capacity array of return addresses plus a
 /// count. No heap; the value is produced at a `raise` site and consumed
 /// immediately by the crash printer. The backtrace deliberately lives in
@@ -7916,6 +7962,7 @@ const RuntimeFormat = struct {
     const frame_indent = "  ";
     const frame_source_separator = " at ";
     const source_line_separator = ":";
+    const inlined_frame_suffix = " (inlined)";
     const ert_section_header = "error return trace:";
     const cause_prefix = "caused by: ";
     const gutter_bar = "\u{2502}";
@@ -8198,6 +8245,23 @@ fn isBacktraceCapturePlumbingSymbol(stripped_mangled: []const u8) bool {
         std.mem.indexOf(u8, stripped_mangled, "captureBacktraceInto") != null;
 }
 
+/// True when a (underscore-stripped) linkage name belongs to the runtime's
+/// heap-allocation entry points that wrap the user's construction site —
+/// `ArcRuntime.allocAny` and the leak-attribution helper
+/// `annotateAllocationForLeakTracking`. These are `inline` so they normally
+/// contribute no physical frame, but on the leak alloc-site cold path the PC is
+/// inline-EXPANDED (`resolve_inline_callers`): the user's construction PC then
+/// resolves to a chain of these inlined runtime frames wrapping the genuine
+/// user frame. Suppressing them — symmetric to `isBacktraceCapturePlumbingSymbol`
+/// for the capture primitive — anchors the rendered alloc-site at the user's
+/// construction frame (e.g. `script.main` at the allocation line) rather than
+/// the runtime allocator it inlined into. Matched as a substring so the
+/// `zap_runtime.` module prefix and any mangling suffix are tolerated.
+fn isAllocPlumbingSymbol(stripped_mangled: []const u8) bool {
+    return std.mem.indexOf(u8, stripped_mangled, "ArcRuntime.allocAny") != null or
+        std.mem.indexOf(u8, stripped_mangled, "annotateAllocationForLeakTracking") != null;
+}
+
 /// True when a (underscore-stripped) linkage name belongs to the Zig runtime
 /// entry that sits *below* the user's Zap entry point — the `std.start`
 /// namespace (`start.callMain`, `start.wrapMain`, `start.main`, …) and the
@@ -8288,7 +8352,20 @@ fn resolveCrashReportFormat() void {
 fn crashReportFrame(addr: usize) FrameAction {
     const call_site_addr = if (addr != 0) addr - 1 else addr;
     const info = symbolizeAddress(call_site_addr);
+    return renderResolvedFrame(info, call_site_addr, false);
+}
 
+/// Render one already-resolved frame line, shared by the physical-frame crash
+/// path (`crashReportFrame`) and the inline-expanded leak path
+/// (`renderAllocationSite`). `info` is the resolved symbol (or `null` when
+/// symbolization failed); `call_site_addr` is the call-site-adjusted address
+/// used only for the no-symbol static-address fallback; `inlined` appends an
+/// ` (inlined)` marker so an inlined source frame is visually distinct from the
+/// physical frame, matching how DWARF inline frames are conventionally
+/// rendered. Returns the `FrameAction` (emit / skip plumbing / stop at entry)
+/// so the caller applies the identical `ZAP_BACKTRACE` budget + plumbing-skip
+/// accounting across both surfaces.
+fn renderResolvedFrame(info: ?ZapSymbolInfo, call_site_addr: usize, inlined: bool) FrameAction {
     const name: ?[]const u8 = if (info) |i| i.name else null;
     const source: ?std.debug.SourceLocation = if (info) |i| i.source else null;
 
@@ -8304,6 +8381,7 @@ fn crashReportFrame(addr: usize) FrameAction {
         crashWriteUnsignedHex(static_addr);
         // Still print a source location if DWARF had one.
         if (source) |loc| crashReportSourceLocation(loc);
+        if (inlined) posixWrite(STDERR_FD, RuntimeFormat.inlined_frame_suffix);
         posixWrite(STDERR_FD, "\n");
         return .emitted;
     }
@@ -8318,8 +8396,16 @@ fn crashReportFrame(addr: usize) FrameAction {
     if (isPanicPlumbingSymbol(mangled)) return .skipped;
     // The runtime's own stack-capture primitive is never a real execution
     // frame; suppress it so the trace begins at the user/runtime frame that
-    // requested the capture (alloc site, raise origin, or fault point).
+    // requested the capture (alloc site, raise origin, or fault point). On the
+    // inline-expanded leak path this is what drops the inlined capture/alloc
+    // plumbing frames so the chain surfaces the user's enclosing frame.
     if (isBacktraceCapturePlumbingSymbol(mangled)) return .skipped;
+    // The runtime allocation entry points (`ArcRuntime.allocAny`,
+    // `annotateAllocationForLeakTracking`) are also pure plumbing when they
+    // appear as inlined frames of the user's allocation PC — suppress them so
+    // the leak alloc-site chain begins at the user's construction frame, not
+    // the runtime allocator it inlined into.
+    if (isAllocPlumbingSymbol(mangled)) return .skipped;
 
     // Stop at the Zig program-startup glue below the user's `main` — those
     // frames are not Zap code and only add noise to the report.
@@ -8349,6 +8435,7 @@ fn crashReportFrame(addr: usize) FrameAction {
     }
 
     if (source) |loc| crashReportSourceLocation(loc);
+    if (inlined) posixWrite(STDERR_FD, RuntimeFormat.inlined_frame_suffix);
     posixWrite(STDERR_FD, "\n");
     return .emitted;
 }
@@ -8778,11 +8865,40 @@ fn renderAllocationSite(backtrace: []const usize) void {
     };
     var shown: usize = 0;
     var i: usize = 0;
-    while (i < backtrace.len and shown < max_shown) : (i += 1) {
-        switch (crashReportFrame(backtrace[i])) {
-            .emitted => shown += 1,
-            .skipped => {},
-            .stop => break,
+    outer: while (i < backtrace.len and shown < max_shown) : (i += 1) {
+        const addr = backtrace[i];
+        const call_site_addr = if (addr != 0) addr - 1 else addr;
+
+        // Expand this physical PC into its DWARF inline-frame chain (innermost
+        // first, ending at the concrete function). A fully-inlined leaf
+        // allocation collapses the whole alloc/capture plumbing AND the user's
+        // construction frame into ONE physical PC; without expansion the PC
+        // symbolizes only to the innermost (plumbing) frame and the plumbing
+        // skip then drops the user frame entirely. With expansion each inline
+        // level is classified independently: the plumbing frames are skipped
+        // and the user's enclosing frame surfaces. The last chain entry is the
+        // physical (non-inlined) frame; all earlier entries are inlined.
+        var chain: [INLINE_CHAIN_MAX_FRAMES]ZapSymbolInfo = undefined;
+        const chain_len = symbolizeAddressInlineChain(call_site_addr, &chain);
+        if (chain_len == 0) {
+            // No DWARF (stripped binary etc.): fall back to the physical-frame
+            // renderer, which emits the static address.
+            switch (renderResolvedFrame(null, call_site_addr, false)) {
+                .emitted => shown += 1,
+                .skipped => {},
+                .stop => break :outer,
+            }
+            continue;
+        }
+
+        var j: usize = 0;
+        while (j < chain_len and shown < max_shown) : (j += 1) {
+            const is_inlined = j + 1 < chain_len; // last entry is the physical frame
+            switch (renderResolvedFrame(chain[j], call_site_addr, is_inlined)) {
+                .emitted => shown += 1,
+                .skipped => {},
+                .stop => break :outer,
+            }
         }
     }
 }
@@ -8797,16 +8913,32 @@ fn renderAllocationSite(backtrace: []const usize) void {
 fn firstSourceLocation(backtrace: []const usize) ?std.debug.SourceLocation {
     for (backtrace) |addr| {
         const call_site = if (addr != 0) addr - 1 else addr;
-        const info = symbolizeAddress(call_site) orelse continue;
-        const name = info.name orelse continue;
-        if (name.len == 0) continue;
-        const mangled = stripSymbolUnderscore(name);
-        if (isRaisePlumbingSymbol(mangled)) continue;
-        if (isPanicPlumbingSymbol(mangled)) continue;
-        if (isBacktraceCapturePlumbingSymbol(mangled)) continue;
-        if (isBelowUserEntrySymbol(mangled)) return null;
-        if (info.source) |loc| {
-            if (loc.file_name.len != 0) return loc;
+
+        // Inline-expand the PC and walk its chain innermost→outermost, applying
+        // the SAME plumbing-skip / below-entry classification the frame
+        // renderer uses, so the headline `allocated at …` location agrees
+        // exactly with the first frame the detail backtrace shows. For a
+        // fully-inlined leaf allocation the chain's only non-plumbing frame is
+        // the user's enclosing function, whose source location is the user's
+        // allocation line.
+        var chain: [INLINE_CHAIN_MAX_FRAMES]ZapSymbolInfo = undefined;
+        const chain_len = symbolizeAddressInlineChain(call_site, &chain);
+        if (chain_len == 0) continue;
+
+        var j: usize = 0;
+        while (j < chain_len) : (j += 1) {
+            const info = chain[j];
+            const name = info.name orelse continue;
+            if (name.len == 0) continue;
+            const mangled = stripSymbolUnderscore(name);
+            if (isRaisePlumbingSymbol(mangled)) continue;
+            if (isPanicPlumbingSymbol(mangled)) continue;
+            if (isBacktraceCapturePlumbingSymbol(mangled)) continue;
+            if (isAllocPlumbingSymbol(mangled)) continue;
+            if (isBelowUserEntrySymbol(mangled)) return null;
+            if (info.source) |loc| {
+                if (loc.file_name.len != 0) return loc;
+            }
         }
     }
     return null;

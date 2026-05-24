@@ -57,6 +57,7 @@ const mirrored_constants = [_]MirroredConstant{
     .{ .name = "frame_indent", .canonical_decl = "pub const frame_indent = ", .mirror_decl = "const frame_indent = " },
     .{ .name = "frame_source_separator", .canonical_decl = "pub const frame_source_separator = ", .mirror_decl = "const frame_source_separator = " },
     .{ .name = "source_line_separator", .canonical_decl = "pub const source_line_separator = ", .mirror_decl = "const source_line_separator = " },
+    .{ .name = "inlined_frame_suffix", .canonical_decl = "pub const inlined_frame_suffix = ", .mirror_decl = "const inlined_frame_suffix = " },
     .{ .name = "ert_section_header", .canonical_decl = "pub const ert_section_header = ", .mirror_decl = "const ert_section_header = " },
     .{ .name = "cause_prefix", .canonical_decl = "pub const cause_prefix = ", .mirror_decl = "const cause_prefix = " },
     .{ .name = "gutter_bar", .canonical_decl = "pub const gutter_bar = ", .mirror_decl = "const gutter_bar = " },
