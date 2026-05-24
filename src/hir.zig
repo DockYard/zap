@@ -332,14 +332,21 @@ pub const TryRescueHir = struct {
 pub const RescueDiscriminator = union(enum) {
     /// `_`, a bare binding `e`, or `e :: <Protocol>` (the protocol the box
     /// already carries) — matches any boxed error without a runtime test.
-    /// The bound variable, if any, stays the boxed `Error` existential.
+    /// The bound variable, if any, stays the boxed `Error` existential, so
+    /// `Error.method(e)` dispatches through the vtable and `raise e` re-raises
+    /// the box. The type checker types such a binding as the open `Error`
+    /// existential, matching this boxed representation.
     catch_all,
     /// `e :: ConcreteError` or `%ConcreteError{...}` — matches only when the
     /// box's runtime concrete type is `target_type_name`. `needs_unbox` is
-    /// true for a struct-pattern clause (its fields must be read off the
-    /// downcast concrete value via `protocol_box_unbox`); a pure
-    /// type-binding clause keeps the binding as the box (no unbox), so a
-    /// `raise e` / `Error.method(e)` in the body still sees an `Error`.
+    /// true for BOTH forms (Phase 3.a Gap A): the matched value is recovered
+    /// to the concrete `ConcreteError` via `protocol_box_unbox` (gated by the
+    /// matching `protocol_box_vtable_eq`), so the binding is the unboxed
+    /// concrete value. A struct-pattern clause reads its fields off that
+    /// concrete value; a type-binding clause binds the whole concrete value to
+    /// `e`. Either way `Error.method(e)` resolves against `ConcreteError`'s
+    /// `impl Error` on a real `ConcreteError`, and concrete field/method
+    /// access works — the type checker types `e` as `ConcreteError` to match.
     concrete: struct {
         target_type_name: []const u8,
         needs_unbox: bool,
@@ -6370,8 +6377,10 @@ pub const HirBuilder = struct {
     ///     already carries (e.g. `Error`)                       -> catch-all
     ///     (the existential already satisfies it; no downcast).
     ///   * `e :: ConcreteError`                                 -> concrete,
-    ///     no unbox (the binding stays the boxed `Error` so the body's
-    ///     `raise e` / `Error.method(e)` still sees an `Error`).
+    ///     needs_unbox (Phase 3.a Gap A): the binding is the unboxed concrete
+    ///     value, so `Error.method(e)` resolves against `ConcreteError`'s
+    ///     `impl Error` and concrete field access works — matching the type
+    ///     checker, which types `e` as `ConcreteError`.
     ///   * `%ConcreteError{...}` struct pattern                 -> concrete,
     ///     needs_unbox (its fields are read off the downcast concrete value).
     fn rescueDiscriminatorForClause(self: *HirBuilder, clause: ast.CaseClause) RescueDiscriminator {
@@ -6404,8 +6413,16 @@ pub const HirBuilder = struct {
             // `e :: <Protocol>` (the existential the box already carries)
             // matches any box: no downcast.
             if (self.isProtocolName(type_struct_name)) return .catch_all;
-            // `e :: ConcreteError`: gate on the runtime type, bind the box.
-            return .{ .concrete = .{ .target_type_name = self.interner.get(type_name), .needs_unbox = false } };
+            // `e :: ConcreteError`: gate on the runtime type, then UNBOX the
+            // binding to the concrete value (Phase 3.a Gap A). The type checker
+            // types `e` as the concrete `ConcreteError`, so the runtime value
+            // must be the unboxed concrete struct — recovered via
+            // `protocol_box_unbox` once `protocol_box_vtable_eq` confirms the
+            // box holds a `ConcreteError`. This makes both `Error.method(e)`
+            // (resolved against `ConcreteError`'s `impl Error`) and concrete
+            // field/method access (`e.field`) work on the binding, mirroring
+            // Elixir's `rescue e in [ConcreteError]`.
+            return .{ .concrete = .{ .target_type_name = self.interner.get(type_name), .needs_unbox = true } };
         }
 
         // Any other pattern shape (literal, tuple, …) is not a meaningful

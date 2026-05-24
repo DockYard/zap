@@ -1368,6 +1368,88 @@ pub const ZirDriver = struct {
         return ref;
     }
 
+    /// Emit the catch value for a `route_to_handler` error-union unwrap.
+    ///
+    /// On the error edge the unwrapped payload is NEVER read — the boxed error
+    /// is in the TLS side-channel and the enclosing `try`'s landing pad takes
+    /// over via the following `raise_occurred()` check. The straight-line try-
+    /// body remainder (a `local_set` of this dest, then the dispatch `if`) still
+    /// EXECUTES on the error path before the landing pad fires, and a dead
+    /// ARC-managed local bound to this value gets a scope-exit release. So the
+    /// catch value MUST be release-safe — `@as(T, undefined)` is a garbage
+    /// non-null pointer whose `release` dereferences a bogus ArcHeader (observed
+    /// as a bus_error in `List(T).release` when a `for`-comprehension list in a
+    /// `try` body is released on the raise path). For ARC-managed payloads we
+    /// therefore emit a canonical EMPTY value whose release is a no-op:
+    ///   * `List(T)` / `Map(K,V)` → `.empty()` (the null cell pointer; the
+    ///     runtime `release(null)` returns early).
+    ///   * `?T` / `*const T` (recursive-struct storage) → `null`.
+    ///   * `ProtocolBox` → a zeroed box (`data_ptr`/`vtable` both null; the
+    ///     runtime `releaseProtocolBoxValue` no-ops on a null `data_ptr`).
+    /// Non-ARC scalar payloads are never released, so `@as(T, undefined)` is
+    /// still correct (and avoids needless instructions) for them.
+    fn emitReleaseSafeCatchValue(self: *ZirDriver, payload_type: ir.ZigType) BuildError!u32 {
+        switch (payload_type) {
+            .list => {
+                const list_cell = try self.emitListCellRef(getListElementType(payload_type));
+                const empty_fn = zir_builder_emit_field_val(self.handle, list_cell, "empty", 5);
+                if (empty_fn == error_ref) return error.EmitFailed;
+                const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
+                if (empty_val == error_ref) return error.EmitFailed;
+                return empty_val;
+            },
+            .map => |mt| {
+                const map_cell = try self.emitMapCellRef(mt.key.*, mt.value.*);
+                const empty_fn = zir_builder_emit_field_val(self.handle, map_cell, "empty", 5);
+                if (empty_fn == error_ref) return error.EmitFailed;
+                const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
+                if (empty_val == error_ref) return error.EmitFailed;
+                return empty_val;
+            },
+            .optional, .ptr => {
+                // A nullable pointer slot: `@as(?T, null)` / a recursive-struct
+                // `?*const T` storage slot. `null` releases as a no-op.
+                const ty_ref = try self.emitImportedTypeRef(payload_type);
+                const ref = zir_builder_emit_as(self.handle, ty_ref, @intFromEnum(Zir.Inst.Ref.null_value));
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            },
+            .protocol_box => {
+                // A zeroed `ProtocolBox` ({data_ptr: null, vtable: null}); the
+                // runtime's box release no-ops on a null inner data pointer.
+                return try self.emitZeroedProtocolBox();
+            },
+            else => return try self.emitTypedUndefRef(payload_type),
+        }
+    }
+
+    /// Emit a zeroed `runtime.ProtocolBox` value —
+    /// `ProtocolBox{ .data_ptr = null, .vtable = null }`. Used as the
+    /// release-safe catch value on a `route_to_handler` unwrap whose payload is
+    /// a protocol existential (see `emitReleaseSafeCatchValue`); the runtime's
+    /// box release is null-guarded on `data_ptr`, so a null-fields box releases
+    /// as a no-op (where `@as(ProtocolBox, undefined)` would deref a garbage
+    /// inner pointer).
+    fn emitZeroedProtocolBox(self: *ZirDriver) BuildError!u32 {
+        const box_ty = try self.emitProtocolBoxTypeRef();
+        const field_names = [_][*]const u8{ "data_ptr".ptr, "vtable".ptr };
+        const field_lens = [_]u32{ "data_ptr".len, "vtable".len };
+        const field_values = [_]u32{
+            @intFromEnum(Zir.Inst.Ref.null_value),
+            @intFromEnum(Zir.Inst.Ref.null_value),
+        };
+        const ref = zir_builder_emit_struct_init_typed(
+            self.handle,
+            box_ty,
+            &field_names,
+            &field_lens,
+            &field_values,
+            field_values.len,
+        );
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
     /// Phase 3.b — emit a call to `Kernel.abort_recoverable_raise()` and
     /// return its Ref. The unhandled-raise terminus: recovers the boxed
     /// `Error` stashed in the thread-local side-channel and aborts through
@@ -6142,12 +6224,19 @@ pub const ZirDriver = struct {
                         try self.setLocal(ueu.dest, unwrapped);
                     },
                     .route_to_handler => {
-                        // `source catch <typed_undef>` — on error the boxed
-                        // payload is already in the TLS side-channel and the
-                        // enclosing `try`'s landing pad (the following
-                        // `raise_occurred()` check) takes over, so the catch
-                        // value is a never-read placeholder of the payload type.
-                        const catch_value = try self.emitTypedUndefRef(ueu.payload_type);
+                        // `source catch <release-safe sentinel>` — on error the
+                        // boxed payload is already in the TLS side-channel and
+                        // the enclosing `try`'s landing pad (the following
+                        // `raise_occurred()` check) takes over, so this value is
+                        // never READ. It is, however, still bound into the
+                        // straight-line try-body remainder and a dead ARC-managed
+                        // binding gets a scope-exit release on the (taken) raise
+                        // path — so the catch value MUST be release-safe. An
+                        // `@as(T, undefined)` ARC value is a garbage non-null
+                        // pointer whose release derefs a bogus ArcHeader; we emit
+                        // a canonical empty/null sentinel instead (see
+                        // `emitReleaseSafeCatchValue`).
+                        const catch_value = try self.emitReleaseSafeCatchValue(ueu.payload_type);
                         const unwrapped = zir_builder_emit_catch(self.handle, source_ref, catch_value);
                         if (unwrapped == error_ref) return error.EmitFailed;
                         try self.setLocal(ueu.dest, unwrapped);

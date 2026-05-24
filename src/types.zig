@@ -6268,15 +6268,32 @@ pub const TypeChecker = struct {
                         (clause.pattern.* == .wildcard or clause.pattern.* == .bind);
                     if (is_catch_all) has_catch_all = true;
 
-                    // Bind the clause pattern. When the clause names a concrete
-                    // error type (via `:: E` or `%E{}`), bind against it so
-                    // field/struct destructuring type-checks; a catch-all binds
-                    // against the body's raised type when singular, else the
-                    // Error existential.
+                    // Bind the clause pattern's type, observing the
+                    // representation invariant the IR dispatch relies on
+                    // (Phase 3.a Gap A): a binding's STATIC type must match the
+                    // runtime value the dispatch hands it.
+                    //
+                    //   * A clause naming a concrete error type (`e :: E` or
+                    //     `%E{}`) is typed as that concrete `E`. The runtime
+                    //     type-discrimination confirms the boxed error IS an
+                    //     `E`, then `protocol_box_unbox` recovers the concrete
+                    //     value — so `Error.message(e)` resolves against `E`'s
+                    //     `impl Error` method on a real `E`, and field/struct
+                    //     destructuring (`e.field`, `%E{field: x}`) type-checks.
+                    //     This is Elixir's `rescue e in [E]` model.
+                    //   * A catch-all (`_`, bare `e`, or `e :: <Protocol>`) is
+                    //     typed as the open `Error` existential — NOT narrowed
+                    //     to the body's singular raised type. The dispatch keeps
+                    //     such a binding as the boxed `ProtocolBox`, so
+                    //     `Error.method(e)` dispatches through the vtable and
+                    //     `raise e` re-raises the box. Narrowing a catch-all to
+                    //     a concrete type would type the binding as a struct the
+                    //     runtime never unboxes it into — a representation
+                    //     mismatch the backend rejects ("expected `E`, found
+                    //     `ProtocolBox`"). The broadest binding correctly admits
+                    //     only the protocol surface, exactly like Elixir.
                     const bind_type: TypeId = if (matched_error) |err_type|
                         err_type
-                    else if (body_raises.items.len == 1)
-                        body_raises.items[0]
                     else
                         try self.errorExistentialType();
 

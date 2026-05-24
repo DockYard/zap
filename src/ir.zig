@@ -3228,6 +3228,23 @@ pub const IrBuilder = struct {
     /// instantiation (e.g. `Map(atom, term)`). Locals in this set
     /// route through the runtime's type-derived helpers instead.
     param_backed_locals: std.AutoHashMap(LocalId, void),
+    /// Rescue-arm binding locals that alias the UNBOXED inner of a
+    /// recovered `Error` box (Phase 3.a Gap A) — `e` in
+    /// `e :: ConcreteError -> ...`. The binding is a BORROW of the box's
+    /// heap cell: `protocol_box_unbox` loads the concrete value by-value
+    /// without transferring ownership (the box still owns the cell and
+    /// deep-releases it via `<Protocol>VTable.drop` at the landing pad's
+    /// scope exit), so the alias must get NEITHER a retain at bind time
+    /// NOR a scope-exit release. Without this, `emitLocalGet`'s retain +
+    /// `computeLocalOwnership`'s `.owned` classification would schedule a
+    /// deep retain/release on the by-value struct, double-walking the
+    /// inner's ARC-managed fields (`message :: String`, `cause ::
+    /// Option(Error)`) against the box's own drop — heap corruption. The
+    /// arm body's own operations create their own owners where needed
+    /// (field extraction retains the field; `raise e` re-boxes a copy),
+    /// exactly as the struct-pattern path treats its borrowed scrutinee.
+    /// `computeLocalOwnership` reads this set to force `.borrowed`.
+    rescue_unboxed_borrow_locals: std.AutoHashMap(LocalId, void),
     /// Tuple-typed locals whose components may have been Term-promoted
     /// because they were extracted via a `via_helper` list operation
     /// (heterogeneous keyword list flowing through `anytype`). When a
@@ -3352,6 +3369,7 @@ pub const IrBuilder = struct {
             .known_local_types = std.AutoHashMap(LocalId, ZigType).init(allocator),
             .local_hir_types = std.AutoHashMap(LocalId, hir_mod.TypeId).init(allocator),
             .param_backed_locals = std.AutoHashMap(LocalId, void).init(allocator),
+            .rescue_unboxed_borrow_locals = std.AutoHashMap(LocalId, void).init(allocator),
             .term_tuple_locals = std.AutoHashMap(LocalId, ZigType).init(allocator),
             .current_struct_prefix = null,
             .known_function_names = std.StringHashMap(void).init(allocator),
@@ -3371,6 +3389,7 @@ pub const IrBuilder = struct {
         self.known_local_types.deinit();
         self.local_hir_types.deinit();
         self.param_backed_locals.deinit();
+        self.rescue_unboxed_borrow_locals.deinit();
         self.term_tuple_locals.deinit();
         self.synthesized_type_defs.deinit(self.allocator);
         self.union_dispatch_map.deinit();
@@ -4376,6 +4395,7 @@ pub const IrBuilder = struct {
         self.known_local_types.clearRetainingCapacity();
         self.local_hir_types.clearRetainingCapacity();
         self.param_backed_locals.clearRetainingCapacity();
+        self.rescue_unboxed_borrow_locals.clearRetainingCapacity();
         self.term_tuple_locals.clearRetainingCapacity();
         self.current_param_types = .empty;
         self.current_param_hir_types = .empty;
@@ -4487,6 +4507,7 @@ pub const IrBuilder = struct {
         self.known_local_types.clearRetainingCapacity();
         self.local_hir_types.clearRetainingCapacity();
         self.param_backed_locals.clearRetainingCapacity();
+        self.rescue_unboxed_borrow_locals.clearRetainingCapacity();
         self.term_tuple_locals.clearRetainingCapacity();
         self.current_param_types = .empty;
         self.current_param_hir_types = .empty;
@@ -4974,6 +4995,7 @@ pub const IrBuilder = struct {
             self.known_local_types.clearRetainingCapacity();
             self.local_hir_types.clearRetainingCapacity();
             self.param_backed_locals.clearRetainingCapacity();
+            self.rescue_unboxed_borrow_locals.clearRetainingCapacity();
             self.term_tuple_locals.clearRetainingCapacity();
 
             // Reserve binding locals (same as normal function)
@@ -7587,11 +7609,19 @@ pub const IrBuilder = struct {
         else
             arm.body;
 
-        if (unboxed_local) |concrete_local| {
-            // Struct-pattern arm: match the (single-arm) pattern against the
-            // unboxed concrete value via the general case-body lowering so
-            // field extraction, nested patterns and guards work unchanged.
-            // A fresh single-arm CaseData reuses `lowerCaseExprBody`'s
+        // A struct-pattern arm (`%ConcreteError{field: x}`) destructures the
+        // unboxed concrete value: route it through the general case-body
+        // lowering so field extraction, nested patterns and guards work
+        // unchanged. A bind/wildcard arm — `e :: ConcreteError` (Phase 3.a
+        // Gap A; `unboxed_local` set) or a catch-all `_`/`e`/`e :: <Protocol>`
+        // (`unboxed_local` null) — binds the whole scrutinee, handled by the
+        // straight-line path below; it needs no decision tree.
+        const arm_destructures = unboxed_local != null and arm.pattern != null and
+            arm.pattern.?.* == .struct_match;
+        if (arm_destructures) {
+            const concrete_local = unboxed_local.?;
+            // Match the (single-arm) pattern against the unboxed concrete
+            // value. A fresh single-arm CaseData reuses `lowerCaseExprBody`'s
             // decision-tree path; its result flows to `handler_dest`. The
             // `scrutinee` expr is only a placeholder for the matrix
             // compiler's id-0 mapping (the real scrutinee is the passed
@@ -7623,13 +7653,53 @@ pub const IrBuilder = struct {
             return .{ .result = handler_dest, .diverges = body_diverges };
         }
 
-        // Catch-all or type-binding arm: bind any whole-scrutinee binding to
-        // the box, then lower the body. The bound variable (e.g. `e`) stays
-        // the boxed `Error` existential so `raise e` / `Error.method(e)` in
-        // the body sees an `Error`.
-        for (arm.bindings) |binding| {
-            if (binding.kind == .scrutinee) {
-                try self.emitLocalGet(binding.local_index, error_local);
+        // Whole-value bind arm. The binding source and its ARC discipline
+        // depend on the arm form:
+        //   * `e :: ConcreteError` (`unboxed_local` set, Phase 3.a Gap A):
+        //     bind `e` to the UNBOXED concrete value, so `Error.method(e)`
+        //     resolves against `ConcreteError`'s `impl Error` on a real
+        //     `ConcreteError` and concrete field/method access works. This
+        //     matches the type checker, which types `e` as `ConcreteError`.
+        //     The bind is a BORROW of the box's inner: `protocol_box_unbox`
+        //     loaded the value by-value without transferring ownership (the
+        //     box still owns the heap cell and deep-releases it at scope exit),
+        //     so `e` gets NO retain here and NO scope-exit release — recorded
+        //     in `rescue_unboxed_borrow_locals` so `computeLocalOwnership`
+        //     forces `.borrowed`. The arm body's own operations create owners
+        //     where needed (a field read retains the field; `raise e` re-boxes
+        //     a copy), exactly as the struct-pattern path treats its borrowed
+        //     scrutinee. A bare `retain`/`release` on the whole struct value
+        //     would instead deep-walk the inner's ARC-managed fields a second
+        //     time against the box's own drop — heap corruption.
+        //   * catch-all `_` / bare `e` / `e :: <Protocol>` (`unboxed_local`
+        //     null): bind to the box, so `e` stays the `Error` existential —
+        //     `Error.method(e)` dispatches through the vtable and `raise e`
+        //     re-raises the box. The box is genuinely ARC-managed; the
+        //     `emitLocalGet` retain + scope-exit release pair the alias against
+        //     the box's drop correctly.
+        if (unboxed_local) |concrete_local| {
+            for (arm.bindings) |binding| {
+                if (binding.kind != .scrutinee) continue;
+                try self.current_instrs.append(self.allocator, .{
+                    .local_get = .{ .dest = binding.local_index, .source = concrete_local },
+                });
+                // Carry the unboxed value's concrete type onto the binding so
+                // the body's field/method resolution sees `ConcreteError`, and
+                // mark the binding a borrow so no scope-exit release is
+                // scheduled (the box owns the cell).
+                if (self.known_local_types.get(concrete_local)) |zt| {
+                    try self.known_local_types.put(binding.local_index, zt);
+                }
+                if (self.local_hir_types.get(concrete_local)) |ht| {
+                    try self.local_hir_types.put(binding.local_index, ht);
+                }
+                try self.rescue_unboxed_borrow_locals.put(binding.local_index, {});
+            }
+        } else {
+            for (arm.bindings) |binding| {
+                if (binding.kind == .scrutinee) {
+                    try self.emitLocalGet(binding.local_index, error_local);
+                }
             }
         }
         const body_result = try self.lowerBlock(arm_body) orelse
@@ -7723,9 +7793,22 @@ pub const IrBuilder = struct {
         try self.known_local_types.put(unboxed_local, target_zig);
         // Record the unboxed value's HIR struct type so field extraction in
         // the arm body (struct_match) resolves field types/storage correctly.
+        // This also marks the local ARC-managed (concrete error structs carry
+        // `message :: String` / `cause :: Option(Error)` fields), so without
+        // the borrow record below `computeLocalOwnership` would classify the
+        // unbox dest `.owned` and schedule a scope-exit deep-release on it.
         if (self.structHirTypeByName(target_type_name)) |struct_hir_type| {
             try self.local_hir_types.put(unboxed_local, struct_hir_type);
         }
+        // The unbox dest is a BORROW of the box's heap cell: `protocol_box_unbox`
+        // lowers to a by-value load that does NOT transfer ownership (the box
+        // stays owned by the rescue landing pad and deep-releases the inner via
+        // `<Protocol>VTable.drop` at scope exit — see the `protocol_box_unbox`
+        // ownership contract in arc_ownership). Marking it borrowed prevents a
+        // second, conflicting scope-exit deep-release of the same inner fields.
+        // The arm body's own consumers create owners where needed (a
+        // `field_get` retains the extracted field; `raise e` re-boxes a copy).
+        try self.rescue_unboxed_borrow_locals.put(unboxed_local, {});
         return unboxed_local;
     }
 
@@ -10194,6 +10277,17 @@ pub const IrBuilder = struct {
         const out = try self.allocator.alloc(OwnershipClass, local_count);
         var index: u32 = 0;
         while (index < local_count) : (index += 1) {
+            // A rescue-arm binding aliasing an unboxed `Error` box inner
+            // (Phase 3.a Gap A) is a BORROW: the box owns the heap cell and
+            // deep-releases it at scope exit, so the alias gets no scope-exit
+            // release. Force `.borrowed` even though its concrete-error struct
+            // type is ARC-managed (it carries `message :: String` /
+            // `cause :: Option(Error)` fields) — classifying it `.owned` would
+            // double-walk those fields against the box's own drop.
+            if (self.rescue_unboxed_borrow_locals.contains(index)) {
+                out[index] = .borrowed;
+                continue;
+            }
             out[index] = if (self.isArcManagedLocal(index)) .owned else .trivial;
         }
         return out;
@@ -12633,6 +12727,32 @@ fn maxLocalSetIndexInExpr(expr: *const hir_mod.Expr) LocalId {
                 max_local = @max(max_local, maxLocalSetIndexInExpr(step.expr));
             }
             max_local = @max(max_local, maxLocalSetIndexInExpr(ep.handler));
+        },
+        .try_rescue => |*tr| {
+            // A `try`/`rescue`/`after` reserves several HIR-numbered locals
+            // the IR builder's `next_local` floor MUST clear, or freshly
+            // allocated lowering locals (`share_value`/`param_get`/
+            // `borrow_value`/`copy_value` dests) collide with them and rebind
+            // a live, ARC-managed local mid-function — corrupting its refcount
+            // header (observed as a bus_error in an unrelated `List(T).release`
+            // when a `for`-comprehension list in the body aliases a low local
+            // that a rescue arm's binding then reuses). Walk every reserved
+            // index: the recovered-error binding (`error_local`), the try
+            // body's `local_set`s, and each rescue arm's body `local_set`s AND
+            // pattern bindings (`e :: E`, `%E{field: x}` field binds, the
+            // synthesized re-raise binding). The `after` block runs straight-
+            // line and allocates locals from the same space, so include it too.
+            max_local = @max(max_local, tr.error_local + 1);
+            max_local = @max(max_local, maxLocalSetIndexInBlock(tr.body));
+            for (tr.arms) |arm| {
+                max_local = @max(max_local, maxLocalSetIndexInBlock(arm.body));
+                for (arm.bindings) |binding| {
+                    max_local = @max(max_local, binding.local_index + 1);
+                }
+            }
+            if (tr.after_block) |after_block| {
+                max_local = @max(max_local, maxLocalSetIndexInBlock(after_block));
+            }
         },
         else => {},
     }
