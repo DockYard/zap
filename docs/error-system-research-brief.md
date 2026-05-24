@@ -677,6 +677,56 @@ Elixir-aligned Zap; see Part II and decisions #3 and #6.)
 - **Acceptance:** round-tripping Elixir-shaped pipelines is identical to today; effect-polymorphic
   combinators compose without explicit annotation; mandatory-`raises` lint mode passes on `lib/*`.
 
+> **Phase 3.a implementation note (`try`/`rescue`/`after` — the landed recoverable-handler model).**
+> Phase 3.a delivered the `raise`/`rescue` effect handler. The mechanism: a `raise %E{}` boxes the
+> error struct into a `ProtocolBox` (`Error` existential), stashes it into a thread-local
+> recoverable-raise *side-channel*, and returns `error.ZapRaise`; an enclosing `try`/`rescue` catches
+> via a landing pad that recovers the box (`Kernel.take_recoverable_raise`) and dispatches the
+> `rescue` arms against it. Four capabilities complete the model as its final design:
+>
+> - **Rescue binding semantics (typed vs untyped).** A *concrete-typed* binding `e :: MyError`
+>   runtime-discriminates the boxed error against `MyError` and, on a match, **unboxes the existential
+>   to the concrete value** — the arm body then operates on a plain `MyError` struct (Elixir
+>   `rescue e in [Type]` semantics): field access (`e.message`) and concrete-type method calls are
+>   direct, no vtable. An *untyped* binding `e ->` (and a typed binding used existentially) binds the
+>   `Error` existential itself, and method calls on it dispatch dynamically through the `ProtocolBox`
+>   vtable. Both forms coexist across arms of one `rescue`. The unboxed concrete binding is held
+>   **borrowed** (no scope-exit release on the binding), so it never double-frees against the
+>   box-owner release below.
+>
+> - **Boxed-error ownership — the per-arm release model.** The side-channel transfers *ownership* of
+>   the boxed error to the recovering `try`/`rescue` (the recovered box is the sole owner; the
+>   original `raise`-constructed local does not also get a scope-exit release — that dual-drop was the
+>   double-free fixed under `Memory.Tracking`). Each **catching** arm releases the boxed error
+>   **exactly once** at the handling arm's scope exit (gated on a non-diverging dispatch), whether the
+>   body's tail is a local `raise` (fast straight-line path) or a call to a raising callee (slow
+>   landing-pad path — the release is emitted inside the landing pad's reachable fall-through). A
+>   **re-raising** arm re-boxes a *fresh* copy of the error and diverges before the owner-release, so
+>   the original box is propagated (not freed) and the fresh copy is released at the next handler — no
+>   double-free, no leak. When every reachable arm diverges, the branch is flagged noreturn and no
+>   fall-through release is emitted. Balanced under **both** `Memory.ARC` and `Memory.Tracking`.
+>
+> - **`after` runs on every exit, including the divergent re-raise path.** `after` (finally) splices
+>   its statements before an arm's terminal `raise` on the divergent path and after the `if_expr` on
+>   the normal path — mutually exclusive at runtime, so `after` runs exactly once whether the `try`
+>   completes, a `rescue` arm yields a value, or a `rescue` arm re-raises/propagates. A `try`/`rescue`
+>   may itself appear *inside* an `after` block (its own nested landing pad), handled by the same
+>   machinery (`test/fixtures/try_rescue/nested_in_after.zap`).
+>
+> - **Arbitrary-depth nested `try`/`rescue`.** `try`/`rescue` nests to arbitrary depth in any position
+>   — the `try` body, a `rescue` arm body, an `after` block, and across function boundaries — with
+>   inner non-matching/re-raising arms propagating to the next enclosing handler. The dynamic unwind
+>   is the recoverable-raise side-channel + landing pads (not ZIR `noreturn` control flow): because a
+>   recoverable `raise` lowers to a *recoverable return* rather than a ZIR-noreturn terminator, the
+>   lowering classifies each arm's divergence by its **lowered tail**, which is what unblocked nesting
+>   (a naive noreturn assumption crashed the fork's Sema on nested struct-pattern re-raise).
+>   (`test/fixtures/try_rescue/nested_*`, `raise_cross_fn/three_deep.zap`.)
+>
+> The runtime type-discrimination (each arm's resolved error type matched against the boxed error,
+> with a no-match → re-stash → propagate path) closes the original Phase 3.a single-arm/first-arm
+> limitation: multi-arm typed and struct-pattern `rescue` now discriminate correctly and propagate on
+> no match.
+
 > **Phase 3.c implementation note (the `~>`→`rescue` migration is intentionally deferred).**
 > Phase 3.c delivered the `with` macro (Elixir-style multi-step `Result` composition, desugared to
 > nested `case` — see `ast.WithExpr` and `src/macro.zig:withToNestedCase`). The companion goal,
@@ -751,40 +801,58 @@ Elixir-aligned Zap; see Part II and decisions #3 and #6.)
 >   `test/fixtures/raise_cross_fn/effect_poly.zap`, `raises_complex_return.zap`). A pure body leaves
 >   the helper pure.
 >
-> **GAP 3 — ERT chain in the unhandled-raise crash report (root-caused; deferred).** The goal:
-> surface `@errorReturnTrace()` so a 3-deep unhandled `a→b→c` raise shows the propagation chain, not
-> just the `Kernel.abort_recoverable_raise` terminus the fresh abort-site backtrace captures. The
-> display path is fully designed and was prototyped (a fork `zir_builder_emit_error_return_trace`
-> C-ABI emitting the `error_return_trace` extended instruction; a `zap_stash_error_return_trace`
-> runtime thread-local sink emitted at the unhandled-recoverable-raise catch site; an
-> `emitErrorReturnTraceSection` in `runtime.zig`'s crash printer reusing `crashReportFrame`). The
-> **blocker is upstream of display:** the ERT is never populated. `@errorReturnTrace()` returns a
-> real cap-20 buffer but with `index == 0`. Root cause: Zap's `FuncBody.addReturnError` emits a plain
-> `error_value` + `ret_node` for `return error.ZapRaise`, whereas Zig's `return error.X` emits
-> `ret_err_value` — the only return form whose Sema/codegen records an error-return-trace frame.
-> Switching to `ret_err_value` is correct but **still left `index == 0`**: the per-frame push also
-> needs the AIR/codegen error-trace-frame recording to fire on the injected-ZIR path (the
-> function-entry `restore_err_ret_index_unconditional` prologue is emitted, but frames do not
-> accumulate). The prototype was reverted to avoid shipping an always-empty `raised, propagated
-> through:` section. **What's needed:** verify the script Compilation actually enables error tracing
-> for the injected ZIR (the `error_tracing`/`any_error_tracing` module flags), switch
-> `addReturnError` to `ret_err_value`, and confirm the fork's self-hosted/LLVM backend emits the
-> error-return-trace frame push for `ret_err_value` AIR — then the already-designed display path
-> drops in. This is a fork backend/codegen task, tracked for the Phase 4 unified-renderer work (which
-> generalizes the renderer across compile/runtime/**ERT**/leak anyway).
+> **GAP 3 — ERT chain in the unhandled-raise crash report (closed — Phase 4.a / #201).** The goal:
+> a 3-deep unhandled `a→b→c` raise shows the propagation chain, not just the
+> `Kernel.abort_recoverable_raise` terminus the fresh abort-site backtrace captures. An earlier
+> prototype tried to populate `@errorReturnTrace()` itself (switch `FuncBody.addReturnError` from a
+> plain `error_value`+`ret_node` to Zig's frame-recording `ret_err_value`, plus the AIR/codegen
+> error-trace-frame push on the injected-ZIR path); that route never populated the buffer
+> (`index == 0`) and was abandoned. **The shipped resolution does not depend on `@errorReturnTrace()`
+> at all:** the backtrace is captured at the **raise origin** — `Kernel.recoverable_raise` records the
+> full stack into the thread-local `current_error_return_trace` (with a companion
+> `current_error_return_trace_pending` flag) at the moment the error is stashed into the side-channel.
+> The unhandled terminus reads it via a **non-clearing** `peek_recoverable_raise`
+> (`abort_recoverable_raise/0`), so the abort path still has the origin chain; the recovered path uses
+> the clearing `take_recoverable_raise`, so a caught error does not bleed a stale chain into a later
+> report. `runtime.zig`'s `emitErrorReturnTraceSection` renders it under the `error return trace:`
+> header via the shared `crashReportFrame`. Verified live: `test/fixtures/raise_cross_fn/`
+> `unhandled_cross_fn.zap` (and `three_deep.zap`) print the propagation chain
+> (`Worker.deep/0 → script.main`) under the header. No fork-backend change was required.
 >
-> **Remaining effect-polymorphism sub-layer (documented): `Enum.map` with a raising *closure*.**
-> GAP 2b demonstrates effect-polymorphism through the for-comprehension (whose `__for_N` helper
-> invokes the raising callee via a **direct** call, which the existing direct-call propagation
-> handles). The literal `Enum.map(list, &raising/1)` routes the callback through `map_next`'s
-> `call_closure` (the callback is a polymorphic parameter — a runtime closure value). The closure
-> correctly emits `error{ZapRaise}!T`, but `ir.CallClosure` / `ir.ZigType` have **no error-union
-> representation**, so the combinator neither propagates nor unwraps the closure result
-> (`expected i64, found anyerror!i64`). Closing this needs the closure's effect modeled through the
-> IR: an effect bit on `Type.FunctionType` threaded by the monomorphizer onto the concrete callback
-> param, an error-union-aware `call_closure.return_type`, and a propagating unwrap at the
-> `call_closure` site (mark the combinator specialization raising). This is a deeper IR-type-system
-> change than the stated 2a/2b and is the natural next increment.
+> **Effect-polymorphism through `call_closure` (closed — #201).** GAP 2b demonstrated
+> effect-polymorphism through the for-comprehension, whose `__for_N` helper invokes the raising callee
+> via a **direct** call. The remaining sub-layer was the higher-order case: a raising **closure**
+> invoked through `call_closure` (`apply(f) { f() }`, `Enum.map`-style combinators) — the callback is
+> a polymorphic runtime closure value, and `ir.CallClosure` had no error-union representation, so the
+> combinator neither propagated nor unwrapped the closure result (`expected i64, found anyerror!i64`).
+> This is now **resolved by inference, with no new syntax**:
+>
+> - **The closure value's effect is part of its type.** A closure's `Type.FunctionType` carries its
+>   inferred `raises`, so a raising closure (`() -> i64 raises`) is a **distinct `TypeId`** from a pure
+>   one (`() -> i64`) under structural type equality. A closure value is a deferred computation: its
+>   body's `raise`s do **not** leak into the *constructing* function's effect row (returning or storing
+>   a raising closure does not make the enclosing function raise — only *invoking* it does), so the
+>   constructing function's inferred row is snapshotted/restored around closure inference.
+>
+> - **Higher-order functions specialize per-instance.** A function that *invokes* a closure parameter
+>   gets a fresh effect type variable on that parameter's declared `FunctionType`, making it a generic
+>   group; the existing monomorphizer (keyed on the bound type arguments) then splits the raising
+>   instance from the pure instance into distinct specializations. Each instance gets the correct
+>   `raises`: the raising instance returns `error{ZapRaise}!T` and its `call_closure` lowering emits an
+>   error-union unwrap (try/catch/abort by mode — exactly mirroring the direct-call path); the pure
+>   instance stays pure. A blanket "the higher-order fn always raises" is unsound (it would fire abort
+>   on the pure case) and is rejected.
+>
+> Verified end-to-end (`test/fixtures/raise_closure/`): `mixed_raising_and_pure` (same combinator
+> applied to a raising and a pure closure in one program — the two specializations coexist),
+> `transitive_closure_raise`, `pure_closure_no_spurious_raise` (no spurious effect on the pure path),
+> and `undischarged_flagged` (a raising closure whose effect is neither rescued nor declared is a
+> **type error** — the row stays checked).
+>
+> *(A separate, pre-existing general closure-value limitation is out of scope for the error system:
+> closures as first-class return values (`-> ( -> i64)`) or struct fields (`h.action()`) fail in
+> codegen — reproducible with pure closures, unrelated to effects. #201 targets closures invoked as
+> parameters through `call_closure`, which is complete.)*
 
 ### Phase 4 — Unified diagnostic renderer + leak subsystem
 
