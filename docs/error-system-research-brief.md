@@ -775,7 +775,7 @@ Elixir-aligned Zap; see Part II and decisions #3 and #6.)
 >   (`src/desugar.zig` `etaExpandFunctionRefArg`) now rewrites it into a forwarding anonymous function
 >   `fn(a..) { Struct.fn(a..) }`, copying the referenced clause's declared param/return type
 >   annotations resolved through the scope graph the desugarer holds. The synthetic closure
->   type-checks against a `(a -> b)` callback parameter and lowers through the proven anonymous-
+>   type-checks against a `fn(a) -> b` callback parameter and lowers through the proven anonymous-
 >   function/`closure_create` path; a `raises` row on the referenced function flows through the
 >   forwarded call. Reflective uses (a reference returned where `Function` is expected) are not call
 >   arguments and keep the struct shape. `Enum.map([1,2,3], &Doubler.double/1)` now type-checks and
@@ -850,7 +850,7 @@ Elixir-aligned Zap; see Part II and decisions #3 and #6.)
 > **type error** — the row stays checked).
 >
 > *(A separate, pre-existing general closure-value limitation is out of scope for the error system:
-> closures as first-class return values (`-> ( -> i64)`) or struct fields (`h.action()`) fail in
+> closures as first-class return values (`-> fn() -> i64`) or struct fields (`h.action()`) fail in
 > codegen — reproducible with pure closures, unrelated to effects. #201 targets closures invoked as
 > parameters through `call_closure`, which is complete.)*
 

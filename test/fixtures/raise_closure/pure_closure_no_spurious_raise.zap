@@ -3,7 +3,7 @@ pub struct Higher {
   # closure. apply's effect is polymorphic, NOT blanket-assumed: a pure
   # closure contributes no `raises`, so apply is not forced to raise and
   # the call site needs no `rescue`. No spurious raises requirement.
-  pub fn apply(f :: ( -> i64)) -> i64 {
+  pub fn apply(f :: fn() -> i64) -> i64 {
     f()
   }
 }

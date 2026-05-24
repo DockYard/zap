@@ -6,7 +6,7 @@ pub struct Direct {
   # a parameter). The raise propagates through `invoke` to its caller and is
   # caught by the enclosing `rescue`. `invoke`'s effect row is polymorphic
   # over its closure parameter's effect — inferred, no annotation.
-  pub fn invoke(f :: ( -> i64)) -> i64 {
+  pub fn invoke(f :: fn() -> i64) -> i64 {
     f()
   }
 }

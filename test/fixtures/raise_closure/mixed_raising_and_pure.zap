@@ -7,7 +7,7 @@ pub struct Mixed {
   # closure in one program. Each call site must resolve to a DISTINCT
   # monomorphized instance — the raising instance returns `error{ZapRaise}!T`
   # and propagates, the pure instance returns plain `T` and never raises.
-  pub fn apply(f :: ( -> i64)) -> i64 {
+  pub fn apply(f :: fn() -> i64) -> i64 {
     f()
   }
 }

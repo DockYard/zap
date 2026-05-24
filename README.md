@@ -407,11 +407,12 @@ Enum.map([1, 2, 3], fn(value :: i64) -> i64 {
 })
 ```
 
-Function type annotations use arrow syntax:
+Function type annotations mirror the closure literal with parameter names
+and body erased — `fn(param-types) -> return-type`:
 
 ```zap
-callback :: (i64 -> i64)
-reducer :: (i64, i64 -> i64)
+callback :: fn(i64) -> i64
+reducer :: fn(i64, i64) -> i64
 ```
 
 ### Pipes and Catch Basin

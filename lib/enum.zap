@@ -39,7 +39,7 @@ pub struct Enum {
         Enum.map(1..3, fn(x) { x * 2 })       # => [2, 4, 6]
     """
 
-  pub fn map(collection :: Enumerable(element), callback :: (element -> mapped)) -> [mapped] {
+  pub fn map(collection :: Enumerable(element), callback :: fn(element) -> mapped) -> [mapped] {
     List.reverse(map_next(collection, callback, []))
   }
 
@@ -52,7 +52,7 @@ pub struct Enum {
         Enum.filter(1..5, fn(x) { x > 3 })          # => [4, 5]
     """
 
-  pub fn filter(collection :: Enumerable(element), predicate :: (element -> Bool)) -> [element] {
+  pub fn filter(collection :: Enumerable(element), predicate :: fn(element) -> Bool) -> [element] {
     List.reverse(filter_next(collection, predicate, []))
   }
 
@@ -65,7 +65,7 @@ pub struct Enum {
         Enum.reject([1, 2, 3, 4], fn(x) { x > 2 })  # => [1, 2]
     """
 
-  pub fn reject(collection :: Enumerable(element), predicate :: (element -> Bool)) -> [element] {
+  pub fn reject(collection :: Enumerable(element), predicate :: fn(element) -> Bool) -> [element] {
     List.reverse(reject_next(collection, predicate, []))
   }
 
@@ -83,7 +83,7 @@ pub struct Enum {
         Enum.reduce(1..4, 0, fn(acc, x) { acc + x })       # => 10
     """
 
-  pub fn reduce(collection :: Enumerable(element), initial :: accumulator, callback :: (accumulator, element -> accumulator)) -> accumulator {
+  pub fn reduce(collection :: Enumerable(element), initial :: accumulator, callback :: fn(accumulator, element) -> accumulator) -> accumulator {
     reduce_next(collection, initial, callback)
   }
 
@@ -96,7 +96,7 @@ pub struct Enum {
         Enum.each([1, 2, 3], fn(x) { IO.puts(Integer.to_string(x)) })
     """
 
-  pub fn each(collection :: Enumerable(element), callback :: (element -> result)) -> Nil {
+  pub fn each(collection :: Enumerable(element), callback :: fn(element) -> result) -> Nil {
     each_next(collection, callback)
   }
 
@@ -110,7 +110,7 @@ pub struct Enum {
         Enum.find(1..2, 0, fn(x) { x > 10 })         # => 0
     """
 
-  pub fn find(collection :: Enumerable(element), default :: element, predicate :: (element -> Bool)) -> element {
+  pub fn find(collection :: Enumerable(element), default :: element, predicate :: fn(element) -> Bool) -> element {
     find_next(collection, default, predicate)
   }
 
@@ -123,7 +123,7 @@ pub struct Enum {
         Enum.any?(1..3, fn(x) { x > 10 })       # => false
     """
 
-  pub fn any?(collection :: Enumerable(element), predicate :: (element -> Bool)) -> Bool {
+  pub fn any?(collection :: Enumerable(element), predicate :: fn(element) -> Bool) -> Bool {
     any_next(collection, predicate)
   }
 
@@ -136,7 +136,7 @@ pub struct Enum {
         Enum.all?(1..3, fn(x) { x > 2 })        # => false
     """
 
-  pub fn all?(collection :: Enumerable(element), predicate :: (element -> Bool)) -> Bool {
+  pub fn all?(collection :: Enumerable(element), predicate :: fn(element) -> Bool) -> Bool {
     all_next(collection, predicate)
   }
 
@@ -148,7 +148,7 @@ pub struct Enum {
         Enum.count([1, 2, 3, 4, 5], fn(x) { x > 2 })  # => 3
     """
 
-  pub fn count(collection :: Enumerable(element), predicate :: (element -> Bool)) -> i64 {
+  pub fn count(collection :: Enumerable(element), predicate :: fn(element) -> Bool) -> i64 {
     count_next(collection, predicate, 0)
   }
 
@@ -243,7 +243,7 @@ pub struct Enum {
         Enum.sort(1..3, fn(a, b) { a > b })       # => [3, 2, 1]
     """
 
-  pub fn sort(collection :: Enumerable(element), comparator :: (element, element -> Bool)) -> [element] {
+  pub fn sort(collection :: Enumerable(element), comparator :: fn(element, element) -> Bool) -> [element] {
     sort_next(collection, comparator, [])
   }
 
@@ -257,7 +257,7 @@ pub struct Enum {
         # => [1, 10, 2, 20, 3, 30]
     """
 
-  pub fn flat_map(collection :: Enumerable(element), callback :: (element -> [mapped])) -> [mapped] {
+  pub fn flat_map(collection :: Enumerable(element), callback :: fn(element) -> [mapped]) -> [mapped] {
     List.reverse(flat_map_next(collection, callback, []))
   }
 
@@ -516,14 +516,14 @@ pub struct Enum {
     }
   }
 
-  fn map_next(state :: Enumerable(element), callback :: (element -> mapped), accumulator :: [mapped]) -> [mapped] {
+  fn map_next(state :: Enumerable(element), callback :: fn(element) -> mapped, accumulator :: [mapped]) -> [mapped] {
     case Enumerable.next(state) {
       {:done, _, _} -> accumulator
       {:cont, value, next_state} -> map_next(next_state, callback, List.prepend(accumulator, callback(value)))
     }
   }
 
-  fn filter_next(state :: Enumerable(element), predicate :: (element -> Bool), accumulator :: [element]) -> [element] {
+  fn filter_next(state :: Enumerable(element), predicate :: fn(element) -> Bool, accumulator :: [element]) -> [element] {
     case Enumerable.next(state) {
       {:done, _, _} -> accumulator
       {:cont, value, next_state} ->
@@ -535,7 +535,7 @@ pub struct Enum {
     }
   }
 
-  fn reject_next(state :: Enumerable(element), predicate :: (element -> Bool), accumulator :: [element]) -> [element] {
+  fn reject_next(state :: Enumerable(element), predicate :: fn(element) -> Bool, accumulator :: [element]) -> [element] {
     case Enumerable.next(state) {
       {:done, _, _} -> accumulator
       {:cont, value, next_state} ->
@@ -547,25 +547,25 @@ pub struct Enum {
     }
   }
 
-  fn reduce_next(state :: Enumerable(element), accumulator :: accumulator_type, callback :: (accumulator_type, element -> accumulator_type)) -> accumulator_type {
+  fn reduce_next(state :: Enumerable(element), accumulator :: accumulator_type, callback :: fn(accumulator_type, element) -> accumulator_type) -> accumulator_type {
     case Enumerable.next(state) {
       {:done, _, _} -> accumulator
       {:cont, value, next_state} -> reduce_next(next_state, callback(accumulator, value), callback)
     }
   }
 
-  fn each_next(state :: Enumerable(element), callback :: (element -> result)) -> Nil {
+  fn each_next(state :: Enumerable(element), callback :: fn(element) -> result) -> Nil {
     case Enumerable.next(state) {
       {:done, _, _} -> nil
       {:cont, value, next_state} -> each_continue(callback(value), next_state, callback)
     }
   }
 
-  fn each_continue(_ignored_result :: result, next_state :: Enumerable(element), callback :: (element -> result)) -> Nil {
+  fn each_continue(_ignored_result :: result, next_state :: Enumerable(element), callback :: fn(element) -> result) -> Nil {
     each_next(next_state, callback)
   }
 
-  fn count_next(state :: Enumerable(element), predicate :: (element -> Bool), total :: i64) -> i64 {
+  fn count_next(state :: Enumerable(element), predicate :: fn(element) -> Bool, total :: i64) -> i64 {
     case Enumerable.next(state) {
       {:done, _, _} -> total
       {:cont, value, next_state} ->
@@ -603,7 +603,7 @@ pub struct Enum {
     }
   }
 
-  fn find_next(state :: Enumerable(element), default :: element, predicate :: (element -> Bool)) -> element {
+  fn find_next(state :: Enumerable(element), default :: element, predicate :: fn(element) -> Bool) -> element {
     case Enumerable.next(state) {
       {:done, _, _} -> default
       {:cont, value, next_state} ->
@@ -615,7 +615,7 @@ pub struct Enum {
     }
   }
 
-  fn any_next(state :: Enumerable(element), predicate :: (element -> Bool)) -> Bool {
+  fn any_next(state :: Enumerable(element), predicate :: fn(element) -> Bool) -> Bool {
     case Enumerable.next(state) {
       {:done, _, _} -> false
       {:cont, value, next_state} ->
@@ -627,7 +627,7 @@ pub struct Enum {
     }
   }
 
-  fn all_next(state :: Enumerable(element), predicate :: (element -> Bool)) -> Bool {
+  fn all_next(state :: Enumerable(element), predicate :: fn(element) -> Bool) -> Bool {
     case Enumerable.next(state) {
       {:done, _, _} -> true
       {:cont, value, next_state} ->
@@ -671,18 +671,18 @@ pub struct Enum {
     }
   }
 
-  fn sort_next(state :: Enumerable(element), comparator :: (element, element -> Bool), sorted :: [element]) -> [element] {
+  fn sort_next(state :: Enumerable(element), comparator :: fn(element, element) -> Bool, sorted :: [element]) -> [element] {
     case Enumerable.next(state) {
       {:done, _, _} -> sorted
       {:cont, value, next_state} -> sort_next(next_state, comparator, insert_sorted(sorted, value, comparator))
     }
   }
 
-  fn insert_sorted([] :: [element], value :: element, comparator :: (element, element -> Bool)) -> [element] {
+  fn insert_sorted([] :: [element], value :: element, comparator :: fn(element, element) -> Bool) -> [element] {
     [value]
   }
 
-  fn insert_sorted([head | tail] :: [element], value :: element, comparator :: (element, element -> Bool)) -> [element] {
+  fn insert_sorted([head | tail] :: [element], value :: element, comparator :: fn(element, element) -> Bool) -> [element] {
     if comparator(value, head) {
       [value | [head | tail]]
     } else {
@@ -690,7 +690,7 @@ pub struct Enum {
     }
   }
 
-  fn flat_map_next(state :: Enumerable(element), callback :: (element -> [mapped]), accumulator :: [mapped]) -> [mapped] {
+  fn flat_map_next(state :: Enumerable(element), callback :: fn(element) -> [mapped], accumulator :: [mapped]) -> [mapped] {
     case Enumerable.next(state) {
       {:done, _, _} -> accumulator
       {:cont, value, next_state} -> flat_map_next(next_state, callback, prepend_each(callback(value), accumulator))

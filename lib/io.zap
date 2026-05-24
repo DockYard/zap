@@ -132,7 +132,7 @@ pub struct IO {
         })
     """
 
-  pub fn mode(mode_value :: IO.Mode, callback :: ( -> result)) -> result {
+  pub fn mode(mode_value :: IO.Mode, callback :: fn() -> result) -> result {
     :zig.IO.set_terminal_mode(mode_value)
     result = callback()
     :zig.IO.set_terminal_mode(IO.Mode.Normal)

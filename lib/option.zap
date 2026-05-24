@@ -99,7 +99,7 @@ pub struct Option {
         # => Option(i64).None
     """
 
-  pub fn map(opt :: Option(value), f :: (value -> mapped)) -> Option(mapped) {
+  pub fn map(opt :: Option(value), f :: fn(value) -> mapped) -> Option(mapped) {
     case opt {
       Option.Some(payload) -> Option.Some(f(payload))
       Option.None -> Option.None
@@ -124,7 +124,7 @@ pub struct Option {
         # => Option(i64).None
     """
 
-  pub fn and_then(opt :: Option(value), f :: (value -> Option(mapped))) -> Option(mapped) {
+  pub fn and_then(opt :: Option(value), f :: fn(value) -> Option(mapped)) -> Option(mapped) {
     case opt {
       Option.Some(payload) -> f(payload)
       Option.None -> Option.None

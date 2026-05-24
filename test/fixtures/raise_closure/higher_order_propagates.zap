@@ -6,7 +6,7 @@ pub struct Higher {
   # call_closure. apply/1 is effect-polymorphic by inference — invoking it
   # with a raising closure surfaces that closure's `raises` at apply's call
   # site, where the enclosing `rescue` discharges it.
-  pub fn apply(f :: ( -> i64)) -> i64 {
+  pub fn apply(f :: fn() -> i64) -> i64 {
     f()
   }
 }

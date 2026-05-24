@@ -135,7 +135,7 @@ pub struct Result {
         # => Result(i64, ParseError).Error(err)
     """
 
-  pub fn map(r :: Result(value, err), f :: (value -> mapped)) -> Result(mapped, err) {
+  pub fn map(r :: Result(value, err), f :: fn(value) -> mapped) -> Result(mapped, err) {
     case r {
       Result.Ok(payload) -> Result.Ok(f(payload))
       Result.Error(reason) -> Result.Error(reason)
@@ -156,7 +156,7 @@ pub struct Result {
         # => Result(i64, WrappedError).Error(WrappedError.wrap(parse_err))
     """
 
-  pub fn map_error(r :: Result(value, err), f :: (err -> mapped_err)) -> Result(value, mapped_err) {
+  pub fn map_error(r :: Result(value, err), f :: fn(err) -> mapped_err) -> Result(value, mapped_err) {
     case r {
       Result.Ok(payload) -> Result.Ok(payload)
       Result.Error(reason) -> Result.Error(f(reason))
@@ -185,7 +185,7 @@ pub struct Result {
         # => Result(i64, ParseError).Error(err)
     """
 
-  pub fn and_then(r :: Result(value, err), f :: (value -> Result(mapped, err))) -> Result(mapped, err) {
+  pub fn and_then(r :: Result(value, err), f :: fn(value) -> Result(mapped, err)) -> Result(mapped, err) {
     case r {
       Result.Ok(payload) -> f(payload)
       Result.Error(reason) -> Result.Error(reason)

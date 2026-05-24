@@ -95,7 +95,7 @@ pub struct ProtocolTest {
     }
   }
 
-  fn apply_fn(value :: i64, callback :: (i64 -> i64)) -> i64 {
+  fn apply_fn(value :: i64, callback :: fn(i64) -> i64) -> i64 {
     callback(value)
   }
 

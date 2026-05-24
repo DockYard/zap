@@ -2,7 +2,7 @@
 pub error BoomError {}
 
 pub struct Higher {
-  pub fn apply(f :: ( -> i64)) -> i64 {
+  pub fn apply(f :: fn() -> i64) -> i64 {
     f()
   }
 

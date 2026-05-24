@@ -7,11 +7,11 @@ pub struct Transitive {
   # raises. The effect must propagate transitively: the wrapper closure is
   # itself raising (because it invokes a raising closure), so `apply`'s
   # instance is raising too, and the raise surfaces at apply's call site.
-  pub fn apply(f :: ( -> i64)) -> i64 {
+  pub fn apply(f :: fn() -> i64) -> i64 {
     f()
   }
 
-  pub fn call_inner(g :: ( -> i64)) -> i64 {
+  pub fn call_inner(g :: fn() -> i64) -> i64 {
     g()
   }
 }

@@ -151,7 +151,7 @@ Enum.filter([1, 2, 3, 4], fn(x :: i64) -> Bool { x > 2 })
 Enum.reduce([1, 2, 3], 0, fn(acc :: i64, x :: i64) -> i64 { acc + x })
 ```
 
-Function type syntax: `callback :: (i64 -> i64)`, `predicate :: (i64 -> Bool)`.
+Function type syntax: `callback :: fn(i64) -> i64`, `predicate :: fn(i64) -> Bool`.
 
 ### Case Expressions
 
@@ -533,7 +533,7 @@ Zap has a protocol system similar to Elixir protocols or Rust traits. It enables
 ```zap
 # lib/enumerable.zap
 pub protocol Enumerable {
-  fn reduce(collection, accumulator, callback :: (accumulator, member -> {Atom, accumulator})) -> {Atom, accumulator}
+  fn reduce(collection, accumulator, callback :: fn(accumulator, member) -> {Atom, accumulator}) -> {Atom, accumulator}
 }
 ```
 

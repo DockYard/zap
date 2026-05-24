@@ -183,7 +183,7 @@ pub struct List {
     Transforms each element with `callback`.
     """
 
-  pub fn map(list :: List(t), callback :: (t -> mapped)) -> List(mapped) {
+  pub fn map(list :: List(t), callback :: fn(t) -> mapped) -> List(mapped) {
     map_walk(list, callback, 0, List.length(list), List.new_empty(List.length(list)))
   }
 
@@ -191,7 +191,7 @@ pub struct List {
     Keeps elements for which `predicate` returns true.
     """
 
-  pub fn filter(list :: List(t), predicate :: (t -> Bool)) -> List(t) {
+  pub fn filter(list :: List(t), predicate :: fn(t) -> Bool) -> List(t) {
     filter_walk(list, predicate, 0, List.length(list), List.new_empty(List.length(list)))
   }
 
@@ -199,7 +199,7 @@ pub struct List {
     Folds the list from left to right.
     """
 
-  pub fn reduce(list :: List(t), initial :: accumulator, callback :: (accumulator, t -> accumulator)) -> accumulator {
+  pub fn reduce(list :: List(t), initial :: accumulator, callback :: fn(accumulator, t) -> accumulator) -> accumulator {
     reduce_walk(list, callback, 0, List.length(list), initial)
   }
 
@@ -239,7 +239,7 @@ pub struct List {
     }
   }
 
-  fn map_walk(list :: List(t), callback :: (t -> mapped), index :: i64, total :: i64, accumulator :: List(mapped)) -> List(mapped) {
+  fn map_walk(list :: List(t), callback :: fn(t) -> mapped, index :: i64, total :: i64, accumulator :: List(mapped)) -> List(mapped) {
     if index < total {
       map_walk(list, callback, index + 1, total, List.push(accumulator, callback(List.get(list, index))))
     } else {
@@ -247,7 +247,7 @@ pub struct List {
     }
   }
 
-  fn filter_walk(list :: List(t), predicate :: (t -> Bool), index :: i64, total :: i64, accumulator :: List(t)) -> List(t) {
+  fn filter_walk(list :: List(t), predicate :: fn(t) -> Bool, index :: i64, total :: i64, accumulator :: List(t)) -> List(t) {
     if index < total {
       value = List.get(list, index)
       next_accumulator = if predicate(value) {
@@ -261,7 +261,7 @@ pub struct List {
     }
   }
 
-  fn reduce_walk(list :: List(t), callback :: (accumulator, t -> accumulator), index :: i64, total :: i64, current :: accumulator) -> accumulator {
+  fn reduce_walk(list :: List(t), callback :: fn(accumulator, t) -> accumulator, index :: i64, total :: i64, current :: accumulator) -> accumulator {
     if index < total {
       reduce_walk(list, callback, index + 1, total, callback(current, List.get(list, index)))
     } else {

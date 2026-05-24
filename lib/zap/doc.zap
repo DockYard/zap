@@ -1243,7 +1243,7 @@ pub struct Zap.Doc {
 
   @doc = """
     Split a comma-separated string at top-level commas, respecting
-    paren/bracket/brace depth. Parameters like `f :: (i64, i64) -> i64`
+    paren/bracket/brace depth. Parameters like `f :: fn(i64, i64) -> i64`
     stay grouped because the comma inside the function type sits at
     depth > 0.
     """

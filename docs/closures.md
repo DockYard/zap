@@ -25,7 +25,7 @@ Struct-qualified function reference:
 
 ```zap
 pub struct Demo {
-  pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
+  pub fn apply(x :: i64, f :: fn(i64) -> i64) -> i64 {
     f(x)
   }
 
@@ -77,7 +77,7 @@ Function values use ordinary function types.
 
 ```zap
 pub struct Demo {
-  pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
+  pub fn apply(x :: i64, f :: fn(i64) -> i64) -> i64 {
     f(x)
   }
 
@@ -142,7 +142,7 @@ Invalid:
 
 ```zap
 pub struct Demo {
-  pub fn run(x :: borrowed String) -> (String -> String) {
+  pub fn run(x :: borrowed String) -> fn(String) -> String {
     fn(y :: String) -> String {
       x <> y
     }

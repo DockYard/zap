@@ -43,11 +43,11 @@ pub struct ClosureTest {
     x * y
   }
 
-  fn apply(value :: i64, callback :: (i64 -> i64)) -> i64 {
+  fn apply(value :: i64, callback :: fn(i64) -> i64) -> i64 {
     callback(value)
   }
 
-  fn apply_twice(value :: i64, callback :: (i64 -> i64)) -> i64 {
+  fn apply_twice(value :: i64, callback :: fn(i64) -> i64) -> i64 {
     callback(callback(value))
   }
 
@@ -65,7 +65,7 @@ pub struct ClosureTest {
     wrap_call(fn() -> i64 { 42 })
   }
 
-  fn wrap_call(callback :: ( -> i64)) -> i64 {
+  fn wrap_call(callback :: fn() -> i64) -> i64 {
     callback()
   }
 

@@ -436,7 +436,7 @@ empty input lines — the two are not distinguished).
 pub fn map, filter, reduce, sort, each, count, any?, all?, find, …
 
 pub fn sort(collection :: Enumerable(element),
-            comparator :: (element, element -> Bool)) -> [element]
+            comparator :: fn(element, element) -> Bool) -> [element]
 ```
 
 `sort` takes a comparator function value (closure). Internally
