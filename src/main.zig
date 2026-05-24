@@ -5805,6 +5805,34 @@ fn compileProjectFrontend(
         for (graph_order) |struct_name| {
             names.append(alloc, struct_name) catch {};
         }
+        // The precomputed `struct_order` is the discovery-time topological
+        // ordering of the SOURCE structs. Structs that only exist after
+        // desugaring — notably the `pub struct Foo` every `pub error Foo`
+        // rewrite produces — are absent from it because discovery ran
+        // before `applyErrorDeclDesugar`. They ARE present in
+        // `ctx.struct_programs` (built from the fully desugared programs).
+        // Compiling only `struct_order` silently drops these structs from
+        // the per-struct compile, so their `pub impl Error` method bodies
+        // (`TimeoutError.message`, …) are never lowered: a call to
+        // `Error.message(e)` then resolves against a `TimeoutError` module
+        // that exports no `message`, surfacing as "struct 'TimeoutError'
+        // has no member named 'message'". Append every collected struct
+        // program missing from the precomputed order so the compilation
+        // set is the union of the discovery order and the actually
+        // collected structs. This mirrors the daemon/incremental path in
+        // `compiler.buildIncremental` (the #186 fix); the per-struct loops
+        // downstream dedup by name, so appending an already-present name
+        // is harmless.
+        for (ctx.struct_programs) |mp| {
+            var already_ordered = false;
+            for (names.items) |existing| {
+                if (std.mem.eql(u8, existing, mp.name)) {
+                    already_ordered = true;
+                    break;
+                }
+            }
+            if (!already_ordered) names.append(alloc, mp.name) catch {};
+        }
     } else {
         for (ctx.struct_programs) |mp| {
             names.append(alloc, mp.name) catch {};

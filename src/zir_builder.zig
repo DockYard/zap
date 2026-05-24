@@ -6424,23 +6424,35 @@ pub const ZirDriver = struct {
                                 if (ref == error_ref) return error.EmitFailed;
                                 try self.setLocal(cb.dest, ref);
                             }
-                        } else if (self.findStructDef(runtime_mod) != null) {
-                            // `runtime_mod` names a user-defined struct, not a
-                            // runtime module. This reaches the `call_builtin`
-                            // path when a protocol-method call on a concrete
-                            // receiver — e.g. `Error.message(e)` where
-                            // `e :: TimeoutError` — was devirtualized to the
-                            // concrete impl `TimeoutError.message` but the
+                        } else if (self.findStructDef(runtime_mod) != null and !self.currentStructMatches(runtime_mod)) {
+                            // `runtime_mod` names a user-defined struct (not a
+                            // runtime module) AND the call crosses out of the
+                            // struct currently being emitted. This reaches the
+                            // `call_builtin` path when a protocol-method call
+                            // on a concrete receiver — e.g. `Error.message(e)`
+                            // where `e :: TimeoutError` — was devirtualized to
+                            // the concrete impl `TimeoutError.message`, but the
                             // method's owning module is a separate per-struct
                             // emission (the `impl Error for TimeoutError`
                             // methods live in `TimeoutError`'s own ZIR file,
                             // not the caller's). Routing through
                             // `@import("zap_runtime").TimeoutError.message`
-                            // would fail Sema with `zap_runtime has no member
-                            // named TimeoutError` because the runtime namespace
-                            // owns no user types. Instead reach the method on
-                            // its real module via the file-IS-struct import,
-                            // exactly as a regular cross-struct call would.
+                            // fails Sema with `zap_runtime has no member named
+                            // TimeoutError` because the runtime namespace owns
+                            // no user types. Reach the method on its real
+                            // module via the file-IS-struct import, exactly as
+                            // a regular cross-struct call would.
+                            //
+                            // The `!currentStructMatches` guard is essential:
+                            // a struct's OWN `:zig.<Self>.method` body bridge
+                            // (e.g. `lib/range.zap`'s `:zig.Range.reverse`
+                            // inside `Range`, or `:zig.Atom.to_string` inside
+                            // `Atom`) targets the RUNTIME implementation, not
+                            // the Zap module — and emitting `@import("Range")`
+                            // from within `Range`'s own emission would be an
+                            // illegal self-import (`no module named 'Range'
+                            // within module 'Range'`). Those self-bridges keep
+                            // the runtime path below.
                             const ref = try self.emitCrossStructCall(runtime_mod, func_name, args.items);
                             if (ref == error_ref) return error.EmitFailed;
                             try self.setLocal(cb.dest, ref);
