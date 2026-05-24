@@ -1038,122 +1038,6 @@ fn arcGetCapabilityDesc(
     return null;
 }
 
-// ---------------------------------------------------------------------------
-// Phase 4.d — ARC reference-cycle candidate (purple) buffer.
-//
-// Bacon–Rajan: a `release` decrement that leaves a POSITIVE refcount makes the
-// object a *possible cycle root* (it lost a reference but is still alive). Such
-// objects are buffered here; the runtime drains the buffer at deinit and runs
-// trial-deletion over it (the engine + report live in the runtime —
-// `src/runtime.zig` / the `src/memory/cycle_detector.zig` reference). A
-// decrement-to-ZERO buffers NOTHING (the object is being torn down on the spot
-// — the common Perceus path), so the hot release path pays nothing for
-// cycle-free programs. This is the HARD zero-cost requirement, and it is
-// satisfied structurally: `recordCycleCandidate` is invoked ONLY from the
-// `else` (prev > 1) arm of each release path, and the entire mechanism is
-// comptime-gated by `CYCLE_CHECK_ENABLED` below.
-//
-// ## Activation (zero cost by default)
-//
-// `CYCLE_CHECK_ENABLED` defaults to `false`, so under a normal `Memory.ARC`
-// build every `recordCycleCandidate` call site folds away to nothing — no
-// buffer storage, no branch, byte-identical to the pre-4.d release path. The
-// `-Denable-cycle-check` build flag flips it on (the build pipeline rewrites
-// the `CYCLE_CHECK_DEFAULT` marker below, the same mechanism `instrument_map`
-// uses for the runtime — wiring tracked in Phase-4 gap #207, since this
-// self-contained manager object has no `build_options` import).
-//
-// NOTE: cycles are not constructible from today's fully-immutable Zap (no field
-// mutation / `Ref` / `weak`), so this buffer has nothing to capture until Phase
-// 5. It is preemptive infrastructure placed at the architecturally-correct hook
-// site; the engine that consumes it is fully unit-tested (cycle_detector.zig).
-//
-// ## Phase-4 gap #231 — the two remaining pieces (deliberately routed to Phase 5)
-//
-// For `-Denable-cycle-check` to actually run trial-deletion over THIS buffer at
-// deinit (as opposed to the Tracking live-set, which the runtime already
-// drains via `runCycleDetectionAndReport`), exactly two pieces remain:
-//
-//   1. BUILD-LITERAL REWRITE. The build pipeline must rewrite the
-//      `CYCLE_CHECK_DEFAULT` literal below to `true` under `-Denable-cycle-check`,
-//      mirroring how `build_options.instrument_map` is threaded for the runtime.
-//      This self-contained manager TU (std + builtin only) has no
-//      `build_options` import, so the gate cannot read the flag directly — it
-//      must be a source-literal rewrite at build time, like the `instrument_map`
-//      marker pattern.
-//
-//   2. RUNTIME DRAIN SINK. A deinit-time consumer in `src/runtime.zig` must read
-//      `cycle_candidate_buffer.roots[0..len]` and feed those raw pointers as the
-//      candidate roots of the runtime `CycleEngine` (looking each up in
-//      `cycle_registry` for its size/walk/type, exactly as the Tracking path
-//      does). Because the manager cannot import the runtime, this is a
-//      manager→runtime channel: either an exported accessor the runtime calls by
-//      name (the `setLeakReportSink`/`annotateAllocation` optional-interface
-//      pattern Phase 4.c already uses) or a runtime-installed drain callback.
-//
-// WHY PHASE 5, NOT NOW (the #231 decision):
-//   * Nothing to detect. A reference cycle is STRUCTURALLY impossible to build
-//     from today's immutable surface — every `%Node{next: Some(other)}` needs
-//     `other` to pre-exist, so allocations only point at strictly-older
-//     allocations and the loop can never close. The buffer is provably empty at
-//     deinit, so the drain would be an unfireable, untestable code path (no
-//     `.zap` fixture can exercise it).
-//   * Not low-risk. The drain dereferences each candidate's ARC-child fields via
-//     the deep-walk at deinit — the SAME deref hazard the runtime's Tracking
-//     auto-walk is gated behind (a boxed `cause :: Option(Error)` subtree may be
-//     partially torn down at deinit; see `runtime.zig` `resolveCycleCheckRuntime`).
-//     Adding it now buys nothing and inherits that hazard.
-//   * It pairs naturally with Phase 5. Mutation + `weak`/`unowned` + the
-//     ARC-cycle FIX make cycles real, the drain testable, and the deref provably
-//     safe — all at once. Wiring the drain only when there is something to drain,
-//     a way to test it, and a safety guarantee is the correct sequencing.
-
-/// Source-level default for the ARC cycle-check gate. The build pipeline
-/// rewrites this literal (marker: `CYCLE_CHECK_DEFAULT`) when the toolchain is
-/// built with `-Denable-cycle-check`, mirroring the runtime `instrument_map`
-/// pattern. `false` ⇒ the purple buffer + every hook fold away at comptime.
-const CYCLE_CHECK_DEFAULT: bool = false;
-
-const CYCLE_CHECK_ENABLED: bool = CYCLE_CHECK_DEFAULT;
-
-/// Fixed-capacity, lock-free-append purple candidate buffer. Stores raw object
-/// pointers (`@intFromPtr`); per-object descriptors (size / walk / type) are
-/// looked up at drain time from the runtime's alloc-time registry, because
-/// release sites are type-erased. Only carries storage when the gate is on.
-const CycleCandidateBuffer = if (CYCLE_CHECK_ENABLED) struct {
-    const CAPACITY: usize = 8192;
-    roots: [CAPACITY]usize = undefined,
-    len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-
-    fn record(self: *CycleCandidateBuffer, object: *anyopaque) void {
-        // Reserve a slot with a relaxed fetch-add; drop past capacity (the
-        // drain-time live-set walk still finds every survivor, so dropping a
-        // redundant root only risks missing a cycle whose ONLY root
-        // overflowed — acceptable for a diagnostic).
-        const idx = self.len.fetchAdd(1, .monotonic);
-        if (idx >= CAPACITY) {
-            _ = self.len.fetchSub(1, .monotonic);
-            return;
-        }
-        self.roots[idx] = @intFromPtr(object);
-    }
-} else struct {};
-
-var cycle_candidate_buffer: CycleCandidateBuffer = .{};
-
-/// Record an object whose release left a POSITIVE refcount as a possible cycle
-/// root. Inlined and comptime-elided to NOTHING when the gate is off, so the
-/// decrement-to-zero hot path is untouched (this is only ever called from the
-/// `prev > 1` arm). `prev` is the pre-decrement count the caller already holds.
-inline fn recordCycleCandidate(prev: u32, object: *anyopaque) void {
-    if (comptime !CYCLE_CHECK_ENABLED) return;
-    // Defensive: only a decrement that LEFT a positive count is a candidate.
-    // The single call site already guarantees `prev > 1`; assert it so a
-    // future caller cannot violate the zero-hot-path invariant unnoticed.
-    std.debug.assert(prev > 1);
-    cycle_candidate_buffer.record(object);
-}
-
 /// REFCOUNT_V1 `retain` (spec §8). Atomic increment on the 4-byte
 /// refcount at offset 0 of an inline-header cell. Used by Map/List/
 /// MapIter. `.monotonic` ordering — see the ordering policy comment
@@ -1180,10 +1064,6 @@ fn arcRelease(
     std.debug.assert(prev > 0);
     if (prev == 1) {
         if (deep_walk) |walk| walk(object);
-    } else {
-        // Phase 4.d: decrement left a positive count — possible cycle root.
-        // Comptime-elided when cycle-check is off (zero hot-path cost).
-        recordCycleCandidate(prev, object);
     }
 }
 
@@ -1270,9 +1150,6 @@ fn arcReleaseSized(
         if (deep_walk) |walk| walk(object);
         const byte_ptr: [*]u8 = @ptrCast(object);
         largeFree(byte_ptr);
-    } else {
-        // Phase 4.d: decrement left a positive count — possible cycle root.
-        recordCycleCandidate(prev, object);
     }
 }
 
@@ -1299,9 +1176,6 @@ inline fn releaseSlabClass(
         // guarantees the slot's bytes are still valid at this point.
         if (deep_walk) |walk| walk(object);
         slabFreeSlot(slab_pool, slab, slot_index);
-    } else {
-        // Phase 4.d: decrement left a positive count — possible cycle root.
-        recordCycleCandidate(prev, object);
     }
 }
 
@@ -1539,14 +1413,4 @@ test "ARC class-specialized helpers interoperate with generic sized refcount slo
     try std.testing.expectEqual(@as(u32, 1), refcountSizedClass(ctx, slot_ptr, class_index));
 
     releaseSized(ctx, slot_ptr, @sizeOf(Payload), @alignOf(Payload), null);
-}
-
-test "Phase 4.d: cycle-check default-off carries ZERO purple-buffer storage (zero hot-path cost)" {
-    // The HARD zero-cost requirement: a default `Memory.ARC` build (cycle-check
-    // off) must not pay anything for the cycle detector. With the gate off the
-    // candidate buffer collapses to a zero-sized empty struct — no storage, and
-    // every `recordCycleCandidate` call site comptime-folds to nothing, leaving
-    // the release-to-zero hot path byte-identical to the pre-4.d release path.
-    try std.testing.expectEqual(false, CYCLE_CHECK_ENABLED);
-    try std.testing.expectEqual(@as(usize, 0), @sizeOf(CycleCandidateBuffer));
 }

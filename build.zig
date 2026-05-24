@@ -149,22 +149,6 @@ pub fn build(b: *std.Build) void {
     const run_error_format_drift_tests = b.addRunArtifact(error_format_drift_tests);
     test_step.dependOn(&run_error_format_drift_tests.step);
 
-    // Phase 4.d cycle detector: the trial-deletion algorithm + `domain=cycle`
-    // report reference (`src/memory/cycle_detector.zig`) and its production
-    // mirror in `src/runtime.zig` cannot share a Zig `@import` (runtime.zig is
-    // injected standalone). This test reads both as text and fails the build if
-    // the externally-observable report strings or the zero-hot-path purple-buffer
-    // rule drift apart between the tested reference and the runtime copy.
-    const cycle_detector_drift_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/cycle_detector_drift_test.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_cycle_detector_drift_tests = b.addRunArtifact(cycle_detector_drift_tests);
-    test_step.dependOn(&run_cycle_detector_drift_tests.step);
-
     // -----------------------------------------------------------------------
     // Dependency paths
     // -----------------------------------------------------------------------

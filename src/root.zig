@@ -137,12 +137,6 @@ test {
     _ = @import("memory/abi.zig");
     _ = @import("memory/driver.zig");
     _ = @import("memory/elision.zig");
-    // Phase 4.d — Bacon–Rajan trial-deletion cycle detector. Carries
-    // runtime-level unit tests that assemble cyclic `ArcHeader`-style
-    // object graphs directly and drive the engine (cycles are not
-    // user-constructible from today's immutable Zap; see the module
-    // header). Imported here so those tests run under `zig build test`.
-    _ = @import("memory/cycle_detector.zig");
     // The tracking manager carries inline behavioural tests for canary
     // detection, leak reporting, invalid-free, and size/alignment
     // mismatch. The integration tests in `memory/driver.zig` validate
