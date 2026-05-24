@@ -4,11 +4,11 @@
   payload of type `e`.
 
   `Result(t, e)` is the canonical type for functions that can fail
-  in a recoverable way. Pair it with the postfix `?` propagation
-  operator (Phase 1.3) to short-circuit `Error(e)` up the call
-  stack, with `raise` (Phase 1.4) for ad-hoc error construction,
-  and with the helpers below to compose `Result`-returning
-  pipelines without nested `case` expressions.
+  in a recoverable way. Pair it with the `with` expression to chain
+  several `Result`-returning steps and short-circuit on the first
+  `Error(e)`, with `raise` for ad-hoc error construction, and with
+  the helpers below to compose `Result`-returning pipelines without
+  nested `case` expressions.
 
   ## Examples
 
@@ -24,8 +24,8 @@
   pattern matching and runtime variant identity) paired with a
   same-name `pub struct` that hosts the helper functions
   (`Result.is_ok?/1`, `Result.map/2`, …). Phase 1.1.5 round 2
-  introduced this idiom; Phase 1.3's `?` operator and the
-  upcoming Phase 1.4 `~>` rewrite both rely on it.
+  introduced this idiom; the `with` expression and the `~>`
+  rewrite both rely on it.
   """
 
 pub union Result(t, e) {
