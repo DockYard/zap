@@ -4588,9 +4588,79 @@ fn appendImmediateProjectZapFiles(
     } else |_| {}
 }
 
+/// Strip a leading `./` (or repeated `././`) and any leading slash from a
+/// path so two paths can be compared on equal footing regardless of whether
+/// the caller addressed them relative to cwd or as a bare project-relative
+/// path. Mirrors the normalization `zap.glob.match` applies internally.
+fn normalizeRelativePathForMatch(path: []const u8) []const u8 {
+    var rest = path;
+    while (std.mem.startsWith(u8, rest, "./")) rest = rest[2..];
+    if (std.mem.eql(u8, rest, ".")) rest = rest[1..];
+    while (rest.len > 0 and rest[0] == '/') rest = rest[1..];
+    return rest;
+}
+
+/// Decide whether a `.zap` file discovered under a PROJECT source root falls
+/// within the manifest's declared `paths` globs.
+///
+/// The supplementary protocol/impl scan (`appendProtocolAndImplSourceFiles`)
+/// walks every `.zap` file under the project's recursive roots so that
+/// protocols and impls are globally visible to monomorphization and vtable
+/// population — even when they are not reachable through the entry point's
+/// import graph. Left unconstrained, that walk over-collects: `test/` holds
+/// script-mode subprocess fixtures (top-level `fn main`, `try`/`rescue`,
+/// `@code`) that the integration suite runs as standalone `zap run`
+/// processes, and those are illegal at project-mode top level. The manifest
+/// already states the real corpus via `paths` (e.g. `test/**/*_test.zap`),
+/// so the supplementary scan must honor that same contract for the project
+/// root rather than compiling every file under it.
+///
+/// When the manifest declares no `paths` at all, there is no explicit scope
+/// to honor, so every project file is contributed (the historical behavior),
+/// keeping protocols/impls visible for manifests that rely purely on
+/// import-graph discovery. Dependency and stdlib roots are NEVER filtered by
+/// this rule — a library's protocols/impls are governed by the library, not
+/// by the consuming project's `paths`.
+fn projectSourceFileMatchesManifestPaths(
+    alloc: std.mem.Allocator,
+    manifest_paths: []const []const u8,
+    project_root: []const u8,
+    file_path: []const u8,
+) !bool {
+    if (manifest_paths.len == 0) return true;
+
+    const normalized_root = normalizeRelativePathForMatch(project_root);
+    const normalized_file = normalizeRelativePathForMatch(file_path);
+
+    _ = alloc;
+
+    // Reduce the file path to a project-relative path so it can be matched
+    // against the manifest globs, which are themselves project-relative.
+    // Every candidate reaches this function via a source root that was
+    // produced by joining `project_root` with a subdirectory, so the file
+    // always shares the project-root prefix; the non-prefixed branch is a
+    // defensive fallback that matches against the full normalized path.
+    const relative_file = blk: {
+        if (normalized_root.len == 0) break :blk normalized_file;
+        if (std.mem.startsWith(u8, normalized_file, normalized_root)) {
+            const after_root = normalized_file[normalized_root.len..];
+            if (after_root.len > 0 and after_root[0] == '/') break :blk after_root[1..];
+            if (after_root.len == 0) break :blk after_root;
+        }
+        break :blk normalized_file;
+    };
+
+    for (manifest_paths) |pattern| {
+        if (zap.glob.match(pattern, relative_file)) return true;
+    }
+    return false;
+}
+
 fn appendProtocolAndImplSourceFiles(
     alloc: std.mem.Allocator,
     source_roots: []const zap.discovery.SourceRoot,
+    project_root: []const u8,
+    manifest_paths: []const []const u8,
     source_files: *std.ArrayListUnmanaged([]const u8),
 ) !void {
     var discovered = std.StringHashMap(void).init(alloc);
@@ -4599,11 +4669,27 @@ fn appendProtocolAndImplSourceFiles(
         try discovered.put(key, {});
     }
     for (source_roots) |root| {
+        const is_project_root = std.mem.eql(u8, root.name, "project");
         if (sourceRootShouldScanRecursively(root)) {
+            if (is_project_root) {
+                // Honor the manifest `paths` scope for the project's own
+                // recursive roots; dependency and stdlib roots scan fully.
+                var scanned: std.ArrayListUnmanaged([]const u8) = .empty;
+                var scanned_seen = std.StringHashMap(void).init(alloc);
+                try scanZapFilesRecursive(alloc, root.path, &scanned, &scanned_seen);
+                for (scanned.items) |candidate| {
+                    if (!try projectSourceFileMatchesManifestPaths(alloc, manifest_paths, project_root, candidate)) continue;
+                    const key = std.fs.path.resolve(alloc, &.{candidate}) catch candidate;
+                    if (discovered.contains(key)) continue;
+                    try discovered.put(key, {});
+                    try source_files.append(alloc, candidate);
+                }
+                continue;
+            }
             try scanZapFilesRecursive(alloc, root.path, source_files, &discovered);
             continue;
         }
-        if (std.mem.eql(u8, root.name, "project")) {
+        if (is_project_root) {
             try appendImmediateProjectZapFiles(alloc, root.path, source_files, &discovered);
         }
     }
@@ -4740,7 +4826,7 @@ fn discoverManifestSources(
         try source_files.append(alloc, file_path);
     }
 
-    try appendProtocolAndImplSourceFiles(alloc, source_roots, &source_files);
+    try appendProtocolAndImplSourceFiles(alloc, source_roots, project_root, config.paths, &source_files);
 
     var file_index: usize = 0;
     var struct_count: u32 = 0;
@@ -11925,6 +12011,74 @@ test "manifest source-root recursive scan policy covers protocol and impl roots"
     try testing.expect(sourceRootShouldScanRecursively(.{ .name = "dep:math", .path = "vendor/math" }));
     try testing.expect(sourceRootShouldScanRecursively(.{ .name = "zap_stdlib", .path = "stdlib" }));
     try testing.expect(!sourceRootShouldScanRecursively(.{ .name = "project", .path = "." }));
+}
+
+test "project source file honors manifest paths globs for the supplementary protocol/impl scan" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const project_root = "/work/project";
+    const manifest_paths = [_][]const u8{"test/**/*_test.zap"};
+
+    // A real Zest module under the manifest glob is in scope.
+    try testing.expect(try projectSourceFileMatchesManifestPaths(
+        allocator,
+        &manifest_paths,
+        project_root,
+        "/work/project/test/option_test.zap",
+    ));
+    // A nested real Zest module still matches `**`.
+    try testing.expect(try projectSourceFileMatchesManifestPaths(
+        allocator,
+        &manifest_paths,
+        project_root,
+        "/work/project/test/support/nested_test.zap",
+    ));
+    // A script-mode fixture (top-level `fn main`) is OUT of scope: it does
+    // not end in `_test.zap`, so the manifest glob never selects it. This is
+    // exactly the `test/fixtures/` over-collection the scan must exclude.
+    try testing.expect(!try projectSourceFileMatchesManifestPaths(
+        allocator,
+        &manifest_paths,
+        project_root,
+        "/work/project/test/fixtures/raise_cross_fn/cross_fn_catch.zap",
+    ));
+    // A non-test helper under `test/` that is not a `_test.zap` module is
+    // also excluded from the supplementary scan; real modules that need it
+    // pull it in through the explicit import graph instead.
+    try testing.expect(!try projectSourceFileMatchesManifestPaths(
+        allocator,
+        &manifest_paths,
+        project_root,
+        "/work/project/test/result_helper.zap",
+    ));
+    // Relative project roots (the live `zap test` invocation passes
+    // a relative "./test" path through the source roots) match identically.
+    try testing.expect(try projectSourceFileMatchesManifestPaths(
+        allocator,
+        &manifest_paths,
+        ".",
+        "./test/option_test.zap",
+    ));
+    try testing.expect(!try projectSourceFileMatchesManifestPaths(
+        allocator,
+        &manifest_paths,
+        ".",
+        "./test/fixtures/raise_cross_fn/cross_fn_catch.zap",
+    ));
+
+    // An empty manifest `paths` list means "no explicit scope" — the
+    // supplementary scan must fall back to contributing every project file
+    // so a manifest that relies purely on import-graph discovery keeps its
+    // protocols/impls globally visible.
+    const no_paths = [_][]const u8{};
+    try testing.expect(try projectSourceFileMatchesManifestPaths(
+        allocator,
+        &no_paths,
+        project_root,
+        "/work/project/test/fixtures/raise_cross_fn/cross_fn_catch.zap",
+    ));
 }
 
 // ---------------------------------------------------------------------------
