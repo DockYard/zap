@@ -6613,6 +6613,25 @@ pub const HirBuilder = struct {
             .call = .{ .meta = call.meta, .callee = new_callee, .args = call.args },
         });
         const lowered = try self.buildExpr(new_call);
+        // Ownership transfer into the side-channel. `Kernel.recoverable_raise`
+        // STASHES the boxed `Error` into the thread-local side-channel, where
+        // the enclosing `try` handler recovers it via `take_recoverable_raise`
+        // — so the box is CONSUMED by this call: its single owner moves into
+        // the side-channel and back out to the recovered box. Force the box
+        // argument's mode to `.move` so the IR builder transfers ownership
+        // (clearing the raising scope's scope-exit release) and the V7
+        // verifier sees a `.move` producer for the `.owned` slot that
+        // `arc_param_convention` promotes the wrapper to. Without this the box
+        // is dropped twice — once here, once via the recovered box — a
+        // double-free that crashes under `Memory.Tracking` (no refcounts) and
+        // is only masked by slab reuse under `Memory.ARC`. `applyCallArgModes`
+        // leaves the bare-`Error` parameter `.share` because the `:zig.`
+        // stash's ownership transfer is invisible to ownership inference; it
+        // is statically known here.
+        if (lowered.kind == .call and lowered.kind.call.args.len == 1) {
+            const stash_args = @constCast(lowered.kind.call.args);
+            stash_args[0].mode = .move;
+        }
         // Stamp the recoverable-raise call as `Never`-typed even though the
         // `Kernel.recoverable_raise` stdlib fn returns `Nil` at runtime. A
         // `raise` is a diverging terminator in the type system, so a

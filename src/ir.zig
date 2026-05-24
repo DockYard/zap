@@ -11110,8 +11110,24 @@ pub const IrBuilder = struct {
                         defer self.current_expected_type = saved_expected_type;
                         break :blk try self.lowerExpr(arg.expr);
                     };
+                    // A `.move` arg whose value will be auto-boxed into a
+                    // `ProtocolBox` (the target slot is `.protocol_box`) must
+                    // NOT move the pre-box concrete value here: that value is a
+                    // stack struct (`.trivial`), and moving it produces a
+                    // `.trivial` move dest that trips ARC verifier V11. The
+                    // OWNING value is the box, constructed below by
+                    // `maybeBoxAsProtocol`; the ownership transfer (`move_value`)
+                    // is emitted there, over the box local. So pass the raw
+                    // value through unchanged here and let the post-box move
+                    // carry the `.move` semantics.
+                    const arg_autoboxes = blk_box: {
+                        const tgt = self.callTargetExpectedType(call.target, call.args.len, arg_index) orelse arg.expected_type;
+                        if (tgt == types_mod.TypeStore.UNKNOWN or tgt == types_mod.TypeStore.ERROR) break :blk_box false;
+                        break :blk_box typeIdToZigTypeWithStore(tgt, self.type_store) == .protocol_box;
+                    };
                     const lowered_arg = switch (arg.mode) {
                         .move => blk: {
+                            if (arg_autoboxes) break :blk arg_local;
                             const moved_local = self.next_local;
                             self.next_local += 1;
                             try self.current_instrs.append(self.allocator, .{ .move_value = .{ .dest = moved_local, .source = arg_local } });
@@ -11266,6 +11282,44 @@ pub const IrBuilder = struct {
                         if (expected_zig_type != .protocol_box) continue;
                         const boxed = try self.maybeBoxAsProtocol(args.items[i], expected_zig_type);
                         args.items[i] = boxed;
+                        // Ownership transfer of a freshly-boxed `.move` argument.
+                        // The `.move`/`.share`/`.borrow` arg-shape branch above
+                        // ran on the PRE-box concrete value (a stack struct — no
+                        // ARC handling); `maybeBoxAsProtocol` constructed the
+                        // owning `ProtocolBox` HERE. A `.move` arg whose value
+                        // is auto-boxed therefore never emitted the
+                        // `move_value` that ownership transfer requires, so the
+                        // box kept a scope-exit release in the caller. Emit the
+                        // move now over the box local: its `+1` transfers into
+                        // the call, the move clears the caller's scope-exit
+                        // release, and V7 sees a `.move` producer for the
+                        // callee's `.owned` slot. This closes the
+                        // recoverable-raise side-channel double-free —
+                        // `Kernel.recoverable_raise(box)` is a `.move` arg into
+                        // the `.owned` wrapper slot, so the raising scope must
+                        // NOT also drop the box (the recovered box is the sole
+                        // owner). `moved_box` inherits the box's
+                        // `known_local_types` AND `local_hir_types` so
+                        // `computeLocalOwnership` classifies it `.owned` (the
+                        // box's HIR type is the `protocol_constraint` stamped by
+                        // `maybeBoxAsProtocol`); without the HIR type it would
+                        // be `.trivial` and trip ARC verifier V11. Gated on the
+                        // box carrying that HIR type so the move only fires for
+                        // genuinely owned boxes.
+                        if (i < arg_modes.items.len and arg_modes.items[i] == .move) {
+                            if (self.local_hir_types.get(boxed)) |box_hir| {
+                                const moved_box = self.next_local;
+                                self.next_local += 1;
+                                try self.current_instrs.append(self.allocator, .{
+                                    .move_value = .{ .dest = moved_box, .source = boxed },
+                                });
+                                try self.local_hir_types.put(moved_box, box_hir);
+                                if (self.known_local_types.get(boxed)) |box_type| {
+                                    try self.known_local_types.put(moved_box, box_type);
+                                }
+                                args.items[i] = moved_box;
+                            }
+                        }
                     }
                 }
 

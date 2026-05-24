@@ -244,6 +244,47 @@ pub fn inferConventions(
             if (after > before) changed = true;
         }
     }
+
+    // Side-channel-stash promotion (recoverable-raise ownership transfer).
+    //
+    // The uniqueness-gated audit above DELIBERATELY refuses to lift a
+    // parameter slot that escapes its function (`computeLiftSet` condition
+    // 1: a slot whose uniqueness signature `aliases`/`top` cannot be proven
+    // uniquely owned). That veto is correct for the GENERAL escape — an
+    // escaped parameter the function does not also drop would double-free
+    // if the caller transferred ownership in.
+    //
+    // The recoverable-raise stash is the ONE escape that IS a sound
+    // ownership transfer: `Kernel.recoverable_raise(box)` moves the boxed
+    // `Error` into the thread-local side-channel, and the matching owner is
+    // recovered — in a DIFFERENT scope — by `Kernel.take_recoverable_raise`
+    // (an `.owned` result). Exactly one net owner exists across the
+    // transfer, so the `lib/kernel.zap` wrapper that forwards its boxed
+    // parameter straight into that consuming `:zig.` stash builtin MUST
+    // have an `.owned` slot: the caller transfers the box in (no caller
+    // scope-exit release; the box arg is lowered `.move` by
+    // `hir.buildRecoverableRaise`) and the recovered box becomes the sole
+    // owner that drops the inner once.
+    //
+    // This is the ONLY drop-count model correct under BOTH managers. Under
+    // `Memory.ARC` a `.borrowed` wrapper claim-retains the box for the
+    // side-channel, which an extra caller release then balances; under
+    // `Memory.Tracking` (no refcounts, `munmap`'d free pages) the
+    // claim-retain is elided, so that extra caller release frees the inner
+    // and the recovered drop double-frees it (segfault). Transferring
+    // ownership removes the claim-retain and leaves exactly one drop site on
+    // both managers. The promotion is structural
+    // (forwards-param-into-side-channel-stash), never keyed on the wrapper's
+    // mangled name.
+    for (program.functions, 0..) |_, func_index| {
+        const function: *ir.Function = @constCast(&program.functions[func_index]);
+        const conventions: MutableConventions = @constCast(function.param_conventions);
+        for (conventions, 0..) |conv, slot_index| {
+            if (conv != .borrowed) continue;
+            if (!arc_liveness.functionForwardsParamIntoSideChannelStash(function, slot_index)) continue;
+            conventions[slot_index] = .owned;
+        }
+    }
 }
 
 /// Set of `(FunctionId, slot)` pairs that have passed the chain-
