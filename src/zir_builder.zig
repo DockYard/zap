@@ -8123,7 +8123,12 @@ pub const ZirDriver = struct {
                                 else => {
                                     var ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
                                     if (ref == error_ref) return error.EmitFailed;
-                                    const ret_type_ref2 = mapReturnType(cc.return_type);
+                                    // #201 — a raising closure's call yields
+                                    // `error{ZapRaise}!T`; do NOT narrow to the
+                                    // payload here (the `@as` would reject the
+                                    // error union). The following
+                                    // `unwrap_error_union` consumes the union.
+                                    const ret_type_ref2 = if (cc.raises) @as(u32, 0) else mapReturnType(cc.return_type);
                                     if (ret_type_ref2 != 0) {
                                         const cast2 = zir_builder_emit_as(self.handle, ret_type_ref2, ref);
                                         if (cast2 != error_ref) ref = cast2;
@@ -8144,7 +8149,11 @@ pub const ZirDriver = struct {
                                     // type. The runtime helper returns CallReturnType which
                                     // Zig infers from the callable, but the monomorphized
                                     // function may declare a different concrete return type.
-                                    const ret_type_ref = mapReturnType(cc.return_type);
+                                    // #201 — for a raising closure the helper returns
+                                    // `error{ZapRaise}!T`; skip the payload-narrowing
+                                    // `@as` and let the following `unwrap_error_union`
+                                    // `try`/`catch` the error union.
+                                    const ret_type_ref = if (cc.raises) @as(u32, 0) else mapReturnType(cc.return_type);
                                     if (ret_type_ref != 0) {
                                         const cast = zir_builder_emit_as(self.handle, ret_type_ref, ref);
                                         if (cast != error_ref) ref = cast;

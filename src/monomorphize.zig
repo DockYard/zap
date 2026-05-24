@@ -1583,7 +1583,20 @@ const MonomorphContext = struct {
                             try self.applyActiveProtocolParamTypes(expected_type),
                     };
                 }
-                break :blk .{ .call = .{ .target = c.target, .args = new_args } };
+                // #201 — for an indirect (closure) call the callee
+                // expression carries the closure's static type. Clone it
+                // through `cloneExpr` so its `type_id` is substituted by
+                // the active monomorphization map: a polymorphic closure
+                // parameter (`effect_var = tv`) resolves to the concrete
+                // raising/pure closure type for THIS instance. Without
+                // re-cloning, the call site keeps the un-substituted
+                // polymorphic type and the `call_closure` lowering can't
+                // tell whether to unwrap the closure's error union.
+                const new_target: hir.CallTarget = switch (c.target) {
+                    .closure => |callee| .{ .closure = try self.cloneExpr(callee) },
+                    else => c.target,
+                };
+                break :blk .{ .call = .{ .target = new_target, .args = new_args } };
             },
             .tuple_init => |elems| blk: {
                 var new_elems = try self.allocator.alloc(*const hir.Expr, elems.len);
@@ -2020,7 +2033,14 @@ fn containsTypeVar(store: *const TypeStore, type_id: TypeId) bool {
             for (ft.params) |param| {
                 if (containsTypeVar(store, param)) return true;
             }
-            return containsTypeVar(store, ft.return_type);
+            if (containsTypeVar(store, ft.return_type)) return true;
+            // A polymorphic effect marker is a free type variable (#201),
+            // making the enclosing function type generic so it specializes
+            // per closure-argument effect.
+            if (ft.effect_var) |ev| {
+                if (containsTypeVar(store, ev)) return true;
+            }
+            return false;
         },
         .map => |mt| containsTypeVar(store, mt.key) or containsTypeVar(store, mt.value),
         .applied => |at| {

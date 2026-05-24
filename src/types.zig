@@ -148,6 +148,26 @@ pub const Type = union(enum) {
         return_type: TypeId,
         param_ownerships: ?[]const Ownership = null,
         return_ownership: Ownership = .shared,
+        /// Concrete effect of a *closure value*: `true` when the
+        /// closure body can raise (its inferred `raises` row is
+        /// non-empty), `false` for a pure closure. This is part of
+        /// the function type's identity (see `typeStructEq`) so a
+        /// raising closure (`() -> i64` with `raises = true`) is a
+        /// distinct `TypeId` from a pure one. That distinction is
+        /// what drives the monomorphizer to specialize a
+        /// higher-order callee per closure-argument effect (#201).
+        raises: bool = false,
+        /// Polymorphic effect marker carried by a higher-order
+        /// *parameter's* declared closure type. When non-null it
+        /// holds a fresh `type_var` TypeId: the parameter's effect
+        /// is not fixed but unifies with whatever closure value is
+        /// passed at the call site. `unify` binds this variable to
+        /// the argument closure's full function `TypeId` (which
+        /// differs by `raises`), so distinct closure-argument
+        /// effects produce distinct monomorphization keys. Null for
+        /// ordinary (non-effect-polymorphic) function types — the
+        /// common case.
+        effect_var: ?TypeId = null,
     };
 
     pub const AppliedType = struct {
@@ -363,7 +383,7 @@ pub const TypeStore = struct {
             .type_var => false,
             .list => |l| l.element == b.list.element,
             .tuple => |t| std.mem.eql(TypeId, t.elements, b.tuple.elements),
-            .function => |f| f.return_type == b.function.return_type and std.mem.eql(TypeId, f.params, b.function.params) and ownershipSlicesEqual(f.param_ownerships, b.function.param_ownerships) and f.return_ownership == b.function.return_ownership,
+            .function => |f| f.return_type == b.function.return_type and std.mem.eql(TypeId, f.params, b.function.params) and ownershipSlicesEqual(f.param_ownerships, b.function.param_ownerships) and f.return_ownership == b.function.return_ownership and f.raises == b.function.raises and f.effect_var == b.function.effect_var,
             .map => |m| m.key == b.map.key and m.value == b.map.value,
             .struct_type => |s| s.name == b.struct_type.name,
             .tagged_union => |t| t.name == b.tagged_union.name,
@@ -387,6 +407,31 @@ pub const TypeStore = struct {
                 .return_type = return_type,
                 .param_ownerships = param_ownerships,
                 .return_ownership = return_ownership,
+            },
+        });
+    }
+
+    /// Construct (or dedupe) a function type carrying an explicit
+    /// effect. `raises` records a closure *value's* concrete effect;
+    /// `effect_var` carries the polymorphic effect marker for a
+    /// higher-order *parameter*. See `Type.FunctionType` (#201).
+    pub fn addFunctionTypeWithEffect(
+        self: *TypeStore,
+        params: []const TypeId,
+        return_type: TypeId,
+        param_ownerships: ?[]const Ownership,
+        return_ownership: Ownership,
+        raises: bool,
+        effect_var: ?TypeId,
+    ) !TypeId {
+        return try self.addType(.{
+            .function = .{
+                .params = params,
+                .return_type = return_type,
+                .param_ownerships = param_ownerships,
+                .return_ownership = return_ownership,
+                .raises = raises,
+                .effect_var = effect_var,
             },
         });
     }
@@ -748,7 +793,15 @@ pub const TypeStore = struct {
                 for (function_type.params) |param| {
                     if (self.containsTypeVars(param)) return true;
                 }
-                return self.containsTypeVars(function_type.return_type);
+                if (self.containsTypeVars(function_type.return_type)) return true;
+                // A polymorphic effect marker (#201) is a free type
+                // variable — its presence makes the function type
+                // generic so the monomorphizer specializes per
+                // closure-argument effect.
+                if (function_type.effect_var) |ev| {
+                    if (self.containsTypeVars(ev)) return true;
+                }
+                return false;
             },
             .map => |map_type| {
                 return self.containsTypeVars(map_type.key) or
@@ -797,7 +850,11 @@ pub const TypeStore = struct {
                 for (function_type.params) |param| {
                     if (self.occursIn(var_id, param, subs)) return true;
                 }
-                return self.occursIn(var_id, function_type.return_type, subs);
+                if (self.occursIn(var_id, function_type.return_type, subs)) return true;
+                if (function_type.effect_var) |ev| {
+                    if (self.occursIn(var_id, ev, subs)) return true;
+                }
+                return false;
             },
             .map => |map_type| {
                 return self.occursIn(var_id, map_type.key, subs) or
@@ -918,7 +975,29 @@ pub const TypeStore = struct {
             for (type_a.function.params, type_b.function.params) |param_a, param_b| {
                 if (!try self.unify(param_a, param_b, subs)) return false;
             }
-            return self.unify(type_a.function.return_type, type_b.function.return_type, subs);
+            if (!try self.unify(type_a.function.return_type, type_b.function.return_type, subs)) return false;
+            // Effect unification (#201). A higher-order parameter's
+            // declared closure type carries a polymorphic
+            // `effect_var` (a fresh `type_var`); the closure value
+            // passed at the call site carries a concrete `raises`
+            // effect (and no effect_var). Bind the variable to the
+            // *concrete* side's full function TypeId so that a
+            // raising-closure argument and a pure-closure argument
+            // produce DISTINCT bindings — that binding becomes a
+            // monomorphization type-arg, splitting the callee into
+            // per-effect instances. When neither side is polymorphic
+            // the effects must simply agree.
+            if (type_a.function.effect_var) |ev_a| {
+                if (type_b.function.effect_var == null) {
+                    return self.unify(ev_a, resolved_b, subs);
+                }
+            }
+            if (type_b.function.effect_var) |ev_b| {
+                if (type_a.function.effect_var == null) {
+                    return self.unify(ev_b, resolved_a, subs);
+                }
+            }
+            return true;
         }
 
         // Both are map types: unify key and value types
@@ -1084,6 +1163,24 @@ pub const SubstitutionMap = struct {
                 }
                 const new_return = self.applyToType(store, function_type.return_type);
                 if (new_return != function_type.return_type) changed = true;
+                // Resolve a polymorphic effect (#201). When this
+                // function type's `effect_var` is now bound to a
+                // concrete closure function type, the parameter has
+                // been monomorphized to that closure's effect: adopt
+                // its `raises` and drop the (now-resolved) variable.
+                var new_raises = function_type.raises;
+                var new_effect_var = function_type.effect_var;
+                if (function_type.effect_var) |ev| {
+                    const resolved_effect = self.applyToType(store, ev);
+                    if (resolved_effect != ev) {
+                        const resolved_typ = store.getType(resolved_effect);
+                        if (resolved_typ == .function) {
+                            new_raises = resolved_typ.function.raises;
+                            new_effect_var = null;
+                            changed = true;
+                        }
+                    }
+                }
                 if (!changed) {
                     store.allocator.free(new_params);
                     return type_id;
@@ -1093,6 +1190,8 @@ pub const SubstitutionMap = struct {
                     .return_type = new_return,
                     .param_ownerships = function_type.param_ownerships,
                     .return_ownership = function_type.return_ownership,
+                    .raises = new_raises,
+                    .effect_var = new_effect_var,
                 } }) catch type_id;
             },
             .map => |map_type| {
@@ -1217,6 +1316,20 @@ pub const SubstitutionMap = struct {
                 }
                 const new_return = self.applyToReturnTypeImpl(store, function_type.return_type, scalar_position);
                 if (new_return != function_type.return_type) changed = true;
+                // Resolve a polymorphic effect, mirroring `applyToType` (#201).
+                var new_raises = function_type.raises;
+                var new_effect_var = function_type.effect_var;
+                if (function_type.effect_var) |ev| {
+                    const resolved_effect = self.applyToReturnTypeImpl(store, ev, false);
+                    if (resolved_effect != ev) {
+                        const resolved_typ = store.getType(resolved_effect);
+                        if (resolved_typ == .function) {
+                            new_raises = resolved_typ.function.raises;
+                            new_effect_var = null;
+                            changed = true;
+                        }
+                    }
+                }
                 if (!changed) {
                     store.allocator.free(new_params);
                     return type_id;
@@ -1226,6 +1339,8 @@ pub const SubstitutionMap = struct {
                     .return_type = new_return,
                     .param_ownerships = function_type.param_ownerships,
                     .return_ownership = function_type.return_ownership,
+                    .raises = new_raises,
+                    .effect_var = new_effect_var,
                 } }) catch type_id;
             },
             .map => |map_type| {
@@ -3373,6 +3488,56 @@ pub const TypeChecker = struct {
         if (decl.clauses.len == 0) return null;
         const clause = &decl.clauses[0];
         return self.raisesRowKeyForDecl(decl, clause);
+    }
+
+    /// True when a closure/anonymous-function declaration's inferred
+    /// `raises` row is non-empty — i.e. invoking the closure can
+    /// raise. Used to stamp the closure VALUE's function type with
+    /// its concrete effect (#201). A closure with no resolvable
+    /// family (or an empty row) is pure.
+    fn closureDeclRaises(self: *TypeChecker, decl: *const ast.FunctionDecl) bool {
+        const key = self.raisesRowKeyForClosureDecl(decl) orelse return false;
+        const row = self.store.inferred_raises.get(key) orelse return false;
+        return row.len > 0;
+    }
+
+    /// #201 — when `param` is a closure-typed parameter that the
+    /// enclosing clause body INVOKES (`param(...)`), give its declared
+    /// function type a fresh effect variable so the parameter's effect
+    /// is polymorphic over the closure argument passed at each call
+    /// site. Returns `param_type` unchanged for non-closure
+    /// parameters, closure parameters that are never invoked, or
+    /// closure types that already carry an explicit effect. The
+    /// resulting effect-bearing type makes the function generic
+    /// (`containsTypeVars`), so the monomorphizer produces one instance
+    /// per distinct closure-argument effect — the pure instance returns
+    /// `T`, the raising instance returns `error{ZapRaise}!T`.
+    fn makeClosureParamEffectPolymorphic(
+        self: *TypeChecker,
+        param: ast.Param,
+        param_type: TypeId,
+        clause: *const ast.FunctionClause,
+    ) !TypeId {
+        const fn_typ = self.store.getType(param_type);
+        if (fn_typ != .function) return param_type;
+        // Already effect-bearing (explicit raises annotation or a
+        // previously-assigned variable): leave it as declared.
+        if (fn_typ.function.raises or fn_typ.function.effect_var != null) return param_type;
+        const param_name = switch (param.pattern.*) {
+            .bind => |b| b.name,
+            else => return param_type,
+        };
+        const body = clause.body orelse return param_type;
+        if (!self.closureParamInvokedInBody(body, param_name)) return param_type;
+        const effect_var = try self.store.freshVar();
+        return try self.store.addFunctionTypeWithEffect(
+            fn_typ.function.params,
+            fn_typ.function.return_type,
+            fn_typ.function.param_ownerships,
+            fn_typ.function.return_ownership,
+            false,
+            effect_var,
+        );
     }
 
     fn isClosureParamUsedLocally(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) bool {
@@ -5864,7 +6029,18 @@ pub const TypeChecker = struct {
         // Resolve parameter types and populate bindings
         for (clause.params, 0..) |param, param_idx| {
             if (param.type_annotation) |ta| {
-                const param_type = try self.resolveTypeExpr(ta);
+                var param_type = try self.resolveTypeExpr(ta);
+                // #201 — make a higher-order closure parameter that the
+                // body INVOKES effect-polymorphic. Its declared closure
+                // type acquires a fresh effect variable so it is treated
+                // as generic: the monomorphizer then specializes this
+                // function per closure-argument effect, and `unify` binds
+                // the effect variable to the argument closure's concrete
+                // function type at each call site. Parameters that are
+                // merely stored/passed (not invoked) keep their plain
+                // closure type — only invocation establishes the effect
+                // dependency that must propagate.
+                param_type = try self.makeClosureParamEffectPolymorphic(param, param_type, clause);
                 const qualified = QualifiedType.init(param_type, self.resolveParamOwnership(param, param_type));
                 // Store type on the binding in scope graph if this is a bind pattern
                 if (param.pattern.* == .bind) {
@@ -6583,13 +6759,23 @@ pub const TypeChecker = struct {
 
             .anonymous_function => |anon| {
                 try self.checkFunctionDecl(anon.decl);
+                // The closure's body has now been checked, so its
+                // inferred `raises` row is recorded. Carry that
+                // effect on the closure VALUE's function type so a
+                // raising closure is a distinct type from a pure one
+                // (#201): this is what drives per-instance
+                // specialization of any higher-order callee invoked
+                // with this closure.
+                const closure_raises = self.closureDeclRaises(anon.decl);
                 if (self.current_scope) |scope_id| {
                     if (try self.resolveFunctionValueSignature(scope_id, anon.decl.name)) |signature| {
-                        return try self.store.addFunctionType(
+                        return try self.store.addFunctionTypeWithEffect(
                             signature.params,
                             signature.return_type,
                             signature.param_ownerships,
                             signature.return_ownership,
+                            closure_raises,
+                            null,
                         );
                     }
                 }
@@ -6605,7 +6791,8 @@ pub const TypeChecker = struct {
                     try self.resolveTypeExpr(rt)
                 else
                     TypeStore.UNKNOWN;
-                return try self.buildFunctionType(params, return_type);
+                const param_ownerships = try self.sharedOwnershipSlice(params.len);
+                return try self.store.addFunctionTypeWithEffect(params, return_type, param_ownerships, .shared, closure_raises, null);
             },
 
             .function_ref => |fr| {

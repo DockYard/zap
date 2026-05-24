@@ -2706,6 +2706,38 @@ pub const HirBuilder = struct {
     /// reference being resolved; pass `.empty` when the caller has no
     /// reference node in hand (synthetic capture lookups, etc.) — that
     /// path falls through to the lexical-chain walker.
+    /// #201 — when a closure parameter's annotation resolved to a
+    /// plain function type but the type checker recorded an
+    /// effect-polymorphic version on the scope-graph binding (carrying
+    /// a fresh `effect_var` because the body invokes the closure),
+    /// prefer the recorded type. Returns `resolved_type` unchanged for
+    /// non-closure parameters or when the binding has no polymorphic
+    /// effect. The recorded type's params/return must match so we only
+    /// adopt a genuinely-corresponding effect-bearing variant.
+    fn preferEffectPolymorphicParamType(
+        self: *const HirBuilder,
+        param: ast.Param,
+        resolved_type: types_mod.TypeId,
+    ) types_mod.TypeId {
+        const resolved_typ = self.type_store.getType(resolved_type);
+        if (resolved_typ != .function) return resolved_type;
+        if (resolved_typ.function.effect_var != null) return resolved_type;
+        const bind_name = switch (param.pattern.*) {
+            .bind => |b| b.name,
+            else => return resolved_type,
+        };
+        const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
+        const bid = self.graph.resolveBindingHygienic(scope_id, bind_name, param.pattern.bind.meta.scopes) orelse return resolved_type;
+        const binding = self.graph.bindings.items[bid];
+        const prov = binding.type_id orelse return resolved_type;
+        const recorded_typ = self.type_store.getType(prov.type_id);
+        if (recorded_typ != .function) return resolved_type;
+        if (recorded_typ.function.effect_var == null) return resolved_type;
+        if (recorded_typ.function.return_type != resolved_typ.function.return_type) return resolved_type;
+        if (!std.mem.eql(types_mod.TypeId, recorded_typ.function.params, resolved_typ.function.params)) return resolved_type;
+        return prov.type_id;
+    }
+
     fn resolveBindingType(self: *const HirBuilder, name: ast.StringId, reference_scopes: scope_mod.ScopeSet) types_mod.TypeId {
         // Elixir-style shadowing: walk assignment bindings in reverse
         // so the most recent rebinding wins over any earlier ones.
@@ -3994,6 +4026,17 @@ pub const HirBuilder = struct {
         self.current_function_emits_error_union = self.functionEmitsErrorUnion(decls[0], scope_id, arity);
         defer self.current_function_emits_error_union = saved_emits_error_union;
 
+        // #201 — a nested function group (anonymous closure or named
+        // inner fn) is a fresh error-handling boundary. An enclosing
+        // `try` body's `try_scope_depth` must NOT extend into it: a
+        // `raise` in this function propagates OUT of THIS function (via
+        // `ret_raise`/error-union return), not to the lexically-enclosing
+        // `try`'s landing pad (the closure may be invoked anywhere). Reset
+        // to 0 for the duration of this group's clause builds.
+        const saved_try_scope_depth = self.try_scope_depth;
+        self.try_scope_depth = 0;
+        defer self.try_scope_depth = saved_try_scope_depth;
+
         const saved_hir_type_var_scope = self.hir_type_var_scope;
         self.hir_type_var_scope = std.StringHashMap(types_mod.TypeId).init(self.allocator);
         defer {
@@ -4048,6 +4091,12 @@ pub const HirBuilder = struct {
         // qualified key built from the owning struct prefix + name + arity.
         const saved_emits_error_union = self.current_function_emits_error_union;
         self.current_function_emits_error_union = self.functionEmitsErrorUnion(func, scope_id, arity);
+        // #201 — a nested function is a fresh error-handling boundary;
+        // an enclosing `try` body's depth must not leak into it (see
+        // `buildMergedFunctionGroup` for the full rationale). Reset to 0
+        // and restore below alongside `current_function_emits_error_union`.
+        const saved_try_scope_depth = self.try_scope_depth;
+        self.try_scope_depth = 0;
         const saved_hir_type_var_scope = self.hir_type_var_scope;
         self.hir_type_var_scope = std.StringHashMap(types_mod.TypeId).init(self.allocator);
         defer {
@@ -4149,6 +4198,7 @@ pub const HirBuilder = struct {
         self.current_function_name = saved_function_name;
         self.current_function_name_id = saved_function_name_id;
         self.current_function_emits_error_union = saved_emits_error_union;
+        self.try_scope_depth = saved_try_scope_depth;
         self.current_param_names = saved_param_names;
         self.current_param_types = saved_param_types;
         self.current_assignment_bindings = saved_assignment_bindings;
@@ -4302,7 +4352,7 @@ pub const HirBuilder = struct {
 
         var params: std.ArrayList(TypedParam) = .empty;
         for (clause.params, 0..) |param, param_idx| {
-            const type_id = if (param.type_annotation) |ann|
+            var type_id = if (param.type_annotation) |ann|
                 self.resolveTypeExpr(ann)
             else if (inferred_sig) |sig| blk: {
                 // Use type inferred from call-site argument types
@@ -4311,6 +4361,17 @@ pub const HirBuilder = struct {
                 else
                     types_mod.TypeStore.UNKNOWN;
             } else types_mod.TypeStore.UNKNOWN;
+
+            // #201 — for a closure-typed parameter the type checker may
+            // have made the declared type effect-polymorphic (a fresh
+            // `effect_var`) because the body invokes it. `resolveTypeExpr`
+            // rebuilds the bare annotation without that effect variable,
+            // so prefer the scope-graph binding type the type checker
+            // recorded when it carries the polymorphic effect. This keeps
+            // the HIR group's parameter type (which the monomorphizer keys
+            // on) carrying the effect variable that drives per-effect
+            // specialization.
+            type_id = self.preferEffectPolymorphicParamType(param, type_id);
 
             // When a struct pattern has no struct_name (parsed from %{...} :: Type),
             // inject the type name from the type annotation
@@ -6056,6 +6117,15 @@ pub const HirBuilder = struct {
                     function_type = try self.buildResolvedFunctionType(anon.decl.clauses[0]);
                 }
                 const group_scope = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
+                // #201 — stamp the closure VALUE's function type with its
+                // concrete `raises` effect so it is a distinct type from a
+                // pure closure. `resolveFunctionValueType` rebuilds the type
+                // from the clause annotations alone (no effect), so consult
+                // the type store's inferred row the same way `calleeRaises`
+                // does. This effect is what drives the monomorphizer to
+                // specialize a higher-order callee per closure-argument
+                // effect.
+                function_type = try self.applyClosureValueEffect(function_type, anon.decl, group_scope);
                 const group = try self.buildFunctionGroup(anon.decl, group_scope, null, true);
                 const group_ptr = try self.create(FunctionGroup, group);
                 const closure_expr = try self.buildFunctionValueExpr(group.id, function_type, anon.meta.span);
@@ -6570,6 +6640,36 @@ pub const HirBuilder = struct {
             scope_cursor = self.graph.getScope(sid).parent;
         }
         const result = self.type_store.functionRaises(struct_prefix, method_name, arity);        return result;
+    }
+
+    /// #201 — return `function_type` re-stamped with the closure's
+    /// concrete `raises` effect. `resolveFunctionValueType` /
+    /// `buildResolvedFunctionType` rebuild a closure's function type
+    /// from its declared param/return annotations alone, dropping the
+    /// inferred effect; this restores it so a raising closure value
+    /// carries `raises = true` and is a distinct type from a pure one.
+    /// Returns the type unchanged when it is not a function type, the
+    /// closure does not raise, or the effect is already present.
+    fn applyClosureValueEffect(
+        self: *HirBuilder,
+        function_type: types_mod.TypeId,
+        decl: *const ast.FunctionDecl,
+        scope_id: scope_mod.ScopeId,
+    ) !types_mod.TypeId {
+        const typ = self.type_store.getType(function_type);
+        if (typ != .function) return function_type;
+        if (typ.function.raises) return function_type;
+        if (decl.clauses.len == 0) return function_type;
+        const arity: u32 = @intCast(decl.clauses[0].params.len);
+        if (!self.functionEmitsErrorUnion(decl, scope_id, arity)) return function_type;
+        return try self.type_store.addFunctionTypeWithEffect(
+            typ.function.params,
+            typ.function.return_type,
+            typ.function.param_ownerships,
+            typ.function.return_ownership,
+            true,
+            typ.function.effect_var,
+        );
     }
 
     /// Phase 3.b — build a propagating `raise` (`ret_raise`) HIR node from a

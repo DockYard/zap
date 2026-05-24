@@ -2145,6 +2145,13 @@ pub const CallClosure = struct {
     args: []const LocalId,
     arg_modes: []const ValueMode,
     return_type: ZigType,
+    /// #201 — true when the invoked closure carries the `raises`
+    /// effect, so the indirect call returns `error{ZapRaise}!T`
+    /// rather than `T`. The ZIR emitter then skips the
+    /// payload-narrowing `@as` cast (which would reject the error
+    /// union) and leaves the error-union result for the following
+    /// `unwrap_error_union` to `try`/`catch`/abort.
+    raises: bool = false,
 };
 
 pub const CallDispatch = struct {
@@ -3567,7 +3574,14 @@ pub const IrBuilder = struct {
             }
             scope_cursor = graph.getScope(sid).parent;
         }
-        return store.functionRaises(struct_prefix, method_name, group.arity);
+        if (store.functionRaises(struct_prefix, method_name, group.arity)) return true;
+        // #201 — a (monomorphized) higher-order callee that invokes a
+        // raising closure parameter returns `error{ZapRaise}!T` even
+        // though its own inferred row is empty. Its call site must
+        // unwrap/propagate the error union just like a directly-raising
+        // callee. The pure instance has a non-raising closure-param
+        // type, so this is false there (no spurious unwrap).
+        return self.groupInvokesRaisingClosureParam(group);
     }
 
     fn resolvedCallReturnType(
@@ -3767,6 +3781,95 @@ pub const IrBuilder = struct {
             }
         }
         return expr_zig_type;
+    }
+
+    /// #201 — does the closure value invoked at a `call_closure` site
+    /// carry the `raises` effect (so its body returns
+    /// `error{ZapRaise}!T` and the result must be unwrapped)? Resolves
+    /// the callee HIR expression's static type to a `FunctionType` and
+    /// reads its `raises` slot. A pure closure (or an unresolved type)
+    /// returns false, so no unwrap/abort is emitted for it. This is the
+    /// per-instance signal that mirrors `calleeRaises` for direct
+    /// calls: after monomorphization the callee parameter's function
+    /// type is concrete, so its effect is fixed per `apply` instance.
+    fn closureCalleeRaises(self: *const IrBuilder, callee: *const hir_mod.Expr) bool {
+        const store = self.type_store orelse return false;
+        const typ = store.getType(callee.type_id);
+        return switch (typ) {
+            .function => |function_type| function_type.raises,
+            else => false,
+        };
+    }
+
+    /// #201 — does this (monomorphized) function group INVOKE a
+    /// closure parameter whose concrete type carries the `raises`
+    /// effect? Such an instance propagates the closure's raise and so
+    /// must itself return `error{ZapRaise}!T`. After monomorphization
+    /// the closure-argument effect is fixed per instance, so the pure
+    /// instance's closure-param type has `raises = false` and this
+    /// returns false (no widening). Walks the first clause's body for a
+    /// `call_closure` whose callee resolves to a raising-function-typed
+    /// parameter of this group.
+    fn groupInvokesRaisingClosureParam(self: *const IrBuilder, group: *const hir_mod.FunctionGroup) bool {
+        const store = self.type_store orelse return false;
+        if (group.clauses.len == 0) return false;
+        // Collect the parameter local types that are raising closures.
+        // A closure-parameter's `param_get` callee refers to its index;
+        // we treat any param whose declared function type raises as a
+        // candidate and confirm it is actually invoked in the body.
+        for (group.clauses) |clause| {
+            var any_raising_param = false;
+            for (clause.params) |param| {
+                const ptyp = store.getType(param.type_id);
+                if (ptyp == .function and ptyp.function.raises) {
+                    any_raising_param = true;
+                    break;
+                }
+            }
+            if (!any_raising_param) continue;
+            if (self.blockInvokesRaisingClosure(clause.body)) return true;
+        }
+        return false;
+    }
+
+    /// Recursively scan a HIR block for a `call_closure` whose callee
+    /// expression's static type is a raising function. Used by
+    /// `groupInvokesRaisingClosureParam` (#201).
+    fn blockInvokesRaisingClosure(self: *const IrBuilder, block: *const hir_mod.Block) bool {
+        for (block.stmts) |stmt| {
+            if (self.stmtInvokesRaisingClosure(stmt)) return true;
+        }
+        return false;
+    }
+
+    fn stmtInvokesRaisingClosure(self: *const IrBuilder, stmt: hir_mod.Stmt) bool {
+        return switch (stmt) {
+            .expr => |e| self.exprInvokesRaisingClosure(e),
+            .local_set => |ls| self.exprInvokesRaisingClosure(ls.value),
+            else => false,
+        };
+    }
+
+    fn exprInvokesRaisingClosure(self: *const IrBuilder, expr: *const hir_mod.Expr) bool {
+        switch (expr.kind) {
+            .call => |call| {
+                switch (call.target) {
+                    .closure => |callee| {
+                        if (self.closureCalleeRaises(callee)) return true;
+                        if (self.exprInvokesRaisingClosure(callee)) return true;
+                    },
+                    else => {},
+                }
+                for (call.args) |arg| {
+                    if (self.exprInvokesRaisingClosure(arg.expr)) return true;
+                }
+                return false;
+            },
+            .binary => |b| return self.exprInvokesRaisingClosure(b.lhs) or self.exprInvokesRaisingClosure(b.rhs),
+            .unary => |u| return self.exprInvokesRaisingClosure(u.operand),
+            .block => |b| return self.blockInvokesRaisingClosure(&b),
+            else => return false,
+        }
     }
 
     /// Extract the list element ZigType from a local's known type.
@@ -4517,10 +4620,19 @@ pub const IrBuilder = struct {
         // lowered — a propagating raising call in the body consults it to
         // decide `try` (propagate) vs the top-level abort. Also reused for the
         // emitted `ir.Function.raises` flag below.
-        const function_raises = if (self.type_store) |ts|
+        const declared_function_raises = if (self.type_store) |ts|
             ts.functionRaises(self.current_struct_prefix, self.interner.get(group.name), group.arity)
         else
             false;
+        // #201 — a higher-order instance that INVOKES a closure
+        // parameter whose (now-monomorphized) type carries the `raises`
+        // effect must itself return `error{ZapRaise}!T`: the closure's
+        // raise propagates out through this function. The pure instance
+        // of the same source function has a non-raising closure-param
+        // type and so does NOT widen — that is the per-instance
+        // specialization. A function's own inferred row OR an invoked
+        // raising closure parameter both make it raising.
+        const function_raises = declared_function_raises or self.groupInvokesRaisingClosureParam(group);
         self.current_function_raises = function_raises;
 
         // Use first clause for arity and return type
@@ -11538,11 +11650,43 @@ pub const IrBuilder = struct {
                         const lowered_args = try args.toOwnedSlice(self.allocator);
                         const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
                         const return_type = self.closureReturnType(expr.type_id, callee_local);
+                        const closure_raises = self.closureCalleeRaises(callee);
                         try self.current_instrs.append(self.allocator, .{
-                            .call_closure = .{ .dest = dest, .callee = callee_local, .args = lowered_args, .arg_modes = lowered_modes, .return_type = return_type },
+                            .call_closure = .{ .dest = dest, .callee = callee_local, .args = lowered_args, .arg_modes = lowered_modes, .return_type = return_type, .raises = closure_raises },
                         });
                         if (return_type != .any and return_type != .void) {
                             try self.known_local_types.put(dest, return_type);
+                        }
+                        // #201 — when the invoked closure's type carries the
+                        // `raises` effect, its body returned
+                        // `error{ZapRaise}!T` in `dest`. Unwrap it in place to
+                        // the payload `T` and route the error case per this
+                        // function's lexical context, exactly mirroring the
+                        // direct-call propagation path: inside a `try` body →
+                        // `catch` to the enclosing landing pad; in an
+                        // error-union fn → `try` (propagate, ERT chain);
+                        // otherwise → abort via the unhandled-raise crash
+                        // report. Pure closures carry no effect, so this is
+                        // skipped — no spurious `abort_recoverable_raise`.
+                        if (closure_raises) {
+                            const mode: ErrorUnionUnwrapMode = if (self.in_try_body)
+                                .route_to_handler
+                            else if (self.current_function_raises)
+                                .propagate
+                            else
+                                .abort_unhandled;
+                            const payload_zig = if (return_type != .any and return_type != .void)
+                                return_type
+                            else
+                                typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                            try self.current_instrs.append(self.allocator, .{
+                                .unwrap_error_union = .{
+                                    .dest = dest,
+                                    .source = dest,
+                                    .mode = mode,
+                                    .payload_type = payload_zig,
+                                },
+                            });
                         }
                     },
                     .dispatch => |dc| {
@@ -12881,7 +13025,16 @@ fn containsUnresolvedTypeVarForSpecialization(store: *const types_mod.TypeStore,
             for (ft.params) |param| {
                 if (containsUnresolvedTypeVarForSpecialization(store, param)) return true;
             }
-            return containsUnresolvedTypeVarForSpecialization(store, ft.return_type);
+            if (containsUnresolvedTypeVarForSpecialization(store, ft.return_type)) return true;
+            // #201 — a polymorphic closure-effect marker is an
+            // unresolved type variable; an effect-polymorphic
+            // higher-order function is generic and must be
+            // monomorphized per closure-argument effect rather than
+            // compiled in its unspecialized form.
+            if (ft.effect_var) |ev| {
+                if (containsUnresolvedTypeVarForSpecialization(store, ev)) return true;
+            }
+            return false;
         },
         .map => |mt| containsUnresolvedTypeVarForSpecialization(store, mt.key) or
             containsUnresolvedTypeVarForSpecialization(store, mt.value),
