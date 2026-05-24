@@ -7029,10 +7029,16 @@ test "rescue: recovered boxed error drops cleanly under Memory.Tracking (no doub
     // recovered box's inner crashed here before the fix.
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "recovered-ok=missing") != null);
-    // Tracking reports survivors as `LEAK:` lines at deinit; a balanced
-    // recovered-box path leaves none. (An under-free regression — the dual
-    // of the double-free — would surface here as a leak.)
-    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "LEAK:") == null);
+    // The recovered box's inner must be freed EXACTLY once: an under-free
+    // regression (the dual of the double-free) leaves a survivor that
+    // `src/runtime.zig` renders at deinit as `leak summary:` (the canonical
+    // Tracking summary marker) plus a per-allocation `memory leak: …` line.
+    // The earlier `"LEAK:"` probe never matched either marker, so it silently
+    // guarded only the SIGSEGV — not a leak; assert on the real markers (same
+    // detection as the Gap D sibling below) so this genuinely guards BOTH the
+    // double-free crash AND the under-free leak.
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "leak summary:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "memory leak:") == null);
 }
 
 test "rescue: terminal CROSS-FN catch releases the recovered box under Memory.Tracking (Gap D, no leak)" {
