@@ -11861,6 +11861,24 @@ pub const IrBuilder = struct {
                             if (self.known_local_types.get(val)) |t| {
                                 try self.known_local_types.put(ls.index, t);
                             }
+                            // Propagate the HIR type as well so ARC ownership
+                            // classification (`computeLocalOwnership` via
+                            // `isArcManagedLocal`/`local_hir_types`) sees this
+                            // binding's ARC-managed type. Without this, a
+                            // `let` inside a nested block expression (e.g. a
+                            // Zest `describe`/`test` body) whose RHS yields an
+                            // ARC value — such as `first = List.head(items)`
+                            // where `items : List(List(String))` — leaves the
+                            // binding classified `.trivial`. A later ARC pass
+                            // that inserts a `.copy_value` reading that binding
+                            // then trips the V11 verifier invariant (source of
+                            // `.copy_value` must be non-`.trivial`). The
+                            // top-level statement arm already mirrors this; the
+                            // nested-block arm must too, or the two paths
+                            // disagree on which bindings are ARC-managed.
+                            if (self.local_hir_types.get(val)) |src_hir_type| {
+                                try self.local_hir_types.put(ls.index, src_hir_type);
+                            }
                         },
                         .function_group => |group| {
                             // Anonymous functions and nested functions defined
