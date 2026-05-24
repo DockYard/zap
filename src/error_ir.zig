@@ -2,7 +2,7 @@
 //!
 //! A SINGLE schema that every diagnostic surface lowers into: compile-time
 //! errors (parse / typecheck / borrow), runtime panics, error-return traces,
-//! and leak / cycle reports. The brief (Part IV §4) mandates one schema —
+//! and leak reports. The brief (Part IV §4) mandates one schema —
 //!
 //!   `domain, code, severity, message, primary_span, related_spans, notes,
 //!    help, fixits, cause_chain, trace_policy, machine_data, visibility`
@@ -44,7 +44,7 @@ const ast = @import("ast.zig");
 /// domain is metadata, surfaced in JSON and available for future grouping.
 ///
 /// Phase 4.a populates `parse`, `typecheck`, `runtime`, `panic`, and the
-/// abort-kind domains; 4.b adds `ice`; 4.c adds `leak`; 4.d adds `cycle`.
+/// abort-kind domains; 4.b adds `ice`; 4.c adds `leak`.
 /// All variants exist now so the later phases only *populate* them — they do
 /// not extend the schema (the brief's "support them" requirement for 4.b/4.c).
 pub const Domain = enum {
@@ -67,8 +67,6 @@ pub const Domain = enum {
     oom,
     /// A memory leak report (Phase 4.c populates).
     leak,
-    /// An ARC reference cycle report (Phase 4.d populates).
-    cycle,
     /// Foreign-function-interface / `:zig.` boundary error.
     ffi,
     /// I/O failure surfaced as a diagnostic.
@@ -214,7 +212,6 @@ test "Domain wire names are stable lowercase identifiers" {
     try std.testing.expectEqualStrings("typecheck", Domain.typecheck.wireName());
     try std.testing.expectEqualStrings("leak", Domain.leak.wireName());
     try std.testing.expectEqualStrings("ice", Domain.ice.wireName());
-    try std.testing.expectEqualStrings("cycle", Domain.cycle.wireName());
 }
 
 test "Applicability wire names match rustc taxonomy" {

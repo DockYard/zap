@@ -18,7 +18,7 @@ pub const SecurityTier = error_format.SecurityTier;
 // Diagnostics Engine — the ONE renderer (Phase 4.a)
 //
 // Renders ANY diagnostic from the canonical Error IR (`src/error_ir.zig`):
-// compile errors, runtime panics, ERT traces, and leak/cycle reports all
+// compile errors, runtime panics, ERT traces, and leak reports all
 // lower into the same `Diagnostic` shape and render with ONE visual language.
 //
 // Rich error reporting with:

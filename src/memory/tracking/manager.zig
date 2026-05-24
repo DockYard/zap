@@ -212,13 +212,6 @@ const ZapLeakKind = enum(u32) {
     invalid_free = 2,
     /// The runtime-supplied size/alignment disagreed with the record.
     dealloc_mismatch = 3,
-    /// Phase 4.d — one member of a detected reference cycle. The runtime's
-    /// Bacon–Rajan trial-deletion detector identifies cyclic garbage; this
-    /// kind tags a `ZapLeakRecord` rendered for a participating object so the
-    /// renderer selects the `domain=cycle` diagnostic. The aggregate
-    /// retain-path report is assembled runtime-side from the detector's
-    /// result set (the manager does not push cycle records over this ABI).
-    cycle = 4,
 };
 
 /// Structured, render-ready description of one memory fault, handed from
@@ -592,20 +585,6 @@ fn trackingAnnotateAllocation(
     rec_ptr.backtrace_len = copy_len;
 }
 
-/// Phase 4.d — query whether `user_ptr` is currently a live (un-freed)
-/// allocation this manager handed out. The runtime cycle detector calls this
-/// to GUARANTEE memory safety: it only ever dereferences (walks the children
-/// of) a candidate/child cell the manager confirms is still live, so a stale
-/// runtime-registry entry for an already-freed pointer is never followed.
-/// `callconv(.c)` to match the optional `isPointerLive` interface slot the
-/// runtime looks up by name.
-fn trackingIsPointerLive(ctx: *anyopaque, user_ptr: usize) callconv(.c) bool {
-    const tctx: *TrackingContext = @ptrCast(@alignCast(ctx));
-    spinLock(&tctx.spinlock);
-    defer spinUnlock(&tctx.spinlock);
-    return tctx.live.contains(user_ptr);
-}
-
 /// Phase 4.e — report the manager's CURRENT live-allocation totals: the
 /// number of un-freed allocations it is tracking and the sum of their
 /// user-visible sizes in bytes. This is the IN-PROCESS leak signal a Zest
@@ -801,31 +780,19 @@ fn trackingDeinit(ctx: *anyopaque) callconv(.c) void {
                 type_name,
             },
         );
-        // Phase 4.d: do NOT free the survivor's memory here. The runtime's
-        // `report_finish` step below runs the reference-cycle detector, which
-        // must DEREFERENCE each surviving cell (to walk its ARC children).
-        // Freeing in this same pass would leave the detector walking freed
-        // memory. Freeing is therefore deferred to a second pass AFTER
-        // `report_finish`, so every survivor stays live throughout detection.
-        // (Pre-4.d this loop freed inline; the split preserves the same final
-        // reclamation, only reordered.)
-    }
-    // Phase 4.c/4.d: signal report completion. The runtime renderer sorts the
-    // survivors, prints the leak summary, AND — when cycle detection is
-    // enabled — runs the Bacon–Rajan trial-deletion scan over the still-LIVE
-    // survivor cells (this is why the frees are deferred below). Runs while the
-    // live map AND every survivor allocation are intact.
-    if (tctx.report_finish) |finish| {
-        finish(tctx.report_sink_ctx);
-    }
-    // Second pass: now that reporting + cycle detection have observed every
-    // live survivor, return the inner allocations to `page_allocator`.
-    var free_iter = tctx.live.iterator();
-    while (free_iter.next()) |entry| {
-        const rec = entry.value_ptr.*;
+        // Reclaim the leaked allocation's inner pages as we go. The leak sink
+        // copies everything it needs out of `record` by value (the backtrace
+        // is copied; `type_name_ptr` points into the binary's `.rodata`), so
+        // the rendered report — emitted by `report_finish` below — does not
+        // depend on the freed cell staying live.
         const total = rec.leading_canary_size + rec.size + CANARY_SIZE;
         const inner_alignment: std.mem.Alignment = .fromByteUnits(@max(rec.alignment, @as(u32, @intCast(CANARY_SIZE))));
         std.heap.page_allocator.rawFree(rec.base_ptr[0..total], inner_alignment, @returnAddress());
+    }
+    // Phase 4.c: signal report completion. The runtime renderer sorts the
+    // accumulated survivors and prints the unified leak summary / JSON array.
+    if (tctx.report_finish) |finish| {
+        finish(tctx.report_sink_ctx);
     }
     tctx.live.deinit(std.heap.page_allocator);
     std.heap.page_allocator.destroy(tctx);
@@ -1423,7 +1390,6 @@ pub const getCapabilityDesc = trackingGetCapabilityDesc;
 // deinit-time report sink.
 pub const annotateAllocation = trackingAnnotateAllocation;
 pub const setLeakReportSink = trackingSetLeakReportSink;
-pub const isPointerLive = trackingIsPointerLive;
 // Phase 4.e — the in-process live-allocation checkpoint signal a Zest
 // `assert_no_leaks { <block> }` reads before/after a block.
 pub const liveAllocationStats = trackingLiveAllocationStats;
