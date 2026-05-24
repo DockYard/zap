@@ -660,12 +660,14 @@ pub const TypeStore = struct {
     }
 
     /// Check if a value of type `from` can be implicitly widened to type `to`.
-    /// Widening is a fallback after exact overload selection and never crosses
-    /// numeric families:
-    ///   Signed integers: i8→i16→i32→i64→i128
+    /// Widening is a fallback after exact overload selection and is always
+    /// value-preserving (no information loss):
+    ///   Signed integers:   i8→i16→i32→i64→i128
     ///   Unsigned integers: u8→u16→u32→u64→u128
-    ///   Floats: f16→f32→f64→f80→f128
-    /// No signed↔unsigned or int↔float widening is implicit.
+    ///   Unsigned→signed:   uN→iM when M > N (the wider signed type holds the
+    ///                      whole unsigned range — e.g. u16→i64, u8→i16)
+    ///   Floats:            f16→f32→f64→f80→f128
+    /// Signed→unsigned (would drop the sign) and int↔float are never implicit.
     pub fn canWidenTo(self: *const TypeStore, from: TypeId, to: TypeId) bool {
         return self.wideningCost(from, to) != null;
     }
@@ -684,8 +686,24 @@ pub const TypeStore = struct {
             const f = from_t.int;
             const t = to_t.int;
             if (f.signedness == t.signedness) {
+                // Same-signedness widening: any strictly-wider target.
                 if (t.bits > f.bits) return @as(u32, t.bits - f.bits);
                 return null;
+            }
+            // Cross-signedness is value-preserving in exactly one direction:
+            // an unsigned source promoted to a STRICTLY wider signed target,
+            // which can represent the whole unsigned range (u16 → i64, u8 →
+            // i16). The reverse (signed → unsigned) would drop negative
+            // values and stays forbidden. The strict `>` is required: u16 →
+            // i16 must NOT widen because i16 cannot hold 65535. This is the
+            // standard integer-promotion rule and lets mixed-width integer
+            // comparisons/arithmetic (notably the Zest `assert` rewrite,
+            // which binds a literal operand to an i64 temporary before
+            // comparing it against a narrower unsigned field) resolve to a
+            // common-type overload instead of failing clause selection and
+            // falling back to the first-declared (`i8`) clause.
+            if (f.signedness == .unsigned and t.signedness == .signed and t.bits > f.bits) {
+                return @as(u32, t.bits - f.bits);
             }
             return null;
         }

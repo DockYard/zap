@@ -5060,6 +5060,25 @@ pub const HirBuilder = struct {
                 const lhs_expr = try self.buildExpr(bo.lhs);
                 const rhs_expr = try self.buildExpr(bo.rhs);
 
+                // Integer-literal operand contextual typing. A bare
+                // integer literal lowers as a default-`I64` `int_lit`
+                // (buildExpr stamps `I64` unconditionally). When such a
+                // literal is one operand of a binary operator whose
+                // OTHER operand has a concrete non-i64 integer type —
+                // e.g. `cfg.port == 8080` with `port :: u16` — the two
+                // operands disagree on signedness/width, so overload
+                // selection of the `impl Comparator/Arithmetic for
+                // Integer` family (one clause per i8…u128) finds no
+                // applicable clause (mixed signedness fails widening)
+                // and falls back to the first-declared clause (`i8`),
+                // which then cannot represent the literal value. Adopt
+                // the concrete operand's integer type onto the literal
+                // so both operands agree and the matching-width clause
+                // is selected. This is the comparison/arithmetic-site
+                // analog of the call-arg and field-default literal
+                // contextual typing (`propagateExpectedTypeToDefault`).
+                self.unifyIntLiteralOperandType(lhs_expr, rhs_expr);
+
                 // Protocol-driven dispatch: when either operand has a known
                 // concrete type and the corresponding `impl PROTOCOL for T`
                 // exists, lower `a OP b` to a call against the impl's
@@ -5083,6 +5102,27 @@ pub const HirBuilder = struct {
                                     self.resolveCallInStruct(struct_name, method_id, 2, args.items)
                                 else
                                     null;
+
+                                // Record each operand's expected parameter type
+                                // from the selected overload clause so the IR
+                                // call-lowering inserts the implicit numeric
+                                // widening it needs (it keys off
+                                // `CallArg.expected_type`). This matters when
+                                // the two operands are concrete integers of
+                                // different widths — e.g. the Zest `assert`
+                                // rewrite compares a `u16` field against an
+                                // `i64`-typed literal temporary. Overload
+                                // selection lands on the common-width clause
+                                // (`(i64, i64)` via the unsigned→wider-signed
+                                // widening rule), and the narrower operand must
+                                // be widened to that clause's parameter type
+                                // before the runtime comparison.
+                                if (selected_call_info) |info| {
+                                    const count = @min(args.items.len, info.param_types.len);
+                                    for (args.items[0..count], info.param_types[0..count]) |*arg, param_type| {
+                                        arg.expected_type = param_type;
+                                    }
+                                }
 
                                 return try self.create(Expr, .{
                                     .kind = .{ .call = .{
@@ -7464,6 +7504,43 @@ pub const HirBuilder = struct {
             mut.type_id = expected_type;
             return;
         }
+    }
+
+    /// Contextually retype a default-`I64` integer-literal operand of a
+    /// binary operator to the concrete integer type of its sibling
+    /// operand. A bare integer literal is stamped `I64` by `buildExpr`
+    /// unconditionally; when the other operand has a concrete integer
+    /// type that is not `I64` (e.g. a `u16` struct field), the two
+    /// operands disagree and the per-width `impl Comparator/Arithmetic
+    /// for Integer` overload family cannot select a matching clause —
+    /// widening never crosses signedness, so `(u16, i64)` matches no
+    /// `(X, X)` clause and resolution falls back to the first-declared
+    /// `i8` clause. Adopting the concrete operand's type onto the
+    /// literal makes both operands agree so the correct-width clause is
+    /// chosen, and surfaces a genuine out-of-range value as a real
+    /// codegen error against the intended type rather than silently
+    /// widening to `i64`. Symmetric: the literal may be either operand.
+    /// Only fires when exactly one operand is the default-`I64` literal
+    /// and the other is a concrete (non-type-variable) integer type, so
+    /// `1 == 2` (both literals) and `i64Field == 5` (already matching)
+    /// are left untouched.
+    fn unifyIntLiteralOperandType(self: *const HirBuilder, lhs: *const Expr, rhs: *const Expr) void {
+        const lhs_is_default_int_lit = lhs.kind == .int_lit and lhs.type_id == types_mod.TypeStore.I64;
+        const rhs_is_default_int_lit = rhs.kind == .int_lit and rhs.type_id == types_mod.TypeStore.I64;
+        // Exactly one side must be the contextless literal; if both are
+        // literals there is no concrete operand to take a type from, and
+        // if neither is a literal there is nothing to retype.
+        if (lhs_is_default_int_lit == rhs_is_default_int_lit) return;
+
+        const literal = if (lhs_is_default_int_lit) lhs else rhs;
+        const concrete = if (lhs_is_default_int_lit) rhs else lhs;
+
+        // The concrete operand must carry a known, non-i64 integer type.
+        if (concrete.type_id == types_mod.TypeStore.UNKNOWN) return;
+        if (concrete.type_id == types_mod.TypeStore.I64) return;
+        if (self.type_store.getType(concrete.type_id) != .int) return;
+
+        @constCast(literal).type_id = concrete.type_id;
     }
 
     fn isFieldlessStructType(self: *const HirBuilder, type_id: types_mod.TypeId) bool {
