@@ -16,7 +16,6 @@ const ast_data = @import("ast_data.zig");
 const scope = @import("scope.zig");
 const ir = @import("ir.zig");
 const signature = @import("signature.zig");
-const frontend_policy = @import("frontend_policy.zig");
 const CtValue = ctfe.CtValue;
 const AllocationStore = ctfe.AllocationStore;
 const Allocator = std.mem.Allocator;
@@ -81,17 +80,6 @@ pub const Env = struct {
     /// surface-level macro engine queries this to forward a precise
     /// diagnostic when expansion fails. Owned by `alloc`.
     last_capability_error: ?[]const u8 = null,
-    /// The optimize mode of the compilation currently being expanded.
-    /// Exposed to macro bodies as the comptime `optimize_mode()`
-    /// intrinsic so library macros (the three-tier contract macros in
-    /// `Kernel`) can branch their expansion on the build mode —
-    /// dropping the guarded form entirely (so the guarded expression is
-    /// never lowered, never evaluated) in modes where the contract tier
-    /// is elided. The macro engine sets this from the compilation's
-    /// `frontend_optimize_mode`; unit-test and legacy callers that build
-    /// an `Env` directly leave it at the `.debug` default, which keeps
-    /// every contract checked (the conservative choice).
-    optimize_mode: frontend_policy.FrontendOptimizeMode = .debug,
 
     pub fn init(alloc: Allocator, store: *AllocationStore) Env {
         return .{
@@ -667,9 +655,6 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             }
             if (std.mem.eql(u8, form_name, "source_location")) {
                 return sourceLocationIntrinsic(env, arg_elems);
-            }
-            if (std.mem.eql(u8, form_name, "optimize_mode")) {
-                return optimizeModeIntrinsic(env, arg_elems);
             }
 
             // make_call(form_name_string, args_list) — build a
@@ -1997,30 +1982,6 @@ fn atomNameIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
 /// `source_text(expr)`: return the exact source slice for an AST node.
 /// Missing spans, generated nodes, or unavailable source content return
 /// the empty string so macros can fall back without failing expansion.
-/// `optimize_mode()`: return the optimize mode of the compilation
-/// currently being expanded as a comptime `String` — one of
-/// `"debug"`, `"release_safe"`, `"release_fast"`, or `"release_small"`.
-///
-/// This is the compile-time query that lets a library macro branch its
-/// expansion on the build mode. The three-tier contract macros in
-/// `Kernel` (`debug_assert`, `precondition`) use it to drop their
-/// guarded form entirely in the modes where their tier is elided — so
-/// the guarded condition is never placed in the output AST, never
-/// lowered, and never evaluated. `assert` does not consult it (it is
-/// always-on). The returned string is a static label, so no allocation
-/// or source-reflection capability is required. Argument count is
-/// ignored: `optimize_mode()` takes none.
-fn optimizeModeIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
-    _ = args;
-    const label: []const u8 = switch (env.optimize_mode) {
-        .debug => "debug",
-        .release_safe => "release_safe",
-        .release_fast => "release_fast",
-        .release_small => "release_small",
-    };
-    return CtValue{ .string = label };
-}
-
 fn sourceTextIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
     if (args.len != 1) return CtValue{ .string = "" };
     if (!hasReflectionCapability(env)) {

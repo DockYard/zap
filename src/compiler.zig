@@ -3390,7 +3390,6 @@ pub fn collectAllFromUnits(
             interner,
             &collector,
             &diag_engine,
-            options.frontend_optimize_mode,
         ) catch |err| {
             progressClear(options);
             emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
@@ -3628,7 +3627,6 @@ fn collectAllFromParsedPrograms(
         interner,
         &collector,
         &diag_engine,
-        options.frontend_optimize_mode,
     ) catch |err| {
         progressClear(options);
         emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
@@ -3890,7 +3888,6 @@ const Pipeline = struct {
     fn runMacroExpand(self: *Pipeline, program: *const ast.Program) CompileError!ast.Program {
         self.progress("Expand macros");
         var macro_engine = zap.MacroEngine.init(self.alloc, self.ctx.interner, &self.ctx.collector.graph);
-        macro_engine.setOptimizeMode(self.options.frontend_optimize_mode);
         defer macro_engine.deinit();
         const expanded = macro_engine.expandProgram(program) catch {
             for (macro_engine.errors.items) |macro_err| {
@@ -4350,10 +4347,8 @@ fn legacyMacroExpandAndDesugar(
     interner: *ast.StringInterner,
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
-    optimize_mode: frontend_policy.FrontendOptimizeMode,
 ) CompileError!ast.Program {
     var macro_engine = zap.MacroEngine.init(alloc, interner, &collector.graph);
-    macro_engine.setOptimizeMode(optimize_mode);
     defer macro_engine.deinit();
     const expanded_program = macro_engine.expandProgram(program) catch {
         for (macro_engine.errors.items) |macro_err| {
@@ -4412,7 +4407,6 @@ fn stagedMacroExpandAndDesugar(
             collector,
             diag_engine,
             &compiled_executor,
-            options.frontend_optimize_mode,
         );
         const expand_ms = staged_timer.lapMs();
         try expanded_structs.append(alloc, .{ .name = original.name, .program = desugared });
@@ -4457,7 +4451,6 @@ fn stagedMacroExpandAndDesugar(
             collector,
             diag_engine,
             &compiled_executor,
-            options.frontend_optimize_mode,
         );
         try expanded_structs.append(alloc, .{ .name = original.name, .program = desugared });
     }
@@ -4471,7 +4464,6 @@ fn stagedMacroExpandAndDesugar(
             collector,
             diag_engine,
             &compiled_executor,
-            options.frontend_optimize_mode,
         );
         break :blk expanded;
     } else null;
@@ -4577,7 +4569,6 @@ fn stagedMacroExpandAndDesugarCached(
             collector,
             diag_engine,
             &compiled_executor,
-            options.frontend_optimize_mode,
             cache,
         );
         const desugared = expanded.program;
@@ -4632,7 +4623,6 @@ fn stagedMacroExpandAndDesugarCached(
         collector,
         diag_engine,
         &compiled_executor,
-        options.frontend_optimize_mode,
         cache,
     );
 
@@ -4766,7 +4756,6 @@ fn cachedOrExpandTopLevelProgram(
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
     compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
-    optimize_mode: frontend_policy.FrontendOptimizeMode,
     cache: *ExpansionCacheWork,
 ) CompileError!?ast.Program {
     if (top_level_items.len == 0) return null;
@@ -4786,7 +4775,6 @@ fn cachedOrExpandTopLevelProgram(
             collector,
             diag_engine,
             compiled_executor,
-            optimize_mode,
         );
         try updateImplDeclsInProgram(collector, &expanded);
         return expanded;
@@ -4809,7 +4797,6 @@ fn cachedOrExpandTopLevelProgram(
         collector,
         diag_engine,
         compiled_executor,
-        optimize_mode,
     );
     artifact.program = try cloneAstProgramOwned(artifact_alloc, expanded_program, interner);
     try updateImplDeclsInProgram(collector, &artifact.program);
@@ -4824,7 +4811,6 @@ fn cachedOrExpandStagedStruct(
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
     compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
-    optimize_mode: frontend_policy.FrontendOptimizeMode,
     cache: *ExpansionCacheWork,
 ) CompileError!StagedExpansionResult {
     const cached = cache.state.expanded_structs.get(original.name);
@@ -4857,7 +4843,6 @@ fn cachedOrExpandStagedStruct(
         collector,
         diag_engine,
         compiled_executor,
-        optimize_mode,
     );
     artifact.program = try cloneAstProgramOwned(artifact_alloc, expanded_program, interner);
     try reCollectFunctionsInProgram(collector, &artifact.program);
@@ -4897,7 +4882,6 @@ fn expandAndDesugarTopLevelProgram(
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
     compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
-    optimize_mode: frontend_policy.FrontendOptimizeMode,
 ) CompileError!ast.Program {
     const top_program = ast.Program{ .structs = &.{}, .top_items = top_items };
     const error_baseline = diag_engine.errorCount();
@@ -4905,7 +4889,6 @@ fn expandAndDesugarTopLevelProgram(
     var macro_engine = zap.MacroEngine.init(alloc, interner, &collector.graph);
     defer macro_engine.deinit();
     macro_engine.setCompiledExecutor(compiled_executor);
-    macro_engine.setOptimizeMode(optimize_mode);
     const expanded = macro_engine.expandProgram(&top_program) catch {
         for (macro_engine.errors.items) |macro_err| {
             diag_engine.err(macro_err.message, macro_err.span) catch {};
@@ -4931,7 +4914,6 @@ fn expandAndDesugarStagedStruct(
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
     compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
-    optimize_mode: frontend_policy.FrontendOptimizeMode,
 ) CompileError!ast.Program {
     const error_baseline = diag_engine.errorCount();
 
@@ -4958,7 +4940,6 @@ fn expandAndDesugarStagedStruct(
     var macro_engine = zap.MacroEngine.init(alloc, interner, &collector.graph);
     defer macro_engine.deinit();
     macro_engine.setCompiledExecutor(compiled_executor);
-    macro_engine.setOptimizeMode(optimize_mode);
     const expanded = macro_engine.expandProgram(&substituted) catch {
         for (macro_engine.errors.items) |macro_err| {
             diag_engine.err(macro_err.message, macro_err.span) catch {};
@@ -4980,7 +4961,7 @@ fn expandAndDesugarStagedStruct(
     };
     try reCollectFunctionsInProgram(collector, &desugared);
     try updateImplDeclsInProgram(collector, &desugared);
-    try expandGraphImplsForProgram(alloc, &desugared, interner, collector, diag_engine, compiled_executor, optimize_mode);
+    try expandGraphImplsForProgram(alloc, &desugared, interner, collector, diag_engine, compiled_executor);
     return desugared;
 }
 
@@ -4991,7 +4972,6 @@ fn expandGraphImplsForProgram(
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
     compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
-    optimize_mode: frontend_policy.FrontendOptimizeMode,
 ) CompileError!void {
     for (collector.graph.impls.items) |*entry| {
         var target_in_program = false;
@@ -5014,7 +4994,6 @@ fn expandGraphImplsForProgram(
         var macro_engine = zap.MacroEngine.init(alloc, interner, &collector.graph);
         defer macro_engine.deinit();
         macro_engine.setCompiledExecutor(compiled_executor);
-        macro_engine.setOptimizeMode(optimize_mode);
         const expanded = macro_engine.expandProgram(&impl_program) catch {
             for (macro_engine.errors.items) |macro_err| {
                 diag_engine.err(macro_err.message, macro_err.span) catch {};
