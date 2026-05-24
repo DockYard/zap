@@ -262,6 +262,22 @@ pub fn findCatalogEntry(
     while (lines.next()) |raw_line| {
         const trimmed = std.mem.trim(u8, raw_line, " \t\r");
 
+        // Catalog-heredoc close: the records live inside `@doc = """ … """`,
+        // and a line that is exactly `"""` ends that heredoc — i.e. the end
+        // of the catalog data. The LAST `[Zxxxx]` record is followed by this
+        // close and then unrelated source (the `Zap.ErrorCatalog` marker
+        // struct's own `@doc`, the `pub struct` line). Without this, those
+        // lines are mis-read as continuation lines of the last record's final
+        // `key:` value (they are neither a `key:` line nor a `[Zxxxx]`
+        // header), bleeding the trailing source into the explanation. Flush
+        // the pending target value and stop scanning at the heredoc close.
+        if (std.mem.eql(u8, trimmed, "\"\"\"")) {
+            if (in_target_record) {
+                try flush(&entry, current_key, buffer.items, value_arena);
+            }
+            break;
+        }
+
         // Record header: `[Zxxxx]`.
         if (trimmed.len >= 2 and trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']') {
             const header_code = trimmed[1 .. trimmed.len - 1];
@@ -455,6 +471,41 @@ test "findCatalogEntry parses the last record in the file (EOF flush)" {
     const entry = (try findCatalogEntry(alloc, catalog, "Z1004")).?;
     try std.testing.expectEqualStrings("IndexError", entry.title);
     try std.testing.expectEqualStrings("out of bounds", entry.explanation);
+}
+
+test "findCatalogEntry stops the last record at the catalog heredoc close" {
+    // The real `lib/error_catalog.zap` keeps the catalog inside an
+    // `@doc = """ … """` heredoc; the LAST `[Zxxxx]` record is followed by
+    // the closing `"""` and then unrelated source (a second `@doc` heredoc
+    // and the `Zap.ErrorCatalog` marker struct). A `"""` line on its own
+    // terminates the catalog data: the last record's final value must NOT
+    // swallow the heredoc close or the trailing source as continuation lines.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const catalog =
+        \\@doc = """
+        \\  [Z9100]
+        \\  title: ICE script
+        \\  [Z9101]
+        \\  title: ICE project
+        \\  fix: file a report with the Z9101 code.
+        \\  """
+        \\
+        \\@doc = """
+        \\  Marker struct so the file is a well-formed Zap unit.
+        \\  """
+        \\
+        \\pub struct Zap.ErrorCatalog {}
+    ;
+    const entry = (try findCatalogEntry(alloc, catalog, "Z9101")).?;
+    try std.testing.expectEqualStrings("Z9101", entry.code);
+    try std.testing.expectEqualStrings("ICE project", entry.title);
+    // The `fix` value must end at the record's own text — it must not absorb
+    // the closing `"""`, the second `@doc`, the marker-struct prose, or the
+    // `pub struct` line.
+    try std.testing.expectEqualStrings("file a report with the Z9101 code.", entry.fix);
 }
 
 test "checkCodeCollisions is clean when codes are distinct" {
