@@ -374,7 +374,7 @@ A first-class system is **one model with four surfaces and one renderer**, not f
   struct value), preserving zero-cost happy path for `Result`-returned errors.
 
 - **Stdlib `pub error` types**: `RuntimeError`, `ArgumentError`, `ArithmeticError`, `KeyError`,
-  `MatchError`, `IndexError`, `OutOfMemoryError`, `AssertionError`. All in `lib/`.
+  `MatchError`, `IndexError`, `OutOfMemoryError`. All in `lib/`.
 
 - **Parametric errors**: `pub error DeserializeError(T) { … }` — same parametric syntax as
   `pub struct`.
@@ -504,7 +504,7 @@ flag each independently.
 | 3 | **OOM under ARC = abandonment, not recoverable** | Infallible allocation by default in `Memory.ARC`; an explicit `try_alloc` builder for fallible code (CI runners, embedded). Aligns with Midori; both Roc and Koka punt on this and pay later. |
 | 4 | **Async-signal-safe crash printer** | Must be reachable from a SIGTRAP/SIGSEGV handler. **No `malloc`, only `write`/`_exit`** and other POSIX async-signal-safe calls. Reuse the fork's `std.debug` paths which are already signal-aware. Required to reach the known startup SIGTRAP defect from its signal handler. |
 | 5 | **Panic-in-`defer` / double-fault containment** | Second panic during unwind → immediate `abort` with a distinct exit code (e.g. `137 + double-fault marker`), no further user code. Rust precedent. |
-| 6 | **Three-tier contracts** — `assert` (always-on), `debug_assert` (debug-only), `precondition` (release-elided) | Eiffel/Ada/SPARK/Swift precedent. Avoids ambiguity about which assertions survive a release build. |
+| 6 | ~~**Three-tier contracts** — `assert` (always-on), `debug_assert` (debug-only), `precondition` (release-elided)~~ **REMOVED in deflation pass.** Originally drawn from Eiffel/Ada/SPARK/Swift precedent, but misaligned with an Elixir-influenced functional language: Elixir has no language-level `assert` (assertions are a test-framework concern). Zest (`assert`/`reject`) is the assertion surface; production invariants use `raise` or a failing `case`. |
 | 7 | **Per-optimize-mode arithmetic overflow / bounds policy** | Trap in Debug/ReleaseSafe; wrap in ReleaseFast (Zig's model). Document explicitly that traps `raise %ArithmeticError`. |
 | 8 | **Tail-call + `?` interaction** | ERT recording is a guarded out-of-line call so `tail-return foo()?` stays a tail call. Kelley 2018. |
 | 9 | **Diagnostic security tiers** — developer-local / CI-internal / user-safe | Strip absolute paths in release reports; never include heap contents in the default report; emit ASLR-relative offsets when symbolication is unavailable. Sanitizer runtimes are **never** linked into production builds. |
@@ -621,7 +621,7 @@ acceptance test (Part VIII).
 ### Phase 2 — Unrecoverable model + crash reports + three-tier contracts
 
 - Stdlib `pub error` types in `lib/`: `RuntimeError`, `ArgumentError`, `ArithmeticError`, `KeyError`,
-  `MatchError`, `IndexError`, `OutOfMemoryError`, `AssertionError`. Each gets a `@code Zxxxx` so the
+  `MatchError`, `IndexError`, `OutOfMemoryError`. Each gets a `@code Zxxxx` so the
   catalog seeds with stable codes from day one.
 - `raise` accepts any value whose type implements `Error` (uniformly produced by `pub error`).
   Captures a backtrace via the Phase-0 DWARF + a new `zap_capture_backtrace` C-ABI in the fork.
@@ -629,8 +629,10 @@ acceptance test (Part VIII).
   exception + caret'd Zap source line at raise site + symbolized stack trace + ERT.
 - Panic-in-`defer` / double-fault: second panic → distinct exit code + immediate abort, no further
   user code.
-- Three-tier contracts: `assert` (always-on), `debug_assert` (debug-only), `precondition`
-  (release-elided). Maps to `AssertionError` at trap sites where appropriate.
+- ~~Three-tier contracts: `assert` (always-on), `debug_assert` (debug-only), `precondition`
+  (release-elided).~~ **REMOVED in deflation pass** (see decision #6 above). Assertions are a
+  test-framework concern: Zest provides `assert`/`reject`; production invariants use `raise` or a
+  failing `case`. No language-level contract macros and no `AssertionError` type remain.
 - `defer` and `errdefer` lowering wired into the ARC retain/release allow-list with tests.
 - `ZAP_BACKTRACE=full|short|0` convention.
 - **Acceptance:** the known startup SIGTRAP defect produces a symbolicated report; a double-fault

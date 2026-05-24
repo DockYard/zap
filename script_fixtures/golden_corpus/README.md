@@ -52,7 +52,6 @@ asserted verbatim.
 | `type_error_two_sided` | `domain=type` — two-sided `TypeProvenance` (got vs declared-here) |
 | `undefined_name` | `domain=name` — undefined fn + `did you mean …?` fix-it |
 | `runtime_raise` | `domain=panic` runtime `raise` crash + cross-fn `error return trace:` |
-| `assertion_error` | `domain=panic`, `sub_kind=assertion_error` contract violation |
 | `arithmetic_overflow` | `domain=panic`, `sub_kind=arithmetic_error` overflow trap (safe build) |
 | `index_error` | `domain=panic`, `sub_kind=index_error` out-of-bounds `List.get` |
 | `leak_report` | `domain=leak` — attributed survivor under `-Dmemory=Memory.Tracking` |

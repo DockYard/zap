@@ -219,7 +219,7 @@ end
 | Category | Effect tracking | Release behavior | Example |
 |---|---|---|---|
 | Semantic effects | Derived, queryable via MCP | Preserved | IO, FileSystem, System |
-| Diagnostic effects | Excluded from derivation | Erased | inspect, trace, debug_assert |
+| Diagnostic effects | Excluded from derivation | Erased | inspect, trace |
 
 ---
 

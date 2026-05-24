@@ -773,17 +773,17 @@ pub const FrontendIncrementalState = struct {
             // topological ordering of the SOURCE structs. Structs that
             // only exist after desugaring — notably the `pub struct Foo`
             // produced by every `pub error Foo` rewrite (e.g.
-            // `AssertionError`, `RuntimeError`) — are absent from it
+            // `RuntimeError`, `IndexError`) — are absent from it
             // because discovery ran before `applyErrorDeclDesugar`. They
             // ARE present in `ctx.struct_programs` (built from the fully
             // desugared programs and registered in the re-collected
             // scope graph). Compiling only `struct_order` would silently
             // drop these structs from the merged IR: their `pub impl
-            // Error` method functions (`AssertionError.message__1`, …)
+            // Error` method functions (`RuntimeError.message__1`, …)
             // would never be lowered, so the protocol vtable instance
-            // `ErrorVTable_for_AssertionError` — which IS emitted — would
+            // `ErrorVTable_for_RuntimeError` — which IS emitted — would
             // reference methods that do not exist, tripping the ZIR
-            // backend's "struct 'AssertionError' has no member named
+            // backend's "struct 'RuntimeError' has no member named
             // 'message__1'" (#186). Append every collected struct program
             // missing from the precomputed order so the compilation set
             // is the union of the discovery order and the actually
@@ -3507,11 +3507,11 @@ fn collectAllFromParsedPrograms(
     // surfaces via the per-program desugar fallback, which appends it to
     // `top_items` rather than `program.structs`. `buildStructPrograms` only
     // promotes `program.structs` entries into struct programs, so the
-    // generated error structs (e.g. `AssertionError`) would be dropped from
-    // the re-collected scope graph — leaving `%AssertionError{}` literals in
-    // stdlib code (such as `Kernel.contract_violation`) typed UNKNOWN, which
+    // generated error structs (e.g. `RuntimeError`) would be dropped from
+    // the re-collected scope graph — leaving `%RuntimeError{}` literals in
+    // stdlib code typed UNKNOWN, which
     // suppresses the protocol-box auto-boxing and trips Sema's
-    // `expected zap_runtime.ProtocolBox, found Kernel.contract_violation__3__struct`
+    // `expected zap_runtime.ProtocolBox, found <error-struct>` mismatch
     // in the whole-stdlib `zap test` build (#186). Running the desugar here
     // makes the daemon path treat `pub error` exactly like the whole-program
     // path so the rest of the pipeline never sees a raw `ErrorDecl`.

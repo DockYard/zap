@@ -133,7 +133,6 @@ compile_case undefined_name
 echo
 echo "-- runtime diagnostics (text + JSON) --"
 runtime_case runtime_raise
-runtime_case assertion_error
 runtime_case arithmetic_overflow
 runtime_case index_error
 runtime_case leak_report -Dmemory=Memory.Tracking

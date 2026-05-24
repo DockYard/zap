@@ -9313,12 +9313,12 @@ pub const IrBuilder = struct {
         //     impl.
         //
         //   * A `Never`-typed divergent tail (e.g. a body whose last expression
-        //     is `contract_violation(...)`/`do_raise(...)`, a `Never`-returning
-        //     abort): the function never actually returns there, but the IR
+        //     is `do_raise(...)`, a `Never`-returning abort): the function
+        //     never actually returns there, but the IR
         //     still emits a `ret` of the divergent call's value, whose Zig type
         //     is the abort's synthesized struct — clashing with the declared
         //     `ProtocolBox` (`expected 'zap_runtime.ProtocolBox', found
-        //     'Kernel.contract_violation__…'`). Replace that dead ret value
+        //     '<abort-struct>'`). Replace that dead ret value
         //     with a `typed_undef` of the protocol box: a never-read
         //     placeholder of the right peer type, exactly as the `try`/`rescue`
         //     dead-edge coercion does. This keeps the explicit ProtocolBox
@@ -10776,10 +10776,10 @@ pub const IrBuilder = struct {
         // `resolveTypeName` fallback for a type the daemon's merged store
         // couldn't name. Without this HIR check, the ZigType path below would
         // see a non-`protocol_box`, non-impl `struct_ref`, pass the value
-        // through un-boxed, and emit a raw struct (the `contract_violation`
+        // through un-boxed, and emit a raw struct (the `do_raise`
         // abort value at the raise call site) into an `Error` parameter —
         // tripping Sema's `expected zap_runtime.ProtocolBox, found
-        // Kernel.contract_violation__3__struct`. The boxed existential needs
+        // <abort-struct>`. The boxed existential needs
         // no further boxing regardless of how its ZigType resolved.
         if (self.type_store) |ts| {
             if (self.local_hir_types.get(value_local)) |hir_type_id| {

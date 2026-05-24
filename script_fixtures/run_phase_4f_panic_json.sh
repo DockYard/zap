@@ -52,15 +52,14 @@ echo
 # A user `raise` that reaches the top unrescued is domain=runtime; the ERT
 # chain rides inside machine_data.error_return_trace.
 assert_json_domain "${CORPUS_DIR}/runtime_raise.zap"       runtime
-# In a SAFE build the Zap stdlib's own contract / arithmetic / index
-# operations deliberately `raise` the corresponding typed stdlib error
-# (AssertionError / ArithmeticError / IndexError) via
-# `Kernel.raise_with_kind` — so they are `rescue`-able recoverable raises, and
-# reaching the top unrescued is domain=runtime (NOT domain=panic). The
-# `ZapPanic` / domain=panic path is reserved for genuinely-unrecoverable
-# Zig-level safety violations (raw `unreachable`, null-unwrap, untyped overflow
-# in compiler-emitted code, hardware-fault signals).
-assert_json_domain "${CORPUS_DIR}/assertion_error.zap"     runtime
+# In a SAFE build the Zap stdlib's own arithmetic / index operations
+# deliberately `raise` the corresponding typed stdlib error
+# (ArithmeticError / IndexError) via `Kernel.raise_with_kind` — so they are
+# `rescue`-able recoverable raises, and reaching the top unrescued is
+# domain=runtime (NOT domain=panic). The `ZapPanic` / domain=panic path is
+# reserved for genuinely-unrecoverable Zig-level safety violations (raw
+# `unreachable`, null-unwrap, untyped overflow in compiler-emitted code,
+# hardware-fault signals).
 assert_json_domain "${CORPUS_DIR}/arithmetic_overflow.zap" runtime
 assert_json_domain "${CORPUS_DIR}/index_error.zap"         runtime
 
