@@ -7370,6 +7370,59 @@ pub const IrBuilder = struct {
         // a catch-all (the synthesized re-raise when the user omitted one),
         // so an unmatched error re-raises instead of being swallowed.
         const dispatch_outcome = try self.lowerRescueDispatch(handler_dest, error_local, tr.arms, tr.arm_discriminators, tr.result_type_id, tr.after_block);
+
+        // Gap D: release the recovered box at the rescue handler's scope exit
+        // on the TERMINAL-CATCH path. The body of a SLOW-path `try`/`rescue`
+        // does not itself raise (its tail is a CALL to a raising callee — e.g.
+        // a cross-function `Worker.deep()` whose error propagates through the
+        // error-union side-channel), so the box is recovered HERE inside the
+        // landing-pad `then` branch via `take_recoverable_raise → error_local`.
+        // `error_local` carries the `protocol_constraint(<Protocol>)` HIR type
+        // (propagated from `taken` above), so it is an OWNED, ARC-managed local:
+        // it is the sole owner of the boxed `Error` existential's heap cell
+        // (Gap B's move-transfer recovery). Unlike the FAST path — where the
+        // body unconditionally raises so the recovery + dispatch run as
+        // straight-line code in the FUNCTION body and the generic scope-exit
+        // drop pass releases the box at the function `ret` — here the recovery
+        // `local_set` lives INSIDE this branch. The box is therefore dead by
+        // the function-exit point (its last use is confined to this branch),
+        // so `arc_drop_insertion`'s function-exit live/owned drain never sees
+        // it and schedules NO release — the box's inner leaked under
+        // `Memory.Tracking` (masked under `Memory.ARC` by the refcount path).
+        //
+        // Emit the owner-drop explicitly at the end of this `then` branch,
+        // mirroring the FAST path's post-dispatch release of the same box. The
+        // emission is a plain `.release{value=error_local}`: `error_local`'s
+        // `protocol_constraint` HIR type drives the ZIR backend's deep-free
+        // glue (exactly the FAST path's `release value=0 kind=release`, which
+        // is leak-tight), and `rewriteProtocolBoxReleases` retags it to
+        // `.protocol_box_drop` when the box is also tracked in
+        // `protocol_box_locals` — either way the inner is released exactly
+        // once.
+        //
+        // Gated on `!dispatch_outcome.diverges` — i.e. at least one reachable
+        // arm CATCHES + yields a value, so this branch falls through to the
+        // landing-pad merge (the terminal-catch path). The release sits on that
+        // reachable fall-through, AFTER every arm's body:
+        //   * A CATCHING arm borrows the box (a pure type-binding catch-all) or
+        //     borrows its UNBOXED inner (Gap A concrete bind / struct pattern),
+        //     never transferring the box — so this release is its sole owner
+        //     drop (no double-free with Gap A's borrow, which schedules no
+        //     scope-exit release on the borrowed binding).
+        //   * A RE-RAISE arm re-boxes a FRESH copy (`box_as_protocol` of a
+        //     borrow) and propagates THAT; it does not transfer the original
+        //     box and diverges before reaching here, so the original is not
+        //     double-freed and the propagated copy is released at the eventual
+        //     top (Gap B). When EVERY arm re-raises (`dispatch_outcome.diverges`
+        //     — the cross-fn analogue of `reraise_propagates`) this branch is
+        //     flagged noreturn and there is NO fall-through: a release here
+        //     would dangle after a noreturn region (AIR Liveness). It is
+        //     correctly skipped — the box propagates via the re-raised copy and
+        //     control never returns, exactly as the FAST path's post-`if_expr`
+        //     release is unreachable on its all-diverge path.
+        if (!dispatch_outcome.diverges) {
+            try self.current_instrs.append(self.allocator, .{ .release = .{ .value = error_local } });
+        }
         const then_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
         self.current_instrs = saved_then;
 
