@@ -1274,10 +1274,6 @@ fn isFunctionBodyComptimeSafe(body: []const ast.Stmt) bool {
             // body aren't comptime-callable through dispatch (the
             // caller would have to evaluate the whole construct).
             .function_decl, .macro_decl, .import_decl, .attribute => return false,
-            // `defer`/`errdefer` carry scope-exit control-flow semantics
-            // the comptime evaluator does not model, so a body containing
-            // them is not comptime-callable.
-            .defer_stmt => return false,
         }
     }
     return true;

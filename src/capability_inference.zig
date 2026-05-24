@@ -143,9 +143,6 @@ fn walkStmt(
     switch (stmt) {
         .expr => |e| try walkExpr(allocator, record, e, interner),
         .assignment => |a| try walkExpr(allocator, record, a.value, interner),
-        // The deferred cleanup expression is ordinary runtime code, so the
-        // capabilities it exercises count toward the enclosing family.
-        .defer_stmt => |d| try walkExpr(allocator, record, d.expr, interner),
         .function_decl, .macro_decl, .import_decl, .attribute => {},
     }
 }

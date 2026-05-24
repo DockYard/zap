@@ -2401,7 +2401,6 @@ fn stmtSourceSpan(statement: ast.Stmt) ast.SourceSpan {
         .macro_decl => |decl| decl.meta.span,
         .import_decl => |decl| decl.meta.span,
         .attribute => |decl| decl.meta.span,
-        .defer_stmt => |decl| decl.meta.span,
     };
 }
 
@@ -10891,19 +10890,6 @@ fn remapStmt(alloc: std.mem.Allocator, stmt: *ast.Stmt, remap: []const ast.Strin
             mutable.* = attr.*;
             try remapAttributeDecl(alloc, mutable, remap);
             stmt.* = .{ .attribute = mutable };
-        },
-        .defer_stmt => |defer_node| {
-            // StringId-remap gotcha (see the `raises` row fix): the deferred
-            // cleanup expression carries per-unit-local StringIds (var refs,
-            // calls, struct names) that MUST be remapped against the merged
-            // global interner in the multi-unit script/project pipeline.
-            const mutable = try alloc.create(ast.DeferStmt);
-            mutable.* = defer_node.*;
-            const mutable_expr = try alloc.create(ast.Expr);
-            mutable_expr.* = defer_node.expr.*;
-            try remapExpr(alloc, mutable_expr, remap);
-            mutable.expr = mutable_expr;
-            stmt.* = .{ .defer_stmt = mutable };
         },
     }
 }

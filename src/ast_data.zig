@@ -483,17 +483,6 @@ pub fn stmtToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "import" }, try emptyList(alloc, store), args);
         },
         .attribute => |attr| return attributeDeclToCtValue(alloc, interner, store, attr),
-        .defer_stmt => |d| {
-            // Quote `defer <expr>` / `errdefer <expr>` as the Elixir-style
-            // AST tuple `{:defer | :errdefer, [], [<expr-ct>]}`.
-            const kind_atom: []const u8 = switch (d.kind) {
-                .always => "defer",
-                .on_error => "errdefer",
-            };
-            const expr_ct = try exprToCtValue(alloc, interner, store, d.expr);
-            const args = try makeList(alloc, store, &.{expr_ct});
-            return makeTuple3(alloc, store, .{ .atom = kind_atom }, try emptyList(alloc, store), args);
-        },
     };
 }
 

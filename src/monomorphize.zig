@@ -955,12 +955,6 @@ const MonomorphContext = struct {
                         self.restoreLocalTypes(&snapshot);
                     }
                 },
-                .defer_stmt => |defer_node| {
-                    // The deferred cleanup expression can call generic
-                    // functions, so it must be scanned for specialization
-                    // sites like any other expression.
-                    try self.scanExpr(defer_node.expr);
-                },
             }
         }
     }
@@ -1531,10 +1525,6 @@ const MonomorphContext = struct {
                 .index = ls.index,
                 .value = try self.cloneExpr(ls.value),
             } },
-            .defer_stmt => |defer_node| .{ .defer_stmt = .{
-                .kind = defer_node.kind,
-                .expr = try self.cloneExpr(defer_node.expr),
-            } },
             .function_group => |fg| .{ .function_group = fg }, // local fns: share, not specialized
         };
     }
@@ -1883,7 +1873,6 @@ const MonomorphContext = struct {
             switch (stmt) {
                 .expr => |e| self.rewriteExpr(e),
                 .local_set => |ls| self.rewriteExpr(ls.value),
-                .defer_stmt => |defer_node| self.rewriteExpr(defer_node.expr),
                 .function_group => |fg| {
                     for (fg.clauses) |clause| {
                         self.rewriteBlock(clause.body);

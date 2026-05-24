@@ -856,24 +856,6 @@ pub const MacroEngine = struct {
                         try new_stmts.append(self.allocator, stmt);
                     }
                 },
-                .defer_stmt => |defer_node| {
-                    // Macro-expand the deferred cleanup expression so any
-                    // macro calls inside `defer <expr>` / `errdefer <expr>`
-                    // are expanded before lowering.
-                    const expanded = try self.expandExpr(defer_node.expr);
-                    if (expanded.changed) {
-                        changed = true;
-                        try new_stmts.append(self.allocator, .{
-                            .defer_stmt = try self.create(ast.DeferStmt, .{
-                                .meta = defer_node.meta,
-                                .kind = defer_node.kind,
-                                .expr = expanded.expr,
-                            }),
-                        });
-                    } else {
-                        try new_stmts.append(self.allocator, stmt);
-                    }
-                },
             }
         }
 
@@ -3558,11 +3540,6 @@ fn stampExpansionOnStmt(stmt: ast.Stmt, info: *const ast.ExpansionInfo) void {
             const mut: *ast.AttributeDecl = @constCast(attr);
             stampMetaIfUnset(&mut.meta, info);
             if (attr.value) |value| stampExpansionOnExpr(value, info);
-        },
-        .defer_stmt => |defer_node| {
-            const mut: *ast.DeferStmt = @constCast(defer_node);
-            stampMetaIfUnset(&mut.meta, info);
-            stampExpansionOnExpr(defer_node.expr, info);
         },
     }
 }

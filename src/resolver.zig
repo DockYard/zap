@@ -234,7 +234,6 @@ pub const Resolver = struct {
             .attribute => |attr| {
                 if (attr.value) |value| try self.resolveExpr(value);
             },
-            .defer_stmt => |defer_node| try self.resolveExpr(defer_node.expr),
         }
     }
 
