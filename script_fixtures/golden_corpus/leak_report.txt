@@ -1,8 +1,9 @@
 done
-warning: memory leak: Leaked 1 `%Inner{}` (40 B), refcount 1
+warning: memory leak: Leaked 1 `%Inner{}` (40 B), allocated at <FIXTURE>:16, refcount 1
   │
   allocated here:
-  └─ 0xADDR
+  script.main at <FIXTURE>:16
+  └─ <FIXTURE>:16
 
 leak summary: 1 allocation, 40 bytes total
   1 x `%Inner{}` (40 B)
