@@ -1526,7 +1526,28 @@ fn typeIdMangledNameBorrowed(
         .list => @as([]const u8, "List"),
         .map => @as([]const u8, "Map"),
         .tuple => @as([]const u8, "Tuple"),
-        .function => @as([]const u8, "Fn"),
+        .function => |ft| blk: {
+            // #201 — encode the function type's effect AND signature so
+            // two closure types that differ only by their `raises`
+            // effect (or by parameter/return types) mangle to DISTINCT
+            // names. Without this, `() -> i64` and `() -> i64 raises`
+            // both collapse to `Fn`, and the monomorphizer's two
+            // per-effect `apply` instances emit under the same Zig
+            // symbol — a name collision that cross-binds the pure and
+            // raising call sites. Shape: `Fn[Raises]_<param…>_ret_<ret>`.
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            try buf.appendSlice(allocator, if (ft.raises) @as([]const u8, "FnRaises") else @as([]const u8, "Fn"));
+            for (ft.params) |param| {
+                try buf.append(allocator, '_');
+                const param_name = try typeIdMangledNameBorrowed(allocator, store, param);
+                try buf.appendSlice(allocator, param_name);
+            }
+            try buf.appendSlice(allocator, "_ret_");
+            const ret_name = try typeIdMangledNameBorrowed(allocator, store, ft.return_type);
+            try buf.appendSlice(allocator, ret_name);
+            break :blk try buf.toOwnedSlice(allocator);
+        },
         .unknown => @as([]const u8, "Any"),
         .error_type => @as([]const u8, "Error"),
         .struct_type => |st| @constCast(store).interner.get(st.name),
