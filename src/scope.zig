@@ -245,11 +245,11 @@ pub const ImportedScope = struct {
     /// collector injects into every struct. Explicit `use`/`import`
     /// declarations are NOT implicit. Macro/symbol resolution prefers
     /// explicit imports over the implicit Kernel one so a struct that
-    /// `use`s a library defining a same-named macro (e.g. Zest.Case's
-    /// `assert`/`reject`, which must shadow Kernel's contract-based
-    /// `assert`) sees the explicit import win the tie. Without this, the
-    /// auto-import — appended first, at scope-collection time, before any
-    /// `use` in the struct body — would always out-rank explicit imports.
+    /// `use`s a library defining a same-named macro (e.g. `use Zest.Case`,
+    /// which defines `assert`/`reject`) sees the explicit import win the
+    /// tie over any same-named Kernel macro. Without this, the auto-import
+    /// — appended first, at scope-collection time, before any `use` in the
+    /// struct body — would always out-rank explicit imports.
     is_implicit: bool = false,
 };
 
@@ -985,10 +985,13 @@ pub const ScopeGraph = struct {
             }
             // Explicit `use`/`import` declarations take precedence over the
             // implicit Kernel auto-import: scan explicit imports first, then
-            // the implicit one. This lets a struct that `use`s a library with
-            // a same-named macro (e.g. Zest.Case's recoverable `assert`)
-            // shadow Kernel's contract-based `assert`, even though the
-            // auto-import was appended to `s.imports` before the `use`.
+            // the implicit one. This is the generally-correct macro-resolution
+            // rule — an explicitly `use`d/`import`ed macro shadows any
+            // same-named macro reached only through the implicit Kernel
+            // auto-import, even though that auto-import was appended to
+            // `s.imports` before the `use`. Example: `use Zest.Case` brings in
+            // Zest's `assert`/`reject`, which must win over any same-named
+            // Kernel macro a test file would otherwise inherit.
             if (self.resolveMacroFromImports(s, key, false)) |mid| return mid;
             if (self.resolveMacroFromImports(s, key, true)) |mid| return mid;
             current = s.parent;
