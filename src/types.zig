@@ -3196,6 +3196,185 @@ pub const TypeChecker = struct {
         return safe;
     }
 
+    /// #201 — Effect-polymorphism through `call_closure`. For the callee
+    /// family `family_id`, return a per-parameter flag slice marking which
+    /// parameters the callee invokes as a *closure callee* in its body
+    /// (`f(...)` where `f` is the parameter). Such a parameter is the seat
+    /// of an inferred effect variable: the callee is polymorphic over
+    /// whatever the supplied closure raises, and the concrete effect is
+    /// instantiated at the call site from the argument closure's own
+    /// inferred `raises` row.
+    ///
+    /// A function clause whose first param the body calls as `f()` returns
+    /// `[true, ...]` at that index. This is the inverse of the borrow-escape
+    /// `safeClosureParamsForFamily` check (which asks whether a param is used
+    /// only as a direct callee): here we positively detect the callee
+    /// position so the call-site effect-instantiation knows which argument
+    /// closures contribute their effect. Returns `null` when the family has
+    /// no clauses or on OOM (callers then skip instantiation, falling back
+    /// to the pre-#201 behaviour of propagating only the callee's own row).
+    fn closureInvokedParamsForFamily(self: *const TypeChecker, family_id: scope_mod.FunctionFamilyId) ?[]const bool {
+        const family = self.graph.getFamily(family_id);
+        if (family.clauses.items.len == 0) return null;
+
+        const first_clause = family.clauses.items[0];
+        if (first_clause.clause_index >= first_clause.decl.clauses.len) return null;
+        const params = first_clause.decl.clauses[first_clause.clause_index].params;
+        const invoked = self.allocator.alloc(bool, params.len) catch return null;
+        @memset(invoked, false);
+
+        // A parameter is closure-invoked if ANY clause of the family calls
+        // it as a callee. Union across clauses so a multi-clause higher-order
+        // function (e.g. one base case that returns, one that calls `f`) still
+        // surfaces the effect.
+        for (family.clauses.items) |clause_ref| {
+            if (clause_ref.clause_index >= clause_ref.decl.clauses.len) continue;
+            const clause = clause_ref.decl.clauses[clause_ref.clause_index];
+            for (clause.params, 0..) |param, idx| {
+                if (idx >= invoked.len) break;
+                const param_name = switch (param.pattern.*) {
+                    .bind => |b| b.name,
+                    else => continue,
+                };
+                if (self.closureParamInvokedInBody(clause.body orelse &.{}, param_name)) {
+                    invoked[idx] = true;
+                }
+            }
+        }
+
+        return invoked;
+    }
+
+    /// True when `param_name` appears as the callee of a call anywhere in
+    /// `body` (`param_name(...)`). Recurses through the same statement and
+    /// expression shapes as `isClosureParamUsedLocally` so nested blocks,
+    /// `if`/`case`/`cond` arms, and pipes are all covered.
+    fn closureParamInvokedInBody(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) bool {
+        for (body) |stmt| {
+            switch (stmt) {
+                .expr => |expr| {
+                    if (self.exprInvokesClosureParam(expr, param_name)) return true;
+                },
+                .assignment => |assign| {
+                    if (self.exprInvokesClosureParam(assign.value, param_name)) return true;
+                },
+                .attribute => |attr| {
+                    if (attr.value) |value| {
+                        if (self.exprInvokesClosureParam(value, param_name)) return true;
+                    }
+                },
+                .function_decl, .macro_decl, .import_decl => {},
+            }
+        }
+        return false;
+    }
+
+    /// True when `param_name` is the direct callee of a `call` expression
+    /// reachable from `expr` (`param_name(args...)`). A reference to
+    /// `param_name` in any non-callee position does NOT count — only the
+    /// invocation establishes the effect dependency.
+    fn exprInvokesClosureParam(self: *const TypeChecker, expr: *const ast.Expr, param_name: ast.StringId) bool {
+        switch (expr.*) {
+            .call => |call| {
+                if (call.callee.* == .var_ref and call.callee.var_ref.name == param_name) return true;
+                if (self.exprInvokesClosureParam(call.callee, param_name)) return true;
+                for (call.args) |arg| {
+                    if (self.exprInvokesClosureParam(arg, param_name)) return true;
+                }
+                return false;
+            },
+            .tuple => |tuple_expr| {
+                for (tuple_expr.elements) |elem| {
+                    if (self.exprInvokesClosureParam(elem, param_name)) return true;
+                }
+                return false;
+            },
+            .list => |list_expr| {
+                for (list_expr.elements) |elem| {
+                    if (self.exprInvokesClosureParam(elem, param_name)) return true;
+                }
+                return false;
+            },
+            .map => |map_expr| {
+                for (map_expr.fields) |field| {
+                    if (self.exprInvokesClosureParam(field.key, param_name)) return true;
+                    if (self.exprInvokesClosureParam(field.value, param_name)) return true;
+                }
+                return false;
+            },
+            .struct_expr => |struct_expr| {
+                if (struct_expr.update_source) |source| {
+                    if (self.exprInvokesClosureParam(source, param_name)) return true;
+                }
+                for (struct_expr.fields) |field| {
+                    if (self.exprInvokesClosureParam(field.value, param_name)) return true;
+                }
+                return false;
+            },
+            .binary_op => |bo| return self.exprInvokesClosureParam(bo.lhs, param_name) or self.exprInvokesClosureParam(bo.rhs, param_name),
+            .unary_op => |uo| return self.exprInvokesClosureParam(uo.operand, param_name),
+            .field_access => |fa| return self.exprInvokesClosureParam(fa.object, param_name),
+            .pipe => |pipe| return self.exprInvokesClosureParam(pipe.lhs, param_name) or self.exprInvokesClosureParam(pipe.rhs, param_name),
+            .unwrap => |uw| return self.exprInvokesClosureParam(uw.expr, param_name),
+            .type_annotated => |ta| return self.exprInvokesClosureParam(ta.expr, param_name),
+            .if_expr => |ie| {
+                if (self.exprInvokesClosureParam(ie.condition, param_name)) return true;
+                if (self.closureParamInvokedInBody(ie.then_block, param_name)) return true;
+                if (ie.else_block) |else_block| if (self.closureParamInvokedInBody(else_block, param_name)) return true;
+                return false;
+            },
+            .block => |block| return self.closureParamInvokedInBody(block.stmts, param_name),
+            .cond_expr => |cond_expr| {
+                for (cond_expr.clauses) |clause| {
+                    if (self.exprInvokesClosureParam(clause.condition, param_name)) return true;
+                    if (self.closureParamInvokedInBody(clause.body, param_name)) return true;
+                }
+                return false;
+            },
+            .case_expr => |case_expr| {
+                if (self.exprInvokesClosureParam(case_expr.scrutinee, param_name)) return true;
+                for (case_expr.clauses) |clause| {
+                    if (self.closureParamInvokedInBody(clause.body, param_name)) return true;
+                }
+                return false;
+            },
+            // A nested anonymous function does NOT propagate the OUTER
+            // parameter's invocation: the closure has its own effect scope,
+            // captured separately.
+            .anonymous_function => return false,
+            else => return false,
+        }
+    }
+
+    /// #201 — Resolve the inferred `raises` row of a closure ARGUMENT
+    /// expression (an `fn(...) -> ... end` literal or a `var_ref` bound to a
+    /// function value) and fold it into the enclosing function's live row.
+    /// This is the call-site instantiation of a callee's polymorphic
+    /// closure-parameter effect: when a higher-order callee invokes a
+    /// parameter as a closure, supplying a raising closure surfaces that
+    /// closure's effect HERE, exactly as a direct `raise` at this call site.
+    /// A pure closure has an empty row and contributes nothing — the effect
+    /// is polymorphic, not blanket-assumed.
+    fn recordClosureArgRaisesRow(self: *TypeChecker, arg: *const ast.Expr, span: ast.SourceSpan) !void {
+        const decl = self.closureDeclFromExpr(arg) orelse return;
+        const key = self.raisesRowKeyForClosureDecl(decl) orelse return;
+        const row = self.store.inferred_raises.get(key) orelse return;
+        for (row) |error_type| {
+            try self.recordRaisedErrorType(error_type, span);
+        }
+    }
+
+    /// Resolve the stable `inferred_raises` key for a closure/anonymous
+    /// function declaration `decl` by locating its family in the scope graph
+    /// (closures are registered as anonymous function families) and deriving
+    /// the qualified-name key the body-check stored its row under. Returns
+    /// null when the declaration has no resolvable family.
+    fn raisesRowKeyForClosureDecl(self: *TypeChecker, decl: *const ast.FunctionDecl) ?ast.StringId {
+        if (decl.clauses.len == 0) return null;
+        const clause = &decl.clauses[0];
+        return self.raisesRowKeyForDecl(decl, clause);
+    }
+
     fn isClosureParamUsedLocally(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) bool {
         for (body) |stmt| {
             switch (stmt) {
@@ -5590,6 +5769,44 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// #201 — instantiate a callee's polymorphic closure-parameter effect
+    /// with the effect of each closure ARGUMENT supplied to a parameter the
+    /// callee invokes as a closure. This is the indirect (closure-value) half
+    /// of effect propagation: a higher-order callee like
+    /// `apply(f) -> f() end` carries an effect variable on its closure
+    /// parameter; supplying a raising closure instantiates that variable HERE,
+    /// surfacing the closure's `raises` at this call site so an enclosing
+    /// `try`/`rescue` discharges it — and an undischarged instantiation keeps
+    /// propagating, exactly like a direct `raise`. A pure closure argument has
+    /// an empty row and contributes nothing (the effect is polymorphic, not
+    /// blanket-assumed), so a callee invoked only with pure closures is never
+    /// forced to raise.
+    ///
+    /// MUST be invoked AFTER the call's arguments have been type-checked, so a
+    /// raising `fn() -> raise X end` argument has already stored its inferred
+    /// row. The callee's OWN stored row is recorded separately (the existing
+    /// `recordCalleeRaisesRow` at each call site) — this method adds only the
+    /// instantiated closure-argument effects.
+    ///
+    /// Generalises #193's combinator effect-polymorphism (which threaded the
+    /// effect through an eta-expanded forwarding closure whose body made a
+    /// *direct* call) to the genuine indirect path where the callee invokes a
+    /// closure value through `call_closure`.
+    fn recordClosureArgEffectsForFamily(
+        self: *TypeChecker,
+        family_id: scope_mod.FunctionFamilyId,
+        args: []const *const ast.Expr,
+        span: ast.SourceSpan,
+    ) !void {
+        const invoked = self.closureInvokedParamsForFamily(family_id) orelse return;
+        defer self.allocator.free(invoked);
+        for (args, 0..) |arg, idx| {
+            if (idx >= invoked.len) break;
+            if (!invoked[idx]) continue;
+            try self.recordClosureArgRaisesRow(arg, span);
+        }
+    }
+
     /// Render an error row as a `(A | B | ...)`-style string for
     /// diagnostics. A single-element row renders without parentheses.
     fn formatRaisesRow(self: *TypeChecker, row: []const TypeId) ![]const u8 {
@@ -7005,6 +7222,13 @@ pub const TypeChecker = struct {
             }
         }
 
+        // #201: now that the closure arguments have been type-checked (their
+        // bodies' inferred `raises` rows are stored), instantiate the callee's
+        // polymorphic closure-parameter effect with the supplied closures'
+        // rows. Runs AFTER arg inference so a raising `fn() -> raise X end`
+        // argument has already populated its row.
+        try self.recordClosureArgEffectsForFamily(target.family_id, call.args, call.meta.span);
+
         const borrowed = try self.applyCallOwnership(call.args, signature.toFunctionType());
         defer self.endBorrowedBindings(borrowed) catch {};
         return signature.return_type;
@@ -7071,6 +7295,11 @@ pub const TypeChecker = struct {
                     // enclosing function's row (implicit propagation), keyed by the
                     // resolved family so cross-struct method names never alias.
                     try self.recordCalleeRaisesRow(resolved_call.family_id, call.meta.span);
+                    // #201: instantiate the callee's polymorphic closure-parameter
+                    // effect with each closure argument's row. Args were already
+                    // type-checked via `inferCallArgTypes` above, so a raising
+                    // closure argument has stored its inferred row.
+                    try self.recordClosureArgEffectsForFamily(resolved_call.family_id, call.args, call.meta.span);
                     const safe_params = self.safeClosureParamsForCurrentCallee(vr.name, arity);
                     for (call.args, 0..) |arg, idx| {
                         if (arg.* != .var_ref) continue;
@@ -7352,6 +7581,15 @@ pub const TypeChecker = struct {
                                 // picks up `deep`'s row and the `rescue`
                                 // discharges it.
                                 try self.recordCalleeRaisesRow(resolved_call.family_id, call.meta.span);
+                                // #201: a struct-qualified higher-order call
+                                // like `Higher.apply(fn() -> raise X end)`
+                                // instantiates apply's polymorphic closure-
+                                // parameter effect with the closure argument's
+                                // row. `inferCallArgTypes` above already
+                                // type-checked the closure (storing its row),
+                                // so the instantiated effect surfaces here for
+                                // the enclosing `try`/`rescue` to discharge.
+                                try self.recordClosureArgEffectsForFamily(resolved_call.family_id, call.args, call.meta.span);
                                 // Check if the signature is generic (contains type variables)
                                 var mod_sig_is_generic = false;
                                 for (signature.params) |param_type| {
