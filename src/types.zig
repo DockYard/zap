@@ -6779,7 +6779,18 @@ pub const TypeChecker = struct {
             },
 
             .anonymous_function => |anon| {
+                // #201 — checking the closure body records ITS `raise`s into
+                // the shared `current_raises` accumulator. A closure value is
+                // a deferred computation, not an effect of the function that
+                // CONSTRUCTS it: returning or storing a raising closure does
+                // not make the enclosing function raise (only INVOKING it
+                // does, which the call-site `recordClosureArgEffectsForFamily`
+                // discharge folds in deliberately). So snapshot the enclosing
+                // accumulator across the nested check and restore it, leaving
+                // only the closure's OWN stored row (keyed by its family).
+                const enclosing_raises_mark = self.current_raises.items.len;
                 try self.checkFunctionDecl(anon.decl);
+                self.current_raises.shrinkRetainingCapacity(enclosing_raises_mark);
                 // The closure's body has now been checked, so its
                 // inferred `raises` row is recorded. Carry that
                 // effect on the closure VALUE's function type so a
