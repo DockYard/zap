@@ -387,7 +387,6 @@ pub const Resolver = struct {
                     .function => |func| try self.resolveExpr(func),
                 }
             },
-            .try_expr => |te| try self.resolveExpr(te.value),
             .try_rescue => |tr| {
                 for (tr.body) |stmt| try self.resolveStmt(stmt);
                 for (tr.rescue_clauses) |clause| {

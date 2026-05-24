@@ -11114,12 +11114,6 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
             try remapExpr(alloc, mutable, remap);
             uw.expr = mutable;
         },
-        .try_expr => |*te| {
-            const mutable = try alloc.create(ast.Expr);
-            mutable.* = te.value.*;
-            try remapExpr(alloc, mutable, remap);
-            te.value = mutable;
-        },
         .try_rescue => |*tr| {
             // Remap the body, every rescue clause (pattern + type_annotation +
             // guard + body — `remapCaseClause` handles the StringId-bearing

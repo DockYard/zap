@@ -83,7 +83,6 @@ pub const Token = struct {
         pipe, // |
         diamond, // <>
         bang, // !
-        question, // ? (postfix Result-propagation operator)
         ampersand, // &
         caret, // ^
         hash_brace, // #{

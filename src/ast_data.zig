@@ -303,11 +303,6 @@ pub fn exprToCtValue(
             const args = try makeList(alloc, store, &.{value});
             return makeTuple3(alloc, store, .{ .atom = "raise" }, try metaToList(alloc, store, v.meta, null), args);
         },
-        .try_expr => |v| {
-            const inner = try exprToCtValue(alloc, interner, store, v.value);
-            const args = try makeList(alloc, store, &.{inner});
-            return makeTuple3(alloc, store, .{ .atom = "?" }, try metaToList(alloc, store, v.meta, null), args);
-        },
         // {:try_rescue, meta, [do: body, rescue: [clauses...], after: cleanup_or_nil]}
         // where each rescue clause is {:->, [], [[pattern], body]}, mirroring
         // the `cond`/`case` arm serialization.

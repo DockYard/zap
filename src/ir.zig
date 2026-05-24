@@ -2210,7 +2210,8 @@ pub const ErrorCatch = struct {
 /// the call site.
 pub const ErrorUnionUnwrapMode = enum {
     /// `try callee()` — propagate the error out of the enclosing error-union
-    /// function (the implicit `?`); Zig records the error return trace.
+    /// function (implicit cross-function propagation); Zig records the error
+    /// return trace.
     propagate,
     /// `callee() catch undefined` — on error, fall through to the enclosing
     /// `try`'s landing pad (the boxed payload is in the side-channel).
@@ -7082,27 +7083,6 @@ pub const IrBuilder = struct {
         }
     }
 
-    /// Lower the realized `?` propagation operator (`ExprKind.try_project`)
-    /// into a comptime-safe `union_switch` over the operand's `Result(T, E)`:
-    ///
-    ///   * the `Ok(v)` prong binds the payload to a fresh local and
-    ///     `case_break`s it to `dest` (yielding the unwrapped value), and
-    ///   * the `Error(e)` prong binds the payload, re-wraps
-    ///     `Result(T, E).Error(e)` via `union_init` (auto-boxing the payload
-    ///     into a `runtime.ProtocolBox` when the variant's payload type is a
-    ///     protocol existential — the Acceptance-E cross-struct path), then
-    ///     `ret`-terminates to early-return the enclosing function.
-    ///
-    /// `union_switch` is the realized form of the design's `TryProject` node:
-    /// the Ok prong is the projection and the Error prong is the early
-    /// return. The Error prong is `noreturn`, so the switch's value flows
-    /// solely from the Ok prong — exactly the semantics of `expr?`.
-    ///
-    /// ARC return-source contract: the Error re-wrap value is a freshly
-    /// constructed `Result.Error(...)` local that the `ret` consumes, so the
-    /// enclosing function's return-source set already covers it (every `ret`
-    /// value is a return source). The Ok payload `v` becomes the expression
-    /// result through `dest` like any other case-break value.
     /// Lower a `try { body } rescue { … } after { … }` handler (Phase 3.a).
     ///
     /// Realized as: run the body (its recoverable `raise` sites stash the
@@ -7711,84 +7691,6 @@ pub const IrBuilder = struct {
             },
             .function_group => return null,
         }
-    }
-
-    fn lowerTryProject(self: *IrBuilder, tp: hir_mod.TryProjectHir, dest: LocalId) anyerror!void {
-        const scrutinee_local = try self.lowerExpr(tp.operand);
-
-        const result_type_name = self.resolveTypeName(tp.result_type_id);
-        const ok_name = self.interner.get(tp.ok_variant_name);
-        const error_name = self.interner.get(tp.error_variant_name);
-
-        // --- Ok prong: bind the payload, yield it to `dest`. ---
-        // The payload local is bound to the switch's payload-capture
-        // placeholder by the ZIR backend, so the prong yields it directly via
-        // `case_break` (no intermediate copy — an extra `local_get` of the
-        // capture would emit a coercion `ty_op` against the as-yet-unresolved
-        // capture Ref and trip AIR Liveness).
-        const ok_payload_local = self.next_local;
-        self.next_local += 1;
-
-        const saved_ok = self.current_instrs;
-        self.current_instrs = .empty;
-        try self.current_instrs.append(self.allocator, .{ .case_break = .{ .value = ok_payload_local } });
-        const ok_body = try self.current_instrs.toOwnedSlice(self.allocator);
-        self.current_instrs = saved_ok;
-
-        // --- Error prong: bind the payload, re-wrap Result.Error(e), ret. ---
-        const err_payload_local = self.next_local;
-        self.next_local += 1;
-        const rewrapped_local = self.next_local;
-        self.next_local += 1;
-
-        const saved_err = self.current_instrs;
-        self.current_instrs = .empty;
-        // Auto-box the error payload when the `Error` variant's payload type
-        // is a protocol existential (e.g. `Result(T, Error)` where `Error` is
-        // a protocol). This mirrors the construction-site auto-box in the
-        // `.union_init` arm so a concrete error value re-wraps into a
-        // `runtime.ProtocolBox` and the early-returned `Result` matches the
-        // enclosing function's declared return type.
-        var error_value_local = err_payload_local;
-        if (self.variantPayloadZigTypeByName(result_type_name, error_name)) |error_payload_type| {
-            error_value_local = try self.maybeBoxAsProtocol(err_payload_local, error_payload_type);
-        }
-        try self.current_instrs.append(self.allocator, .{
-            .union_init = .{
-                .dest = rewrapped_local,
-                .union_type = result_type_name,
-                .variant_name = error_name,
-                .value = error_value_local,
-            },
-        });
-        try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = rewrapped_local } });
-        const err_body = try self.current_instrs.toOwnedSlice(self.allocator);
-        self.current_instrs = saved_err;
-
-        const cases = try self.allocator.alloc(UnionCase, 2);
-        cases[0] = .{
-            .variant_name = ok_name,
-            .field_bindings = try self.allocSlice(FieldBinding, &.{.{ .field_name = "", .local_name = "", .local_index = ok_payload_local }}),
-            .body_instrs = ok_body,
-            .return_value = null,
-        };
-        cases[1] = .{
-            .variant_name = error_name,
-            .field_bindings = try self.allocSlice(FieldBinding, &.{.{ .field_name = "", .local_name = "", .local_index = err_payload_local }}),
-            .body_instrs = err_body,
-            .return_value = null,
-        };
-
-        try self.current_instrs.append(self.allocator, .{
-            .union_switch = .{
-                .dest = dest,
-                .scrutinee = scrutinee_local,
-                .cases = cases,
-                .else_instrs = &.{},
-                .else_result = null,
-                .has_else = false,
-            },
-        });
     }
 
     /// Context for `buildUnionSwitchFromVariantNode`: case expressions
@@ -11905,7 +11807,6 @@ pub const IrBuilder = struct {
                 });
             },
             .try_rescue => |tr| try self.lowerTryRescue(tr, dest),
-            .try_project => |tp| try self.lowerTryProject(tp, dest),
             .field_get => |fg| {
                 // Check for enum variant access (object is nil_lit placeholder with enum type)
                 if (fg.object.kind == .nil_lit and self.type_store != null) {

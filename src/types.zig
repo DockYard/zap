@@ -218,14 +218,14 @@ pub const TypeStore = struct {
     /// a `FunctionFamilyId`, which is reassigned per scope-graph build).
     /// Populated by
     /// `TypeChecker.checkFunctionClause` after the body is checked: the row
-    /// is the union of every `Error(E)` payload propagated through a `?`,
-    /// every `raise`d error type, and — Phase 3.b — every error type a
-    /// CALLEE with a non-empty row propagates across the call boundary
-    /// (cross-function `raises` propagation, an implicit `?`). Deduplicated
+    /// is the union of every `raise`d error type and — Phase 3.b — every
+    /// error type a CALLEE with a non-empty row propagates across the call
+    /// boundary (cross-function `raises` propagation, an implicit
+    /// propagation at every call site). Deduplicated
     /// structurally. When a function declares an explicit `raises` row that
     /// the body satisfies, the declared row is stored verbatim.
     ///
-    /// Phase 1.3 recorded this for soundness checking only; Phase 3.b reads
+    /// Phase 3.b reads
     /// it back at call sites (`recordCalleeRaisesRow`) so a `raise` in a
     /// callee contributes to the caller's row and an enclosing `try`/`rescue`
     /// can discharge it. This is the type-surface half of the nominal
@@ -1497,25 +1497,15 @@ pub const TypeChecker = struct {
     current_impl: ?*const ast.ImplDecl = null,
 
     /// Accumulator for the `raises` row of the function clause currently
-    /// being checked. Every `?` propagation (`value?`) on a
-    /// `Result(t, e)` operand records its `e` here; once `raise`
-    /// lands (Phase 1.4) it will record its raised type here too. The
+    /// being checked. Every `raise` site records its raised error type
+    /// here, and every call to a callee with a non-empty `raises` row
+    /// folds that row in (cross-function propagation). The
     /// row is the de-duplicated union of these contributions. Reset at
     /// the start of each clause check (`checkFunctionClause`) and read
     /// back afterward to (a) check an explicit declared `raises` row for
     /// coverage and (b) attach the inferred row to the function's
     /// signature. Entries are dedup'd by structural type equality.
     current_raises: std.ArrayListUnmanaged(TypeId) = .empty,
-
-    /// The declared return type of the function clause currently being
-    /// checked, or `null` outside any clause (and for clauses without a
-    /// declared return type). The `try_expr` arm reads this to enforce
-    /// that `?` only appears in a `Result(_, E)`-returning function: an
-    /// `Error(e)` arm early-returns the enclosing function, so the
-    /// function's own return type must itself be a `Result` capable of
-    /// carrying that `Error`. Set/restored around the body check in
-    /// `checkFunctionClause`.
-    current_declared_return: ?TypeId = null,
 
     // Number of stdlib lines prepended (bindings in these lines are skipped for unused checks)
     stdlib_line_count: u32 = 0,
@@ -4625,7 +4615,6 @@ pub const TypeChecker = struct {
                 try self.validateExprDoesNotCallUnderscoreFunctions(pipe.rhs);
             },
             .unwrap => |unwrap| try self.validateExprDoesNotCallUnderscoreFunctions(unwrap.expr),
-            .try_expr => |try_expr| try self.validateExprDoesNotCallUnderscoreFunctions(try_expr.value),
             .try_rescue => |try_rescue| {
                 for (try_rescue.body) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
                 for (try_rescue.rescue_clauses) |clause| {
@@ -5346,88 +5335,14 @@ pub const TypeChecker = struct {
         );
     }
 
-    /// The `Ok` and `Error` payload types extracted from a
-    /// `Result(T, E)`-shaped operand by `resolveResultPayloads`.
-    const ResultPayloads = struct {
-        ok_type: TypeId,
-        error_type: TypeId,
-    };
-
-    /// Resolve the `Ok(T)` and `Error(E)` payload types of a
-    /// `Result`-shaped operand, looking through `.applied` so a
-    /// cross-function/cross-struct call whose declared return type is
-    /// `Result(i64, String)` (an `.applied { base: <Result decl>, args:
-    /// [i64, String] }`) yields the same concrete payload pair as a
-    /// directly-constructed `Result(i64, String).Ok(...)` literal (a bare
-    /// `.tagged_union`). Returns `null` when the operand is not a tagged
-    /// union with `Ok`/`Error` variants, so the `try_expr` arm can surface
-    /// a clear "not a `Result`" diagnostic.
-    ///
-    /// The substitution mirrors the established `.applied` → `tagged_union`
-    /// walk in `recordCasePatternBindingTypes`: a per-instantiation
-    /// `SubstitutionMap` binds the declaration's formal type variables to
-    /// the applied arguments, then rewrites each variant's declared payload
-    /// type through it.
-    fn resolveResultPayloads(self: *TypeChecker, operand_type: TypeId) !?ResultPayloads {
-        if (operand_type == TypeStore.UNKNOWN or operand_type == TypeStore.ERROR) return null;
-        const operand_typ = self.store.getType(operand_type);
-
-        const tagged_decl: Type.TaggedUnionType, var subs_opt: ?SubstitutionMap = blk: {
-            if (operand_typ == .tagged_union) {
-                break :blk .{ operand_typ.tagged_union, @as(?SubstitutionMap, null) };
-            }
-            if (operand_typ == .applied) {
-                const base_typ = self.store.getType(operand_typ.applied.base);
-                if (base_typ != .tagged_union) return null;
-                const decl_union = base_typ.tagged_union;
-                var subs = SubstitutionMap.init(self.allocator);
-                const pair_count = @min(decl_union.type_params.len, operand_typ.applied.args.len);
-                for (decl_union.type_params[0..pair_count], operand_typ.applied.args[0..pair_count]) |formal_id, arg_id| {
-                    const formal_typ = self.store.getType(formal_id);
-                    if (formal_typ != .type_var) continue;
-                    subs.bind(formal_typ.type_var, arg_id);
-                }
-                break :blk .{ decl_union, @as(?SubstitutionMap, subs) };
-            }
-            return null;
-        };
-        defer if (subs_opt) |*owned| owned.deinit();
-
-        const interner_mut: *ast.StringInterner = @constCast(self.interner);
-        const ok_name = interner_mut.intern("Ok") catch return null;
-        const error_name = interner_mut.intern("Error") catch return null;
-
-        var ok_payload: TypeId = TypeStore.UNKNOWN;
-        var error_payload: TypeId = TypeStore.UNKNOWN;
-        var saw_ok = false;
-        var saw_error = false;
-        for (tagged_decl.variants) |variant| {
-            if (variant.name == ok_name) {
-                saw_ok = true;
-                ok_payload = variant.type_id orelse TypeStore.UNKNOWN;
-            } else if (variant.name == error_name) {
-                saw_error = true;
-                error_payload = variant.type_id orelse TypeStore.UNKNOWN;
-            }
-        }
-        // A `Result` has exactly the `Ok` and `Error` variants. A union
-        // missing either is not a `Result` and the operand is rejected.
-        if (!saw_ok or !saw_error) return null;
-
-        if (subs_opt) |*subs| {
-            if (ok_payload != TypeStore.UNKNOWN) ok_payload = subs.applyToType(self.store, ok_payload);
-            if (error_payload != TypeStore.UNKNOWN) error_payload = subs.applyToType(self.store, error_payload);
-        }
-        return ResultPayloads{ .ok_type = ok_payload, .error_type = error_payload };
-    }
-
     /// Record an error type contributed to the enclosing function's
-    /// inferred `raises` row. Called from the `try_expr` inference arm
-    /// (with the `Error(e)` payload type) and, once `raise` lands, from
-    /// the `raise` checker. Dedups by structural type equality so a
-    /// function that propagates the same error type from several `?`
-    /// sites lists it once. `span` is reserved for future
-    /// per-contribution provenance in `raises`-mismatch diagnostics.
+    /// inferred `raises` row. Called from the `raise` checker (with the
+    /// raised error type), from the `try`/`rescue` discharge logic, and
+    /// from `recordCalleeRaisesRow` (cross-function propagation). Dedups
+    /// by structural type equality so a function that contributes the
+    /// same error type from several sites lists it once. `span` is
+    /// reserved for future per-contribution provenance in
+    /// `raises`-mismatch diagnostics.
     fn recordRaisedErrorType(self: *TypeChecker, error_type: TypeId, span: ast.SourceSpan) !void {
         _ = span;
         if (error_type == TypeStore.UNKNOWN or error_type == TypeStore.ERROR) return;
@@ -5659,7 +5574,7 @@ pub const TypeChecker = struct {
 
     /// Phase 3.b — record a CALLEE's stored `raises` row into the enclosing
     /// function's live `raises` accumulator (`current_raises`), as if every
-    /// error the callee can raise were propagated by an implicit `?` at the
+    /// error the callee can raise were propagated implicitly at the
     /// call site. This is the cross-function half of `raises` inference: a
     /// `raise` in a callee flows to the caller's row here, so an enclosing
     /// `try`/`rescue` (which discharges the body's accumulated row) can catch
@@ -5699,8 +5614,8 @@ pub const TypeChecker = struct {
         // `a` in `fn foo(x :: a) -> a` refers to the same type variable.
         self.type_var_scope.clearRetainingCapacity();
 
-        // Fresh `raises` accumulator for this clause. Every `?` in the
-        // body records the propagated `Error(e)` payload type here; the
+        // Fresh `raises` accumulator for this clause. Every `raise` in the
+        // body records its raised error type here; the
         // inferred row is read back after the body is checked (below).
         self.current_raises.clearRetainingCapacity();
 
@@ -5832,15 +5747,6 @@ pub const TypeChecker = struct {
 
         try self.validateMainEntrypointReturnType(func, clause, declared_return);
 
-        // Expose the declared return type to the `try_expr` inference arm
-        // (via `current_declared_return`) so a `?` inside this clause can
-        // enforce that the enclosing function returns a `Result(_, E)`.
-        // Restored on clause exit so nested closures and sibling clauses
-        // see their own return type, not this one's.
-        const prev_declared_return = self.current_declared_return;
-        self.current_declared_return = declared_return;
-        defer self.current_declared_return = prev_declared_return;
-
         // Check refinement is Bool
         if (clause.refinement) |ref| {
             const ref_type = try self.inferExpr(ref);
@@ -5889,10 +5795,10 @@ pub const TypeChecker = struct {
 
         // `raises` row reconciliation. After the body is checked,
         // `self.current_raises` holds the inferred error row (one entry per
-        // distinct `Error(E)` propagated through a `?`). Either verify it
+        // distinct raised/propagated error type). Either verify it
         // against an explicitly declared row, or attach the inferred row to
         // the function's stored signature. Runs for bodyless declarations
-        // too: those contribute no `?` sites, so an explicit `raises ()`
+        // too: those raise nothing, so an explicit `raises ()`
         // (or any declared row) is trivially satisfied and recorded.
         try self.reconcileRaisesRow(func, clause);
 
@@ -6863,63 +6769,6 @@ pub const TypeChecker = struct {
             },
             // error_pipe: infer the chain type as fallback.
 
-            // try_expr (`value?`): the operand must be a `Result(T, E)`.
-            // The expression yields the `Ok` payload type `T`; the
-            // `Error` payload type `E` is recorded as a contribution to
-            // the enclosing function's inferred `raises` row (the value
-            // that an `Error` arm early-returns). `try_expr` survives
-            // type-checking and is lowered to the canonical two-arm
-            // `case` in HIR (`HirBuilder.buildExpr`).
-            .try_expr => |te| {
-                const operand_type = try self.inferExpr(te.value);
-                // The operand must resolve to a `Result(T, E)` tagged
-                // union. A monomorphic call returns the declared signature
-                // type, which for `-> Result(i64, String)` is an
-                // `.applied { base: <Result decl>, args: [i64, String] }`
-                // rather than a bare `.tagged_union`. `resolveResultPayloads`
-                // looks through `.applied` (building the per-instantiation
-                // substitution), so a cross-function/cross-struct call whose
-                // return type is `Result(_, _)` typechecks here exactly like
-                // a directly-constructed `Result` literal.
-                if (try self.resolveResultPayloads(operand_type)) |payloads| {
-                    // `?` early-returns the enclosing function on the
-                    // `Error(e)` arm, so that function must itself return a
-                    // `Result(_, E)` capable of carrying the propagated
-                    // error. Enforce this against the clause's declared
-                    // return type (when checkable), so a `?` in a
-                    // non-`Result`-returning function is rejected with a
-                    // clear diagnostic rather than producing an ill-typed
-                    // early return.
-                    if (self.current_declared_return) |ret_type| {
-                        if (ret_type != TypeStore.UNKNOWN and ret_type != TypeStore.ERROR) {
-                            if ((try self.resolveResultPayloads(ret_type)) == null) {
-                                try self.addRichError(
-                                    "the `?` propagation operator requires the enclosing function to return a `Result(t, e)`",
-                                    te.meta.span,
-                                    "this `?` early-returns an `Error`, but the function does not return a `Result`",
-                                    try std.fmt.allocPrint(self.allocator, "change the function's return type to a `Result(_, _)`; it is declared to return `{s}`", .{self.typeToString(ret_type)}),
-                                );
-                                return TypeStore.ERROR;
-                            }
-                        }
-                    }
-                    if (payloads.error_type != TypeStore.UNKNOWN) {
-                        try self.recordRaisedErrorType(payloads.error_type, te.meta.span);
-                    }
-                    return payloads.ok_type;
-                }
-                // Not a Result-shaped operand: surface a diagnostic so a
-                // misapplied `?` is caught rather than silently passing
-                // the operand type through.
-                try self.addRichError(
-                    "the `?` propagation operator can only be applied to a `Result(t, e)` value",
-                    te.meta.span,
-                    "this expression is not a `Result`",
-                    "`expr?` short-circuits on the `Error(e)` variant and unwraps the `Ok(t)` payload; the operand must be a `Result`",
-                );
-                return TypeStore.ERROR;
-            },
-
             // for_expr is desugared before type checking; return UNKNOWN if we see it
             .for_expr => TypeStore.UNKNOWN,
 
@@ -7202,7 +7051,7 @@ pub const TypeChecker = struct {
                 if (try self.resolveFamilyCallSignature(scope_id, vr.name, arity, arg_types)) |resolved_call| {
                     const signature = resolved_call.signature;
                     // Phase 3.b: propagate the callee's `raises` row into the
-                    // enclosing function's row (implicit `?`), keyed by the
+                    // enclosing function's row (implicit propagation), keyed by the
                     // resolved family so cross-struct method names never alias.
                     try self.recordCalleeRaisesRow(resolved_call.family_id, call.meta.span);
                     const safe_params = self.safeClosureParamsForCurrentCallee(vr.name, arity);
@@ -7479,7 +7328,7 @@ pub const TypeChecker = struct {
                                 // Phase 3.b: a struct-qualified call `Mod.f(...)`
                                 // to a function whose `raises` row is non-empty
                                 // propagates that row into the enclosing
-                                // function's row (implicit `?`). This is the
+                                // function's row (implicit propagation). This is the
                                 // primary cross-function `raise` propagation
                                 // site: `Worker.deep()` inside a `try` body
                                 // routes here, so the body's accumulated row

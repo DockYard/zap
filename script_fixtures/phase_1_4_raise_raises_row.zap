@@ -8,8 +8,8 @@
 # diverges via `raise`.
 #
 # Exercises:
-#   * `raise %E{}` recording `E` into `current_raises` (the same
-#     accumulator the `?` operator feeds, Phase 1.3).
+#   * `raise %E{}` recording `E` into `current_raises` (the
+#     function's inferred `raises` accumulator).
 #   * an explicit `raises E` row that covers a `raise`d error.
 #
 # Expected output:

@@ -57,7 +57,7 @@ pub const MISSING_RAISES_ROW_MESSAGE =
 /// participates in the abortive effect should advertise it.
 ///
 /// Runs on the freshly-parsed AST (BEFORE desugar), so `raise <value>` is
-/// still a `raise_expr` and `value?` a `try_expr`. Unlike the Phase 1.4
+/// still a `raise_expr`. Unlike the Phase 1.4
 /// lints (which SKIP stdlib units), this is intended to run OVER `lib/*` to
 /// confirm the stdlib is consistent under mandatory annotation. Warn-only:
 /// it never blocks a build.
@@ -112,8 +112,8 @@ const RaisesLinter = struct {
     }
 };
 
-/// True when a statement list lexically contains a `raise` expression or a
-/// `?` propagation (`try_expr`) — a conservative, syntactic over-approximation
+/// True when a statement list lexically contains a `raise` expression —
+/// a conservative, syntactic over-approximation
 /// of "this body participates in the abortive effect". Cross-function
 /// propagation through plain calls is intentionally NOT counted here (the
 /// lint is syntactic and pre-type-check); the type checker's `raises`
@@ -135,9 +135,8 @@ fn stmtCanRaise(stmt: ast.Stmt) bool {
 
 fn exprCanRaise(expr: *const ast.Expr) bool {
     return switch (expr.*) {
-        // The two surface effect operators.
+        // The surface raise site.
         .raise_expr => true,
-        .try_expr => true,
         // Recurse into the common compound shapes a raising expression
         // can hide inside. A `try`/`rescue` is NOT a raise site here: it
         // DISCHARGES the body's effect (an unrescued type still surfaces
@@ -301,7 +300,6 @@ const Linter = struct {
             .field_access => |fa| try self.lintExpr(fa.object, is_public),
             .type_annotated => |ta| try self.lintExpr(ta.expr, is_public),
             .panic_expr => |pe| try self.lintExpr(pe.message, is_public),
-            .try_expr => |te| try self.lintExpr(te.value, is_public),
             .try_rescue => |tr| {
                 try self.lintBlock(tr.body, is_public);
                 for (tr.rescue_clauses) |clause| {

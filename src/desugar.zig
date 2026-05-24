@@ -1359,24 +1359,7 @@ pub const Desugarer = struct {
             .unwrap => |uw| {
                 return try self.desugarUnwrap(try self.desugarExpr(uw.expr), uw.meta);
             },
-            // try_expr (`value?`): desugar the operand but keep the node
-            // intact. `?` survives macro-expand/desugar/type-check so the
-            // type checker can type it (`Ok` payload) and accumulate its
-            // `Error` payload into the enclosing function's `raises` row;
-            // it is lowered to the canonical two-arm union switch (Ok ->
-            // yield, Error -> early `ret`) in HIR (`HirBuilder.buildExpr`).
-            // The surface language has no `return`, so the early-return
-            // arm cannot be expressed as surface AST and must be lowered
-            // at HIR/IR where a `ret` terminator is available.
-            .try_expr => |te| {
-                return try self.create(ast.Expr, .{
-                    .try_expr = .{
-                        .meta = te.meta,
-                        .value = try self.desugarExpr(te.value),
-                    },
-                });
-            },
-            // `try_rescue` survives desugar like `try_expr` and `case`: the
+            // `try_rescue` survives desugar like `case`: the
             // node stays intact so the type-checker can compute its
             // exhaustiveness, discharge the rescued error types from the
             // enclosing `raises` row, and so HIR can perform the

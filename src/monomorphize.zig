@@ -1227,7 +1227,6 @@ const MonomorphContext = struct {
             .unwrap => |e| try self.scanExpr(e),
             .ret_raise => |rr| try self.scanExpr(rr.stash_call),
             .union_init => |ui| try self.scanExpr(ui.value),
-            .try_project => |tp| try self.scanExpr(tp.operand),
             .error_pipe => |ep| {
                 for (ep.steps) |step| {
                     try self.scanExpr(step.expr);
@@ -1673,15 +1672,6 @@ const MonomorphContext = struct {
                 .variant_name = ui.variant_name,
                 .value = try self.cloneExpr(ui.value),
             } },
-            .try_project => |tp| .{ .try_project = .{
-                .operand = try self.cloneExpr(tp.operand),
-                .result_type_id = if (self.current_subs) |subs|
-                    try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, tp.result_type_id))
-                else
-                    try self.applyActiveProtocolParamTypes(tp.result_type_id),
-                .ok_variant_name = tp.ok_variant_name,
-                .error_variant_name = tp.error_variant_name,
-            } },
             .try_rescue => |tr| blk: {
                 var new_arms = try self.allocator.alloc(hir.CaseArm, tr.arms.len);
                 for (tr.arms, 0..) |arm, i| {
@@ -1974,7 +1964,6 @@ const MonomorphContext = struct {
                 self.rewriteExpr(mvg.key);
             },
             .ret_raise => |rr| self.rewriteExpr(rr.stash_call),
-            .try_project => |tp| self.rewriteExpr(tp.operand),
             .try_rescue => |tr| {
                 // Mirror the scan-phase traversal (`scanBlock` over the same
                 // sub-expressions): a generic call inside a `try` body, a

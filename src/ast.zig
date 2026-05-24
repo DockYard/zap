@@ -732,7 +732,6 @@ pub const Expr = union(enum) {
     panic_expr: PanicExpr,
     raise_expr: RaiseExpr,
     error_pipe: ErrorPipeExpr,
-    try_expr: TryExpr,
     try_rescue: TryRescueExpr,
 
     // Block
@@ -803,7 +802,6 @@ pub const Expr = union(enum) {
             .panic_expr => |v| v.meta,
             .raise_expr => |v| v.meta,
             .error_pipe => |v| v.meta,
-            .try_expr => |v| v.meta,
             .try_rescue => |v| v.meta,
             .block => |v| v.meta,
             .intrinsic => |v| v.meta,
@@ -1007,30 +1005,6 @@ pub const PipeExpr = struct {
 pub const UnwrapExpr = struct {
     meta: NodeMeta,
     expr: *const Expr,
-};
-
-/// Postfix `?` Result-propagation operator: `value?`.
-///
-/// Desugars (in `src/desugar.zig`) into the canonical two-arm
-/// `case` over `Result(t, e)`:
-///
-///     case value {
-///       Result.Ok(__try_ok) -> __try_ok
-///       Result.Error(__try_err) -> return Result.Error(__try_err)
-///     }
-///
-/// The `Ok` arm yields the success payload; the `Error` arm
-/// re-wraps the failure payload and early-returns it from the
-/// enclosing function. Because the desugar targets `case`, the
-/// existing tagged-union match pipeline
-/// (`buildUnionSwitchFromVariantNode` → `union_switch` →
-/// comptime-safe `switch_block`) lowers `?` with no new HIR/IR
-/// machinery: `union_switch` IS the realized form of the research
-/// brief's proposed `TryProject(value, ok_var, err_var)` node.
-pub const TryExpr = struct {
-    meta: NodeMeta,
-    /// The `Result(t, e)`-typed operand the `?` is applied to.
-    value: *const Expr,
 };
 
 pub const ErrorPipeExpr = struct {
@@ -1570,7 +1544,7 @@ pub const TypeParenExpr = struct {
 // the compiler enforces: getMeta/inferExpr/desugarExpr/expandExpr/resolveExpr/
 // validateExpr…/walkExpr (capability)/substituteInExpr (attr)/exprToCtValue/
 // stampExpansionOnExpr, plus the StringId-free `remapExpr` no-op arm.
-const expected_expr_variants: usize = 42;
+const expected_expr_variants: usize = 41;
 const expected_pattern_variants: usize = 12;
 const expected_type_expr_variants: usize = 11;
 const expected_top_item_variants: usize = 16;

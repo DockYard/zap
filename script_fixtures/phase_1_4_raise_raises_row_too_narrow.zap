@@ -2,9 +2,9 @@
 # declared `raises` row must be rejected.
 #
 # `validate/1` raises `ParseError` but declares `raises i64`, which does
-# NOT cover `ParseError`. The type-checker's subset check (the same one
-# Phase 1.3 applies to `?`-propagated errors) must reject the program,
-# proving `raise` feeds the inferred `raises` row.
+# NOT cover `ParseError`. The type-checker's subset check (covering every
+# error the body can raise) must reject the program, proving `raise`
+# feeds the inferred `raises` row.
 #
 # Expected: compilation FAILS with a `raises`-row diagnostic. Never run.
 
