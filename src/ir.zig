@@ -7626,7 +7626,7 @@ pub const IrBuilder = struct {
                 // Terminal arm: bind any whole-scrutinee binding to the box
                 // and lower the body straight into the current stream,
                 // yielding its value to `handler_dest`.
-                return try self.emitRescueArmBody(handler_dest, error_local, arm, null, after_block);
+                return try self.emitRescueArmBody(handler_dest, error_local, arm, null, after_block, joined_type);
             },
             .concrete => |concrete| {
                 // Resolve the protocol the recovered box carries from
@@ -7661,7 +7661,7 @@ pub const IrBuilder = struct {
                 if (concrete.needs_unbox) {
                     unboxed_local = try self.emitRescueUnbox(error_local, protocol_name, concrete.target_type_name);
                 }
-                const then_outcome = try self.emitRescueArmBody(handler_dest, error_local, arm, unboxed_local, after_block);
+                const then_outcome = try self.emitRescueArmBody(handler_dest, error_local, arm, unboxed_local, after_block, joined_type);
                 const then_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved_then;
 
@@ -7711,21 +7711,65 @@ pub const IrBuilder = struct {
     /// Outcome of lowering one rescue arm (or a dispatch subtree).
     ///
     /// `result` is the local the arm yields to `handler_dest`, or null when
-    /// the arm produced no value (it diverged). `diverges` is true when the
-    /// arm body unconditionally diverges — its tail is a `Never`-returning
-    /// call (a `do_raise` re-raise at top level, or a `recoverable_raise`
-    /// that unwinds). A divergent arm emits NO trailing `local_set`/break:
-    /// the body is already terminal at the ZIR level, so the enclosing
-    /// `if_expr`'s `then_is_noreturn`/`else_is_noreturn` flag is set from
-    /// this verdict and the ZIR backend suppresses the dead trailing break
-    /// (which would otherwise dangle after the noreturn call and trip AIR
-    /// Liveness). `diverges` is a stronger statement than `result == null`:
-    /// a non-divergent arm whose body legitimately yields no value (rare)
-    /// still has `diverges == false`.
+    /// the arm produced no value (it diverged). `diverges` is true ONLY when
+    /// the arm body is terminated by a genuine ZIR-level noreturn terminator:
+    /// a top-level abort re-raise (`Kernel.do_raise`, a `noreturn`-returning
+    /// sink that the fork's Sema treats as block-terminating), a cross-fn
+    /// propagating `ret_raise` (`return error.ZapRaise`), or `ret` /
+    /// `match_fail` / `match_error_return`. A divergent arm emits NO trailing
+    /// `local_set`/break: the body is already terminal at the ZIR level, so
+    /// the enclosing `if_expr`'s `then_is_noreturn`/`else_is_noreturn` flag is
+    /// set from this verdict and the ZIR backend suppresses the dead trailing
+    /// break (which would otherwise dangle after the noreturn terminator and
+    /// trip AIR Liveness).
+    ///
+    /// CRITICAL — a `raise` lexically inside an *enclosing* `try` body lowers
+    /// to `Kernel.recoverable_raise(box)` (it stashes the boxed `Error` into
+    /// the side-channel and RETURNS `Nil`, unwinding dynamically to the
+    /// enclosing landing pad via that pad's `raise_occurred()` check). The HIR
+    /// still stamps such an arm `NEVER` — but that is a *type-surface*
+    /// coercion (so a re-raise in tail position peer-types against value arms),
+    /// NOT a ZIR-noreturn claim: control FALLS THROUGH after the call. Such an
+    /// arm is therefore a value-producing STATICALLY-DEAD merge edge, NOT a
+    /// divergent branch: it must yield a `typed_undef` placeholder and a normal
+    /// break (`diverges == false`, `result` set). Flagging it `diverges`
+    /// (suppressing the break + emitting `unreachable_value`) leaves a condbr
+    /// branch body with no terminator, so the fork's `analyzeBodyInner` —
+    /// which exits a body only on a noreturn instruction — runs off the end
+    /// (`index out of bounds` in `zirCondbr`). This is exactly the nested
+    /// `try`/`rescue` Sema crash (Gap C): the inner try's synthesized re-raise
+    /// catch-all lowers to `recoverable_raise` because the inner try is nested
+    /// in the outer try's body.
+    ///
+    /// `diverges` is thus a stronger statement than `result == null`: a
+    /// recoverable-raise dead edge has `result != null` AND `diverges ==
+    /// false`; only a genuine ZIR-noreturn tail sets `diverges == true`.
     const RescueArmOutcome = struct {
         result: ?LocalId,
         diverges: bool,
     };
+
+    /// Does this lowered instruction sequence end in a returning
+    /// `Kernel.recoverable_raise` call — i.e. is it a recoverable-raise dead
+    /// merge edge rather than a ZIR-noreturn terminator? See
+    /// `RescueArmOutcome` for why this distinction is load-bearing for nested
+    /// `try`/`rescue`.
+    ///
+    /// The recoverable-raise sink takes its boxed-`Error` argument by `.move`
+    /// (ownership transfers into the side-channel), so it carries no trailing
+    /// ARC `release` — the lowered call is the body's literal last
+    /// instruction. By contrast a `do_raise` abort re-raise is `noreturn` (the
+    /// fork's Sema terminates the body at the call regardless of any trailing
+    /// instruction), and a cross-fn propagating raise ends in `ret_raise`; in
+    /// both of those the tail is NOT a recoverable-raise call, so this returns
+    /// false and the genuine-noreturn path is taken.
+    fn instructionsEndInRecoverableRaise(instrs: []const Instruction) bool {
+        if (instrs.len == 0) return false;
+        return switch (instrs[instrs.len - 1]) {
+            .call_named => |cn| callNameIsRecoverableRaiseSink(cn.name),
+            else => false,
+        };
+    }
 
     /// Lower one rescue arm's bindings + body into the current instruction
     /// stream, assigning the body's value to `handler_dest`.
@@ -7745,12 +7789,16 @@ pub const IrBuilder = struct {
         arm: hir_mod.CaseArm,
         unboxed_local: ?LocalId,
         after_block: ?*const hir_mod.Block,
+        joined_type: types_mod.TypeId,
     ) anyerror!RescueArmOutcome {
         // Divergence verdict: the HIR stamps a `raise`-tailed arm body
-        // `NEVER` (`buildHir`'s `.raise_expr` arm). This is authoritative
-        // regardless of struct-pattern unboxing or the lowered result
-        // local's tracked runtime type (`do_raise`/`recoverable_raise`
-        // return `Nil`/a synth struct, not `Never`).
+        // `NEVER` (`buildHir`'s `.raise_expr` arm). This authoritatively
+        // detects a `raise`-tailed arm regardless of struct-pattern unboxing
+        // or the lowered result local's tracked runtime type
+        // (`do_raise`/`recoverable_raise` return `Nil`/a synth struct, not
+        // `Never`). It is NOT, however, a ZIR-noreturn claim on its own: a
+        // `raise` lexically inside an enclosing `try` lowers to a *returning*
+        // `recoverable_raise` (see `RescueArmOutcome` + `finishDivergentArm`).
         const body_diverges = arm.body.result_type == types_mod.TypeStore.NEVER;
 
         // `after` (finally) parity (Elixir): the cleanup MUST run on the
@@ -7868,30 +7916,86 @@ pub const IrBuilder = struct {
             }
         }
         const body_result = try self.lowerBlock(arm_body) orelse
-            return .{ .result = null, .diverges = body_diverges };
+            return self.finishDivergentArm(handler_dest, joined_type);
 
-        // A divergent arm body (e.g. the synthesized re-raise, whose tail is
-        // a `Never`-stamped `raise`) ends in a `Never`-returning call: at top
-        // level a re-raise's `do_raise` is `noreturn` and aborts; a
-        // recoverable re-raise's `recoverable_raise` unwinds via the
-        // side-channel. Either way control never reaches the branch's merge
-        // point, so we must NOT emit a trailing `local_set handler_dest = …`
-        // (it would be dead code after the noreturn call) and must NOT feed a
-        // value into the merge. We report `diverges = true` and `result =
-        // null`; the enclosing `if_expr` sets `then_is_noreturn`/
-        // `else_is_noreturn` from this verdict, the ZIR backend emits
-        // `unreachable_value` for the branch result and suppresses the dead
-        // trailing break. The merge peer-types against `unreachable_value`,
-        // which unifies with any value-producing sibling arm's type — so this
-        // replaces the previous `typed_undef` dead-edge placeholder for a
-        // divergent arm with the canonical noreturn-branch lowering. The
-        // divergent call itself is still emitted by `lowerBlock` above.
+        // A `raise`-tailed arm body produced no usable merge value: classify
+        // its lowered tail to decide whether it is a genuine ZIR-noreturn
+        // branch or a recoverable-raise dead merge edge (see
+        // `finishDivergentArm`). `body_diverges` (HIR `NEVER`) alone is NOT a
+        // ZIR-noreturn claim — a `recoverable_raise` re-raise returns.
         if (body_diverges) {
-            return .{ .result = null, .diverges = true };
+            return self.finishDivergentArm(handler_dest, joined_type);
         }
 
         try self.current_instrs.append(self.allocator, .{
             .local_set = .{ .dest = handler_dest, .value = body_result },
+        });
+        return .{ .result = handler_dest, .diverges = false };
+    }
+
+    /// Finalize the outcome for a rescue arm whose HIR body type is `NEVER`
+    /// (its tail is a `raise`) after the body has already been lowered into
+    /// `self.current_instrs`. Classifies the lowered tail to decide whether
+    /// the arm is a genuine ZIR-noreturn branch or a recoverable-raise dead
+    /// merge edge — the distinction that fixes nested `try`/`rescue` (Gap C).
+    ///
+    ///   * Genuine ZIR-noreturn tail (a top-level abort `do_raise`, a cross-fn
+    ///     propagating `ret_raise`, or `ret`/`match_fail`/…): control never
+    ///     reaches the merge. Report `{ result = null, diverges = true }`; the
+    ///     enclosing `if_expr` flags this branch noreturn, the ZIR backend
+    ///     emits `unreachable_value` and suppresses the dead trailing break
+    ///     (an appended break after a noreturn terminator would dangle in AIR
+    ///     Liveness). No merge value is fed in.
+    ///
+    ///   * Recoverable-raise tail (`Kernel.recoverable_raise`, which RETURNS
+    ///     `Nil` after stashing the boxed `Error`): this arm is reachable at
+    ///     the ZIR level — control falls through after the call. It is a
+    ///     STATICALLY-DEAD merge edge (at runtime the re-stash sets the
+    ///     side-channel, so the nearest enclosing `try`'s landing-pad
+    ///     `raise_occurred()` check redirects to the OUTER handler and this
+    ///     try's own value-merge result is never observed). So we emit a
+    ///     `typed_undef` placeholder of the joined result type, bind it to
+    ///     `handler_dest`, and report `{ result = handler_dest, diverges =
+    ///     false }`: the enclosing `if_expr` then emits a NORMAL break with a
+    ///     clean peer-typed value, terminating the condbr branch body. Without
+    ///     this, the branch would be (wrongly) flagged noreturn and left with
+    ///     no terminator after the returning `recoverable_raise`, so the
+    ///     fork's `analyzeBodyInner` runs off the end (`index out of bounds`
+    ///     in `zirCondbr`). This mirrors `lowerTryRescue`'s dead-else-edge
+    ///     placeholder — the canonical statically-dead-merge-edge primitive.
+    fn finishDivergentArm(
+        self: *IrBuilder,
+        handler_dest: LocalId,
+        joined_type: types_mod.TypeId,
+    ) anyerror!RescueArmOutcome {
+        if (!instructionsEndInRecoverableRaise(self.current_instrs.items)) {
+            // Genuine ZIR-noreturn tail (abort / ret_raise / ret / match_fail).
+            return .{ .result = null, .diverges = true };
+        }
+
+        // Recoverable-raise dead merge edge. Yield a never-observed
+        // placeholder of the joined type so the branch breaks normally and the
+        // condbr body is terminated. When there is no concrete joined type to
+        // peer against (a discarded-value `try`: `Nil`/`Never`/unknown join),
+        // a `typed_undef` of those is rejected by `@as`; yield `null` so the
+        // backend breaks with `void_value` (the merge peer-resolves the other
+        // arms against `void`). This matches `lowerTryRescue`'s else-edge rule.
+        if (joined_type == types_mod.TypeStore.UNKNOWN or
+            joined_type == types_mod.TypeStore.NIL or
+            joined_type == types_mod.TypeStore.NEVER)
+        {
+            return .{ .result = null, .diverges = false };
+        }
+
+        const placeholder = self.next_local;
+        self.next_local += 1;
+        const placeholder_zig = typeIdToZigTypeWithStore(joined_type, self.type_store);
+        try self.current_instrs.append(self.allocator, .{
+            .typed_undef = .{ .dest = placeholder, .ty = placeholder_zig },
+        });
+        try self.local_hir_types.put(placeholder, joined_type);
+        try self.current_instrs.append(self.allocator, .{
+            .local_set = .{ .dest = handler_dest, .value = placeholder },
         });
         return .{ .result = handler_dest, .diverges = false };
     }
@@ -12703,6 +12807,25 @@ pub fn mangleSymbolForZig(allocator: std.mem.Allocator, name: []const u8) ![]con
         }
     }
     return try buf.toOwnedSlice(allocator);
+}
+
+/// The mangled `call_named` name the rescue/raise lowering emits for the
+/// *recoverable* raise sink, `Kernel.recoverable_raise/1` (struct `Kernel`,
+/// function `recoverable_raise`, arity 1 → `Mod__name__N`). Unlike the abort
+/// sink `Kernel.do_raise/1` (`noreturn`) and the cross-fn propagating
+/// `ret_raise`, this sink RETURNS `Nil` after stashing the boxed `Error` into
+/// the side-channel, so a branch ending in it falls through and is NOT
+/// ZIR-noreturn. The lowering recognizes its own emitted control-flow
+/// intrinsic by this canonical name — the single source of truth, mirroring
+/// the runtime's `isRaisePlumbingSymbol` classifier for the same sink.
+const recoverable_raise_sink_call_name = "Kernel__recoverable_raise__1";
+
+/// True when a `call_named.name` is the recoverable-raise sink (see
+/// `recoverable_raise_sink_call_name`). Used by the rescue-arm divergence
+/// verdict to treat a recoverable re-raise as a value-producing dead merge
+/// edge rather than a ZIR-noreturn branch.
+fn callNameIsRecoverableRaiseSink(name: []const u8) bool {
+    return std.mem.eql(u8, name, recoverable_raise_sink_call_name);
 }
 
 fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u32) u32 {
