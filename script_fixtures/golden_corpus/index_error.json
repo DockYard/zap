@@ -1,2 +1,2 @@
 [script-cache hit] <STAGING>
-{"domain":"runtime","severity":"error","sub_kind":"index_error","trace_policy":"backtrace","message":"List.get: index out of bounds","machine_data":{"kind":"index_error","backtrace":[{"symbol":"zap_runtime.List(i64).get"},{"symbol":"zap_runtime.listGet__anon_N"},{"symbol":"IndexError.List_get__i64__2__anon_N"},{"symbol":"IndexError.read_past_end/0"},{"symbol":"script.main"},{"symbol":"__ZapScriptMain.main/1"}],"error_return_trace":[]}}
+{"domain":"runtime","severity":"error","sub_kind":"index_error","trace_policy":"backtrace","message":"List.get: index out of bounds","machine_data":{"kind":"index_error","backtrace":[{"symbol":"zap_runtime.List(i64).get","file":"<STAGING>

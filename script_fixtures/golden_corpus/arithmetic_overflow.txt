@@ -1,7 +1,6 @@
 ** (arithmetic_error) integer overflow
-  zap_runtime.Kernel.addInteger__anon_N
-  zap_runtime.Kernel.add_i64
-  Integer._plus__2__clause_3/2
-  ArithmeticOverflow.boom/1
-  script.main
-  __ZapScriptMain.main/1
+  zap_runtime.Kernel.addInteger__anon_N at <STAGING>
+  zap_runtime.Kernel.add_i64 at <STAGING>
+  Integer._plus__2__clause_3/2 at <REPO>/zig-out/lib/integer.zap:13
+  ArithmeticOverflow.boom/1 at <FIXTURE>:12
+  script.main at <FIXTURE>:18

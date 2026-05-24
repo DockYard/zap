@@ -1,7 +1,6 @@
 ** (index_error) List.get: index out of bounds
-  zap_runtime.List(i64).get
-  zap_runtime.listGet__anon_N
-  IndexError.List_get__i64__2__anon_N
-  IndexError.read_past_end/0
-  script.main
-  __ZapScriptMain.main/1
+  zap_runtime.List(i64).get at <STAGING>
+  zap_runtime.listGet__anon_N at <STAGING>
+  IndexError.List_get__i64__2__anon_N at <FIXTURE>:57
+  IndexError.read_past_end/0 at <FIXTURE>:12
+  script.main at <FIXTURE>:17

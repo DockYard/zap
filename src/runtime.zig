@@ -8177,6 +8177,27 @@ fn isPanicPlumbingSymbol(stripped_mangled: []const u8) bool {
         std.mem.indexOf(u8, stripped_mangled, "zapPanicReport") != null;
 }
 
+/// True when a (underscore-stripped) linkage name belongs to the runtime's own
+/// stack-capture primitive — `Backtrace.capture` or the `noinline`
+/// `captureBacktraceInto` it calls (both live in `zap_runtime`). These frames
+/// are the MECHANISM that records a backtrace, never a place the program was
+/// actually executing user logic, so they must never surface in a rendered
+/// trace — the leak alloc-site backtrace, the error-return trace, and the crash
+/// backtrace must all begin at the genuine user/runtime frame above the
+/// capture call. `Backtrace.capture` is declared `inline` so that on most build
+/// configurations it folds into its caller and contributes no physical frame;
+/// but inlining is a codegen decision, not a guarantee we can render against,
+/// so when the optimizer DOES materialize it (e.g. captured from the deeply-
+/// inlined `allocAny` alloc-attribution site) the symbol-identity skip keeps the
+/// trace anchored at the frame above it. Symmetric to the
+/// `Kernel.recoverable_raise` capture-frame suppression in
+/// `isRaisePlumbingSymbol`. Matched as a substring so the `zap_runtime.` module
+/// prefix and any mangling suffix are tolerated.
+fn isBacktraceCapturePlumbingSymbol(stripped_mangled: []const u8) bool {
+    return std.mem.indexOf(u8, stripped_mangled, "Backtrace.capture") != null or
+        std.mem.indexOf(u8, stripped_mangled, "captureBacktraceInto") != null;
+}
+
 /// True when a (underscore-stripped) linkage name belongs to the Zig runtime
 /// entry that sits *below* the user's Zap entry point — the `std.start`
 /// namespace (`start.callMain`, `start.wrapMain`, `start.main`, …) and the
@@ -8295,6 +8316,10 @@ fn crashReportFrame(addr: usize) FrameAction {
     // tripped a safety check) rather than the abort machinery.
     if (isRaisePlumbingSymbol(mangled)) return .skipped;
     if (isPanicPlumbingSymbol(mangled)) return .skipped;
+    // The runtime's own stack-capture primitive is never a real execution
+    // frame; suppress it so the trace begins at the user/runtime frame that
+    // requested the capture (alloc site, raise origin, or fault point).
+    if (isBacktraceCapturePlumbingSymbol(mangled)) return .skipped;
 
     // Stop at the Zig program-startup glue below the user's `main` — those
     // frames are not Zap code and only add noise to the report.
@@ -8457,6 +8482,7 @@ fn crashReportFrameJson(addr: usize, needs_comma: bool) FrameAction {
     // byte-for-byte equivalent (in membership) to the text frame set.
     if (isRaisePlumbingSymbol(mangled)) return .skipped;
     if (isPanicPlumbingSymbol(mangled)) return .skipped;
+    if (isBacktraceCapturePlumbingSymbol(mangled)) return .skipped;
     if (isBelowUserEntrySymbol(mangled)) return .stop;
 
     if (needs_comma) posixWrite(STDERR_FD, ",");
@@ -8777,6 +8803,7 @@ fn firstSourceLocation(backtrace: []const usize) ?std.debug.SourceLocation {
         const mangled = stripSymbolUnderscore(name);
         if (isRaisePlumbingSymbol(mangled)) continue;
         if (isPanicPlumbingSymbol(mangled)) continue;
+        if (isBacktraceCapturePlumbingSymbol(mangled)) continue;
         if (isBelowUserEntrySymbol(mangled)) return null;
         if (info.source) |loc| {
             if (loc.file_name.len != 0) return loc;

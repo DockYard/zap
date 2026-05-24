@@ -53,8 +53,16 @@ checked=0
 #   * the private per-run script-cache staging path -> <STAGING>
 #   * the trailing run-local cache hash dir under .cache/zap
 normalize() { # normalize <fixture_relpath>
-  local fixture_abs
+  local fixture_abs repo_root
   fixture_abs="$(pwd)/$1"
+  repo_root="$(pwd)"
+  # Substitution order is load-bearing: the most-specific paths (the fixture's
+  # own absolute path, the per-run script-cache staging dir) are folded to
+  # their stable tokens FIRST, so the generic repo-root rewrite below only ever
+  # catches the remaining in-repo source references (notably the stdlib
+  # `zig-out/lib/kernel.zap` frames that the Phase-4.a `at file:line` backtrace
+  # enrichment now surfaces). Without the `<REPO>` rewrite those absolute
+  # machine paths would make the goldens non-portable across machines/CI.
   sed -E \
     -e 's/\x1b\[[0-9;]*m//g' \
     -e 's/0x[0-9a-fA-F]+/0xADDR/g' \
@@ -62,7 +70,8 @@ normalize() { # normalize <fixture_relpath>
     -e "s#${fixture_abs}#<FIXTURE>#g" \
     -e "s#${1}#<FIXTURE>#g" \
     -e 's#/[^ ]*/\.cache/zap/[^ ]*#<STAGING>#g' \
-    -e 's#/[^ ]*/\.zap-cache/[^ ]*#<STAGING>#g'
+    -e 's#/[^ ]*/\.zap-cache/[^ ]*#<STAGING>#g' \
+    -e "s#${repo_root}#<REPO>#g"
 }
 
 # Run one capture, normalize it, and either write the golden (--update) or diff
