@@ -7035,6 +7035,68 @@ test "rescue: recovered boxed error drops cleanly under Memory.Tracking (no doub
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "LEAK:") == null);
 }
 
+test "rescue: terminal CROSS-FN catch releases the recovered box under Memory.Tracking (Gap D, no leak)" {
+    // Gap D regression: a CROSS-FUNCTION raise that propagates through the
+    // error-union side-channel and is caught by a TERMINAL `rescue` (handled,
+    // NOT re-raised) used to LEAK the boxed `Error` existential under
+    // `Memory.Tracking` (masked under `Memory.ARC` by the refcount path).
+    //
+    // Unlike the LOCAL-raise terminal catch (the sibling `recovered_box_tracking`
+    // test above, where the body's tail is a `raise` so `lowerTryRescue` takes
+    // the FAST path and the box is a top-level owned local the generic
+    // scope-exit drop pass releases at the function `ret`), here the `try` body's
+    // tail is a CALL to a raising callee (`CrossFnWorker.boom()`). That takes the
+    // SLOW landing-pad path: the box is recovered via `take_recoverable_raise`
+    // INSIDE the landing-pad `then` branch, so it is dead by the function-exit
+    // point and the generic drain never scheduled its release — the 40-byte
+    // boxed `%CrossFnError{}` inner leaked. `lowerTryRescue` now emits the
+    // owner-drop at the rescue handler's scope exit on the terminal-catch
+    // fall-through (gated on a non-diverging dispatch), releasing the box
+    // exactly once. The re-raise path re-boxes a fresh copy and diverges before
+    // the drop, so there is no double-free (consistent with the Gap B transfer
+    // and the Gap A borrowed-binding model).
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "cross_fn_catch_tracking.zap",
+        \\@code Z9301
+        \\pub error CrossFnError {}
+        \\
+        \\pub struct CrossFnWorker {
+        \\  fn boom() -> String raises CrossFnError {
+        \\    raise %CrossFnError{message: "cross-fn boom"}
+        \\  }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  result = try {
+        \\    CrossFnWorker.boom()
+        \\  } rescue {
+        \\    e :: CrossFnError -> "caught"
+        \\  }
+        \\  IO.puts("recovered-ok=" <> result)
+        \\  0
+        \\}
+    , &.{"-Dmemory=Memory.Tracking"}, &.{});
+    defer r.deinit();
+
+    if (r.exit_code != 0) {
+        std.debug.print(
+            "cross-fn-catch-tracking failed: exit={d}\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.exit_code, r.stdout, r.stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "recovered-ok=caught") != null);
+    // The recovered box's inner must be freed exactly once: a survivor renders
+    // the `leak summary:` line at deinit (the canonical Tracking leak marker;
+    // the per-allocation line is `warning: memory leak: …`). Before the fix this
+    // fired with `1 x \`%CrossFnError{}\` (40 B)`.
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "leak summary:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "memory leak:") == null);
+}
+
 // ---- target / cpu scenarios ---------------------------------------
 
 test "CLI script: native default when neither manifest nor -Dtarget set" {
