@@ -323,10 +323,11 @@ pub fn ctfeManifestDetailedWithProgress(
 
     // Evaluate manifest/1
     const manifest_result = interp.evalAndExport(manifest_id, &.{env_const}, ctfe.CapabilitySet.build) catch {
-        // Report CTFE errors
-        // stderr removed in 0.16
+        // Report CTFE errors through the embedder-owned diagnostic stderr sink
+        // (silent by default in a test build) rather than hardwiring
+        // `std.debug.print` to the global stderr.
         for (interp.errors.items) |err| {
-            std.debug.print("  ctfe error: {s}\n", .{err.message});
+            zap.diagnostics.emitStderrFmt("  ctfe error: {s}\n", .{err.message});
         }
         return error.CtfeFailed;
     };
@@ -861,14 +862,14 @@ fn resolveMemoryManagerBackendFromSourceGraph(
         if (!structNameMatchesDotted(interner, impl_entry.target_type, manager_type_name)) continue;
 
         const source_id = impl_entry.decl.meta.span.source_id orelse {
-            std.debug.print(
+            zap.diagnostics.emitStderrFmt(
                 "Error: memory manager '{s}' impl Memory.Manager has no source location\n",
                 .{manager_type_name},
             );
             return error.InvalidMemoryManagerAdapter;
         };
         const path = scope_graph.sourcePathById(source_id) orelse {
-            std.debug.print(
+            zap.diagnostics.emitStderrFmt(
                 "Error: memory manager '{s}' impl Memory.Manager source file is not registered\n",
                 .{manager_type_name},
             );
@@ -877,7 +878,7 @@ fn resolveMemoryManagerBackendFromSourceGraph(
         return alloc.dupe(u8, path);
     }
 
-    std.debug.print(
+    zap.diagnostics.emitStderrFmt(
         "Error: memory manager '{s}' selected by manifest does not implement Memory.Manager\n",
         .{manager_type_name},
     );

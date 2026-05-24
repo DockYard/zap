@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("ast.zig");
 const env = @import("env.zig");
 const error_ir = @import("error_ir.zig");
@@ -248,6 +249,96 @@ pub fn setOutputPolicy(policy: OutputPolicy) void {
 /// The current process-wide diagnostic-output policy.
 pub fn outputPolicy() OutputPolicy {
     return output_policy;
+}
+
+// ============================================================
+// Diagnostic stderr sink (the embedder-owned write boundary)
+// ============================================================
+//
+// Rendering a diagnostic and *emitting* it to the embedder's error stream are
+// two separate concerns. `DiagnosticEngine.format` is pure: it returns the
+// rendered text. Sending that text to the process's real stderr is a policy
+// the embedder owns, not the compiler library.
+//
+// Production embedders (`zap` CLI, `main.zig`) write to the real stderr. The
+// unit-test harness is ALSO an embedder, and it must NOT have library
+// diagnostics bleed onto its stderr: under `--listen=-` the Zig build runner
+// captures every byte a test process writes to stderr and surfaces it as
+// `failed command:` noise on otherwise-green steps. Tests that deliberately
+// exercise error paths (an invalid `--zap-lib-dir`, a manifest selecting a
+// non-conforming memory manager, a broken-source compile) assert on the
+// *returned error*, never on stderr text — so the correct default for a test
+// build is to discard the emitted diagnostic.
+//
+// A test that genuinely wants to assert on the emitted text installs a
+// capturing sink via `installStderrCapture`; the standalone renderer tests use
+// `format` directly and are unaffected either way.
+
+/// Capturing sink a test installs to intercept emitted diagnostic text instead
+/// of letting it reach the real stderr. Owns no memory; the caller supplies the
+/// backing list and reads it after the emit under test.
+pub const StderrCapture = struct {
+    list: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+};
+
+/// When non-null, `emitStderr` routes bytes here instead of to the real stderr.
+/// Used only by tests that assert on emitted diagnostic text.
+var diagnostic_stderr_capture: ?StderrCapture = null;
+
+/// Whether `emitStderr` writes to the process's real stderr when no capture
+/// sink is installed. Defaults to `false` under `builtin.is_test` so that
+/// exercising an error path in a unit test does not pollute the test harness's
+/// stderr (which the Zig build runner treats as step output). Production builds
+/// default to `true` and keep the user-facing diagnostic behavior unchanged.
+var diagnostic_stderr_enabled: bool = !builtin.is_test;
+
+/// Emit already-rendered diagnostic text to the embedder's error stream.
+///
+/// Precedence: an installed capture sink wins (tests asserting on text); else,
+/// when real-stderr emission is enabled, write to the process stderr; else
+/// discard. This is the single write boundary every library-layer diagnostic
+/// emitter (`compiler.emitDiagnostics`, the stdlib-dir resolver, the memory-
+/// manager-adapter resolver) routes through so none of them hardwire
+/// `std.debug.print` to the global stderr.
+pub fn emitStderr(bytes: []const u8) void {
+    if (diagnostic_stderr_capture) |capture| {
+        capture.list.appendSlice(capture.allocator, bytes) catch {};
+        return;
+    }
+    if (diagnostic_stderr_enabled) {
+        std.debug.print("{s}", .{bytes});
+    }
+}
+
+/// `std.fmt`-style convenience over `emitStderr` so call sites that previously
+/// did `std.debug.print(fmt, args)` for a user-facing diagnostic can route
+/// through the sink with the same ergonomics. Renders into a stack buffer and
+/// falls back to the unformatted format string only if rendering overflows
+/// (which cannot happen for the fixed diagnostic templates that use it).
+pub fn emitStderrFmt(comptime fmt: []const u8, args: anytype) void {
+    var buffer: [4096]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&buffer, fmt, args) catch {
+        emitStderr(fmt);
+        return;
+    };
+    emitStderr(rendered);
+}
+
+/// Enable or disable real-stderr emission for the current process. Production
+/// `main()` is free to leave the default; this exists so a test can opt back
+/// into real-stderr behavior if it must, and to make the default explicit.
+pub fn setStderrEnabled(enabled: bool) void {
+    diagnostic_stderr_enabled = enabled;
+}
+
+/// Install a capturing sink so the next `emitStderr` calls accumulate into the
+/// caller's list rather than reaching stderr. Returns the previous sink so the
+/// caller can restore it. Test-only.
+pub fn installStderrCapture(capture: ?StderrCapture) ?StderrCapture {
+    const previous = diagnostic_stderr_capture;
+    diagnostic_stderr_capture = capture;
+    return previous;
 }
 
 // ============================================================
@@ -1604,4 +1695,46 @@ test "macro-expansion backtrace renders the expansion chain as frame lines" {
     const output = try engine.format(alloc);
     try std.testing.expect(std.mem.find(u8, output, "in expansion of macro `unless`") != null);
     try std.testing.expect(std.mem.find(u8, output, "m.zap:2:3") != null);
+}
+
+test "diagnostic stderr sink: real-stderr emission defaults off under is_test" {
+    // The whole point of the sink: a unit-test build must not bleed library
+    // diagnostics onto the harness stderr, because the Zig build runner
+    // (`--listen=-`) treats any test-process stderr as step output and prints
+    // a spurious `failed command:` on an otherwise-green step.
+    try std.testing.expect(builtin.is_test);
+    try std.testing.expectEqual(false, diagnostic_stderr_enabled);
+    // No capture is installed by default, so an emit is silently discarded
+    // rather than reaching fd 2.
+    try std.testing.expect(diagnostic_stderr_capture == null);
+    emitStderr("this must not reach the real stderr under test\n");
+}
+
+test "diagnostic stderr sink: installed capture intercepts emitted text" {
+    var captured: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured.deinit(std.testing.allocator);
+
+    const previous = installStderrCapture(.{ .list = &captured, .allocator = std.testing.allocator });
+    defer _ = installStderrCapture(previous);
+
+    emitStderr("first ");
+    emitStderrFmt("second={d}\n", .{42});
+
+    try std.testing.expectEqualStrings("first second=42\n", captured.items);
+}
+
+test "diagnostic stderr sink: capture wins even when real-stderr emission is enabled" {
+    var captured: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured.deinit(std.testing.allocator);
+
+    // Force real-stderr emission ON, then prove the capture still intercepts
+    // (so a test can assert on emitted text without it also hitting fd 2).
+    setStderrEnabled(true);
+    defer setStderrEnabled(!builtin.is_test);
+
+    const previous = installStderrCapture(.{ .list = &captured, .allocator = std.testing.allocator });
+    defer _ = installStderrCapture(previous);
+
+    emitStderr("captured-not-printed");
+    try std.testing.expectEqualStrings("captured-not-printed", captured.items);
 }

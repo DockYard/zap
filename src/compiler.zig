@@ -9606,8 +9606,13 @@ fn emitDiagnostics(diag_engine: *zap.DiagnosticEngine, alloc: std.mem.Allocator)
     switch (policy.format) {
         .text => {
             const rendered = diag_engine.format(alloc) catch return;
-            // stderr writer: use debug.print in 0.16
-            std.debug.print("{s}", .{rendered});
+            // Route through the diagnostics module's embedder-owned stderr sink
+            // rather than hardwiring `std.debug.print`: production writes to the
+            // real stderr, while a unit-test build discards by default so a
+            // deliberately-failing compile fixture does not bleed its rendered
+            // diagnostic onto the test harness's stderr (which the `--listen=-`
+            // build runner would surface as `failed command:` on a green step).
+            zap.diagnostics.emitStderr(rendered);
         },
         .json => {
             // `--error-format=json`: emit the canonical Error IR as a single

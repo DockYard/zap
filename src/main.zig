@@ -2639,7 +2639,7 @@ fn resolveZapLibDir(allocator: std.mem.Allocator, flag: ?[]const u8, project_roo
     // 1. Explicit `--zap-lib-dir` flag — validated; wrong is fatal.
     if (flag) |flag_dir| {
         if (!zapLibDirContainsKernel(allocator, flag_dir)) {
-            std.debug.print(
+            zap.diagnostics.emitStderrFmt(
                 "Error: --zap-lib-dir '{s}' is not a valid Zap stdlib directory (no kernel.zap found)\n",
                 .{flag_dir},
             );
@@ -2651,7 +2651,7 @@ fn resolveZapLibDir(allocator: std.mem.Allocator, flag: ?[]const u8, project_roo
     // 2. `ZAP_LIB_DIR` environment variable — validated; wrong is fatal.
     if (env.getenv("ZAP_LIB_DIR")) |env_dir| {
         if (!zapLibDirContainsKernel(allocator, env_dir)) {
-            std.debug.print(
+            zap.diagnostics.emitStderrFmt(
                 "Error: ZAP_LIB_DIR '{s}' is not a valid Zap stdlib directory (no kernel.zap found)\n",
                 .{env_dir},
             );

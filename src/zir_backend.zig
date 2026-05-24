@@ -14,6 +14,7 @@ const ir = @import("ir.zig");
 const env = @import("env.zig");
 const progress_mod = @import("progress.zig");
 const zap_symbol_table = @import("zap_symbol_table.zig");
+const diagnostics = @import("diagnostics.zig");
 
 // ---------------------------------------------------------------------------
 // Extern declarations for the C-ABI functions in libzig_compiler.a
@@ -761,7 +762,7 @@ pub fn injectAndUpdate(allocator: std.mem.Allocator, program: ir.Program, ctx: *
             const sidecar_path = try std.fmt.allocPrint(allocator, "{s}.zap-symbols", .{options.output_path});
             defer allocator.free(sidecar_path);
             writeSymbolTableSidecar(sidecar_path, bytes) catch |err| {
-                std.debug.print(
+                diagnostics.emitStderrFmt(
                     "Warning: failed to write zap symbol-table sidecar at {s}: {s}\n",
                     .{ sidecar_path, @errorName(err) },
                 );
@@ -906,7 +907,7 @@ pub fn injectPreparedAndUpdate(allocator: std.mem.Allocator, program: ir.Program
         out_sym_ptr,
     ) catch |inject_err| {
         abortUpdate(ctx) catch |abort_err| {
-            std.debug.print(
+            diagnostics.emitStderrFmt(
                 "Error: failed to abort prepared incremental update after ZIR injection failure ({s}); context must be discarded: {s}\n",
                 .{ @errorName(inject_err), @errorName(abort_err) },
             );
@@ -921,7 +922,7 @@ pub fn injectPreparedAndUpdate(allocator: std.mem.Allocator, program: ir.Program
             const sidecar_path = try std.fmt.allocPrint(allocator, "{s}.zap-symbols", .{options.output_path});
             defer allocator.free(sidecar_path);
             writeSymbolTableSidecar(sidecar_path, bytes) catch |err| {
-                std.debug.print(
+                diagnostics.emitStderrFmt(
                     "Warning: failed to write zap symbol-table sidecar at {s}: {s}\n",
                     .{ sidecar_path, @errorName(err) },
                 );
@@ -984,7 +985,7 @@ pub fn injectPreparedSelectedAndUpdate(
         out_sym_ptr,
     ) catch |inject_err| {
         abortUpdate(ctx) catch |abort_err| {
-            std.debug.print(
+            diagnostics.emitStderrFmt(
                 "Error: failed to abort prepared incremental update after selective ZIR injection failure ({s}); context must be discarded: {s}\n",
                 .{ @errorName(inject_err), @errorName(abort_err) },
             );
@@ -1078,7 +1079,7 @@ fn mergeAndWriteSelectedSidecar(
     defer allocator.free(merged_blob);
 
     writeSymbolTableSidecar(sidecar_path, merged_blob) catch |err| {
-        std.debug.print(
+        diagnostics.emitStderrFmt(
             "Warning: failed to write merged zap symbol-table sidecar at {s}: {s}\n",
             .{ sidecar_path, @errorName(err) },
         );
@@ -1092,13 +1093,13 @@ fn mergeAndWriteSelectedSidecar(
 /// itself worth surfacing.
 fn invalidateSidecarFallback(sidecar_path: []const u8, context: []const u8, err: anyerror) void {
     const io = std.Options.debug_io;
-    std.debug.print(
+    diagnostics.emitStderrFmt(
         "Warning: invalidating stale zap symbol-table sidecar {s} ({s}: {s})\n",
         .{ sidecar_path, context, @errorName(err) },
     );
     std.Io.Dir.cwd().deleteFile(io, sidecar_path) catch |del_err| switch (del_err) {
         error.FileNotFound => {},
-        else => std.debug.print(
+        else => diagnostics.emitStderrFmt(
             "Warning: failed to remove stale sidecar {s}: {s}\n",
             .{ sidecar_path, @errorName(del_err) },
         ),
