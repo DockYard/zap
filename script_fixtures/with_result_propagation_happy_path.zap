@@ -22,11 +22,11 @@ pub struct Demo {
   }
 
   pub fn double_it(n :: i64) -> Result(i64, String) {
-    with Result.Ok(value) <- Demo.parse_positive(n) do
+    with Result.Ok(value) <- Demo.parse_positive(n) {
       Result(i64, String).Ok(value * 2)
-    else
+    } else {
       Result.Error(reason) -> Result(i64, String).Error(reason)
-    end
+    }
   }
 }
 

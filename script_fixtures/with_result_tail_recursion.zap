@@ -3,7 +3,7 @@
 # `count_down/2` is self-recursive in tail position through a `with`
 # chain: `with Ok(next) <- step(n)` unwraps the `Ok` and the
 # recursive `count_down(next, acc + 1)` sits in tail position inside
-# the `do` body. With ERT recording emitted as a guarded
+# the success body. With ERT recording emitted as a guarded
 # out-of-line call (not inline in the hot return path), the
 # self-tail-call is still rewritten to `tail_call` and the deep
 # recursion runs in O(1) stack.
@@ -26,11 +26,11 @@ pub struct Deep {
   pub fn count_down(n :: i64, acc :: i64) -> Result(i64, String) {
     case n > 0 {
       true -> {
-        with Result.Ok(next) <- Deep.step(n) do
+        with Result.Ok(next) <- Deep.step(n) {
           Deep.count_down(next, acc + 1)
-        else
+        } else {
           Result.Error(reason) -> Result(i64, String).Error(reason)
-        end
+        }
       }
       false -> Result(i64, String).Ok(acc)
     }
