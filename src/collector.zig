@@ -1472,7 +1472,7 @@ test "collect empty struct declaration registers nominal type" {
 test "collect protocol declaration" {
     const source =
         \\pub protocol Enumerable {
-        \\  fn each(collection, callback :: (member -> member)) -> collection
+        \\  fn each(collection, callback :: fn(member) -> member) -> collection
         \\}
     ;
 
@@ -1496,7 +1496,7 @@ test "collect protocol declaration" {
 test "collect impl declaration" {
     const source =
         \\pub impl Enumerable for List {
-        \\  pub fn each(list :: [member], callback :: (member -> member)) -> [member] {
+        \\  pub fn each(list :: [member], callback :: fn(member) -> member) -> [member] {
         \\    list
         \\  }
         \\}

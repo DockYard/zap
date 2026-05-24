@@ -5471,7 +5471,8 @@ pub const Parser = struct {
 
     fn parseTypeTerm(self: *Parser) !*const ast.TypeExpr {
         switch (self.peek()) {
-            .left_paren => return self.parseFunctionTypeOrParenType(),
+            .keyword_fn => return self.parseFunctionType(),
+            .left_paren => return self.parseParenType(),
             .left_brace => return self.parseTupleType(),
             .left_bracket => return self.parseListType(),
             .percent_brace => return self.parseMapType(),
@@ -5493,90 +5494,134 @@ pub const Parser = struct {
         }
     }
 
-    fn parseFunctionTypeOrParenType(self: *Parser) !*const ast.TypeExpr {
+    /// Parse a function TYPE: `fn(param-types) -> return-type`.
+    ///
+    /// This is the type-position analogue of the closure value literal
+    /// `fn(name :: T, ...) -> R { body }`: it reads as the literal with
+    /// the parameter names and the body erased. The parameter list is a
+    /// comma-separated list of TYPES (each optionally ownership-qualified,
+    /// e.g. `borrowed String`), never `name :: type`. The return type is
+    /// parsed via the full type-expression parser, so it composes
+    /// right-associatively without parentheses (`fn() -> fn() -> i64`) and
+    /// admits arbitrary nested types, including function-typed parameters
+    /// (`fn(fn() -> i64) -> i64`).
+    ///
+    /// CRITICAL — TYPE vs VALUE disambiguation: in type position this
+    /// parser STOPS immediately after the return type. It never consumes a
+    /// trailing `{ ... }` — that brace belongs to the enclosing construct
+    /// (for example the body of the function whose return type this is, as
+    /// in `pub fn make() -> fn() -> i64 { <body of make> }`). The closure
+    /// VALUE literal (which does consume the body) is parsed by
+    /// `parseAnonymousFunctionExpr`, reached only from expression position.
+    fn parseFunctionType(self: *Parser) !*const ast.TypeExpr {
         const start = self.currentSpan();
-        _ = try self.expect(.left_paren);
+        _ = try self.expect(.keyword_fn);
 
-        if (self.check(.arrow)) {
-            _ = self.advance();
-            const return_q = try self.parseOptionalOwnershipQualifier();
-            const return_type = try self.parseTypeExpr();
-            _ = try self.expect(.right_paren);
-            return self.create(ast.TypeExpr, .{
-                .function = .{
-                    .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-                    .params = &[_]*const ast.TypeExpr{},
-                    .param_ownerships = &[_]ast.Ownership{},
-                    .param_ownerships_explicit = &[_]bool{},
-                    .return_type = return_type,
-                    .return_ownership = return_q.ownership,
-                    .return_ownership_explicit = return_q.explicit,
-                },
-            });
+        if (!self.check(.left_paren)) {
+            try self.addRichError(
+                "I was expecting `(` to start the parameter-type list of a function type",
+                self.currentSpan(),
+                "a function type looks like `fn(A, B) -> C`",
+                "add `()` after `fn`, even for a no-argument function type: `fn() -> T`",
+            );
+            return error.ParseError;
         }
+        _ = self.advance();
 
-        const first_q = try self.parseOptionalOwnershipQualifier();
-        const first = try self.parseTypeExpr();
+        var params: std.ArrayList(*const ast.TypeExpr) = .empty;
+        var param_ownerships: std.ArrayList(ast.Ownership) = .empty;
+        var param_ownerships_explicit: std.ArrayList(bool) = .empty;
 
-        if (self.check(.arrow)) {
-            _ = self.advance();
-            const return_q = try self.parseOptionalOwnershipQualifier();
-            const return_type = try self.parseTypeExpr();
-            _ = try self.expect(.right_paren);
-            return self.create(ast.TypeExpr, .{
-                .function = .{
-                    .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-                    .params = try self.allocator.dupe(*const ast.TypeExpr, &[_]*const ast.TypeExpr{first}),
-                    .param_ownerships = try self.allocator.dupe(ast.Ownership, &[_]ast.Ownership{first_q.ownership}),
-                    .param_ownerships_explicit = try self.allocator.dupe(bool, &[_]bool{first_q.explicit}),
-                    .return_type = return_type,
-                    .return_ownership = return_q.ownership,
-                    .return_ownership_explicit = return_q.explicit,
-                },
-            });
-        }
-
-        if (self.check(.comma)) {
-            var params: std.ArrayList(*const ast.TypeExpr) = .empty;
-            var param_ownerships: std.ArrayList(ast.Ownership) = .empty;
-            var param_ownerships_explicit: std.ArrayList(bool) = .empty;
-            try params.append(self.allocator, first);
-            try param_ownerships.append(self.allocator, first_q.ownership);
-            try param_ownerships_explicit.append(self.allocator, first_q.explicit);
-            while (self.match(.comma)) {
-                if (self.check(.arrow)) break;
+        if (!self.check(.right_paren)) {
+            while (true) {
                 const ownership = try self.parseOptionalOwnershipQualifier();
                 const param = try self.parseTypeExpr();
                 try params.append(self.allocator, param);
                 try param_ownerships.append(self.allocator, ownership.ownership);
                 try param_ownerships_explicit.append(self.allocator, ownership.explicit);
+                if (!self.match(.comma)) break;
             }
-            if (self.check(.arrow)) {
-                _ = self.advance();
-                const return_q = try self.parseOptionalOwnershipQualifier();
-                const return_type = try self.parseTypeExpr();
-                _ = try self.expect(.right_paren);
-                return self.create(ast.TypeExpr, .{
-                    .function = .{
-                        .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-                        .params = try params.toOwnedSlice(self.allocator),
-                        .param_ownerships = try param_ownerships.toOwnedSlice(self.allocator),
-                        .param_ownerships_explicit = try param_ownerships_explicit.toOwnedSlice(self.allocator),
-                        .return_type = return_type,
-                        .return_ownership = return_q.ownership,
-                        .return_ownership_explicit = return_q.explicit,
-                    },
-                });
-            }
+        }
+
+        if (!self.check(.right_paren)) {
+            try self.addRichError(
+                "this function type's parameter list was never closed",
+                start,
+                "the parameter-type list opened here",
+                "add `)` to close the parameter list before the `->` return type",
+            );
+            return error.ParseError;
+        }
+        _ = self.advance();
+
+        if (!self.check(.arrow)) {
+            try self.addRichError(
+                "a function type requires a `->` and a return type",
+                self.currentSpan(),
+                "expected `->` after the parameter-type list",
+                "write the return type, for example `fn(i64) -> i64`",
+            );
+            return error.ParseError;
+        }
+        _ = self.advance();
+
+        const return_q = try self.parseOptionalOwnershipQualifier();
+        const return_type = try self.parseTypeExpr();
+
+        return self.create(ast.TypeExpr, .{
+            .function = .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .params = try params.toOwnedSlice(self.allocator),
+                .param_ownerships = try param_ownerships.toOwnedSlice(self.allocator),
+                .param_ownerships_explicit = try param_ownerships_explicit.toOwnedSlice(self.allocator),
+                .return_type = return_type,
+                .return_ownership = return_q.ownership,
+                .return_ownership_explicit = return_q.explicit,
+            },
+        });
+    }
+
+    /// Parse a parenthesized (grouped) type: `(T)`.
+    ///
+    /// Function types are no longer spelled with an arrow inside parens —
+    /// they use the `fn(...) -> T` form parsed by `parseFunctionType`. So a
+    /// `->` encountered inside these parens is a use of the removed syntax
+    /// and is rejected with a diagnostic that points to the new spelling.
+    /// Ordinary grouping (`(i64)`) is preserved.
+    fn parseParenType(self: *Parser) !*const ast.TypeExpr {
+        const start = self.currentSpan();
+        _ = try self.expect(.left_paren);
+
+        if (self.check(.arrow)) {
+            try self.reportLegacyFunctionType(start);
+            return error.ParseError;
+        }
+
+        const inner = try self.parseTypeExpr();
+
+        if (self.check(.arrow) or self.check(.comma)) {
+            try self.reportLegacyFunctionType(start);
+            return error.ParseError;
         }
 
         _ = try self.expect(.right_paren);
         return self.create(ast.TypeExpr, .{
             .paren = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-                .inner = first,
+                .inner = inner,
             },
         });
+    }
+
+    /// Emit the diagnostic for the removed `(A -> B)` function-type form,
+    /// directing the author to the `fn(A) -> B` spelling.
+    fn reportLegacyFunctionType(self: *Parser, open_paren: ast.SourceSpan) !void {
+        try self.addRichError(
+            "function types are written `fn(A) -> B`, not `(A -> B)`",
+            open_paren,
+            "this `(` begins the old function-type syntax, which has been removed",
+            "rewrite it with `fn(...) -> ...`, e.g. `fn(i64) -> i64`, `fn() -> i64`, or `fn(A, B) -> C`",
+        );
     }
 
     fn parseOptionalOwnershipQualifier(self: *Parser) !struct { ownership: ast.Ownership, explicit: bool } {
@@ -6202,7 +6247,7 @@ test "parse borrowed param ownership annotation" {
 test "parse function type ownership annotations" {
     const source =
         \\pub struct Test {
-        \\  pub fn apply(f :: (borrowed String -> unique String)) {
+        \\  pub fn apply(f :: fn(borrowed String) -> unique String) {
         \\    f
         \\  }
         \\}
@@ -6217,6 +6262,182 @@ test "parse function type ownership annotations" {
     const fn_type = program.structs[0].items[0].function.clauses[0].params[0].type_annotation.?.function;
     try std.testing.expectEqual(ast.Ownership.borrowed, fn_type.param_ownerships[0]);
     try std.testing.expectEqual(ast.Ownership.unique, fn_type.return_ownership);
+}
+
+test "parse fn() -> T function type (nullary)" {
+    // The new function-TYPE surface: `fn() -> i64` mirrors the closure
+    // value literal `fn() -> i64 { ... }` with parameter names and body
+    // erased. In type position the parser must STOP before any `{`.
+    const source = "fn() -> i64";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const type_expr = try parser.parseTypeExpr();
+    try std.testing.expect(type_expr.* == .function);
+    try std.testing.expectEqual(@as(usize, 0), type_expr.function.params.len);
+    try std.testing.expect(type_expr.function.return_type.* == .name);
+}
+
+test "parse fn(A) -> T function type (unary)" {
+    const source = "fn(i64) -> i64";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const type_expr = try parser.parseTypeExpr();
+    try std.testing.expect(type_expr.* == .function);
+    try std.testing.expectEqual(@as(usize, 1), type_expr.function.params.len);
+    try std.testing.expect(type_expr.function.params[0].* == .name);
+    try std.testing.expect(type_expr.function.return_type.* == .name);
+}
+
+test "parse fn(A, B) -> T function type (binary)" {
+    const source = "fn(i64, i64) -> Bool";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const type_expr = try parser.parseTypeExpr();
+    try std.testing.expect(type_expr.* == .function);
+    try std.testing.expectEqual(@as(usize, 2), type_expr.function.params.len);
+    try std.testing.expect(type_expr.function.return_type.* == .name);
+}
+
+test "parse fn function type with ownership qualifiers" {
+    const source = "fn(borrowed String) -> unique String";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const type_expr = try parser.parseTypeExpr();
+    try std.testing.expect(type_expr.* == .function);
+    try std.testing.expectEqual(ast.Ownership.borrowed, type_expr.function.param_ownerships[0]);
+    try std.testing.expectEqual(ast.Ownership.unique, type_expr.function.return_ownership);
+}
+
+test "parse right-associative nested fn function type" {
+    // `fn() -> fn() -> i64` parses as a function returning a function
+    // returning i64 — no parentheses needed, the return type recurses
+    // through parseTypeExpr.
+    const source = "fn() -> fn() -> i64";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const type_expr = try parser.parseTypeExpr();
+    try std.testing.expect(type_expr.* == .function);
+    try std.testing.expectEqual(@as(usize, 0), type_expr.function.params.len);
+    try std.testing.expect(type_expr.function.return_type.* == .function);
+    try std.testing.expect(type_expr.function.return_type.function.return_type.* == .name);
+}
+
+test "parse fn function type with a closure parameter type" {
+    // `fn(fn() -> i64) -> i64` — the param is itself a function type with
+    // its own arrow, parsed via the recursive type parser.
+    const source = "fn(fn() -> i64) -> i64";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const type_expr = try parser.parseTypeExpr();
+    try std.testing.expect(type_expr.* == .function);
+    try std.testing.expectEqual(@as(usize, 1), type_expr.function.params.len);
+    try std.testing.expect(type_expr.function.params[0].* == .function);
+    try std.testing.expect(type_expr.function.return_type.* == .name);
+}
+
+test "parse fn function type stops before a trailing brace (type vs value)" {
+    // In TYPE position the parser must NOT consume a `{` body — that brace
+    // belongs to the enclosing construct (e.g. an enclosing fn's body).
+    // After parsing `fn() -> i64` the next token must still be `{`.
+    const source = "fn() -> i64 { 42 }";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const type_expr = try parser.parseTypeExpr();
+    try std.testing.expect(type_expr.* == .function);
+    try std.testing.expect(parser.check(.left_brace));
+}
+
+test "parse return-position fn function type — brace is the outer fn body" {
+    // `pub fn make() -> fn() -> i64 { <body> }`: the return TYPE is
+    // `fn() -> i64`; the `{` after it opens `make`'s body, not a closure.
+    const source =
+        \\pub struct Maker {
+        \\  pub fn make() -> fn() -> i64 {
+        \\    fn() -> i64 { 7 }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const clause = program.structs[0].items[0].function.clauses[0];
+    try std.testing.expect(clause.return_type.?.* == .function);
+    try std.testing.expect(clause.return_type.?.function.return_type.* == .name);
+    try std.testing.expect(clause.body != null);
+}
+
+test "old arrow-in-parens function type is now a parse error" {
+    // The old `(A -> B)` function-type form is removed: an arrow inside a
+    // parenthesized type must now be a clean parse error directing the
+    // author to the `fn(A) -> B` spelling.
+    const source = "(i64 -> i64)";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const result = parser.parseTypeExpr();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "old nullary arrow-in-parens function type is now a parse error" {
+    const source = "( -> i64)";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const result = parser.parseTypeExpr();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "grouped-paren type still parses after removing arrow form" {
+    // Removing the arrow-in-parens function type must NOT break ordinary
+    // parenthesized grouping: `(i64)` is still a paren type wrapping i64.
+    const source = "(i64)";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const type_expr = try parser.parseTypeExpr();
+    try std.testing.expect(type_expr.* == .paren);
+    try std.testing.expect(type_expr.paren.inner.* == .name);
 }
 
 test "parse struct" {
@@ -7770,7 +7991,7 @@ test "parse anonymous function expression" {
 test "parse protocol declaration" {
     const source =
         \\pub protocol Enumerable {
-        \\  fn each(collection, callback :: (member -> member)) -> collection
+        \\  fn each(collection, callback :: fn(member) -> member) -> collection
         \\}
     ;
 
@@ -7822,7 +8043,7 @@ test "parse protocol with multiple function signatures" {
 test "parse impl declaration" {
     const source =
         \\pub impl Enumerable for List {
-        \\  pub fn each(list :: [member], callback :: (member -> member)) -> [member] {
+        \\  pub fn each(list :: [member], callback :: fn(member) -> member) -> [member] {
         \\    :zig.List.eachFn(list, callback)
         \\  }
         \\}
@@ -7846,11 +8067,11 @@ test "parse impl declaration" {
 test "parse impl with multiple functions" {
     const source =
         \\pub impl Enumerable for List {
-        \\  pub fn each(list :: [member], callback :: (member -> member)) -> [member] {
+        \\  pub fn each(list :: [member], callback :: fn(member) -> member) -> [member] {
         \\    :zig.List.eachFn(list, callback)
         \\  }
         \\
-        \\  pub fn reduce(list :: [member], acc :: result, callback :: (result, member -> result)) -> result {
+        \\  pub fn reduce(list :: [member], acc :: result, callback :: fn(result, member) -> result) -> result {
         \\    :zig.List.reduceFn(list, acc, callback)
         \\  }
         \\}

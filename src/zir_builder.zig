@@ -68,7 +68,7 @@ extern "c" fn zir_builder_emit_single_const_ptr_type(handle: ?*ZirBuilderHandle,
 /// `param_type_refs` are the parameter type Refs (each a
 /// `@intFromEnum(Zir.Inst.Ref)`); `ret_type` is the return type Ref. This is
 /// the runtime representation of a non-capturing (0-capture) Zap closure
-/// value, so the ZIR backend renders a closure type (`( -> i64)`) through
+/// value, so the ZIR backend renders a closure type (`fn() -> i64`) through
 /// this at every concrete-type position — struct field, function return
 /// type, tuple element — where the param-position `anytype` lowering can't
 /// be used. See `FuncBody.addFuncPtrType` in the fork.
@@ -1341,7 +1341,7 @@ pub const ZirDriver = struct {
         };
     }
 
-    /// Resolve a closure type `( -> Ret)` / `(P... -> Ret)` to a ZIR
+    /// Resolve a closure type `fn() -> Ret` / `fn(P...) -> Ret` to a ZIR
     /// `*const fn(P...) Ret` type ref. This is the runtime representation
     /// of a NON-capturing (0-capture) Zap closure value (a bare function
     /// pointer); the ZIR backend uses it at every concrete-type position
@@ -1373,7 +1373,7 @@ pub const ZirDriver = struct {
     /// Resolve a single closure-signature component (a parameter type or
     /// the return type) to a ZIR type Ref. Primitives map to well-known
     /// Refs; a bare `void` return maps to the well-known `void_type` Ref
-    /// (a `( -> i64)`-style closure always has a concrete return, but a
+    /// (a `fn() -> i64`-style closure always has a concrete return, but a
     /// nested `void` element must still resolve); everything else is
     /// emitted inline via `emitImportedTypeRef` so its support
     /// instructions land in the func-ptr type's body.
@@ -4457,7 +4457,7 @@ pub const ZirDriver = struct {
         }
         switch (return_type) {
             .function => |fn_type| {
-                // A function declared to RETURN a closure type `( -> Ret)`
+                // A function declared to RETURN a closure type `fn() -> Ret`
                 // returns `*const fn(P...) Ret` — the runtime representation
                 // of the non-capturing closure value it produces. The
                 // func-ptr type's support instructions (the param/func/

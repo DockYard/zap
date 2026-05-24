@@ -8285,7 +8285,7 @@ test "HIR call args default to share mode" {
 test "HIR call args adopt function ownership modes" {
     const source =
         \\pub struct Test {
-        \\  pub fn apply(f :: (String -> String), x :: String) -> String {
+        \\  pub fn apply(f :: fn(String) -> String, x :: String) -> String {
         \\    f(x)
         \\  }
         \\}
@@ -8383,7 +8383,7 @@ test "HIR named calls use resolved parameter ownership" {
 test "HIR closure calls adopt borrowed ownership mode" {
     const source =
         \\pub struct Test {
-        \\  pub fn apply(f :: (String -> String), x :: String) {
+        \\  pub fn apply(f :: fn(String) -> String, x :: String) {
         \\    f(x)
         \\  }
         \\}

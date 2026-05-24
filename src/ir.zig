@@ -13914,7 +13914,7 @@ test "IR param_get indices are unique for multi-parameter functions" {
 test "IR call preserves HIR arg modes" {
     const source =
         \\pub struct Test {
-        \\  pub fn apply(f :: (String -> String), x :: String) {
+        \\  pub fn apply(f :: fn(String) -> String, x :: String) {
         \\    f(x)
         \\  }
         \\}
@@ -14046,7 +14046,7 @@ test "IR closure call preserves borrow mode without ARC ops" {
         \\pub struct Test {
         \\  opaque Handle = String
         \\
-        \\  pub fn apply(f :: (Handle -> Handle), x :: Handle) {
+        \\  pub fn apply(f :: fn(Handle) -> Handle, x :: Handle) {
         \\    f(x)
         \\  }
         \\}
@@ -14122,7 +14122,7 @@ test "IR shared opaque call emits retain and release" {
         \\    handle
         \\  }
         \\
-        \\  pub fn run(use_fn :: (Handle -> Handle), handle :: Handle) {
+        \\  pub fn run(use_fn :: fn(Handle) -> Handle, handle :: Handle) {
         \\    use_fn(handle)
         \\  }
         \\}

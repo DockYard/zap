@@ -9927,7 +9927,7 @@ test "anonymous closure with borrowed capture cannot escape via assignment" {
 test "anonymous closure with borrowed capture cannot escape through return" {
     const source =
         \\pub struct Test {
-        \\  pub fn run(x :: borrowed String) -> (String -> String) {
+        \\  pub fn run(x :: borrowed String) -> fn(String) -> String {
         \\    fn(y :: String) -> String {
         \\      x <> y
         \\    }
@@ -9967,7 +9967,7 @@ test "anonymous closure with borrowed capture cannot escape through return" {
 test "anonymous closure missing parameter annotation has closure-specific diagnostic" {
     const source =
         \\pub struct Test {
-        \\  pub fn run() -> (i64 -> i64) {
+        \\  pub fn run() -> fn(i64) -> i64 {
         \\    fn(x) -> i64 {
         \\      x + 1
         \\    }
@@ -10004,7 +10004,7 @@ test "anonymous closure missing parameter annotation has closure-specific diagno
 test "anonymous closure missing return annotation has closure-specific diagnostic" {
     const source =
         \\pub struct Test {
-        \\  pub fn run() -> (i64 -> i64) {
+        \\  pub fn run() -> fn(i64) -> i64 {
         \\    fn(x :: i64) {
         \\      x + 1
         \\    }
@@ -10041,7 +10041,7 @@ test "anonymous closure missing return annotation has closure-specific diagnosti
 test "higher-order call reports callable signature mismatch for anonymous closure" {
     const source =
         \\pub struct Test {
-        \\  pub fn apply(f :: (i64 -> i64)) -> i64 {
+        \\  pub fn apply(f :: fn(i64) -> i64) -> i64 {
         \\    f(41)
         \\  }
         \\
@@ -10100,7 +10100,7 @@ test "higher-order call reports callable signature mismatch for function ref" {
         \\    x + y
         \\  }
         \\
-        \\  pub fn apply(f :: (i64 -> i64)) -> i64 {
+        \\  pub fn apply(f :: fn(i64) -> i64) -> i64 {
         \\    f(41)
         \\  }
         \\
@@ -10496,7 +10496,7 @@ test "closure with borrowed capture cannot be passed as argument" {
         \\pub struct Test {
         \\  opaque Handle = String
         \\
-        \\  pub fn apply(f :: (-> Handle)) {
+        \\  pub fn apply(f :: fn() -> Handle) {
         \\    f
         \\  }
         \\
@@ -10661,7 +10661,7 @@ test "closure with borrowed capture may be passed to known-safe callee" {
         \\pub struct Test {
         \\  opaque Handle = String
         \\
-        \\  pub fn apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) -> Bool {
+        \\  pub fn apply(f :: fn(borrowed Handle) -> Bool, handle :: borrowed Handle) -> Bool {
         \\    f(handle)
         \\  }
         \\

@@ -2132,7 +2132,7 @@ pub const Desugarer = struct {
     // (`{struct, name, arity}` from `lib/function.zap`), which carries no
     // function pointer and so cannot be invoked through the `call_closure`
     // path the higher-order callee uses. Worse, its struct type fails to
-    // unify with the callback's `(a -> b)` parameter ("expects callable,
+    // unify with the callback's `fn(a) -> b` parameter ("expects callable,
     // got Function").
     //
     // The fix eta-expands the reference into an anonymous function whose

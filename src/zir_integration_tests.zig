@@ -1338,7 +1338,7 @@ test "ZIR: static local function ref call captures environment" {
 test "ZIR: anonymous closure is first-class callable" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
+        \\  pub fn apply(x :: i64, f :: fn(i64) -> i64) -> i64 {
         \\    f(x)
         \\  }
         \\
@@ -1360,7 +1360,7 @@ test "ZIR: anonymous closure is first-class callable" {
 test "ZIR: anonymous closure captures environment" {
     var result = try compileAndRun(
         \\pub struct TestProg {
-        \\  pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
+        \\  pub fn apply(x :: i64, f :: fn(i64) -> i64) -> i64 {
         \\    f(x)
         \\  }
         \\
@@ -2412,7 +2412,7 @@ test "ZIR (Result stdlib): map/map_error transform the matching variant" {
 // structurally identical to the working `Option.and_then/2`. An end-to-end
 // integration test is intentionally deferred: exercising it requires passing
 // a continuation (closure or `&fn/1`) to a parameter whose declared type is
-// the *generic* callable `(value -> Result(mapped, err))`. Passing a
+// the *generic* callable `fn(value) -> Result(mapped, err)`. Passing a
 // function reference or a `Result`-returning closure through a type-var
 // callable parameter currently fails callable-signature matching — a
 // pre-existing higher-order-generic inference gap (orthogonal to Phase 1.3,
@@ -8531,7 +8531,7 @@ test "Phase5 script cache: concurrent identical runs are race-safe (atomic publi
 // ============================================================
 
 test "closure: returned from a function then called (Gap E symptom 1)" {
-    // `Adders.make_adder()` RETURNS a pure closure `( -> i64)`; `main`
+    // `Adders.make_adder()` RETURNS a pure closure `fn() -> i64`; `main`
     // binds it and invokes it. Before the fix this failed at ZIR with
     // `expected type 'void', found '*const fn () i64'` because the closure
     // return type lowered to `void`.
@@ -8541,7 +8541,7 @@ test "closure: returned from a function then called (Gap E symptom 1)" {
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "closure_return.zap",
         \\pub struct Adders {
-        \\  pub fn make_adder() -> ( -> i64) {
+        \\  pub fn make_adder() -> fn() -> i64 {
         \\    fn() -> i64 { 42 }
         \\  }
         \\}
@@ -8565,7 +8565,7 @@ test "closure: returned from a function then called (Gap E symptom 1)" {
 }
 
 test "closure: stored in a struct field then called via field access (Gap E symptom 2)" {
-    // A `pub struct Handler` carries a closure-typed field `action :: ( -> i64)`.
+    // A `pub struct Handler` carries a closure-typed field `action :: fn() -> i64`.
     // `main` constructs `%Handler{ action: fn() -> i64 { 7 } }` and invokes it
     // via `h.action()`. Before the fix this hit `EmitFailed` because the
     // closure field type couldn't be rendered into ZIR.
@@ -8575,7 +8575,7 @@ test "closure: stored in a struct field then called via field access (Gap E symp
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "closure_field.zap",
         \\pub struct Handler {
-        \\  action :: ( -> i64)
+        \\  action :: fn() -> i64
         \\}
         \\
         \\fn main(_args :: [String]) -> u8 {
@@ -8597,7 +8597,7 @@ test "closure: stored in a struct field then called via field access (Gap E symp
 }
 
 test "closure: closure-typed field with a parameter, called with an argument" {
-    // The field carries a one-arg closure `(i64 -> i64)`; calling it through
+    // The field carries a one-arg closure `fn(i64) -> i64`; calling it through
     // field access must thread the argument to the bare fn-ptr.
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
@@ -8605,7 +8605,7 @@ test "closure: closure-typed field with a parameter, called with an argument" {
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "closure_field_arg.zap",
         \\pub struct Transform {
-        \\  op :: (i64 -> i64)
+        \\  op :: fn(i64) -> i64
         \\}
         \\
         \\fn main(_args :: [String]) -> u8 {
@@ -8635,7 +8635,7 @@ test "closure: struct holding a closure returned from a function, then called (G
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "closure_struct_return.zap",
         \\pub struct Handler {
-        \\  action :: ( -> i64)
+        \\  action :: fn() -> i64
         \\}
         \\
         \\pub struct Factory {
@@ -8673,11 +8673,11 @@ test "closure: higher-order fn that returns a closure, both invoked (Gap E scena
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "closure_higher_order_return.zap",
         \\pub struct Compose {
-        \\  pub fn run_first(f :: ( -> i64)) -> i64 {
+        \\  pub fn run_first(f :: fn() -> i64) -> i64 {
         \\    f()
         \\  }
         \\
-        \\  pub fn make() -> ( -> i64) {
+        \\  pub fn make() -> fn() -> i64 {
         \\    fn() -> i64 { 5 }
         \\  }
         \\}
@@ -8702,6 +8702,62 @@ test "closure: higher-order fn that returns a closure, both invoked (Gap E scena
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "42") != null);
 }
 
+test "fn() -> T function-type surface: all arities in param/field/return positions" {
+    // End-to-end exercise of the NEW function-TYPE syntax `fn(...) -> T`
+    // (mirrors the closure value literal with names + body erased) across
+    // every type-position the migration touches:
+    //   * nullary param  `fn() -> i64`         (higher-order call)
+    //   * unary field    `fn(i64) -> i64`      (stored closure, field call)
+    //   * binary param   `fn(i64, i64) -> i64` (two-arg higher-order call)
+    //   * return position `-> fn() -> i64`     (returned closure call)
+    // Each closure is non-capturing; the value literal syntax is unchanged.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "fn_type_surface.zap",
+        \\pub struct Holder {
+        \\  op :: fn(i64) -> i64
+        \\}
+        \\
+        \\pub struct Surface {
+        \\  pub fn run_nullary(f :: fn() -> i64) -> i64 {
+        \\    f()
+        \\  }
+        \\
+        \\  pub fn run_binary(g :: fn(i64, i64) -> i64) -> i64 {
+        \\    g(3, 4)
+        \\  }
+        \\
+        \\  pub fn make() -> fn() -> i64 {
+        \\    fn() -> i64 { 8 }
+        \\  }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  nullary = Surface.run_nullary(fn() -> i64 { 10 })
+        \\  binary = Surface.run_binary(fn(a :: i64, b :: i64) -> i64 { a + b })
+        \\  holder = %Holder{ op: fn(x :: i64) -> i64 { x * 2 } }
+        \\  field = holder.op(9)
+        \\  returned = Surface.make()
+        \\  total = nullary + binary + field + returned()
+        \\  IO.puts(Integer.to_string(total))
+        \\  0
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    if (r.exit_code != 0) {
+        std.debug.print(
+            "fn-type-surface failed: exit={d}\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.exit_code, r.stdout, r.stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    // 10 (nullary) + 7 (binary 3+4) + 18 (field 9*2) + 8 (returned) = 43
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "43") != null);
+}
+
 test "closure: returned/field closures leak-free under Memory.Tracking (Gap E ARC balance)" {
     // The non-capturing closure value is a bare `*const fn() i64` code
     // pointer — NOT ARC-managed — so neither the returned nor the field-
@@ -8716,7 +8772,7 @@ test "closure: returned/field closures leak-free under Memory.Tracking (Gap E AR
 
     var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "closure_field_tracking.zap",
         \\pub struct Handler {
-        \\  action :: ( -> i64)
+        \\  action :: fn() -> i64
         \\}
         \\
         \\pub struct Factory {
@@ -8724,7 +8780,7 @@ test "closure: returned/field closures leak-free under Memory.Tracking (Gap E AR
         \\    %Handler{ action: fn() -> i64 { 99 } }
         \\  }
         \\
-        \\  pub fn make() -> ( -> i64) {
+        \\  pub fn make() -> fn() -> i64 {
         \\    fn() -> i64 { 7 }
         \\  }
         \\}

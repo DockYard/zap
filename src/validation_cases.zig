@@ -2,7 +2,7 @@ pub const borrowed_closure_arg =
     \\pub struct Test {
     \\  opaque Handle = String
     \\
-    \\  pub fn run(use_fn :: (borrowed Handle -> Handle), handle :: Handle) -> Handle {
+    \\  pub fn run(use_fn :: fn(borrowed Handle) -> Handle, handle :: Handle) -> Handle {
     \\    use_fn(handle)
     \\  }
     \\}
@@ -12,7 +12,7 @@ pub const shared_closure_arg =
     \\pub struct Test {
     \\  opaque Handle = String
     \\
-    \\  pub fn run(use_fn :: (shared Handle -> Handle), handle :: Handle) -> Handle {
+    \\  pub fn run(use_fn :: fn(shared Handle) -> Handle, handle :: Handle) -> Handle {
     \\    use_fn(handle)
     \\  }
     \\}
@@ -28,11 +28,11 @@ pub const switch_dispatch =
     \\    x - 1
     \\  }
     \\
-    \\  pub fn apply(f :: (i64 -> i64), value :: i64) -> i64 {
+    \\  pub fn apply(f :: fn(i64) -> i64, value :: i64) -> i64 {
     \\    f(value)
     \\  }
     \\
-    \\  pub fn choose(flag :: Bool) -> (i64 -> i64) {
+    \\  pub fn choose(flag :: Bool) -> fn(i64) -> i64 {
     \\    if flag {
     \\      inc
     \\    } else {
