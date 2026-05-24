@@ -7738,6 +7738,18 @@ pub const IrBuilder = struct {
         if (instrs.len == 0) return false;
         return switch (instrs[instrs.len - 1]) {
             .call_named => |cn| callNameIsRecoverableRaiseSink(cn.name),
+            // A struct-pattern rescue arm lowers its body inside a `case_block`
+            // (decision-tree match on the unboxed concrete value); the
+            // recoverable `raise` then lives in the matched leaf, followed by a
+            // `case_break` value marker (which is pure dataflow — it sets the
+            // case dest, it is NOT a ZIR terminator). Look past a trailing
+            // `case_break` into the `case_block`'s lowered body to find the real
+            // tail, so a struct-pattern re-raise nested in an enclosing `try`
+            // (e.g. `%IOError{m} -> raise %IOError{m}`) is classified as the
+            // recoverable dead edge it is — not a ZIR-noreturn branch (the
+            // nested struct-pattern variant of the Gap C crash).
+            .case_break => instrs.len >= 2 and instructionsEndInRecoverableRaise(instrs[0 .. instrs.len - 1]),
+            .case_block => |cb| instructionsEndInRecoverableRaise(cb.pre_instrs),
             else => false,
         };
     }
@@ -7829,23 +7841,34 @@ pub const IrBuilder = struct {
             });
             // `lowerCaseExprBody` emits a `case_block` whose own internal
             // `case_break`s yield to `handler_dest`, so the merge edge's
-            // result is `handler_dest`. A divergent struct-pattern arm body
-            // (e.g. `e :: IOError{..} -> raise e`) ends in the noreturn
-            // `do_raise`; the inner `case_block`'s own noreturn detection
-            // already terminates it cleanly, so we still report `diverges`
-            // so the enclosing `if_expr` branch is flagged noreturn.
+            // result is `handler_dest`.
             //
             // A CATCHING struct-pattern arm (non-divergent) gets the per-arm box
             // owner-drop: the unboxed `concrete_local` is a borrow of the box's
             // inner (`emitRescueUnbox` records it borrowed), so the box is the
             // sole owner — release it here, after the case-block body's last use
-            // of the destructured fields. A divergent re-raise arm takes no
-            // release (the box's ownership moves out via the re-raise / is
-            // abandoned on a diverging abort), exactly as the whole-value path.
+            // of the destructured fields.
             if (!body_diverges) {
                 try self.emitRescueBoxRelease(error_local);
+                return .{ .result = handler_dest, .diverges = false };
             }
-            return .{ .result = handler_dest, .diverges = body_diverges };
+
+            // A divergent struct-pattern arm (`%IOError{..} -> raise ...`):
+            // classify its lowered tail exactly like the whole-value path
+            // (`finishDivergentArm`). A top-level abort `do_raise` is genuinely
+            // ZIR-noreturn (the inner `case_block`'s own noreturn detection
+            // terminates it) → diverges. A RECOVERABLE re-raise (nested in an
+            // enclosing `try`) lowers to a RETURNING `recoverable_raise` inside
+            // the `case_block`'s matched leaf (followed by a `case_break` value
+            // marker) — control falls through, so the case_block is NOT
+            // ZIR-noreturn. `instructionsEndInRecoverableRaise` recurses through
+            // the trailing `case_block`/`case_break` to detect this, and
+            // `finishDivergentArm` then yields a `typed_undef` placeholder + a
+            // normal merge value so the enclosing `if_expr` breaks normally
+            // instead of being (wrongly) flagged noreturn and left unterminated
+            // (the nested struct-pattern variant of the Gap C Sema crash). The
+            // box's ownership moved out via the re-raise, so no per-arm release.
+            return self.finishDivergentArm(handler_dest, joined_type);
         }
 
         // Whole-value bind arm. The binding source and its ARC discipline
