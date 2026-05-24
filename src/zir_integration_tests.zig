@@ -6979,6 +6979,62 @@ test "stdlib manager matrix: each manager + default builds the real backend and 
     }
 }
 
+test "rescue: recovered boxed error drops cleanly under Memory.Tracking (no double-free / UAF)" {
+    // Regression: a recoverable-raise–RECOVERED `ProtocolBox` (the box the
+    // `try` body stashed into the thread-local side-channel, recovered via
+    // `Kernel.take_recoverable_raise`) used to be dropped TWICE — once for
+    // the original boxed-error local the `raise` constructed (`box_as_protocol`
+    // → `recoverable_raise(box)`) and once for the recovered local — because
+    // the side-channel transfer was invisible to the ARC ownership pipeline,
+    // so the consumed box still got a scope-exit release. Under `Memory.ARC`
+    // the second decrement was masked by slab reuse; under `Memory.Tracking`
+    // (which `munmap`s freed pages and runs no refcounts) the second drop
+    // dereferenced the already-freed inner and SIGSEGV'd in
+    // `freeAnyNonRefcountedImpl`'s by-value child-walk load.
+    //
+    // The boxed `pub error` carries a `message :: String` AND an auto-injected
+    // `cause :: Option(Error)` — both ARC-managed children — so the inner's
+    // deep child-walk is real (not a trivial shallow free). A clean exit here
+    // means the recovered box's inner is freed EXACTLY once and the
+    // Tracking live-set ends balanced.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "recovered_box_tracking.zap",
+        \\@code Z9301
+        \\pub error KeyError {
+        \\  key :: Atom
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  result = try {
+        \\    raise %KeyError{key: :missing, message: "absent"}
+        \\  } rescue {
+        \\    %KeyError{key: k} -> Atom.to_string(k)
+        \\  }
+        \\  IO.puts("recovered-ok=" <> result)
+        \\  0
+        \\}
+    , &.{"-Dmemory=Memory.Tracking"}, &.{});
+    defer r.deinit();
+
+    if (r.exit_code != 0) {
+        std.debug.print(
+            "recovered-box-tracking failed: exit={d}\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.exit_code, r.stdout, r.stderr },
+        );
+    }
+    // Clean exit = no SIGSEGV (255) and no abort. A double-free/UAF on the
+    // recovered box's inner crashed here before the fix.
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "recovered-ok=missing") != null);
+    // Tracking reports survivors as `LEAK:` lines at deinit; a balanced
+    // recovered-box path leaves none. (An under-free regression — the dual
+    // of the double-free — would surface here as a leak.)
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "LEAK:") == null);
+}
+
 // ---- target / cpu scenarios ---------------------------------------
 
 test "CLI script: native default when neither manifest nor -Dtarget set" {

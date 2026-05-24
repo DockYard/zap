@@ -3077,7 +3077,13 @@ pub fn builtinArgCanMoveAtLastUse(name: []const u8, slot: usize) bool {
     if (ownedMutatingBuiltinSlot(name)) |owned_slot| {
         if (owned_slot == slot) return true;
     }
-    return listElementConsumingBuiltinArg(name, slot);
+    if (listElementConsumingBuiltinArg(name, slot)) return true;
+    // The recoverable-raise side-channel stash always takes ownership of
+    // its boxed-`Error` argument (transferred out to the recovered owner
+    // via `take_recoverable_raise`), so a last-use owner can always move
+    // straight in — and the post-call release in the `:zig.` wrapper must
+    // be dropped (it would double-decrement against the recovered owner).
+    return sideChannelStashBuiltinArg(name, slot);
 }
 
 /// Does `name` consume the argument in `slot` as part of the builtin's
@@ -3103,6 +3109,215 @@ pub fn alwaysConsumingBuiltinArg(name: []const u8, slot: usize) bool {
 
     if (listElementConsumingBuiltinArgWithParts(prefix, method, slot)) return true;
 
+    if (sideChannelStashBuiltinArg(name, slot)) return true;
+
+    return false;
+}
+
+/// Does `name`/`slot` name the recoverable-raise side-channel STASH
+/// primitive that takes ownership of a boxed `Error` and transfers it
+/// OUT of the caller into the thread-local raise side-channel?
+///
+/// `:zig.Kernel.recoverable_raise(box)` stores the boxed-`Error`
+/// `ProtocolBox` into `current_recoverable_raise` (src/runtime.zig). The
+/// box's matching owner is recovered LATER, in a different scope, by
+/// `Kernel.take_recoverable_raise()` — which returns the stashed box as
+/// an OWNED result. The two form a single matched ownership-transfer
+/// pair through the side-channel: exactly one net owner exists from the
+/// raise to the recovery.
+///
+/// The ARC pipeline cannot infer this transfer because the stash crosses
+/// a thread-local global through a `:zig.` bridge (the convention-
+/// inference's uniqueness audit explicitly REFUSES to lift a parameter
+/// that escapes the function — see `arc_param_convention.computeLiftSet`
+/// condition 1). So the stash's consume convention is a property of the
+/// runtime primitive's ABI, classified here exactly as the runtime-
+/// collection primitives (`Map.put`, `List.cons`) are.
+///
+/// Without this, the boxed-error local the `raise` constructed
+/// (`box_as_protocol` → `recoverable_raise(box)`) keeps a scope-exit
+/// release in the raising scope, while the recovered box gets its own
+/// scope-exit release — TWO releases of one inner. Under `Memory.ARC`
+/// the second decrement was masked by slab reuse; under `Memory.Tracking`
+/// (no refcounts, `munmap`'d free pages) the second drop dereferenced the
+/// freed inner and SIGSEGV'd in `freeAnyNonRefcountedImpl`'s by-value
+/// child-walk. Marking slot 0 consuming transfers the box's ownership
+/// into the call so the raising scope emits NO release; the recovered
+/// box is then the sole owner and drops the inner exactly once.
+///
+/// Slot 0 only (the boxed-`Error` argument). The pre-monomorph name is
+/// the only shape: `recoverable_raise` takes a bare `Error` existential,
+/// so the `:zig.` bridge is never type-specialised into an encoded name.
+pub fn sideChannelStashBuiltinArg(name: []const u8, slot: usize) bool {
+    return slot == 0 and std.mem.eql(u8, name, "Kernel.recoverable_raise");
+}
+
+/// Does `function`'s body forward parameter `param_index` directly into the
+/// recoverable-raise side-channel STASH builtin (`sideChannelStashBuiltinArg`)?
+///
+/// Used by `arc_param_convention.inferConventions` to promote the
+/// `lib/kernel.zap` `recoverable_raise` wrapper's boxed-`Error` slot to
+/// `.owned` — the ONE escaping-parameter promotion the uniqueness audit
+/// cannot derive, because the stash crosses a thread-local global through a
+/// `:zig.` bridge yet is still a sound ownership transfer (matched by
+/// `take_recoverable_raise`). See the promotion site for the full
+/// rationale.
+///
+/// Tracks the SSA alias chain from each `param_get` of the slot through
+/// `move_value`/`local_get`/`borrow_value`/`share_value` copies to a fixed
+/// point, then checks whether any alias is passed in the stash builtin's
+/// consuming slot. Structural (forwards-into-stash), never keyed on the
+/// wrapper's mangled name. Uses `page_allocator` for the transient alias
+/// set (freed before return); the program is small per-function so the
+/// allocation cost is negligible and confined to convention inference.
+pub fn functionForwardsParamIntoSideChannelStash(
+    function: *const ir.Function,
+    param_index: usize,
+) bool {
+    var alias_set: std.ArrayListUnmanaged(ir.LocalId) = .empty;
+    defer alias_set.deinit(std.heap.page_allocator);
+
+    for (function.body) |block| {
+        sideChannelSeedParamAliases(block.instructions, param_index, &alias_set);
+    }
+    if (alias_set.items.len == 0) return false;
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (function.body) |block| {
+            if (sideChannelExtendParamAliases(block.instructions, &alias_set)) changed = true;
+        }
+    }
+
+    for (function.body) |block| {
+        if (sideChannelStreamConsumesAlias(block.instructions, alias_set.items)) return true;
+    }
+    return false;
+}
+
+fn sideChannelAliasContains(set: []const ir.LocalId, local: ir.LocalId) bool {
+    for (set) |id| {
+        if (id == local) return true;
+    }
+    return false;
+}
+
+fn sideChannelAppendAlias(set: *std.ArrayListUnmanaged(ir.LocalId), local: ir.LocalId) bool {
+    if (sideChannelAliasContains(set.items, local)) return false;
+    set.append(std.heap.page_allocator, local) catch return false;
+    return true;
+}
+
+fn sideChannelSeedParamAliases(
+    stream: []const ir.Instruction,
+    param_index: usize,
+    alias_set: *std.ArrayListUnmanaged(ir.LocalId),
+) void {
+    for (stream) |*instr| {
+        switch (instr.*) {
+            .param_get => |pg| {
+                if (pg.index == param_index) _ = sideChannelAppendAlias(alias_set, pg.dest);
+            },
+            .if_expr => |ie| {
+                sideChannelSeedParamAliases(ie.then_instrs, param_index, alias_set);
+                sideChannelSeedParamAliases(ie.else_instrs, param_index, alias_set);
+            },
+            .case_block => |cb| {
+                sideChannelSeedParamAliases(cb.pre_instrs, param_index, alias_set);
+                for (cb.arms) |arm| {
+                    sideChannelSeedParamAliases(arm.cond_instrs, param_index, alias_set);
+                    sideChannelSeedParamAliases(arm.body_instrs, param_index, alias_set);
+                }
+                sideChannelSeedParamAliases(cb.default_instrs, param_index, alias_set);
+            },
+            .guard_block => |gb| sideChannelSeedParamAliases(gb.body, param_index, alias_set),
+            else => {},
+        }
+    }
+}
+
+fn sideChannelExtendParamAliases(
+    stream: []const ir.Instruction,
+    alias_set: *std.ArrayListUnmanaged(ir.LocalId),
+) bool {
+    var changed = false;
+    for (stream) |*instr| {
+        switch (instr.*) {
+            .move_value => |mv| {
+                if (sideChannelAliasContains(alias_set.items, mv.source)) {
+                    if (sideChannelAppendAlias(alias_set, mv.dest)) changed = true;
+                }
+            },
+            .local_get => |lg| {
+                if (sideChannelAliasContains(alias_set.items, lg.source)) {
+                    if (sideChannelAppendAlias(alias_set, lg.dest)) changed = true;
+                }
+            },
+            .borrow_value => |bv| {
+                if (sideChannelAliasContains(alias_set.items, bv.source)) {
+                    if (sideChannelAppendAlias(alias_set, bv.dest)) changed = true;
+                }
+            },
+            .share_value => |sv| {
+                if (sideChannelAliasContains(alias_set.items, sv.source)) {
+                    if (sideChannelAppendAlias(alias_set, sv.dest)) changed = true;
+                }
+            },
+            .if_expr => |ie| {
+                if (sideChannelExtendParamAliases(ie.then_instrs, alias_set)) changed = true;
+                if (sideChannelExtendParamAliases(ie.else_instrs, alias_set)) changed = true;
+            },
+            .case_block => |cb| {
+                if (sideChannelExtendParamAliases(cb.pre_instrs, alias_set)) changed = true;
+                for (cb.arms) |arm| {
+                    if (sideChannelExtendParamAliases(arm.cond_instrs, alias_set)) changed = true;
+                    if (sideChannelExtendParamAliases(arm.body_instrs, alias_set)) changed = true;
+                }
+                if (sideChannelExtendParamAliases(cb.default_instrs, alias_set)) changed = true;
+            },
+            .guard_block => |gb| {
+                if (sideChannelExtendParamAliases(gb.body, alias_set)) changed = true;
+            },
+            else => {},
+        }
+    }
+    return changed;
+}
+
+fn sideChannelStreamConsumesAlias(
+    stream: []const ir.Instruction,
+    alias_set: []const ir.LocalId,
+) bool {
+    for (stream) |*instr| {
+        switch (instr.*) {
+            .call_builtin => |cb| {
+                for (cb.args, 0..) |arg, slot| {
+                    if (sideChannelStashBuiltinArg(cb.name, slot) and
+                        sideChannelAliasContains(alias_set, arg))
+                    {
+                        return true;
+                    }
+                }
+            },
+            .if_expr => |ie| {
+                if (sideChannelStreamConsumesAlias(ie.then_instrs, alias_set)) return true;
+                if (sideChannelStreamConsumesAlias(ie.else_instrs, alias_set)) return true;
+            },
+            .case_block => |cb| {
+                if (sideChannelStreamConsumesAlias(cb.pre_instrs, alias_set)) return true;
+                for (cb.arms) |arm| {
+                    if (sideChannelStreamConsumesAlias(arm.cond_instrs, alias_set)) return true;
+                    if (sideChannelStreamConsumesAlias(arm.body_instrs, alias_set)) return true;
+                }
+                if (sideChannelStreamConsumesAlias(cb.default_instrs, alias_set)) return true;
+            },
+            .guard_block => |gb| {
+                if (sideChannelStreamConsumesAlias(gb.body, alias_set)) return true;
+            },
+            else => {},
+        }
+    }
     return false;
 }
 
@@ -3282,6 +3497,34 @@ test "arc_liveness: alwaysConsumingBuiltinArg recognizes List.cons argument slot
     try std.testing.expect(!alwaysConsumingBuiltinArg("Map.put", 0));
     try std.testing.expect(!alwaysConsumingBuiltinArg("ListAlt.cons", 0));
     try std.testing.expect(!alwaysConsumingBuiltinArg("cons", 0));
+}
+
+test "arc_liveness: recoverable-raise side-channel stash consumes its boxed-Error arg" {
+    // `Kernel.recoverable_raise(box)` transfers the boxed `Error` into the
+    // thread-local side-channel (recovered later by `take_recoverable_raise`).
+    // Slot 0 is consuming; the raising scope must NOT emit a scope-exit
+    // release for the stashed box (the recovered owner drops it once),
+    // otherwise the inner double-frees (segfault under Memory.Tracking).
+    try std.testing.expect(sideChannelStashBuiltinArg("Kernel.recoverable_raise", 0));
+    try std.testing.expect(alwaysConsumingBuiltinArg("Kernel.recoverable_raise", 0));
+    try std.testing.expect(builtinArgCanMoveAtLastUse("Kernel.recoverable_raise", 0));
+
+    // Only slot 0 (the box); the primitive has no other ARC-owning args.
+    try std.testing.expect(!sideChannelStashBuiltinArg("Kernel.recoverable_raise", 1));
+    try std.testing.expect(!alwaysConsumingBuiltinArg("Kernel.recoverable_raise", 1));
+
+    // Sibling raise-plumbing primitives are NOT consume sinks: `do_raise`
+    // formats+aborts (its box is borrowed for the crash report, not stashed),
+    // `peek_recoverable_raise`/`take_recoverable_raise` PRODUCE the box (no
+    // consumed argument). A false positive here would suppress a legitimate
+    // drop and leak.
+    try std.testing.expect(!sideChannelStashBuiltinArg("Kernel.do_raise", 0));
+    try std.testing.expect(!sideChannelStashBuiltinArg("Kernel.peek_recoverable_raise", 0));
+    try std.testing.expect(!sideChannelStashBuiltinArg("Kernel.take_recoverable_raise", 0));
+    // Lookalike names must not match.
+    try std.testing.expect(!sideChannelStashBuiltinArg("KernelAlt.recoverable_raise", 0));
+    try std.testing.expect(!sideChannelStashBuiltinArg("recoverable_raise", 0));
+    try std.testing.expect(!sideChannelStashBuiltinArg("", 0));
 }
 
 test "arc_liveness: List.set and List.push element slots are consumed by builtin ABI" {
