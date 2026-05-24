@@ -57,16 +57,18 @@ asserted verbatim.
 | `index_error` | `domain=panic`, `sub_kind=index_error` out-of-bounds `List.get` |
 | `leak_report` | `domain=leak` — attributed survivor under `-Dmemory=Memory.Tracking` |
 
-Two diagnostic domains are covered by the unit-test suite rather than a
-fixture here, because neither is reliably triggerable from a `.zap` source:
+One diagnostic domain is covered by the unit-test suite rather than a
+fixture here, because it is not reliably triggerable from a `.zap` source:
 
-- **`domain=cycle`** — a reference cycle is not constructible from today's
-  fully-immutable Zap surface (the Phase-5 caveat). Its text + JSON shape is
-  golden-locked by the render tests in `src/memory/cycle_detector.zig` and the
-  runtime↔reference byte-lock in `tools/cycle_detector_drift_test.zig`.
 - **ICE** (internal compiler error) — by definition not triggerable from
   valid-looking source without a compiler bug; the ICE diagnostic class and its
   routing are covered by the Phase 4.b unit tests.
+
+(There is no `domain=cycle`: a reference cycle is not constructible from Zap's
+fully-immutable surface — every value references only strictly-older values, so
+the points-to graph is always a DAG and pure reference counting reclaims it
+completely. This is a language guarantee, not a gap, so there is no cycle
+collector to cover.)
 
 ## Adding a fixture
 

@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 
 ZAP=./zig-out/bin/zap
 CORPUS_DIR=script_fixtures/golden_corpus
-unset ZAP_ZIG_LIB_DIR ZIG_LIB_DIR ZAP_ERROR_FORMAT ZAP_LEAKS_FATAL ZAP_BACKTRACE ZAP_CYCLE_CHECK
+unset ZAP_ZIG_LIB_DIR ZIG_LIB_DIR ZAP_ERROR_FORMAT ZAP_LEAKS_FATAL ZAP_BACKTRACE
 rm -rf "${HOME}/.cache/zap/scripts" 2>/dev/null || true
 
 fail=0

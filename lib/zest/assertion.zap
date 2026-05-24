@@ -154,63 +154,12 @@ pub struct Zest.Assertion {
     }
   }
 
-  @doc = """
-    Records the result of an `assert_no_cycles { <block> }` assertion.
-
-    Drives the runtime Bacon–Rajan cycle detector over the allocations the
-    block made (the registered live-set) and asserts no reference cycle is
-    present. `cycle_object_count` is the number of objects the detector found
-    held alive only by a cycle (the detector's white-set size). Zero passes; a
-    positive count fails with the `domain=cycle` summary as the failure detail.
-    When cycle checking is not active here (no Tracking manager, or the runtime
-    cycle scan is disabled), the assertion passes as a documented no-op.
-
-    Phase-5 caveat: reference cycles are not constructible from today's fully
-    immutable Zap surface (no field mutation / `Ref` / `weak`), so this
-    assertion can only ever fail once Phase 5 lands mutation. It is wired to the
-    detector signal now and unit-verified at the runtime level; on real Zap code
-    today it always passes.
-    """
-
-  pub fn no_cycles_result(cycle_check_active :: Bool, cycle_object_count :: i64, cycle_bytes :: i64, code :: String, location :: String) -> String {
-    if not cycle_check_active {
-      :zig.Zest.pass_assertion()
-      "."
-    } else {
-      if would_report_cycle?(cycle_object_count) {
-        :zig.Zest.fail_assertion_with_message(format_cycle_failure(cycle_object_count, cycle_bytes, code, location))
-        "F"
-      } else {
-        :zig.Zest.pass_assertion()
-        "."
-      }
-    }
-  }
-
-  @doc = """
-    Pure decision: would an `assert_no_cycles` block with the given detected-
-    cycle object count be reported as a reference cycle? `true` for a positive
-    count (the trial-deletion detector found cyclic garbage), `false` otherwise.
-    Side-effect-free — the recording in `no_cycles_result` delegates to this so
-    the detect-and-fail polarity is unit-testable without touching the live test
-    tracker, and the runtime detector engine that PRODUCES the count is
-    independently verified in `src/memory/cycle_detector.zig`.
-    """
-
-  pub fn would_report_cycle?(cycle_object_count :: i64) -> Bool {
-    cycle_object_count > 0
-  }
-
   fn format_leak_failure(leaked_count :: i64, leaked_bytes :: i64, code :: String, location :: String) -> String {
     "memory leak assertion failed" <> location_block(location) <> "\nblock: " <> display_text(code, "block") <> "\nleaked: " <> Kernel.to_string(leaked_count) <> " allocation(s), " <> Kernel.to_string(leaked_bytes) <> " bytes\nexpected: 0 net live allocations after the block"
   }
 
   fn format_expected_leak_failure(code :: String, location :: String) -> String {
     "@expect_leak assertion failed" <> location_block(location) <> "\nblock: " <> display_text(code, "block") <> "\nresult: the block did not leak, but it was marked @expect_leak\nexpected: at least one net live allocation to remain"
-  }
-
-  fn format_cycle_failure(cycle_object_count :: i64, cycle_bytes :: i64, code :: String, location :: String) -> String {
-    "reference cycle assertion failed" <> location_block(location) <> "\nblock: " <> display_text(code, "block") <> "\ncycle: " <> Kernel.to_string(cycle_object_count) <> " object(s), " <> Kernel.to_string(cycle_bytes) <> " bytes held alive only by a cycle\nexpected: no reference cycle among the block's allocations"
   }
 
   fn format_truthy_failure(kind :: String, code :: String, value :: String, custom_message :: String, location :: String) -> String {

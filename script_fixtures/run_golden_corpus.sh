@@ -18,16 +18,6 @@
 #
 # Requires a freshly-built `zig-out/bin/zap`.
 #
-# ## Cycle-report coverage
-#
-# A reference cycle is NOT constructible from today's fully-immutable Zap
-# surface (the Phase-5 caveat), so a `domain=cycle` report cannot be produced
-# from a `.zap` fixture. Its text + JSON shape is golden-locked elsewhere: the
-# render tests in `src/memory/cycle_detector.zig` pin the exact bytes, and
-# `tools/cycle_detector_drift_test.zig` byte-locks the runtime mirror to them.
-# Both run under `zig build test`. The cycle domain is therefore covered by the
-# test suite rather than this script.
-#
 # ## ICE coverage
 #
 # An internal-compiler-error (ICE) is, by definition, not reliably triggerable

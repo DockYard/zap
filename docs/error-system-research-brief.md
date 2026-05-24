@@ -26,7 +26,8 @@ The four problem domains in scope:
 1. **Runtime errors** (raising/handling, exception values, recoverable vs. unrecoverable).
 2. **Compilation errors** (diagnostics quality, recovery, structured output, explainability).
 3. **Stack traces** (debug info, runtime backtrace capture, symbolication, crash reports).
-4. **Memory leaks** (attribution, reporting, ARC reference cycles, test-time enforcement).
+4. **Memory leaks** (attribution, reporting, test-time enforcement). ARC reference cycles are out
+   of scope — Zap's immutable surface cannot construct one (see Decision 3).
 
 ---
 
@@ -138,8 +139,12 @@ choice in Part VII.
   (`Zap.Manifest.memory :: Type`, default `Memory.ARC`). Built-in managers: `Memory.ARC`,
   `Memory.Arena`, `Memory.NoOp`, `Memory.Leak`, `Memory.Tracking`; third parties can implement the
   zero-method `Memory.Manager` marker. Exactly one manager per binary.
-- **Pure Perceus is garbage-free only for cycle-free programs** (PLDI 2021 §1). Zap has no cycle
-  collector and no `weak`/`unowned` references today.
+- **Pure Perceus is garbage-free only for cycle-free programs** (PLDI 2021 §1) — and **every Zap
+  program is cycle-free by construction.** The fully-immutable surface (no field mutation, no
+  `Ref`/`Cell`/`Atom`) means a value can only reference strictly-older values, so the points-to
+  graph is always a DAG that pure reference counting reclaims completely. Zap therefore needs no
+  cycle collector and no `weak`/`unowned` references — not as a deferred gap, but as a language
+  guarantee (see Decision 3).
 
 ---
 
@@ -251,8 +256,10 @@ Systemic gaps (not cosmetic):
   - UAF/OOB: 16-byte `0xCC` canaries → `USE-AFTER-FREE or OOB: canary corrupted at ptr=0x...`
 - **No allocation site, no Zap type name, no backtrace, no diagnostic-engine rendering, no summary,
   no deterministic ordering, no CI fail mode integration.**
-- ARC is default and **silently leaks reference cycles** — no detector, no `weak`/`unowned`. This
-  is a *correctness* gap, not just a tooling gap.
+- ARC is default and reclaims everything a Zap program can build: reference **cycles are not
+  constructible** from the immutable surface (see Decision 3), so there is nothing for a cycle
+  detector or `weak`/`unowned` to fix. Plain **leaks** (a live allocation simply never released)
+  remain real and are the leak subsystem's concern.
 - Two known live issues this tooling would directly illuminate: (a) an **intentional** leak —
   `FieldStorage.indirect` heap slots are allocated but not released on struct drop (deliberately
   preferred over a use-after-free, pending full ARC integration with indirect storage); (b) an
@@ -451,15 +458,11 @@ Generalize `DiagnosticEngine` into the shared report core (Part IV §4). Add:
   with a deterministic summary table and `--leaks-fatal` for CI.
 - **`@expect_leak` test attribute** — handles the intentional `FieldStorage.indirect` leak: Zest
   reads the attribute and subtracts those allocations from the live set before asserting empty.
-- **Zest leak assertions** (`assert_no_leaks`, `assert_no_cycles`) make "no leaks in this block" a
-  first-class test primitive.
-- **ARC cycle detector — Bacon–Rajan trial-deletion (ECOOP 2001).** Synchronous "purple" candidate
-  buffer: when a decrement leaves a *positive* count, the object is added to the buffer; later the
-  buffer is drained via local SCC search. Zero cost on the common Perceus path (decrement → 0).
-  Default-on in `Memory.Tracking`; default-off in `Memory.ARC` behind `--enable-cycle-check`.
-- **`weak`/`unowned` field annotations** (Swift model) as the production cycle fix — Phase 5.
-  Natural alongside Zap's existing `shared`/`unique`/`borrowed` ownership syntax. Deferred because
-  it changes the static type of stored references and would invalidate today's IR.
+- **Zest leak assertion** (`assert_no_leaks`) makes "no leaks in this block" a first-class test
+  primitive.
+- **No ARC cycle detector and no `weak`/`unowned`.** A reference cycle is not constructible from
+  Zap's immutable surface (see Decision 3), so there is nothing for a cycle collector to reclaim or
+  for `weak`/`unowned` to break. This is a language guarantee, not a gap.
 - Existing canary UAF/double-free reports upgrade to the same attributed, symbolized, rendered
   format — directly tooling the open SIGTRAP defect.
 
@@ -478,8 +481,10 @@ Generalize `DiagnosticEngine` into the shared report core (Part IV §4). Add:
 4. **Fork changes are allowed** and held to the same quality bar.
 5. **Effects-system v1 limits:** opt-in, no multi-shot resumptions, lexical handler scope, nominal
    effect declarations, static resolution prioritized. Exceptions are one-shot abortive (compatible).
-6. **ARC, no GC.** Cycles are unreclaimed today. Any cycle solution must not impose unconditional
-   production cost without opt-in.
+6. **ARC, no GC.** Reference cycles are not constructible from the immutable surface (see
+   Decision 3), so there is no cycle garbage to reclaim and no cycle collector. Any future
+   collector (only relevant if mutation is ever added) must not impose unconditional production
+   cost without opt-in.
 7. **Performance:** happy path stays zero-cost; error-path cost is acceptable.
 8. **Determinism:** diagnostics and reports must be deterministically ordered (CI, golden tests).
 9. **Known landmines:** intentional `FieldStorage.indirect` leak; open startup SIGTRAP defect;
@@ -546,23 +551,32 @@ Inference-by-default is also the only path that permits effect-polymorphic gener
 monomorphization blow-up: generics that don't annotate stay effect-polymorphic and do not
 monomorphize per error type. Cost is paid only by code that opts in.
 
-### Decision 3 — ARC cycles: **diagnostic detector now + `weak`/`unowned` later**
+### Decision 3 — ARC cycles: **none are constructible, so no collector is needed**
 
-**Defense.** Perceus (Reinking, Xie, de Moura, Leijen, PLDI 2021) is explicit that it is
-"garbage-free" only for *cycle-free* programs. Bacon & Rajan's synchronous trial-deletion algorithm
-(ECOOP 2001) is the canonical primary source for an on-by-default cycle *detector* (not collector)
-with zero cost on acyclic decrements. Lobster (van Oortmerssen, 2020) is the shipped precedent for
-using cycle detection as a *test/diagnostic* mechanism rather than a runtime collector. Koka itself
-uses exactly this option.
+**Defense.** Perceus (Reinking, Xie, de Moura, Leijen, PLDI 2021) is "garbage-free" only for
+*cycle-free* programs. The decisive observation is that **Zap programs are always cycle-free by
+construction.** Zap's surface is fully immutable: a functional update `%R{r | f: v}` produces a NEW
+value, there is no field-mutation operator, and there is no `Ref`/`Cell`/`Atom` mutable primitive.
+A value-level reference can therefore only point at a value that *already exists* — every
+`%Node{next: Some(other)}` requires `other` to have been built first. Allocations only ever point
+at strictly-older allocations, so the points-to graph is a DAG and the loop that would close a
+cycle can never form. Pure reference counting reclaims a DAG completely.
 
-Why not `weak`/`unowned` only: forces premature API churn before users know where cycles live.
-Why not an opt-in tracing backup collector: violates Zap's "no tracing GC" charter and reintroduces
-stop-the-world semantics Zap was built to avoid.
+Consequently there is **no cycle detector and no cycle collector** — not as a deferred gap, but
+because the language guarantees the thing they would detect cannot occur. (An earlier iteration
+shipped a Bacon–Rajan trial-deletion *detector* as preemptive infrastructure; it was removed once
+the immutability guarantee was recognised as total. It detected something structurally impossible
+and was dead surface.) This is distinct from **leaks**, which *are* real under immutable + ARC (a
+live allocation that is simply never released — e.g. the intentional `FieldStorage.indirect` one)
+and which the Phase 4.c leak subsystem attributes and reports.
+
+If a future phase ever introduces mutation or a mutable cell that can form a back-edge, a cycle
+collector becomes relevant again — and only then. It is not owed today.
 
 ### Decision 4 — Scope/sequencing: **approve and iterate phase-by-phase**
 
 The design surface (effect-typed errors, ERT plumbing, diagnostic-engine generalization, leak
-reports, cycle detector, three-tier contracts) is too large to land atomically without freezing the
+reports, three-tier contracts) is too large to land atomically without freezing the
 language. Phase boundaries also align with what can be *measured*: each phase has a concrete
 acceptance test (Part VIII).
 
@@ -748,7 +762,7 @@ acceptance test (Part VIII).
 > `call_closure` site (mark the combinator specialization raising). This is a deeper IR-type-system
 > change than the stated 2a/2b and is the natural next increment.
 
-### Phase 4 — Unified diagnostic renderer + leak/cycle subsystem
+### Phase 4 — Unified diagnostic renderer + leak subsystem
 
 - Generalize `src/diagnostics.zig` into the canonical Error IR (Part IV §4) — one renderer for
   compile errors, runtime panics, ERT, leak reports.
@@ -756,9 +770,10 @@ acceptance test (Part VIII).
 - **Compile-error systemics now:** error-tolerant parsing + poisoned `Error` AST node;
   multi-error per compile; ICE diagnostic class; `zap explain Zxxxx` long-form catalog;
   macro-expansion backtraces; two-sided `TypeProvenance` rendering; suggestion applicability tags.
-- `Memory.Tracking` records allocation-site backtrace + Zap type per alloc; ships Bacon–Rajan
-  cycle detection at test teardown.
-- Zest: `assert_no_leaks`, `assert_no_cycles`; `@expect_leak` attribute (handles the intentional
+- `Memory.Tracking` records allocation-site backtrace + Zap type per alloc; reports surviving
+  leaks at teardown. (No cycle detector — reference cycles are not constructible from Zap's
+  immutable surface; see Decision 3.)
+- Zest: `assert_no_leaks`; `@expect_leak` attribute (handles the intentional
   `FieldStorage.indirect` leak).
 - Diagnostic security tiers (developer-local / CI-internal / user-safe) enforced in the renderer.
 - **Zap-native golden diagnostic corpus** becomes a first-class project artifact (the primary
@@ -768,45 +783,32 @@ acceptance test (Part VIII).
 
 ### Phase 5 *(deferred)* — `weak`/`unowned`, LSP code-actions, OTel hooks, WASM unwinding
 
-- `weak`/`unowned` field annotations (Swift model) — production fix for cycles.
 - LSP `CodeAction` projection of `MachineApplicable` suggestions; pull-based diagnostics with
   result IDs (LSP 3.17).
 - Optional `on_panic(report)` hook for OpenTelemetry/Sentry-style crash upload.
 - WASM exception-handling integration when the upstream proposal stabilizes.
 
-#### Phase 5 ↔ Phase 4.d — reference cycles are not user-constructible yet; the detector is preemptive infra
+#### ARC reference cycles — not constructible, so no collector is owed
 
-The Bacon–Rajan synchronous trial-deletion **cycle DETECTOR** shipped in Phase 4.d
-(`src/memory/cycle_detector.zig` — the algorithm + `domain=cycle` report reference, with the
-production integration mirrored in `src/runtime.zig`). It is **diagnostic-only**: it REPORTS a
-detected cycle and does NOT free it — freeing requires breaking an edge, which is the
-`weak`/`unowned` **FIX** owned by this Phase 5.
-
-Crucially, **a reference cycle CANNOT be constructed from today's fully-immutable Zap.** There is
-no field-mutation operator, no `Ref`/`Cell`/`Atom` mutable primitive, and functional update
+**A reference cycle CANNOT be constructed from Zap's fully-immutable surface.** There is no
+field-mutation operator, no `Ref`/`Cell`/`Atom` mutable primitive, and functional update
 (`%R{r | f: v}`) always creates a NEW value — so every `%Node{next: Some(other)}` requires `other`
 to already exist, and allocations only ever point at strictly-older allocations. The back-edge that
-would close a loop can never be formed. (The `CycleA`/`CycleB` types in `test/struct_test.zap` are a
-*type-level* mutually-referencing SCC, constructed acyclically with `back: nil`.)
+would close a loop can never be formed, so the points-to graph is always a DAG and pure reference
+counting reclaims it completely. (The `CycleA`/`CycleB` types in `test/struct_test.zap` are a
+*type-level* mutually-referencing SCC, constructed acyclically with `back: nil`; they are a layout
+test, not a runtime cycle.)
 
-Consequences, and what Phase 5 unblocks:
+This is a **language guarantee, not a gap.** Zap therefore ships **no cycle detector and no cycle
+collector**, and needs no `weak`/`unowned` annotations to break cycles. (An earlier iteration
+shipped a Bacon–Rajan trial-deletion detector as preemptive infrastructure; it was removed once the
+guarantee was recognised as total — it detected something structurally impossible.) Plain **leaks**
+(a live allocation simply never released) are a separate, real concern handled by the Phase 4.c
+leak subsystem.
 
-- The detector is therefore **preemptive infrastructure**, built and tested NOW via runtime-level
-  Zig unit tests that assemble cyclic `ArcHeader`-style object graphs directly (no throwaway
-  language primitive) — `src/memory/cycle_detector.zig` pins 2-node/self/3-node detection, the
-  acyclic / externally-referenced / mixed false-positive controls, the zero-hot-path purple-buffer
-  rule, and the exact `domain=cycle` text + JSON shape.
-- **Phase 5 must add: (a)** the mutation / `Ref` / recursive-binding capability that lets a user
-  build a cycle in the first place, and **(b)** `weak`/`unowned` as the cycle FIX (break the strong
-  edge so the cycle reclaims). Once (a) lands, the detector immediately has real cycles to find;
-  once (b) lands, the report can graduate from diagnostic to a reclamation hint.
-- **Activation today:** the detector is DEFAULT-OFF under `Memory.ARC` (production pays nothing) and
-  opt-in via `-Denable-cycle-check` / `ZAP_CYCLE_CHECK` even under `Memory.Tracking`. The Tracking
-  deinit-time auto-walk over the live-set is the remaining surface to mature in Phase 5: a *safe*
-  universal heap walk wants the compiler to mark which allocations are cycle-capable Zap aggregates
-  (the same type machinery the mutation/`weak` work introduces), and the walk must follow a
-  `ProtocolBox`'s vtable-typed inner only once typed back-edges exist. Until then the walk treats a
-  `ProtocolBox` as a cycle leaf and dereferences only manager-confirmed-live cells.
+The only thing that would reopen this is a future capability that can form a back-edge — mutation,
+a mutable cell, or a recursive binding primitive. A cycle collector becomes relevant if and only if
+such a capability is ever introduced, and is owed only then.
 
 ### Must-not-skip-for-production
 
@@ -817,7 +819,7 @@ emission allow-list.
 
 ### Defer-safely
 
-i18n; OTel/Sentry; full LSP code-actions; WASM exception-handling; `weak`/`unowned`;
+i18n; OTel/Sentry; full LSP code-actions; WASM exception-handling;
 OOM-as-recoverable (keep infallible-by-default with opt-in `try_alloc`).
 
 ---
@@ -841,12 +843,9 @@ validated by experiment, measurement, or implementation spike — not by further
    `tuple_to_result/1` shim covers them.
 5. **DWARF size & build-time impact.** Measure binary-size and build-time deltas for ReleaseSafe
    with full DWARF and split-debug; confirm the per-mode policy stays within budget.
-6. **Bacon–Rajan candidate-buffer behavior under Perceus.** Measure how often Perceus's static
-   elimination already prevents purple-buffer entries on representative workloads (Lobster
-   reports 95%+ elimination; verify the order of magnitude for Zap).
-7. **Frame-pointer cost in ReleaseSafe.** Measure on representative benchmarks; confirm the
+6. **Frame-pointer cost in ReleaseSafe.** Measure on representative benchmarks; confirm the
    ~1-3% number holds for Zap workloads.
-8. **`AddressSanitizer` / `LeakSanitizer` numbers from the original Serebryany et al. paper** —
+7. **`AddressSanitizer` / `LeakSanitizer` numbers from the original Serebryany et al. paper** —
    verify primary citations before publication (one of the reports flagged this as
    citation-from-memory rather than freshly verified).
 
@@ -863,8 +862,9 @@ thesis, Royal Institute of Technology (KTH), Stockholm, December 2003. — The "
 foundation; processes, not functions, are the error boundary.
 
 ★ **Bacon, David F. and V. T. Rajan.** "Concurrent Cycle Collection in Reference Counted Systems."
-*ECOOP 2001 — Object-Oriented Programming,* LNCS 2072, pp. 207–235. Springer. — The cycle detector
-algorithm referenced by Decision 3.
+*ECOOP 2001 — Object-Oriented Programming,* LNCS 2072, pp. 207–235. Springer. — The canonical
+trial-deletion cycle detector. Evaluated by Decision 3 and ultimately found unnecessary: Zap's
+immutable surface cannot construct a cycle, so there is nothing to detect.
 
 ★ **Clebsch, Sylvan, Juliana Franco, Sophia Drossopoulou, Albert Mingkun Yang, Tobias Wrigstad, Jan
 Vitek.** "Orca: GC and Type System Co-Design for Actor Languages." *Proc. ACM Program. Lang.* 1,
@@ -903,7 +903,9 @@ The algorithm Zap already uses; explicit about garbage-free *for cycle-free prog
 for effect handlers; effects + DWARF coexistence.
 
 ★ **van Oortmerssen, Wouter.** *Compile Time Reference Counting & Lifetime Analysis in Lobster.*
-strlen.com/lobster, 2020. — Cycle detection at exit as a *diagnostic* mechanism, not a collector.
+strlen.com/lobster, 2020. — Cycle detection at exit as a *diagnostic* mechanism, not a collector;
+the precedent Decision 3 considered. Not adopted by Zap — Zap's cycles are structurally
+impossible, so even a diagnostic detector has nothing to report.
 
 ★ **Serebryany, Konstantin, Derek Bruening, Alexander Potapenko, Dmitriy Vyukov.** "AddressSanitizer:
 A Fast Address Sanity Checker." *USENIX ATC 2012.* — The leak-detector design template for
@@ -965,13 +967,15 @@ A Fast Address Sanity Checker." *USENIX ATC 2012.* — The leak-detector design 
 - **Sema** — the Zig compiler's semantic-analysis stage (type checking, comptime) inside the fork.
 - **HIR / IR** — Zap's high-level and lower intermediate representations before ZIR.
 - **Monomorphization** — specializing generic functions per concrete type (zero-cost generics).
-- **ARC** — Atomic Reference Counting; Zap's default memory management. No tracing GC; cycles leak
-  without intervention.
+- **ARC** — Atomic Reference Counting; Zap's default memory management. No tracing GC. Reference
+  cycles are not constructible from the immutable surface, so ARC reclaims everything a Zap program
+  can build (see Decision 3).
 - **Perceus** — compile-time reference-counting + reuse analysis (PLDI 2021). Zap uses Perceus to
-  insert drops/reuses precisely. Garbage-free for cycle-free programs only.
-- **Bacon–Rajan** — synchronous cycle detector (ECOOP 2001). Maintains a "purple" candidate buffer
-  populated when a refcount decrement leaves a *positive* count; drains via local SCC search. Zero
-  cost on the common Perceus path (decrement → 0).
+  insert drops/reuses precisely. Garbage-free for cycle-free programs only — and every Zap program
+  is cycle-free by construction.
+- **Bacon–Rajan** — synchronous trial-deletion cycle detector (ECOOP 2001). Evaluated by Decision 3
+  and not adopted: Zap's immutable surface makes reference cycles structurally impossible, so there
+  is nothing for a detector to find.
 - **Effect / effect row / handler** — algebraic-effects terms. Zap has a hybrid effects system
   (monomorphization + defunctionalized CPS). The error effect is *one-shot abortive* — admits
   direct lowering per Leijen 2017's selective-CPS theorem.

@@ -28,7 +28,7 @@
 # container-owned box's `allocAny` inner is not `core.deallocate`d under
 # Tracking and shows as a `LEAK:`. This is a Phase-6-elision-vs-lifecycle-
 # pairing interaction (not a G-box ABI defect) deferred to the Phase 4
-# leak/cycle subsystem; the box's OWN scope-exit drop (call-arg / local
+# leak subsystem; the box's OWN scope-exit drop (call-arg / local
 # box) bypasses elision via `protocol_box_drop` and IS Tracking-clean.
 #
 # Three shapes:

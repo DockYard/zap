@@ -3125,9 +3125,9 @@ pub const Parser = struct {
                 // single-argument call `name({ body })`. This is the general
                 // block-passing form (Ruby/Elixir style) that lets a macro
                 // take a block as its sole argument without an empty `()` — it
-                // is what makes Zest's `assert_no_leaks { ... }` /
-                // `assert_no_cycles { ... }` first-class block primitives read
-                // naturally, but it is entirely name-agnostic: ANY bare
+                // is what makes Zest's `assert_no_leaks { ... }` first-class
+                // block primitive read naturally, but it is entirely
+                // name-agnostic: ANY bare
                 // identifier or field-access callee in expression position
                 // accepts it. Restricted to identifier-like callees so a
                 // value followed by a block on the next line (e.g. a struct
