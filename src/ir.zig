@@ -7165,15 +7165,18 @@ pub const IrBuilder = struct {
                     try self.known_local_types.put(handler_dest_fast, handler_joined_zig);
                 }
             }
-            const fast_outcome = try self.lowerRescueDispatch(handler_dest_fast, error_local_fast, tr.arms, tr.arm_discriminators, tr.result_type_id);
+            const fast_outcome = try self.lowerRescueDispatch(handler_dest_fast, error_local_fast, tr.arms, tr.arm_discriminators, tr.result_type_id, tr.after_block);
             // When EVERY reachable arm diverges (the `reraise_propagates`
             // shape), the dispatch is noreturn and `handler_dest_fast` is never
-            // assigned — so we emit NOTHING after it: no `local_set dest = …`
-            // (which would read an unwritten local) and no `after` block (it is
-            // unreachable; a divergent handler aborts/propagates before any
-            // finally would run). When at least one arm yields a value, forward
-            // it to the whole expression's `dest` and run the `after` cleanup on
-            // that (reachable) path.
+            // assigned — so we emit NOTHING after it here: no `local_set dest =
+            // …` (which would read an unwritten local). The `after` cleanup is
+            // NOT skipped on this path — `emitRescueArmBody` already spliced it
+            // into each divergent arm immediately before its terminal re-raise
+            // (Elixir `after`-always-runs parity), so it runs exactly once on
+            // the re-raise path. When at least one arm yields a value, forward
+            // it to the whole expression's `dest` and run the `after` cleanup
+            // on that (reachable) fall-through path — the value-yielding arm
+            // got no in-arm splice (only divergent arms do).
             if (!fast_outcome.diverges) {
                 try self.current_instrs.append(self.allocator, .{ .local_set = .{ .dest = dest, .value = handler_dest_fast } });
                 if (tr.after_block) |cleanup| {
@@ -7232,7 +7235,7 @@ pub const IrBuilder = struct {
         // gated behind a `protocol_box_vtable_eq` test; the terminal arm is
         // a catch-all (the synthesized re-raise when the user omitted one),
         // so an unmatched error re-raises instead of being swallowed.
-        const dispatch_outcome = try self.lowerRescueDispatch(handler_dest, error_local, tr.arms, tr.arm_discriminators, tr.result_type_id);
+        const dispatch_outcome = try self.lowerRescueDispatch(handler_dest, error_local, tr.arms, tr.arm_discriminators, tr.result_type_id, tr.after_block);
         const then_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
         self.current_instrs = saved_then;
 
@@ -7361,11 +7364,20 @@ pub const IrBuilder = struct {
             },
         });
 
-        // 6. `after` (finally): runs on every edge. Both `if` branches are
-        //    normal control flow that fall through to here, so emitting the
-        //    cleanup after the `if` covers the normal-completion and rescued
-        //    paths alike — ARC-correct because these are real IR instructions
-        //    walked by perceus/arc_liveness like any `defer` body.
+        // 6. `after` (finally): runs on every FALL-THROUGH edge. The two `if`
+        //    branches are normal control flow that fall through to here on the
+        //    reachable paths — normal completion (no raise) and a value-
+        //    yielding rescue — so emitting the cleanup after the `if` covers
+        //    them. ARC-correct because these are real IR instructions walked
+        //    by perceus/arc_liveness.
+        //
+        //    The re-raise/propagate path does NOT fall through here: a
+        //    divergent rescue arm already ran the cleanup via the in-arm splice
+        //    in `emitRescueArmBody` (immediately before its terminal raise) and
+        //    then diverged. So `after` runs exactly once on every exit — Elixir
+        //    `after`-always-runs parity — without double-emission on any single
+        //    runtime path (the splice path and this fall-through path are
+        //    mutually exclusive).
         if (tr.after_block) |cleanup| {
             for (cleanup.stmts) |stmt| {
                 _ = try self.lowerTryRescueBodyStmt(stmt);
@@ -7398,8 +7410,9 @@ pub const IrBuilder = struct {
         arms: []const hir_mod.CaseArm,
         discriminators: []const hir_mod.RescueDiscriminator,
         joined_type: types_mod.TypeId,
+        after_block: ?*const hir_mod.Block,
     ) anyerror!RescueArmOutcome {
-        return try self.lowerRescueDispatchFrom(handler_dest, error_local, arms, discriminators, joined_type, 0);
+        return try self.lowerRescueDispatchFrom(handler_dest, error_local, arms, discriminators, joined_type, after_block, 0);
     }
 
     /// Recursive worker for `lowerRescueDispatch`: emit the dispatch chain
@@ -7415,6 +7428,7 @@ pub const IrBuilder = struct {
         arms: []const hir_mod.CaseArm,
         discriminators: []const hir_mod.RescueDiscriminator,
         joined_type: types_mod.TypeId,
+        after_block: ?*const hir_mod.Block,
         index: usize,
     ) anyerror!RescueArmOutcome {
         const arm = arms[index];
@@ -7425,7 +7439,7 @@ pub const IrBuilder = struct {
                 // Terminal arm: bind any whole-scrutinee binding to the box
                 // and lower the body straight into the current stream,
                 // yielding its value to `handler_dest`.
-                return try self.emitRescueArmBody(handler_dest, error_local, arm, null);
+                return try self.emitRescueArmBody(handler_dest, error_local, arm, null, after_block);
             },
             .concrete => |concrete| {
                 // Resolve the protocol the recovered box carries from
@@ -7460,7 +7474,7 @@ pub const IrBuilder = struct {
                 if (concrete.needs_unbox) {
                     unboxed_local = try self.emitRescueUnbox(error_local, protocol_name, concrete.target_type_name);
                 }
-                const then_outcome = try self.emitRescueArmBody(handler_dest, error_local, arm, unboxed_local);
+                const then_outcome = try self.emitRescueArmBody(handler_dest, error_local, arm, unboxed_local, after_block);
                 const then_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved_then;
 
@@ -7468,7 +7482,7 @@ pub const IrBuilder = struct {
                 // arm is a catch-all, so this bottoms out.
                 const saved_else = self.current_instrs;
                 self.current_instrs = .empty;
-                const else_outcome = try self.lowerRescueDispatchFrom(handler_dest, error_local, arms, discriminators, joined_type, index + 1);
+                const else_outcome = try self.lowerRescueDispatchFrom(handler_dest, error_local, arms, discriminators, joined_type, after_block, index + 1);
                 const else_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved_else;
 
@@ -7543,6 +7557,7 @@ pub const IrBuilder = struct {
         error_local: LocalId,
         arm: hir_mod.CaseArm,
         unboxed_local: ?LocalId,
+        after_block: ?*const hir_mod.Block,
     ) anyerror!RescueArmOutcome {
         // Divergence verdict: the HIR stamps a `raise`-tailed arm body
         // `NEVER` (`buildHir`'s `.raise_expr` arm). This is authoritative
@@ -7550,6 +7565,27 @@ pub const IrBuilder = struct {
         // local's tracked runtime type (`do_raise`/`recoverable_raise`
         // return `Nil`/a synth struct, not `Never`).
         const body_diverges = arm.body.result_type == types_mod.TypeStore.NEVER;
+
+        // `after` (finally) parity (Elixir): the cleanup MUST run on the
+        // re-raise/propagate path too, not only on normal-completion and
+        // value-yielding-rescue paths. A divergent rescue arm (`e :: X ->
+        // raise e`, or the synthesized re-raise catch-all) ends in a `Never`
+        // tail — its terminal statement is the propagating `raise` — and never
+        // falls through to the post-`if_expr` cleanup the caller emits for the
+        // reachable paths. So for a divergent arm with an `after` block we
+        // SPLICE the cleanup statements in immediately before that terminal
+        // raise: the arm's own observable work runs, then `after`, then the
+        // re-raise unwinds the frame. The cleanup is plain straight-line IR
+        // walked by perceus/arc_liveness like any other statement (fresh
+        // locals, balanced retain/release), and because a divergent arm and
+        // the fall-through path are mutually exclusive at runtime, `after`
+        // still executes exactly once on every exit. A non-divergent arm needs
+        // no in-arm cleanup — its value flows to the merge and the caller's
+        // post-`if_expr` emission runs `after` on that (reachable) path.
+        const arm_body: *const hir_mod.Block = if (body_diverges and after_block != null)
+            try self.spliceAfterBeforeTail(arm.body, after_block.?)
+        else
+            arm.body;
 
         if (unboxed_local) |concrete_local| {
             // Struct-pattern arm: match the (single-arm) pattern against the
@@ -7567,7 +7603,12 @@ pub const IrBuilder = struct {
                 .type_id = self.local_hir_types.get(concrete_local) orelse types_mod.TypeStore.UNKNOWN,
                 .span = .{ .start = 0, .end = 0 },
             };
-            const single_arm = try self.allocSlice(hir_mod.CaseArm, &.{arm});
+            // Splice `after` into the arm before its terminal raise (see the
+            // `arm_body` note above) by rebinding the arm's body; bindings,
+            // pattern and guard are preserved.
+            var spliced_arm = arm;
+            spliced_arm.body = arm_body;
+            const single_arm = try self.allocSlice(hir_mod.CaseArm, &.{spliced_arm});
             try self.lowerCaseExprBody(handler_dest, concrete_local, .{
                 .scrutinee = scrutinee_expr,
                 .arms = single_arm,
@@ -7591,7 +7632,7 @@ pub const IrBuilder = struct {
                 try self.emitLocalGet(binding.local_index, error_local);
             }
         }
-        const body_result = try self.lowerBlock(arm.body) orelse
+        const body_result = try self.lowerBlock(arm_body) orelse
             return .{ .result = null, .diverges = body_diverges };
 
         // A divergent arm body (e.g. the synthesized re-raise, whose tail is
@@ -7618,6 +7659,43 @@ pub const IrBuilder = struct {
             .local_set = .{ .dest = handler_dest, .value = body_result },
         });
         return .{ .result = handler_dest, .diverges = false };
+    }
+
+    /// Build a rewritten copy of a divergent rescue-arm `body` with the
+    /// `after` (finally) cleanup statements spliced in immediately BEFORE the
+    /// body's terminal statement — the propagating `raise` that unwinds the
+    /// frame. This gives Elixir-exact ordering for the re-raise path: the
+    /// arm's own statements run, then `after`, then the re-raise. The result
+    /// type is preserved (`NEVER`) because the terminal raise — the source of
+    /// the divergence verdict — stays last; the `after` statements are
+    /// non-divergent straight-line work inserted ahead of it.
+    ///
+    /// Used only for a divergent arm (`body.result_type == NEVER`) whose
+    /// terminal statement is the divergence point. A divergent arm always has
+    /// at least that one statement; an (impossible) empty body degenerates to
+    /// just the cleanup, which still runs before control leaves.
+    fn spliceAfterBeforeTail(
+        self: *IrBuilder,
+        body: *const hir_mod.Block,
+        after_block: *const hir_mod.Block,
+    ) anyerror!*const hir_mod.Block {
+        const body_stmts = body.stmts;
+        const after_stmts = after_block.stmts;
+
+        const tail_count: usize = if (body_stmts.len == 0) 0 else 1;
+        const prefix_count = body_stmts.len - tail_count;
+
+        const merged = try self.allocator.alloc(hir_mod.Stmt, prefix_count + after_stmts.len + tail_count);
+        // [prefix … , after … , terminal-raise]
+        @memcpy(merged[0..prefix_count], body_stmts[0..prefix_count]);
+        @memcpy(merged[prefix_count .. prefix_count + after_stmts.len], after_stmts);
+        if (tail_count == 1) {
+            merged[prefix_count + after_stmts.len] = body_stmts[body_stmts.len - 1];
+        }
+
+        const rewritten = try self.allocator.create(hir_mod.Block);
+        rewritten.* = .{ .stmts = merged, .result_type = body.result_type };
+        return rewritten;
     }
 
     /// Emit a `protocol_box_unbox` recovering the concrete `target_type_name`
