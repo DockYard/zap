@@ -1273,6 +1273,8 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
             .args = try clonePlainSlice(LocalId, allocator, value.args),
             .arg_modes = try clonePlainSlice(ValueMode, allocator, value.arg_modes),
             .return_type = try cloneZigType(allocator, value.return_type),
+            .raises = value.raises,
+            .callee_is_bare_fn_value = value.callee_is_bare_fn_value,
         } },
         .call_dispatch => |value| .{ .call_dispatch = .{
             .dest = value.dest,
@@ -2152,6 +2154,17 @@ pub const CallClosure = struct {
     /// union) and leaves the error-union result for the following
     /// `unwrap_error_union` to `try`/`catch`/abort.
     raises: bool = false,
+    /// Gap E — true when the callee is a MATERIALIZED closure VALUE
+    /// read out of storage (a struct field, a function return value, a
+    /// collection element) rather than constructed inline (`make_closure`)
+    /// or received as a higher-order PARAMETER. Such a value is a bare
+    /// `*const fn(...) ret` code pointer (the runtime representation of a
+    /// non-capturing closure that flowed through a concrete-typed
+    /// position), so the ZIR backend invokes it with a DIRECT `call_ref`
+    /// instead of destructuring a `{call_fn, env}` closure struct or
+    /// routing through `Kernel.callCallableN`. Set by the IR builder from
+    /// the callee HIR expression's shape (see `closureCalleeIsMaterializedValue`).
+    callee_is_bare_fn_value: bool = false,
 };
 
 pub const CallDispatch = struct {
@@ -3226,6 +3239,14 @@ pub const IrBuilder = struct {
     /// restored across nested `function_group` blocks alongside
     /// `known_local_types`.
     local_hir_types: std.AutoHashMap(LocalId, hir_mod.TypeId),
+    /// Gap E — IR locals holding a MATERIALIZED closure VALUE (a bare
+    /// `*const fn(...) ret` read out of a struct field / function return /
+    /// collection element). A `call_closure` whose callee aliases one of
+    /// these invokes it via a direct `call_ref` (set on
+    /// `CallClosure.callee_is_bare_fn_value`). Populated by
+    /// `noteMaterializedClosureLocal`, propagated source→dest through
+    /// `emitLocalGet`. Cleared per function group like `known_local_types`.
+    materialized_closure_locals: std.AutoHashMapUnmanaged(LocalId, void),
     /// Locals whose value originated from a `param_get` instruction.
     /// Used by the call-builtin encoder to detect bridge calls inside
     /// generic Zap functions — those have `param: anytype` in the
@@ -3375,6 +3396,7 @@ pub const IrBuilder = struct {
             .type_store = null,
             .known_local_types = std.AutoHashMap(LocalId, ZigType).init(allocator),
             .local_hir_types = std.AutoHashMap(LocalId, hir_mod.TypeId).init(allocator),
+            .materialized_closure_locals = .empty,
             .param_backed_locals = std.AutoHashMap(LocalId, void).init(allocator),
             .rescue_unboxed_borrow_locals = std.AutoHashMap(LocalId, void).init(allocator),
             .term_tuple_locals = std.AutoHashMap(LocalId, ZigType).init(allocator),
@@ -3395,6 +3417,7 @@ pub const IrBuilder = struct {
         self.current_instrs.deinit(self.allocator);
         self.known_local_types.deinit();
         self.local_hir_types.deinit();
+        self.materialized_closure_locals.deinit(self.allocator);
         self.param_backed_locals.deinit();
         self.rescue_unboxed_borrow_locals.deinit();
         self.term_tuple_locals.deinit();
@@ -3799,6 +3822,77 @@ pub const IrBuilder = struct {
             .function => |function_type| function_type.raises,
             else => false,
         };
+    }
+
+    /// Gap E — does this `call_closure` callee (already lowered to the IR
+    /// local `callee_local`) resolve to a MATERIALIZED closure VALUE read
+    /// out of storage (a struct field, a function return value, a
+    /// collection element) rather than constructed inline (`closure_create`)
+    /// or received as a higher-order PARAMETER?
+    ///
+    /// Such a value is a bare `*const fn(...) ret` code pointer (the
+    /// runtime representation of a non-capturing closure that flowed
+    /// through a concrete-typed position — see the `.function` ZigType
+    /// rendering in `zir_builder.zig`). The ZIR backend must invoke it
+    /// with a DIRECT `call_ref` rather than destructuring a `{call_fn,
+    /// env}` closure struct or routing through `Kernel.callCallableN`.
+    ///
+    /// Detection is purely structural on the callee HIR expression — a
+    /// `field_get` / `call` / tuple-or-list-or-map element extraction
+    /// produces a stored value. A `local_get` is resolved through the
+    /// IR-local `materialized_closure_locals` set (populated below as
+    /// bindings are lowered, propagated like `param_derived_closure_locals`)
+    /// so `h = factory(); h.action()` and `f = make(); f()` are both
+    /// recognised once the closure value is bound to a local. Inline
+    /// closure literals (`closure_create`), parameters (`param_get`), and
+    /// bare function references keep their existing lowering (the
+    /// param-derived / `make_closure`-traced paths in the ZIR backend), so
+    /// this never widens those.
+    ///
+    /// Guarded by the callee's static type being a function type, so a
+    /// non-closure `field_get`/`call` is never misclassified.
+    fn closureCalleeIsMaterializedValue(self: *const IrBuilder, callee: *const hir_mod.Expr, callee_local: LocalId) bool {
+        const store = self.type_store orelse return false;
+        if (store.getType(callee.type_id) != .function) return false;
+        return switch (callee.kind) {
+            // Reading a closure out of storage / from a call boundary
+            // yields a materialized bare-fn-ptr value directly.
+            .field_get,
+            .call,
+            .tuple_index_get,
+            .list_index_get,
+            .list_head_get,
+            .list_tail_get,
+            .map_value_get,
+            => true,
+            // A `local_get` aliases an earlier binding: the lowered local
+            // carries the materialized-value marker if its source did.
+            .local_get => self.materialized_closure_locals.contains(callee_local),
+            else => false,
+        };
+    }
+
+    /// Gap E — record (when its static type is a function) that the IR
+    /// local `dest` holds a MATERIALIZED closure value, so a later
+    /// `call_closure` whose callee aliases it invokes via a direct
+    /// `call_ref`. Mirrors the `param_derived_closure_locals` marker:
+    /// populated when lowering a `field_get`/`call`/element-extraction that
+    /// produces a closure value, and propagated source→dest through
+    /// `emitLocalGet` and the alias-forming instructions.
+    fn noteMaterializedClosureLocal(self: *IrBuilder, dest: LocalId, expr: *const hir_mod.Expr) void {
+        const store = self.type_store orelse return;
+        if (store.getType(expr.type_id) != .function) return;
+        switch (expr.kind) {
+            .field_get,
+            .call,
+            .tuple_index_get,
+            .list_index_get,
+            .list_head_get,
+            .list_tail_get,
+            .map_value_get,
+            => self.materialized_closure_locals.put(self.allocator, dest, {}) catch {},
+            else => {},
+        }
     }
 
     /// #201 — does this (monomorphized) function group INVOKE a
@@ -4497,6 +4591,7 @@ pub const IrBuilder = struct {
         self.current_instrs = .empty;
         self.known_local_types.clearRetainingCapacity();
         self.local_hir_types.clearRetainingCapacity();
+        self.materialized_closure_locals.clearRetainingCapacity();
         self.param_backed_locals.clearRetainingCapacity();
         self.rescue_unboxed_borrow_locals.clearRetainingCapacity();
         self.term_tuple_locals.clearRetainingCapacity();
@@ -4609,6 +4704,7 @@ pub const IrBuilder = struct {
         self.current_instrs = .empty;
         self.known_local_types.clearRetainingCapacity();
         self.local_hir_types.clearRetainingCapacity();
+        self.materialized_closure_locals.clearRetainingCapacity();
         self.param_backed_locals.clearRetainingCapacity();
         self.rescue_unboxed_borrow_locals.clearRetainingCapacity();
         self.term_tuple_locals.clearRetainingCapacity();
@@ -5106,6 +5202,7 @@ pub const IrBuilder = struct {
             self.current_instrs = .empty;
             self.known_local_types.clearRetainingCapacity();
             self.local_hir_types.clearRetainingCapacity();
+            self.materialized_closure_locals.clearRetainingCapacity();
             self.param_backed_locals.clearRetainingCapacity();
             self.rescue_unboxed_borrow_locals.clearRetainingCapacity();
             self.term_tuple_locals.clearRetainingCapacity();
@@ -9518,6 +9615,14 @@ pub const IrBuilder = struct {
                     if (self.local_hir_types.get(val)) |src_hir_type| {
                         try self.local_hir_types.put(ls.index, src_hir_type);
                     }
+                    // Gap E — propagate the materialized-closure-value marker
+                    // from the RHS into the binding local, so a later
+                    // `call_closure` whose callee is `local_get(name)`
+                    // recognises `name = make(); name()` as a bare-fn-ptr
+                    // call (direct `call_ref`).
+                    if (self.materialized_closure_locals.contains(val)) {
+                        try self.materialized_closure_locals.put(self.allocator, ls.index, {});
+                    }
                     // Phase 0 — DWARF foundation: record the Zap source
                     // identifier for this local so the ZIR backend can
                     // emit a `dbg_var_val`, preserving the name into
@@ -10708,6 +10813,12 @@ pub const IrBuilder = struct {
         if (self.param_backed_locals.contains(source)) {
             try self.param_backed_locals.put(dest, {});
         }
+        // Gap E — propagate the materialized-closure-value marker across
+        // the alias so `f = make(); f()` (callee `local_get(f)`) is
+        // recognised as a bare-fn-ptr call.
+        if (self.materialized_closure_locals.contains(source)) {
+            try self.materialized_closure_locals.put(self.allocator, dest, {});
+        }
     }
 
     /// Emit `.retain {value=dest}` when `dest` holds an ARC-managed
@@ -11857,8 +11968,9 @@ pub const IrBuilder = struct {
                         const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
                         const return_type = self.closureReturnType(expr.type_id, callee_local);
                         const closure_raises = self.closureCalleeRaises(callee);
+                        const callee_bare_fn = self.closureCalleeIsMaterializedValue(callee, callee_local);
                         try self.current_instrs.append(self.allocator, .{
-                            .call_closure = .{ .dest = dest, .callee = callee_local, .args = lowered_args, .arg_modes = lowered_modes, .return_type = return_type, .raises = closure_raises },
+                            .call_closure = .{ .dest = dest, .callee = callee_local, .args = lowered_args, .arg_modes = lowered_modes, .return_type = return_type, .raises = closure_raises, .callee_is_bare_fn_value = callee_bare_fn },
                         });
                         if (return_type != .any and return_type != .void) {
                             try self.known_local_types.put(dest, return_type);
@@ -12635,6 +12747,11 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{ .const_nil = dest });
             },
         }
+
+        // Gap E — mark `dest` if this expression materialized a closure
+        // VALUE out of storage (field / return / collection element), so a
+        // later `call_closure` aliasing it invokes via a direct `call_ref`.
+        self.noteMaterializedClosureLocal(dest, expr);
 
         return dest;
     }

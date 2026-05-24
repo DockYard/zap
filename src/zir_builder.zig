@@ -64,6 +64,15 @@ extern "c" fn zir_builder_emit_optional_type(handle: ?*ZirBuilderHandle, child: 
 /// and its enclosing optional, breaking what would otherwise be
 /// an infinite-size value-typed cycle.
 extern "c" fn zir_builder_emit_single_const_ptr_type(handle: ?*ZirBuilderHandle, pointee: u32) u32;
+/// Emit `*const fn(P0, P1, ...) Ret` — a pointer to a bare function TYPE.
+/// `param_type_refs` are the parameter type Refs (each a
+/// `@intFromEnum(Zir.Inst.Ref)`); `ret_type` is the return type Ref. This is
+/// the runtime representation of a non-capturing (0-capture) Zap closure
+/// value, so the ZIR backend renders a closure type (`( -> i64)`) through
+/// this at every concrete-type position — struct field, function return
+/// type, tuple element — where the param-position `anytype` lowering can't
+/// be used. See `FuncBody.addFuncPtrType` in the fork.
+extern "c" fn zir_builder_emit_func_ptr_type(handle: ?*ZirBuilderHandle, param_type_refs_ptr: [*]const u32, param_type_refs_len: u32, ret_type: u32) u32;
 extern "c" fn zir_builder_emit_if_else(handle: ?*ZirBuilderHandle, condition: u32, then_value: u32, else_value: u32) u32;
 extern "c" fn zir_builder_emit_struct_init_anon(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
 extern "c" fn zir_builder_emit_union_init(handle: ?*ZirBuilderHandle, union_type: u32, field_name_ptr: [*]const u8, field_name_len: u32, init_value: u32) u32;
@@ -603,6 +612,18 @@ fn appendZigTypeForVTable(
             try buf.appendSlice(allocator, name);
             try buf.appendSlice(allocator, "\").");
             try buf.appendSlice(allocator, name);
+        },
+        // A closure type renders as a Zig function-pointer type
+        // `*const fn(P...) Ret` — the runtime representation of a
+        // non-capturing closure value.
+        .function => |fn_type| {
+            try buf.appendSlice(allocator, "*const fn (");
+            for (fn_type.params, 0..) |param_type, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                try appendZigTypeForVTable(allocator, buf, param_type);
+            }
+            try buf.appendSlice(allocator, ") ");
+            try appendZigTypeForVTable(allocator, buf, fn_type.return_type.*);
         },
         else => try buf.appendSlice(allocator, "anytype"),
     }
@@ -1309,12 +1330,58 @@ pub const ZirDriver = struct {
     fn emitTypeRef(self: *ZirDriver, zig_type: ir.ZigType) BuildError!u32 {
         return switch (zig_type) {
             .tuple => self.emitBodyLocalTupleType(zig_type),
+            // A closure type lowers to `*const fn(P...) Ret` — the
+            // runtime representation of a non-capturing closure value.
+            .function => |fn_type| try self.emitFuncPtrTypeRef(fn_type),
             else => blk: {
                 const ref = mapReturnType(zig_type);
                 if (ref == @intFromEnum(Zir.Inst.Ref.none)) return error.EmitFailed;
                 break :blk ref;
             },
         };
+    }
+
+    /// Resolve a closure type `( -> Ret)` / `(P... -> Ret)` to a ZIR
+    /// `*const fn(P...) Ret` type ref. This is the runtime representation
+    /// of a NON-capturing (0-capture) Zap closure value (a bare function
+    /// pointer); the ZIR backend uses it at every concrete-type position
+    /// (struct field, function return type, tuple element) where the
+    /// param-position `anytype` lowering can't be used. The param and
+    /// return type Refs must be resolved into the SAME body the func-ptr
+    /// type is emitted into (the fork's `addFuncPtrType` nests its
+    /// `param`/`func`/`break_inline` instructions inside the type's
+    /// `block_inline`), so primitive Refs (well-known, body-independent)
+    /// are used directly and complex element types are emitted inline via
+    /// `emitImportedTypeRef`.
+    fn emitFuncPtrTypeRef(self: *ZirDriver, fn_type: ir.ZigType.FnType) BuildError!u32 {
+        var param_refs: std.ArrayListUnmanaged(u32) = .empty;
+        defer param_refs.deinit(self.allocator);
+        for (fn_type.params) |param_type| {
+            try param_refs.append(self.allocator, try self.emitClosureSignatureTypeRef(param_type));
+        }
+        const ret_ref = try self.emitClosureSignatureTypeRef(fn_type.return_type.*);
+        const ref = zir_builder_emit_func_ptr_type(
+            self.handle,
+            param_refs.items.ptr,
+            @intCast(param_refs.items.len),
+            ret_ref,
+        );
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
+    /// Resolve a single closure-signature component (a parameter type or
+    /// the return type) to a ZIR type Ref. Primitives map to well-known
+    /// Refs; a bare `void` return maps to the well-known `void_type` Ref
+    /// (a `( -> i64)`-style closure always has a concrete return, but a
+    /// nested `void` element must still resolve); everything else is
+    /// emitted inline via `emitImportedTypeRef` so its support
+    /// instructions land in the func-ptr type's body.
+    fn emitClosureSignatureTypeRef(self: *ZirDriver, zig_type: ir.ZigType) BuildError!u32 {
+        if (zig_type == .void) return @intFromEnum(Zir.Inst.Ref.void_type);
+        const simple = mapReturnType(zig_type);
+        if (simple != 0) return simple;
+        return try self.emitImportedTypeRef(zig_type);
     }
 
     fn emitClosureEnvParam(self: *ZirDriver, captures: []const ir.Capture) BuildError!u32 {
@@ -1521,10 +1588,15 @@ pub const ZirDriver = struct {
                 if (ref == error_ref) return error.EmitFailed;
                 return ref;
             },
+            // A closure type lowers to `*const fn(P...) Ret` — the runtime
+            // representation of a non-capturing closure value. Reachable
+            // when a closure type appears nested inside an optional/ptr/
+            // tuple, or as a struct field type emitted through this path.
+            .function => |fn_type| return try self.emitFuncPtrTypeRef(fn_type),
             // void/nil/never should not appear as tuple elements
             .void, .nil, .never => return error.EmitFailed,
             // Types that don't have runtime representations as tuple elements yet
-            .function, .tagged_union, .any => return error.EmitFailed,
+            .tagged_union, .any => return error.EmitFailed,
             // Primitives are handled above by mapReturnType — they never reach here
             .bool_type,
             .i8,
@@ -4384,6 +4456,30 @@ pub const ZirDriver = struct {
             return;
         }
         switch (return_type) {
+            .function => |fn_type| {
+                // A function declared to RETURN a closure type `( -> Ret)`
+                // returns `*const fn(P...) Ret` — the runtime representation
+                // of the non-capturing closure value it produces. The
+                // func-ptr type's support instructions (the param/func/
+                // break_inline nested inside its block_inline) must live
+                // INSIDE the ret_ty body, so capture them and route through
+                // `set_custom_return_type` (the same mechanism the
+                // recursive-struct return path above uses).
+                var support: std.ArrayListUnmanaged(u32) = .empty;
+                defer support.deinit(self.allocator);
+                const before = zir_builder_get_body_inst_count(self.handle);
+                const type_ref = try self.emitFuncPtrTypeRef(fn_type);
+                try self.captureBodyInsts(before, &support);
+                const result_inst = zir_builder_ref_to_inst_index(self.handle, type_ref);
+                if (result_inst == 0xFFFFFFFF) return error.EmitFailed;
+                if (zir_builder_set_custom_return_type(
+                    self.handle,
+                    support.items.ptr,
+                    @intCast(support.items.len),
+                    result_inst,
+                ) != 0) return error.EmitFailed;
+                self.current_ret_type = 1;
+            },
             .list => {
                 // emitContainerElementTypeRef may emit support instructions
                 // (e.g. `@import("zap_runtime")`, `field_val Term`) into the
@@ -4668,13 +4764,21 @@ pub const ZirDriver = struct {
                 ) != 0) return error.EmitFailed;
                 self.current_ret_type = 1;
             },
-            .function, .tagged_union, .ptr, .any, .term => {
+            .tagged_union, .ptr, .any, .term => {
                 // These types are structural and created anonymously in the
                 // body. Zig infers the return type from the body construction.
                 // `.term` falls into this bucket because the runtime type
                 // (`zap_runtime.Term`) is resolved by the body — declaring
                 // it explicitly here would require eagerly emitting the
                 // import path, which is unnecessary for inference.
+                //
+                // `.function` is NOT in this bucket: a closure return type
+                // is declared EXPLICITLY as `*const fn(P...) Ret` by the
+                // `.function` arm at the top of this switch. Relying on
+                // generic inference for a closure return silently resolved
+                // to `void` (the body's `*const fn() i64` value then tripped
+                // `expected type 'void', found '*const fn () i64'`), which
+                // was Gap E symptom 1.
                 if (zir_builder_set_generic_return_type(self.handle) != 0)
                     return error.EmitFailed;
                 self.current_ret_type = 1;
@@ -8077,6 +8181,41 @@ pub const ZirDriver = struct {
             .call_closure => |cc| {
                 const lattice = @import("escape_lattice.zig");
                 const callee_is_param = self.isParamDerivedClosure(cc.callee);
+
+                // Gap E — the callee is a MATERIALIZED closure VALUE read out
+                // of storage (a struct field, a function return value, a
+                // collection element). Its runtime representation is a bare
+                // `*const fn(...) ret` code pointer (a non-capturing closure
+                // that flowed through a concrete-typed position), so invoke
+                // it with a DIRECT `call_ref` — NOT the `{call_fn, env}`
+                // closure-struct destructuring (which would emit a `field_val`
+                // on a function-pointer value: `type 'fn () ...' does not
+                // support field access`) and NOT `Kernel.callCallableN` (the
+                // param-position dynamic dispatch). The IR builder set this
+                // flag from the callee expression's shape + function type.
+                if (cc.callee_is_bare_fn_value) {
+                    const callee_ref = self.refForLocal(cc.callee) catch return error.EmitFailed;
+                    var args: std.ArrayListUnmanaged(u32) = .empty;
+                    defer args.deinit(self.allocator);
+                    for (cc.args) |arg| {
+                        const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        try args.append(self.allocator, ref);
+                    }
+                    var ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
+                    if (ref == error_ref) return error.EmitFailed;
+                    // #201 — a raising closure's call yields `error{ZapRaise}!T`;
+                    // skip the payload-narrowing `@as` (it would reject the
+                    // error union) and leave the union for the following
+                    // `unwrap_error_union`. A pure closure narrows to its
+                    // declared return type.
+                    const ret_type_ref = if (cc.raises) @as(u32, 0) else mapReturnType(cc.return_type);
+                    if (ret_type_ref != 0) {
+                        const cast = zir_builder_emit_as(self.handle, ret_type_ref, ref);
+                        if (cast != error_ref) ref = cast;
+                    }
+                    try self.setLocal(cc.dest, ref);
+                    return;
+                }
 
                 // Parameter-derived closures: the callee is a function parameter.
                 // It could be either a bare function pointer or a closure struct

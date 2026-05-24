@@ -8509,3 +8509,243 @@ test "Phase5 script cache: concurrent identical runs are race-safe (atomic publi
     try std.testing.expectEqual(@as(usize, 1), try countScriptKeyDirs(allocator, &tmp_dir));
     try expectOnlyScriptInDir(&tmp_dir, script_name);
 }
+
+// ============================================================
+// Gap E — first-class closures as RETURN VALUES and STRUCT FIELDS
+//
+// #201 made closures work as `call_closure` PARAMETERS (a closure value
+// passed to a higher-order fn and invoked). Gap E extends closure VALUES
+// to the RETURN-VALUE and STRUCT-FIELD positions, and to being CALLED from
+// those positions. Before the fix, a function declared to return a closure
+// type lowered its return type to `void` (`mapReturnType`'s `.function`
+// arm fell through to `0`), so the body's `*const fn() i64` value tripped
+// `expected void, found *const fn () i64`; a closure-typed struct field
+// hit `EmitFailed` because `emitTypeRef`/`emitImportedTypeRef` had no
+// `.function` arm. Both symptoms reproduce with PURE (non-raising)
+// closures, so these are general closure-value plumbing tests, not
+// error-system tests. The fix renders a `.function` ZigType as a Zig
+// function-pointer type (`*const fn(P...) Ret`) — which is exactly the
+// runtime representation of a 0-capture closure value — at the return,
+// field, and type-ref positions, and routes a `call_closure` whose callee
+// is a field-access / return-value bare fn-ptr through a direct `call_ref`.
+// ============================================================
+
+test "closure: returned from a function then called (Gap E symptom 1)" {
+    // `Adders.make_adder()` RETURNS a pure closure `( -> i64)`; `main`
+    // binds it and invokes it. Before the fix this failed at ZIR with
+    // `expected type 'void', found '*const fn () i64'` because the closure
+    // return type lowered to `void`.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "closure_return.zap",
+        \\pub struct Adders {
+        \\  pub fn make_adder() -> ( -> i64) {
+        \\    fn() -> i64 { 42 }
+        \\  }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  f = Adders.make_adder()
+        \\  IO.puts(Integer.to_string(f()))
+        \\  0
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    if (r.exit_code != 0) {
+        std.debug.print(
+            "closure-return failed: exit={d}\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.exit_code, r.stdout, r.stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "42") != null);
+}
+
+test "closure: stored in a struct field then called via field access (Gap E symptom 2)" {
+    // A `pub struct Handler` carries a closure-typed field `action :: ( -> i64)`.
+    // `main` constructs `%Handler{ action: fn() -> i64 { 7 } }` and invokes it
+    // via `h.action()`. Before the fix this hit `EmitFailed` because the
+    // closure field type couldn't be rendered into ZIR.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "closure_field.zap",
+        \\pub struct Handler {
+        \\  action :: ( -> i64)
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  h = %Handler{ action: fn() -> i64 { 7 } }
+        \\  IO.puts(Integer.to_string(h.action()))
+        \\  0
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    if (r.exit_code != 0) {
+        std.debug.print(
+            "closure-field failed: exit={d}\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.exit_code, r.stdout, r.stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "7") != null);
+}
+
+test "closure: closure-typed field with a parameter, called with an argument" {
+    // The field carries a one-arg closure `(i64 -> i64)`; calling it through
+    // field access must thread the argument to the bare fn-ptr.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "closure_field_arg.zap",
+        \\pub struct Transform {
+        \\  op :: (i64 -> i64)
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  t = %Transform{ op: fn(x :: i64) -> i64 { x * 2 } }
+        \\  IO.puts(Integer.to_string(t.op(21)))
+        \\  0
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    if (r.exit_code != 0) {
+        std.debug.print(
+            "closure-field-arg failed: exit={d}\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.exit_code, r.stdout, r.stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "42") != null);
+}
+
+test "closure: struct holding a closure returned from a function, then called (Gap E scenario 3)" {
+    // Combine return + field: a function returns a struct VALUE that holds a
+    // closure field; the caller reads the field and invokes it.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "closure_struct_return.zap",
+        \\pub struct Handler {
+        \\  action :: ( -> i64)
+        \\}
+        \\
+        \\pub struct Factory {
+        \\  pub fn build() -> Handler {
+        \\    %Handler{ action: fn() -> i64 { 99 } }
+        \\  }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  h = Factory.build()
+        \\  IO.puts(Integer.to_string(h.action()))
+        \\  0
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    if (r.exit_code != 0) {
+        std.debug.print(
+            "closure-struct-return failed: exit={d}\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.exit_code, r.stdout, r.stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "99") != null);
+}
+
+test "closure: higher-order fn that returns a closure, both invoked (Gap E scenario 4, composes with #201)" {
+    // `Compose.wrap` takes a closure param `f` AND returns a (different)
+    // closure. The returned closure is non-capturing; the param is invoked
+    // through #201's `call_closure`. Both the param-invocation and the
+    // returned-closure-invocation must work together.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "closure_higher_order_return.zap",
+        \\pub struct Compose {
+        \\  pub fn run_first(f :: ( -> i64)) -> i64 {
+        \\    f()
+        \\  }
+        \\
+        \\  pub fn make() -> ( -> i64) {
+        \\    fn() -> i64 { 5 }
+        \\  }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  g = Compose.make()
+        \\  a = g()
+        \\  b = Compose.run_first(fn() -> i64 { 37 })
+        \\  IO.puts(Integer.to_string(a + b))
+        \\  0
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    if (r.exit_code != 0) {
+        std.debug.print(
+            "closure-higher-order-return failed: exit={d}\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.exit_code, r.stdout, r.stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "42") != null);
+}
+
+test "closure: returned/field closures leak-free under Memory.Tracking (Gap E ARC balance)" {
+    // The non-capturing closure value is a bare `*const fn() i64` code
+    // pointer — NOT ARC-managed — so neither the returned nor the field-
+    // stored closure may schedule a spurious retain/release on the code
+    // pointer. Under `Memory.Tracking` (munmap + no refcounts) a spurious
+    // release of a code pointer would crash or leak; a clean run with no
+    // `leak summary:` / `memory leak:` markers proves the bare fn-ptr
+    // carries no ARC obligation through these positions.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "closure_field_tracking.zap",
+        \\pub struct Handler {
+        \\  action :: ( -> i64)
+        \\}
+        \\
+        \\pub struct Factory {
+        \\  pub fn build() -> Handler {
+        \\    %Handler{ action: fn() -> i64 { 99 } }
+        \\  }
+        \\
+        \\  pub fn make() -> ( -> i64) {
+        \\    fn() -> i64 { 7 }
+        \\  }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  h = Factory.build()
+        \\  g = Factory.make()
+        \\  IO.puts(Integer.to_string(h.action() + g()))
+        \\  0
+        \\}
+    , &.{"-Dmemory=Memory.Tracking"}, &.{});
+    defer r.deinit();
+
+    if (r.exit_code != 0) {
+        std.debug.print(
+            "closure-field-tracking failed: exit={d}\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.exit_code, r.stdout, r.stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "106") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "leak summary:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "memory leak:") == null);
+}
