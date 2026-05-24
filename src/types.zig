@@ -12087,12 +12087,13 @@ test "numeric call matching prefers exact type over widening" {
     try std.testing.expectEqual(@as(?u32, 49), store.callMatchCost(TypeStore.F80, TypeStore.F128));
 }
 
-test "numeric widening stays within signed unsigned and float families" {
+test "numeric widening is value-preserving across the integer and float families" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
     var store = TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
+    // Same-signedness widening to any strictly-wider target.
     try std.testing.expect(store.canWidenTo(TypeStore.I8, TypeStore.I64));
     try std.testing.expect(store.canWidenTo(TypeStore.I64, TypeStore.I128));
     try std.testing.expect(store.canWidenTo(TypeStore.U8, TypeStore.U64));
@@ -12101,8 +12102,22 @@ test "numeric widening stays within signed unsigned and float families" {
     try std.testing.expect(store.canWidenTo(TypeStore.F64, TypeStore.F80));
     try std.testing.expect(store.canWidenTo(TypeStore.F80, TypeStore.F128));
 
-    try std.testing.expect(!store.canWidenTo(TypeStore.U32, TypeStore.I64));
-    try std.testing.expect(!store.canWidenTo(TypeStore.U64, TypeStore.I128));
+    // Unsigned -> strictly-wider signed is value-preserving (the wider
+    // signed type holds the whole unsigned range): the standard integer
+    // promotion. This is what lets a `u16` operand unify with an `i64`
+    // operand in a mixed-width comparison/arithmetic dispatch (notably
+    // the Zest `assert` rewrite binding a literal to an i64 temporary).
+    try std.testing.expect(store.canWidenTo(TypeStore.U32, TypeStore.I64));
+    try std.testing.expect(store.canWidenTo(TypeStore.U64, TypeStore.I128));
+    try std.testing.expect(store.canWidenTo(TypeStore.U8, TypeStore.I16));
+
+    // Unsigned -> same-or-narrower signed is NOT value-preserving (the
+    // signed target cannot represent the unsigned maximum).
+    try std.testing.expect(!store.canWidenTo(TypeStore.U16, TypeStore.I16));
+    try std.testing.expect(!store.canWidenTo(TypeStore.U32, TypeStore.I32));
+    try std.testing.expect(!store.canWidenTo(TypeStore.U64, TypeStore.I32));
+
+    // Signed -> unsigned would drop the sign; int<->float never widens.
     try std.testing.expect(!store.canWidenTo(TypeStore.I32, TypeStore.U64));
     try std.testing.expect(!store.canWidenTo(TypeStore.I64, TypeStore.U128));
     try std.testing.expect(!store.canWidenTo(TypeStore.I32, TypeStore.F64));

@@ -6424,6 +6424,26 @@ pub const ZirDriver = struct {
                                 if (ref == error_ref) return error.EmitFailed;
                                 try self.setLocal(cb.dest, ref);
                             }
+                        } else if (self.findStructDef(runtime_mod) != null) {
+                            // `runtime_mod` names a user-defined struct, not a
+                            // runtime module. This reaches the `call_builtin`
+                            // path when a protocol-method call on a concrete
+                            // receiver — e.g. `Error.message(e)` where
+                            // `e :: TimeoutError` — was devirtualized to the
+                            // concrete impl `TimeoutError.message` but the
+                            // method's owning module is a separate per-struct
+                            // emission (the `impl Error for TimeoutError`
+                            // methods live in `TimeoutError`'s own ZIR file,
+                            // not the caller's). Routing through
+                            // `@import("zap_runtime").TimeoutError.message`
+                            // would fail Sema with `zap_runtime has no member
+                            // named TimeoutError` because the runtime namespace
+                            // owns no user types. Instead reach the method on
+                            // its real module via the file-IS-struct import,
+                            // exactly as a regular cross-struct call would.
+                            const ref = try self.emitCrossStructCall(runtime_mod, func_name, args.items);
+                            if (ref == error_ref) return error.EmitFailed;
+                            try self.setLocal(cb.dest, ref);
                         } else {
                             const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                             if (rt_import == error_ref) return error.EmitFailed;
