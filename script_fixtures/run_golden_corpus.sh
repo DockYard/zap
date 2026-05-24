@@ -35,7 +35,7 @@ UPDATE=0
 
 # Never let an inherited knob perturb a capture; the harness sets the format
 # per-case explicitly via the CLI flag.
-unset ZAP_ZIG_LIB_DIR ZIG_LIB_DIR ZAP_ERROR_FORMAT ZAP_LEAKS_FATAL ZAP_BACKTRACE ZAP_CYCLE_CHECK
+unset ZAP_ZIG_LIB_DIR ZIG_LIB_DIR ZAP_ERROR_FORMAT ZAP_LEAKS_FATAL ZAP_BACKTRACE
 
 # Always recompile from source so a stale script-cache binary never masks a
 # behavior change.
