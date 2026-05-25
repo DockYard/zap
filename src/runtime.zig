@@ -4528,8 +4528,8 @@ pub const ArcRuntime = struct {
     /// one across owners can never double-free it.
     ///
     /// This is the precise discriminator the box-in-container clone-on-share
-    /// (`ownElement` / `ownEntryValue`) and deep-release
-    /// (`releaseElementsNonRefcounted`) consult under no-REFCOUNT_V1: clone /
+    /// (`List.ownElement`) and deep-release (`releaseAndPoisonEagerChildren`)
+    /// consult under no-REFCOUNT_V1: clone /
     /// deep-release fire ONLY when an eagerly-freed child is present, leaving
     /// the established no-refcount semantics for scalars, `String` arena
     /// slices, and nested inline-header collections untouched. Always `false`
@@ -5454,7 +5454,7 @@ pub const ArcRuntime = struct {
     ///
     /// Children are released before the parent slot is reused (spec §8.2
     /// ordering). Safe under aliasing because the cloned-on-share extraction
-    /// (`ownElement` / `ownEntryValue`) gives every EXTRACTED owner its own
+    /// (`List.ownElement`) gives every EXTRACTED owner its own
     /// independent inner — nulling the container's slot never dangles an
     /// extracted value.
     pub fn releaseAndPoisonEagerChildren(comptime T: type, allocator: std.mem.Allocator, slot: *T) void {
