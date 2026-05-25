@@ -8572,10 +8572,34 @@ pub const TypeChecker = struct {
     /// non-`fn` field type resolves normally. Mirrors
     /// `HirBuilder.resolveStructFieldType`.
     fn resolveFieldTypeExpr(self: *TypeChecker, type_expr: *const ast.TypeExpr) anyerror!TypeId {
-        if (type_expr.* == .function) {
-            return self.callableConstraintFromFnTypeExpr(type_expr.function);
-        }
-        return self.resolveTypeExpr(type_expr);
+        const resolved = try self.resolveTypeExpr(type_expr);
+        // Redirect on the RESOLVED type, not the syntactic form, so a
+        // `fn(A) -> R` reached through a `type Adder = fn(A) -> R` alias is
+        // boxed identically to the inline `fn(A) -> R` — preserving the
+        // alias/inline same-TypeId invariant.
+        return self.callableConstraintFromFunctionTypeId(resolved);
+    }
+
+    /// If `type_id` resolved to a bare `fn(A...) -> R` `function` type, return
+    /// the equivalent boxed `Callable({A...}, R)` `protocol_constraint`
+    /// TypeId; otherwise return `type_id` unchanged. Used by field/element
+    /// resolution so a first-class-closure-typed position is the boxed
+    /// existential regardless of whether the `fn` type was written inline or
+    /// reached through a `type` alias.
+    fn callableConstraintFromFunctionTypeId(self: *TypeChecker, type_id: TypeId) !TypeId {
+        const typ = self.store.getType(type_id);
+        if (typ != .function) return type_id;
+        const ft = typ.function;
+        const args_tuple = try self.store.addType(.{ .tuple = .{ .elements = try self.allocator.dupe(TypeId, ft.params) } });
+        const interner_mut: *ast.StringInterner = @constCast(self.interner);
+        const callable_name = try interner_mut.intern("Callable");
+        const type_params = try self.allocator.alloc(TypeId, 2);
+        type_params[0] = args_tuple;
+        type_params[1] = ft.return_type;
+        return try self.store.addType(.{ .protocol_constraint = .{
+            .protocol_name = callable_name,
+            .type_params = type_params,
+        } });
     }
 
     /// Build the `Callable({params}, ret)` `protocol_constraint` TypeId
@@ -14244,6 +14268,15 @@ test "function-type alias resolves to the same TypeId as the inline form" {
     // it would fork monomorphization specializations. `addType`'s
     // structural dedup guarantees identical `Type` values share one id;
     // this test proves the alias body resolves to that same `Type`.
+    //
+    // FCC Phase 3 (the unified Callable model): a `fn(A) -> R`-typed STRUCT
+    // FIELD resolves to the boxed `Callable({A}, R)` existential
+    // (`protocol_constraint`), not a bare `.function`, because a first-class
+    // closure stored in a field must outlive the constructing frame. Both the
+    // alias and the inline form must still resolve to the SAME `Callable`
+    // TypeId (the invariant this test guards) — `resolveFieldTypeExpr` applies
+    // the identical `fn -> Callable` redirect to both, and `addType` dedups
+    // the structurally-identical constraint.
     const source =
         \\type Adder = fn(i64) -> i64
         \\pub struct Holder {
@@ -14275,7 +14308,11 @@ test "function-type alias resolves to the same TypeId as the inline form" {
 
     const aliased_type = fieldTypeIdByName(&checker, parser.interner, "Holder", "aliased").?;
     const inline_type = fieldTypeIdByName(&checker, parser.interner, "Holder", "inline_form").?;
-    try std.testing.expect(checker.store.getType(aliased_type) == .function);
+    // FCC Phase 3: a `fn`-typed field resolves to the boxed `Callable`
+    // existential. Both forms must be the SAME `Callable` constraint TypeId.
+    const aliased = checker.store.getType(aliased_type);
+    try std.testing.expect(aliased == .protocol_constraint);
+    try std.testing.expectEqualStrings("Callable", parser.interner.get(aliased.protocol_constraint.protocol_name));
     try std.testing.expectEqual(inline_type, aliased_type);
 }
 
