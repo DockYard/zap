@@ -7527,6 +7527,56 @@ pub const HirBuilder = struct {
         return expected;
     }
 
+    /// True iff `type_id` is a `Callable(args, result)` existential.
+    fn isCallableType(self: *const HirBuilder, type_id: types_mod.TypeId) bool {
+        if (type_id == types_mod.TypeStore.UNKNOWN) return false;
+        if (type_id >= self.type_store.types.items.len) return false;
+        const typ = self.type_store.getType(type_id);
+        if (typ != .protocol_constraint) return false;
+        return std.mem.eql(u8, self.interner.get(typ.protocol_constraint.protocol_name), "Callable");
+    }
+
+    /// If `callee` is a container element accessor whose container's
+    /// resolved type has a `Callable` element — e.g. `List.get(ops, i)`,
+    /// `List.at(ops, i)`, `List.head(ops)`, `List.last(ops)` where
+    /// `ops : List(Callable(...))` — return that `Callable` element type.
+    /// Otherwise null.
+    ///
+    /// This recovers the boxed-closure element type for an indexed-call
+    /// (`List.get(ops, i)(v)`) when the accessor's own return-type
+    /// substitution came back unresolved in the staged project pipeline
+    /// (its `t -> Callable` binding does not always survive the
+    /// scope/struct boundary, unlike the bound-local form whose binding
+    /// type the type-checker records directly). The element type read here
+    /// is exact (the container's resolved element), never a heuristic.
+    fn callableTypeFromContainerAccessor(self: *HirBuilder, callee: *const ast.Expr) ?types_mod.TypeId {
+        if (callee.* != .call) return null;
+        const accessor = callee.call;
+        // The accessor must be a `List.<method>` field access on a struct.
+        if (accessor.callee.* != .field_access) return null;
+        const fa = accessor.callee.field_access;
+        if (fa.object.* != .struct_ref) return null;
+        const obj_parts = fa.object.struct_ref.name.parts;
+        if (obj_parts.len != 1) return null;
+        if (!std.mem.eql(u8, self.interner.get(obj_parts[0]), "List")) return null;
+        const method = self.interner.get(fa.field);
+        const returns_element = std.mem.eql(u8, method, "get") or
+            std.mem.eql(u8, method, "at") or
+            std.mem.eql(u8, method, "head") or
+            std.mem.eql(u8, method, "first") or
+            std.mem.eql(u8, method, "last");
+        if (!returns_element) return null;
+        if (accessor.args.len == 0) return null;
+        // The first argument is the container; resolve its element type.
+        const container = self.buildExpr(accessor.args[0]) catch return null;
+        if (container.type_id == types_mod.TypeStore.UNKNOWN) return null;
+        if (container.type_id >= self.type_store.types.items.len) return null;
+        const container_typ = self.type_store.getType(container.type_id);
+        if (container_typ != .list) return null;
+        if (self.isCallableType(container_typ.list.element)) return container_typ.list.element;
+        return null;
+    }
+
     /// True iff `type_id` is, or structurally contains, a `Callable`
     /// `protocol_constraint` existential. Walks list/map/tuple/function/
     /// applied compounds. Used to scope the container-return `Callable`
@@ -7630,19 +7680,33 @@ pub const HirBuilder = struct {
     /// dispatched call.
     fn buildCallableNonVarRefCall(self: *HirBuilder, call: *const ast.CallExpr) anyerror!?*const Expr {
         // A `var_ref` callee is the `rewriteCallableValueCall` path; a
-        // dotted call (`Mod.f(...)`) is a static function/struct-method
-        // call, never a first-class closure value. Only an expression that
-        // computes a value — a `.call` (e.g. `List.get(...)`) or a
-        // `.field_access` reading a closure-typed field — can be a boxed
-        // `Callable` callee here.
-        switch (call.callee.*) {
-            .call, .field_access => {},
-            else => return null,
-        }
+        // dotted call (`Mod.f(...)`) and a method call (`recv.method(...)`,
+        // a `.field_access` callee) are static dispatch, never a first-class
+        // closure value. The only NON-`var_ref` callee that yields a boxed
+        // `Callable` is an indexed/accessor CALL whose result is itself
+        // invoked — `List.get(ops, i)(v)`, a `.call` callee. A closure
+        // stored in a struct field is read into a local first
+        // (`f = recv.handler; f(v)`), covered by the `var_ref` path. Gating
+        // on `.call` here also avoids speculatively building every
+        // `recv.method(...)` callee just to test Callable-ness.
+        if (call.callee.* != .call) return null;
 
         // Build the callee once so we can read its resolved type and bind it.
         const built_callee = try self.buildExpr(call.callee);
-        const callee_type_id = built_callee.type_id;
+        // The built callee's `type_id` is the primary signal. But a boxed
+        // `Callable` read out of a container can come back UNKNOWN in the
+        // project/staged pipeline when the container element type isn't
+        // propagated into the accessor's return-type substitution across a
+        // scope/struct boundary (the script pipeline resolves it directly).
+        // Fall back to re-deriving the element type from the container
+        // accessor's first argument so the indexed-call form
+        // (`List.get(ops, i)(v)`) dispatches through the box in BOTH modes,
+        // exactly like the bound-local form `f = List.get(ops, i); f(v)`.
+        const callee_type_id: types_mod.TypeId = blk: {
+            if (self.isCallableType(built_callee.type_id)) break :blk built_callee.type_id;
+            if (self.callableTypeFromContainerAccessor(call.callee)) |t| break :blk t;
+            break :blk built_callee.type_id;
+        };
         if (callee_type_id == types_mod.TypeStore.UNKNOWN) return null;
         if (callee_type_id >= self.type_store.types.items.len) return null;
         const callee_type = self.type_store.getType(callee_type_id);
@@ -7660,7 +7724,15 @@ pub const HirBuilder = struct {
         const recv_name_id = try interner_mut.intern(recv_name_text);
 
         // `__callable_recv_N = <callee>` — single evaluation of the callee.
-        const recv_set: Stmt = .{ .local_set = .{ .index = recv_local, .value = built_callee, .name = recv_name_id } };
+        // Re-stamp the built callee with the resolved `Callable` type so the
+        // bound local carries it (the original build may have left it
+        // UNKNOWN in the staged pipeline; see the re-derivation above).
+        const typed_callee = try self.create(Expr, .{
+            .kind = built_callee.kind,
+            .type_id = callee_type_id,
+            .span = built_callee.span,
+        });
+        const recv_set: Stmt = .{ .local_set = .{ .index = recv_local, .value = typed_callee, .name = recv_name_id } };
 
         // Make the receiver resolvable as a `Callable`-typed binding for the
         // duration of the inner-call build, then restore so it does not leak.
@@ -7682,13 +7754,36 @@ pub const HirBuilder = struct {
         });
         const inner_call = try self.buildExpr(inner_call_ast);
 
+        // The block's value type is the `Callable`'s `result` type
+        // argument (`type_params[1]`). The boxed-dispatch implicit call
+        // (`Callable.call(recv, {args})`) does not always resolve a
+        // concrete `result` into `inner_call.type_id` (it can stay
+        // UNKNOWN), and a block whose `result_type` is UNKNOWN leaves the
+        // bound value untyped — under project-mode emission that surfaces
+        // as `?T`/null at a downstream comparison (`x == 11` →
+        // "comparison of comptime_int with null"). Stamping the concrete
+        // `result` here (available directly from the callee's existential
+        // type args) types the block, the bound local, and every later
+        // reference correctly. Falls back to the inner call's own type
+        // only when the existential carries no `result` arg.
+        const callable_result: types_mod.TypeId = blk: {
+            const tp = callee_type.protocol_constraint.type_params;
+            if (tp.len >= 2 and tp[1] != types_mod.TypeStore.UNKNOWN) break :blk tp[1];
+            break :blk inner_call.type_id;
+        };
+        const typed_inner = try self.create(Expr, .{
+            .kind = inner_call.kind,
+            .type_id = callable_result,
+            .span = inner_call.span,
+        });
+
         const stmts = try self.allocator.alloc(Stmt, 2);
         stmts[0] = recv_set;
-        stmts[1] = .{ .expr = inner_call };
-        const block = try self.create(Block, .{ .stmts = stmts, .result_type = inner_call.type_id });
+        stmts[1] = .{ .expr = typed_inner };
+        const block = try self.create(Block, .{ .stmts = stmts, .result_type = callable_result });
         return try self.create(Expr, .{
             .kind = .{ .block = block.* },
-            .type_id = inner_call.type_id,
+            .type_id = callable_result,
             .span = span,
         });
     }

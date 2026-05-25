@@ -4900,10 +4900,15 @@ fn expandAndDesugarTopLevelProgram(
     if (diag_engine.errorCount() > error_baseline) return error.MacroExpansionFailed;
 
     var desugarer = zap.Desugarer.init(alloc, interner, &collector.graph);
-    return desugarer.desugarProgram(&expanded) catch {
+    const desugared = desugarer.desugarProgram(&expanded) catch {
         diag_engine.err("Error during top-level desugaring", .{ .start = 0, .end = 0 }) catch {};
         return error.DesugarFailed;
     };
+    // A closure literal at the top level (a script `main/1` body) also
+    // synthesizes `__closure_N` structs; register them so the top-level
+    // program's own type-check + IR can resolve them in project mode.
+    try registerSynthesizedClosureTypes(collector, &desugared);
+    return desugared;
 }
 
 fn expandAndDesugarStagedStruct(
@@ -4958,6 +4963,12 @@ fn expandAndDesugarStagedStruct(
         diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch {};
         return error.DesugarFailed;
     };
+    // Register the closure structs the desugar synthesized (`__closure_N` +
+    // their `impl Callable`) as nominal types in the shared graph BEFORE
+    // this struct (and every later one in the staged order) is type-checked
+    // against it. Without this the per-struct type-check fails to resolve
+    // `__closure_N` in project mode (see `registerSynthesizedClosureTypes`).
+    try registerSynthesizedClosureTypes(collector, &desugared);
     try reCollectFunctionsInProgram(collector, &desugared);
     try updateImplDeclsInProgram(collector, &desugared);
     try expandGraphImplsForProgram(alloc, &desugared, interner, collector, diag_engine, compiled_executor);
@@ -5342,6 +5353,85 @@ fn reCollectFunctionsInProgram(collector: *zap.Collector, program: *const ast.Pr
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.CollectFailed,
     };
+}
+
+/// Register the closure structs synthesized by the closure-literal desugar
+/// (`__closure_N` + their `impl Callable`) into the shared scope graph so
+/// they are first-class nominal TYPES.
+///
+/// A capturing closure literal in an escaping/collection position is
+/// rewritten by `Desugarer.desugarEscapingClosure` (which runs as part of
+/// the FULL `desugarProgram`, AFTER the initial collect) into a fresh
+/// `struct __closure_N { <captures> }` + `pub impl Callable({...}, R) for
+/// __closure_N`. Unlike `pub error` — whose desugar runs PRE-collect via
+/// `applyErrorDeclDesugar`, so its structs are in `graph.types` before any
+/// type-check — these closure structs appear only in the post-desugar AST.
+/// In the STAGED project/daemon pipeline each struct is type-checked
+/// against the FIRST `collector.graph` right after its desugar; without
+/// registering the synthesized structs there, a cross-struct reference to a
+/// closure type (e.g. one struct returning a `Callable` built by another,
+/// or simply the IR resolving `__closure_N`) fails with "I cannot find a
+/// type named `__closure_N`". This mirrors how the `pub error` structs are
+/// registered, restoring script/project parity for boxed closures.
+///
+/// Idempotent: a `__closure_N` already registered (the same struct
+/// re-desugared in the staged + "extra" loops) is skipped. The unique
+/// program-wide counter guarantees names never collide across structs.
+fn registerSynthesizedClosureTypes(collector: *zap.Collector, program: *const ast.Program) CompileError!void {
+    var new_structs: std.ArrayList(ast.StructDecl) = .empty;
+    for (program.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        const name = collector.interner.get(mod.name.parts[0]);
+        if (!std.mem.startsWith(u8, name, "__closure_")) continue;
+        if (closureStructAlreadyRegistered(collector, mod.name)) continue;
+        new_structs.append(collector.allocator, mod) catch return error.OutOfMemory;
+    }
+    if (new_structs.items.len == 0) return;
+
+    // Collect the synthesized structs together with their `impl Callable`
+    // top-items so both the nominal type and its protocol conformance land
+    // in the shared graph. `collectProgramSurface` registers struct types
+    // (and scopes) for `program.structs` and impls for `program.top_items`.
+    var closure_impls: std.ArrayList(ast.TopItem) = .empty;
+    for (program.top_items) |item| {
+        const impl = switch (item) {
+            .impl_decl => |id| id,
+            .priv_impl_decl => |id| id,
+            else => continue,
+        };
+        if (impl.target_type.parts.len != 1) continue;
+        const target = collector.interner.get(impl.target_type.parts[0]);
+        if (!std.mem.startsWith(u8, target, "__closure_")) continue;
+        closure_impls.append(collector.allocator, item) catch return error.OutOfMemory;
+    }
+
+    const closure_program = ast.Program{
+        .structs = new_structs.items,
+        .top_items = closure_impls.items,
+    };
+    collector.collectProgramSurface(&closure_program) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CollectFailed,
+    };
+    collector.registerImplFunctionsInTargetScopes() catch return error.OutOfMemory;
+}
+
+/// True iff a `__closure_N` struct with this name is already registered in
+/// the scope graph (so re-running the closure-type registration over a
+/// struct desugared more than once does not double-register).
+fn closureStructAlreadyRegistered(collector: *const zap.Collector, name: ast.StructName) bool {
+    for (collector.graph.structs.items) |existing| {
+        if (existing.name.parts.len != name.parts.len) continue;
+        var all_equal = true;
+        for (existing.name.parts, name.parts) |a, b| {
+            if (a != b) {
+                all_equal = false;
+                break;
+            }
+        }
+        if (all_equal) return true;
+    }
+    return false;
 }
 
 fn updateImplDeclsInProgram(collector: *zap.Collector, program: *const ast.Program) CompileError!void {
