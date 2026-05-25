@@ -2909,18 +2909,16 @@ pub fn isArcManagedTypeId(type_store: *const types_mod.TypeStore, type_id: types
         // `.kind = .protocol_box_drop` so the ZIR backend lowers it
         // through `drop(box)` instead of `releaseAny(box)`.
         //
-        // Parametric protocol constraints (`Enumerable(t)`,
-        // `Iterator(K, V)`) are deliberately EXCLUDED: their
-        // per-protocol vtable + per-impl adapter codegen is still
-        // gated off in `populateProtocolVTables`
-        // (`if (proto_entry.decl.type_params.len != 0) continue;`),
-        // so no `<Protocol>VTable.drop` helper exists for them. The
-        // existing HIR `protocolDispatchStruct` rewrite folds parametric
-        // protocol calls to concrete-impl calls before IR sees them, so
-        // their receivers never actually flow through a `ProtocolBox`
-        // value — classifying them as ARC-managed would be a
-        // diagnostic-only no-op at best and trip the V11 verifier on
-        // share_value of trivial-classified arguments at worst.
+        // A BARE protocol constraint (`Error`) is an owning box. A
+        // PARAMETRIC protocol constraint is NOT blanket-owning here: a
+        // devirtualized parametric protocol (`Enumerable(element)`) keeps
+        // its `protocol_constraint` PARAM type but never materialises a
+        // box, and classifying it ARC-managed trips the V11 verifier on
+        // `Enum.sum`'s share_value. A BOXED parametric existential
+        // (`Callable`) is instead classified owning at the box-dest LOCAL
+        // via its `.protocol_box` ZigType (see `isArcManagedBoxLocal` /
+        // the box-dest stamping in `maybeBoxAsProtocol`), not via this
+        // type-level predicate.
         .protocol_constraint => |pc| pc.type_params.len == 0,
         // A plain struct VALUE is ARC-managed when it either uses
         // recursive boxing (self-referential trees, heap-promoted via the
@@ -2969,6 +2967,8 @@ fn isArcManagedTypeIdDepth(
     if (depth > type_store.types.items.len) return false;
     return switch (type_store.getType(type_id)) {
         .opaque_type, .map, .list => true,
+        // Bare protocol constraint only (see the depth-0 entry); a boxed
+        // parametric `Callable` is owned at the box-dest local level.
         .protocol_constraint => |pc| pc.type_params.len == 0,
         .struct_type => structTypeUsesRecursiveBoxing(type_store, type_id) or
             structTypeHasArcManagedField(type_store, type_id, depth + 1),
