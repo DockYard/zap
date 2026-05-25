@@ -636,7 +636,22 @@ const MonomorphContext = struct {
         // their arguments. Use those when the expression itself is still
         // `any`/UNKNOWN. This is what lets recursive protocol helpers keep
         // the concrete state type returned by a protocol impl.
-        if (!self.isConcreteRuntimeType(arg_type) and self.isConcreteRuntimeType(arg.expected_type)) {
+        //
+        // FCC unified model: a boxed `Callable({A}, R)` argument (a
+        // `protocol_constraint`) is NOT `isConcreteRuntimeType` by the narrow
+        // predicate, but it IS a fully-defined runtime value — a `ProtocolBox`
+        // existential. It must NOT be overwritten by the parameter's
+        // `expected_type` (a `fn(A) -> R` function type, possibly carrying the
+        // higher-order `effect_var`): doing so would erase the boxed-ness and
+        // make the argument's type identical to the param's, so `unify`
+        // short-circuits on type identity and never binds the `effect_var` —
+        // leaving the higher-order callee unspecialized (the call site then
+        // references a dropped generic group). The boxed existential's own
+        // type is the truth; keep it.
+        if (!self.isConcreteRuntimeType(arg_type) and
+            self.store.getType(arg_type) != .protocol_constraint and
+            self.isConcreteRuntimeType(arg.expected_type))
+        {
             arg_type = arg.expected_type;
         }
 
@@ -1468,6 +1483,30 @@ const MonomorphContext = struct {
         };
     }
 
+    /// FCC unified model: if `param_type` is a higher-order `fn(A) -> R`
+    /// (`function`) whose polymorphic `effect_var` (#201) was bound by `subs`
+    /// to a `Callable({A}, R)` existential, return that `Callable` constraint
+    /// — the boxed representation this specialization receives. Otherwise
+    /// return `param_type` unchanged. A higher-order param invoked with an
+    /// INLINE/non-escaping closure binds its effect_var to a concrete
+    /// `function` type (not a `Callable`), so this leaves the zero-overhead
+    /// direct path's param a `function` (no boxing) — the #201 no-regression
+    /// invariant. Only a boxed-`Callable` argument re-stamps the param.
+    fn boxedCallableRepresentationForParam(
+        self: *const MonomorphContext,
+        param_type: TypeId,
+        subs: *const SubstitutionMap,
+    ) TypeId {
+        const typ = self.store.getType(param_type);
+        if (typ != .function) return param_type;
+        const effect_var = typ.function.effect_var orelse return param_type;
+        const resolved_effect = subs.applyToType(self.store, effect_var);
+        const resolved_typ = self.store.getType(resolved_effect);
+        if (resolved_typ != .protocol_constraint) return param_type;
+        if (!std.mem.eql(u8, self.interner.get(resolved_typ.protocol_constraint.protocol_name), "Callable")) return param_type;
+        return resolved_effect;
+    }
+
     fn cloneGroupWithSubs(
         self: *MonomorphContext,
         group: *const hir.FunctionGroup,
@@ -1492,12 +1531,26 @@ const MonomorphContext = struct {
             var new_params = try self.allocator.alloc(hir.TypedParam, clause.params.len);
             for (clause.params, 0..) |param, i| {
                 const protocol_param_type = if (i < protocol_param_types.len) protocol_param_types[i] else types_mod.TypeStore.UNKNOWN;
+                const substituted_param_type = if (protocol_param_type != types_mod.TypeStore.UNKNOWN)
+                    protocol_param_type
+                else
+                    try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, param.type_id));
                 new_params[i] = .{
                     .name = param.name,
-                    .type_id = if (protocol_param_type != types_mod.TypeStore.UNKNOWN)
-                        protocol_param_type
-                    else
-                        try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, param.type_id)),
+                    // FCC unified model: a higher-order parameter whose declared
+                    // `fn(A) -> R` type carries a polymorphic `effect_var` (#201)
+                    // that `subs` bound to a `Callable({A}, R)` existential is
+                    // receiving a BOXED closure argument in THIS specialization.
+                    // Its runtime representation must be the boxed `Callable`
+                    // (`protocol_box`), so the body's `f(v)` call dispatches
+                    // through the box `call` slot (`protocol_dispatch`) rather
+                    // than a direct `call_ref` on a function pointer. Re-stamp
+                    // the param to that `Callable` constraint. This is also what
+                    // makes the clone non-generic: leaving the `function` type
+                    // with an effect_var that still mentions the (now-bound)
+                    // type variable would make `isGenericGroup` re-classify the
+                    // clone as generic and drop it.
+                    .type_id = self.boxedCallableRepresentationForParam(substituted_param_type, subs),
                     .ownership = param.ownership,
                     .pattern = param.pattern,
                     .default = if (param.default) |d| try self.cloneExpr(d) else null,

@@ -10756,6 +10756,93 @@ pub const IrBuilder = struct {
     /// `receiver_type_id`'s `protocol_constraint` type arguments first, so
     /// `Callable.call`'s `result` return resolves to the instantiation's
     /// concrete return type (`i64`) rather than a formal type-var.
+    /// FCC unified model: lower an implicit closure call `f(args...)` whose
+    /// callee is a boxed `Callable({A...}, R)` existential to a
+    /// `protocol_dispatch` through the box vtable `call` slot. The `Callable`
+    /// protocol's `call(self, arguments :: args)` takes the arguments packed
+    /// into the `args` brace-tuple, so the lowered call-argument locals are
+    /// first packed into a `tuple_init` and that single tuple is the dispatch
+    /// argument. Returns `true` when it handled the call (callee is a boxed
+    /// `Callable`); `false` to leave the non-boxed closure callee on the
+    /// `call_closure` direct/devirtualized path (the #201 / Gap E invariant).
+    fn lowerBoxedCallableInvocation(
+        self: *IrBuilder,
+        dest: LocalId,
+        callee: *const hir_mod.Expr,
+        callee_local: LocalId,
+        arg_locals: []const LocalId,
+    ) !bool {
+        // The callee's representation: prefer the tracked ZigType (the
+        // monomorphizer-restamped `Callable` param flows here), fall back to
+        // the HIR type. Only a `.protocol_box` whose family is `Callable`
+        // routes through the box vtable.
+        const callee_zig = self.known_local_types.get(callee_local) orelse
+            typeIdToZigTypeWithStore(callee.type_id, self.type_store);
+        if (callee_zig != .protocol_box) return false;
+        const box_name = callee_zig.protocol_box;
+        const base_protocol = self.baseProtocolName(box_name);
+        if (!std.mem.eql(u8, base_protocol, "Callable")) return false;
+
+        // Resolve the `Callable` existential TypeId so the method slot's
+        // parametric return type (`result`) and the `args` tuple type resolve
+        // concretely. Prefer the HIR type when it is the `Callable` constraint.
+        const store = self.type_store orelse return false;
+        const callable_type_id: hir_mod.TypeId = blk: {
+            const ht = self.local_hir_types.get(callee_local) orelse callee.type_id;
+            if (ht < store.types.items.len and store.getType(ht) == .protocol_constraint) break :blk ht;
+            break :blk callee.type_id;
+        };
+        const callable_type = store.getType(callable_type_id);
+        if (callable_type != .protocol_constraint) return false;
+        const type_params = callable_type.protocol_constraint.type_params;
+        if (type_params.len < 2) return false;
+        const args_tuple_type_id = type_params[0];
+
+        const slot = self.findProtocolMethodSlotForReceiver("Callable", "call", callable_type_id) orelse return false;
+
+        // Pack the call arguments into the `args` tuple. A zero-arg closure
+        // packs the canonical empty tuple `{}` (a zero-element `tuple_init`).
+        const tuple_local = self.next_local;
+        self.next_local += 1;
+        const tuple_elements = try self.allocator.dupe(LocalId, arg_locals);
+        const tuple_zig = typeIdToZigTypeWithStore(args_tuple_type_id, self.type_store);
+        const component_types: ?[]const ZigType = if (tuple_zig == .tuple and tuple_zig.tuple.len == arg_locals.len)
+            try self.allocator.dupe(ZigType, tuple_zig.tuple)
+        else
+            null;
+        try self.current_instrs.append(self.allocator, .{
+            .tuple_init = .{ .dest = tuple_local, .elements = tuple_elements, .component_types = component_types },
+        });
+        try self.known_local_types.put(tuple_local, tuple_zig);
+        try self.local_hir_types.put(tuple_local, args_tuple_type_id);
+
+        // Dispatch `Callable.call(receiver, args_tuple)` through the box
+        // vtable. The dispatcher takes the receiver by value plus the single
+        // packed tuple argument; it unwraps `box.data_ptr` internally.
+        const dispatch_args = try self.allocator.alloc(LocalId, 1);
+        dispatch_args[0] = tuple_local;
+        const dispatch_modes = try self.allocator.alloc(ValueMode, 1);
+        dispatch_modes[0] = .share;
+        try self.current_instrs.append(self.allocator, .{
+            .protocol_dispatch = .{
+                .dest = dest,
+                .receiver = callee_local,
+                .protocol_name = try cloneBytes(self.allocator, box_name),
+                .method_name = try cloneBytes(self.allocator, "call"),
+                .method_index = slot.method_index,
+                .arity = slot.arity,
+                .args = dispatch_args,
+                .arg_modes = dispatch_modes,
+                .return_type = slot.return_type,
+            },
+        });
+        if (slot.return_type != .any and slot.return_type != .void) {
+            try self.known_local_types.put(dest, slot.return_type);
+        }
+        try self.trackCallResultType(dest, type_params[1]);
+        return true;
+    }
+
     fn findProtocolMethodSlotForReceiver(
         self: *IrBuilder,
         protocol_name_text: []const u8,
@@ -12482,6 +12569,24 @@ pub const IrBuilder = struct {
                     },
                     .closure => |callee| {
                         const callee_local = try self.lowerExpr(callee);
+
+                        // FCC unified model — boxed `Callable` invocation. When
+                        // the callee's representation is a `.protocol_box`
+                        // whose family is `Callable` (a higher-order parameter
+                        // that the monomorphizer re-stamped to the boxed
+                        // existential for a boxed-closure argument, or any
+                        // value typed as a boxed `Callable`), the call must
+                        // dispatch through the box vtable `call` slot — NOT a
+                        // direct `call_ref` / `callCallableN` on a function
+                        // pointer (which rejects a `ProtocolBox`). This is the
+                        // codegen collapse: representation is `protocol_box` →
+                        // `protocol_dispatch`. The non-boxed closure callee
+                        // (the #201 direct path / Gap E bare-fn-ptr) falls
+                        // through to `call_closure` below, unchanged.
+                        if (try self.lowerBoxedCallableInvocation(dest, callee, callee_local, args.items)) {
+                            return dest;
+                        }
+
                         const lowered_args = try args.toOwnedSlice(self.allocator);
                         const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
                         const return_type = self.closureReturnType(expr.type_id, callee_local);

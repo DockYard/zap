@@ -762,12 +762,64 @@ pub const TypeStore = struct {
         return null;
     }
 
+    /// If `type_id` is a `Callable(args, result)` `protocol_constraint`,
+    /// return its `{args_tuple, result}` type-argument pair. The FCC unified
+    /// `Callable` model represents a `fn(A) -> R` value's canonical type as
+    /// `Callable({A}, R)`, so the type checker must see the two forms as
+    /// equivalent regardless of which representation (devirtualized
+    /// `ZigType.function` vs boxed `ZigType.protocol_box`) the value takes.
+    /// `type_params[0]` is the arguments tuple, `type_params[1]` the result.
+    /// Returns null for any non-`Callable` type.
+    fn callableArgsAndResult(self: *const TypeStore, type_id: TypeId) ?struct { args_tuple: TypeId, result: TypeId } {
+        const t = self.getType(type_id);
+        if (t != .protocol_constraint) return null;
+        const pc = t.protocol_constraint;
+        if (!std.mem.eql(u8, self.interner.get(pc.protocol_name), "Callable")) return null;
+        if (pc.type_params.len < 2) return null;
+        return .{ .args_tuple = pc.type_params[0], .result = pc.type_params[1] };
+    }
+
+    /// Structural equivalence between a `fn(A...) -> R` `FunctionType` and a
+    /// `Callable({A...}, R)` `protocol_constraint` — the core claim of the
+    /// FCC unified model: these are the SAME type, differing only in
+    /// representation (direct-call vs boxed existential). The function's
+    /// parameter list must match the `Callable` `args` tuple element-for-
+    /// element, and the function's return type must match the `Callable`
+    /// `result`. Symmetric: either `a` or `b` may be the function side. The
+    /// closure-effect (`raises`/`effect_var`) rides on the function type and
+    /// does NOT participate in this equivalence — boxing erases the concrete
+    /// impl, so a `Callable`-typed slot accepts a raising closure whether or
+    /// not the written `fn` type annotated an effect (effect inference is
+    /// Phase 4). Returns false when neither side is a `Callable` constraint
+    /// or the shapes diverge.
+    pub fn functionCallableEquiv(self: *const TypeStore, a: TypeId, b: TypeId) bool {
+        const ta = self.getType(a);
+        const tb = self.getType(b);
+        const fn_type: Type.FunctionType, const callable_id: TypeId = blk: {
+            if (ta == .function and tb == .protocol_constraint) break :blk .{ ta.function, b };
+            if (tb == .function and ta == .protocol_constraint) break :blk .{ tb.function, a };
+            return false;
+        };
+        const callable = self.callableArgsAndResult(callable_id) orelse return false;
+        const args_tuple = self.getType(callable.args_tuple);
+        if (args_tuple != .tuple) return false;
+        if (fn_type.params.len != args_tuple.tuple.elements.len) return false;
+        for (fn_type.params, args_tuple.tuple.elements) |fn_param, tuple_element| {
+            if (!self.typeEquals(fn_param, tuple_element)) return false;
+        }
+        return self.typeEquals(fn_type.return_type, callable.result);
+    }
+
     /// Score a call argument against an expected parameter type.
     /// Exact compatibility is 0; widening fallback is 1 + bit delta; null
     /// means the argument cannot satisfy the parameter.
     pub fn callMatchCost(self: *const TypeStore, actual: TypeId, expected: TypeId) ?u32 {
         if (expected == UNKNOWN or actual == UNKNOWN or actual == ERROR) return 0;
         if (self.typeEquals(actual, expected)) return 0;
+        // FCC unified model: a `fn(A) -> R` value and a `Callable({A}, R)`
+        // existential are the same type in two representations. Accept the
+        // argument when the function/`Callable` shapes are equivalent.
+        if (self.functionCallableEquiv(actual, expected)) return 0;
         if (self.wideningCost(actual, expected)) |cost| return cost + 1;
         return null;
     }
@@ -952,6 +1004,25 @@ pub const TypeStore = struct {
             return true;
         }
 
+        // FCC unified model: a `fn(A) -> R` `FunctionType` and a
+        // `Callable({A}, R)` `protocol_constraint` are the SAME type in two
+        // representations. When one side is a function and the other a
+        // `Callable` constraint, decompose the constraint into its function
+        // shape and unify STRUCTURALLY — binding the higher-order parameter's
+        // polymorphic `effect_var` (#201) so the monomorphizer still forms a
+        // specialization key for a boxed-`Callable` argument flowing into a
+        // `fn`-typed parameter (THE CRUX). Without this, the blanket
+        // protocol-constraint accept below short-circuits before the
+        // effect_var binds, leaving `subs` empty and the callee unspecialized
+        // (so the call site references a dropped generic group). Must run
+        // BEFORE the generic protocol-constraint accept.
+        if (type_a == .function and type_b == .protocol_constraint) {
+            if (try self.unifyFunctionWithCallable(type_a.function, b, subs)) |ok| return ok;
+        }
+        if (type_b == .function and type_a == .protocol_constraint) {
+            if (try self.unifyFunctionWithCallable(type_b.function, a, subs)) |ok| return ok;
+        }
+
         // Protocol constraints accept any type — dispatch verified at monomorphization
         if (type_a == .protocol_constraint or type_b == .protocol_constraint) return true;
 
@@ -1057,6 +1128,46 @@ pub const TypeStore = struct {
 
         // Incompatible types
         return false;
+    }
+
+    /// Unify a `fn(A...) -> R` `FunctionType` against a `Callable` constraint
+    /// TypeId. Returns null when `callable_id` is not actually a `Callable`
+    /// constraint (so `unify` falls through to its generic protocol-constraint
+    /// accept). Otherwise unifies the function's parameters against the
+    /// `Callable` `args` tuple element-for-element, the function's return
+    /// against the `Callable` `result`, and binds the function's higher-order
+    /// `effect_var` (#201) to the `Callable` constraint TypeId — the same
+    /// rule as the function↔function arm when only one side carries an
+    /// effect_var. This is what makes the monomorphizer specialize a
+    /// higher-order callee for a boxed-`Callable` argument.
+    fn unifyFunctionWithCallable(
+        self: *const TypeStore,
+        fn_type: Type.FunctionType,
+        callable_id: TypeId,
+        subs: *SubstitutionMap,
+    ) error{OutOfMemory}!?bool {
+        const callable = self.callableArgsAndResult(callable_id) orelse return null;
+        const args_tuple = self.getType(callable.args_tuple);
+        if (args_tuple != .tuple) return false;
+        if (fn_type.params.len != args_tuple.tuple.elements.len) return false;
+        // Unify the function's parameters against the `Callable` `args` tuple
+        // elements and the return against the `Callable` `result`, threading
+        // the caller's subs so any type variables on the function side bind.
+        for (fn_type.params, args_tuple.tuple.elements) |fn_param, tuple_element| {
+            if (!try self.unify(fn_param, tuple_element, subs)) return false;
+        }
+        if (!try self.unify(fn_type.return_type, callable.result, subs)) return false;
+        // Bind the higher-order parameter's polymorphic `effect_var` (#201)
+        // to the `Callable` constraint TypeId. The `Callable` side has no
+        // effect_var (it is a concrete existential value), so this mirrors the
+        // function↔function arm where only one side is effect-polymorphic: the
+        // binding gives the monomorphizer a concrete type-arg so it forms a
+        // specialization key for the boxed-closure argument instead of leaving
+        // the callee unspecialized.
+        if (fn_type.effect_var) |ev| {
+            return try self.unify(ev, callable_id, subs);
+        }
+        return true;
     }
 };
 
@@ -3048,12 +3159,25 @@ pub const TypeChecker = struct {
                 return null;
             }
 
+            // FCC unified model: a `fn(A) -> R` value flowing into a
+            // `Callable({A}, R)`-typed slot (e.g. a bare/non-capturing closure
+            // passed where a boxed `Callable` is expected). The two forms are
+            // the same type; accept when the shapes are equivalent.
+            if (self.store.functionCallableEquiv(actual, expected)) return 0;
+
             if (self.implTargetForProtocolId(expected_type.protocol_constraint.protocol_name, actual) != null) return 0;
             return null;
         }
 
         if (actual_type == .protocol_constraint) {
             if (expected_type == .type_var) return 0;
+            // FCC unified model: a boxed `Callable({A}, R)` value (e.g. the
+            // result of `make_adder(5)`) flowing into a `fn(A) -> R` parameter
+            // — THE CRUX. A `Callable` existential and a `fn(A) -> R`
+            // FunctionType are the same type, so the boxed closure satisfies
+            // the function-typed parameter and is invoked through the box's
+            // `call` slot.
+            if (self.store.functionCallableEquiv(actual, expected)) return 0;
             return null;
         }
 
