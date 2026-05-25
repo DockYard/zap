@@ -3008,6 +3008,30 @@ fn isArcManagedTypeIdDepth(
 /// a struct that OWNS an ARC value by value — chiefly a `ProtocolBox`
 /// reached through an `Option(<protocol>)` field. Depth-guarded against
 /// cyclic type graphs.
+/// True when `type_id` is a parametric `Callable({A...}, R)`
+/// `protocol_constraint` — a BOXED first-class-closure existential that
+/// always materializes a `runtime.ProtocolBox` at runtime. Distinct from the
+/// devirtualized parametric protocol param (`Enumerable(element)`): the
+/// type-level `isArcManagedTypeId` deliberately classifies a parametric
+/// `protocol_constraint` as NOT ARC-managed (boxed-vs-devirtualized is
+/// decided at the construction-site LOCAL via its `.protocol_box` ZigType, so
+/// `Enum.*`'s devirtualized `Enumerable` does not trip V11). But a parametric
+/// `Callable` reached as a STRUCT FIELD / collection element / value position
+/// is unambiguously boxed — there is no devirtualized field representation —
+/// so its owning `ProtocolBox` must be deep-released by the enclosing
+/// aggregate's drop. Keyed precisely on the `Callable` protocol name so it
+/// never matches the devirtualized `Enumerable` param.
+fn protocolConstraintIsBoxedCallable(
+    type_store: *const types_mod.TypeStore,
+    type_id: types_mod.TypeId,
+) bool {
+    if (type_id >= type_store.types.items.len) return false;
+    const typ = type_store.getType(type_id);
+    if (typ != .protocol_constraint) return false;
+    if (typ.protocol_constraint.type_params.len == 0) return false;
+    return std.mem.eql(u8, type_store.interner.get(typ.protocol_constraint.protocol_name), "Callable");
+}
+
 fn structTypeHasArcManagedField(
     type_store: *const types_mod.TypeStore,
     type_id: types_mod.TypeId,
@@ -3019,6 +3043,13 @@ fn structTypeHasArcManagedField(
     const struct_type = type_store.getType(type_id).struct_type;
     for (struct_type.fields) |field| {
         if (isArcManagedTypeIdDepth(type_store, field.type_id, depth + 1)) return true;
+        // FCC unified model: a `fn(A) -> R`-typed field resolves to a boxed
+        // parametric `Callable` existential whose owning `ProtocolBox` must be
+        // deep-released when the enclosing struct drops. The type-level
+        // predicate above intentionally excludes parametric constraints (the
+        // Enumerable-devirtualization V11 contract); a Callable FIELD is
+        // always boxed, so account for it here.
+        if (protocolConstraintIsBoxedCallable(type_store, field.type_id)) return true;
     }
     return false;
 }

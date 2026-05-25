@@ -3718,7 +3718,25 @@ pub const TypeChecker = struct {
             else => return param_type,
         };
         const body = clause.body orelse return param_type;
-        if (!self.closureParamInvokedInBody(body, param_name)) return param_type;
+        // The param becomes representation-polymorphic (gets a fresh
+        // `effect_var`, which makes the function generic so the monomorphizer
+        // specializes it per closure-argument) when the closure param ESCAPES
+        // this function: either it is INVOKED directly in the body (the #201
+        // effect dependency), OR it is CAPTURED into a nested closure that
+        // escapes (the FCC nested-box case — `make_twice(f)` returns
+        // `fn(x){ f(f(x)) }`). In the capture case the param flows into the
+        // returned closure's boxed environment, so its representation must be
+        // the boxed `Callable` (a `ProtocolBox`) for the capture to clone-on-
+        // share / retain correctly; otherwise the param stays `.trivial`, the
+        // capture aliases without cloning, and the captured box is freed early
+        // under a no-refcount manager. `groupInvokesRaisingClosureParam` is
+        // still gated on actual invocation, so a captured-but-not-invoked
+        // closure adds no spurious `raises` to THIS function.
+        if (!self.closureParamInvokedInBody(body, param_name) and
+            !self.closureParamCapturedIntoNestedClosure(body, param_name))
+        {
+            return param_type;
+        }
         const effect_var = try self.store.freshVar();
         return try self.store.addFunctionTypeWithEffect(
             fn_typ.function.params,
@@ -3728,6 +3746,168 @@ pub const TypeChecker = struct {
             false,
             effect_var,
         );
+    }
+
+    /// True when `param_name` is referenced anywhere inside a nested
+    /// `anonymous_function` reachable from `body` — i.e. the closure param is
+    /// CAPTURED into a nested closure (the closure closes over it). Any
+    /// reference inside a nested closure body is a capture (the nested
+    /// closure has its own parameter scope; a same-named inner parameter would
+    /// shadow, but the conservative over-approximation is sound — it only
+    /// promotes the param to the boxed representation, which is always correct
+    /// for a value that may be boxed). Used by
+    /// `makeClosureParamEffectPolymorphic` to make a capturing higher-order
+    /// function representation-polymorphic so a boxed-`Callable` argument is
+    /// captured with correct ARC ownership.
+    fn closureParamCapturedIntoNestedClosure(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) bool {
+        for (body) |stmt| {
+            switch (stmt) {
+                .expr => |expr| if (self.exprCapturesParamIntoNestedClosure(expr, param_name)) return true,
+                .assignment => |assign| if (self.exprCapturesParamIntoNestedClosure(assign.value, param_name)) return true,
+                .attribute => |attr| {
+                    if (attr.value) |value| {
+                        if (self.exprCapturesParamIntoNestedClosure(value, param_name)) return true;
+                    }
+                },
+                .function_decl, .macro_decl, .import_decl => {},
+            }
+        }
+        return false;
+    }
+
+    /// Walk `expr` for a nested `anonymous_function` whose body references
+    /// `param_name`. Recurses through the ordinary sub-expression structure
+    /// to reach nested closures; once inside a closure body, any mention of
+    /// `param_name` counts as a capture (`exprMentionsVar`).
+    fn exprCapturesParamIntoNestedClosure(self: *const TypeChecker, expr: *const ast.Expr, param_name: ast.StringId) bool {
+        switch (expr.*) {
+            .anonymous_function => |anon| {
+                for (anon.decl.clauses) |anon_clause| {
+                    const anon_body = anon_clause.body orelse continue;
+                    for (anon_body) |stmt| {
+                        if (self.stmtMentionsVar(stmt, param_name)) return true;
+                    }
+                }
+                return false;
+            },
+            .call => |call| {
+                if (self.exprCapturesParamIntoNestedClosure(call.callee, param_name)) return true;
+                for (call.args) |arg| {
+                    if (self.exprCapturesParamIntoNestedClosure(arg, param_name)) return true;
+                }
+                return false;
+            },
+            .tuple => |t| {
+                for (t.elements) |elem| if (self.exprCapturesParamIntoNestedClosure(elem, param_name)) return true;
+                return false;
+            },
+            .list => |l| {
+                for (l.elements) |elem| if (self.exprCapturesParamIntoNestedClosure(elem, param_name)) return true;
+                return false;
+            },
+            .struct_expr => |se| {
+                // The closure literal is desugared to a `%__closure_N{cap: cap}`
+                // struct construction BEFORE type-checking, so a captured
+                // enclosing-closure parameter appears here as a field value of
+                // a `__closure_N` env struct. A `param_name` reference as a
+                // closure-env field value IS the capture-into-closure signal.
+                if (se.struct_name.parts.len > 0 and
+                    self.isClosureStructName(se.struct_name.parts[se.struct_name.parts.len - 1]))
+                {
+                    for (se.fields) |field| if (self.exprMentionsVar(field.value, param_name)) return true;
+                }
+                for (se.fields) |field| if (self.exprCapturesParamIntoNestedClosure(field.value, param_name)) return true;
+                return false;
+            },
+            .binary_op => |bo| return self.exprCapturesParamIntoNestedClosure(bo.lhs, param_name) or self.exprCapturesParamIntoNestedClosure(bo.rhs, param_name),
+            .unary_op => |uo| return self.exprCapturesParamIntoNestedClosure(uo.operand, param_name),
+            .field_access => |fa| return self.exprCapturesParamIntoNestedClosure(fa.object, param_name),
+            .pipe => |pipe| return self.exprCapturesParamIntoNestedClosure(pipe.lhs, param_name) or self.exprCapturesParamIntoNestedClosure(pipe.rhs, param_name),
+            .unwrap => |uw| return self.exprCapturesParamIntoNestedClosure(uw.expr, param_name),
+            .type_annotated => |ta| return self.exprCapturesParamIntoNestedClosure(ta.expr, param_name),
+            .if_expr => |ie| {
+                if (self.exprCapturesParamIntoNestedClosure(ie.condition, param_name)) return true;
+                for (ie.then_block) |stmt| if (self.stmtCapturesParamIntoNestedClosure(stmt, param_name)) return true;
+                if (ie.else_block) |eb| for (eb) |stmt| if (self.stmtCapturesParamIntoNestedClosure(stmt, param_name)) return true;
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    fn stmtCapturesParamIntoNestedClosure(self: *const TypeChecker, stmt: ast.Stmt, param_name: ast.StringId) bool {
+        return switch (stmt) {
+            .expr => |expr| self.exprCapturesParamIntoNestedClosure(expr, param_name),
+            .assignment => |assign| self.exprCapturesParamIntoNestedClosure(assign.value, param_name),
+            .attribute => |attr| if (attr.value) |value| self.exprCapturesParamIntoNestedClosure(value, param_name) else false,
+            .function_decl, .macro_decl, .import_decl => false,
+        };
+    }
+
+    /// Conservative "does this statement reference `name` anywhere" check,
+    /// used once execution is already inside a nested closure body (so any
+    /// reference is a capture of the enclosing scope).
+    fn stmtMentionsVar(self: *const TypeChecker, stmt: ast.Stmt, name: ast.StringId) bool {
+        return switch (stmt) {
+            .expr => |expr| self.exprMentionsVar(expr, name),
+            .assignment => |assign| self.exprMentionsVar(assign.value, name),
+            .attribute => |attr| if (attr.value) |value| self.exprMentionsVar(value, name) else false,
+            .function_decl, .macro_decl, .import_decl => false,
+        };
+    }
+
+    /// Conservative recursive "does `expr` mention the variable `name`"
+    /// check. Used inside a nested-closure body to detect a captured
+    /// reference to an enclosing closure parameter.
+    fn exprMentionsVar(self: *const TypeChecker, expr: *const ast.Expr, name: ast.StringId) bool {
+        switch (expr.*) {
+            .var_ref => |vr| return vr.name == name,
+            .call => |call| {
+                if (self.exprMentionsVar(call.callee, name)) return true;
+                for (call.args) |arg| if (self.exprMentionsVar(arg, name)) return true;
+                return false;
+            },
+            .tuple => |t| {
+                for (t.elements) |elem| if (self.exprMentionsVar(elem, name)) return true;
+                return false;
+            },
+            .list => |l| {
+                for (l.elements) |elem| if (self.exprMentionsVar(elem, name)) return true;
+                return false;
+            },
+            .map => |m| {
+                for (m.fields) |field| {
+                    if (self.exprMentionsVar(field.key, name)) return true;
+                    if (self.exprMentionsVar(field.value, name)) return true;
+                }
+                return false;
+            },
+            .struct_expr => |se| {
+                if (se.update_source) |source| if (self.exprMentionsVar(source, name)) return true;
+                for (se.fields) |field| if (self.exprMentionsVar(field.value, name)) return true;
+                return false;
+            },
+            .binary_op => |bo| return self.exprMentionsVar(bo.lhs, name) or self.exprMentionsVar(bo.rhs, name),
+            .unary_op => |uo| return self.exprMentionsVar(uo.operand, name),
+            .field_access => |fa| return self.exprMentionsVar(fa.object, name),
+            .pipe => |pipe| return self.exprMentionsVar(pipe.lhs, name) or self.exprMentionsVar(pipe.rhs, name),
+            .unwrap => |uw| return self.exprMentionsVar(uw.expr, name),
+            .type_annotated => |ta| return self.exprMentionsVar(ta.expr, name),
+            .anonymous_function => |anon| {
+                for (anon.decl.clauses) |anon_clause| {
+                    const anon_body = anon_clause.body orelse continue;
+                    for (anon_body) |stmt| if (self.stmtMentionsVar(stmt, name)) return true;
+                }
+                return false;
+            },
+            .if_expr => |ie| {
+                if (self.exprMentionsVar(ie.condition, name)) return true;
+                for (ie.then_block) |stmt| if (self.stmtMentionsVar(stmt, name)) return true;
+                if (ie.else_block) |eb| for (eb) |stmt| if (self.stmtMentionsVar(stmt, name)) return true;
+                return false;
+            },
+            else => return false,
+        }
     }
 
     fn isClosureParamUsedLocally(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) bool {
@@ -5037,7 +5217,7 @@ pub const TypeChecker = struct {
                             if (parent_entry.kind == .struct_type) {
                                 const parent_sd = parent_entry.kind.struct_type;
                                 for (parent_sd.fields) |field| {
-                                    const field_type = self.resolveTypeExpr(field.type_expr) catch TypeStore.UNKNOWN;
+                                    const field_type = self.resolveFieldTypeExpr(field.type_expr) catch TypeStore.UNKNOWN;
                                     try fields.append(self.allocator, .{
                                         .name = field.name,
                                         .type_id = field_type,
@@ -5048,7 +5228,7 @@ pub const TypeChecker = struct {
                         }
                     }
                     for (sd.fields) |field| {
-                        const field_type = self.resolveTypeExpr(field.type_expr) catch TypeStore.UNKNOWN;
+                        const field_type = self.resolveFieldTypeExpr(field.type_expr) catch TypeStore.UNKNOWN;
                         const default = field.default;
                         var found_parent = false;
                         for (fields.items) |*pf| {
@@ -8375,6 +8555,23 @@ pub const TypeChecker = struct {
     /// type resolves normally. Mirrors
     /// `HirBuilder.resolveCollectionElementType`.
     fn resolveCollectionElementType(self: *TypeChecker, type_expr: *const ast.TypeExpr) anyerror!TypeId {
+        if (type_expr.* == .function) {
+            return self.callableConstraintFromFnTypeExpr(type_expr.function);
+        }
+        return self.resolveTypeExpr(type_expr);
+    }
+
+    /// Resolve a struct FIELD type. A `fn(A) -> B`-typed field stores a
+    /// first-class closure that must outlive the constructing frame, so it
+    /// resolves to the `Callable({A}, B)` boxed existential (a `ProtocolBox`
+    /// field) — the same redirect collection elements take. The closure
+    /// literal stored into the field (`%Holder{op: fn(x){...}}`) is a
+    /// `__closure_N` value with a registered `impl Callable`; the field's
+    /// `Callable` type lets `maybeBoxAsProtocol` box it and a later read-back
+    /// (`f = h.op; f(10)`) dispatch through the box `call` slot. Every
+    /// non-`fn` field type resolves normally. Mirrors
+    /// `HirBuilder.resolveStructFieldType`.
+    fn resolveFieldTypeExpr(self: *TypeChecker, type_expr: *const ast.TypeExpr) anyerror!TypeId {
         if (type_expr.* == .function) {
             return self.callableConstraintFromFnTypeExpr(type_expr.function);
         }
