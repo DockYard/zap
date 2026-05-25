@@ -4518,6 +4518,51 @@ pub const ArcRuntime = struct {
         };
     }
 
+    /// True iff a container element/value of type `T` transitively owns a
+    /// child that is EAGERLY freed under a no-REFCOUNT_V1 manager — i.e. a
+    /// `ProtocolBox` inner (`allocAny`'d via `core.allocate`, leak-tracked,
+    /// reclaimed by each owner's `__drop__`) or an indirect-storage
+    /// side-table cell (also `allocAny`'d). It deliberately does NOT count an
+    /// inline-header `List`/`Map` cell: those are reclaimed at process
+    /// teardown (their `release` is a no-op under no-REFCOUNT_V1), so aliasing
+    /// one across owners can never double-free it.
+    ///
+    /// This is the precise discriminator the box-in-container clone-on-share
+    /// (`ownElement` / `ownEntryValue`) and deep-release
+    /// (`releaseElementsNonRefcounted`) consult under no-REFCOUNT_V1: clone /
+    /// deep-release fire ONLY when an eagerly-freed child is present, leaving
+    /// the established no-refcount semantics for scalars, `String` arena
+    /// slices, and nested inline-header collections untouched. Always `false`
+    /// (so the whole machinery comptime-elides) for plain-data element types.
+    pub fn elementHasEagerlyFreedChild(comptime T: type) bool {
+        if (comptime isProtocolBox(T)) return true;
+        return switch (@typeInfo(T)) {
+            .optional => |opt| elementHasEagerlyFreedChild(opt.child),
+            .pointer => |p| blk: {
+                if (p.size != .one) break :blk false;
+                // An inline-header List/Map cell is reclaimed at teardown, so a
+                // pointer to one is never an eagerly-freed child. A side-table
+                // (indirect-storage) cell IS eagerly freed; recurse so a box
+                // buried inside it still counts.
+                if (comptime hasInlineArcHeader(p.child)) break :blk false;
+                break :blk true;
+            },
+            .@"struct" => |s| blk: {
+                inline for (s.fields) |field| {
+                    if (elementHasEagerlyFreedChild(field.type)) break :blk true;
+                }
+                break :blk false;
+            },
+            .@"union" => |u| blk: {
+                inline for (u.fields) |field| {
+                    if (elementHasEagerlyFreedChild(field.type)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
     /// Element type of an Arc value pointer. The ZIR backend calls every
     /// public release helper with `(allocator, ptr)` — Zig's call-site
     /// inference cannot recover a `comptime T` slot from runtime arguments,
@@ -5367,6 +5412,69 @@ pub const ArcRuntime = struct {
         }
     }
 
+    /// Box-in-container deep-release for a no-REFCOUNT_V1 manager, run on a
+    /// MUTABLE element/value slot. Deep-releases every eagerly-freed child
+    /// (`ProtocolBox` inner, indirect-storage cell) reachable from `*slot`,
+    /// then ZEROES that child in place so a SECOND release of the same cell
+    /// (an aliased inline-header `List`/`Map` shared across owners, which
+    /// each emit a no-op `release` under no-REFCOUNT_V1) walks a `None` box
+    /// and frees nothing. This idempotent poison is what lets the container
+    /// drop reclaim its boxed elements EXACTLY ONCE without a refcount to
+    /// detect the last release.
+    ///
+    /// The mirror of `releaseChildrenAny`, but: (1) it operates through a
+    /// pointer so it can null the freed child; (2) it recurses into nested
+    /// inline-header collection pointers (`releaseArcAny` -> that cell's
+    /// `release` -> its own `releaseElementsNonRefcounted`) so a
+    /// `List(List(ProtocolBox))` reclaims the inner lists' boxes too; (3) it
+    /// is comptime-elided whole for slot types with no eagerly-freed child.
+    ///
+    /// Children are released before the parent slot is reused (spec §8.2
+    /// ordering). Safe under aliasing because the cloned-on-share extraction
+    /// (`ownElement` / `ownEntryValue`) gives every EXTRACTED owner its own
+    /// independent inner — nulling the container's slot never dangles an
+    /// extracted value.
+    pub fn releaseAndPoisonEagerChildren(comptime T: type, allocator: std.mem.Allocator, slot: *T) void {
+        if (comptime !elementHasEagerlyFreedChild(T)) return;
+        if (comptime isProtocolBox(T)) {
+            releaseProtocolBoxValue(slot.*);
+            slot.* = .{ .data_ptr = null, .vtable = null };
+            return;
+        }
+        switch (@typeInfo(T)) {
+            .optional => |opt| {
+                if (slot.*) |inner| {
+                    var tmp: opt.child = inner;
+                    releaseAndPoisonEagerChildren(opt.child, allocator, &tmp);
+                    slot.* = tmp;
+                }
+            },
+            .pointer => |p| {
+                if (p.size == .one) {
+                    // Only reached for an eagerly-freed pointee (an inline-
+                    // header cell is excluded by `elementHasEagerlyFreedChild`).
+                    // An indirect-storage cell is released through the generic
+                    // path, which deep-walks ITS children; null the slot after.
+                    releaseArcAny(p.child, allocator, @constCast(slot.*));
+                }
+            },
+            .@"struct" => |s| {
+                inline for (s.fields) |field| {
+                    releaseAndPoisonEagerChildren(field.type, allocator, &@field(slot, field.name));
+                }
+            },
+            .@"union" => {
+                const active = std.meta.activeTag(slot.*);
+                inline for (std.meta.fields(T)) |field| {
+                    if (active == @field(std.meta.Tag(T), field.name)) {
+                        releaseAndPoisonEagerChildren(field.type, allocator, &@field(slot, field.name));
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
     /// Walk every field of an aggregate value at comptime and deep-retain
     /// any indirect-storage Arc'd children encountered. Mirrors
     /// `releaseChildrenAny` exactly — every field shape that the release
@@ -6106,6 +6214,29 @@ pub fn List(comptime T: type) type {
             if (vec == null) return;
             const v = vec.?;
             const mut: *Self = @constCast(v);
+            // Box-in-container deep-release under a no-REFCOUNT_V1 manager.
+            // `headerRelease` below is a comptime no-op in that mode, so the
+            // `listDeepWalk` -> `bufferFreeDeep` element teardown never fires
+            // and the buffer cell is reclaimed at process teardown (not per-
+            // drop). That is sound for elements that are themselves reclaimed
+            // at teardown (scalars, `String` arena slices, nested inline-
+            // header cells), but a boxed-existential element inner is
+            // `allocAny`'d and IS eagerly freed + leak-tracked — without this
+            // walk every un-extracted box element leaks (the inline-header
+            // analog of the Phase 4.c box-in-struct leak). Deep-release each
+            // populated slot's eagerly-freed children and poison the slot so a
+            // repeated release of an aliased cell (shared across owners, each
+            // emitting a no-op `release`) frees nothing. Comptime-elided whole
+            // for element types with no eagerly-freed child, and skipped under
+            // REFCOUNT_V1 (the deep_walk callback handles it via refcounts).
+            if (comptime !refcount_v1_active and ArcRuntime.elementHasEagerlyFreedChild(T)) {
+                if (v.len != 0) {
+                    const data = mut.dataPtr();
+                    for (0..v.len) |i| {
+                        ArcRuntime.releaseAndPoisonEagerChildren(T, std.heap.c_allocator, &data[i]);
+                    }
+                }
+            }
             // Optimistically count as kept-alive; the deep_walk callback
             // rolls this back to "freed" on the zero-transition.
             incrementRuntimeStatCounter(&list_release_kept_alive_total);
@@ -6135,9 +6266,15 @@ pub fn List(comptime T: type) type {
         // Clone helpers
         // -------------------------------------------------------------------
 
-        /// Clone with deep-retain of element children. Used on the
-        /// shared (rc>1) mutation path so the original cell stays
-        /// valid while the clone takes the mutation.
+        /// Clone with deep-own of element children so the original cell
+        /// stays valid while the clone is an independent owner. Used by
+        /// non-consuming derivations (slice/take/drop/reverse/uniq, the
+        /// shared-mutation clone path) where source and result coexist:
+        /// `ownElement` bumps the refcount under REFCOUNT_V1 and deep-clones
+        /// the eagerly-freed children (box inners) under no-REFCOUNT_V1, so
+        /// the box-in-container deep-release frees each list's elements
+        /// exactly once. (Consuming mutations — push/pop/set growth — use
+        /// `cloneBufferMovingChildren` instead and free the old buffer.)
         fn cloneBufferRetainingChildren(self: *const Self, new_capacity: u32) ?*Self {
             std.debug.assert(new_capacity >= self.len);
             const fresh = bufferAlloc(new_capacity, self.len) orelse return null;
@@ -6146,8 +6283,7 @@ pub fn List(comptime T: type) type {
             const old_data = self.dataPtr();
             const new_data = fresh.dataPtr();
             for (0..self.len) |i| {
-                new_data[i] = old_data[i];
-                retainElement(old_data[i]);
+                new_data[i] = ownElement(old_data[i]);
             }
             return fresh;
         }
@@ -6165,6 +6301,28 @@ pub fn List(comptime T: type) type {
                 new_data[i] = old_data[i];
             }
             return fresh;
+        }
+
+        /// True when a consuming mutation (`push` / `pop` / `set`) may take
+        /// the in-place / move-and-free-old fast path rather than the
+        /// deep-own retaining clone.
+        ///
+        ///   * REFCOUNT_V1 — exactly when the receiver is the sole owner
+        ///     (`header.count() == 1`); a shared cell must be cloned so the
+        ///     other owners still observe the pre-mutation value.
+        ///   * no-REFCOUNT_V1 — ALWAYS. There is no refcount to detect
+        ///     sharing, and the no-refcount model is move/value-semantics:
+        ///     a mutation consumes its receiver. Crucially, `header.count()`
+        ///     is always 0 in this mode, so WITHOUT this the mutation would
+        ///     misroute to the retaining clone and (for box elements) leak
+        ///     the moved-from buffer's eagerly-freed inners. Moving instead
+        ///     transfers each element's single inner to the new buffer and
+        ///     frees the old buffer shallowly — exactly one owner per inner.
+        inline fn mutationMayMoveInPlace(self: *const Self) bool {
+            return comptime_or_unique: {
+                if (comptime !refcount_v1_active) break :comptime_or_unique true;
+                break :comptime_or_unique self.header.count() == 1;
+            };
         }
 
         // -------------------------------------------------------------------
@@ -6224,17 +6382,19 @@ pub fn List(comptime T: type) type {
             const slot_count: u32 = @intCast(size);
             const fresh = bufferAlloc(slot_count, slot_count) orelse return null;
             const data = fresh.dataPtr();
-            for (0..slot_count) |i| {
-                data[i] = init;
-            }
-            // The caller's +1 covers slot 0; retain (slot_count - 1)
-            // times for the remaining slots. For trivial T this loop
-            // compiles to nothing.
+            // The caller's +1 covers slot 0 (the `init` value moves into it);
+            // every other slot needs an INDEPENDENT owner. Under REFCOUNT_V1
+            // that is `init` retained (slot_count - 1) times; under no-
+            // REFCOUNT_V1 each extra slot is a clone of `init`'s eagerly-freed
+            // children (`ownElement`) so the box-in-container deep-release frees
+            // exactly one inner per slot. For trivial T this compiles to N
+            // bit-copies and nothing else.
             if (slot_count == 0) {
                 releaseElement(init, std.heap.c_allocator);
             } else {
+                data[0] = init;
                 var k: u32 = 1;
-                while (k < slot_count) : (k += 1) retainElement(init);
+                while (k < slot_count) : (k += 1) data[k] = ownElement(init);
             }
             return fresh;
         }
@@ -6265,8 +6425,7 @@ pub fn List(comptime T: type) type {
             // optimize mode.
             if (slot >= v.len) Kernel.raise_with_kind("index_error", "List.get: index out of bounds");
             const value = v.slotAtConst(slot).*;
-            retainElement(value);
-            return value;
+            return ownElement(value);
         }
 
         /// Return the first element, or the element type's default for
@@ -6276,8 +6435,7 @@ pub fn List(comptime T: type) type {
             const v = vec orelse return defaultElement();
             if (v.len == 0) return defaultElement();
             const value = v.slotAtConst(0).*;
-            retainElement(value);
-            return value;
+            return ownElement(value);
         }
 
         /// Return a freshly-owned list containing every element after
@@ -6303,8 +6461,7 @@ pub fn List(comptime T: type) type {
             const v = vec orelse return defaultElement();
             if (v.len == 0) return defaultElement();
             const value = v.slotAtConst(v.len - 1).*;
-            retainElement(value);
-            return value;
+            return ownElement(value);
         }
 
         /// Bounds-checked element write. Refcount-aware: on rc==1 the
@@ -6319,7 +6476,7 @@ pub fn List(comptime T: type) type {
             if (slot >= v.len) Kernel.raise_with_kind("index_error", "List.set: index out of bounds");
 
             incrementRuntimeStatCounter(&list_mut_calls_total);
-            if (v.header.count() == 1) {
+            if (v.mutationMayMoveInPlace()) {
                 incrementRuntimeStatCounter(&list_rc1_fast_path_total);
                 const mut: *Self = @constCast(v);
                 const existing = mut.slotAt(slot).*;
@@ -6362,7 +6519,7 @@ pub fn List(comptime T: type) type {
             }
             const v = vec.?;
 
-            if (v.header.count() == 1) {
+            if (v.mutationMayMoveInPlace()) {
                 incrementRuntimeStatCounter(&list_rc1_fast_path_total);
                 const mut: *Self = @constCast(v);
                 if (mut.len < mut.cap) {
@@ -6400,7 +6557,7 @@ pub fn List(comptime T: type) type {
             if (v.len == 0) @panic("List.pop: empty list");
 
             incrementRuntimeStatCounter(&list_mut_calls_total);
-            if (v.header.count() == 1) {
+            if (v.mutationMayMoveInPlace()) {
                 incrementRuntimeStatCounter(&list_rc1_fast_path_total);
                 const mut: *Self = @constCast(v);
                 const removed_value = mut.slotAtPtr(mut.len - 1).*;
@@ -6443,8 +6600,7 @@ pub fn List(comptime T: type) type {
                 const src_data = bv.dataPtr();
                 var i: u32 = 0;
                 while (i < bv.len) : (i += 1) {
-                    dst_data[mut.len + i] = src_data[i];
-                    retainElement(src_data[i]);
+                    dst_data[mut.len + i] = ownElement(src_data[i]);
                 }
                 mut.len = total_len;
                 return mut;
@@ -6462,8 +6618,7 @@ pub fn List(comptime T: type) type {
                 var i: u32 = 0;
                 while (i < b_len) : (i += 1) {
                     const value = if (same_buffer) grown_data[i] else bv.dataPtr()[i];
-                    grown_data[grown.len + i] = value;
-                    retainElement(value);
+                    grown_data[grown.len + i] = ownElement(value);
                 }
                 grown.len = total_len;
                 return grown;
@@ -6480,12 +6635,10 @@ pub fn List(comptime T: type) type {
             const b_data = bv.dataPtr();
             var i: u32 = 0;
             while (i < av.len) : (i += 1) {
-                fresh_data[i] = a_data[i];
-                retainElement(a_data[i]);
+                fresh_data[i] = ownElement(a_data[i]);
             }
             while (i < total_len) : (i += 1) {
-                fresh_data[i] = b_data[i - av.len];
-                retainElement(b_data[i - av.len]);
+                fresh_data[i] = ownElement(b_data[i - av.len]);
             }
             return fresh;
         }
@@ -6583,8 +6736,7 @@ pub fn List(comptime T: type) type {
             const tail_data = t.dataPtr();
             var i: u32 = 0;
             while (i < tail_len) : (i += 1) {
-                data[i + 1] = tail_data[i];
-                retainElement(tail_data[i]);
+                data[i + 1] = ownElement(tail_data[i]);
             }
             release(tail);
             return fresh;
@@ -6599,9 +6751,7 @@ pub fn List(comptime T: type) type {
             const dest = fresh.dataPtr();
             var i: u32 = 0;
             while (i < v.len) : (i += 1) {
-                const value = source[v.len - 1 - i];
-                dest[i] = value;
-                retainElement(value);
+                dest[i] = ownElement(source[v.len - 1 - i]);
             }
             return fresh;
         }
@@ -6645,8 +6795,7 @@ pub fn List(comptime T: type) type {
             var i: u32 = 0;
             while (i < v.len) : (i += 1) {
                 if (!contains(result, data[i])) {
-                    retainElement(data[i]);
-                    result = push(result, data[i]);
+                    result = push(result, ownElement(data[i]));
                 }
             }
             return result;
@@ -6657,8 +6806,7 @@ pub fn List(comptime T: type) type {
         pub fn next(vec: ?*const Self) std.meta.Tuple(&.{ u32, T, ?*const Self }) {
             const v = vec orelse return .{ ATOM_DONE, defaultElement(), null };
             if (v.len == 0) return .{ ATOM_DONE, defaultElement(), null };
-            const head = v.slotAtConst(0).*;
-            retainElement(head);
+            const head = ownElement(v.slotAtConst(0).*);
             const tail = if (v.len > 1) cloneRangeRetainingChildren(v, 1, v.len - 1) else null;
             return .{ ATOM_CONT, head, tail };
         }
@@ -6682,8 +6830,7 @@ pub fn List(comptime T: type) type {
             var i: u32 = 0;
             while (i < v.len) : (i += 1) {
                 if (call1WithOwnedElement(predicate, data[i])) {
-                    retainElement(data[i]);
-                    result = push(result, data[i]);
+                    result = push(result, ownElement(data[i]));
                 }
             }
             return result;
@@ -6696,8 +6843,7 @@ pub fn List(comptime T: type) type {
             var i: u32 = 0;
             while (i < v.len) : (i += 1) {
                 if (!call1WithOwnedElement(predicate, data[i])) {
-                    retainElement(data[i]);
-                    result = push(result, data[i]);
+                    result = push(result, ownElement(data[i]));
                 }
             }
             return result;
@@ -6731,8 +6877,7 @@ pub fn List(comptime T: type) type {
             var i: u32 = 0;
             while (i < v.len) : (i += 1) {
                 if (call1WithOwnedElement(predicate, data[i])) {
-                    retainElement(data[i]);
-                    return data[i];
+                    return ownElement(data[i]);
                 }
             }
             return default;
@@ -6789,8 +6934,7 @@ pub fn List(comptime T: type) type {
             std.sort.pdq(T, arr, Ctx{ .cmp = comparator_storage }, Ctx.lessThan);
             var result: ?*const Self = null;
             for (arr) |value| {
-                retainElement(value);
-                result = push(result, value);
+                result = push(result, ownElement(value));
             }
             return result;
         }
@@ -6913,8 +7057,7 @@ pub fn List(comptime T: type) type {
             const v = vec orelse return defaultElement();
             if (v.len == 0) return defaultElement();
             const value = v.slotAtConst(0).*;
-            retainElement(value);
-            return value;
+            return ownElement(value);
         }
 
         /// Like `getTail`, but skips the rc==1 check and consumes the
@@ -7048,8 +7191,7 @@ pub fn List(comptime T: type) type {
                 const src_data = bv.dataPtr();
                 var i: u32 = 0;
                 while (i < bv.len) : (i += 1) {
-                    dst_data[mut.len + i] = src_data[i];
-                    retainElement(src_data[i]);
+                    dst_data[mut.len + i] = ownElement(src_data[i]);
                 }
                 mut.len = total_len;
                 return mut;
@@ -7068,8 +7210,7 @@ pub fn List(comptime T: type) type {
             var i: u32 = 0;
             while (i < b_len) : (i += 1) {
                 const value = if (same_buffer) grown_data[i] else bv.dataPtr()[i];
-                grown_data[grown.len + i] = value;
-                retainElement(value);
+                grown_data[grown.len + i] = ownElement(value);
             }
             grown.len = total_len;
             return grown;
@@ -7093,9 +7234,7 @@ pub fn List(comptime T: type) type {
             const dest = fresh.dataPtr();
             var i: u32 = 0;
             while (i < count) : (i += 1) {
-                const value = source[start + i];
-                dest[i] = value;
-                retainElement(value);
+                dest[i] = ownElement(source[start + i]);
             }
             return fresh;
         }
@@ -7122,20 +7261,48 @@ pub fn List(comptime T: type) type {
             retainElementShape(T, value);
         }
 
-        inline fn call1WithOwnedElement(callback: anytype, value: T) CallableReturn(@TypeOf(callback)) {
+        /// Produce an INDEPENDENTLY-OWNED copy of `value` for a new owner
+        /// (an extracted element, a fresh-buffer element copy, a value
+        /// handed to a consuming callback). This is the element-level
+        /// clone-on-share that keeps the box-in-container deep-release
+        /// (`releaseElementsNonRefcounted`) balanced under a no-REFCOUNT_V1
+        /// manager.
+        ///
+        ///   * REFCOUNT_V1 — bump the element's refcount and return the
+        ///     SAME value (`retainElement`). The new owner is a real second
+        ///     reference the last drop reclaims; the container and the new
+        ///     owner each decrement once.
+        ///   * no-REFCOUNT_V1 — there is no refcount, so a second owner
+        ///     cannot be a `+1` on a shared cell. A boxed-existential inner
+        ///     (a `ProtocolBox`'s `data_ptr`) IS eagerly freed by each
+        ///     owner's drop, so the new owner must own an INDEPENDENT inner
+        ///     or the container-drop and the owner-drop double-free it.
+        ///     `cloneChildrenAnyInPlace` deep-clones exactly the eagerly-
+        ///     freed children (`ProtocolBox` inners, indirect-storage cells)
+        ///     and leaves everything reclaimed-at-teardown (inline-header
+        ///     `List`/`Map` cells, `String` arena slices, scalars) aliased —
+        ///     the same rule the boxed-closure clone-on-share already uses.
+        ///     Elided at comptime for element types with no ARC children.
+        inline fn ownElement(value: T) T {
+            if (comptime !refcount_v1_active and ArcRuntime.elementHasEagerlyFreedChild(T)) {
+                var owned: T = value;
+                ArcRuntime.cloneChildrenAnyInPlace(T, std.heap.c_allocator, &owned);
+                return owned;
+            }
             retainElement(value);
-            return call1(callback, value);
+            return value;
+        }
+
+        inline fn call1WithOwnedElement(callback: anytype, value: T) CallableReturn(@TypeOf(callback)) {
+            return call1(callback, ownElement(value));
         }
 
         inline fn call2WithOwnedElement(callback: anytype, arg0: anytype, value: T) CallableReturn(@TypeOf(callback)) {
-            retainElement(value);
-            return call2(callback, arg0, value);
+            return call2(callback, arg0, ownElement(value));
         }
 
         inline fn call2WithOwnedElements(callback: anytype, left: T, right: T) CallableReturn(@TypeOf(callback)) {
-            retainElement(left);
-            retainElement(right);
-            return call2(callback, left, right);
+            return call2(callback, ownElement(left), ownElement(right));
         }
 
         fn releaseElementShape(comptime ElemT: type, value: ElemT, allocator: std.mem.Allocator) void {
