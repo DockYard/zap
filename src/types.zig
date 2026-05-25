@@ -1658,6 +1658,16 @@ pub const TypeChecker = struct {
     /// strict everywhere else.
     allow_external_static_references: bool = false,
 
+    /// Re-entrancy guard for `type` alias expansion. Each entry is the
+    /// scope-graph `TypeId` (index into `graph.types`) of an alias whose
+    /// body is currently being resolved. A `type` alias's body is
+    /// substituted in place of the alias name (see `resolveTypeAliasRef`),
+    /// so a non-productive cycle (`type A = B; type B = A`) would otherwise
+    /// recurse forever. Pushing the alias before recursing and checking
+    /// membership on entry turns a cycle into a clean diagnostic. Empty
+    /// outside alias resolution; balanced push/pop keeps it that way.
+    alias_resolution_stack: std.ArrayListUnmanaged(scope_mod.TypeId) = .empty,
+
     pub const Error = struct {
         message: []const u8,
         span: ast.SourceSpan,
@@ -1761,6 +1771,7 @@ pub const TypeChecker = struct {
         self.ownership_bindings.deinit();
         self.type_var_scope.deinit();
         self.eager_helper_in_flight.deinit();
+        self.alias_resolution_stack.deinit(self.allocator);
     }
 
     pub fn setAnalysisContext(self: *TypeChecker, context: *const escape_lattice.AnalysisContext, program: *const ir.Program) void {
@@ -4337,6 +4348,119 @@ pub const TypeChecker = struct {
             if (field.name == field_name) return field.type_id;
         }
         return null;
+    }
+
+    /// Find the scope-graph type entry registered for `name` whose kind is
+    /// a `type` alias (`type Name = ...` / `type Name(t) = ...`). Returns
+    /// the scope-graph `TypeId` (index into `graph.types`) of the FIRST
+    /// such entry, or null when no alias by that name exists. Nominal types
+    /// (struct/union/opaque) are intentionally excluded — they resolve via
+    /// `name_to_type` earlier in the `.name` arm; only aliases need body
+    /// substitution here.
+    fn findTypeAliasEntry(self: *const TypeChecker, name: ast.StringId) ?scope_mod.TypeId {
+        for (self.graph.types.items, 0..) |type_entry, idx| {
+            if (type_entry.name != name) continue;
+            if (type_entry.kind == .type_alias) return @intCast(idx);
+        }
+        return null;
+    }
+
+    /// Resolve a `.name` type reference that names a `type` alias by
+    /// substituting the alias body in place of the name. `alias_entry_id`
+    /// is the scope-graph `TypeId` returned by `findTypeAliasEntry`; `tn`
+    /// is the original type-name node (carrying any generic `args`); `span`
+    /// is the reference site for diagnostics.
+    ///
+    /// The alias resolves to the EXACT same `TypeId` as writing its body
+    /// inline: the body is resolved through `resolveTypeExpr` and interned
+    /// by `TypeStore.addType`'s structural deduplication, so `type Adder =
+    /// fn(i64) -> i64` and a bare `fn(i64) -> i64` collapse to one id and
+    /// never fork a monomorphization specialization. An alias is therefore
+    /// a transparent name, not a distinct nominal type.
+    ///
+    /// Parameterized aliases (`type Pair(t) = {t, t}`) substitute their
+    /// formal parameters with the supplied arguments before resolving the
+    /// body, reusing the same `type_var_scope` substitution path that
+    /// parametric struct/union field resolution uses (see
+    /// `registerUserTypes` pass 2). Arguments are resolved in the CALLER's
+    /// type-var scope first, then the alias's formals are installed in a
+    /// fresh overlay so the body sees only its own parameters.
+    ///
+    /// `alias_resolution_stack` detects non-productive cycles (`type A = B;
+    /// type B = A`): a re-entrant expansion of an alias already on the
+    /// stack emits a `cyclic type alias` diagnostic and yields
+    /// `TypeStore.ERROR` rather than recursing forever.
+    fn resolveTypeAliasRef(
+        self: *TypeChecker,
+        alias_entry_id: scope_mod.TypeId,
+        tn: ast.TypeNameExpr,
+        span: ast.SourceSpan,
+    ) anyerror!TypeId {
+        const alias_entry = self.graph.types.items[alias_entry_id];
+        const alias_name = self.interner.get(alias_entry.name);
+        const body = alias_entry.kind.type_alias;
+        const formal_params = alias_entry.params;
+
+        // Cycle guard: if this exact alias is already being expanded, the
+        // chain is non-productive — report and stop.
+        for (self.alias_resolution_stack.items) |in_flight| {
+            if (in_flight == alias_entry_id) {
+                try self.addHardError(
+                    try std.fmt.allocPrint(
+                        self.allocator,
+                        "cyclic type alias `{s}`",
+                        .{alias_name},
+                    ),
+                    span,
+                    "this alias expands to itself without ever reaching a concrete type",
+                    "break the cycle — a `type` alias body must eventually name a concrete type (a pointer/box indirection through a struct or union is fine, a bare alias-to-alias loop is not)",
+                );
+                return TypeStore.ERROR;
+            }
+        }
+
+        try self.alias_resolution_stack.append(self.allocator, alias_entry_id);
+        defer _ = self.alias_resolution_stack.pop();
+
+        // Non-parameterized alias used WITH arguments: arity error.
+        if (formal_params.len == 0) {
+            if (tn.args.len > 0) {
+                try self.reportNonParametricInstantiation(alias_name, tn.args.len, span);
+                // Fall through and resolve the body anyway so downstream
+                // inference has a concrete type; the diagnostic already
+                // pins the mistake.
+            }
+            return try self.resolveTypeExpr(body);
+        }
+
+        // Parameterized alias. Validate arity against the supplied args.
+        if (formal_params.len != tn.args.len) {
+            try self.reportParametricArityMismatch(alias_name, formal_params.len, tn.args.len, span);
+            // Bind as many formals as we have args (below); any unbound
+            // formal stays a fresh type variable, which keeps resolution
+            // total. The diagnostic already reports the arity mismatch.
+        }
+
+        // Resolve the supplied arguments in the CALLER's type-var scope
+        // (they may themselves reference the enclosing function's type
+        // variables, e.g. `Pair(a)` inside `fn f(x :: a)`).
+        const bind_count = @min(formal_params.len, tn.args.len);
+        var resolved_args = try self.allocator.alloc(TypeId, bind_count);
+        defer self.allocator.free(resolved_args);
+        for (0..bind_count) |index| {
+            resolved_args[index] = try self.resolveTypeExpr(tn.args[index]);
+        }
+
+        // Install the alias's formals in a fresh overlay so the body sees
+        // only its own parameters (not the caller's), then resolve.
+        const saved_type_var_scope = try self.snapshotTypeVarScope();
+        defer self.restoreTypeVarScope(saved_type_var_scope);
+        self.type_var_scope.clearRetainingCapacity();
+        for (0..bind_count) |index| {
+            const formal_name = self.interner.get(formal_params[index].name);
+            try self.type_var_scope.put(formal_name, resolved_args[index]);
+        }
+        return try self.resolveTypeExpr(body);
     }
 
     /// Number of formal type parameters declared on a registered
@@ -8045,6 +8169,20 @@ pub const TypeChecker = struct {
                 if (resolved_builtin_or_meta) |tid| {
                     return tid;
                 }
+
+                // `type` alias — substitute the alias body in place of the
+                // name. Resolves to the SAME `TypeId` as the body written
+                // inline (structural dedup in `addType`), with parameter
+                // substitution for `type Name(t) = ...` and cycle detection
+                // for non-productive alias loops. Placed after the builtin
+                // and nominal checks so an alias can never silently shadow a
+                // builtin or a struct/union of the same name; placed before
+                // the UNKNOWN forward-reference fallback so a registered
+                // alias actually resolves instead of degrading to void.
+                if (self.findTypeAliasEntry(tn.name)) |alias_entry_id| {
+                    return try self.resolveTypeAliasRef(alias_entry_id, tn, type_expr.getMeta().span);
+                }
+
                 // Check user-defined types in scope graph (forward reference fallback)
                 for (self.graph.types.items) |type_entry| {
                     const type_name = self.interner.get(type_entry.name);
@@ -13503,4 +13641,225 @@ test "parametric tagged-union with multiple type parameters constructs cleanly" 
         std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
     }
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+// ============================================================
+// Phase 0 — `type` alias resolution (first-class-closures prerequisite)
+// ============================================================
+
+/// Resolve the field types of a checked struct by name, returning the
+/// resolved `TypeId` recorded on each `StructField`. Field resolution
+/// runs through `resolveTypeExpr` in `registerUserTypes` pass 2, so this
+/// is a faithful observation of how the type-checker resolved each field
+/// annotation — including any `type` alias substitution.
+fn fieldTypeIdByName(
+    checker: *const TypeChecker,
+    interner: *const ast.StringInterner,
+    struct_name: []const u8,
+    field_name: []const u8,
+) ?TypeId {
+    const struct_name_id = interner.lookupExisting(struct_name) orelse return null;
+    const struct_type_id = checker.store.name_to_type.get(struct_name_id) orelse return null;
+    const struct_typ = checker.store.getType(struct_type_id);
+    if (struct_typ != .struct_type) return null;
+    const field_name_id = interner.lookupExisting(field_name) orelse return null;
+    for (struct_typ.struct_type.fields) |field| {
+        if (field.name == field_name_id) return field.type_id;
+    }
+    return null;
+}
+
+test "type alias of a builtin resolves to the builtin TypeId" {
+    // `type Celsius = i64` used as a struct field type must resolve to
+    // exactly `i64` (TypeStore.I64), not void/UNKNOWN. Before the alias
+    // resolver, the `.name` arm's forward-reference fallback returned
+    // UNKNOWN for any name registered in the scope graph's type list.
+    const source =
+        \\type Celsius = i64
+        \\pub struct Reading {
+        \\  temp :: Celsius
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    const temp_type = fieldTypeIdByName(&checker, parser.interner, "Reading", "temp").?;
+    try std.testing.expectEqual(TypeStore.I64, temp_type);
+}
+
+test "function-type alias resolves to the same TypeId as the inline form" {
+    // The same-TypeId invariant: `type Adder = fn(i64) -> i64` used as a
+    // field type must resolve to the EXACT same TypeId as the inline
+    // `fn(i64) -> i64`. An alias must NOT mint a distinct nominal type, or
+    // it would fork monomorphization specializations. `addType`'s
+    // structural dedup guarantees identical `Type` values share one id;
+    // this test proves the alias body resolves to that same `Type`.
+    const source =
+        \\type Adder = fn(i64) -> i64
+        \\pub struct Holder {
+        \\  aliased :: Adder
+        \\  inline_form :: fn(i64) -> i64
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    const aliased_type = fieldTypeIdByName(&checker, parser.interner, "Holder", "aliased").?;
+    const inline_type = fieldTypeIdByName(&checker, parser.interner, "Holder", "inline_form").?;
+    try std.testing.expect(checker.store.getType(aliased_type) == .function);
+    try std.testing.expectEqual(inline_type, aliased_type);
+}
+
+test "parameterized type alias substitutes its formal parameter" {
+    // `type Pair(t) = {t, t}` applied as `Pair(i64)` must substitute the
+    // formal `t` with `i64`, resolving to the tuple `{i64, i64}` — the
+    // EXACT same TypeId as writing `{i64, i64}` inline.
+    const source =
+        \\type Pair(t) = {t, t}
+        \\pub struct Holder {
+        \\  aliased :: Pair(i64)
+        \\  inline_form :: {i64, i64}
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    const aliased_type = fieldTypeIdByName(&checker, parser.interner, "Holder", "aliased").?;
+    const inline_type = fieldTypeIdByName(&checker, parser.interner, "Holder", "inline_form").?;
+    const aliased_typ = checker.store.getType(aliased_type);
+    try std.testing.expect(aliased_typ == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), aliased_typ.tuple.elements.len);
+    try std.testing.expectEqual(TypeStore.I64, aliased_typ.tuple.elements[0]);
+    try std.testing.expectEqual(TypeStore.I64, aliased_typ.tuple.elements[1]);
+    try std.testing.expectEqual(inline_type, aliased_type);
+}
+
+test "alias of an alias resolves transitively to the underlying TypeId" {
+    // `type A = i64; type B = A` — a reference to `B` must resolve through
+    // `A` to `i64`. Chained (productive) aliases are legal and terminate.
+    const source =
+        \\type A = i64
+        \\type B = A
+        \\pub struct Holder {
+        \\  chained :: B
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    const chained_type = fieldTypeIdByName(&checker, parser.interner, "Holder", "chained").?;
+    try std.testing.expectEqual(TypeStore.I64, chained_type);
+}
+
+test "cyclic type alias produces a clean diagnostic instead of looping" {
+    // `type A = B; type B = A` is a non-productive cycle — its expansion
+    // never reaches a concrete type. The resolver must detect the cycle
+    // and report a diagnostic, never loop forever or overflow the stack.
+    const source =
+        \\type A = B
+        \\type B = A
+        \\pub struct Holder {
+        \\  field :: A
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found_cycle_diag = false;
+    for (checker.errors.items) |type_err| {
+        if (std.mem.indexOf(u8, type_err.message, "cyclic type alias") != null) {
+            found_cycle_diag = true;
+        }
+    }
+    try std.testing.expect(found_cycle_diag);
 }

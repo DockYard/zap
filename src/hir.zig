@@ -2559,6 +2559,16 @@ pub const HirBuilder = struct {
     /// Pushed by `buildExprWithExpected` / `lowerWithExpected` helpers
     /// and popped on return; lookups read the topmost entry.
     expected_type_stack: std.ArrayListUnmanaged(types_mod.TypeId) = .empty,
+    /// Re-entrancy guard for `type` alias expansion in HIR type
+    /// resolution, mirroring `TypeChecker.alias_resolution_stack`. Each
+    /// entry is the scope-graph `TypeId` of an alias whose body is
+    /// currently being substituted. A non-productive cycle (`type A = B;
+    /// type B = A`) would otherwise recurse forever; pushing before
+    /// recursing and checking membership on entry stops the loop. The
+    /// type-checker already reports the cycle diagnostic, so HIR resolution
+    /// (which never emits user diagnostics from `resolveTypeExpr`) just
+    /// yields `UNKNOWN` on detection. Empty outside alias resolution.
+    alias_resolution_stack: std.ArrayListUnmanaged(scope_mod.TypeId) = .empty,
     errors: std.ArrayList(Error),
 
     pub const Error = struct {
@@ -2622,6 +2632,7 @@ pub const HirBuilder = struct {
         self.parent_assignment_bindings.deinit(self.allocator);
         self.hir_type_var_scope.deinit();
         self.expected_type_stack.deinit(self.allocator);
+        self.alias_resolution_stack.deinit(self.allocator);
         self.errors.deinit(self.allocator);
     }
 
@@ -6923,6 +6934,76 @@ pub const HirBuilder = struct {
     // Allocation helper
     // ============================================================
 
+    /// Find the scope-graph type entry registered for `name` whose kind is
+    /// a `type` alias. Returns the scope-graph `TypeId` of the first such
+    /// entry, or null. Mirrors `TypeChecker.findTypeAliasEntry`; nominal
+    /// types resolve via `name_to_type` earlier in the `.name` arm, so only
+    /// aliases reach this lookup.
+    fn findTypeAliasEntry(self: *const HirBuilder, name: ast.StringId) ?scope_mod.TypeId {
+        for (self.graph.types.items, 0..) |type_entry, idx| {
+            if (type_entry.name != name) continue;
+            if (type_entry.kind == .type_alias) return @intCast(idx);
+        }
+        return null;
+    }
+
+    /// HIR-side `type` alias substitution, mirroring
+    /// `TypeChecker.resolveTypeAliasRef`. Substitutes the alias body in
+    /// place of the name so the lowered type matches what the type-checker
+    /// produced (and the same structurally-deduped `TypeId` the body would
+    /// produce inline). Parameterized aliases substitute formals→args
+    /// through `hir_type_var_scope` (the existing HIR type-var path);
+    /// `alias_resolution_stack` turns a non-productive cycle into a clean
+    /// `UNKNOWN` instead of unbounded recursion (the type-checker already
+    /// reported the cycle diagnostic). Uses the file-local `@constCast`
+    /// pattern to mutate the const builder's stacks/scope.
+    fn resolveTypeAliasRef(
+        self: *const HirBuilder,
+        alias_entry_id: scope_mod.TypeId,
+        tn: ast.TypeNameExpr,
+    ) TypeId {
+        const alias_entry = self.graph.types.items[alias_entry_id];
+        const body = alias_entry.kind.type_alias;
+        const formal_params = alias_entry.params;
+        const self_mut: *HirBuilder = @constCast(self);
+
+        // Cycle guard.
+        for (self.alias_resolution_stack.items) |in_flight| {
+            if (in_flight == alias_entry_id) return types_mod.TypeStore.UNKNOWN;
+        }
+        self_mut.alias_resolution_stack.append(self.allocator, alias_entry_id) catch return types_mod.TypeStore.UNKNOWN;
+        defer _ = self_mut.alias_resolution_stack.pop();
+
+        // Non-parameterized alias: resolve the body directly. (Argument-
+        // arity mistakes are diagnosed by the type checker; HIR resolution
+        // stays total.)
+        if (formal_params.len == 0) {
+            return self.resolveTypeExpr(body);
+        }
+
+        // Parameterized alias: resolve args in the caller scope, then
+        // install the formals in a fresh `hir_type_var_scope` overlay so
+        // the body sees only its own parameters.
+        const bind_count = @min(formal_params.len, tn.args.len);
+        const resolved_args = self.allocator.alloc(types_mod.TypeId, bind_count) catch return types_mod.TypeStore.UNKNOWN;
+        defer self.allocator.free(resolved_args);
+        for (0..bind_count) |index| {
+            resolved_args[index] = self.resolveTypeExpr(tn.args[index]);
+        }
+
+        const saved_scope = self_mut.hir_type_var_scope;
+        self_mut.hir_type_var_scope = std.StringHashMap(types_mod.TypeId).init(self.allocator);
+        defer {
+            self_mut.hir_type_var_scope.deinit();
+            self_mut.hir_type_var_scope = saved_scope;
+        }
+        for (0..bind_count) |index| {
+            const formal_name = self.interner.get(formal_params[index].name);
+            self_mut.hir_type_var_scope.put(formal_name, resolved_args[index]) catch {};
+        }
+        return self.resolveTypeExpr(body);
+    }
+
     fn resolveTypeExpr(self: *const HirBuilder, type_expr: *const ast.TypeExpr) TypeId {
         return switch (type_expr.*) {
             .name => |n| {
@@ -7009,6 +7090,18 @@ pub const HirBuilder = struct {
                         }) catch types_mod.TypeStore.UNKNOWN;
                     }
                 }
+
+                // `type` alias — substitute the alias body so the lowered
+                // type matches the type-checker's resolution (same
+                // structurally-deduped TypeId as the body inline), with
+                // parameter substitution and cycle detection. After the
+                // builtin/nominal/protocol checks so an alias never shadows
+                // them; before the UNKNOWN fall-through so a registered
+                // alias resolves instead of degrading to void.
+                if (self.findTypeAliasEntry(n.name)) |alias_entry_id| {
+                    return self.resolveTypeAliasRef(alias_entry_id, n);
+                }
+
                 return types_mod.TypeStore.UNKNOWN;
             },
             .never => types_mod.TypeStore.NEVER,

@@ -82,8 +82,15 @@ pub fn build(b: *std.Build) void {
     // -----------------------------------------------------------------------
     // Test steps (no native deps needed)
     // -----------------------------------------------------------------------
+    // Optional name substring filter for the primary module test binary,
+    // forwarded to Zig's test runner. Pass `-Dtest-filter=<substring>` to
+    // run only matching tests (e.g. iterating on one feature) without
+    // recompiling the whole suite every run. Absent (the default), every
+    // test runs.
+    const test_filter = b.option([]const u8, "test-filter", "Run only tests whose name contains this substring");
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .filters = if (test_filter) |f| &.{f} else &.{},
     });
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");
