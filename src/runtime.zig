@@ -5013,24 +5013,28 @@ pub const ArcRuntime = struct {
             },
             .pointer => |p| {
                 if (p.size == .one) {
-                    // A single-item owned pointer is either an inline-header
-                    // List/Map-class cell or a side-table `Arc(T)` /
-                    // indirect-storage struct cell. Inline-header cells carry
-                    // their own structural sharing (buffers, chains) that a
-                    // generic field-walk cannot safely duplicate; cloning one
-                    // correctly requires the cell type's own deep-copy, which
-                    // does not yet exist. A boxed closure that CAPTURES a
-                    // List/Map is therefore out of scope for clone-on-share —
-                    // fail loudly at compile time for env types that contain
-                    // one rather than silently shallow-share a cell two owners
-                    // would each free (a double-free under no-REFCOUNT_V1).
                     if (comptime hasInlineArcHeader(p.child)) {
-                        @compileError(
-                            "cloneChildrenAnyInPlace: clone-on-share does not yet support a captured " ++
-                                "inline-header cell (" ++ @typeName(p.child) ++ ", e.g. List/Map) inside a " ++
-                                "shared boxed existential; the cell type needs its own deep-copy primitive " ++
-                                "(FCC Phase 3 follow-up).",
-                        );
+                        // An inline-header List/Map-class cell (a captured
+                        // `List(t)` / `Map(k, v)`). These carry their own
+                        // structural sharing (buffers, chains) that a generic
+                        // field-walk cannot duplicate, so the cloned env keeps
+                        // the SAME cell pointer and instead registers a new
+                        // persistent owner via the cell's refcount. This is
+                        // balanced under BOTH managers:
+                        //   * REFCOUNT_V1 — `retainAnyPersistent` bumps the
+                        //     cell's refcount, so the cloned env is a real
+                        //     second owner the last drop reclaims.
+                        //   * no-REFCOUNT_V1 — the bump is a no-op, BUT an
+                        //     inline-header cell is never eagerly freed under
+                        //     no-REFCOUNT_V1 (`ArcHeaderEmpty.release` always
+                        //     returns false; the cell is reclaimed at teardown,
+                        //     not per-drop), so two envs aliasing the same cell
+                        //     cannot double-free it. Unlike a boxed-existential
+                        //     inner — which IS eagerly freed and so must be
+                        //     cloned — a shared List/Map child is sound to
+                        //     alias here.
+                        retainAnyPersistent(@as(*const p.child, @constCast(field_ptr.*)));
+                        return;
                     }
                     // Indirect-storage / side-table ARC struct: allocate an
                     // independent cell, bit-copy the pointee, then recurse to
