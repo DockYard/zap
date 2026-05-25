@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# FCC Phase 2 acceptance harness — a boxed `Callable` closure's captured
+# environment is heap-allocated and released EXACTLY ONCE at scope exit under
+# BOTH `Memory.ARC` and `-Dmemory=Memory.Tracking`, deep-dropping captured ARC
+# values, with no leak and no double-free. Exits non-zero on any mismatch.
+#
+# Usage: script_fixtures/run_fcc_phase2_acceptance.sh
+# Requires `zig-out/bin/zap` to be freshly built.
+set -u
+cd "$(dirname "$0")/.."
+
+ZAP=./zig-out/bin/zap
+unset ZAP_ZIG_LIB_DIR ZIG_LIB_DIR ZAP_ERROR_FORMAT ZAP_LEAKS_FATAL
+rm -rf "${HOME}/.cache/zap/scripts" 2>/dev/null || true
+
+fail=0
+DIR=script_fixtures/fcc_phase2
+
+# run_clean "<fixture>" "<expected-substr-1>" ["<expected-substr-2>" ...]
+# Asserts, under BOTH managers, that the fixture prints the expected lines,
+# leaves ZERO leaks, and triggers no double-free / use-after-free canary.
+run_clean() {
+  local fixture="$1"; shift
+  for mgr in "" "-Dmemory=Memory.Tracking"; do
+    local label="${mgr:-Memory.ARC}"
+    local out
+    out=$("$ZAP" run $mgr "$DIR/$fixture" 2>&1)
+    for needle in "$@"; do
+      if printf '%s' "$out" | grep -qF -- "$needle"; then
+        echo "  PASS: $fixture [$label] prints '$needle'"
+      else
+        echo "  FAIL: $fixture [$label] missing '$needle'"; fail=1
+      fi
+    done
+    for bad in "memory leak:" "INVALID FREE" "invalid free" "USE-AFTER-FREE" "double fault" "panic: reached"; do
+      if printf '%s' "$out" | grep -qF -- "$bad"; then
+        echo "  FAIL: $fixture [$label] hit '$bad'"; fail=1
+      fi
+    done
+  done
+}
+
+echo "== FCC Phase 2: boxed closure environments released exactly once =="
+run_clean capture_i64_dropped.zap "15"
+run_clean capture_string_deep_drop.zap "hello world"
+run_clean heterogeneous_list_dropped.zap "11" "15"
+
+echo
+if [ "$fail" -eq 0 ]; then
+  echo "FCC PHASE 2 ACCEPTANCE: ALL PASS"
+else
+  echo "FCC PHASE 2 ACCEPTANCE: FAILURES ABOVE"
+fi
+exit "$fail"

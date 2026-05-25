@@ -42,5 +42,23 @@ pub struct Zap.ClosureBoxedTest {
       assert(f0(10) == 11)
       assert(f1(10) == 15)
     }
+
+    test("boxed closure environment is released exactly once (no leak)") {
+      # FCC Phase 2 — proves the leak subsystem now covers boxed `Callable`
+      # closures: a capturing closure (its boxed environment) and a
+      # heterogeneous list of boxed closures are constructed and invoked
+      # inside the block, then go out of scope. The net live-allocation
+      # delta must be zero — the boxed environments are reclaimed by the
+      # scope-exit `__box_header__.drop`. Active under `Memory.Tracking`
+      # (where the live-allocation checkpoint is observable); a documented
+      # no-op pass under the default `Memory.ARC` corpus manager.
+      assert_no_leaks {
+        add5 = Zap.ClosureFactory.make_adder(5)
+        assert(add5(10) == 15)
+        ops = Zap.ClosureFactory.adders()
+        first = List.get(ops, 0)
+        assert(first(10) == 11)
+      }
+    }
   }
 }
