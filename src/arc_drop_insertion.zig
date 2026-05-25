@@ -2049,15 +2049,104 @@ fn isBorrowedLocal(
 /// `kind != .release` skip-check fires.
 pub fn rewriteProtocolBoxReleases(function: *ir.Function) void {
     if (function.protocol_box_locals.count() == 0) return;
+
+    // FCC Phase 2 clone-on-share: to decide whether a PERSISTENT box retain
+    // is a genuine new-owner SHARE (needs `.protocol_box_share` — a clone
+    // under no-REFCOUNT_V1) or a transient borrow (`.protocol_box_retain` —
+    // a plain refcount bump, balanced by its paired post-call release), the
+    // rewrite needs whole-function visibility: a genuine new owner is a box
+    // value that is bound to a NAMED local (it appears as a `local_set.value`,
+    // e.g. `also = add5` lowers to `copy_value %4 <- %0; retain %4; local_set
+    // %1 <- %4`), whereas a transient dispatch/call receiver is consumed
+    // in-place and never re-bound. Collect the set of box locals that flow
+    // into a `local_set` once, up front, then consult it per retain.
+    var binding_targets: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+    defer binding_targets.deinit(std.heap.page_allocator);
+    collectLocalSetValueLocals(function.body, &binding_targets);
+
     for (function.body) |*block_const| {
         const block: *ir.Block = @constCast(block_const);
-        rewriteProtocolBoxReleasesInStream(function, @constCast(block.instructions));
+        rewriteProtocolBoxReleasesInStream(function, @constCast(block.instructions), &binding_targets);
+    }
+}
+
+/// Collect every local that appears as the `value` operand of a `local_set`
+/// anywhere in the function body (recursing into nested control-flow
+/// streams). Used by `rewriteProtocolBoxReleases` to recognise a box value
+/// that becomes a named binding (a genuine new owner) versus a transient
+/// borrow consumed in place.
+fn collectLocalSetValueLocals(
+    blocks: []const ir.Block,
+    out: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+) void {
+    for (blocks) |block| {
+        collectLocalSetValueLocalsInStream(block.instructions, out);
+    }
+}
+
+fn collectLocalSetValueLocalsInStream(
+    stream: []const ir.Instruction,
+    out: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+) void {
+    // Mirror the nested-stream traversal of `rewriteProtocolBoxReleasesInStream`
+    // exactly so a `local_set` buried in any control-flow arm is observed.
+    for (stream) |instr| {
+        switch (instr) {
+            .local_set => |ls| out.put(std.heap.page_allocator, ls.value, {}) catch {},
+            .if_expr => |ie| {
+                collectLocalSetValueLocalsInStream(ie.then_instrs, out);
+                collectLocalSetValueLocalsInStream(ie.else_instrs, out);
+            },
+            .case_block => |cb| {
+                collectLocalSetValueLocalsInStream(cb.pre_instrs, out);
+                for (cb.arms) |arm| {
+                    collectLocalSetValueLocalsInStream(arm.cond_instrs, out);
+                    collectLocalSetValueLocalsInStream(arm.body_instrs, out);
+                }
+                collectLocalSetValueLocalsInStream(cb.default_instrs, out);
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |c| {
+                    collectLocalSetValueLocalsInStream(c.body_instrs, out);
+                }
+                collectLocalSetValueLocalsInStream(sl.default_instrs, out);
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| {
+                    collectLocalSetValueLocalsInStream(c.body_instrs, out);
+                }
+                collectLocalSetValueLocalsInStream(sr.default_instrs, out);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| {
+                    collectLocalSetValueLocalsInStream(c.body_instrs, out);
+                }
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| {
+                    collectLocalSetValueLocalsInStream(c.body_instrs, out);
+                }
+            },
+            .optional_dispatch => |od| {
+                collectLocalSetValueLocalsInStream(od.nil_instrs, out);
+                collectLocalSetValueLocalsInStream(od.struct_instrs, out);
+            },
+            .guard_block => |gb| {
+                collectLocalSetValueLocalsInStream(gb.body, out);
+            },
+            .try_call_named => |tc| {
+                collectLocalSetValueLocalsInStream(tc.handler_instrs, out);
+                collectLocalSetValueLocalsInStream(tc.success_instrs, out);
+            },
+            else => {},
+        }
     }
 }
 
 fn rewriteProtocolBoxReleasesInStream(
     function: *const ir.Function,
     stream: []ir.Instruction,
+    binding_targets: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
 ) void {
     for (stream) |*instr_ptr| {
         switch (instr_ptr.*) {
@@ -2072,72 +2161,103 @@ fn rewriteProtocolBoxReleasesInStream(
             },
             // Symmetric to the release rewrite: a `.retain` of a known
             // protocol-box local must route through the synthetic
-            // `<Protocol>VTable.retain(box)` helper, not the generic
-            // `retainAny`/`retainAnyPersistent` dispatchers (both
+            // `<Protocol>VTable.{retain,share}(box)` helpers, not the
+            // generic `retainAny`/`retainAnyPersistent` dispatchers (both
             // `@compileError` on a 16-byte `ProtocolBox` value — they
-            // accept only single-item pointers). BOTH the transient
-            // `.normal` retain (borrow / call-arg share) and the
-            // `.persistent` retain (box stashed into struct-field /
-            // container storage, e.g. `%Outer{cause: Option.Some(box)}`)
-            // must be flipped: a ProtocolBox carries no inline ArcHeader,
-            // so there is no separate persistent retain semantics — the
-            // box's vtable `retain` bumps the inner's refcount either way.
-            // Already-rewritten `.protocol_box_retain` retains are left
-            // alone (idempotent re-run guard).
+            // accept only single-item pointers).
+            //
+            // FCC Phase 2 distinguishes the two retain PURPOSES that the
+            // generic ARC pipeline records on the box local, because under
+            // a no-REFCOUNT_V1 manager they need different handling:
+            //   * `.normal` — a TRANSIENT borrow (call-argument share)
+            //     balanced by a matching post-call `.release`. Flip to
+            //     `.protocol_box_retain` (a real refcount bump under a
+            //     refcount manager; a no-op under no-REFCOUNT_V1, where the
+            //     paired release is also elided). NO clone.
+            //   * `.persistent` — a genuine SECOND OWNER with its own
+            //     scope-exit `.protocol_box_drop` (a binding alias `g = f`,
+            //     a box stashed into a struct field). Flip to
+            //     `.protocol_box_share`, which under no-REFCOUNT_V1 CLONES
+            //     the inner and rebinds the new owner so each owner frees
+            //     its own inner exactly once (no double-free under
+            //     `Memory.Tracking`). Cloning a transient borrow instead
+            //     would leak (its drop is the borrow site's, not a
+            //     scope-exit owner drop).
+            // Already-rewritten box retains are left alone (idempotent
+            // re-run guard).
             .retain => |ret| {
-                if (ret.kind == .protocol_box_retain) continue;
+                if (ret.kind == .protocol_box_retain or ret.kind == .protocol_box_share) continue;
                 const protocol_name = function.protocol_box_locals.get(ret.value) orelse continue;
+                // A `.persistent` box retain becomes a genuine new-owner SHARE
+                // (clone under no-REFCOUNT_V1) ONLY when its value is bound to a
+                // named local — it appears as a `local_set.value`. A
+                // `.persistent` retain on a box that is consumed in place (a
+                // dispatch/call receiver the conservative classifier copied
+                // rather than borrowed) is NOT a new owner: its scope-exit drop
+                // is suppressed as a transient, so cloning it would leak.
+                // Treat such an in-place `.persistent` box retain as a plain
+                // `.protocol_box_retain` (refcount bump under a refcount
+                // manager; no-op under no-REFCOUNT_V1, balanced by the
+                // transient's suppressed release).
+                const box_kind: ir.RetainKind = switch (ret.kind) {
+                    .persistent => if (binding_targets.contains(ret.value))
+                        .protocol_box_share
+                    else
+                        .protocol_box_retain,
+                    .normal => .protocol_box_retain,
+                    .protocol_box_retain, .protocol_box_share => unreachable,
+                };
                 instr_ptr.* = .{ .retain = .{
                     .value = ret.value,
-                    .kind = .protocol_box_retain,
+                    .kind = box_kind,
                     .protocol_name = protocol_name,
                 } };
             },
             .if_expr => |*ie| {
-                rewriteProtocolBoxReleasesInStream(function, @constCast(ie.then_instrs));
-                rewriteProtocolBoxReleasesInStream(function, @constCast(ie.else_instrs));
+                rewriteProtocolBoxReleasesInStream(function, @constCast(ie.then_instrs), binding_targets);
+                rewriteProtocolBoxReleasesInStream(function, @constCast(ie.else_instrs), binding_targets);
             },
             .case_block => |*cb| {
-                rewriteProtocolBoxReleasesInStream(function, @constCast(cb.pre_instrs));
+                rewriteProtocolBoxReleasesInStream(function, @constCast(cb.pre_instrs), binding_targets);
                 for (cb.arms) |*arm_const| {
                     const arm: *ir.IrCaseArm = @constCast(arm_const);
-                    rewriteProtocolBoxReleasesInStream(function, @constCast(arm.cond_instrs));
-                    rewriteProtocolBoxReleasesInStream(function, @constCast(arm.body_instrs));
+                    rewriteProtocolBoxReleasesInStream(function, @constCast(arm.cond_instrs), binding_targets);
+                    rewriteProtocolBoxReleasesInStream(function, @constCast(arm.body_instrs), binding_targets);
                 }
-                rewriteProtocolBoxReleasesInStream(function, @constCast(cb.default_instrs));
+                rewriteProtocolBoxReleasesInStream(function, @constCast(cb.default_instrs), binding_targets);
             },
             .switch_literal => |*sl| {
                 for (sl.cases) |*c| {
-                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs));
+                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs), binding_targets);
                 }
-                rewriteProtocolBoxReleasesInStream(function, @constCast(sl.default_instrs));
+                rewriteProtocolBoxReleasesInStream(function, @constCast(sl.default_instrs), binding_targets);
             },
             .switch_return => |*sr| {
                 for (sr.cases) |*c| {
-                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs));
+                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs), binding_targets);
                 }
-                rewriteProtocolBoxReleasesInStream(function, @constCast(sr.default_instrs));
+                rewriteProtocolBoxReleasesInStream(function, @constCast(sr.default_instrs), binding_targets);
             },
             .union_switch_return => |*usr| {
                 for (usr.cases) |*c| {
-                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs));
+                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs), binding_targets);
                 }
             },
             .union_switch => |*us| {
                 for (us.cases) |*c| {
-                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs));
+                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs), binding_targets);
                 }
             },
             .optional_dispatch => |*od| {
-                rewriteProtocolBoxReleasesInStream(function, @constCast(od.nil_instrs));
-                rewriteProtocolBoxReleasesInStream(function, @constCast(od.struct_instrs));
+                rewriteProtocolBoxReleasesInStream(function, @constCast(od.nil_instrs), binding_targets);
+                rewriteProtocolBoxReleasesInStream(function, @constCast(od.struct_instrs), binding_targets);
             },
             .guard_block => |*gb| {
-                rewriteProtocolBoxReleasesInStream(function, @constCast(gb.body));
+                rewriteProtocolBoxReleasesInStream(function, @constCast(gb.body), binding_targets);
             },
             .try_call_named => |*tc| {
-                rewriteProtocolBoxReleasesInStream(function, @constCast(tc.handler_instrs));
-                rewriteProtocolBoxReleasesInStream(function, @constCast(tc.success_instrs));
+                rewriteProtocolBoxReleasesInStream(function, @constCast(tc.handler_instrs), binding_targets);
+                rewriteProtocolBoxReleasesInStream(function, @constCast(tc.success_instrs), binding_targets);
             },
             else => {},
         }

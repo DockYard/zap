@@ -999,15 +999,32 @@ pub const ProtocolBoxVTableHeader = extern struct {
     /// impl's `__vtable_adapter__…____drop__`, which calls
     /// `ArcRuntime.releaseProtocolBoxInner`.
     drop: *const fn (data_ptr: ?*anyopaque) callconv(.c) void,
+
+    /// Type-erased deep-clone of the box's inner value (FCC Phase 2
+    /// clone-on-share). Allocates an INDEPENDENT inner cell through the
+    /// active manager and deep-clones the inner's ARC children, returning
+    /// the new cell's erased `data_ptr`. The per-impl adapter
+    /// (`__vtable_adapter__…____clone__`) recovers the concrete `*T` and
+    /// routes through `ArcRuntime.cloneProtocolBoxInner`.
+    ///
+    /// Used by the share path under a NO-REFCOUNT_V1 manager: a boxed
+    /// existential has no inline `ArcHeader`, so a second owner cannot be
+    /// represented by a refcount bump (there is no refcount). Instead the
+    /// new owner receives a cloned inner so each owner's scope-exit drop
+    /// frees its OWN inner exactly once — no double-free under
+    /// `Memory.Tracking`, no leak. Under a REFCOUNT_V1 manager the share
+    /// path uses `retain` (refcount bump) and never calls `clone`.
+    clone: *const fn (data_ptr: ?*anyopaque) callconv(.c) ?*anyopaque,
 };
 
 comptime {
     // The header is the runtime side of a layout contract baked into the
     // synthetic vtable emission. Construction- and consumption-site
     // codegen, plus the generic deep-walk's `@ptrCast` recovery, all
-    // assume `retain` at offset 0 and `drop` immediately after.
-    if (@sizeOf(ProtocolBoxVTableHeader) != 2 * @sizeOf(*anyopaque)) @compileError(
-        "runtime: ProtocolBoxVTableHeader must be exactly two fn-pointers wide",
+    // assume `retain` at offset 0, `drop` immediately after, and `clone`
+    // third.
+    if (@sizeOf(ProtocolBoxVTableHeader) != 3 * @sizeOf(*anyopaque)) @compileError(
+        "runtime: ProtocolBoxVTableHeader must be exactly three fn-pointers wide",
     );
     if (@offsetOf(ProtocolBoxVTableHeader, "retain") != 0) @compileError(
         "runtime: ProtocolBoxVTableHeader.retain must be at offset 0 — the " ++
@@ -1015,6 +1032,9 @@ comptime {
     );
     if (@offsetOf(ProtocolBoxVTableHeader, "drop") != @sizeOf(*anyopaque)) @compileError(
         "runtime: ProtocolBoxVTableHeader.drop must immediately follow retain",
+    );
+    if (@offsetOf(ProtocolBoxVTableHeader, "clone") != 2 * @sizeOf(*anyopaque)) @compileError(
+        "runtime: ProtocolBoxVTableHeader.clone must immediately follow drop",
     );
 }
 
@@ -4438,7 +4458,7 @@ pub const ArcRuntime = struct {
     /// (`?*anyopaque`) as a single-item Arc pointer and try to release a
     /// raw `anyopaque` cell. Every deep-walk entry point checks this
     /// FIRST and routes the box through its vtable header instead.
-    fn isProtocolBox(comptime T: type) bool {
+    pub fn isProtocolBox(comptime T: type) bool {
         return T == ProtocolBox;
     }
 
@@ -4530,7 +4550,7 @@ pub const ArcRuntime = struct {
     /// `List(T)`). Inline-header types bypass the side-table refcount
     /// path entirely: their refcount lives in the cell's own `header`
     /// field, allocated and freed through the type's bespoke pool.
-    fn hasInlineArcHeader(comptime T: type) bool {
+    pub fn hasInlineArcHeader(comptime T: type) bool {
         const info = @typeInfo(T);
         if (info != .@"struct") return false;
         if (info.@"struct".fields.len == 0) return false;
@@ -4874,6 +4894,158 @@ pub const ArcRuntime = struct {
         const vtable_erased = box.vtable orelse return;
         const header: *const ProtocolBoxVTableHeader = @ptrCast(@alignCast(vtable_erased));
         header.retain(box.data_ptr);
+    }
+
+    /// Deep-clone a `ProtocolBox`'s inner value through a typed pointer
+    /// (FCC Phase 2 clone-on-share). Allocates an INDEPENDENT inner cell
+    /// of the concrete inner type `InnerT` through the active manager
+    /// (`allocAny`, which bit-copies the source inner) and then deep-clones
+    /// the new cell's ARC-managed children in place (`cloneChildrenAnyInPlace`)
+    /// so the clone shares NO heap-owned descendant with the source. Returns
+    /// the fresh `*InnerT`; the caller wraps it in a new box that reuses the
+    /// SAME (static, `.rodata`) vtable pointer.
+    ///
+    /// The per-impl synthetic vtable file generates one
+    /// `__vtable_adapter__<Target>____clone__(data_ptr: ?*anyopaque) ?*anyopaque`
+    /// per impl; that adapter casts `data_ptr` back to `*InnerT` and calls
+    /// this helper. Symmetric with `releaseProtocolBoxInner` /
+    /// `retainProtocolBoxInner`: the same set of ARC children the drop glue
+    /// would deep-release, this helper deep-clones.
+    ///
+    /// Why a clone instead of a refcount bump: a boxed existential's inner
+    /// is allocated through `allocAny` with NO inline `ArcHeader` accessible
+    /// to the share path, and under a no-REFCOUNT_V1 manager there is no
+    /// refcount at all. A second owner therefore cannot be expressed as a
+    /// `+1` on a shared cell — it must own an independent inner so each
+    /// owner's scope-exit `__drop__` frees exactly one inner. This mirrors
+    /// the principle that under no-REFCOUNT_V1 each owner of an ARC value
+    /// must reach a single, unambiguous free.
+    pub inline fn cloneProtocolBoxInner(
+        comptime InnerT: type,
+        allocator: std.mem.Allocator,
+        inner_ptr_typed: *InnerT,
+    ) *InnerT {
+        const cloned = allocAny(InnerT, allocator, inner_ptr_typed.*);
+        cloneChildrenAnyInPlace(InnerT, allocator, cloned);
+        return cloned;
+    }
+
+    /// Deep-clone a `ProtocolBox` VALUE, returning an independent box that
+    /// owns a freshly-cloned inner and reuses the SAME vtable pointer (the
+    /// vtable is a compile-time `.rodata` constant, never owned — only the
+    /// inner data is cloned). Type-erased counterpart of
+    /// `retainProtocolBoxValue`: recovers the `ProtocolBoxVTableHeader` from
+    /// `box.vtable` and invokes the header's `clone(box.data_ptr)` slot,
+    /// which routes through the per-impl `__vtable_adapter__…____clone__`.
+    ///
+    /// `None` boxes (`data_ptr == null`) clone to themselves (an absent box
+    /// owns nothing). Used by the box-LOCAL `.protocol_box_retain` share
+    /// lowering under a no-REFCOUNT_V1 manager and by the generic ARC
+    /// field-walk when a container holding a box is itself cloned.
+    pub inline fn cloneProtocolBoxValue(box: ProtocolBox) ProtocolBox {
+        if (box.data_ptr == null) return box;
+        const vtable_erased = box.vtable orelse return box;
+        const header: *const ProtocolBoxVTableHeader = @ptrCast(@alignCast(vtable_erased));
+        return .{
+            .data_ptr = header.clone(box.data_ptr),
+            .vtable = box.vtable,
+        };
+    }
+
+    /// Deep-clone the ARC-managed children of an aggregate value IN PLACE,
+    /// rewriting each owned child reference so the aggregate shares no
+    /// heap-owned descendant with whatever it was bit-copied from. The exact
+    /// structural mirror of `releaseChildrenAny`: every field shape that the
+    /// release walker would deep-release, this walker deep-clones; every
+    /// shape it would skip (scalars, slices — including `String`, which is a
+    /// `[]const u8` slice into the global runtime arena and is therefore
+    /// safely shared by value), this walker leaves as the bit-copy.
+    ///
+    /// `value` points at a freshly-`allocAny`'d cell whose fields are a
+    /// shallow bit-copy of the source; this routine replaces the
+    /// owned-pointer fields with independent clones.
+    pub fn cloneChildrenAnyInPlace(comptime T: type, allocator: std.mem.Allocator, value: *T) void {
+        // A `ProtocolBox` reached as a top-level subject (the cell IS a box)
+        // routes through its vtable header clone, never the generic field
+        // walk — its `data_ptr`/`vtable` fields are not independently
+        // Arc-managed pointers.
+        if (comptime isProtocolBox(T)) {
+            value.* = cloneProtocolBoxValue(value.*);
+            return;
+        }
+        // Skip the entire walk for types with no ARC children — the bit-copy
+        // is already fully independent.
+        if (comptime !typeHasArcChildren(T)) return;
+        switch (@typeInfo(T)) {
+            .@"struct" => |s| {
+                inline for (s.fields) |field| {
+                    cloneFieldChildInPlace(field.type, allocator, &@field(value, field.name));
+                }
+            },
+            .@"union" => {
+                const active = std.meta.activeTag(value.*);
+                inline for (std.meta.fields(T)) |field| {
+                    if (active == @field(std.meta.Tag(T), field.name)) {
+                        cloneFieldChildInPlace(field.type, allocator, &@field(value, field.name));
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn cloneFieldChildInPlace(
+        comptime FieldType: type,
+        allocator: std.mem.Allocator,
+        field_ptr: *FieldType,
+    ) void {
+        if (comptime isProtocolBox(FieldType)) {
+            field_ptr.* = cloneProtocolBoxValue(field_ptr.*);
+            return;
+        }
+        switch (@typeInfo(FieldType)) {
+            .optional => |opt| {
+                if (field_ptr.*) |inner| {
+                    var tmp: opt.child = inner;
+                    cloneFieldChildInPlace(opt.child, allocator, &tmp);
+                    field_ptr.* = tmp;
+                }
+            },
+            .pointer => |p| {
+                if (p.size == .one) {
+                    // A single-item owned pointer is either an inline-header
+                    // List/Map-class cell or a side-table `Arc(T)` /
+                    // indirect-storage struct cell. Inline-header cells carry
+                    // their own structural sharing (buffers, chains) that a
+                    // generic field-walk cannot safely duplicate; cloning one
+                    // correctly requires the cell type's own deep-copy, which
+                    // does not yet exist. A boxed closure that CAPTURES a
+                    // List/Map is therefore out of scope for clone-on-share —
+                    // fail loudly at compile time for env types that contain
+                    // one rather than silently shallow-share a cell two owners
+                    // would each free (a double-free under no-REFCOUNT_V1).
+                    if (comptime hasInlineArcHeader(p.child)) {
+                        @compileError(
+                            "cloneChildrenAnyInPlace: clone-on-share does not yet support a captured " ++
+                                "inline-header cell (" ++ @typeName(p.child) ++ ", e.g. List/Map) inside a " ++
+                                "shared boxed existential; the cell type needs its own deep-copy primitive " ++
+                                "(FCC Phase 3 follow-up).",
+                        );
+                    }
+                    // Indirect-storage / side-table ARC struct: allocate an
+                    // independent cell, bit-copy the pointee, then recurse to
+                    // clone ITS owned children.
+                    const fresh = allocAny(p.child, allocator, field_ptr.*.*);
+                    cloneChildrenAnyInPlace(p.child, allocator, fresh);
+                    field_ptr.* = fresh;
+                }
+            },
+            // A nested by-value aggregate (struct or `union(enum)`) is walked
+            // recursively so a `ProtocolBox` or indirect-storage pointer
+            // buried inside it still gets cloned.
+            .@"struct", .@"union" => cloneChildrenAnyInPlace(FieldType, allocator, field_ptr),
+            else => {},
+        }
     }
 
     /// Deep-release a `ProtocolBox` value reached by the generic ARC

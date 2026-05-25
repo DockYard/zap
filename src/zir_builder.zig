@@ -2144,6 +2144,45 @@ pub const ZirDriver = struct {
         try buf.appendSlice(self.allocator, "    }\n");
         try buf.appendSlice(self.allocator, "}\n\n");
 
+        // `clone(box) zap_runtime.ProtocolBox` — FCC Phase 2 clone-on-share.
+        // Deep-clones the box's inner value and returns a NEW box that owns
+        // the independent inner and reuses the SAME (static `.rodata`) vtable
+        // pointer. Recovers the vtable cast and invokes the synthetic
+        // `__clone__` slot. `None` boxes clone to themselves.
+        try buf.appendSlice(self.allocator, "pub fn clone(box: zap_runtime.ProtocolBox) zap_runtime.ProtocolBox {\n");
+        try buf.appendSlice(self.allocator, "    if (box.data_ptr == null) return box;\n");
+        try buf.appendSlice(self.allocator, "    if (box.vtable) |vt_erased| {\n");
+        try buf.appendSlice(self.allocator, "        const vt: *const ");
+        try buf.appendSlice(self.allocator, type_def.name);
+        try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(vt_erased));\n");
+        try buf.appendSlice(self.allocator, "        return .{ .data_ptr = vt.__box_header__.clone(box.data_ptr), .vtable = box.vtable };\n");
+        try buf.appendSlice(self.allocator, "    }\n");
+        try buf.appendSlice(self.allocator, "    return box;\n");
+        try buf.appendSlice(self.allocator, "}\n\n");
+
+        // `share(box) zap_runtime.ProtocolBox` — the single chokepoint the
+        // box-local `.protocol_box_retain` share lowering calls when a box
+        // gains a second owner. Comptime-specialized on the active manager's
+        // REFCOUNT_V1 capability:
+        //   * REFCOUNT_V1 manager — bump the inner's refcount and return the
+        //     SAME box; the two owners share one refcounted inner that the
+        //     last drop frees. (Identity rebind at the call site.)
+        //   * no-REFCOUNT_V1 manager — there is no refcount, so a second
+        //     owner of the same inner would double-free at scope exit. Return
+        //     an independent CLONE so each owner drops its own inner exactly
+        //     once (no double-free under `Memory.Tracking`, no leak).
+        // Keeping the policy inside this comptime-specialized helper lets the
+        // `.protocol_box_retain` ZIR handler stay uniform: it always rebinds
+        // the new owner local to `share(box)`.
+        try buf.appendSlice(self.allocator, "pub fn share(box: zap_runtime.ProtocolBox) zap_runtime.ProtocolBox {\n");
+        try buf.appendSlice(self.allocator, "    if (comptime zap_runtime.refcount_v1_active) {\n");
+        try buf.appendSlice(self.allocator, "        retain(box);\n");
+        try buf.appendSlice(self.allocator, "        return box;\n");
+        try buf.appendSlice(self.allocator, "    } else {\n");
+        try buf.appendSlice(self.allocator, "        return clone(box);\n");
+        try buf.appendSlice(self.allocator, "    }\n");
+        try buf.appendSlice(self.allocator, "}\n\n");
+
         // `dispatch_<method>(box, args...) RT`
         for (vt_def.methods) |method| {
             try buf.appendSlice(self.allocator, "pub fn dispatch_");
@@ -2388,6 +2427,27 @@ pub const ZirDriver = struct {
         try buf.appendSlice(self.allocator, ", inner);\n");
         try buf.appendSlice(self.allocator, "}\n\n");
 
+        // Synthetic `__clone__` adapter — FCC Phase 2 clone-on-share. Casts
+        // the box's erased `data_ptr` back to a mutable `*<Target>` and
+        // routes through `zap_runtime.ArcRuntime.cloneProtocolBoxInner`,
+        // which allocates an independent inner cell and deep-clones its ARC
+        // children. Returns the fresh inner as an erased pointer; the box's
+        // `clone`/`share` helper wraps it with the same vtable. The
+        // `std.heap.page_allocator` argument is vestigial in the
+        // manager-routed `allocAny` path (see the `allocAny` header), exactly
+        // as for `__drop__`'s `releaseProtocolBoxInner` call.
+        try buf.appendSlice(self.allocator, "fn __vtable_adapter__");
+        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, "____clone__(data_ptr: ?*anyopaque) callconv(.c) ?*anyopaque {\n");
+        try buf.appendSlice(self.allocator, "    const inner: *");
+        try buf.appendSlice(self.allocator, target_type_ref);
+        try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(data_ptr.?));\n");
+        try buf.appendSlice(self.allocator, "    const cloned = zap_runtime.ArcRuntime.cloneProtocolBoxInner(");
+        try buf.appendSlice(self.allocator, target_type_ref);
+        try buf.appendSlice(self.allocator, ", std.heap.page_allocator, inner);\n");
+        try buf.appendSlice(self.allocator, "    return @ptrCast(cloned);\n");
+        try buf.appendSlice(self.allocator, "}\n\n");
+
         // Declare the per-impl vtable instance constant. Phase
         // 1.2.5.c populates each slot with the address of the
         // corresponding adapter function so the box's runtime
@@ -2424,6 +2484,9 @@ pub const ZirDriver = struct {
         try buf.appendSlice(self.allocator, "        .drop = &__vtable_adapter__");
         try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
         try buf.appendSlice(self.allocator, "____drop__,\n");
+        try buf.appendSlice(self.allocator, "        .clone = &__vtable_adapter__");
+        try appendZigIdentifier(self.allocator, &buf, inst_def.target_type_name);
+        try buf.appendSlice(self.allocator, "____clone__,\n");
         try buf.appendSlice(self.allocator, "    },\n");
         try buf.appendSlice(self.allocator, "};\n\n");
 
@@ -9055,6 +9118,53 @@ pub const ZirDriver = struct {
                     return;
                 }
 
+                // FCC Phase 2 clone-on-share: a PERSISTENT box retain creates a
+                // genuine second owner with its own scope-exit
+                // `.protocol_box_drop`. Route it through the per-protocol
+                // `<Protocol>VTable.share(box)` helper and REBIND the new-owner
+                // local to its result. `share` is comptime-specialized on the
+                // active manager's REFCOUNT_V1 capability — under a refcount
+                // manager it bumps the inner's refcount and returns the SAME box
+                // (the rebind is an identity); under a no-REFCOUNT_V1 manager it
+                // returns an independent CLONE so the new owner drops its own
+                // inner exactly once, never double-freeing the inner the source
+                // owner also frees. Like `.protocol_box_retain` this MUST run
+                // before the `shouldSkipArc` guard: the paired
+                // `.protocol_box_drop` is unconditional, so eliding the
+                // share/clone here would leave the new owner aliasing the
+                // source's inner — a double-free under `Memory.Tracking`.
+                if (ret.kind == .protocol_box_share) {
+                    const protocol_name = ret.protocol_name orelse return error.EmitFailed;
+                    const vtable_module_name = try std.fmt.allocPrint(
+                        self.allocator,
+                        "{s}VTable",
+                        .{protocol_name},
+                    );
+                    defer self.allocator.free(vtable_module_name);
+
+                    const vtable_import = zir_builder_emit_import(
+                        self.handle,
+                        vtable_module_name.ptr,
+                        @intCast(vtable_module_name.len),
+                    );
+                    if (vtable_import == error_ref) return error.EmitFailed;
+
+                    const share_helper = zir_builder_emit_field_val(
+                        self.handle,
+                        vtable_import,
+                        "share",
+                        5,
+                    );
+                    if (share_helper == error_ref) return error.EmitFailed;
+
+                    const box_ref = self.refForLocal(ret.value) catch return;
+                    const share_args = [_]u32{box_ref};
+                    const shared_ref = zir_builder_emit_call_ref(self.handle, share_helper, &share_args, 1);
+                    if (shared_ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(ret.value, shared_ref);
+                    return;
+                }
+
                 if (!self.shouldSkipArc(ret.value)) {
                     // Phase 1 Class A: dispatch on the IR-level kind
                     // enum so callers control the helper choice
@@ -9070,7 +9180,7 @@ pub const ZirDriver = struct {
                     const helper_name: []const u8 = switch (ret.kind) {
                         .normal => "retainAny",
                         .persistent => "retainAnyPersistent",
-                        .protocol_box_retain => unreachable, // handled above
+                        .protocol_box_retain, .protocol_box_share => unreachable, // handled above
                     };
                     const val_ref = self.refForLocal(ret.value) catch return;
 

@@ -2695,7 +2695,26 @@ pub const RetainKind = enum {
     /// `retain(box)` casts the vtable slot to `*const <Protocol>VTable`
     /// and invokes the synthetic `__retain__` slot, which routes the
     /// inner's typed pointer through `retainProtocolBoxInner`.
+    ///
+    /// Used for a TRANSIENT box borrow (a call-argument share whose
+    /// matching post-call `.release` keeps the pair balanced). Under a
+    /// no-REFCOUNT_V1 manager `retain` is a no-op and the borrow is
+    /// balanced by the (also-elided) post-call release — no clone needed.
     protocol_box_retain,
+    /// FCC Phase 2 protocol-existential SHARE — a PERSISTENT box retain
+    /// that creates a genuine second owner with its own scope-exit
+    /// `.protocol_box_drop` (a binding alias `g = f`, a box stashed into a
+    /// struct field). Lowers to the per-protocol synthetic
+    /// `<Protocol>VTable.share(box)` helper and REBINDS the new-owner local
+    /// to its result. `share` is comptime-specialized on the active
+    /// manager's REFCOUNT_V1 capability: under a refcount manager it bumps
+    /// the inner's refcount and returns the SAME box (identity rebind);
+    /// under a no-REFCOUNT_V1 manager it returns an independent CLONE so
+    /// the new owner drops its OWN inner exactly once — no double-free
+    /// under `Memory.Tracking`. Distinct from `.protocol_box_retain`
+    /// because a transient borrow must NOT clone (its drop is paired with
+    /// the borrow site, and a clone there would leak).
+    protocol_box_share,
 };
 
 pub const Retain = struct {
