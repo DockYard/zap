@@ -846,6 +846,28 @@ pub const ProtocolBox = extern struct {
     }
 };
 
+/// The canonical zero-element tuple type — the runtime representation of
+/// the empty Zap tuple `{}` (a genuine zero-arity product type, distinct
+/// from `void`). A `fn() -> R`-typed closure desugars to
+/// `Callable({}, R)`, whose `call` slot takes its arguments packed into
+/// this empty tuple.
+///
+/// WHY a single named type (and not an inline `struct {}` per site): Zig
+/// gives every *separately written* anonymous `struct {}` a DISTINCT
+/// nominal identity, and the empty anonymous-aggregate literal `.{}`
+/// (`@TypeOf(.{})`) does not coerce into any of them. The vtable `call`
+/// slot, the `dispatch_call` helper, the per-impl adapter, the impl's
+/// `args :: {}` parameter, and the call-site argument value are emitted
+/// from FOUR independent synthetic-source / ZIR paths; without one shared
+/// nominal type they never unify (`expected type 'struct {}', found
+/// '@TypeOf(.{})'`). Routing every empty-tuple position through this one
+/// `zap_runtime.EmptyTuple` makes them all reference the same
+/// InternPool type, so a zero-argument boxed `Callable` type-checks and
+/// dispatches end-to-end. Non-empty tuples already unify via Zig's
+/// structural positional-tuple coercion, so only the empty case needs the
+/// named carrier.
+pub const EmptyTuple = struct {};
+
 /// Thread-local raise side-channel (Phase 3.a). `Kernel.recoverable_raise`
 /// stashes the raised `Error` value (a `ProtocolBox` fat pointer) here, then
 /// the IR `try_rescue` lowering emits an `error.ZapRaise` return that unwinds

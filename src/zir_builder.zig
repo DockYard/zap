@@ -211,6 +211,7 @@ extern "c" fn zir_builder_emit_tuple_decl_untracked(handle: ?*ZirBuilderHandle, 
 extern "c" fn zir_builder_ref_to_inst_index(handle: ?*ZirBuilderHandle, ref: u32) u32;
 extern "c" fn zir_builder_get_tuple_return_type(handle: ?*ZirBuilderHandle) u32;
 extern "c" fn zir_builder_emit_struct_init_typed(handle: ?*ZirBuilderHandle, struct_type: u32, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
+extern "c" fn zir_builder_emit_struct_init_empty(handle: ?*ZirBuilderHandle, struct_type: u32) u32;
 extern "c" fn zir_builder_emit_tuple_decl(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) u32;
 extern "c" fn zir_builder_emit_tuple_decl_body(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) u32;
 
@@ -628,17 +629,33 @@ fn appendZigTypeForVTable(
         // A Zap tuple renders as a Zig anonymous tuple type
         // `struct { T0, T1, ... }`. This is the representation of a
         // `Callable` method's `args` parameter (arity-as-tuple): a
-        // zero-arg closure's `{}` becomes `struct {}`, a one-arg `{i64}`
-        // becomes `struct { i64 }`, etc. Rendering it here lets a tuple-
-        // typed protocol method slot (the `call` slot of `Callable`)
-        // type-check against the per-impl adapter.
+        // one-arg `{i64}` becomes `struct { i64 }`, a two-arg
+        // `{i64, String}` becomes `struct { i64, []const u8 }`, etc.
+        // Rendering it here lets a tuple-typed protocol method slot (the
+        // `call` slot of `Callable`) type-check against the per-impl
+        // adapter — a non-empty tuple value unifies with such a slot via
+        // Zig's structural positional-tuple coercion.
+        //
+        // The ZERO-element tuple `{}` (a zero-argument closure's `args`)
+        // is special: a separately written `struct {}` gets a distinct
+        // nominal identity at every emission site and the empty literal
+        // `.{}` will not coerce into it. Render it as the single canonical
+        // `zap_runtime.EmptyTuple` named type so the vtable slot, the
+        // dispatch helper, the per-impl adapter, the impl's `args :: {}`
+        // parameter, and the construction-site value all reference one
+        // shared nominal type and unify. (`zap_runtime` is imported at the
+        // top of every synthetic vtable source file.)
         .tuple => |elements| {
-            try buf.appendSlice(allocator, "struct { ");
-            for (elements, 0..) |elem, i| {
-                if (i > 0) try buf.appendSlice(allocator, ", ");
-                try appendZigTypeForVTable(allocator, buf, elem);
+            if (elements.len == 0) {
+                try buf.appendSlice(allocator, "zap_runtime.EmptyTuple");
+            } else {
+                try buf.appendSlice(allocator, "struct { ");
+                for (elements, 0..) |elem, i| {
+                    if (i > 0) try buf.appendSlice(allocator, ", ");
+                    try appendZigTypeForVTable(allocator, buf, elem);
+                }
+                try buf.appendSlice(allocator, " }");
             }
-            try buf.appendSlice(allocator, " }");
         },
         else => try buf.appendSlice(allocator, "anytype"),
     }
@@ -1130,6 +1147,20 @@ pub const ZirDriver = struct {
     /// tuple_decl with a null operand that crashes Sema's `resolveInst`.
     fn mapTupleElementType(self: *ZirDriver, zig_type: ir.ZigType) u32 {
         if (zig_type == .tuple) {
+            // The zero-element tuple resolves to the canonical
+            // `zap_runtime.EmptyTuple` named type (one shared nominal
+            // identity), not a fresh 0-field `tuple_decl`. Track the
+            // import-field's inst index so the caller hoists it into the
+            // surrounding ret_ty/param support body, mirroring the
+            // non-empty tuple_decl tracking below.
+            if (zig_type.tuple.len == 0) {
+                const empty_ref = self.emitEmptyTupleTypeRef() catch return 0;
+                const idx = zir_builder_ref_to_inst_index(self.handle, empty_ref);
+                if (idx != 0xFFFFFFFF) {
+                    self.pending_ret_ty_untracked.append(self.allocator, idx) catch return 0;
+                }
+                return empty_ref;
+            }
             var inner_refs: std.ArrayListUnmanaged(u32) = .empty;
             defer inner_refs.deinit(self.allocator);
             for (zig_type.tuple) |inner_elem| {
@@ -1177,6 +1208,13 @@ pub const ZirDriver = struct {
             const simple = mapReturnType(zig_type);
             if (simple != 0) return simple;
             return self.emitImportedTypeRef(zig_type) catch 0;
+        }
+        // The zero-element tuple resolves to the canonical
+        // `zap_runtime.EmptyTuple` named type so a body-local empty tuple
+        // shares the same nominal identity as the param/return/vtable
+        // positions.
+        if (zig_type.tuple.len == 0) {
+            return self.emitEmptyTupleTypeRef() catch 0;
         }
         var inner_refs: std.ArrayListUnmanaged(u32) = .empty;
         defer inner_refs.deinit(self.allocator);
@@ -3787,6 +3825,24 @@ pub const ZirDriver = struct {
         return box_ref;
     }
 
+    /// Emit a reference to the canonical zero-element tuple type
+    /// (`@import("zap_runtime").EmptyTuple`). The empty Zap tuple `{}`
+    /// (a zero-argument closure's `Callable` `args`) lowers through this
+    /// ONE named nominal type at every position — param, return, nested
+    /// element, and construction value — so a `fn() -> R` boxed closure's
+    /// `call` slot, dispatch helper, per-impl adapter, impl `args :: {}`
+    /// parameter, and call-site argument all reference the same
+    /// InternPool type and unify. (A separately written `struct {}` gets a
+    /// distinct identity per site and the empty literal `.{}` will not
+    /// coerce into it — see `zap_runtime.EmptyTuple`.)
+    fn emitEmptyTupleTypeRef(self: *ZirDriver) BuildError!u32 {
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+        const empty_ref = zir_builder_emit_field_val(self.handle, rt_import, "EmptyTuple", 10);
+        if (empty_ref == error_ref) return error.EmitFailed;
+        return empty_ref;
+    }
+
     /// Emit `runtime.Term.from(value_ref)` — wraps a concrete value as
     /// a `Term`. Used by collection construction sites whose element
     /// type was promoted to `Term` because the static element types
@@ -4007,6 +4063,31 @@ pub const ZirDriver = struct {
     }
 
     fn emitTupleParam(self: *ZirDriver, param: ir.Param, elements: []const ir.ZigType) !u32 {
+        // The zero-element tuple `{}` (a zero-argument closure's `args`)
+        // is the single canonical `zap_runtime.EmptyTuple` named type, not
+        // a fresh anonymous 0-field `tuple_decl` (which would get a
+        // distinct nominal identity per emission and never unify with the
+        // vtable slot / call-site value). Hoist the import-field's support
+        // instructions into the param's type body, exactly like
+        // `emitProtocolBoxParam`.
+        if (elements.len == 0) {
+            var support_inst_indices: std.ArrayListUnmanaged(u32) = .empty;
+            defer support_inst_indices.deinit(self.allocator);
+            const before = zir_builder_get_body_inst_count(self.handle);
+            const empty_ref = try self.emitEmptyTupleTypeRef();
+            try self.captureBodyInsts(before, &support_inst_indices);
+            const ref = zir_builder_emit_param_type_body(
+                self.handle,
+                param.name.ptr,
+                @intCast(param.name.len),
+                support_inst_indices.items.ptr,
+                @intCast(support_inst_indices.items.len),
+                empty_ref,
+            );
+            if (ref == error_ref) return error.EmitFailed;
+            return ref;
+        }
+
         var support_inst_indices: std.ArrayListUnmanaged(u32) = .empty;
         defer support_inst_indices.deinit(self.allocator);
         var tuple_type_refs: std.ArrayListUnmanaged(u32) = .empty;
@@ -6984,6 +7065,26 @@ pub const ZirDriver = struct {
 
             // Aggregates
             .tuple_init => |ti| {
+                // The zero-element tuple `{}` is the canonical
+                // `zap_runtime.EmptyTuple` named type, constructed as a
+                // typed zero-field struct init `EmptyTuple{}` — NOT the
+                // anonymous empty literal `.{}` (`@TypeOf(.{})`), which
+                // would not coerce into the named `EmptyTuple` the boxed
+                // `Callable` `call` slot / impl param expect. This is the
+                // construction-site half of the empty-tuple
+                // canonicalization (the type positions are handled in
+                // `emitTupleParam` / `mapTupleElementType` /
+                // `appendZigTypeForVTable`). A zero-element tuple holds no
+                // values, so it never participates in Perceus reuse.
+                if (ti.elements.len == 0) {
+                    const empty_ty = try self.emitEmptyTupleTypeRef();
+                    const ref = zir_builder_emit_struct_init_empty(self.handle, empty_ty);
+                    if (ref == error_ref) return error.EmitFailed;
+                    _ = self.reuse_backed_tuple_locals.remove(ti.dest);
+                    try self.setLocal(ti.dest, ref);
+                    return;
+                }
+
                 // Build field names ("0", "1", "2", ...) and value refs.
                 // When the tuple's component type at index i is `.term`,
                 // wrap the value via `Term.from(value)` so heterogeneous
