@@ -83,5 +83,55 @@ pub struct Zap.ClosureBoxedTest {
         assert(picked(10) == 15)
       }
     }
+
+    test("partially-consumed list of boxed closures is leak-free") {
+      # FCC Phase 2 gap — the canonical leaking case. A three-element
+      # `[fn(i64) -> i64]` list is built; only the first element is extracted
+      # and invoked. The list then drops with elements 1 and 2 un-extracted.
+      # Before the box-in-container deep-release fix those two boxed
+      # environments leaked under `Memory.Tracking` (List release never
+      # deep-released its box elements; only extracted owners freed them). Now
+      # the list-drop deep-releases the un-extracted boxes while the extracted
+      # first element is freed by its clone-on-share owner — net delta zero.
+      assert_no_leaks {
+        ops = Zap.ClosureFactory.triple_adders()
+        first = List.get(ops, 0)
+        assert(first(10) == 11)
+      }
+    }
+
+    test("list of boxed closures dropped with NO extraction is leak-free") {
+      # The list is built and never read, then dropped. Every boxed
+      # environment must be reclaimed by the list-drop.
+      assert_no_leaks {
+        ops = Zap.ClosureFactory.triple_adders()
+        assert(List.length(ops) == 3)
+      }
+    }
+
+    test("re-extracted element clones independently (no double-free)") {
+      # Extracting the SAME index twice yields two independent owners; the
+      # list keeps its own original. Three drops (two clones + the list-owned
+      # original of index 0, plus the two un-extracted originals) each free
+      # exactly one inner.
+      assert_no_leaks {
+        ops = Zap.ClosureFactory.triple_adders()
+        a = List.get(ops, 0)
+        b = List.get(ops, 0)
+        assert(a(10) == 11)
+        assert(b(20) == 21)
+      }
+    }
+
+    test("dropped list of String-capturing closures deep-releases captures") {
+      # A `[fn(String) -> String]` list of closures each capturing a `String`.
+      # Partially consumed, then dropped: each un-extracted boxed environment
+      # AND its captured value are reclaimed by the list-drop.
+      assert_no_leaks {
+        gs = Zap.ClosureFactory.greeters()
+        hi = List.get(gs, 0)
+        assert(hi("hi") == "hi alice")
+      }
+    }
   }
 }

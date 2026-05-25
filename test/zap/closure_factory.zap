@@ -40,4 +40,33 @@ pub struct Zap.ClosureFactory {
   pub fn adders() -> [fn(i64) -> i64] {
     [fn(x :: i64) -> i64 { x + 1 }, Zap.ClosureFactory.make_adder(5)]
   }
+
+  @doc = """
+    A three-element `[fn(i64) -> i64]` list of capturing closures. Used to
+    exercise the box-in-container deep-release for a partially-consumed list
+    (extract one, drop the rest) and a never-extracted list (drop all): the
+    un-extracted boxed environments must be released by the list-drop.
+    """
+
+  pub fn triple_adders() -> [fn(i64) -> i64] {
+    [Zap.ClosureFactory.make_adder(1), Zap.ClosureFactory.make_adder(2), Zap.ClosureFactory.make_adder(3)]
+  }
+
+  @doc = """
+    Returns a closure capturing a `String`, used to prove the box-in-container
+    deep-release reclaims a closure's captured ARC value when its boxed
+    environment is freed by the list-drop.
+    """
+
+  pub fn make_greeter(name :: String) -> fn(String) -> String {
+    fn(greeting :: String) -> String { greeting <> " " <> name }
+  }
+
+  @doc = """
+    A three-element `[fn(String) -> String]` list of String-capturing closures.
+    """
+
+  pub fn greeters() -> [fn(String) -> String] {
+    [Zap.ClosureFactory.make_greeter("alice"), Zap.ClosureFactory.make_greeter("bob"), Zap.ClosureFactory.make_greeter("carol")]
+  }
 }
