@@ -4540,11 +4540,16 @@ pub const ArcRuntime = struct {
             .optional => |opt| elementHasEagerlyFreedChild(opt.child),
             .pointer => |p| blk: {
                 if (p.size != .one) break :blk false;
-                // An inline-header List/Map cell is reclaimed at teardown, so a
-                // pointer to one is never an eagerly-freed child. A side-table
-                // (indirect-storage) cell IS eagerly freed; recurse so a box
-                // buried inside it still counts.
-                if (comptime hasInlineArcHeader(p.child)) break :blk false;
+                // An inline-header List/Map cell is itself reclaimed at teardown
+                // (not eagerly freed), but it may OWN eagerly-freed grandchildren
+                // (a `[[fn(i64) -> i64]]` outer list, a `Map(_, fn..)`). The
+                // container-drop must recurse into such a cell to reach them, so
+                // a pointer to one counts iff the cell's own element/entry types
+                // have an eagerly-freed child. A side-table (indirect-storage)
+                // cell IS eagerly freed; recurse so a box buried inside it counts.
+                if (comptime hasInlineArcHeader(p.child)) {
+                    break :blk inlineHeaderCellHasEagerlyFreedChild(p.child);
+                }
                 break :blk true;
             },
             .@"struct" => |s| blk: {
@@ -4561,6 +4566,24 @@ pub const ArcRuntime = struct {
             },
             else => false,
         };
+    }
+
+    /// True iff an inline-header collection cell type (`List(E)` / `Map(K, V)`)
+    /// owns an eagerly-freed grandchild — i.e. its element type (`List.Element`)
+    /// or its key/value types (`Map.KeyType` / `Map.ValueType`) transitively
+    /// carry an eagerly-freed child. Drives the recursion in
+    /// `elementHasEagerlyFreedChild` for nested collections (`[[fn..]]`,
+    /// `Map(_, fn..)`, `[Map(_, fn..)]`). Conservatively `false` for any cell
+    /// type that does not expose the expected comptime element-type consts.
+    fn inlineHeaderCellHasEagerlyFreedChild(comptime CellT: type) bool {
+        if (@hasDecl(CellT, "Element")) {
+            return elementHasEagerlyFreedChild(CellT.Element);
+        }
+        if (@hasDecl(CellT, "KeyType") and @hasDecl(CellT, "ValueType")) {
+            return elementHasEagerlyFreedChild(CellT.KeyType) or
+                elementHasEagerlyFreedChild(CellT.ValueType);
+        }
+        return false;
     }
 
     /// Element type of an Arc value pointer. The ZIR backend calls every
@@ -12904,6 +12927,12 @@ pub fn Map(comptime K: type, comptime V: type) type {
     // alias. Extern struct lays fields in declaration order.
     return extern struct {
         const Self = @This();
+        /// Comptime-visible key/value element types (mirrors `List(T).Element`).
+        /// Used by `ArcRuntime.elementHasEagerlyFreedChild` to recurse into a
+        /// nested `Map`'s entries when deciding whether a container holding it
+        /// owns box-in-container children.
+        pub const KeyType = K;
+        pub const ValueType = V;
 
         // Inline buffer header. Self IS the header; the cell pointer is
         // the buffer pointer. `header: ArcHeader` lives at offset 0 so

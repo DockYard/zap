@@ -45,6 +45,16 @@ run_clean capture_i64_dropped.zap "15"
 run_clean capture_string_deep_drop.zap "hello world"
 run_clean heterogeneous_list_dropped.zap "11" "15"
 
+echo "== FCC Phase 2: boxed elements in a dropped/partially-consumed List =="
+# A ProtocolBox element stored in a List must be deep-released by the list-drop
+# under BOTH managers, balanced with clone-on-share extraction: un-extracted
+# elements are freed by the list-drop, extracted ones by their owner's drop.
+run_clean list_partial_consume_dropped.zap "11"
+run_clean list_no_extract_dropped.zap "3"
+run_clean list_extract_some_iterate_rest.zap "11" "12"
+run_clean list_string_capture_dropped.zap "hi alice"
+run_clean nested_list_of_boxes_dropped.zap "11"
+
 echo "== FCC Phase 2: SHARED boxed closures balanced under both managers =="
 # A shared boxed closure (aliased to a second/third binding, or kept while
 # also held in a container) must be balanced under BOTH managers: under a
